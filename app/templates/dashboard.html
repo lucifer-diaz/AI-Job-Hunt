@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Job Hunt OS</title>
+  <style>
+    :root { font-family: Inter, ui-sans-serif, system-ui, -apple-system, sans-serif; color: #171717; background: #f7f7f8; }
+    body { margin: 0; }
+    header { padding: 20px 28px; background: #111; color: white; display:flex; justify-content:space-between; align-items:center; }
+    main { padding: 24px; max-width: 1400px; margin: auto; }
+    .grid { display:grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap:12px; }
+    .card { background:white; border:1px solid #e5e5e5; border-radius:14px; padding:16px; margin-bottom:16px; }
+    .metric { font-size:30px; font-weight:700; }
+    .muted { color:#707070; font-size:13px; }
+    h2 { margin: 0 0 12px; font-size:18px; }
+    input, textarea, button, select { font: inherit; }
+    input, textarea { width:100%; box-sizing:border-box; border:1px solid #d7d7d7; border-radius:8px; padding:9px 10px; margin:4px 0 8px; }
+    textarea { min-height:90px; }
+    button { border:0; border-radius:8px; padding:8px 11px; cursor:pointer; background:#1f2937; color:white; margin:2px; }
+    button.secondary { background:#e5e7eb; color:#111827; }
+    button.good { background:#166534; }
+    table { width:100%; border-collapse:collapse; font-size:14px; }
+    th, td { text-align:left; padding:10px 8px; border-bottom:1px solid #eee; vertical-align:top; }
+    th { color:#666; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+    .score { font-weight:700; }
+    .row2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+    .status { padding:3px 7px; background:#f0f0f0; border-radius:999px; font-size:12px; display:inline-block; }
+    dialog { width:min(850px,90vw); border:0; border-radius:14px; padding:0; box-shadow:0 20px 60px #0004; }
+    dialog .inner { padding:20px; }
+    pre { white-space:pre-wrap; background:#f5f5f5; padding:12px; border-radius:8px; max-height:55vh; overflow:auto; }
+    @media (max-width:900px){ .grid,.row2{grid-template-columns:1fr;} table{font-size:12px;} }
+  </style>
+</head>
+<body>
+<header><div><strong>Job Hunt OS</strong><div class="muted" style="color:#bbb">Hunter → Ranker → Tailor → Review → Apply → Follow-up</div></div><div>LLM: {{ llm_provider }}</div></header>
+<main>
+  <div class="grid">
+    <div class="card"><div class="metric">{{ stats.jobs }}</div><div class="muted">Jobs discovered</div></div>
+    <div class="card"><div class="metric">{{ stats.shortlisted }}</div><div class="muted">Shortlisted</div></div>
+    <div class="card"><div class="metric">{{ stats.tailored }}</div><div class="muted">Tailored</div></div>
+    <div class="card"><div class="metric">{{ stats.applied }}</div><div class="muted">Applied</div></div>
+  </div>
+
+  <div class="row2">
+    <section class="card">
+      <h2>1. Candidate profile</h2>
+      <input id="p-name" placeholder="Name" value="{{ profile.name }}">
+      <input id="p-headline" placeholder="Headline" value="{{ profile.headline }}">
+      <input id="p-location" placeholder="Current location" value="{{ profile.location }}">
+      <input id="p-target" placeholder="Target roles, comma separated" value="{{ profile.target_roles|join(', ') }}">
+      <input id="p-locations" placeholder="Preferred locations, comma separated" value="{{ profile.preferred_locations|join(', ') }}">
+      <textarea id="p-auth" placeholder="Work authorization / visa notes">{{ profile.work_authorization }}</textarea>
+      <textarea id="p-resume" placeholder="Paste your master resume here" style="min-height:180px">{{ profile.master_resume }}</textarea>
+      <button onclick="saveProfile()">Save profile</button>
+    </section>
+
+    <section class="card">
+      <h2>2. Evidence bank</h2>
+      <input id="e-company" placeholder="Company">
+      <input id="e-role" placeholder="Role">
+      <textarea id="e-claim" placeholder="Verified achievement, e.g. Reduced MTTR by 35%..."></textarea>
+      <input id="e-skills" placeholder="Skills, comma separated">
+      <button onclick="addEvidence()">Add evidence</button>
+      <div style="max-height:250px;overflow:auto;margin-top:12px">
+      {% for e in evidence %}<div style="padding:8px 0;border-top:1px solid #eee"><strong>{{ e.company }}</strong> — {{ e.claim }}<div class="muted">{{ e.skills|join(', ') }}</div></div>{% endfor %}
+      </div>
+    </section>
+  </div>
+
+  <div class="row2">
+    <section class="card">
+      <h2>3. Discover jobs with Apify</h2>
+      <div class="muted">Primary Hunter source. Default actor: {{ apify_actor_id }}. Search LinkedIn, Indeed, Glassdoor, Naukri, Bayt and more from one run.</div><br>
+      <input id="apify-terms" placeholder="Search terms, comma separated — e.g. Engineering Manager, Lead AI Engineer">
+      <input id="apify-location" placeholder="Location — e.g. Singapore, Dubai, India, Remote">
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin:7px 0 10px">
+        <label><input class="sitebox" type="checkbox" value="linkedin" checked style="width:auto"> LinkedIn</label>
+        <label><input class="sitebox" type="checkbox" value="indeed" checked style="width:auto"> Indeed</label>
+        <label><input class="sitebox" type="checkbox" value="glassdoor" checked style="width:auto"> Glassdoor</label>
+        <label><input class="sitebox" type="checkbox" value="naukri" style="width:auto"> Naukri</label>
+        <label><input class="sitebox" type="checkbox" value="bayt" style="width:auto"> Bayt</label>
+        <label><input class="sitebox" type="checkbox" value="zip_recruiter" style="width:auto"> ZipRecruiter</label>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+        <input id="apify-max" type="number" min="1" max="100" value="20" placeholder="Max results / board / term">
+        <input id="apify-hours" type="number" min="1" value="168" placeholder="Posted within hours">
+      </div>
+      <div style="display:flex;gap:14px;align-items:center;margin:4px 0 10px">
+        <label><input id="apify-remote" type="checkbox" style="width:auto"> Remote only</label>
+        <label><input id="apify-easy" type="checkbox" style="width:auto"> Easy apply only</label>
+      </div>
+      <input id="apify-actor" placeholder="Optional Actor ID override" value="{{ apify_actor_id }}">
+      <button onclick="searchApify()">Start Apify search</button>
+      <div id="apify-status" class="muted" style="margin-top:8px"></div>
+      <details style="margin-top:12px"><summary class="muted">Direct ATS fallbacks</summary>
+        <input id="lever-site" placeholder="Lever site slug">
+        <button class="secondary" onclick="importLever()">Import Lever</button>
+        <input id="gh-board" placeholder="Greenhouse board token">
+        <button class="secondary" onclick="importGreenhouse()">Import Greenhouse</button>
+      </details>
+      {% if search_runs %}<div style="margin-top:12px"><strong style="font-size:13px">Recent Apify runs</strong>
+      {% for r in search_runs %}<div class="muted" style="padding:5px 0;border-top:1px solid #eee">#{{r.id}} · {{r.status}} · {{r.created_jobs}} new / {{r.item_count}} rows · {{r.actor_id}}</div>{% endfor %}
+      </div>{% endif %}
+    </section>
+
+    <section class="card">
+      <h2>Add a job manually</h2>
+      <input id="j-title" placeholder="Title"><input id="j-company" placeholder="Company"><input id="j-location" placeholder="Location"><input id="j-url" placeholder="Application URL"><textarea id="j-desc" placeholder="Paste job description"></textarea><button onclick="addJob()">Add job</button>
+    </section>
+  </div>
+
+  <section class="card">
+    <h2>4. Pipeline</h2>
+    <button onclick="post('/api/jobs/rank-batch').then(done)">Rank unscored jobs</button>
+    <table><thead><tr><th>Role</th><th>Source</th><th>Fit</th><th>Status</th><th>Actions</th></tr></thead><tbody>
+      {% for j in jobs %}
+      <tr><td><strong>{{ j.title }}</strong><br>{{ j.company }} · {{ j.location }}{% if j.url %}<br><a href="{{ j.url }}" target="_blank">Open application ↗</a>{% endif %}</td>
+      <td>{{ j.source }}</td><td class="score">{{ '%.0f'|format(j.fit_score) if j.fit_score is not none else '—' }}</td><td><span class="status">{{ j.status }}</span></td>
+      <td>
+        <button class="secondary" onclick="act({{ j.id }},'rank')">Rank</button>
+        <button onclick="act({{ j.id }},'tailor')">Tailor</button>
+        <button class="good" onclick="act({{ j.id }},'approve')">Approve</button>
+        {% if j.status in ['tailored','approved','applied'] %}<button class="secondary" onclick="window.open('/api/jobs/{{j.id}}/resume.pdf','_blank')">PDF</button>{% endif %}
+        {% if j.status == 'approved' %}<button onclick="markApplied({{j.id}})">Mark applied</button>{% endif %}
+      </td></tr>
+      {% endfor %}
+    </tbody></table>
+  </section>
+
+  <section class="card"><h2>5. Follow-ups</h2>
+    <div class="muted">Only drafts are generated automatically. Sending remains a human action.</div>
+    {% for f in followups %}<div style="padding:10px 0;border-top:1px solid #eee"><strong>Due {{ f.due_at }}</strong><pre>{{ f.draft }}</pre></div>{% else %}<p class="muted">No follow-up drafts yet.</p>{% endfor %}
+  </section>
+</main>
+<dialog id="modal"><div class="inner"><button style="float:right" class="secondary" onclick="modal.close()">Close</button><h2>Result</h2><pre id="modaltext"></pre></div></dialog>
+<script>
+const modal=document.getElementById('modal'), modaltext=document.getElementById('modaltext');
+async function post(url, body){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined}); const t=await r.text(); let data; try{data=JSON.parse(t)}catch{data=t} if(!r.ok) throw new Error(typeof data==='string'?data:(data.detail||JSON.stringify(data))); return data}
+function done(data){modaltext.textContent=JSON.stringify(data,null,2);modal.showModal();setTimeout(()=>location.reload(),800)}
+async function act(id,a){try{done(await post(`/api/jobs/${id}/${a}`))}catch(e){alert(e.message)}}
+async function addJob(){try{done(await post('/api/jobs/manual',{title:val('j-title'),company:val('j-company'),location:val('j-location'),url:val('j-url'),description:val('j-desc')}))}catch(e){alert(e.message)}}
+async function importLever(){try{done(await post('/api/import/lever/'+encodeURIComponent(val('lever-site'))))}catch(e){alert(e.message)}}
+async function importGreenhouse(){try{done(await post('/api/import/greenhouse/'+encodeURIComponent(val('gh-board'))))}catch(e){alert(e.message)}}
+async function searchApify(){
+  try{
+    const terms=csv('apify-terms'); if(!terms.length) return alert('Add at least one search term');
+    const sites=[...document.querySelectorAll('.sitebox:checked')].map(x=>x.value); if(!sites.length) return alert('Choose at least one job board');
+    const body={search_terms:terms,location:val('apify-location'),sites,max_results:Number(val('apify-max')||20),hours_old:Number(val('apify-hours')||168),is_remote:document.getElementById('apify-remote').checked,easy_apply:document.getElementById('apify-easy').checked,country_indeed:'',linkedin_fetch_description:true,actor_id:val('apify-actor'),custom_input:{}};
+    const run=await post('/api/search/apify',body);
+    document.getElementById('apify-status').textContent=`Apify run #${run.id} started (${run.status}). Waiting for results…`;
+    pollApify(run.id);
+  }catch(e){alert(e.message)}
+}
+async function pollApify(id){
+  try{
+    const r=await fetch(`/api/search/apify/runs/${id}`); const data=await r.json(); if(!r.ok) throw new Error(data.detail||JSON.stringify(data));
+    document.getElementById('apify-status').textContent=`Run #${id}: ${data.status} · ${data.created_jobs||0} new jobs`;
+    if(data.completed){ if(data.status==='SUCCEEDED'){done(data)} else {alert(`Apify run ended: ${data.status}${data.error?' — '+data.error:''}`)}; return; }
+    setTimeout(()=>pollApify(id),4000);
+  }catch(e){document.getElementById('apify-status').textContent=`Polling error: ${e.message}`}
+}
+async function addEvidence(){try{done(await post('/api/evidence',{company:val('e-company'),role:val('e-role'),claim:val('e-claim'),skills:csv('e-skills'),tags:[],verified:true}))}catch(e){alert(e.message)}}
+async function saveProfile(){const body={name:val('p-name'),email:'',phone:'',location:val('p-location'),linkedin_url:'',github_url:'',headline:val('p-headline'),target_roles:csv('p-target'),preferred_locations:csv('p-locations'),work_authorization:val('p-auth'),compensation_notes:'',master_resume:val('p-resume'),search_preferences:{}}; const r=await fetch('/api/profile',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); if(!r.ok) alert(await r.text()); else alert('Profile saved')}
+async function markApplied(id){try{done(await post(`/api/jobs/${id}/applied`,{recruiter_name:'',recruiter_email:'',notes:''}))}catch(e){alert(e.message)}}
+function val(id){return document.getElementById(id).value.trim()} function csv(id){return val(id).split(',').map(x=>x.trim()).filter(Boolean)}
+</script>
+</body></html>
