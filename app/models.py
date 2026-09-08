@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -118,6 +118,9 @@ class Application(Base):
 
     job: Mapped[Job] = relationship(back_populates="application")
     followups: Mapped[list[FollowUp]] = relationship(back_populates="application", cascade="all, delete-orphan")
+    question_occurrences: Mapped[list[ATSQuestionOccurrence]] = relationship(
+        back_populates="application", cascade="all, delete-orphan"
+    )
 
 
 class FollowUp(Base):
@@ -133,3 +136,75 @@ class FollowUp(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
     application: Mapped[Application] = relationship(back_populates="followups")
+
+
+class ATSQuestion(Base):
+    """Canonical ATS question, independent of any one application form."""
+
+    __tablename__ = "ats_questions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    normalized_text: Mapped[str] = mapped_column(Text)
+    fingerprint: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    category: Mapped[str] = mapped_column(String(80), default="general", index=True)
+    answer_type: Mapped[str] = mapped_column(String(40), default="text")
+    allowed_choices: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    sensitivity: Mapped[str] = mapped_column(String(80), default="none", index=True)
+    archived: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+    answers: Mapped[list[ATSAnswer]] = relationship(
+        back_populates="question", cascade="all, delete-orphan", order_by="ATSAnswer.version"
+    )
+    occurrences: Mapped[list[ATSQuestionOccurrence]] = relationship(back_populates="question")
+
+
+class ATSAnswer(Base):
+    """Immutable, auditable answer version for a canonical question."""
+
+    __tablename__ = "ats_answers"
+    __table_args__ = (UniqueConstraint("question_id", "version", name="uq_ats_answer_version"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    question_id: Mapped[int] = mapped_column(ForeignKey("ats_questions.id", ondelete="CASCADE"), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    answer: Mapped[Any] = mapped_column(JSON)
+    verification_state: Mapped[str] = mapped_column(String(30), default="unverified", index=True)
+    source_application_id: Mapped[int | None] = mapped_column(
+        ForeignKey("applications.id", ondelete="SET NULL"), nullable=True
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+    question: Mapped[ATSQuestion] = relationship(back_populates="answers")
+
+
+class ATSQuestionOccurrence(Base):
+    """The exact question seen in an application and the decision made for it."""
+
+    __tablename__ = "ats_question_occurrences"
+    __table_args__ = (UniqueConstraint("application_id", "external_key", name="uq_ats_occurrence_key"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    application_id: Mapped[int] = mapped_column(ForeignKey("applications.id", ondelete="CASCADE"), index=True)
+    question_id: Mapped[int] = mapped_column(ForeignKey("ats_questions.id", ondelete="RESTRICT"), index=True)
+    answer_id: Mapped[int | None] = mapped_column(ForeignKey("ats_answers.id", ondelete="SET NULL"), nullable=True)
+    external_key: Mapped[str] = mapped_column(String(300))
+    raw_question_text: Mapped[str] = mapped_column(Text)
+    normalized_text: Mapped[str] = mapped_column(Text)
+    fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    answer_type: Mapped[str] = mapped_column(String(40))
+    allowed_choices: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    match_kind: Mapped[str] = mapped_column(String(30), default="new")
+    match_confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    resolution_state: Mapped[str] = mapped_column(String(30), default="needs_approval", index=True)
+    conflict_warning: Mapped[str] = mapped_column(Text, default="")
+    provenance: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    application: Mapped[Application] = relationship(back_populates="question_occurrences")
+    question: Mapped[ATSQuestion] = relationship(back_populates="occurrences")
+    answer_version: Mapped[ATSAnswer | None] = relationship(foreign_keys=[answer_id])

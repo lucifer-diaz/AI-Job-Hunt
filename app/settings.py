@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     min_fit_score: int = 72
     followup_days: int = 5
     max_jobs_per_batch: int = 30
+    ats_reuse_confidence: float = 0.92
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 

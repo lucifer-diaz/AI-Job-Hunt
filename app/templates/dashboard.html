@@ -20,6 +20,8 @@
     button { border:0; border-radius:8px; padding:8px 11px; cursor:pointer; background:#1f2937; color:white; margin:2px; }
     button.secondary { background:#e5e7eb; color:#111827; }
     button.good { background:#166534; }
+    button.danger { background:#991b1b; }
+    .warning { color:#991b1b; font-weight:600; }
     table { width:100%; border-collapse:collapse; font-size:14px; }
     th, td { text-align:left; padding:10px 8px; border-bottom:1px solid #eee; vertical-align:top; }
     th { color:#666; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
@@ -132,8 +134,33 @@
     <div class="muted">Only drafts are generated automatically. Sending remains a human action.</div>
     {% for f in followups %}<div style="padding:10px 0;border-top:1px solid #eee"><strong>Due {{ f.due_at }}</strong><pre>{{ f.draft }}</pre></div>{% else %}<p class="muted">No follow-up drafts yet.</p>{% endfor %}
   </section>
+
+  <section class="card" id="knowledge-bank">
+    <h2>6. ATS Knowledge Bank</h2>
+    <div class="muted">Canonical, verified answers are kept separately from every application occurrence. Approximate matches always expose confidence and provenance.</div>
+    <input id="knowledge-search" placeholder="Search questions" oninput="filterKnowledge()">
+    <select id="knowledge-category" onchange="filterKnowledge()"><option value="">All categories</option>
+      {% for category in knowledge|map(attribute='category')|unique %}<option>{{ category }}</option>{% endfor %}
+    </select>
+    <table><thead><tr><th>Question</th><th>Category / sensitivity</th><th>Answer</th><th>Verification</th><th>Provenance / usage</th><th>Controls</th></tr></thead>
+    <tbody id="knowledge-rows">{% for q in knowledge %}
+      {% set latest = q.answers|last if q.answers else none %}
+      <tr data-text="{{ q.normalized_text }}" data-category="{{ q.category }}">
+        <td>{{ q.normalized_text }}{% if q.archived %} <span class="status">archived</span>{% endif %}</td>
+        <td>{{ q.category }}<br><span class="muted">{{ q.sensitivity }} · {{ q.answer_type }}</span></td>
+        <td>{{ latest.answer if latest else '—' }}</td>
+        <td><span class="status">{{ latest.verification_state if latest else 'unanswered' }}</span>
+          {% if q.answers|selectattr('verification_state','equalto','verified')|list|length > 1 %}<div class="warning">Review answer history for possible conflicts</div>{% endif %}</td>
+        <td><span class="muted">{{ q.occurrences|length }} uses{% if latest and latest.source_application_id %} · application #{{ latest.source_application_id }}{% endif %}</span></td>
+        <td><button class="secondary" onclick="editKnowledge({{ q.id }},'{{ q.category|e }}')">Edit</button>{% if not q.archived %}<button class="danger" onclick="archiveKnowledge({{ q.id }})">Archive</button>{% endif %}</td>
+      </tr>{% else %}<tr><td colspan="6" class="muted">No ATS questions captured yet.</td></tr>{% endfor %}</tbody></table>
+  </section>
 </main>
 <dialog id="modal"><div class="inner"><button style="float:right" class="secondary" onclick="modal.close()">Close</button><h2>Result</h2><pre id="modaltext"></pre></div></dialog>
+<dialog id="approval-modal"><div class="inner"><button style="float:right" class="secondary" onclick="document.getElementById('approval-modal').close()">Close</button><h2>ATS questions need approval</h2>
+  <div class="muted">New, conflicting, sensitive, stale, unverified, and low-confidence answers are never silently reused.</div>
+  {% for o in pending_questions %}<div style="border-top:1px solid #eee;padding:12px 0"><strong>{{ o.raw_question_text }}</strong><div class="muted">{{ o.match_kind }} match · {{ '%.0f'|format(o.match_confidence * 100) }}% · canonical #{{ o.question_id }}</div>{% if o.conflict_warning %}<div class="warning">{{ o.conflict_warning }}</div>{% endif %}<input id="answer-{{o.id}}" placeholder="Confirmed answer"><button class="good" onclick="resolveATS({{o.application_id}},{{o.id}})">Confirm verified answer</button></div>{% else %}<p class="muted">No questions await approval.</p>{% endfor %}
+</div></dialog>
 <script>
 const modal=document.getElementById('modal'), modaltext=document.getElementById('modaltext');
 async function post(url, body){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined}); const t=await r.text(); let data; try{data=JSON.parse(t)}catch{data=t} if(!r.ok) throw new Error(typeof data==='string'?data:(data.detail||JSON.stringify(data))); return data}
@@ -164,5 +191,10 @@ async function addEvidence(){try{done(await post('/api/evidence',{company:val('e
 async function saveProfile(){const body={name:val('p-name'),email:'',phone:'',location:val('p-location'),linkedin_url:'',github_url:'',headline:val('p-headline'),target_roles:csv('p-target'),preferred_locations:csv('p-locations'),work_authorization:val('p-auth'),compensation_notes:'',master_resume:val('p-resume'),search_preferences:{}}; const r=await fetch('/api/profile',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); if(!r.ok) alert(await r.text()); else alert('Profile saved')}
 async function markApplied(id){try{done(await post(`/api/jobs/${id}/applied`,{recruiter_name:'',recruiter_email:'',notes:''}))}catch(e){alert(e.message)}}
 function val(id){return document.getElementById(id).value.trim()} function csv(id){return val(id).split(',').map(x=>x.trim()).filter(Boolean)}
+function filterKnowledge(){const q=val('knowledge-search').toLowerCase(), category=document.getElementById('knowledge-category').value; document.querySelectorAll('#knowledge-rows tr[data-text]').forEach(row=>row.hidden=!(row.dataset.text.includes(q)&&(!category||row.dataset.category===category)))}
+async function archiveKnowledge(id){if(!confirm('Archive this canonical question?'))return; const r=await fetch(`/api/knowledge/${id}`,{method:'DELETE'}); if(r.ok)location.reload();else alert(await r.text())}
+async function editKnowledge(id,current){const category=prompt('Category',current); if(category===null)return; const r=await fetch(`/api/knowledge/${id}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({category})}); if(r.ok)location.reload();else alert(await r.text())}
+async function resolveATS(applicationId,occurrenceId){const answer=val(`answer-${occurrenceId}`); if(!answer)return alert('Enter an answer'); try{done(await post(`/api/applications/${applicationId}/questions/${occurrenceId}/resolve`,{answer,verification_state:'verified'}))}catch(e){alert(e.message)}}
+{% if pending_questions %}document.getElementById('approval-modal').showModal();{% endif %}
 </script>
 </body></html>

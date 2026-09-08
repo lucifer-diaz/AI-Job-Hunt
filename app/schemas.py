@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field, HttpUrl
+from datetime import datetime
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field
 
 
 class ProfileIn(BaseModel):
@@ -57,3 +60,45 @@ class RecruiterIn(BaseModel):
     recruiter_name: str = ""
     recruiter_email: str = ""
     notes: str = ""
+
+
+AnswerType = Literal["text", "textarea", "boolean", "single_choice", "multi_choice", "number", "date"]
+VerificationState = Literal["unverified", "verified", "rejected"]
+
+
+class ATSQuestionIn(BaseModel):
+    text: str = Field(min_length=1)
+    category: str = "general"
+    answer_type: AnswerType = "text"
+    allowed_choices: list[Any] = Field(default_factory=list)
+    sensitivity: str = "none"
+
+
+class ATSQuestionUpdate(BaseModel):
+    text: str | None = None
+    category: str | None = None
+    answer_type: AnswerType | None = None
+    allowed_choices: list[Any] | None = None
+    sensitivity: str | None = None
+    archived: bool | None = None
+
+
+class ATSAnswerIn(BaseModel):
+    answer: Any
+    verification_state: VerificationState = "unverified"
+    source_application_id: int | None = None
+    expires_at: datetime | None = None
+
+
+class ATSObservedQuestion(ATSQuestionIn):
+    external_key: str = Field(min_length=1, max_length=300)
+
+
+class ATSInspectionIn(BaseModel):
+    questions: list[ATSObservedQuestion] = Field(min_length=1)
+
+
+class ATSResolutionIn(BaseModel):
+    answer: Any
+    verification_state: VerificationState = "verified"
+    expires_at: datetime | None = None

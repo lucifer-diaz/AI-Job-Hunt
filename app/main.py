@@ -5,7 +5,6 @@ import hashlib
 import json
 import secrets
 from datetime import UTC, datetime
-from io import BytesIO
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
@@ -14,8 +13,14 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
 from app.db import Base, engine, get_db
-from app.models import Application, CandidateProfile, Evidence, FollowUp, Job, ResumeVariant, SearchRun
-from app.schemas import ApifySearchIn, EvidenceIn, ManualJobIn, ProfileIn, RecruiterIn
+from app.models import (ATSQuestion, ATSQuestionOccurrence, Application, CandidateProfile,
+                        Evidence, FollowUp, Job, ResumeVariant, SearchRun)
+from app.schemas import (ApifySearchIn, ATSAnswerIn, ATSInspectionIn, ATSQuestionIn,
+                         ATSQuestionUpdate, ATSResolutionIn, EvidenceIn, ManualJobIn, ProfileIn,
+                         RecruiterIn)
+from app.services.applications import (create_answer_version, inspect_application_questions,
+                                       normalize_question, question_fingerprint, resolve_occurrence,
+                                       semantic_confidence)
 from app.services.exports import markdown_to_simple_pdf
 from app.services.sources import import_greenhouse, import_lever, refresh_apify_run, start_apify_search, upsert_job
 from app.services.workflow import approve_job, create_due_followups, get_profile, mark_applied, rank_job, tailor_job
@@ -69,6 +74,10 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
     applications = db.scalars(select(Application).order_by(desc(Application.id)).limit(50)).all()
     followups = db.scalars(select(FollowUp).order_by(desc(FollowUp.id)).limit(50)).all()
     search_runs = db.scalars(select(SearchRun).order_by(desc(SearchRun.id)).limit(10)).all()
+    knowledge = db.scalars(select(ATSQuestion).order_by(desc(ATSQuestion.updated_at)).limit(100)).all()
+    pending_questions = db.scalars(select(ATSQuestionOccurrence).where(
+        ATSQuestionOccurrence.resolution_state == "needs_approval"
+    ).order_by(desc(ATSQuestionOccurrence.created_at)).limit(100)).all()
     stats = {
         "jobs": db.scalar(select(func.count(Job.id))) or 0,
         "shortlisted": db.scalar(select(func.count(Job.id)).where(Job.status == "shortlisted")) or 0,
@@ -78,6 +87,8 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
     return templates.TemplateResponse(request=request, name="dashboard.html", context={ "jobs": jobs, "profile": profile, "evidence": evidence,
         "applications": applications, "followups": followups, "search_runs": search_runs, "stats": stats,
         "llm_provider": settings.llm_provider, "apify_actor_id": settings.apify_actor_id,
+        "knowledge": knowledge,
+        "pending_questions": pending_questions,
     })
 
 
@@ -253,6 +264,157 @@ def evidence_post(payload: EvidenceIn, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(e)
     return {"id": e.id}
+
+
+def knowledge_dict(question: ATSQuestion, include_history: bool = True) -> dict:
+    answers = sorted(question.answers, key=lambda item: item.version, reverse=True)
+    occurrences = sorted(question.occurrences, key=lambda item: item.created_at, reverse=True)
+    data = {
+        "id": question.id, "normalized_text": question.normalized_text,
+        "fingerprint": question.fingerprint, "category": question.category,
+        "answer_type": question.answer_type, "allowed_choices": question.allowed_choices,
+        "sensitivity": question.sensitivity, "archived": question.archived,
+        "created_at": question.created_at, "updated_at": question.updated_at,
+        "latest_answer": ({"id": answers[0].id, "version": answers[0].version,
+                           "answer": answers[0].answer,
+                           "verification_state": answers[0].verification_state,
+                           "source_application_id": answers[0].source_application_id,
+                           "expires_at": answers[0].expires_at} if answers else None),
+        "conflict_warning": len({json.dumps(a.answer, sort_keys=True) for a in answers
+                                 if a.verification_state == "verified"}) > 1,
+    }
+    if include_history:
+        data["answer_history"] = [
+            {"id": a.id, "version": a.version, "answer": a.answer,
+             "verification_state": a.verification_state,
+             "source_application_id": a.source_application_id, "expires_at": a.expires_at,
+             "created_at": a.created_at} for a in answers
+        ]
+        data["usage_history"] = [
+            {"occurrence_id": o.id, "application_id": o.application_id,
+             "answer_version_id": o.answer_id, "raw_question_text": o.raw_question_text,
+             "match_kind": o.match_kind, "match_confidence": o.match_confidence,
+             "resolution_state": o.resolution_state, "provenance": o.provenance,
+             "conflict_warning": o.conflict_warning, "created_at": o.created_at}
+            for o in occurrences
+        ]
+    return data
+
+
+@app.get("/api/knowledge")
+def knowledge_search(q: str = "", category: str = "", fingerprint: str = "",
+                     include_archived: bool = False, db: Session = Depends(get_db)):
+    statement = select(ATSQuestion)
+    if fingerprint:
+        statement = statement.where(ATSQuestion.fingerprint == fingerprint)
+    if category:
+        statement = statement.where(ATSQuestion.category == category)
+    if not include_archived:
+        statement = statement.where(ATSQuestion.archived.is_(False))
+    questions = db.scalars(statement.order_by(desc(ATSQuestion.updated_at))).all()
+    normalized = normalize_question(q) if q else ""
+    results = []
+    for question in questions:
+        confidence = semantic_confidence(normalized, question.normalized_text) if normalized else 1.0
+        if normalized and normalized not in question.normalized_text and confidence < 0.55:
+            continue
+        item = knowledge_dict(question, include_history=False)
+        item["match_confidence"] = confidence
+        item["match_kind"] = "exact" if q and question_fingerprint(q) == question.fingerprint else (
+            "semantic" if q else "listing")
+        item["provenance"] = {"canonical_question_id": question.id,
+                              "latest_answer_id": item["latest_answer"]["id"] if item["latest_answer"] else None}
+        results.append(item)
+    return results
+
+
+@app.post("/api/knowledge")
+def knowledge_create(payload: ATSQuestionIn, db: Session = Depends(get_db)):
+    fingerprint = question_fingerprint(payload.text)
+    if db.scalar(select(ATSQuestion).where(ATSQuestion.fingerprint == fingerprint)):
+        raise HTTPException(409, "A canonical question with this fingerprint already exists")
+    question = ATSQuestion(normalized_text=normalize_question(payload.text), fingerprint=fingerprint,
+                           category=payload.category, answer_type=payload.answer_type,
+                           allowed_choices=payload.allowed_choices, sensitivity=payload.sensitivity)
+    db.add(question)
+    db.commit()
+    db.refresh(question)
+    return knowledge_dict(question)
+
+
+@app.get("/api/knowledge/{question_id}")
+def knowledge_get(question_id: int, db: Session = Depends(get_db)):
+    question = db.get(ATSQuestion, question_id)
+    if not question:
+        raise HTTPException(404, "Knowledge question not found")
+    return knowledge_dict(question)
+
+
+@app.patch("/api/knowledge/{question_id}")
+def knowledge_update(question_id: int, payload: ATSQuestionUpdate, db: Session = Depends(get_db)):
+    question = db.get(ATSQuestion, question_id)
+    if not question:
+        raise HTTPException(404, "Knowledge question not found")
+    changes = payload.model_dump(exclude_unset=True)
+    if "text" in changes:
+        question.normalized_text = normalize_question(changes.pop("text"))
+        question.fingerprint = question_fingerprint(question.normalized_text)
+    for key, value in changes.items():
+        setattr(question, key, value)
+    db.commit()
+    return knowledge_dict(question)
+
+
+@app.delete("/api/knowledge/{question_id}")
+def knowledge_archive(question_id: int, db: Session = Depends(get_db)):
+    question = db.get(ATSQuestion, question_id)
+    if not question:
+        raise HTTPException(404, "Knowledge question not found")
+    question.archived = True
+    db.commit()
+    return {"ok": True, "archived": True}
+
+
+@app.post("/api/knowledge/{question_id}/answers")
+def knowledge_answer(question_id: int, payload: ATSAnswerIn, db: Session = Depends(get_db)):
+    question = db.get(ATSQuestion, question_id)
+    if not question:
+        raise HTTPException(404, "Knowledge question not found")
+    try:
+        answer = create_answer_version(db, question, **payload.model_dump())
+        db.commit()
+        db.refresh(answer)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return {"id": answer.id, "version": answer.version}
+
+
+@app.post("/api/applications/{application_id}/questions/inspect")
+def inspect_questions(application_id: int, payload: ATSInspectionIn, db: Session = Depends(get_db)):
+    application = db.get(Application, application_id)
+    if not application:
+        raise HTTPException(404, "Application not found")
+    occurrences = inspect_application_questions(
+        db, application, [item.model_dump() for item in payload.questions], settings.ats_reuse_confidence)
+    return [{"id": o.id, "question_id": o.question_id, "answer_version_id": o.answer_id,
+             "resolution_state": o.resolution_state, "match_kind": o.match_kind,
+             "match_confidence": o.match_confidence, "provenance": o.provenance,
+             "conflict_warning": o.conflict_warning} for o in occurrences]
+
+
+@app.post("/api/applications/{application_id}/questions/{occurrence_id}/resolve")
+def resolve_question(application_id: int, occurrence_id: int, payload: ATSResolutionIn,
+                     db: Session = Depends(get_db)):
+    occurrence = db.get(ATSQuestionOccurrence, occurrence_id)
+    if not occurrence or occurrence.application_id != application_id:
+        raise HTTPException(404, "Question occurrence not found")
+    try:
+        answer = resolve_occurrence(db, occurrence, **payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return {"answer_version_id": answer.id, "version": answer.version,
+            "resolution_state": occurrence.resolution_state,
+            "conflict_warning": occurrence.conflict_warning, "provenance": occurrence.provenance}
 
 
 @app.post("/api/cron/followups")
