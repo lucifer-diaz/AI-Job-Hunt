@@ -17,7 +17,8 @@ dependencies = [
   "openai>=2.0,<3",
   "anthropic>=0.67,<1",
   "reportlab>=4.4,<5",
-  "email-validator>=2.2,<3"
+  "email-validator>=2.2,<3",
+  "google-adk>=1.15,<2"
 ]
 
 [project.optional-dependencies]

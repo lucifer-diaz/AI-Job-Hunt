@@ -231,3 +231,43 @@ For one user, do **not** start with Redis, Celery, Kafka, a vector database, or 
 - Optional Playwright **assistive** form filling where permitted, with a hard stop before submit
 
 See [DEPLOY.md](DEPLOY.md) for hosting instructions.
+
+## 7. Google Gemini agent deployment
+
+The repository includes a Google ADK package named `job_hunt_agent`. Its
+`root_agent` coordinates four narrowly scoped agents: `job_fit_ranker`,
+`resume_tailor`, `resume_reviewer`, and `follow_up_writer`. The agents use Gemini
+for reasoning and validated database tools for reads/writes; no tool approves,
+submits, or sends an application.
+
+Run it locally after installing the project:
+
+```bash
+gcloud auth application-default login
+export GOOGLE_GENAI_USE_VERTEXAI=true
+export GOOGLE_CLOUD_PROJECT="your-project-id"
+export GOOGLE_CLOUD_LOCATION="us-central1"
+export DATABASE_URL="postgresql+psycopg://..."
+pip install -e .
+adk web
+```
+
+In the ADK web UI, select `job_hunt_agent` and use stored numeric IDs, for
+example: `Rank job 42`. To deploy the same package to Vertex AI Agent Engine:
+
+```bash
+gcloud services enable aiplatform.googleapis.com
+gcloud storage buckets create "gs://${GOOGLE_CLOUD_PROJECT}-agent-staging" \
+  --location="${GOOGLE_CLOUD_LOCATION}"
+adk deploy agent_engine \
+  --project="${GOOGLE_CLOUD_PROJECT}" \
+  --region="${GOOGLE_CLOUD_LOCATION}" \
+  --staging_bucket="gs://${GOOGLE_CLOUD_PROJECT}-agent-staging" \
+  job_hunt_agent
+```
+
+Use a reachable PostgreSQL `DATABASE_URL` in Agent Engine rather than SQLite:
+local SQLite state is ephemeral and is not shared between deployed instances.
+Grant the deployment identity access to Vertex AI, the staging bucket, and the
+database/network secrets it needs. See [DEPLOY.md](DEPLOY.md) for limitations
+and operational checks.
