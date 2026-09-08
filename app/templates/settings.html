@@ -1,10 +1,6 @@
-<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Settings · Job Hunt OS</title>
 <style>
-:root{font-family:Inter,ui-sans-serif,system-ui,sans-serif;color:#171717;background:#f7f7f8}body{margin:0}header{padding:20px 28px;background:#111;color:#fff;display:flex;justify-content:space-between}header a{color:#fff}main{max-width:850px;margin:auto;padding:28px}.card{background:#fff;border:1px solid #e5e5e5;border-radius:14px;padding:20px;margin-bottom:16px}.providers{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.provider{border:1px solid #ddd;border-radius:10px;padding:14px}.provider:has(input:checked){border-color:#2563eb;background:#eff6ff}label{display:block;font-weight:600;margin-top:12px}input,select,button{font:inherit}input[type=text],input[type=number],select{width:100%;box-sizing:border-box;border:1px solid #ccc;border-radius:8px;padding:9px;margin-top:5px}button{border:0;border-radius:8px;padding:10px 14px;background:#1f2937;color:white;cursor:pointer;margin-right:6px}.secondary{background:#e5e7eb;color:#111}.muted{color:#666;font-size:13px}.ready{color:#166534}.missing{color:#b91c1c}#message{padding-top:12px;font-weight:600}@media(max-width:650px){.providers{grid-template-columns:1fr}}
-</style></head><body>
-<header><strong>Application settings</strong><a href="/">← Dashboard</a></header><main>
+.providers{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.provider{border:1px solid #ddd;border-radius:10px;padding:14px}.provider input{width:auto}.provider:has(input:checked){border-color:#2563eb;background:#eff6ff}.ready{color:#166534}.missing{color:#b91c1c}#message{padding-top:12px;font-weight:600}@media(max-width:650px){.providers{grid-template-columns:1fr}}
+</style>
 <section class="card"><h2>LLM provider</h2><p class="muted">Credentials remain server-side environment secrets and can never be edited here.</p>
 <div class="providers" id="providers">
 <label class="provider"><input type="radio" name="provider" value="openrouter" checked> OpenRouter <div class="muted" id="credential-openrouter">Checking…</div></label>
@@ -20,14 +16,14 @@
 <label>Follow-up delay (days)<input id="followup_days" type="number" min="1" max="90"></label>
 <label>Maximum jobs per batch<input id="max_jobs_per_batch" type="number" min="1" max="200"></label></section>
 <button onclick="save()">Save settings</button><button class="secondary" onclick="testConnection()">Test connection</button><div id="message" role="status"></div>
-</main><script>
+<script>
 let current;
 const message=document.getElementById('message');
-async function request(url,options){const response=await fetch(url,options);const body=await response.json().catch(()=>({detail:'The server returned an unreadable response'}));if(!response.ok)throw new Error(body.detail||`Request failed (${response.status})`);return body}
+async function settingsRequest(url,options){const response=await fetch(url,options);const body=await response.json().catch(()=>({detail:'The server returned an unreadable response'}));if(!response.ok)throw new Error(body.detail||`Request failed (${response.status})`);return body}
 function render(data){current=data;document.querySelector(`[name=provider][value="${data.active_provider}"]`).checked=true;for(const key of ['openrouter_model','openai_model','anthropic_model','approval_mode','min_fit_score','followup_days','max_jobs_per_batch'])document.getElementById(key).value=data[key];for(const provider of ['openrouter','openai','anthropic']){const state=data.credentials[provider],el=document.getElementById(`credential-${provider}`);el.textContent=state.configured?`Credential ready ${state.masked_suffix||''}`:'Credential not configured';el.className=state.configured?'muted ready':'muted missing'}}
 function payload(){return {active_provider:document.querySelector('[name=provider]:checked').value,openrouter_model:value('openrouter_model'),openai_model:value('openai_model'),anthropic_model:value('anthropic_model'),approval_mode:value('approval_mode'),min_fit_score:Number(value('min_fit_score')),followup_days:Number(value('followup_days')),max_jobs_per_batch:Number(value('max_jobs_per_batch'))}}
 function value(id){return document.getElementById(id).value.trim()}
-async function save(){message.textContent='Saving…';try{render(await request('/api/settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload())}));message.textContent='Settings saved.'}catch(error){message.textContent=`Could not save settings: ${error.message}`}}
-async function testConnection(){message.textContent='Testing connection…';try{await save();const result=await request('/api/settings/test',{method:'POST'});message.textContent=result.message}catch(error){message.textContent=`Connection failed: ${error.message}`}}
-request('/api/settings').then(render).catch(error=>message.textContent=`Could not load settings: ${error.message}`);
-</script></body></html>
+async function save(){message.textContent='Saving…';try{render(await settingsRequest('/api/settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload())}));message.textContent='Settings saved.'}catch(error){message.textContent=`Could not save settings: ${error.message}`}}
+async function testConnection(){message.textContent='Testing connection…';try{await save();const result=await settingsRequest('/api/settings/test',{method:'POST'});message.textContent=result.message}catch(error){message.textContent=`Connection failed: ${error.message}`}}
+settingsRequest('/api/settings').then(render).catch(error=>message.textContent=`Could not load settings: ${error.message}`);
+</script>
