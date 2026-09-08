@@ -32,6 +32,31 @@ class CandidateProfile(Base):
     search_preferences: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
 
+    resume_document: Mapped[ResumeDocument | None] = relationship(
+        back_populates="profile", cascade="all, delete-orphan", uselist=False
+    )
+
+
+class ResumeDocument(Base):
+    """Metadata only. Resume binary data is deliberately stored out-of-database."""
+
+    __tablename__ = "resume_documents"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    profile_id: Mapped[int] = mapped_column(
+        ForeignKey("candidate_profiles.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    original_filename: Mapped[str] = mapped_column(String(500))
+    media_type: Mapped[str] = mapped_column(String(150))
+    storage_key: Mapped[str] = mapped_column(String(500), unique=True)
+    checksum: Mapped[str] = mapped_column(String(64))
+    size: Mapped[int] = mapped_column(Integer)
+    uploaded_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    extraction_status: Mapped[str] = mapped_column(String(30), default="complete")
+    extracted_text: Mapped[str] = mapped_column(Text, default="")
+
+    profile: Mapped[CandidateProfile] = relationship(back_populates="resume_document")
+
 
 class Evidence(Base):
     __tablename__ = "evidence"

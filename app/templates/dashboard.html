@@ -51,7 +51,19 @@
       <input id="p-target" placeholder="Target roles, comma separated" value="{{ profile.target_roles|join(', ') }}">
       <input id="p-locations" placeholder="Preferred locations, comma separated" value="{{ profile.preferred_locations|join(', ') }}">
       <textarea id="p-auth" placeholder="Work authorization / visa notes">{{ profile.work_authorization }}</textarea>
-      <textarea id="p-resume" placeholder="Paste your master resume here" style="min-height:180px">{{ profile.master_resume }}</textarea>
+      <div id="resume-current" class="muted" style="padding:10px;background:#f5f5f5;border-radius:8px">
+        {% if resume_document %}<strong>{{ resume_document.original_filename }}</strong> · {{ resume_document.size }} bytes · {{ resume_document.extraction_status }}
+        {% else %}No resume document uploaded.{% endif %}
+      </div>
+      <input id="resume-file" type="file" accept=".pdf,.docx,.txt,.md" aria-label="Resume document">
+      <progress id="resume-progress" value="0" max="100" style="width:100%;display:none"></progress>
+      <div id="resume-feedback" class="muted" aria-live="polite"></div>
+      <button type="button" onclick="uploadResume()">{% if resume_document %}Replace document{% else %}Upload document{% endif %}</button>
+      {% if resume_document %}<button type="button" class="secondary" onclick="window.open('/api/profile/resume/download')">Download</button>
+      <button type="button" class="secondary" onclick="removeResume()">Remove</button>{% endif %}
+      <details style="margin:8px 0"><summary class="muted">Extracted text preview / editor</summary>
+        <textarea id="p-resume" placeholder="Extracted master resume text" style="min-height:180px">{{ profile.master_resume }}</textarea>
+      </details>
       <button onclick="saveProfile()">Save profile</button>
     </section>
 
@@ -161,7 +173,18 @@ async function pollApify(id){
   }catch(e){document.getElementById('apify-status').textContent=`Polling error: ${e.message}`}
 }
 async function addEvidence(){try{done(await post('/api/evidence',{company:val('e-company'),role:val('e-role'),claim:val('e-claim'),skills:csv('e-skills'),tags:[],verified:true}))}catch(e){alert(e.message)}}
-async function saveProfile(){const body={name:val('p-name'),email:'',phone:'',location:val('p-location'),linkedin_url:'',github_url:'',headline:val('p-headline'),target_roles:csv('p-target'),preferred_locations:csv('p-locations'),work_authorization:val('p-auth'),compensation_notes:'',master_resume:val('p-resume'),search_preferences:{}}; const r=await fetch('/api/profile',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); if(!r.ok) alert(await r.text()); else alert('Profile saved')}
+async function saveProfile(){const body={name:val('p-name'),location:val('p-location'),headline:val('p-headline'),target_roles:csv('p-target'),preferred_locations:csv('p-locations'),work_authorization:val('p-auth'),master_resume:val('p-resume')}; const r=await fetch('/api/profile',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); if(!r.ok) alert(await r.text()); else alert('Profile saved')}
+function uploadResume(){
+  const file=document.getElementById('resume-file').files[0]; if(!file) return alert('Choose a resume document first');
+  const form=new FormData(); form.append('file',file); const xhr=new XMLHttpRequest();
+  const progress=document.getElementById('resume-progress'), feedback=document.getElementById('resume-feedback');
+  progress.style.display='block'; progress.value=0; feedback.textContent='Uploading…';
+  xhr.upload.onprogress=e=>{if(e.lengthComputable) progress.value=Math.round(e.loaded/e.total*100)};
+  xhr.onload=()=>{let data={};try{data=JSON.parse(xhr.responseText)}catch{} if(xhr.status>=200&&xhr.status<300){feedback.textContent='Extraction complete. The master resume is ready.'; document.getElementById('p-resume').value=data.extracted_text||''; setTimeout(()=>location.reload(),600)}else{feedback.textContent='Upload failed: '+(data.detail||xhr.responseText)}};
+  xhr.onerror=()=>feedback.textContent='Upload failed due to a network error.';
+  xhr.open({% if resume_document %}'PUT'{% else %}'POST'{% endif %},'/api/profile/resume'); xhr.send(form);
+}
+async function removeResume(){if(!confirm('Remove the current resume document and extracted text?')) return; const r=await fetch('/api/profile/resume',{method:'DELETE'}); if(r.ok) location.reload(); else alert(await r.text())}
 async function markApplied(id){try{done(await post(`/api/jobs/${id}/applied`,{recruiter_name:'',recruiter_email:'',notes:''}))}catch(e){alert(e.message)}}
 function val(id){return document.getElementById(id).value.trim()} function csv(id){return val(id).split(',').map(x=>x.trim()).filter(Boolean)}
 </script>

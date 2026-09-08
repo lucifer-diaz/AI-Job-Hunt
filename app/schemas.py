@@ -1,22 +1,22 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field
 
 
 class ProfileIn(BaseModel):
-    name: str = ""
-    email: str = ""
-    phone: str = ""
-    location: str = ""
-    linkedin_url: str = ""
-    github_url: str = ""
-    headline: str = ""
-    target_roles: list[str] = Field(default_factory=list)
-    preferred_locations: list[str] = Field(default_factory=list)
-    work_authorization: str = ""
-    compensation_notes: str = ""
-    master_resume: str = ""
-    search_preferences: dict = Field(default_factory=dict)
+    name: str | None = None
+    email: str | None = None
+    phone: str | None = None
+    location: str | None = None
+    linkedin_url: str | None = None
+    github_url: str | None = None
+    headline: str | None = None
+    target_roles: list[str] | None = None
+    preferred_locations: list[str] | None = None
+    work_authorization: str | None = None
+    compensation_notes: str | None = None
+    master_resume: str | None = None
+    search_preferences: dict | None = None
 
 
 class EvidenceIn(BaseModel):

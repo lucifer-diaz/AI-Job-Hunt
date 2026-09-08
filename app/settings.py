@@ -46,6 +46,12 @@ class Settings(BaseSettings):
     followup_days: int = 5
     max_jobs_per_batch: int = 30
 
+    # Resume binaries live outside the relational database. In production this
+    # directory may be a mounted object-storage/FUSE volume; the adapter keeps
+    # storage concerns isolated so a cloud implementation can be substituted.
+    resume_storage_path: str = "./data/resumes"
+    resume_max_upload_bytes: int = 10 * 1024 * 1024
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
 

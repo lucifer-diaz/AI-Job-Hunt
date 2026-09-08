@@ -2,21 +2,21 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import json
 import secrets
+import uuid
 from datetime import UTC, datetime
-from io import BytesIO
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import HTMLResponse, Response
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
 from app.db import Base, engine, get_db
-from app.models import Application, CandidateProfile, Evidence, FollowUp, Job, ResumeVariant, SearchRun
+from app.models import Application, CandidateProfile, Evidence, FollowUp, Job, ResumeDocument, ResumeVariant, SearchRun
 from app.schemas import ApifySearchIn, EvidenceIn, ManualJobIn, ProfileIn, RecruiterIn
 from app.services.exports import markdown_to_simple_pdf
+from app.services.documents import DocumentError, LocalDocumentStorage, extract_document, validate_document
 from app.services.sources import import_greenhouse, import_lever, refresh_apify_run, start_apify_search, upsert_job
 from app.services.workflow import approve_job, create_due_followups, get_profile, mark_applied, rank_job, tailor_job
 from app.settings import get_settings
@@ -24,6 +24,7 @@ from app.settings import get_settings
 Base.metadata.create_all(bind=engine)
 settings = get_settings()
 app = FastAPI(title=settings.app_name, version="0.3.0")
+document_storage = LocalDocumentStorage(settings.resume_storage_path)
 
 
 @app.middleware("http")
@@ -77,6 +78,7 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
     }
     return templates.TemplateResponse(request=request, name="dashboard.html", context={ "jobs": jobs, "profile": profile, "evidence": evidence,
         "applications": applications, "followups": followups, "search_runs": search_runs, "stats": stats,
+        "resume_document": profile.resume_document,
         "llm_provider": settings.llm_provider, "apify_actor_id": settings.apify_actor_id,
     })
 
@@ -231,12 +233,122 @@ def profile_get(db: Session = Depends(get_db)):
 
 
 @app.put("/api/profile")
+@app.patch("/api/profile")
 def profile_put(payload: ProfileIn, db: Session = Depends(get_db)):
     p = get_profile(db)
-    for key, value in payload.model_dump().items():
+    for key, value in payload.model_dump(exclude_unset=True).items():
         setattr(p, key, value)
     db.commit()
     return {"ok": True}
+
+
+def document_dict(document: ResumeDocument, include_text: bool = False) -> dict:
+    result = {
+        "id": document.id,
+        "original_filename": document.original_filename,
+        "media_type": document.media_type,
+        "checksum": document.checksum,
+        "size": document.size,
+        "uploaded_at": document.uploaded_at.isoformat(),
+        "extraction_status": document.extraction_status,
+        "download_url": "/api/profile/resume/download",
+    }
+    if include_text:
+        result["extracted_text"] = document.extracted_text
+    return result
+
+
+async def save_resume_upload(upload: UploadFile, db: Session) -> dict:
+    data = bytearray()
+    while chunk := await upload.read(64 * 1024):
+        data.extend(chunk)
+        if len(data) > settings.resume_max_upload_bytes:
+            raise HTTPException(413, f"Resume exceeds {settings.resume_max_upload_bytes} byte limit")
+    filename = upload.filename or ""
+    try:
+        extension, media_type = validate_document(filename, upload.content_type, bytes(data))
+        extracted_text = extract_document(bytes(data), extension)
+    except DocumentError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+    profile = get_profile(db)
+    old_document = profile.resume_document
+    old_key = old_document.storage_key if old_document else None
+    storage_key = f"{profile.id}/{uuid.uuid4().hex}{extension}"
+    try:
+        document_storage.put(storage_key, bytes(data))
+        if old_document:
+            old_document.original_filename = filename
+            old_document.media_type = media_type
+            old_document.storage_key = storage_key
+            old_document.checksum = hashlib.sha256(data).hexdigest()
+            old_document.size = len(data)
+            old_document.uploaded_at = datetime.now(UTC).replace(tzinfo=None)
+            old_document.extraction_status = "complete"
+            old_document.extracted_text = extracted_text
+            document = old_document
+        else:
+            document = ResumeDocument(
+                profile_id=profile.id, original_filename=filename, media_type=media_type,
+                storage_key=storage_key, checksum=hashlib.sha256(data).hexdigest(), size=len(data),
+                extraction_status="complete", extracted_text=extracted_text,
+            )
+            db.add(document)
+        # This is the canonical text workflow.py already consumes.
+        profile.master_resume = extracted_text
+        db.commit()
+        db.refresh(document)
+    except Exception:
+        db.rollback()
+        document_storage.delete(storage_key)
+        raise
+    if old_key and old_key != storage_key:
+        document_storage.delete(old_key)
+    return document_dict(document, include_text=True)
+
+
+@app.get("/api/profile/resume")
+def resume_metadata(include_text: bool = False, db: Session = Depends(get_db)):
+    document = get_profile(db).resume_document
+    if not document:
+        raise HTTPException(404, "No resume document uploaded")
+    return document_dict(document, include_text)
+
+
+@app.post("/api/profile/resume", status_code=201)
+async def resume_upload(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    return await save_resume_upload(file, db)
+
+
+@app.put("/api/profile/resume")
+async def resume_replace(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    if not get_profile(db).resume_document:
+        raise HTTPException(404, "No resume document to replace")
+    return await save_resume_upload(file, db)
+
+
+@app.get("/api/profile/resume/download")
+def resume_download(db: Session = Depends(get_db)):
+    document = get_profile(db).resume_document
+    if not document:
+        raise HTTPException(404, "No resume document uploaded")
+    path = document_storage.path(document.storage_key)
+    if not path.is_file():
+        raise HTTPException(404, "Stored resume file is missing")
+    return FileResponse(path, media_type=document.media_type, filename=document.original_filename)
+
+
+@app.delete("/api/profile/resume", status_code=204)
+def resume_delete(db: Session = Depends(get_db)):
+    profile = get_profile(db)
+    document = profile.resume_document
+    if not document:
+        raise HTTPException(404, "No resume document uploaded")
+    storage_key = document.storage_key
+    db.delete(document)
+    profile.master_resume = ""
+    db.commit()
+    document_storage.delete(storage_key)
 
 
 @app.get("/api/evidence")

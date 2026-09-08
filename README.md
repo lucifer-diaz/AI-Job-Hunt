@@ -8,7 +8,7 @@ It deliberately does **not** auto-submit applications or bypass anti-bot/CAPTCHA
 
 ## What works
 
-- Candidate profile + master resume
+- Candidate profile + securely stored PDF, DOCX, TXT, or Markdown master resume
 - Verified evidence bank to prevent resume hallucinations
 - **Apify-first multi-board job discovery**
 - Default Apify Actor searches LinkedIn, Indeed, Glassdoor, Naukri, Bayt and ZipRecruiter
@@ -45,6 +45,11 @@ uvicorn app.main:app --reload
 ```
 
 Open http://localhost:8000. For any public deployment, set `APP_USERNAME` and `APP_PASSWORD`.
+
+Resume binaries are stored outside the database through the document-storage adapter
+(`RESUME_STORAGE_PATH`, default `./data/resumes`); only searchable metadata and extracted text
+are persisted in SQL. Mount durable or object-backed storage at that path in production. Uploads
+are limited to 10 MiB by default (`RESUME_MAX_UPLOAD_BYTES`).
 
 For PostgreSQL:
 
