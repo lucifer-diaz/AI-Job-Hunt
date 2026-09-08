@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import json
 import secrets
 from datetime import UTC, datetime
-from io import BytesIO
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
@@ -13,7 +11,7 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
-from app.db import Base, engine, get_db
+from app.db import get_db
 from app.models import Application, CandidateProfile, Evidence, FollowUp, Job, ResumeVariant, SearchRun
 from app.schemas import ApifySearchIn, EvidenceIn, ManualJobIn, ProfileIn, RecruiterIn
 from app.services.exports import markdown_to_simple_pdf
@@ -21,7 +19,6 @@ from app.services.sources import import_greenhouse, import_lever, refresh_apify_
 from app.services.workflow import approve_job, create_due_followups, get_profile, mark_applied, rank_job, tailor_job
 from app.settings import get_settings
 
-Base.metadata.create_all(bind=engine)
 settings = get_settings()
 app = FastAPI(title=settings.app_name, version="0.3.0")
 

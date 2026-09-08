@@ -41,6 +41,7 @@ cp .env.example .env
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
+alembic upgrade head
 uvicorn app.main:app --reload
 ```
 
@@ -50,6 +51,31 @@ For PostgreSQL:
 
 ```bash
 docker compose up --build
+```
+
+### Database migrations
+
+The application never creates tables while being imported. Before starting a
+local process, upgrade the database using the configured `DATABASE_URL`:
+
+```bash
+alembic current
+alembic upgrade head
+```
+
+Create a migration after changing ORM models with `alembic revision
+--autogenerate -m "description"`, and review the generated operations before
+applying them. To roll back the latest revision (take a backup first):
+
+```bash
+alembic downgrade -1
+```
+
+To exercise the complete legacy-schema upgrade, data-backfill, and downgrade
+path against a disposable SQLite database:
+
+```bash
+python scripts/verify_migrations.py
 ```
 
 ## 2. Apify job discovery

@@ -14,5 +14,6 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://jobhunt:jobhunt@db:5432/jobhunt
     depends_on: [db]
+    command: sh -c "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000"
 volumes:
   pgdata:

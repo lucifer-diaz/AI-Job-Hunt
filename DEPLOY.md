@@ -28,7 +28,9 @@ MIN_FIT_SCORE=72
 FOLLOWUP_DAYS=5
 ```
 
-6. Health check: `/health`.
+6. Back up the database and run `alembic upgrade head` as a release command.
+   The supplied Docker command also performs this controlled upgrade immediately
+   before starting the web process. Health check: `/health`.
 7. Add a Render Cron Job for due follow-up drafts:
 
 ```bash
@@ -37,13 +39,63 @@ python -m app.cron
 
 A once-daily run is sufficient for follow-ups.
 
+## Schema migration and rollback runbook
+
+All processes use `DATABASE_URL`, including Alembic. Schema creation is not an
+application import side effect. For production, take a provider snapshot/backup,
+stop writers (or put the service in maintenance mode), and run:
+
+```bash
+alembic current
+alembic upgrade head
+alembic current
+```
+
+The Docker, Compose, Render, and Railway commands in this repository run the
+idempotent upgrade before Uvicorn starts. On a multi-replica deployment, prefer
+a single platform release/pre-deploy job instead, then start all replicas without
+the migration prefix so only one actor changes the schema.
+
+Inspect history and roll back one incremental revision with:
+
+```bash
+alembic history --verbose
+alembic downgrade -1
+```
+
+Or roll back to a reviewed revision explicitly, for example:
+
+```bash
+alembic downgrade 0005_application_execution_state
+```
+
+Downgrading removes data owned by the removed feature tables. Restore the backup
+instead if that data must be recovered. The baseline downgrade intentionally
+removes the legacy schema and should never be used against production unless the
+database is being destroyed.
+
+Before releasing, verify the migration chain against a disposable copy of the
+old schema:
+
+```bash
+python scripts/verify_migrations.py
+```
+
+The verifier creates the old schema at `0001_baseline`, seeds representative
+profile, job, resume, and application rows, upgrades to `head`, checks retained
+records and new-table backfills, downgrades to the baseline, rechecks the legacy
+data, and finally confirms that the baseline itself can downgrade on a disposable
+database. For a staging copy of production, separately run `alembic upgrade head`
+and application smoke tests; never point the disposable verifier at production.
+
 ## Railway alternative
 
 Railway is convenient if you prefer a single platform for web + database + cron.
 
 1. Deploy the Dockerfile from GitHub.
 2. Add Railway Postgres or connect Neon.
-3. Add the same environment variables above.
+3. Add the same environment variables above. The supplied Railway start command
+   runs `alembic upgrade head` before Uvicorn.
 4. Create a second service using `python -m app.cron` as the start command and configure a daily cron schedule.
 
 
@@ -125,8 +177,8 @@ delegates to four specialist agents, whose prompts are kept in
    Credentials.
 2. Enable `aiplatform.googleapis.com` and create a regional Cloud Storage
    staging bucket.
-3. Provision PostgreSQL reachable from Agent Engine. Apply the normal app schema
-   by starting the web app once; this project does not yet use migrations.
+3. Provision PostgreSQL reachable from Agent Engine and apply the schema with
+   `alembic upgrade head` from a release job or trusted workstation.
 4. Configure these runtime values using your deployment's secret/environment
    controls (never bake credentials into the source bundle):
 
@@ -161,7 +213,8 @@ marked `applied`; the tool saves a draft but never sends it.
 
 - Agent Engine does not host the FastAPI dashboard or the Apify polling worker;
   deploy those separately and point both services at the same PostgreSQL database.
-- Database tables are created directly rather than through versioned migrations.
+- Agent Engine does not run database migrations itself; run the release migration
+  before deploying agent code that relies on a newer schema.
 - The tool layer has no end-user identity/tenant boundary; deploy this personal
   agent with restricted IAM access rather than exposing it as a public multi-user bot.
 - Agent output quality depends on the selected Gemini model. Persistence tools
