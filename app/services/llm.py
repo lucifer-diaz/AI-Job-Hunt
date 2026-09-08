@@ -48,29 +48,45 @@ def _is_free_openrouter_model(model: str) -> bool:
 
 
 class LLMClient:
-    def __init__(self):
+    SUPPORTED_PROVIDERS = frozenset({"openrouter", "openai", "anthropic", "mock"})
+
+    def __init__(self, db=None):
         self.settings = get_settings()
+        self.db = db
+
+    def _preferences(self):
+        """Resolve mutable, non-secret preferences at call time."""
+        from app.models import ApplicationSettings
+
+        if self.db is not None:
+            return self.db.get(ApplicationSettings, 1)
+        return None
 
     def generate_json(self, system: str, user: str) -> dict[str, Any]:
-        provider = self.settings.llm_provider.lower()
+        preferences = self._preferences()
+        provider = (
+            preferences.active_provider if preferences else self.settings.llm_provider
+        ).lower()
         if provider == "mock":
             return self._mock(user)
         if provider == "openai":
-            return self._openai(system, user)
+            return self._openai(system, user, preferences)
         if provider == "anthropic":
-            return self._anthropic(system, user)
+            return self._anthropic(system, user, preferences)
         if provider == "openrouter":
-            return self._openrouter(system, user, task=_task_from_prompt(user))
+            return self._openrouter(
+                system, user, task=_task_from_prompt(user), preferences=preferences
+            )
         raise LLMError(f"Unsupported LLM_PROVIDER={provider}")
 
-    def _openai(self, system: str, user: str) -> dict[str, Any]:
+    def _openai(self, system: str, user: str, preferences=None) -> dict[str, Any]:
         if not self.settings.openai_api_key:
             raise LLMError("OPENAI_API_KEY is missing")
         from openai import OpenAI
 
         client = OpenAI(api_key=self.settings.openai_api_key)
         response = client.chat.completions.create(
-            model=self.settings.openai_model,
+            model=preferences.openai_model if preferences else self.settings.openai_model,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
@@ -79,14 +95,14 @@ class LLMClient:
         )
         return _extract_json(response.choices[0].message.content or "{}")
 
-    def _anthropic(self, system: str, user: str) -> dict[str, Any]:
+    def _anthropic(self, system: str, user: str, preferences=None) -> dict[str, Any]:
         if not self.settings.anthropic_api_key:
             raise LLMError("ANTHROPIC_API_KEY is missing")
         from anthropic import Anthropic
 
         client = Anthropic(api_key=self.settings.anthropic_api_key)
         msg = client.messages.create(
-            model=self.settings.anthropic_model,
+            model=preferences.anthropic_model if preferences else self.settings.anthropic_model,
             max_tokens=5000,
             system=system + "\nReturn only valid JSON. No markdown fences.",
             messages=[{"role": "user", "content": user}],
@@ -94,20 +110,24 @@ class LLMClient:
         text = "".join(getattr(block, "text", "") for block in msg.content)
         return _extract_json(text)
 
-    def _openrouter_model_for_task(self, task: str) -> str:
+    def _openrouter_model_for_task(self, task: str, preferences=None) -> str:
         overrides = {
             "rank": self.settings.openrouter_model_rank,
             "tailor": self.settings.openrouter_model_tailor,
             "review": self.settings.openrouter_model_review,
             "followup": self.settings.openrouter_model_followup,
         }
-        return overrides.get(task) or self.settings.openrouter_model
+        return overrides.get(task) or (
+            preferences.openrouter_model if preferences else self.settings.openrouter_model
+        )
 
-    def _openrouter(self, system: str, user: str, task: str = "default") -> dict[str, Any]:
+    def _openrouter(
+        self, system: str, user: str, task: str = "default", preferences=None
+    ) -> dict[str, Any]:
         if not self.settings.openrouter_api_key:
             raise LLMError("OPENROUTER_API_KEY is missing")
 
-        primary = self._openrouter_model_for_task(task)
+        primary = self._openrouter_model_for_task(task, preferences)
         fallbacks = _csv_models(self.settings.openrouter_fallback_models)
         all_models = [primary, *fallbacks]
 
@@ -142,7 +162,10 @@ class LLMClient:
         request_kwargs: dict[str, Any] = {
             "model": primary,
             "messages": [
-                {"role": "system", "content": system + "\nReturn only valid JSON. No markdown fences."},
+                {
+                    "role": "system",
+                    "content": system + "\nReturn only valid JSON. No markdown fences.",
+                },
                 {"role": "user", "content": user},
             ],
             "response_format": {"type": "json_object"},
@@ -154,7 +177,9 @@ class LLMClient:
         try:
             response = client.chat.completions.create(**request_kwargs)
         except Exception as exc:
-            raise LLMError(f"OpenRouter request failed for task={task}, model={primary}: {exc}") from exc
+            raise LLMError(
+                f"OpenRouter request failed for task={task}, model={primary}: {exc}"
+            ) from exc
 
         content = response.choices[0].message.content or "{}"
         return _extract_json(content)
@@ -180,7 +205,9 @@ class LLMClient:
                 "improvements": ["Keep bullets concise"],
             }
         if "FOLLOW_UP" in user:
-            return {"draft": "Hi, I wanted to follow up on my application and reiterate my interest in the role. Best regards."}
+            return {
+                "draft": "Hi, I wanted to follow up on my application and reiterate my interest in the role. Best regards."
+            }
         return {
             "summary": "Tailored engineering leader with production AI and backend experience.",
             "skills": ["Python", "FastAPI", "AWS", "Kubernetes"],

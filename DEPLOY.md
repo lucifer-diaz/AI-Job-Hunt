@@ -126,7 +126,8 @@ delegates to four specialist agents, whose prompts are kept in
 2. Enable `aiplatform.googleapis.com` and create a regional Cloud Storage
    staging bucket.
 3. Provision PostgreSQL reachable from Agent Engine. Apply the normal app schema
-   by starting the web app once; this project does not yet use migrations.
+   by running `alembic upgrade head` before starting the web app. The supplied
+   deployment commands do this automatically and safely upgrade existing databases.
 4. Configure these runtime values using your deployment's secret/environment
    controls (never bake credentials into the source bundle):
 
@@ -161,7 +162,8 @@ marked `applied`; the tool saves a draft but never sends it.
 
 - Agent Engine does not host the FastAPI dashboard or the Apify polling worker;
   deploy those separately and point both services at the same PostgreSQL database.
-- Database tables are created directly rather than through versioned migrations.
+- Database changes are tracked in versioned Alembic migrations. Run
+  `alembic upgrade head` during every deployment.
 - The tool layer has no end-user identity/tenant boundary; deploy this personal
   agent with restricted IAM access rather than exposing it as a public multi-user bot.
 - Agent output quality depends on the selected Gemini model. Persistence tools

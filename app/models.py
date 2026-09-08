@@ -33,6 +33,27 @@ class CandidateProfile(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
 
 
+class ApplicationSettings(Base):
+    """Singleton, non-secret application preferences.
+
+    Provider credentials deliberately do not belong in this table. They continue
+    to be supplied by the process environment (or its backing secret store).
+    """
+
+    __tablename__ = "application_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    active_provider: Mapped[str] = mapped_column(String(30), default="openrouter")
+    openrouter_model: Mapped[str] = mapped_column(String(300), default="openrouter/free")
+    openai_model: Mapped[str] = mapped_column(String(300), default="gpt-5.6-luna")
+    anthropic_model: Mapped[str] = mapped_column(String(300), default="claude-sonnet-5")
+    approval_mode: Mapped[str] = mapped_column(String(30), default="manual")
+    min_fit_score: Mapped[int] = mapped_column(Integer, default=72)
+    followup_days: Mapped[int] = mapped_column(Integer, default=5)
+    max_jobs_per_batch: Mapped[int] = mapped_column(Integer, default=30)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+
 class Evidence(Base):
     __tablename__ = "evidence"
 
@@ -65,8 +86,12 @@ class Job(Base):
     fit_analysis: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(50), default="discovered")
 
-    resumes: Mapped[list[ResumeVariant]] = relationship(back_populates="job", cascade="all, delete-orphan")
-    application: Mapped[Application | None] = relationship(back_populates="job", uselist=False, cascade="all, delete-orphan")
+    resumes: Mapped[list[ResumeVariant]] = relationship(
+        back_populates="job", cascade="all, delete-orphan"
+    )
+    application: Mapped[Application | None] = relationship(
+        back_populates="job", uselist=False, cascade="all, delete-orphan"
+    )
 
 
 class SearchRun(Base):
@@ -117,14 +142,18 @@ class Application(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
     job: Mapped[Job] = relationship(back_populates="application")
-    followups: Mapped[list[FollowUp]] = relationship(back_populates="application", cascade="all, delete-orphan")
+    followups: Mapped[list[FollowUp]] = relationship(
+        back_populates="application", cascade="all, delete-orphan"
+    )
 
 
 class FollowUp(Base):
     __tablename__ = "followups"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    application_id: Mapped[int] = mapped_column(ForeignKey("applications.id", ondelete="CASCADE"), index=True)
+    application_id: Mapped[int] = mapped_column(
+        ForeignKey("applications.id", ondelete="CASCADE"), index=True
+    )
     due_at: Mapped[datetime] = mapped_column(DateTime)
     channel: Mapped[str] = mapped_column(String(30), default="email")
     draft: Mapped[str] = mapped_column(Text, default="")
