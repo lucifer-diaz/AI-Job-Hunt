@@ -2,26 +2,31 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import json
 import secrets
+import re
+from pathlib import Path
 from datetime import UTC, datetime
 from io import BytesIO
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import HTMLResponse, Response
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
 from app.db import Base, engine, get_db
-from app.models import Application, CandidateProfile, Evidence, FollowUp, Job, ResumeVariant, SearchRun
-from app.schemas import ApifySearchIn, EvidenceIn, ManualJobIn, ProfileIn, RecruiterIn
+from app.db_migrations import migrate
+from app.models import (AppSetting, Application, CandidateProfile, Evidence, FollowUp, Job,
+                        KnowledgeAnswer, ResumeDocument, ResumeVariant, SearchRun)
+from app.schemas import (ApplicationUpdateIn, ApifySearchIn, EvidenceIn, KnowledgeIn,
+                         ManualJobIn, ProfileIn, RecruiterIn, SettingsIn)
 from app.services.exports import markdown_to_simple_pdf
 from app.services.sources import import_greenhouse, import_lever, refresh_apify_run, start_apify_search, upsert_job
 from app.services.workflow import approve_job, create_due_followups, get_profile, mark_applied, rank_job, tailor_job
 from app.settings import get_settings
 
 Base.metadata.create_all(bind=engine)
+migrate(engine)
 settings = get_settings()
 app = FastAPI(title=settings.app_name, version="0.3.0")
 
@@ -46,6 +51,22 @@ async def basic_auth(request: Request, call_next):
 
 
 templates = Jinja2Templates(directory="app/templates")
+
+
+def get_app_setting(db: Session) -> AppSetting:
+    value = db.get(AppSetting, 1)
+    if not value:
+        value = AppSetting(id=1, llm_provider=settings.llm_provider,
+                           model=getattr(settings, f"{settings.llm_provider}_model", ""))
+        db.add(value)
+        db.commit()
+        db.refresh(value)
+    return value
+
+
+def question_key(question: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", " ", question.lower()).strip()
+    return hashlib.sha256(normalized.encode()).hexdigest()
 
 
 def job_dict(j: Job) -> dict:
@@ -75,10 +96,42 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
         "tailored": db.scalar(select(func.count(Job.id)).where(Job.status == "tailored")) or 0,
         "applied": db.scalar(select(func.count(Job.id)).where(Job.status == "applied")) or 0,
     }
+    app_setting = get_app_setting(db)
+    knowledge = db.scalars(select(KnowledgeAnswer).order_by(desc(KnowledgeAnswer.updated_at)).limit(100)).all()
+    resume_document = db.scalar(select(ResumeDocument).where(ResumeDocument.active.is_(True)).order_by(desc(ResumeDocument.id)))
     return templates.TemplateResponse(request=request, name="dashboard.html", context={ "jobs": jobs, "profile": profile, "evidence": evidence,
         "applications": applications, "followups": followups, "search_runs": search_runs, "stats": stats,
-        "llm_provider": settings.llm_provider, "apify_actor_id": settings.apify_actor_id,
+        "llm_provider": app_setting.llm_provider, "app_setting": app_setting, "knowledge": knowledge,
+        "resume_document": resume_document, "apify_actor_id": settings.apify_actor_id,
     })
+
+
+@app.get("/api/settings")
+def settings_get(db: Session = Depends(get_db)):
+    value = get_app_setting(db)
+    configured = {
+        "openrouter": bool(settings.openrouter_api_key), "openai": bool(settings.openai_api_key),
+        "anthropic": bool(settings.anthropic_api_key), "mock": True,
+    }
+    return {"llm_provider": value.llm_provider, "model": value.model,
+            "application_mode": value.application_mode, "min_review_score": value.min_review_score,
+            "configured": configured}
+
+
+@app.put("/api/settings")
+def settings_put(payload: SettingsIn, db: Session = Depends(get_db)):
+    if payload.llm_provider not in {"openrouter", "openai", "anthropic", "mock"}:
+        raise HTTPException(422, "Unsupported LLM provider")
+    if payload.application_mode not in {"manual_approval", "automatic"}:
+        raise HTTPException(422, "Unsupported application mode")
+    value = get_app_setting(db)
+    for key, item in payload.model_dump().items():
+        setattr(value, key, item)
+    settings.llm_provider = payload.llm_provider
+    if payload.llm_provider != "mock":
+        setattr(settings, f"{payload.llm_provider}_model", payload.model)
+    db.commit()
+    return settings_get(db)
 
 
 @app.get("/api/jobs")
@@ -181,9 +234,14 @@ def tailor(job_id: int, db: Session = Depends(get_db)):
         raise HTTPException(404, "Job not found")
     try:
         resume = tailor_job(db, job)
+        auto_approved = False
+        app_setting = get_app_setting(db)
+        if app_setting.application_mode == "automatic" and (resume.reviewer_score or 0) >= app_setting.min_review_score:
+            approve_job(db, job)
+            auto_approved = True
         return {"resume_id": resume.id, "version": resume.version, "reviewer_score": resume.reviewer_score,
                 "markdown": resume.markdown, "cover_letter": resume.cover_letter,
-                "reviewer_notes": resume.reviewer_notes}
+                "reviewer_notes": resume.reviewer_notes, "auto_approved": auto_approved}
     except Exception as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -204,7 +262,13 @@ def approve(job_id: int, db: Session = Depends(get_db)):
         raise HTTPException(404, "Job not found")
     if not job.resumes:
         raise HTTPException(400, "Tailor and review a resume before approval")
-    app_obj = approve_job(db, job)
+    latest = max(job.resumes, key=lambda item: item.version)
+    if latest.reviewer_score is None or latest.reviewer_score < get_app_setting(db).min_review_score:
+        raise HTTPException(400, f"Resume review score must be at least {get_app_setting(db).min_review_score}")
+    try:
+        app_obj = approve_job(db, job)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     return {"application_id": app_obj.id, "status": app_obj.status, "apply_url": job.url}
 
 
@@ -224,6 +288,50 @@ def applied(job_id: int, payload: RecruiterIn, db: Session = Depends(get_db)):
     return {"status": app_obj.status, "followup_due_at": app_obj.followup_due_at}
 
 
+@app.get("/api/applications")
+def application_list(db: Session = Depends(get_db)):
+    rows = db.scalars(select(Application).order_by(desc(Application.id))).all()
+    return [{"id": item.id, "job_id": item.job_id, "status": item.status,
+             "notes": item.notes, "recruiter_name": item.recruiter_name,
+             "recruiter_email": item.recruiter_email,
+             "approved_resume_id": item.approved_resume_id} for item in rows]
+
+
+@app.get("/api/jobs/{job_id}/application-detail")
+def application_detail(job_id: int, db: Session = Depends(get_db)):
+    job = db.get(Job, job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    resume = db.scalar(select(ResumeVariant).where(ResumeVariant.job_id == job.id)
+                       .order_by(desc(ResumeVariant.version)).limit(1))
+    app_obj = job.application
+    questions = db.scalars(select(KnowledgeAnswer).where(KnowledgeAnswer.source_job_id == job.id)).all()
+    return {"job": {**job_dict(job), "description": job.description},
+            "resume": None if not resume else {"id": resume.id, "version": resume.version,
+                "markdown": resume.markdown, "cover_letter": resume.cover_letter,
+                "reviewer_score": resume.reviewer_score, "reviewer_notes": resume.reviewer_notes},
+            "application": None if not app_obj else {"id": app_obj.id, "status": app_obj.status,
+                "notes": app_obj.notes, "recruiter_name": app_obj.recruiter_name,
+                "recruiter_email": app_obj.recruiter_email},
+            "questions": [{"id": q.id, "question": q.question, "answer": q.answer,
+                            "verified": q.verified, "sensitive": q.sensitive} for q in questions]}
+
+
+@app.patch("/api/applications/{application_id}")
+def application_update(application_id: int, payload: ApplicationUpdateIn, db: Session = Depends(get_db)):
+    item = db.get(Application, application_id)
+    if not item:
+        raise HTTPException(404, "Application not found")
+    item.notes, item.recruiter_name, item.recruiter_email = payload.notes, payload.recruiter_name, payload.recruiter_email
+    if payload.status:
+        if payload.status not in {"pending_approval", "rejected"}:
+            raise HTTPException(422, "Only pending approval or rejected may be set here")
+        item.status = payload.status
+        item.job.status = payload.status
+    db.commit()
+    return {"ok": True, "status": item.status}
+
+
 @app.get("/api/profile")
 def profile_get(db: Session = Depends(get_db)):
     p = get_profile(db)
@@ -235,6 +343,72 @@ def profile_put(payload: ProfileIn, db: Session = Depends(get_db)):
     p = get_profile(db)
     for key, value in payload.model_dump().items():
         setattr(p, key, value)
+    db.commit()
+    return {"ok": True}
+
+
+@app.post("/api/profile/resume")
+async def resume_upload(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    allowed = {"text/plain", "application/pdf",
+               "application/vnd.openxmlformats-officedocument.wordprocessingml.document"}
+    if file.content_type not in allowed:
+        raise HTTPException(415, "Upload a TXT, PDF, or DOCX resume")
+    data = await file.read(settings.max_resume_upload_mb * 1024 * 1024 + 1)
+    if len(data) > settings.max_resume_upload_mb * 1024 * 1024:
+        raise HTTPException(413, f"Resume exceeds {settings.max_resume_upload_mb} MB")
+    if not data:
+        raise HTTPException(400, "Resume is empty")
+    try:
+        if file.content_type == "text/plain":
+            extracted = data.decode("utf-8")
+        elif file.content_type == "application/pdf":
+            from pypdf import PdfReader
+            extracted = "\n".join(page.extract_text() or "" for page in PdfReader(BytesIO(data)).pages)
+        else:
+            from docx import Document
+            extracted = "\n".join(p.text for p in Document(BytesIO(data)).paragraphs)
+    except Exception as exc:
+        raise HTTPException(422, f"Could not read resume: {exc}") from exc
+    if not extracted.strip():
+        raise HTTPException(422, "No readable text was found in the resume")
+    digest = hashlib.sha256(data).hexdigest()
+    root = Path(settings.upload_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / digest
+    path.write_bytes(data)
+    for old in db.scalars(select(ResumeDocument).where(ResumeDocument.active.is_(True))).all():
+        old.active = False
+    document = ResumeDocument(original_filename=Path(file.filename or "resume").name,
+                              media_type=file.content_type, storage_path=str(path), checksum=digest,
+                              size=len(data), extracted_text=extracted, active=True)
+    existing = db.scalar(select(ResumeDocument).where(ResumeDocument.checksum == digest))
+    if existing:
+        existing.active, existing.extracted_text = True, extracted
+        document = existing
+    else:
+        db.add(document)
+    profile = get_profile(db)
+    profile.master_resume = extracted
+    db.commit()
+    db.refresh(document)
+    return {"id": document.id, "filename": document.original_filename, "size": document.size}
+
+
+@app.get("/api/profile/resume")
+def resume_download(db: Session = Depends(get_db)):
+    document = db.scalar(select(ResumeDocument).where(ResumeDocument.active.is_(True)).order_by(desc(ResumeDocument.id)))
+    if not document or not Path(document.storage_path).is_file():
+        raise HTTPException(404, "No uploaded resume")
+    return FileResponse(document.storage_path, media_type=document.media_type,
+                        filename=document.original_filename)
+
+
+@app.delete("/api/profile/resume")
+def resume_delete(db: Session = Depends(get_db)):
+    document = db.scalar(select(ResumeDocument).where(ResumeDocument.active.is_(True)).order_by(desc(ResumeDocument.id)))
+    if not document:
+        raise HTTPException(404, "No uploaded resume")
+    document.active = False
     db.commit()
     return {"ok": True}
 
@@ -253,6 +427,41 @@ def evidence_post(payload: EvidenceIn, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(e)
     return {"id": e.id}
+
+
+@app.get("/api/knowledge")
+def knowledge_get(db: Session = Depends(get_db)):
+    rows = db.scalars(select(KnowledgeAnswer).order_by(desc(KnowledgeAnswer.updated_at))).all()
+    return [{"id": q.id, "question": q.question, "answer": q.answer, "category": q.category,
+             "answer_type": q.answer_type, "verified": q.verified, "sensitive": q.sensitive,
+             "source_job_id": q.source_job_id, "use_count": q.use_count} for q in rows]
+
+
+@app.post("/api/knowledge")
+def knowledge_post(payload: KnowledgeIn, db: Session = Depends(get_db)):
+    key = question_key(payload.question)
+    item = db.scalar(select(KnowledgeAnswer).where(KnowledgeAnswer.question_key == key))
+    if item:
+        if item.verified and item.answer != payload.answer and not payload.verified:
+            raise HTTPException(409, "A verified answer already exists; verify the replacement explicitly")
+        for field, value in payload.model_dump().items():
+            setattr(item, field, value)
+    else:
+        item = KnowledgeAnswer(question_key=key, **payload.model_dump())
+        db.add(item)
+    db.commit()
+    db.refresh(item)
+    return {"id": item.id, "verified": item.verified}
+
+
+@app.delete("/api/knowledge/{item_id}")
+def knowledge_delete(item_id: int, db: Session = Depends(get_db)):
+    item = db.get(KnowledgeAnswer, item_id)
+    if not item:
+        raise HTTPException(404, "Knowledge answer not found")
+    db.delete(item)
+    db.commit()
+    return {"ok": True}
 
 
 @app.post("/api/cron/followups")

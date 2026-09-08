@@ -184,12 +184,17 @@ def review_resume(db: Session, resume: ResumeVariant) -> dict:
 
 
 def approve_job(db: Session, job: Job) -> Application:
+    latest = db.scalar(select(ResumeVariant).where(ResumeVariant.job_id == job.id)
+                       .order_by(desc(ResumeVariant.version)).limit(1))
+    if not latest or latest.reviewer_score is None:
+        raise ValueError("The latest resume must be reviewed before approval")
     application = job.application
     if not application:
         application = Application(job_id=job.id)
         db.add(application)
     application.status = "approved"
     application.approved_at = datetime.now(UTC).replace(tzinfo=None)
+    application.approved_resume_id = latest.id
     job.status = "approved"
     db.commit()
     db.refresh(application)

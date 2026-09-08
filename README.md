@@ -1,14 +1,18 @@
-# Job Hunt OS v0.3 — Apify Hunter + OpenRouter
+# Job Hunt OS v0.4 — Guided application workspace
 
 A human-in-the-loop AI workflow for personal job hunting:
 
 **Apify Hunter → Ranker → Tailor → Reviewer → Approval → Application Tracker → Follow-up**
 
-It deliberately does **not** auto-submit applications or bypass anti-bot/CAPTCHA controls. It discovers and prepares applications, then requires human approval before external actions.
+It deliberately does **not** bypass anti-bot/CAPTCHA controls. It discovers and prepares applications, then either queues them for human approval or auto-approves reviewed materials according to your settings. External submission remains a user action.
 
 ## What works
 
 - Candidate profile + master resume
+- TXT, PDF, and DOCX resume upload with local storage and text extraction
+- Dedicated Discovery, Approvals, Knowledge Bank, and Settings workspaces
+- Reusable, human-verifiable ATS question answers
+- Manual or review-threshold-based automatic approval
 - Verified evidence bank to prevent resume hallucinations
 - **Apify-first multi-board job discovery**
 - Default Apify Actor searches LinkedIn, Indeed, Glassdoor, Naukri, Bayt and ZipRecruiter
@@ -45,6 +49,14 @@ uvicorn app.main:app --reload
 ```
 
 Open http://localhost:8000. For any public deployment, set `APP_USERNAME` and `APP_PASSWORD`.
+
+Uploaded resumes are stored in `./data/resumes` by default. Set `UPLOAD_DIR` to a
+persistent private volume in production and `MAX_RESUME_UPLOAD_MB` to change the
+default 8 MB limit. Files must not be placed on a publicly served path.
+
+On startup, the application creates the new settings, resume-document, and knowledge
+tables and applies its idempotent compatibility column migration. Back up an existing
+production database before the first v0.4 startup.
 
 For PostgreSQL:
 
@@ -88,7 +100,7 @@ Use smaller `maxResults` values while testing. Apify Actor pricing is Actor-spec
 
 ## 3. LLM configuration
 
-### Recommended: OpenRouter free models
+### Default: OpenRouter free models
 
 ```env
 LLM_PROVIDER=openrouter

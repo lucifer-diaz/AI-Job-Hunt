@@ -11,7 +11,9 @@ class Settings(BaseSettings):
     app_password: str | None = None
 
     # LLM provider: openai | anthropic | openrouter | mock
-    llm_provider: str = "openai"
+    llm_provider: str = "openrouter"
+    upload_dir: str = "./data/resumes"
+    max_resume_upload_mb: int = 8
 
     openai_api_key: str | None = None
     openai_model: str = "gpt-5.6-luna"
