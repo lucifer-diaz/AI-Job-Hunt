@@ -110,3 +110,63 @@ This separation is friendlier to low-cost hosting request timeouts.
 ## Future: fully scheduled Hunter
 
 Apify supports schedules and webhooks. The clean production upgrade is to schedule Actor runs inside Apify and have a Job Hunt OS webhook ingest the completed dataset, removing dashboard polling entirely. The current persisted `SearchRun` model was designed so that upgrade does not require changing the ranking/tailoring pipeline.
+
+## Vertex AI Agent Engine deployment
+
+`job_hunt_agent/agent.py` exposes the ADK-required `root_agent`. The coordinator
+delegates to four specialist agents, whose prompts are kept in
+`job_hunt_agent/prompts.py` and whose validated persistence tools are in
+`job_hunt_agent/tools.py`.
+
+### Setup
+
+1. Select or create a Google Cloud project with billing enabled, install and
+   initialize the Google Cloud CLI, and authenticate Application Default
+   Credentials.
+2. Enable `aiplatform.googleapis.com` and create a regional Cloud Storage
+   staging bucket.
+3. Provision PostgreSQL reachable from Agent Engine. Apply the normal app schema
+   by starting the web app once; this project does not yet use migrations.
+4. Configure these runtime values using your deployment's secret/environment
+   controls (never bake credentials into the source bundle):
+
+```env
+GOOGLE_GENAI_USE_VERTEXAI=true
+GOOGLE_CLOUD_PROJECT=your-project-id
+GOOGLE_CLOUD_LOCATION=us-central1
+GEMINI_AGENT_MODEL=gemini-2.5-flash
+DATABASE_URL=postgresql+psycopg://user:password@host/database?sslmode=require
+```
+
+5. From the repository root, install and test the agent, then deploy:
+
+```bash
+pip install -e .
+adk web
+adk deploy agent_engine \
+  --project="$GOOGLE_CLOUD_PROJECT" \
+  --region="$GOOGLE_CLOUD_LOCATION" \
+  --staging_bucket="gs://YOUR_STAGING_BUCKET" \
+  job_hunt_agent
+```
+
+### Smoke checks
+
+Ask the deployed coordinator to `Rank job <existing-id>`, then `Tailor job
+<same-id>`, and finally `Review resume <new-resume-id>`. Confirm each write in
+the web dashboard/database. Follow-up drafting requires an application already
+marked `applied`; the tool saves a draft but never sends it.
+
+### Current limitations
+
+- Agent Engine does not host the FastAPI dashboard or the Apify polling worker;
+  deploy those separately and point both services at the same PostgreSQL database.
+- Database tables are created directly rather than through versioned migrations.
+- The tool layer has no end-user identity/tenant boundary; deploy this personal
+  agent with restricted IAM access rather than exposing it as a public multi-user bot.
+- Agent output quality depends on the selected Gemini model. Persistence tools
+  validate ranges, types, workflow order, and evidence IDs, but cannot prove that
+  every paraphrase is semantically faithful; human review remains required.
+- Deployment commands require live Google Cloud credentials, billing, APIs,
+  IAM, networking, and a staging bucket, so unit tests cannot validate the final
+  cloud control plane from an offline development environment.

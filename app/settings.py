@@ -34,6 +34,10 @@ class Settings(BaseSettings):
     openrouter_site_url: str | None = None
     openrouter_app_name: str = "Job Hunt OS"
 
+    # Google ADK / Vertex AI Agent Engine. Authentication and project/location
+    # are read by the Google SDK from standard GOOGLE_* environment variables.
+    gemini_agent_model: str = "gemini-2.5-flash"
+
     apify_api_token: str | None = None
     apify_actor_id: str = "openclawai/job-board-scraper"
     apify_dataset_limit: int = 5000
