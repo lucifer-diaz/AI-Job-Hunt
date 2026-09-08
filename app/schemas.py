@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field
 
 
 class ProfileIn(BaseModel):
@@ -57,3 +57,17 @@ class RecruiterIn(BaseModel):
     recruiter_name: str = ""
     recruiter_email: str = ""
     notes: str = ""
+
+
+class ApplicationUpdateIn(BaseModel):
+    recruiter_name: str = Field(default="", max_length=200)
+    recruiter_email: str = Field(default="", max_length=300)
+    notes: str = Field(default="", max_length=10000)
+
+
+class ApplicationDecisionIn(BaseModel):
+    reason: str = Field(default="", max_length=5000)
+
+
+class MarkAppliedIn(ApplicationUpdateIn):
+    submitted: bool

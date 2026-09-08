@@ -22,10 +22,19 @@ def get_profile(db: Session) -> CandidateProfile:
 
 
 def _evidence_payload(db: Session) -> list[dict]:
-    items = db.scalars(select(Evidence).where(Evidence.verified.is_(True)).order_by(desc(Evidence.id))).all()
+    items = db.scalars(
+        select(Evidence).where(Evidence.verified.is_(True)).order_by(desc(Evidence.id))
+    ).all()
     return [
-        {"id": e.id, "company": e.company, "role": e.role, "claim": e.claim,
-         "context": e.context, "skills": e.skills, "tags": e.tags}
+        {
+            "id": e.id,
+            "company": e.company,
+            "role": e.role,
+            "claim": e.claim,
+            "context": e.context,
+            "skills": e.skills,
+            "tags": e.tags,
+        }
         for e in items
     ]
 
@@ -50,19 +59,34 @@ def rank_job(db: Session, job: Job) -> dict:
             confidence (0-1).
         """
     user = f"""FIT_ANALYSIS
-        CANDIDATE PROFILE:\n{json.dumps({
-            'headline': profile.headline,
-            'target_roles': profile.target_roles,
-            'preferred_locations': profile.preferred_locations,
-            'work_authorization': profile.work_authorization,
-            'master_resume': profile.master_resume[:16000],
-            'search_preferences': profile.search_preferences,
-        }, ensure_ascii=False)}
+        CANDIDATE PROFILE:\n{
+        json.dumps(
+            {
+                "headline": profile.headline,
+                "target_roles": profile.target_roles,
+                "preferred_locations": profile.preferred_locations,
+                "work_authorization": profile.work_authorization,
+                "master_resume": profile.master_resume[:16000],
+                "search_preferences": profile.search_preferences,
+            },
+            ensure_ascii=False,
+        )
+    }
         VERIFIED EVIDENCE:\n{json.dumps(evidence, ensure_ascii=False)[:30000]}
 
 VERIFIED EVIDENCE:\n{json.dumps(evidence, ensure_ascii=False)[:30000]}
 
-JOB:\n{json.dumps({'title': job.title, 'company': job.company, 'location': job.location, 'description': job.description[:24000]}, ensure_ascii=False)}
+JOB:\n{
+        json.dumps(
+            {
+                "title": job.title,
+                "company": job.company,
+                "location": job.location,
+                "description": job.description[:24000],
+            },
+            ensure_ascii=False,
+        )
+    }
 """
     result = llm.generate_json(system, user)
     job.fit_score = float(result.get("score", 0))
@@ -88,51 +112,71 @@ def tailor_job(db: Session, job: Job) -> ResumeVariant:
         Keep bullets concise and ATS-friendly."""
     user = f"""
         TAILOR_RESUME:\n
-        CANDIDATE PROFILE:\n{json.dumps({
-            'name': profile.name,
-            'headline': profile.headline,
-            'master_resume': profile.master_resume[:22000],
-            'target_roles': profile.target_roles,
-            'preferred_locations': profile.preferred_locations,
-            'work_authorization': profile.work_authorization,
-            'search_preferences': profile.search_preferences,
-        }, ensure_ascii=False)}
+        CANDIDATE PROFILE:\n{
+        json.dumps(
+            {
+                "name": profile.name,
+                "headline": profile.headline,
+                "master_resume": profile.master_resume[:22000],
+                "target_roles": profile.target_roles,
+                "preferred_locations": profile.preferred_locations,
+                "work_authorization": profile.work_authorization,
+                "search_preferences": profile.search_preferences,
+            },
+            ensure_ascii=False,
+        )
+    }
 
         VERIFIED EVIDENCE:\n{json.dumps(evidence, ensure_ascii=False)[:32000]}
 
         JOB DESCRIPTION:\n{job.description[:26000]}
 
-        FIT ANALYSIS:\n{json.dumps({
-            'score': job.fit_score,
-            'summary': job.fit_analysis.get("summary", ""),
-            'strong_matches': job.fit_analysis.get("strong_matches", []),
-            'gaps': job.fit_analysis.get("gaps", []),
-            'must_have_missing': job.fit_analysis.get("must_have_missing", []),
-            'keywords': job.fit_analysis.get("keywords", []),
-            'application_strategy': job.fit_analysis.get("application_strategy", ""),
-            'confidence': job.fit_analysis.get("confidence", 0),
-        }, ensure_ascii=False)}
+        FIT ANALYSIS:\n{
+        json.dumps(
+            {
+                "score": job.fit_score,
+                "summary": job.fit_analysis.get("summary", ""),
+                "strong_matches": job.fit_analysis.get("strong_matches", []),
+                "gaps": job.fit_analysis.get("gaps", []),
+                "must_have_missing": job.fit_analysis.get("must_have_missing", []),
+                "keywords": job.fit_analysis.get("keywords", []),
+                "application_strategy": job.fit_analysis.get("application_strategy", ""),
+                "confidence": job.fit_analysis.get("confidence", 0),
+            },
+            ensure_ascii=False,
+        )
+    }
     """
     content = llm.generate_json(system, user)
     bullets = content.get("experience_bullets") or []
     skills = content.get("skills") or []
-    markdown = "\n".join([
-        f"# {profile.name or 'Candidate'}",
-        profile.headline or "",
-        "",
-        "## Summary",
-        content.get("summary", ""),
-        "",
-        "## Relevant Skills",
-        ", ".join(skills),
-        "",
-        "## Selected Experience",
-        *[f"- {b}" for b in bullets],
-        "",
-        "## Source Resume",
-        profile.master_resume,
-    ])
-    version = (db.scalar(select(ResumeVariant.version).where(ResumeVariant.job_id == job.id).order_by(desc(ResumeVariant.version)).limit(1)) or 0) + 1
+    markdown = "\n".join(
+        [
+            f"# {profile.name or 'Candidate'}",
+            profile.headline or "",
+            "",
+            "## Summary",
+            content.get("summary", ""),
+            "",
+            "## Relevant Skills",
+            ", ".join(skills),
+            "",
+            "## Selected Experience",
+            *[f"- {b}" for b in bullets],
+            "",
+            "## Source Resume",
+            profile.master_resume,
+        ]
+    )
+    version = (
+        db.scalar(
+            select(ResumeVariant.version)
+            .where(ResumeVariant.job_id == job.id)
+            .order_by(desc(ResumeVariant.version))
+            .limit(1)
+        )
+        or 0
+    ) + 1
     resume = ResumeVariant(
         job_id=job.id,
         version=version,
@@ -160,19 +204,34 @@ def review_resume(db: Session, resume: ResumeVariant) -> dict:
     """
     user = f"""
     REVIEW_RESUME:\n
-    CANDIDATE PROFILE:\n{json.dumps({
-            'name': resume.content.get("name", ""),
-            'headline': resume.content.get("headline", ""),
-            'master_resume': resume.content.get("master_resume", ""),
-            'target_roles': resume.content.get("target_roles", []),
-            'preferred_locations': resume.content.get("preferred_locations", []),
-            'work_authorization': resume.content.get("work_authorization", ""),
-            'search_preferences': resume.content.get("search_preferences", {}),
-        }, ensure_ascii=False)}
+    CANDIDATE PROFILE:\n{
+        json.dumps(
+            {
+                "name": resume.content.get("name", ""),
+                "headline": resume.content.get("headline", ""),
+                "master_resume": resume.content.get("master_resume", ""),
+                "target_roles": resume.content.get("target_roles", []),
+                "preferred_locations": resume.content.get("preferred_locations", []),
+                "work_authorization": resume.content.get("work_authorization", ""),
+                "search_preferences": resume.content.get("search_preferences", {}),
+            },
+            ensure_ascii=False,
+        )
+    }
 
     VERIFIED EVIDENCE:\n{json.dumps(_evidence_payload(db), ensure_ascii=False)[:32000]}
 
-    JOB:\n{json.dumps({'title': job.title, 'company': job.company, 'location': job.location, 'description': job.description[:24000]}, ensure_ascii=False)}
+    JOB:\n{
+        json.dumps(
+            {
+                "title": job.title,
+                "company": job.company,
+                "location": job.location,
+                "description": job.description[:24000],
+            },
+            ensure_ascii=False,
+        )
+    }
 
     TAILORED RESUME:\n{resume.markdown[:24000]}
     """
@@ -185,10 +244,32 @@ def review_resume(db: Session, resume: ResumeVariant) -> dict:
 
 def approve_job(db: Session, job: Job) -> Application:
     application = job.application
+    if application and application.status == "approved":
+        # Approval is idempotent and remains pinned to its reviewed artifact.
+        return application
+    latest_resume = db.scalar(
+        select(ResumeVariant)
+        .where(ResumeVariant.job_id == job.id)
+        .order_by(desc(ResumeVariant.version))
+        .limit(1)
+    )
+    if not latest_resume:
+        raise ValueError("Tailor a resume before approval")
+    if latest_resume.reviewer_score is None:
+        raise ValueError("The latest resume must have a completed review before approval")
+    threshold = get_settings().min_review_score
+    if latest_resume.reviewer_score < threshold:
+        raise ValueError(
+            f"The latest resume review score ({latest_resume.reviewer_score:g}) "
+            f"is below the required minimum ({threshold:g})"
+        )
+    if application and application.status in {"applied", "rejected"}:
+        raise ValueError(f"Cannot approve an application with status '{application.status}'")
     if not application:
         application = Application(job_id=job.id)
         db.add(application)
     application.status = "approved"
+    application.approved_resume_id = latest_resume.id
     application.approved_at = datetime.now(UTC).replace(tzinfo=None)
     job.status = "approved"
     db.commit()
@@ -197,7 +278,11 @@ def approve_job(db: Session, job: Job) -> Application:
 
 
 def mark_applied(db: Session, job: Job) -> Application:
-    application = job.application or approve_job(db, job)
+    application = job.application
+    if not application:
+        raise ValueError("Application must be approved before marking applied")
+    if application.status == "applied":
+        return application
     if application.status != "approved":
         raise ValueError("Application must be approved before marking applied")
     applied_at = datetime.now(UTC).replace(tzinfo=None)
@@ -205,6 +290,28 @@ def mark_applied(db: Session, job: Job) -> Application:
     application.applied_at = applied_at
     application.followup_due_at = applied_at + timedelta(days=get_settings().followup_days)
     job.status = "applied"
+    db.commit()
+    db.refresh(application)
+    return application
+
+
+def change_application_state(db: Session, job: Job, target: str, reason: str = "") -> Application:
+    application = job.application
+    if not application:
+        application = Application(job_id=job.id, status="pending_approval")
+        db.add(application)
+    if application.status == target:
+        return application
+    allowed = {
+        "rejected": {"pending_approval", "revision_requested", "approved"},
+        "revision_requested": {"pending_approval", "approved"},
+    }
+    if target not in allowed or application.status not in allowed[target]:
+        raise ValueError(f"Cannot change application from '{application.status}' to '{target}'")
+    application.status = target
+    if reason:
+        application.notes = reason if not application.notes else f"{application.notes}\n\n{reason}"
+    job.status = "rejected" if target == "rejected" else "tailored"
     db.commit()
     db.refresh(application)
     return application
@@ -234,22 +341,49 @@ def create_due_followups(db: Session) -> int:
         """
         user = f"""
         FOLLOW_UP:\n
-        CANDIDATE PROFILE:\n{json.dumps({
-            'name': profile.name,
-            'headline': profile.headline,
-            'master_resume': profile.master_resume[:22000],
-            'target_roles': profile.target_roles,
-            'preferred_locations': profile.preferred_locations,
-            'work_authorization': profile.work_authorization,
-            'search_preferences': profile.search_preferences,
-        }, ensure_ascii=False)}
+        CANDIDATE PROFILE:\n{
+            json.dumps(
+                {
+                    "name": profile.name,
+                    "headline": profile.headline,
+                    "master_resume": profile.master_resume[:22000],
+                    "target_roles": profile.target_roles,
+                    "preferred_locations": profile.preferred_locations,
+                    "work_authorization": profile.work_authorization,
+                    "search_preferences": profile.search_preferences,
+                },
+                ensure_ascii=False,
+            )
+        }
         VERIFIED EVIDENCE:\n{json.dumps(_evidence_payload(db), ensure_ascii=False)[:32000]}
 
-        JOB:\n{json.dumps({'title': job.title, 'company': job.company, 'location': job.location, 'description': job.description[:24000]}, ensure_ascii=False)}
+        JOB:\n{
+            json.dumps(
+                {
+                    "title": job.title,
+                    "company": job.company,
+                    "location": job.location,
+                    "description": job.description[:24000],
+                },
+                ensure_ascii=False,
+            )
+        }
 
-        APPLICATION:\n{json.dumps({'status': app.status, 'applied_at': app.applied_at.isoformat() if app.applied_at else ''}, ensure_ascii=False)}
+        APPLICATION:\n{
+            json.dumps(
+                {
+                    "status": app.status,
+                    "applied_at": app.applied_at.isoformat() if app.applied_at else "",
+                },
+                ensure_ascii=False,
+            )
+        }
 
-        RECRUITER:\n{json.dumps({'name': app.recruiter_name, 'email': app.recruiter_email}, ensure_ascii=False)}
+        RECRUITER:\n{
+            json.dumps(
+                {"name": app.recruiter_name, "email": app.recruiter_email}, ensure_ascii=False
+            )
+        }
         """
         result = llm.generate_json(system, user)
         fu = FollowUp(

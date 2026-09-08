@@ -65,8 +65,12 @@ class Job(Base):
     fit_analysis: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(50), default="discovered")
 
-    resumes: Mapped[list[ResumeVariant]] = relationship(back_populates="job", cascade="all, delete-orphan")
-    application: Mapped[Application | None] = relationship(back_populates="job", uselist=False, cascade="all, delete-orphan")
+    resumes: Mapped[list[ResumeVariant]] = relationship(
+        back_populates="job", cascade="all, delete-orphan"
+    )
+    application: Mapped[Application | None] = relationship(
+        back_populates="job", uselist=False, cascade="all, delete-orphan"
+    )
 
 
 class SearchRun(Base):
@@ -114,17 +118,24 @@ class Application(Base):
     recruiter_name: Mapped[str] = mapped_column(String(200), default="")
     recruiter_email: Mapped[str] = mapped_column(String(300), default="")
     notes: Mapped[str] = mapped_column(Text, default="")
+    approved_resume_id: Mapped[int | None] = mapped_column(
+        ForeignKey("resume_variants.id", ondelete="RESTRICT"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
     job: Mapped[Job] = relationship(back_populates="application")
-    followups: Mapped[list[FollowUp]] = relationship(back_populates="application", cascade="all, delete-orphan")
+    followups: Mapped[list[FollowUp]] = relationship(
+        back_populates="application", cascade="all, delete-orphan"
+    )
 
 
 class FollowUp(Base):
     __tablename__ = "followups"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    application_id: Mapped[int] = mapped_column(ForeignKey("applications.id", ondelete="CASCADE"), index=True)
+    application_id: Mapped[int] = mapped_column(
+        ForeignKey("applications.id", ondelete="CASCADE"), index=True
+    )
     due_at: Mapped[datetime] = mapped_column(DateTime)
     channel: Mapped[str] = mapped_column(String(30), default="email")
     draft: Mapped[str] = mapped_column(Text, default="")

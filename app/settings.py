@@ -43,6 +43,8 @@ class Settings(BaseSettings):
     apify_dataset_limit: int = 5000
 
     min_fit_score: int = 72
+    # Set to 0 to require a completed review without enforcing a numeric cutoff.
+    min_review_score: float = 0
     followup_days: int = 5
     max_jobs_per_batch: int = 30
 
