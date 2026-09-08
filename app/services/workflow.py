@@ -188,7 +188,7 @@ def approve_job(db: Session, job: Job) -> Application:
     if not application:
         application = Application(job_id=job.id)
         db.add(application)
-    application.status = "approved"
+    application.status = "queued"
     application.approved_at = datetime.now(UTC).replace(tzinfo=None)
     job.status = "approved"
     db.commit()
@@ -198,10 +198,11 @@ def approve_job(db: Session, job: Job) -> Application:
 
 def mark_applied(db: Session, job: Job) -> Application:
     application = job.application or approve_job(db, job)
-    if application.status != "approved":
+    if application.approved_at is None:
         raise ValueError("Application must be approved before marking applied")
     applied_at = datetime.now(UTC).replace(tzinfo=None)
-    application.status = "applied"
+    application.status = "submitted"
+    application.submitted_at = applied_at
     application.applied_at = applied_at
     application.followup_due_at = applied_at + timedelta(days=get_settings().followup_days)
     job.status = "applied"
@@ -214,7 +215,7 @@ def create_due_followups(db: Session) -> int:
     now = datetime.now(UTC).replace(tzinfo=None)
     apps = db.scalars(
         select(Application).where(
-            Application.status == "applied",
+            Application.status == "submitted",
             Application.followup_due_at.is_not(None),
             Application.followup_due_at <= now,
         )

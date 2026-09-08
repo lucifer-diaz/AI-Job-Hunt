@@ -22,15 +22,16 @@ def test_core_happy_path():
     db.add(Evidence(company="Acme", role="Lead", claim="Reduced incidents by 40%", skills=["Python", "AWS"]))
     job = Job(source="manual", source_ref="x", title="Senior Python Engineer", company="Example", description="Need Python FastAPI AWS")
     db.add(job)
-    db.commit(); db.refresh(job)
+    db.commit()
+    db.refresh(job)
 
     result = rank_job(db, job)
     assert result["score"] == 80
     resume = tailor_job(db, job)
     assert resume.reviewer_score == 86
     app = approve_job(db, job)
-    assert app.status == "approved"
+    assert app.status == "queued"
     app = mark_applied(db, job)
-    assert app.status == "applied"
+    assert app.status == "submitted"
     assert app.followup_due_at is not None
     db.close()

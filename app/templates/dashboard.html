@@ -42,6 +42,20 @@
     <div class="card"><div class="metric">{{ stats.applied }}</div><div class="muted">Applied</div></div>
   </div>
 
+  <section class="card">
+    <h2>Application settings</h2>
+    <p class="muted"><strong>Manual approval</strong> keeps every application in the Approvals queue for you to open, review, and submit. <strong>Automatic</strong> permits a tested adapter to submit only after every score, resume, URL, ATS-question, duplicate, company, and location policy gate passes.</p>
+    <select id="application-mode">
+      <option value="manual_approval" {% if application_policy.application_mode == 'manual_approval' %}selected{% endif %}>Manual approval</option>
+      <option value="automatic" {% if application_policy.application_mode == 'automatic' %}selected{% endif %}>Automatic</option>
+    </select>
+    <input id="min-fit" type="number" min="0" max="100" value="{{ application_policy.min_fit_score }}" placeholder="Minimum fit score">
+    <input id="min-resume" type="number" min="0" max="100" value="{{ application_policy.min_resume_score }}" placeholder="Minimum resume review score">
+    <input id="excluded-companies" value="{{ application_policy.excluded_companies|join(', ') }}" placeholder="Excluded companies, comma separated">
+    <input id="excluded-locations" value="{{ application_policy.excluded_locations|join(', ') }}" placeholder="Excluded locations, comma separated">
+    <button onclick="saveApplicationSettings()">Save application settings</button>
+  </section>
+
   <div class="row2">
     <section class="card">
       <h2>1. Candidate profile</h2>
@@ -128,6 +142,16 @@
     </tbody></table>
   </section>
 
+  <section class="card">
+    <h2>Approvals &amp; application execution</h2>
+    <div class="muted">Approval is not proof of submission. Execution states are tracked separately and uncertain responses require reconciliation before retry.</div>
+    <table><thead><tr><th>Role</th><th>Approved</th><th>Execution state</th><th>Provider / reference</th><th>Details</th></tr></thead><tbody>
+      {% for a in applications %}
+      <tr><td>{{ a.job.title }}<br><span class="muted">{{ a.job.company }}</span></td><td>{{ 'Yes' if a.approved_at else 'No' }}</td><td><span class="status">{{ a.status }}</span></td><td>{{ a.provider or '—' }}{% if a.external_reference %}<br>{{ a.external_reference }}{% endif %}</td><td><button class="secondary" onclick='showApplication({{ {"status": a.status, "provider": a.provider, "external_reference": a.external_reference, "submitted_at": a.submitted_at|string if a.submitted_at else none, "blocked_reason": a.blocked_reason, "unresolved_questions": a.unresolved_questions, "evidence": a.receipt}|tojson }})'>View detail</button></td></tr>
+      {% else %}<tr><td colspan="5" class="muted">No applications awaiting approval or execution.</td></tr>{% endfor %}
+    </tbody></table>
+  </section>
+
   <section class="card"><h2>5. Follow-ups</h2>
     <div class="muted">Only drafts are generated automatically. Sending remains a human action.</div>
     {% for f in followups %}<div style="padding:10px 0;border-top:1px solid #eee"><strong>Due {{ f.due_at }}</strong><pre>{{ f.draft }}</pre></div>{% else %}<p class="muted">No follow-up drafts yet.</p>{% endfor %}
@@ -163,6 +187,16 @@ async function pollApify(id){
 async function addEvidence(){try{done(await post('/api/evidence',{company:val('e-company'),role:val('e-role'),claim:val('e-claim'),skills:csv('e-skills'),tags:[],verified:true}))}catch(e){alert(e.message)}}
 async function saveProfile(){const body={name:val('p-name'),email:'',phone:'',location:val('p-location'),linkedin_url:'',github_url:'',headline:val('p-headline'),target_roles:csv('p-target'),preferred_locations:csv('p-locations'),work_authorization:val('p-auth'),compensation_notes:'',master_resume:val('p-resume'),search_preferences:{}}; const r=await fetch('/api/profile',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); if(!r.ok) alert(await r.text()); else alert('Profile saved')}
 async function markApplied(id){try{done(await post(`/api/jobs/${id}/applied`,{recruiter_name:'',recruiter_email:'',notes:''}))}catch(e){alert(e.message)}}
+function showApplication(application){modaltext.textContent=JSON.stringify(application,null,2);modal.showModal()}
+async function saveApplicationSettings(){
+  const mode=val('application-mode');
+  let confirmed=false;
+  if(mode==='automatic') confirmed=confirm('Automatic mode may submit applications without another click when every policy gate passes. Enable it?');
+  if(mode==='automatic'&&!confirmed) return;
+  const body={application_mode:mode,min_fit_score:Number(val('min-fit')),min_resume_score:Number(val('min-resume')),excluded_companies:csv('excluded-companies'),excluded_locations:csv('excluded-locations'),confirm_automatic:confirmed};
+  const r=await fetch('/api/application-settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  if(!r.ok) alert(await r.text()); else alert('Application settings saved. Existing queued work was not dispatched.')
+}
 function val(id){return document.getElementById(id).value.trim()} function csv(id){return val(id).split(',').map(x=>x.trim()).filter(Boolean)}
 </script>
 </body></html>

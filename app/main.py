@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import json
 import secrets
 from datetime import UTC, datetime
-from io import BytesIO
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
@@ -14,11 +12,44 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
 from app.db import Base, engine, get_db
-from app.models import Application, CandidateProfile, Evidence, FollowUp, Job, ResumeVariant, SearchRun
-from app.schemas import ApifySearchIn, EvidenceIn, ManualJobIn, ProfileIn, RecruiterIn
+from app.models import (
+    Application,
+    CandidateProfile,
+    Evidence,
+    FollowUp,
+    Job,
+    ResumeVariant,
+    SearchRun,
+)
+from app.schemas import (
+    ApplicationSettingsIn,
+    ApifySearchIn,
+    EvidenceIn,
+    ManualJobIn,
+    ProfileIn,
+    RecruiterIn,
+)
+from app.services.applications import (
+    UnsupportedExecutor,
+    dispatch_application,
+    get_application_settings,
+)
 from app.services.exports import markdown_to_simple_pdf
-from app.services.sources import import_greenhouse, import_lever, refresh_apify_run, start_apify_search, upsert_job
-from app.services.workflow import approve_job, create_due_followups, get_profile, mark_applied, rank_job, tailor_job
+from app.services.sources import (
+    import_greenhouse,
+    import_lever,
+    refresh_apify_run,
+    start_apify_search,
+    upsert_job,
+)
+from app.services.workflow import (
+    approve_job,
+    create_due_followups,
+    get_profile,
+    mark_applied,
+    rank_job,
+    tailor_job,
+)
 from app.settings import get_settings
 
 Base.metadata.create_all(bind=engine)
@@ -37,7 +68,9 @@ async def basic_auth(request: Request, call_next):
         try:
             decoded = base64.b64decode(header.split(" ", 1)[1]).decode("utf-8")
             username, password = decoded.split(":", 1)
-            authenticated = secrets.compare_digest(username, settings.app_username) and secrets.compare_digest(password, settings.app_password)
+            authenticated = secrets.compare_digest(
+                username, settings.app_username
+            ) and secrets.compare_digest(password, settings.app_password)
         except Exception:
             authenticated = False
     if not authenticated:
@@ -50,9 +83,16 @@ templates = Jinja2Templates(directory="app/templates")
 
 def job_dict(j: Job) -> dict:
     return {
-        "id": j.id, "title": j.title, "company": j.company, "location": j.location,
-        "url": j.url, "source": j.source, "fit_score": j.fit_score,
-        "fit_analysis": j.fit_analysis, "status": j.status, "discovered_at": j.discovered_at.isoformat(),
+        "id": j.id,
+        "title": j.title,
+        "company": j.company,
+        "location": j.location,
+        "url": j.url,
+        "source": j.source,
+        "fit_score": j.fit_score,
+        "fit_analysis": j.fit_analysis,
+        "status": j.status,
+        "discovered_at": j.discovered_at.isoformat(),
     }
 
 
@@ -69,16 +109,30 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
     applications = db.scalars(select(Application).order_by(desc(Application.id)).limit(50)).all()
     followups = db.scalars(select(FollowUp).order_by(desc(FollowUp.id)).limit(50)).all()
     search_runs = db.scalars(select(SearchRun).order_by(desc(SearchRun.id)).limit(10)).all()
+    application_policy = get_application_settings(db)
     stats = {
         "jobs": db.scalar(select(func.count(Job.id))) or 0,
-        "shortlisted": db.scalar(select(func.count(Job.id)).where(Job.status == "shortlisted")) or 0,
+        "shortlisted": db.scalar(select(func.count(Job.id)).where(Job.status == "shortlisted"))
+        or 0,
         "tailored": db.scalar(select(func.count(Job.id)).where(Job.status == "tailored")) or 0,
         "applied": db.scalar(select(func.count(Job.id)).where(Job.status == "applied")) or 0,
     }
-    return templates.TemplateResponse(request=request, name="dashboard.html", context={ "jobs": jobs, "profile": profile, "evidence": evidence,
-        "applications": applications, "followups": followups, "search_runs": search_runs, "stats": stats,
-        "llm_provider": settings.llm_provider, "apify_actor_id": settings.apify_actor_id,
-    })
+    return templates.TemplateResponse(
+        request=request,
+        name="dashboard.html",
+        context={
+            "jobs": jobs,
+            "profile": profile,
+            "evidence": evidence,
+            "applications": applications,
+            "followups": followups,
+            "search_runs": search_runs,
+            "stats": stats,
+            "llm_provider": settings.llm_provider,
+            "apify_actor_id": settings.apify_actor_id,
+            "application_policy": application_policy,
+        },
+    )
 
 
 @app.get("/api/jobs")
@@ -88,10 +142,19 @@ def list_jobs(db: Session = Depends(get_db)):
 
 @app.post("/api/jobs/manual")
 def add_job(payload: ManualJobIn, db: Session = Depends(get_db)):
-    ref = hashlib.sha256(f"{payload.company}|{payload.title}|{payload.url}".encode()).hexdigest()[:40]
-    job, created = upsert_job(db, source="manual", source_ref=ref, title=payload.title,
-                              company=payload.company, location=payload.location, url=payload.url,
-                              description=payload.description)
+    ref = hashlib.sha256(f"{payload.company}|{payload.title}|{payload.url}".encode()).hexdigest()[
+        :40
+    ]
+    job, created = upsert_job(
+        db,
+        source="manual",
+        source_ref=ref,
+        title=payload.title,
+        company=payload.company,
+        location=payload.location,
+        url=payload.url,
+        description=payload.description,
+    )
     return {"created": created, "job": job_dict(job)}
 
 
@@ -141,9 +204,14 @@ def apify_runs(db: Session = Depends(get_db)):
     runs = db.scalars(select(SearchRun).order_by(desc(SearchRun.id)).limit(50)).all()
     return [
         {
-            "id": r.id, "external_run_id": r.external_run_id, "actor_id": r.actor_id,
-            "status": r.status, "item_count": r.item_count, "created_jobs": r.created_jobs,
-            "created_at": r.created_at.isoformat(), "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+            "id": r.id,
+            "external_run_id": r.external_run_id,
+            "actor_id": r.actor_id,
+            "status": r.status,
+            "item_count": r.item_count,
+            "created_jobs": r.created_jobs,
+            "created_at": r.created_at.isoformat(),
+            "completed_at": r.completed_at.isoformat() if r.completed_at else None,
             "error": r.error,
         }
         for r in runs
@@ -163,7 +231,9 @@ def rank(job_id: int, db: Session = Depends(get_db)):
 
 @app.post("/api/jobs/rank-batch")
 def rank_batch(db: Session = Depends(get_db)):
-    jobs = db.scalars(select(Job).where(Job.fit_score.is_(None)).limit(settings.max_jobs_per_batch)).all()
+    jobs = db.scalars(
+        select(Job).where(Job.fit_score.is_(None)).limit(settings.max_jobs_per_batch)
+    ).all()
     done = []
     for job in jobs:
         try:
@@ -181,20 +251,34 @@ def tailor(job_id: int, db: Session = Depends(get_db)):
         raise HTTPException(404, "Job not found")
     try:
         resume = tailor_job(db, job)
-        return {"resume_id": resume.id, "version": resume.version, "reviewer_score": resume.reviewer_score,
-                "markdown": resume.markdown, "cover_letter": resume.cover_letter,
-                "reviewer_notes": resume.reviewer_notes}
+        return {
+            "resume_id": resume.id,
+            "version": resume.version,
+            "reviewer_score": resume.reviewer_score,
+            "markdown": resume.markdown,
+            "cover_letter": resume.cover_letter,
+            "reviewer_notes": resume.reviewer_notes,
+        }
     except Exception as exc:
         raise HTTPException(400, str(exc)) from exc
 
 
 @app.get("/api/jobs/{job_id}/resume.pdf")
 def resume_pdf(job_id: int, db: Session = Depends(get_db)):
-    resume = db.scalar(select(ResumeVariant).where(ResumeVariant.job_id == job_id).order_by(desc(ResumeVariant.version)).limit(1))
+    resume = db.scalar(
+        select(ResumeVariant)
+        .where(ResumeVariant.job_id == job_id)
+        .order_by(desc(ResumeVariant.version))
+        .limit(1)
+    )
     if not resume:
         raise HTTPException(404, "No tailored resume for this job")
     data = markdown_to_simple_pdf(resume.markdown)
-    return Response(data, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="job-{job_id}-resume.pdf"'})
+    return Response(
+        data,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="job-{job_id}-resume.pdf"'},
+    )
 
 
 @app.post("/api/jobs/{job_id}/approve")
@@ -206,6 +290,42 @@ def approve(job_id: int, db: Session = Depends(get_db)):
         raise HTTPException(400, "Tailor and review a resume before approval")
     app_obj = approve_job(db, job)
     return {"application_id": app_obj.id, "status": app_obj.status, "apply_url": job.url}
+
+
+@app.get("/api/application-settings")
+def application_settings_get(db: Session = Depends(get_db)):
+    policy = get_application_settings(db)
+    return {
+        c.name: getattr(policy, c.name) for c in policy.__table__.columns if c.name != "updated_at"
+    }
+
+
+@app.put("/api/application-settings")
+def application_settings_put(payload: ApplicationSettingsIn, db: Session = Depends(get_db)):
+    policy = get_application_settings(db)
+    data = payload.model_dump(exclude={"confirm_automatic"})
+    for key, value in data.items():
+        setattr(policy, key, value)
+    # Queued work is intentionally not dispatched or reclassified by a mode change.
+    db.commit()
+    return {"ok": True, **data}
+
+
+@app.post("/api/jobs/{job_id}/dispatch")
+def dispatch(job_id: int, db: Session = Depends(get_db)):
+    job = db.get(Job, job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    outcome = dispatch_application(db, job, UnsupportedExecutor())
+    return {
+        "status": outcome.status,
+        "provider": outcome.provider,
+        "external_reference": outcome.external_reference,
+        "submitted_at": outcome.submitted_at,
+        "blocked_reason": outcome.blocked_reason,
+        "unresolved_questions": outcome.unresolved_questions,
+        "evidence": outcome.evidence,
+    }
 
 
 @app.post("/api/jobs/{job_id}/applied")
@@ -227,7 +347,11 @@ def applied(job_id: int, payload: RecruiterIn, db: Session = Depends(get_db)):
 @app.get("/api/profile")
 def profile_get(db: Session = Depends(get_db)):
     p = get_profile(db)
-    return {c.name: getattr(p, c.name) for c in CandidateProfile.__table__.columns if c.name not in {"updated_at"}}
+    return {
+        c.name: getattr(p, c.name)
+        for c in CandidateProfile.__table__.columns
+        if c.name not in {"updated_at"}
+    }
 
 
 @app.put("/api/profile")
@@ -242,8 +366,19 @@ def profile_put(payload: ProfileIn, db: Session = Depends(get_db)):
 @app.get("/api/evidence")
 def evidence_get(db: Session = Depends(get_db)):
     items = db.scalars(select(Evidence).order_by(desc(Evidence.id))).all()
-    return [{"id": e.id, "company": e.company, "role": e.role, "claim": e.claim,
-             "context": e.context, "skills": e.skills, "tags": e.tags, "verified": e.verified} for e in items]
+    return [
+        {
+            "id": e.id,
+            "company": e.company,
+            "role": e.role,
+            "claim": e.claim,
+            "context": e.context,
+            "skills": e.skills,
+            "tags": e.tags,
+            "verified": e.verified,
+        }
+        for e in items
+    ]
 
 
 @app.post("/api/evidence")

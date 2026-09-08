@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field, HttpUrl
+from typing import Literal
+
+from pydantic import BaseModel, Field, model_validator
 
 
 class ProfileIn(BaseModel):
@@ -57,3 +59,18 @@ class RecruiterIn(BaseModel):
     recruiter_name: str = ""
     recruiter_email: str = ""
     notes: str = ""
+
+
+class ApplicationSettingsIn(BaseModel):
+    application_mode: Literal["manual_approval", "automatic"]
+    min_fit_score: float = Field(default=72, ge=0, le=100)
+    min_resume_score: float = Field(default=70, ge=0, le=100)
+    excluded_companies: list[str] = Field(default_factory=list)
+    excluded_locations: list[str] = Field(default_factory=list)
+    confirm_automatic: bool = False
+
+    @model_validator(mode="after")
+    def automatic_requires_confirmation(self):
+        if self.application_mode == "automatic" and not self.confirm_automatic:
+            raise ValueError("Explicit confirmation is required to enable automatic applications")
+        return self
