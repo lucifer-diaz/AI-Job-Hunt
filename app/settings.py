@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     app_password: str | None = None
 
     # LLM provider: openai | anthropic | openrouter | mock
-    llm_provider: str = "openai"
+    llm_provider: str = "openrouter"
 
     openai_api_key: str | None = None
     openai_model: str = "gpt-5.6-luna"
