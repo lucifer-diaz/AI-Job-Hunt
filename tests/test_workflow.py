@@ -22,7 +22,8 @@ def test_core_happy_path():
     db.add(Evidence(company="Acme", role="Lead", claim="Reduced incidents by 40%", skills=["Python", "AWS"]))
     job = Job(source="manual", source_ref="x", title="Senior Python Engineer", company="Example", description="Need Python FastAPI AWS")
     db.add(job)
-    db.commit(); db.refresh(job)
+    db.commit()
+    db.refresh(job)
 
     result = rank_job(db, job)
     assert result["score"] == 80

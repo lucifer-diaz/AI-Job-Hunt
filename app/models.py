@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -30,6 +30,49 @@ class CandidateProfile(Base):
     compensation_notes: Mapped[str] = mapped_column(Text, default="")
     master_resume: Mapped[str] = mapped_column(Text, default="")
     search_preferences: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+
+class AppSetting(Base):
+    __tablename__ = "app_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    llm_provider: Mapped[str] = mapped_column(String(30), default="openrouter")
+    model: Mapped[str] = mapped_column(String(300), default="openrouter/free")
+    application_mode: Mapped[str] = mapped_column(String(30), default="manual_approval")
+    min_review_score: Mapped[int] = mapped_column(Integer, default=70)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+
+class ResumeDocument(Base):
+    __tablename__ = "resume_documents"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    original_filename: Mapped[str] = mapped_column(String(500))
+    media_type: Mapped[str] = mapped_column(String(150))
+    storage_path: Mapped[str] = mapped_column(String(1000))
+    checksum: Mapped[str] = mapped_column(String(64), unique=True)
+    size: Mapped[int] = mapped_column(Integer)
+    extracted_text: Mapped[str] = mapped_column(Text, default="")
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+
+class KnowledgeAnswer(Base):
+    __tablename__ = "knowledge_answers"
+    __table_args__ = (UniqueConstraint("question_key", name="uq_knowledge_question_key"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    question: Mapped[str] = mapped_column(Text)
+    question_key: Mapped[str] = mapped_column(String(64), index=True)
+    answer: Mapped[str] = mapped_column(Text, default="")
+    category: Mapped[str] = mapped_column(String(80), default="general")
+    answer_type: Mapped[str] = mapped_column(String(40), default="text")
+    verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    sensitive: Mapped[bool] = mapped_column(Boolean, default=False)
+    source_job_id: Mapped[int | None] = mapped_column(ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True)
+    use_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
 
 
@@ -114,6 +157,7 @@ class Application(Base):
     recruiter_name: Mapped[str] = mapped_column(String(200), default="")
     recruiter_email: Mapped[str] = mapped_column(String(300), default="")
     notes: Mapped[str] = mapped_column(Text, default="")
+    approved_resume_id: Mapped[int | None] = mapped_column(ForeignKey("resume_variants.id", ondelete="SET NULL"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
     job: Mapped[Job] = relationship(back_populates="application")

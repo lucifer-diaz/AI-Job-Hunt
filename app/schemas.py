@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field
 
 
 class ProfileIn(BaseModel):
@@ -40,6 +40,7 @@ class ManualJobIn(BaseModel):
 class ApifySearchIn(BaseModel):
     search_terms: list[str] = Field(min_length=1, max_length=5)
     location: str = ""
+    locations: list[str] = Field(default_factory=list, max_length=5)
     sites: list[str] = Field(default_factory=lambda: ["linkedin", "indeed", "glassdoor"])
     max_results: int = Field(default=20, ge=1, le=100)
     hours_old: int | None = Field(default=168, ge=1, le=8760)
@@ -57,3 +58,27 @@ class RecruiterIn(BaseModel):
     recruiter_name: str = ""
     recruiter_email: str = ""
     notes: str = ""
+
+
+class SettingsIn(BaseModel):
+    llm_provider: str = "openrouter"
+    model: str = "openrouter/free"
+    application_mode: str = "manual_approval"
+    min_review_score: int = Field(default=70, ge=0, le=100)
+
+
+class ApplicationUpdateIn(BaseModel):
+    notes: str = ""
+    recruiter_name: str = ""
+    recruiter_email: str = ""
+    status: str | None = None
+
+
+class KnowledgeIn(BaseModel):
+    question: str = Field(min_length=2)
+    answer: str = ""
+    category: str = "general"
+    answer_type: str = "text"
+    verified: bool = False
+    sensitive: bool = False
+    source_job_id: int | None = None
