@@ -40,6 +40,7 @@ class ManualJobIn(BaseModel):
 class ApifySearchIn(BaseModel):
     search_terms: list[str] = Field(min_length=1, max_length=5)
     location: str = ""
+    locations: list[str] = Field(default_factory=list, max_length=5)
     sites: list[str] = Field(default_factory=lambda: ["linkedin", "indeed", "glassdoor"])
     max_results: int = Field(default=20, ge=1, le=100)
     hours_old: int | None = Field(default=168, ge=1, le=8760)

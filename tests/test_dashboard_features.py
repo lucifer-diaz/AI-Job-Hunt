@@ -1,4 +1,5 @@
 import io
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
@@ -13,6 +14,9 @@ def test_dashboard_has_workspace_navigation():
     assert response.status_code == 200
     for label in ("Discovery", "Approvals", "Knowledge bank", "Settings"):
         assert label in response.text
+    assert 'data-tag-input="roles"' in response.text
+    assert 'data-tag-input="locations"' in response.text
+    assert "Press Enter to add" in response.text
 
 
 def test_settings_validation_and_secret_status():
@@ -55,3 +59,30 @@ def test_knowledge_conflict_requires_explicit_verification():
 
 def test_missing_application_detail_is_404():
     assert client.get("/api/jobs/999999/application-detail").status_code == 404
+
+
+def test_discovery_limits_locations_to_five():
+    response = client.post("/api/search/apify", json={
+        "search_terms": ["Engineer"],
+        "locations": [f"Location {index}" for index in range(6)],
+    })
+    assert response.status_code == 422
+
+
+def test_discovery_starts_one_run_per_location(monkeypatch):
+    started = []
+
+    def fake_start(_db, payload):
+        started.append(payload["location"])
+        index = len(started)
+        return SimpleNamespace(id=index, external_run_id=f"run-{index}",
+                               actor_id="actor", status="READY")
+
+    monkeypatch.setattr("app.main.start_apify_search", fake_start)
+    response = client.post("/api/search/apify", json={
+        "search_terms": ["AI Engineer", "ML Engineer"],
+        "locations": ["Singapore", "Remote"],
+    })
+    assert response.status_code == 200
+    assert started == ["Singapore", "Remote"]
+    assert [run["location"] for run in response.json()["runs"]] == started

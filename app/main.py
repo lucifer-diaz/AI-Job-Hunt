@@ -166,16 +166,20 @@ def greenhouse(board_token: str, db: Session = Depends(get_db)):
 
 @app.post("/api/search/apify")
 def apify_search(payload: ApifySearchIn, db: Session = Depends(get_db)):
+    values = payload.model_dump()
+    locations = list(dict.fromkeys(location.strip() for location in payload.locations if location.strip()))
+    if not locations:
+        locations = [payload.location.strip()]
+    runs = []
     try:
-        run = start_apify_search(db, payload.model_dump())
-        return {
-            "id": run.id,
-            "external_run_id": run.external_run_id,
-            "actor_id": run.actor_id,
-            "status": run.status,
-        }
+        for location in locations:
+            run = start_apify_search(db, {**values, "location": location})
+            runs.append({"id": run.id, "external_run_id": run.external_run_id,
+                         "actor_id": run.actor_id, "status": run.status,
+                         "location": location})
     except Exception as exc:
         raise HTTPException(400, str(exc)) from exc
+    return {**runs[0], "runs": runs}
 
 
 @app.get("/api/search/apify/runs/{run_id}")
