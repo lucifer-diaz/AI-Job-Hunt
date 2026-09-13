@@ -131,13 +131,32 @@ def job_dict(j: Job) -> dict:
     }
 
 
+def search_run_dict(run: SearchRun, *, completed: bool | None = None) -> dict:
+    result = {
+        "id": run.id,
+        "provider": run.provider,
+        "external_run_id": run.external_run_id,
+        "actor_id": run.actor_id,
+        "status": run.status,
+        "dataset_id": run.dataset_id,
+        "input": run.input_json or {},
+        "item_count": run.item_count,
+        "created_jobs": run.created_jobs,
+        "created_at": run.created_at.isoformat(),
+        "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+        "error": run.error,
+    }
+    if completed is not None:
+        result["completed"] = completed
+    return result
+
+
 @app.get("/health")
 def health():
     return {"ok": True, "time": datetime.now(UTC).isoformat()}
 
 
-@app.get("/", response_class=HTMLResponse)
-def dashboard(request: Request, db: Session = Depends(get_db)):
+def render_view(request: Request, view: str, db: Session):
     preferences = get_application_settings(db)
     jobs = db.scalars(select(Job).order_by(desc(Job.discovered_at)).limit(100)).all()
     profile = get_profile(db)
@@ -165,13 +184,21 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
             "stats": stats,
             "llm_provider": preferences.active_provider,
             "apify_actor_id": settings.apify_actor_id,
+            "view": view,
         },
     )
 
 
-@app.get("/settings", response_class=HTMLResponse)
-def settings_page(request: Request):
-    return templates.TemplateResponse(request=request, name="settings.html", context={})
+@app.get("/", response_class=HTMLResponse)
+def dashboard(request: Request, db: Session = Depends(get_db)):
+    return render_view(request, "dashboard", db)
+
+
+@app.get("/{view}", response_class=HTMLResponse)
+def workspace_view(request: Request, view: str, db: Session = Depends(get_db)):
+    if view not in {"discovery", "approvals", "knowledge", "settings"}:
+        raise HTTPException(404, "View not found")
+    return render_view(request, view, db)
 
 
 @app.get("/api/settings", response_model=ApplicationSettingsOut)
@@ -248,6 +275,9 @@ def greenhouse(board_token: str, db: Session = Depends(get_db)):
 
 @app.post("/api/search/apify")
 def apify_search(payload: ApifySearchIn, db: Session = Depends(get_db)):
+    profile = get_profile(db)
+    profile.search_preferences = payload.model_dump(exclude={"custom_input", "raw_actor_input"})
+    db.commit()
     try:
         run = start_apify_search(db, payload.model_dump())
         return {
@@ -266,7 +296,8 @@ def apify_run_status(run_id: int, db: Session = Depends(get_db)):
     if not run:
         raise HTTPException(404, "Search run not found")
     try:
-        return refresh_apify_run(db, run)
+        result = refresh_apify_run(db, run)
+        return {**search_run_dict(run, completed=result["completed"]), "import": result["import"]}
     except Exception as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -274,20 +305,7 @@ def apify_run_status(run_id: int, db: Session = Depends(get_db)):
 @app.get("/api/search/apify/runs")
 def apify_runs(db: Session = Depends(get_db)):
     runs = db.scalars(select(SearchRun).order_by(desc(SearchRun.id)).limit(50)).all()
-    return [
-        {
-            "id": r.id,
-            "external_run_id": r.external_run_id,
-            "actor_id": r.actor_id,
-            "status": r.status,
-            "item_count": r.item_count,
-            "created_jobs": r.created_jobs,
-            "created_at": r.created_at.isoformat(),
-            "completed_at": r.completed_at.isoformat() if r.completed_at else None,
-            "error": r.error,
-        }
-        for r in runs
-    ]
+    return [search_run_dict(r) for r in runs]
 
 
 @app.post("/api/jobs/{job_id}/rank")
@@ -392,7 +410,9 @@ def profile_get(db: Session = Depends(get_db)):
 @app.put("/api/profile")
 def profile_put(payload: ProfileIn, db: Session = Depends(get_db)):
     p = get_profile(db)
-    for key, value in payload.model_dump().items():
+    # PUT remains backwards compatible while omitted fields are left untouched. In
+    # particular, saving Settings must never erase reusable Discovery preferences.
+    for key, value in payload.model_dump(exclude_unset=True).items():
         setattr(p, key, value)
     db.commit()
     return {"ok": True}
