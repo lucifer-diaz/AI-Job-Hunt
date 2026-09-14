@@ -185,12 +185,12 @@ def apify_search(payload: ApifySearchIn, db: Session = Depends(get_db)):
 
 
 @app.get("/api/search/apify/runs/{run_id}")
-def apify_run_status(run_id: int, db: Session = Depends(get_db)):
+def apify_run_status(run_id: int, reimport: bool = False, db: Session = Depends(get_db)):
     run = db.get(SearchRun, run_id)
     if not run:
         raise HTTPException(404, "Search run not found")
     try:
-        return refresh_apify_run(db, run)
+        return refresh_apify_run(db, run, reimport=reimport)
     except Exception as exc:
         raise HTTPException(400, str(exc)) from exc
 
