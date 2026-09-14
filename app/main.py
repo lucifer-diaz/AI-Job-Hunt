@@ -25,6 +25,8 @@ from app.schemas import (ApplicationUpdateIn, ApifySearchIn, EvidenceIn, Knowled
 from app.services.exports import markdown_to_simple_pdf
 from app.services.sources import import_greenhouse, import_lever, refresh_apify_run, start_apify_search, upsert_job
 from app.services.workflow import approve_job, create_due_followups, get_profile, mark_applied, rank_job, tailor_job
+from app.services.ai_config import PROVIDERS as AI_PROVIDERS, STAGES as AI_STAGES, env_defaults as ai_env_defaults
+from app.services.ai_config import resolve as resolve_ai_config
 from app.settings import get_settings
 from app.workspace import router as workspace_router, run_search_profile, get_search_profile
 
@@ -108,23 +110,36 @@ def settings_get(db: Session = Depends(get_db)):
         "openrouter": bool(settings.openrouter_api_key), "openai": bool(settings.openai_api_key),
         "anthropic": bool(settings.anthropic_api_key), "mock": True,
     }
-    return {"llm_provider": value.llm_provider, "model": value.model,
+    overrides = (value.preferences or {}).get("ai") or {}
+    effective = resolve_ai_config(settings, overrides)
+    return {"llm_provider": effective["llm_provider"], "model": effective["model"],
             "application_mode": value.application_mode, "min_review_score": value.min_review_score,
-            "configured": configured}
+            "configured": configured,
+            # Raw saved values (blank = inherit) plus what .env would supply, for the editor.
+            "ai": {"saved": {"llm_provider": overrides.get("llm_provider") or "", "model": overrides.get("model") or "",
+                             "stage_models": overrides.get("stage_models") or {},
+                             "require_free": overrides.get("require_free")},
+                   "env": ai_env_defaults(settings), "effective": effective}}
 
 
 @app.put("/api/settings")
 def settings_put(payload: SettingsIn, db: Session = Depends(get_db)):
-    if payload.llm_provider not in {"openrouter", "openai", "anthropic", "mock"}:
+    provider = payload.llm_provider.strip().lower()
+    if provider and provider not in AI_PROVIDERS:
         raise HTTPException(422, "Unsupported LLM provider")
     if payload.application_mode not in {"manual_approval", "automatic"}:
         raise HTTPException(422, "Unsupported application mode")
+    unknown = set(payload.stage_models) - {stage for stage, _ in AI_STAGES}
+    if unknown:
+        raise HTTPException(422, f"Unknown stage(s): {', '.join(sorted(unknown))}")
     value = get_app_setting(db)
-    for key, item in payload.model_dump().items():
-        setattr(value, key, item)
-    settings.llm_provider = payload.llm_provider
-    if payload.llm_provider != "mock":
-        setattr(settings, f"{payload.llm_provider}_model", payload.model)
+    ai = {"llm_provider": provider, "model": payload.model.strip(),
+          "stage_models": {k: v.strip()[:300] for k, v in payload.stage_models.items() if v.strip()},
+          "require_free": payload.require_free}
+    value.preferences = {**(value.preferences or {}), "ai": ai}
+    effective = resolve_ai_config(settings, ai)
+    value.llm_provider, value.model = effective["llm_provider"], effective["model"][:300]
+    value.application_mode, value.min_review_score = payload.application_mode, payload.min_review_score
     db.commit()
     return settings_get(db)
 

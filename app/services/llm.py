@@ -4,6 +4,7 @@ import json
 import re
 from typing import Any
 
+from app.services.ai_config import is_free_model, load_overrides, resolve as resolve_ai_config
 from app.settings import get_settings
 
 
@@ -45,34 +46,41 @@ def _csv_models(value: str) -> list[str]:
 
 def _is_free_openrouter_model(model: str) -> bool:
     # The free router itself and explicit :free variants have zero token price.
-    clean = model.strip()
-    return clean == "openrouter/free" or ":free" in clean.split("@", 1)[0]
+    return is_free_model("openrouter", model)
 
 
 class LLMClient:
-    def __init__(self):
+    def __init__(self, overrides: dict[str, Any] | None = None):
         self.settings = get_settings()
+        # None = read saved Settings from the database on each call.
+        self.overrides = overrides
+
+    def _config(self) -> dict[str, Any]:
+        return resolve_ai_config(self.settings, load_overrides() if self.overrides is None else self.overrides)
 
     def generate_json(self, system: str, user: str) -> dict[str, Any]:
-        provider = self.settings.llm_provider.lower()
+        config = self._config()
+        provider = config["llm_provider"]
+        task = _task_from_prompt(user)
+        model = config["stage_models"].get(task) or config["model"]
         if provider == "mock":
             return self._mock(user)
         if provider == "openai":
-            return self._openai(system, user)
+            return self._openai(system, user, model)
         if provider == "anthropic":
-            return self._anthropic(system, user)
+            return self._anthropic(system, user, model)
         if provider == "openrouter":
-            return self._openrouter(system, user, task=_task_from_prompt(user))
+            return self._openrouter(system, user, task=task, model=model, require_free=config["require_free"])
         raise LLMError(f"Unsupported LLM_PROVIDER={provider}")
 
-    def _openai(self, system: str, user: str) -> dict[str, Any]:
+    def _openai(self, system: str, user: str, model: str) -> dict[str, Any]:
         if not self.settings.openai_api_key:
             raise LLMError("OPENAI_API_KEY is missing")
         from openai import OpenAI
 
         client = OpenAI(api_key=self.settings.openai_api_key)
         response = client.chat.completions.create(
-            model=self.settings.openai_model,
+            model=model,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
@@ -81,14 +89,14 @@ class LLMClient:
         )
         return _extract_json(response.choices[0].message.content or "{}")
 
-    def _anthropic(self, system: str, user: str) -> dict[str, Any]:
+    def _anthropic(self, system: str, user: str, model: str) -> dict[str, Any]:
         if not self.settings.anthropic_api_key:
             raise LLMError("ANTHROPIC_API_KEY is missing")
         from anthropic import Anthropic
 
         client = Anthropic(api_key=self.settings.anthropic_api_key)
         msg = client.messages.create(
-            model=self.settings.anthropic_model,
+            model=model,
             max_tokens=5000,
             system=system + "\nReturn only valid JSON. No markdown fences.",
             messages=[{"role": "user", "content": user}],
@@ -96,31 +104,22 @@ class LLMClient:
         text = "".join(getattr(block, "text", "") for block in msg.content)
         return _extract_json(text)
 
-    def _openrouter_model_for_task(self, task: str) -> str:
-        overrides = {
-            "rank": self.settings.openrouter_model_rank,
-            "tailor": self.settings.openrouter_model_tailor,
-            "review": self.settings.openrouter_model_review,
-            "followup": self.settings.openrouter_model_followup,
-        }
-        return overrides.get(task) or self.settings.openrouter_model
-
-    def _openrouter(self, system: str, user: str, task: str = "default") -> dict[str, Any]:
+    def _openrouter(self, system: str, user: str, task: str, model: str, require_free: bool) -> dict[str, Any]:
         if not self.settings.openrouter_api_key:
             raise LLMError("OPENROUTER_API_KEY is missing")
 
-        primary = self._openrouter_model_for_task(task)
+        primary = model
         fallbacks = _csv_models(self.settings.openrouter_fallback_models)
         all_models = [primary, *fallbacks]
 
         # Avoid accidental spend when the user intends to run on free inference.
-        if self.settings.openrouter_require_free:
-            paid = [model for model in all_models if not _is_free_openrouter_model(model)]
+        if require_free:
+            paid = [name for name in all_models if not _is_free_openrouter_model(name)]
             if paid:
                 raise LLMError(
                     "OPENROUTER_REQUIRE_FREE=true but paid/non-free model(s) were configured: "
                     + ", ".join(paid)
-                    + ". Use openrouter/free or a :free model, or explicitly set OPENROUTER_REQUIRE_FREE=false."
+                    + ". Use openrouter/free or a :free model, or turn off the free-only guard in Settings."
                 )
 
         from openai import OpenAI
