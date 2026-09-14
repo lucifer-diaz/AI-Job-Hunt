@@ -95,7 +95,20 @@ APIFY_API_TOKEN=apify_api_...
 APIFY_ACTOR_ID=openclawai/job-board-scraper
 ```
 
-The default Actor supports multi-term search plus filters such as location, boards, results per board, recency, remote-only, job type and Easy Apply.
+### Multiple actors
+
+Discovery → Search setup lets you tick one or more actors. One search profile is translated into each actor's own input schema (`app/services/actors.py`), and each actor gets the filters it supports:
+
+| Actor | Runs | Filters it receives |
+| --- | --- | --- |
+| `openclawai/job-board-scraper` (Multi Job Board) | one per location, all roles | `searchTerm`/`searchTerms`, `location`, `sites`, `maxResults`, `hoursOld`, `jobType`, `isRemote`, `easyApply`, `countryIndeed`, `distance`, `offset`, `linkedinFetchDescription`, `linkedinCompanyIds`, `enforceAnnualSalary`, `proxyConfiguration` |
+| `fantastic-jobs/advanced-linkedin-job-search-api` (Advanced LinkedIn) | one for everything | `titleSearch`, `locationSearch` (needs `City, State, Country`), `timeRange`, `limit`, `aiWorkArrangementFilter`, `aiEmploymentTypeFilter`, `seniorityFilter`, `directApply`, `hasSalary`, `aiVisaSponsorshipFilter`, `removeAgency`, `titleExclusionSearch` |
+| `benthepythondev/remote-jobs-aggregator` | one per role | `searchKeywords`, `platforms`, `maxJobsPerPlatform`, `postedWithinDays`, `locationKeywords`, `jobTypes`, `seniorityLevels`, `salaryOnly`, `excludeKeywords` |
+| `shahidirfan/Remoteok-Job-Scraper` | one per role | `startUrl`, `keyword`, `results_wanted` |
+
+Conflicting filters are reported before a run starts (for example, Multi Job Board drops `hoursOld` when Easy Apply is on). "Show exact inputs" displays the JSON each run will send, and one profile may start at most 30 runs.
+
+**Your own actors:** "+ Add your own actor" takes a Store actor ID, how it should fan out (per role × location, per location, per role, or once) and a JSON input template. "Look up on Apify" confirms the actor exists and pre-fills the template from its input schema. Placeholders: `{{role}}`, `{{roles}}`, `{{location}}`, `{{locations}}`, `{{max_results}}`, `{{hours_old}}`, `{{days_old}}`, `{{is_remote}}`, `{{job_type}}`, `{{sites}}`, `{{country}}`. A value that is only a placeholder keeps its type. Output items are normalized from common field names (title, company/organization, location/locations_derived, url/apply_url, description/description_text).
 
 The dashboard starts the Actor **asynchronously**. The app persists the Apify run ID, polls its status, and imports the default dataset after the run succeeds. This avoids keeping a Render/Railway HTTP request open while the scraper runs.
 
@@ -107,16 +120,24 @@ Apify Actors do not all use the same input/output schema. `APIFY_ACTOR_ID` can p
 
 ```json
 {
+  "searchTerm": "Engineering Manager",
   "searchTerms": ["Engineering Manager", "Lead AI Engineer"],
   "location": "Singapore",
   "sites": ["linkedin", "indeed", "glassdoor"],
   "maxResults": 20,
   "hoursOld": 168,
   "isRemote": false,
+  "easyApply": false,
+  "countryIndeed": "singapore",
+  "distance": 50,
   "linkedinFetchDescription": true,
-  "descriptionFormat": "markdown"
+  "enforceAnnualSalary": false,
+  "descriptionFormat": "markdown",
+  "proxyConfiguration": {"useApifyProxy": true, "apifyProxyGroups": ["RESIDENTIAL"]}
 }
 ```
+
+`searchTerms` is only sent when there is more than one role.
 
 Use smaller `maxResults` values while testing. Apify Actor pricing is Actor-specific, so check the chosen Actor's live pricing before large searches.
 

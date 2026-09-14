@@ -27,6 +27,8 @@ from sqlalchemy.orm import Session
 from app.db import get_db
 from app.models import (AppSetting, Application, ApplicationEvent, Evidence, FollowUp, Job, KnowledgeAnswer,
                         ResumeDocument, ResumeVariant, SearchRun)
+from app.services.actors import (BUILTIN, DEFAULT_ACTORS, FAN_OUTS, MAX_RUNS, PLACEHOLDERS, REMOTE_PLATFORMS,
+                                 SENIORITY_LEVELS, catalog as actor_catalog, describe_input, plan_runs)
 from app.services.llm import LLMClient
 from app.services.sources import UA, start_apify_search, upsert_job
 from app.services.workflow import (draft_followup, followup_days, get_profile, rank_job, resume_edits,
@@ -551,25 +553,142 @@ def job_from_url(payload: JobUrlIn, db: Session = Depends(get_db)):
     return {"created": created, "job": job_card(job)}
 
 
+class CustomActorIn(BaseModel):
+    id: str = Field(pattern=r"^[\w.-]+[/~][\w.-]+$", max_length=200)
+    name: str = Field(default="", max_length=120)
+    fan_out: str = "role_location"
+    input_template: dict = Field(default_factory=dict)
+
+
 class SearchProfileIn(BaseModel):
     roles: list[str] = Field(default_factory=list, max_length=5)
     locations: list[str] = Field(default_factory=list, max_length=5)
+    actors: list[str] = Field(default_factory=lambda: list(DEFAULT_ACTORS), max_length=10)
+    custom_actors: list[CustomActorIn] = Field(default_factory=list, max_length=10)
     sites: list[str] = Field(default_factory=lambda: ["linkedin", "indeed", "glassdoor"])
-    hours_old: int = Field(default=168, ge=1, le=8760)
+    remote_platforms: list[str] = Field(default_factory=lambda: list(REMOTE_PLATFORMS))
+    remoteok_url: str = "https://remoteok.com/remote-jobs"
+    hours_old: int = Field(default=168, ge=0, le=8760)
     max_results: int = Field(default=20, ge=1, le=100)
+    offset: int = Field(default=0, ge=0, le=1000)
     job_type: str = ""
-    seniority: str = "any"
+    seniority: list[str] = Field(default_factory=list)
+    country_indeed: str = Field(default="usa", max_length=40)
+    distance: int = Field(default=50, ge=0, le=500)
     is_remote: bool = False
+    easy_apply: bool = False
+    fetch_description: bool = True
+    enforce_annual_salary: bool = False
+    residential_proxy: bool = True
+    salary_only: bool = False
+    visa_sponsorship: bool = False
+    exclude_keywords: list[str] = Field(default_factory=list, max_length=20)
+    linkedin_company_ids: list[str] = Field(default_factory=list, max_length=20)
     skip_agencies: bool = True
     auto_rank: bool = True
     schedule: str = "manual"
 
 
+JOB_TYPES = {"", "fulltime", "parttime", "contract", "internship", "temporary"}
+
+
 def get_search_profile(db: Session) -> dict:
     profile = get_profile(db)
-    saved = (profile.search_preferences or {}).get("search_profile") or {}
+    saved = dict((profile.search_preferences or {}).get("search_profile") or {})
+    if not isinstance(saved.get("seniority"), list):  # older profiles stored "any"
+        saved.pop("seniority", None)
     base = SearchProfileIn(roles=(profile.target_roles or [])[:5], locations=(profile.preferred_locations or [])[:5]).model_dump()
     return {**base, **saved}
+
+
+def validate_search_profile(payload: SearchProfileIn) -> None:
+    problems = []
+    if payload.schedule not in ("manual", "daily"):
+        problems.append("Schedule must be manual or daily")
+    if payload.job_type not in JOB_TYPES:
+        problems.append("Unknown job type")
+    if set(payload.sites) - set(BOARDS):
+        problems.append(f"Unknown boards: {', '.join(sorted(set(payload.sites) - set(BOARDS)))}")
+    if set(payload.remote_platforms) - set(REMOTE_PLATFORMS):
+        problems.append("Unknown remote job boards")
+    if set(payload.seniority) - set(SENIORITY_LEVELS):
+        problems.append("Unknown seniority level")
+    for entry in payload.custom_actors:
+        if entry.fan_out not in FAN_OUTS:
+            problems.append(f"{entry.id}: unknown fan-out '{entry.fan_out}'")
+        if entry.id in BUILTIN:
+            problems.append(f"{entry.id} is already built in")
+    known = set(BUILTIN) | {c.id for c in payload.custom_actors}
+    if not payload.actors:
+        problems.append("Choose at least one Apify actor")
+    if set(payload.actors) - known:
+        problems.append(f"Unknown actors: {', '.join(sorted(set(payload.actors) - known))}")
+    if "openclawai/job-board-scraper" in payload.actors and not payload.sites:
+        problems.append("Choose at least one board for Multi Job Board")
+    if problems:
+        raise HTTPException(422, "; ".join(problems))
+
+
+@router.get("/api/search/actors")
+def search_actors(db: Session = Depends(get_db)):
+    sp = get_search_profile(db)
+    return {"actors": [spec.public() for spec in actor_catalog(sp).values()], "placeholders": list(PLACEHOLDERS),
+            "fan_outs": list(FAN_OUTS), "boards": BOARDS, "remote_platforms": REMOTE_PLATFORMS,
+            "seniority": SENIORITY_LEVELS, "max_runs": MAX_RUNS}
+
+
+class ActorLookupIn(BaseModel):
+    id: str = Field(pattern=r"^[\w.-]+[/~][\w.-]+$", max_length=200)
+
+
+GUESSES = [(re.compile(r"^(search_?term|keywords?|query|search|search_?keywords?|title|position)$", re.I), "{{role}}"),
+           (re.compile(r"^(search_?terms|titles|queries|title_?search)$", re.I), "{{roles}}"),
+           (re.compile(r"^(location|city|place|where)$", re.I), "{{location}}"),
+           (re.compile(r"^(locations|location_?search)$", re.I), "{{locations}}"),
+           (re.compile(r"^(max_?(items|results|jobs)|limit|results_?wanted|rows|count)$", re.I), "{{max_results}}"),
+           (re.compile(r"^(hours_?old|posted_?within_?hours)$", re.I), "{{hours_old}}"),
+           (re.compile(r"^(days_?old|posted_?within_?days|date_?posted)$", re.I), "{{days_old}}"),
+           (re.compile(r"^(is_?remote|remote(_?only)?)$", re.I), "{{is_remote}}")]
+
+
+@router.post("/api/search/actors/lookup")
+def lookup_actor(payload: ActorLookupIn):
+    """Confirm a Store actor exists and suggest an input template from its input schema."""
+    token = get_settings().apify_api_token
+    if not token:
+        raise HTTPException(400, "Set APIFY_API_TOKEN on the server to look actors up")
+    api_id = payload.id.replace("/", "~")
+    headers = {"Authorization": f"Bearer {token}", "User-Agent": UA}
+    try:
+        with httpx.Client(timeout=20, headers=headers) as client:
+            actor = client.get(f"https://api.apify.com/v2/acts/{api_id}")
+            if actor.status_code == 404:
+                raise HTTPException(404, f"No Apify actor named '{payload.id}'")
+            actor.raise_for_status()
+            info = actor.json().get("data") or {}
+            build = client.get(f"https://api.apify.com/v2/acts/{api_id}/builds/default")
+            schema = {}
+            if build.is_success:
+                raw = (build.json().get("data") or {}).get("inputSchema") or "{}"
+                schema = json.loads(raw) if isinstance(raw, str) else raw
+    except HTTPException:
+        raise
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(502, f"Could not reach Apify: {exc.__class__.__name__}") from exc
+    properties = (schema or {}).get("properties") or {}
+    template = {}
+    for name, prop in properties.items():
+        guess = next((value for pattern, value in GUESSES if pattern.match(name)), None)
+        if guess:
+            template[name] = guess
+        elif name in (schema.get("required") or []) and "prefill" in prop:
+            template[name] = prop["prefill"]
+    return {"id": f"{info.get('username', payload.id.split('/')[0])}/{info.get('name', payload.id.split('/')[-1])}",
+            "name": info.get("title") or info.get("name") or payload.id,
+            "summary": (info.get("description") or "")[:300],
+            "fields": [{"name": n, "type": p.get("type", ""), "title": p.get("title", ""), "required": n in (schema.get("required") or [])}
+                       for n, p in properties.items()],
+            "input_template": template}
 
 
 @router.get("/api/search/profile")
@@ -587,11 +706,7 @@ def search_profile_get(db: Session = Depends(get_db)):
 
 @router.put("/api/search/profile")
 def search_profile_put(payload: SearchProfileIn, db: Session = Depends(get_db)):
-    if payload.schedule not in ("manual", "daily"):
-        raise HTTPException(422, "Schedule must be manual or daily")
-    unknown = set(payload.sites) - set(BOARDS)
-    if unknown:
-        raise HTTPException(422, f"Unknown boards: {', '.join(sorted(unknown))}")
+    validate_search_profile(payload)
     profile = get_profile(db)
     prefs_value = dict(profile.search_preferences or {})
     prefs_value["search_profile"] = payload.model_dump()
@@ -600,30 +715,40 @@ def search_profile_put(payload: SearchProfileIn, db: Session = Depends(get_db)):
     return {"profile": get_search_profile(db)}
 
 
+@router.post("/api/search/profile/preview")
+def search_profile_preview(payload: SearchProfileIn):
+    """Show exactly which actor runs a profile would start, with the inputs and any filter conflicts."""
+    validate_search_profile(payload)
+    try:
+        runs, warnings = plan_runs(payload.model_dump())
+    except ValueError as exc:
+        return {"runs": [], "warnings": [], "error": str(exc)}
+    return {"runs": [{"actor_id": r["actor_id"], "actor_name": r["actor_name"], "location": r["location"],
+                      "roles": r["roles"], "input": r["input"]} for r in runs],
+            "warnings": warnings, "error": None}
+
+
 def run_search_profile(db: Session, sp: dict) -> list[SearchRun]:
-    roles = [r for r in sp.get("roles") or [] if r.strip()]
-    if not roles:
-        raise HTTPException(422, "Add at least one role to the search profile")
-    if not sp.get("sites"):
-        raise HTTPException(422, "Choose at least one board")
-    runs = []
-    for location in sp.get("locations") or [""]:
-        runs.append(start_apify_search(db, {
-            "search_terms": roles, "location": location, "sites": sp["sites"], "max_results": sp["max_results"],
-            "hours_old": sp["hours_old"], "is_remote": sp["is_remote"], "job_type": sp.get("job_type", ""),
-            "linkedin_fetch_description": True}))
-    return runs
+    try:
+        plan, _ = plan_runs(sp)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return [start_apify_search(db, {"actor_id": item["actor_id"], "actor_input": item["input"],
+                                    "location": item["location"]}) for item in plan]
 
 
 @router.post("/api/search/profile/run")
 def search_profile_run(db: Session = Depends(get_db)):
+    sp = get_search_profile(db)
     try:
-        runs = run_search_profile(db, get_search_profile(db))
+        runs = run_search_profile(db, sp)
+        _, warnings = plan_runs(sp)
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(400, str(exc)) from exc
-    return {"runs": [{"id": r.id, "status": r.status, "location": r.input_json.get("location", "")} for r in runs]}
+    return {"runs": [{"id": r.id, "status": r.status, "actor_id": getattr(r, "actor_id", ""),
+                      "location": (r.input_json or {}).get("location", "")} for r in runs], "warnings": warnings}
 
 
 @router.get("/api/search/apify/runs/{run_id}/detail")
@@ -638,15 +763,8 @@ def run_detail(run_id: int, db: Session = Depends(get_db)):
         seconds = int((run.completed_at - run.created_at).total_seconds())
         duration = f"{seconds // 60}m {seconds % 60:02d}s"
     filtered = sum(1 for j in pulled if j.status in ("archived", "dismissed") or is_agency(j.company))
-    context = [
-        ["Roles", " · ".join(i.get("searchTerms") or [])],
-        ["Locations", i.get("location") or "Anywhere"],
-        ["Boards", ", ".join(board_label(s) for s in i.get("sites") or []) or "Actor default"],
-        ["Filters", " · ".join(filter(None, [f"posted ≤ {round(i['hoursOld'] / 24)}d" if i.get("hoursOld") else "",
-                                              "remote only" if i.get("isRemote") else "", i.get("jobType", ""),
-                                              f"{i['maxResults']} per combination" if i.get("maxResults") else ""])) or "none"],
-        ["Actor", f"{run.actor_id} · run {run.external_run_id[:6]}…" + (f" · {duration}" if duration else "")],
-    ]
+    context = [["Actor", f"{run.actor_id} · run {run.external_run_id[:6]}…" + (f" · {duration}" if duration else "")],
+               *describe_input(i)]
     if run.error:
         context.append(["Error", run.error])
     return {

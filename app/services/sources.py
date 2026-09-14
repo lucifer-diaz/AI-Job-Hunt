@@ -152,40 +152,34 @@ def _first(item: dict[str, Any], *keys: str, default: Any = "") -> Any:
     return default
 
 
-def normalize_apify_job(item: dict[str, Any]) -> dict[str, Any] | None:
-    """Normalize the default multi-board Actor plus common third-party Actor field names."""
-    title = str(_first(item, "title", "job_title", "jobTitle", "position", "name")).strip()
-    company = str(_first(item, "company", "company_name", "companyName", "employer")).strip()
+def _text(value: Any) -> str:
+    if isinstance(value, dict):
+        return str(_first(value, "name", "formatted", "text", "title", default=""))
+    if isinstance(value, list):
+        return ", ".join(_text(v) for v in value if v)
+    return str(value or "")
+
+
+def normalize_apify_job(item: dict[str, Any], default_site: str = "unknown") -> dict[str, Any] | None:
+    """Normalize job items from the built-in actors and common third-party field names."""
+    title = _text(_first(item, "title", "job_title", "jobTitle", "position", "name")).strip()
+    company = _text(_first(item, "company", "company_name", "companyName", "organization", "employer",
+                           "employer_name", "hiringOrganization")).strip()
     if not title or not company:
         return None
 
-    location_value = _first(item, "location", "job_location", "jobLocation", "formattedLocation")
-    if isinstance(location_value, dict):
-        location = str(_first(location_value, "name", "formatted", "text"))
-    else:
-        location = str(location_value or "")
-
-    url = str(
-        _first(
-            item,
-            "job_url_direct",
-            "apply_url",
-            "applyUrl",
-            "applicationUrl",
-            "job_url",
-            "jobUrl",
-            "url",
-            "link",
-        )
-        or ""
-    )
-    description = _first(item, "description", "job_description", "jobDescription", "descriptionText", "text")
+    location = _text(_first(item, "location", "job_location", "jobLocation", "formattedLocation",
+                            "locations_derived", "locations_raw", "candidate_required_location", "locations"))
+    url = _text(_first(item, "job_url_direct", "apply_url", "applyUrl", "applicationUrl", "application_url",
+                       "job_url", "jobUrl", "url", "link", "listing_url"))
+    description = _first(item, "description", "description_text", "job_description", "jobDescription",
+                         "descriptionText", "description_html", "descriptionHtml", "text", "content")
     if isinstance(description, str) and "<" in description and ">" in description:
         description = BeautifulSoup(description, "html.parser").get_text("\n", strip=True)
     description = str(description or "")[:100000]
 
-    site = str(_first(item, "site", "source", "platform", default="unknown")).lower().replace(" ", "_")
-    raw_id = _first(item, "id", "job_id", "jobId", "jobKey", "external_id")
+    site = _text(_first(item, "site", "source", "platform", "board", default=default_site)).lower().replace(" ", "_")
+    raw_id = _first(item, "id", "job_id", "jobId", "jobKey", "external_id", "slug", "fingerprint")
     if raw_id:
         source_ref = f"{site}:{raw_id}"
     elif url:
@@ -205,12 +199,13 @@ def normalize_apify_job(item: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def import_apify_items(db: Session, items: list[dict[str, Any]], search_run_id: int | None = None) -> dict[str, int]:
+def import_apify_items(db: Session, items: list[dict[str, Any]], search_run_id: int | None = None,
+                       default_site: str = "unknown") -> dict[str, int]:
     created = 0
     normalized = 0
     skipped = 0
     for item in items:
-        job_data = normalize_apify_job(item)
+        job_data = normalize_apify_job(item, default_site)
         if not job_data:
             skipped += 1
             continue
@@ -233,11 +228,16 @@ def build_apify_input(payload: dict[str, Any]) -> dict[str, Any]:
     if not terms:
         raise ValueError("At least one search term is required")
 
+    # openclawai/job-board-scraper reads searchTerm; searchTerms is only used for multi-term runs.
     actor_input: dict[str, Any] = {
-        "searchTerms": terms[:5],
+        "searchTerm": terms[0],
         "maxResults": int(payload.get("max_results", 20)),
         "descriptionFormat": "markdown",
     }
+    if len(terms) > 1:
+        actor_input["searchTerms"] = terms[:5]
+    if payload.get("easy_apply"):
+        payload = {**payload, "hours_old": None}  # the actor cannot combine hoursOld with easyApply
     optional_map = {
         "location": "location",
         "sites": "sites",
@@ -247,6 +247,8 @@ def build_apify_input(payload: dict[str, Any]) -> dict[str, Any]:
         "is_remote": "isRemote",
         "easy_apply": "easyApply",
         "linkedin_fetch_description": "linkedinFetchDescription",
+        "distance": "distance",
+        "enforce_annual_salary": "enforceAnnualSalary",
     }
     for source_key, actor_key in optional_map.items():
         value = payload.get(source_key)
@@ -267,7 +269,8 @@ def start_apify_search(db: Session, payload: dict[str, Any]) -> SearchRun:
         raise RuntimeError("APIFY_API_TOKEN is missing")
 
     actor_id = (payload.get("actor_id") or settings.apify_actor_id).strip()
-    actor_input = build_apify_input(payload)
+    # Search profiles pass an input already built for this actor's schema.
+    actor_input = payload.get("actor_input") or build_apify_input(payload)
     api_actor_id = _apify_actor_api_id(actor_id)
     headers = {
         "Authorization": f"Bearer {settings.apify_api_token}",
@@ -327,7 +330,9 @@ def refresh_apify_run(db: Session, search_run: SearchRun) -> dict[str, Any]:
             items = payload.get("items", []) if isinstance(payload, dict) else payload
             if not isinstance(items, list):
                 items = []
-            import_stats = import_apify_items(db, items, search_run.id)
+            from app.services.actors import default_site_for
+
+            import_stats = import_apify_items(db, items, search_run.id, default_site_for(search_run.actor_id))
             search_run.item_count = import_stats["seen"]
             search_run.created_jobs = import_stats["created"]
             search_run.completed_at = datetime.now(UTC).replace(tzinfo=None)

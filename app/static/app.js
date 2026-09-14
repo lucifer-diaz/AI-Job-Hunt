@@ -47,7 +47,8 @@ async function busy(key, fn, okMsg) {
   S.busy[key] = true; render();
   try {
     const out = await fn();
-    if (okMsg) toast(typeof okMsg === 'function' ? okMsg(out) : okMsg);
+    const message = typeof okMsg === 'function' ? okMsg(out) : okMsg;
+    if (message) toast(message);
     return out;
   } catch (e) { toast(e.message, true); }
   finally { delete S.busy[key]; render(); }
@@ -76,7 +77,7 @@ const btn = (text, act, data = {}, cls = '', disabled = false) =>
 
 /* form drafts survive re-renders */
 const fv = (form, key, fallback) => (S.forms[form] && key in S.forms[form]) ? S.forms[form][key] : fallback;
-const setF = (form, key, value) => { (S.forms[form] = S.forms[form] || {})[key] = value; };
+const setF = (form, key, value) => { (S.forms[form] = S.forms[form] || {})[key] = value; if (form === 'sp') schedulePreview(); };
 function inputF(form, key, value, extra = '') { return `<input class="input" id="${form}-${key}" data-form="${form}" data-field="${key}" value="${attr(fv(form, key, value ?? ''))}" ${extra}>`; }
 function textareaF(form, key, value, extra = '') { return `<textarea class="textarea" id="${form}-${key}" data-form="${form}" data-field="${key}" ${extra}>${esc(fv(form, key, value ?? ''))}</textarea>`; }
 function checkF(form, key, value, text, extra = '') { const on = fv(form, key, !!value); return `<label class="check"><input type="checkbox" id="${form}-${key}" data-form="${form}" data-field="${key}" ${on ? 'checked' : ''} ${extra}>${text}</label>`; }
@@ -88,11 +89,13 @@ function chips(form, key, values, tone = '') {
   return (fv(form, key, values) || []).map((v, i) => `<span class="chip ${tone}">${esc(v)}<button type="button" aria-label="Remove ${attr(v)}" data-act="tag-remove" data-form="${form}" data-key="${key}" data-index="${i}">×</button></span>`).join('');
 }
 function tagBox(form, key, values, placeholder, max = 20, tone = '') {
-  return `<div class="tagbox" data-tag-box="${key}" data-act="focus-tag" data-target="${form}-${key}">${chips(form, key, values, tone)}<input id="${form}-${key}" data-tag="${key}" data-form="${form}" data-max="${max}" autocomplete="off" placeholder="${attr(placeholder)}"></div>`;
+  return `<div class="tagbox" data-tag-box="${key}" data-act="focus-tag" data-target="${form}-${key}">${chips(form, key, values, tone)}<input id="${form}-${key}" data-tag="${key}" data-form="${form}" data-max="${max}" ${LOCATION_KEYS.includes(key) ? 'data-split="newline"' : ''} autocomplete="off" placeholder="${attr(placeholder)}"></div>`;
 }
-function addTags(form, key, raw, max, fallback) {
+// Locations keep their commas ("New York, NY"), so those inputs split on new lines only.
+const LOCATION_KEYS = ['locations', 'preferred_locations'];
+function addTags(form, key, raw, max, fallback, commas = !LOCATION_KEYS.includes(key)) {
   const list = [...(fv(form, key, fallback) || [])];
-  for (const part of raw.split(/[,\n]/)) {
+  for (const part of raw.split(commas ? /[,\n]/ : /\n/)) {
     const v = part.trim();
     if (!v || list.some(x => x.toLowerCase() === v.toLowerCase())) continue;
     if (list.length >= max) { toast(`You can add up to ${max}.`, true); break; }
@@ -185,7 +188,8 @@ async function loadTable() {
   D.selDetail = S.selJob ? await api(`/api/jobs/${S.selJob}`) : null;
 }
 async function loadSetup() {
-  [D.searchProfile, D.runs] = await Promise.all([api('/api/search/profile'), api('/api/search/apify/runs')]);
+  [D.searchProfile, D.runs, D.actors] = await Promise.all([api('/api/search/profile'), api('/api/search/apify/runs'), api('/api/search/actors')]);
+  schedulePreview();
   if (!D.runs.some(r => r.id === S.runSel)) S.runSel = (D.runs[0] || {}).id || null;
   D.runDetail = S.runSel ? await api(`/api/search/apify/runs/${S.runSel}/detail`) : null;
 }
@@ -449,10 +453,15 @@ function renderTable() {
 function renderSetup() {
   const data = D.searchProfile; if (!data) return loading();
   const p = data.profile, F = 'sp';
-  const roles = fv(F, 'roles', p.roles), locations = fv(F, 'locations', p.locations), sites = fv(F, 'sites', p.sites);
+  const roles = fv(F, 'roles', p.roles), sites = fv(F, 'sites', p.sites);
   const suggestions = (D.summary && D.profileRoles || []).filter(r => !roles.includes(r)).slice(0, 3);
-  const combos = Math.max(1, locations.length);
-  const results = combos * Number(fv(F, 'max_results', p.max_results)) * Math.max(1, sites.length);
+  const actors = fv(F, 'actors', p.actors || []), customs = fv(F, 'custom_actors', p.custom_actors || []);
+  const catalogList = [...(D.actors?.actors || []).filter(a => !a.custom),
+    ...customs.map(c => ({ ...c, name: c.name || c.id, summary: 'Added by you', cost: "see the actor's pricing", custom: true }))];
+  const on = id => actors.includes(id);
+  const platforms = fv(F, 'remote_platforms', p.remote_platforms || []), seniority = fv(F, 'seniority', p.seniority || []);
+  const hint = catalogList.filter(a => on(a.id) && a.location_hint).map(a => a.location_hint).join(' ');
+  const preview = D.spPreview;
   const run = D.runDetail;
   const boardName = { linkedin: 'LinkedIn', indeed: 'Indeed', glassdoor: 'Glassdoor', naukri: 'Naukri', bayt: 'Bayt', zip_recruiter: 'ZipRecruiter' };
   return `<div class="split">
@@ -464,25 +473,45 @@ function renderSetup() {
         <div class="tagbox" data-tag-input="roles" data-act="focus-tag" data-target="sp-roles">${chips(F, 'roles', p.roles)}<input id="sp-roles" data-tag="roles" data-form="sp" data-max="5" autocomplete="off" placeholder="Type a role, then press Enter"></div>
         <div class="helper">Press Enter to add each role · Backspace removes the last one${suggestions.length ? ` · Suggested from your profile: ${suggestions.map(s => `<a href="#" data-act="suggest-role" data-role="${attr(s)}">${esc(s)}</a>`).join(' · ')}` : ''}</div></div>
       <div><div class="small b mb8">Locations <span class="faint" style="font-weight:400">· up to 5, one search each</span></div>
-        <div class="tagbox" data-tag-input="locations" data-act="focus-tag" data-target="sp-locations">${chips(F, 'locations', p.locations)}<input id="sp-locations" data-tag="locations" data-form="sp" data-max="5" autocomplete="off" placeholder="Type a city or Remote, then press Enter"></div>
-        <div class="helper">Press Enter to add each location · leave empty to search anywhere</div></div>
-      <div><div class="small b mb8">Boards</div><div class="grid-auto w140">${Object.keys(boardName).map(b => `<label class="board-opt ${sites.includes(b) ? 'on' : ''}"><input type="checkbox" data-act="toggle-site" data-site="${b}" ${sites.includes(b) ? 'checked' : ''}><span class="grow">${boardName[b]}</span><span class="tiny mono faint" title="kept per 100 found, last 30 days">${data.board_yield[b] ?? '—'}</span></label>`).join('')}</div>
-        <div class="helper">Numbers show jobs kept per 100 found over the last 30 days.</div></div>
-      <div><div class="small b mb8">Filters</div><div class="grid-auto">
-        <label class="field">Posted within${selectF(F, 'hours_old', p.hours_old, [[24, 'Past 24 hours'], [72, 'Past 3 days'], [168, 'Past 7 days'], [720, 'Past 30 days']])}</label>
-        <label class="field">Job type${selectF(F, 'job_type', p.job_type, [['', 'Any job type'], ['fulltime', 'Full-time'], ['parttime', 'Part-time'], ['contract', 'Contract']])}</label>
-        <label class="field">Results per combination${inputF(F, 'max_results', p.max_results, 'type="number" min="1" max="100"')}</label>
+        <div class="tagbox" data-tag-input="locations" data-act="focus-tag" data-target="sp-locations">${chips(F, 'locations', p.locations)}<input id="sp-locations" data-tag="locations" data-form="sp" data-max="5" data-split="newline" autocomplete="off" placeholder="Type a city or Remote, then press Enter"></div>
+        <div class="helper">Press Enter to add each location — commas stay part of it (New York, NY) · leave empty to search anywhere</div></div>
+      <div><div class="row base between mb8"><span class="small b">Apify actors <span class="faint" style="font-weight:400">· pick one or more</span></span><a href="#" class="xs" data-act="toggle-add-actor">${S.addActor ? 'Close' : '+ Add your own actor'}</a></div>
+        <div class="grid-auto" style="grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:8px">${catalogList.map(a => `<label class="board-opt ${on(a.id) ? 'on' : ''}" style="align-items:flex-start"><input type="checkbox" data-act="toggle-actor" data-actor="${attr(a.id)}" ${on(a.id) ? 'checked' : ''} style="margin-top:3px"><span class="grow" style="min-width:0"><span class="small b" style="display:block">${esc(a.name)}</span><span class="xs muted" style="display:block">${esc(a.summary)}</span><span class="tiny faint" style="display:block;margin-top:4px"><span class="mono">${esc(a.id)}</span> · ${esc(a.cost)} · ${esc(FANOUT[a.fan_out] || a.fan_out)}</span></span>${a.custom ? `<button type="button" class="btn ghost sm danger none" data-act="remove-actor" data-actor="${attr(a.id)}">Remove</button>` : ''}</label>`).join('') || '<span class="small muted">Loading actors…</span>'}</div>
+        ${hint ? `<div class="helper" style="color:var(--warn)">${esc(hint)}</div>` : ''}
+        ${S.addActor ? addActorForm() : ''}</div>
+      ${on('openclawai/job-board-scraper') ? `<div class="box soft" style="padding:14px"><div class="small b mb8">Multi Job Board settings</div>
+        <div class="grid-auto w140">${Object.keys(boardName).map(b => `<label class="board-opt ${sites.includes(b) ? 'on' : ''}"><input type="checkbox" data-act="toggle-site" data-site="${b}" ${sites.includes(b) ? 'checked' : ''}><span class="grow">${boardName[b]}</span><span class="tiny mono faint" title="kept per 100 found, last 30 days">${data.board_yield[b] ?? '—'}</span></label>`).join('')}</div>
+        <div class="helper">Numbers show jobs kept per 100 found over the last 30 days.</div>
+        <div class="grid-auto mt12"><label class="field">Indeed &amp; Glassdoor country${inputF(F, 'country_indeed', p.country_indeed, 'list="indeed-countries" placeholder="usa, uk, india…"')}<datalist id="indeed-countries">${COUNTRIES.map(c => `<option value="${c}">`).join('')}</datalist></label>
+          <label class="field">Search radius (miles)${inputF(F, 'distance', p.distance, 'type="number" min="0" max="500"')}</label>
+          <label class="field">Skip first N results${inputF(F, 'offset', p.offset, 'type="number" min="0" max="1000"')}</label></div>
+        <div class="mt12"><div class="xs muted mb4">LinkedIn company IDs <span class="faint">· optional, restricts LinkedIn to these companies</span></div>${tagBox(F, 'linkedin_company_ids', p.linkedin_company_ids || [], 'e.g. 1441, then Enter', 20)}</div>
+        <div class="row gap16 wrap mt12">${checkF(F, 'fetch_description', p.fetch_description, 'Fetch full LinkedIn descriptions')}${checkF(F, 'enforce_annual_salary', p.enforce_annual_salary, 'Normalize salaries to annual')}${checkF(F, 'residential_proxy', p.residential_proxy, 'Residential proxy (recommended for LinkedIn)')}</div></div>` : ''}
+      ${on('benthepythondev/remote-jobs-aggregator') ? `<div class="box soft" style="padding:14px"><div class="small b mb8">Remote Jobs Aggregator boards</div>
+        <div class="grid-auto w140">${(D.actors?.remote_platforms || []).map(pl => `<label class="board-opt ${platforms.includes(pl) ? 'on' : ''}"><input type="checkbox" data-act="toggle-list" data-key="remote_platforms" data-value="${pl}" ${platforms.includes(pl) ? 'checked' : ''}><span class="grow">${pl}</span></label>`).join('')}</div></div>` : ''}
+      ${on('shahidirfan/Remoteok-Job-Scraper') ? `<div class="box soft" style="padding:14px"><label class="field strong">RemoteOK start page${inputF(F, 'remoteok_url', p.remoteok_url, 'placeholder="https://remoteok.com/remote-dev-jobs"')}</label>
+        <div class="helper">Use a category page such as https://remoteok.com/remote-dev-jobs to narrow results before the keyword filter.</div></div>` : ''}
+      <div><div class="small b mb8">Filters <span class="faint" style="font-weight:400">· each actor receives the filters it supports</span></div><div class="grid-auto">
+        <label class="field">Posted within${selectF(F, 'hours_old', p.hours_old, [[1, 'Past hour'], [24, 'Past 24 hours'], [72, 'Past 3 days'], [168, 'Past 7 days'], [720, 'Past 30 days'], [0, 'Any time']])}</label>
+        <label class="field">Job type${selectF(F, 'job_type', p.job_type, [['', 'Any job type'], ['fulltime', 'Full-time'], ['parttime', 'Part-time'], ['contract', 'Contract'], ['internship', 'Internship'], ['temporary', 'Temporary']])}</label>
+        <label class="field">Results per search${inputF(F, 'max_results', p.max_results, 'type="number" min="1" max="100"')}</label>
         <label class="field">Run schedule${selectF(F, 'schedule', p.schedule, [['daily', 'Daily (cron)'], ['manual', 'Manual only']])}</label></div>
-        <div class="row gap16 wrap mt12">${checkF(F, 'is_remote', p.is_remote, 'Remote only')}${checkF(F, 'skip_agencies', p.skip_agencies, 'Skip agencies &amp; reposts in triage')}${checkF(F, 'auto_rank', p.auto_rank, 'Auto-rank on import')}</div></div>
+        <div class="mt12"><div class="xs muted mb4">Seniority <span class="faint">· Advanced LinkedIn and Remote Jobs Aggregator</span></div><div class="row gap6 wrap">${(D.actors?.seniority || []).map(s => `<button type="button" class="btn sm ${seniority.includes(s) ? 'soft' : ''}" data-act="toggle-list" data-key="seniority" data-value="${s}">${seniority.includes(s) ? '✓ ' : ''}${s}</button>`).join('')}</div></div>
+        <div class="mt12"><div class="xs muted mb4">Exclude titles or keywords</div>${tagBox(F, 'exclude_keywords', p.exclude_keywords || [], 'e.g. intern, then Enter', 20)}</div>
+        <div class="row gap16 wrap mt12">${checkF(F, 'is_remote', p.is_remote, 'Remote only')}${checkF(F, 'easy_apply', p.easy_apply, 'Easy Apply only')}${checkF(F, 'salary_only', p.salary_only, 'Salary listed only')}${checkF(F, 'visa_sponsorship', p.visa_sponsorship, 'Offers visa sponsorship')}${checkF(F, 'skip_agencies', p.skip_agencies, 'Skip agencies &amp; reposts')}${checkF(F, 'auto_rank', p.auto_rank, 'Auto-rank on import')}</div></div>
     </div>
     <div class="card-foot row gap12 wrap">
       ${btn(label('run', 'Run now &amp; triage', 'Starting…'), 'run-search', {}, 'primary lg', isBusy('run') || !!S.polling)}
       ${btn(label('saveSp', 'Save profile', 'Saving…'), 'save-search', {}, 'lg', isBusy('saveSp'))}
-      <span class="small muted">${combos} search${combos === 1 ? '' : 'es'} · up to ~${results} results</span></div>
+      <span class="small muted grow">${!preview ? 'Planning runs…' : preview.error ? esc(preview.error)
+        : `${preview.runs.length} run${preview.runs.length === 1 ? '' : 's'} across ${new Set(preview.runs.map(r => r.actor_id)).size} actor${new Set(preview.runs.map(r => r.actor_id)).size === 1 ? '' : 's'}`}</span>
+      ${preview?.runs?.length ? btn(S.showInputs ? 'Hide inputs' : 'Show exact inputs', 'toggle-inputs', {}, 'sm ghost') : ''}</div>
+    ${preview?.warnings?.length ? `<div class="banner warn" style="margin:0 22px 16px;display:block">${preview.warnings.map(w => `<div>• ${esc(w)}</div>`).join('')}</div>` : ''}
+    ${S.showInputs && preview?.runs?.length ? `<div style="margin:0 22px 18px" class="doc clip"><pre class="plain mono" style="font-size:11px">${esc(JSON.stringify(preview.runs.map(r => ({ actor: r.actor_id, location: r.location, input: r.input })), null, 2))}</pre></div>` : ''}
   </section>
   <div class="c-narrow col gap14">
     <section class="card flush"><div class="card-head"><div class="card-title sm">Recent runs</div><div class="card-sub">Pick a run to see exactly what it searched and everything it pulled.</div></div>
-      ${D.runs.length ? D.runs.slice(0, 6).map(r => `<div class="lrow click ${r.id === S.runSel ? 'sel' : ''}" data-act="select-run" data-id="${r.id}" style="align-items:flex-start"><span class="dot" style="width:7px;height:7px;margin-top:6px;background:${r.status === 'SUCCEEDED' ? '#0f9c86' : r.completed_at ? '#c22f4e' : '#e0a136'}"></span><div class="grow"><div class="small b">Run #${r.id} · ${esc(r.status.toLowerCase())}</div><div class="xs muted mt4">${r.created_jobs} new from ${r.item_count} results · ${fmtDateTime(r.created_at)}</div></div></div>`).join('') : `<div class="small muted" style="padding:16px">No runs yet.</div>`}
+      ${D.runs.length ? D.runs.slice(0, 6).map(r => `<div class="lrow click ${r.id === S.runSel ? 'sel' : ''}" data-act="select-run" data-id="${r.id}" style="align-items:flex-start"><span class="dot" style="width:7px;height:7px;margin-top:6px;background:${r.status === 'SUCCEEDED' ? '#0f9c86' : r.completed_at ? '#c22f4e' : '#e0a136'}"></span><div class="grow"><div class="small b">Run #${r.id} · ${esc(r.status.toLowerCase())}</div><div class="xs muted mt4"><span class="mono">${esc((r.actor_id || '').split('/').pop())}</span> · ${r.created_jobs} new from ${r.item_count} results · ${fmtDateTime(r.created_at)}</div></div></div>`).join('') : `<div class="small muted" style="padding:16px">No runs yet.</div>`}
       ${run ? `<div style="padding:16px;background:#fbfbfe">
         <div class="row base between wrap mb12"><div class="base b">Run #${run.id}</div>${pill(run.status, run.status === 'SUCCEEDED' ? 'good' : run.completed ? 'bad' : 'warn')}</div>
         <div class="grid-auto w96 mb14">${[['pulled', 'Pulled', 'var(--ink)'], ['new', 'New', 'var(--good)'], ['duplicates', 'Duplicates', 'var(--muted)'], ['filtered', 'Filtered out', 'var(--warn)']].map(([k, l, c]) => `<div class="box" style="padding:9px 10px"><div class="mono bb" style="font-size:17px;color:${c}">${run.counts[k]}</div><div class="tiny muted">${l}</div></div>`).join('')}</div>
@@ -880,14 +909,48 @@ async function pollRuns() {
     go('discovery', { discMode: 'triage', triagedThisSession: 0 });
   } catch (e) { toast(`Could not refresh search status: ${e.message}`, true); S.polling = null; render(); }
 }
+const FANOUT = { role_location: 'one run per role × location', location: 'one run per location', role: 'one run per role', once: 'one run for everything' };
+const COUNTRIES = ['usa', 'uk', 'canada', 'australia', 'india', 'singapore', 'uae', 'germany', 'france', 'netherlands', 'ireland', 'spain', 'italy', 'japan', 'brazil', 'mexico', 'south africa', 'new zealand'];
+const DEFAULT_TEMPLATE = JSON.stringify({ searchTerm: '{{role}}', location: '{{location}}', maxItems: '{{max_results}}' }, null, 2);
+function addActorForm() {
+  return `<div class="box brand mt10" style="padding:14px"><div class="small b mb4">Add an Apify actor</div>
+    <div class="xs muted mb8">Any Store actor that returns job listings. Items are normalized automatically — title, company, location, URL and description.</div>
+    <div class="row gap8 wrap">${inputF('ca', 'id', '', 'placeholder="username/actor-name" style="flex:1 1 220px;margin-top:0"')}${btn(label('lookup', 'Look up on Apify', 'Looking up…'), 'lookup-actor', {}, 'sm', isBusy('lookup'))}</div>
+    ${inputF('ca', 'name', '', 'placeholder="Display name"')}
+    <label class="field mt8">Runs${selectF('ca', 'fan_out', 'role_location', Object.entries(FANOUT).map(([k, v]) => [k, v[0].toUpperCase() + v.slice(1)]))}</label>
+    <label class="field mt8">Input template (JSON)${textareaF('ca', 'input_template', DEFAULT_TEMPLATE, 'style="font-family:var(--mono);font-size:11.5px;min-height:130px"')}</label>
+    <div class="helper">Placeholders: ${(D.actors?.placeholders || []).map(x => `<span class="mono">{{${x}}}</span>`).join(' ')}. A value that is only a placeholder keeps its type (number, list, true/false).</div>
+    ${S.caFields ? `<div class="xs muted mt8">This actor accepts: ${S.caFields.map(f => `<span class="mono">${esc(f.name)}${f.required ? '*' : ''}</span>`).join(', ') || 'no documented inputs'}</div>` : ''}
+    ${btn('Add actor', 'add-actor', {}, 'primary sm mt10')}</div>`;
+}
 function searchPayload() {
-  const p = D.searchProfile.profile, F = 'sp';
+  const p = D.searchProfile.profile, F = 'sp', v = (k, d) => fv(F, k, p[k] ?? d);
   return {
-    roles: fv(F, 'roles', p.roles), locations: fv(F, 'locations', p.locations), sites: fv(F, 'sites', p.sites),
-    hours_old: Number(fv(F, 'hours_old', p.hours_old)), max_results: Number(fv(F, 'max_results', p.max_results)),
-    job_type: fv(F, 'job_type', p.job_type), seniority: p.seniority, is_remote: fv(F, 'is_remote', p.is_remote),
-    skip_agencies: fv(F, 'skip_agencies', p.skip_agencies), auto_rank: fv(F, 'auto_rank', p.auto_rank), schedule: fv(F, 'schedule', p.schedule),
+    roles: v('roles', []), locations: v('locations', []), actors: v('actors', []), custom_actors: v('custom_actors', []),
+    sites: v('sites', []), remote_platforms: v('remote_platforms', []), remoteok_url: v('remoteok_url', ''),
+    hours_old: Number(v('hours_old', 168)) || 0, max_results: Number(v('max_results', 20)) || 20, offset: Number(v('offset', 0)) || 0,
+    job_type: v('job_type', ''), seniority: v('seniority', []), country_indeed: v('country_indeed', 'usa'),
+    distance: Number(v('distance', 50)) || 0, is_remote: !!v('is_remote', false), easy_apply: !!v('easy_apply', false),
+    fetch_description: !!v('fetch_description', true), enforce_annual_salary: !!v('enforce_annual_salary', false),
+    residential_proxy: !!v('residential_proxy', true), salary_only: !!v('salary_only', false), visa_sponsorship: !!v('visa_sponsorship', false),
+    exclude_keywords: v('exclude_keywords', []), linkedin_company_ids: v('linkedin_company_ids', []),
+    skip_agencies: !!v('skip_agencies', true), auto_rank: !!v('auto_rank', true), schedule: v('schedule', 'manual'),
   };
+}
+let previewTimer;
+function schedulePreview() {
+  clearTimeout(previewTimer);
+  previewTimer = setTimeout(async () => {
+    if (!D.searchProfile) return;
+    try { D.spPreview = await api('/api/search/profile/preview', { method: 'POST', body: searchPayload() }); }
+    catch (e) { D.spPreview = { runs: [], warnings: [], error: e.message }; }
+    if (S.screen === 'discovery' && S.discMode === 'setup') render();
+  }, 350);
+}
+function toggleIn(key, value) {
+  const list = [...(fv('sp', key, D.searchProfile.profile[key] || []) || [])];
+  const i = list.indexOf(value); i >= 0 ? list.splice(i, 1) : list.push(value);
+  setF('sp', key, list); render();
 }
 async function saveSearchProfile() {
   const pending = document.getElementById('sp-roles')?.value.trim(); if (pending) addTags('sp', 'roles', pending, 5, D.searchProfile.profile.roles);
@@ -972,20 +1035,52 @@ const A = {
     const list = [...(fv(form, key, tagFallback(form, key)) || [])]; list.splice(Number(el.dataset.index), 1); setF(form, key, list); render();
   },
   'suggest-role': (el, e) => { e.preventDefault(); addTags('sp', 'roles', el.dataset.role, 5, D.searchProfile.profile.roles); render(); },
-  'toggle-site': el => {
-    const sites = [...fv('sp', 'sites', D.searchProfile.profile.sites)];
-    const i = sites.indexOf(el.dataset.site); i >= 0 ? sites.splice(i, 1) : sites.push(el.dataset.site);
-    setF('sp', 'sites', sites); render();
+  'toggle-site': el => toggleIn('sites', el.dataset.site),
+  'toggle-actor': el => toggleIn('actors', el.dataset.actor),
+  'toggle-list': el => toggleIn(el.dataset.key, el.dataset.value),
+  'toggle-inputs': () => { S.showInputs = !S.showInputs; render(); },
+  'toggle-add-actor': (el, e) => { e.preventDefault(); S.addActor = !S.addActor; S.caFields = null; render(); },
+  'remove-actor': (el, e) => {
+    e.preventDefault(); e.stopPropagation();
+    const p = D.searchProfile.profile, id = el.dataset.actor;
+    setF('sp', 'custom_actors', fv('sp', 'custom_actors', p.custom_actors || []).filter(c => c.id !== id));
+    setF('sp', 'actors', fv('sp', 'actors', p.actors || []).filter(a => a !== id));
+    render(); toast('Actor removed — save the profile to keep the change');
+  },
+  'lookup-actor': () => busy('lookup', async () => {
+    const id = (fv('ca', 'id', '') || '').trim();
+    if (!/^[\w.-]+[/~][\w.-]+$/.test(id)) throw new Error('Enter the actor as username/actor-name');
+    const out = await api('/api/search/actors/lookup', { method: 'POST', body: { id } });
+    setF('ca', 'id', out.id); setF('ca', 'name', out.name);
+    if (Object.keys(out.input_template).length) setF('ca', 'input_template', JSON.stringify(out.input_template, null, 2));
+    S.caFields = out.fields;
+    return out;
+  }, out => `Found ${out.name} · ${out.fields.length} documented inputs`),
+  'add-actor': () => {
+    const f = S.forms.ca || {}, p = D.searchProfile.profile, id = (f.id || '').trim();
+    if (!/^[\w.-]+[/~][\w.-]+$/.test(id)) return toast('Enter the actor as username/actor-name', true);
+    if ((D.actors?.actors || []).some(a => !a.custom && a.id === id)) return toast('That actor is already built in — just tick it', true);
+    let template;
+    try { template = JSON.parse(f.input_template ?? DEFAULT_TEMPLATE); } catch { return toast('The input template is not valid JSON', true); }
+    if (!template || typeof template !== 'object' || Array.isArray(template)) return toast('The input template must be a JSON object', true);
+    const customs = fv('sp', 'custom_actors', p.custom_actors || []).filter(c => c.id !== id);
+    customs.push({ id, name: (f.name || '').trim() || id, fan_out: f.fan_out || 'role_location', input_template: template });
+    setF('sp', 'custom_actors', customs);
+    const selected = fv('sp', 'actors', p.actors || []);
+    if (!selected.includes(id)) setF('sp', 'actors', [...selected, id]);
+    delete S.forms.ca; S.addActor = false; S.caFields = null;
+    render(); toast('Actor added — save the profile to keep it');
   },
   'save-search': () => busy('saveSp', saveSearchProfile, 'Search profile saved'),
   'run-search': () => busy('run', async () => {
     if (!D.searchProfile) D.searchProfile = await api('/api/search/profile');
     if (S.screen === 'discovery' && S.discMode === 'setup') await saveSearchProfile();
     const out = await api('/api/search/profile/run', { method: 'POST' });
-    S.polling = { ids: out.runs.map(r => r.id), text: `Started ${out.runs.length} search${out.runs.length === 1 ? '' : 'es'}. Waiting for results…` };
+    const actorCount = new Set(out.runs.map(r => r.actor_id)).size;
+    S.polling = { ids: out.runs.map(r => r.id), text: `Started ${out.runs.length} run${out.runs.length === 1 ? '' : 's'} on ${actorCount} actor${actorCount === 1 ? '' : 's'}. Waiting for results…` };
     setTimeout(pollRuns, 3000);
     return out;
-  }),
+  }, out => out.warnings?.length ? `Started · note: ${out.warnings[0]}` : null),
   'select-run': async el => { S.runSel = Number(el.dataset.id); render(); D.runDetail = await api(`/api/search/apify/runs/${S.runSel}/detail`).catch(e => { toast(e.message, true); return null; }); render(); },
   'add-manual': () => busy('manual', async () => {
     const m = S.forms.manual || {};
@@ -1212,7 +1307,7 @@ document.addEventListener('keydown', e => {
   if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); A.palette(); return; }
   if (e.key === 'Escape') { if (S.paletteOpen || S.jobOpen || S.kitJob) { S.paletteOpen = false; S.jobOpen = null; S.kitJob = null; render(); } return; }
   if (el.dataset && el.dataset.tag) {
-    if (e.key === 'Enter' || e.key === ',') { e.preventDefault(); if (el.value.trim()) commitTag(el); return; }
+    if (e.key === 'Enter' || (e.key === ',' && el.dataset.split !== 'newline')) { e.preventDefault(); if (el.value.trim()) commitTag(el); return; }
     if (e.key === 'Backspace' && !el.value) {
       const { form, tag } = el.dataset;
       if (form === 'triage') { S.triage.keywords.pop(); load(); return; }
@@ -1234,7 +1329,7 @@ document.addEventListener('paste', e => {
   const el = e.target;
   if (!el.dataset || !el.dataset.tag) return;
   const text = e.clipboardData.getData('text');
-  if (/[,\n]/.test(text)) { e.preventDefault(); el.value = text; commitTag(el); }
+  if ((el.dataset.split === 'newline' ? /\n/ : /[,\n]/).test(text)) { e.preventDefault(); el.value = text; commitTag(el); }
 });
 // Tracker drag and drop
 document.addEventListener('dragstart', e => { const card = e.target.closest?.('[data-drag-app]'); if (card) { e.dataTransfer.setData('text/plain', card.dataset.dragApp); e.dataTransfer.effectAllowed = 'move'; } });
