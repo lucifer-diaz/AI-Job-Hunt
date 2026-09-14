@@ -29,6 +29,7 @@ from app.models import (AppSetting, Application, ApplicationEvent, Evidence, Fol
                         ResumeDocument, ResumeVariant, SearchRun)
 from app.services.actors import (BUILTIN, DEFAULT_ACTORS, FAN_OUTS, MAX_RUNS, PLACEHOLDERS, REMOTE_PLATFORMS,
                                  SENIORITY_LEVELS, catalog as actor_catalog, describe_input, plan_runs)
+from app.services.ai_config import STAGES as AI_STAGES, is_free_model, resolve as resolve_ai_config
 from app.services.llm import LLMClient
 from app.services.sources import UA, start_apify_search, upsert_job
 from app.services.workflow import (draft_followup, followup_days, get_profile, rank_job, resume_edits,
@@ -1168,21 +1169,14 @@ class PreferencesIn(BaseModel):
 
 @router.get("/api/preferences")
 def preferences_get(db: Session = Depends(get_db)):
-    settings = get_settings()
-    row = setting_row(db)
-    provider = row.llm_provider
-    def model_for(stage: str) -> str:
-        if provider == "openrouter":
-            return getattr(settings, f"openrouter_model_{stage}") or row.model or settings.openrouter_model
-        if provider == "mock":
-            return "mock (no API calls)"
-        return row.model or getattr(settings, f"{provider}_model", "")
+    config = resolve_ai_config(get_settings(), (setting_row(db).preferences or {}).get("ai") or {})
+    provider = config["llm_provider"]
     stage_models = []
-    for stage, label in (("rank", "Rank"), ("tailor", "Tailor"), ("review", "Review"), ("followup", "Follow-up")):
-        model = model_for(stage)
-        free = provider == "mock" or model == "openrouter/free" or ":free" in model
-        stage_models.append({"stage": label, "model": model, "badge": "free" if free else "paid"})
-    return {**prefs(db), "stage_models": stage_models, "require_free": settings.openrouter_require_free}
+    for stage, label in AI_STAGES:
+        model = "mock (no API calls)" if provider == "mock" else config["stage_models"][stage]
+        stage_models.append({"id": stage, "stage": label, "model": model, "source": config["stage_sources"][stage],
+                             "badge": "free" if is_free_model(provider, model) else "paid"})
+    return {**prefs(db), "stage_models": stage_models, "require_free": config["require_free"]}
 
 
 @router.put("/api/preferences")

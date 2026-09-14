@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.services.ai_config import resolve as resolve_ai_config
 from app.services.llm import LLMClient, LLMError, _is_free_openrouter_model, _task_from_prompt
 
 
@@ -56,7 +57,7 @@ def test_openrouter_stage_model_and_fallbacks(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=FakeOpenAI))
 
-    client = LLMClient()
+    client = LLMClient(overrides={})
     client.settings = _settings(
         openrouter_model_rank="nvidia/example:free",
         openrouter_fallback_models="vendor/backup:free,openrouter/free",
@@ -72,8 +73,28 @@ def test_openrouter_stage_model_and_fallbacks(monkeypatch):
 
 
 def test_require_free_blocks_accidental_paid_model():
-    client = LLMClient()
+    client = LLMClient(overrides={})
     client.settings = _settings(openrouter_model_review="anthropic/some-paid-model")
 
     with pytest.raises(LLMError, match="OPENROUTER_REQUIRE_FREE=true"):
         client.generate_json("system", "REVIEW_RESUME\nresume")
+
+
+def test_saved_settings_override_env_and_blank_values_fall_back():
+    env = _settings(openrouter_model="openrouter/free", openrouter_model_rank="env/rank:free",
+                    openrouter_model_tailor="env/tailor:free")
+    # Nothing saved: every value comes from .env.
+    plain = resolve_ai_config(env, {})
+    assert plain["stage_models"] == {"rank": "env/rank:free", "tailor": "env/tailor:free",
+                                     "review": "openrouter/free", "followup": "openrouter/free"}
+    assert plain["require_free"] is True and plain["sources"]["model"] == "env"
+
+    saved = resolve_ai_config(env, {"stage_models": {"tailor": "db/tailor:free", "review": "  "},
+                                    "require_free": False})
+    assert saved["stage_models"]["tailor"] == "db/tailor:free" and saved["stage_sources"]["tailor"] == "settings"
+    assert saved["stage_models"]["rank"] == "env/rank:free" and saved["stage_models"]["review"] == "openrouter/free"
+    assert saved["require_free"] is False
+
+    client = LLMClient(overrides={"require_free": False, "stage_models": {"review": "vendor/paid"}})
+    client.settings = env
+    assert client._config()["stage_models"]["review"] == "vendor/paid"

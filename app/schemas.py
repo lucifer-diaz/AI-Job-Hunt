@@ -61,8 +61,11 @@ class RecruiterIn(BaseModel):
 
 
 class SettingsIn(BaseModel):
-    llm_provider: str = "openrouter"
-    model: str = "openrouter/free"
+    # Blank AI values mean "use the .env value".
+    llm_provider: str = ""
+    model: str = Field(default="", max_length=300)
+    stage_models: dict[str, str] = Field(default_factory=dict)
+    require_free: bool | None = None
     application_mode: str = "manual_approval"
     min_review_score: int = Field(default=70, ge=0, le=100)
 

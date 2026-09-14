@@ -33,6 +33,25 @@ def test_settings_validation_and_secret_status():
     assert "api_key" not in response.text.lower()
 
 
+def test_ai_settings_persist_and_blank_values_inherit_env():
+    base = {"application_mode": "manual_approval", "min_review_score": 70}
+    assert client.put("/api/settings", json={**base, "stage_models": {"bogus": "x"}}).status_code == 422
+    try:
+        saved = client.put("/api/settings", json={
+            **base, "llm_provider": "openrouter", "model": "",
+            "stage_models": {"tailor": "vendor/tailor:free", "review": ""}, "require_free": False}).json()
+        assert saved["ai"]["saved"]["stage_models"] == {"tailor": "vendor/tailor:free"}
+        assert saved["ai"]["saved"]["require_free"] is False
+        prefs = {s["id"]: s for s in client.get("/api/preferences").json()["stage_models"]}
+        assert prefs["tailor"]["model"] == "vendor/tailor:free" and prefs["tailor"]["source"] == "settings"
+        assert prefs["review"]["source"] in {"env", "default"}
+        assert client.get("/api/preferences").json()["require_free"] is False
+    finally:
+        # Blank everything so other tests keep using their .env / monkeypatched provider.
+        cleared = client.put("/api/settings", json=base).json()
+        assert cleared["ai"]["saved"] == {"llm_provider": "", "model": "", "stage_models": {}, "require_free": None}
+
+
 def test_resume_upload_failure_cases_and_text_success():
     unsupported = client.post("/api/profile/resume", files={
         "file": ("resume.exe", io.BytesIO(b"bad"), "application/octet-stream")})

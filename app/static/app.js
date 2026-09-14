@@ -751,6 +751,10 @@ function renderSettings() {
   const filled = [fv(F, 'name', p.name), fv(F, 'headline', p.headline), fv(F, 'email', p.email), fv(F, 'phone', p.phone), fv(F, 'location', p.location), fv(F, 'total_experience', sp.total_experience), fv(F, 'notice_period', sp.notice_period), fv(F, 'compensation_notes', p.compensation_notes), (fv(F, 'target_roles', p.target_roles) || []).length, (fv(F, 'primary_skills', sp.primary_skills) || []).length, fv(F, 'work_authorization', p.work_authorization), p.master_resume];
   const pct = Math.round(100 * filled.filter(Boolean).length / filled.length);
   const mode = fv('ai', 'application_mode', st.application_mode);
+  // AI editor: blank inputs inherit .env, so placeholders show what would be used.
+  const ai = st.ai, aiProvider = fv('ai', 'llm_provider', ai.saved.llm_provider) || ai.env.llm_provider;
+  const aiDefault = () => String(fv('ai', 'model', ai.saved.model)).trim() || ai.env.models[aiProvider] || '';
+  const stageFallback = id => aiProvider === 'mock' ? 'mock (no API calls)' : (aiProvider === 'openrouter' && !String(fv('ai', 'model', ai.saved.model)).trim() && ai.env.stage_models[id]) || aiDefault();
   const fields = [['name', 'Full name', p.name], ['headline', 'Headline', p.headline], ['email', 'Email', p.email], ['phone', 'Phone', p.phone], ['location', 'Current location', p.location], ['total_experience', 'Total experience', sp.total_experience], ['notice_period', 'Notice period', sp.notice_period], ['compensation_notes', 'Expected compensation', p.compensation_notes]];
   return `<div class="grid-auto" style="grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px;align-items:start">
   <section class="card" style="grid-column:1/-1;padding:20px">
@@ -771,11 +775,12 @@ function renderSettings() {
     </div>
     <div class="row gap9 wrap mt20">${btn(label('profile', 'Save profile', 'Saving…'), 'save-profile', {}, 'primary', isBusy('profile'))}${btn(label('parse', 'Re-parse resume into evidence', 'Parsing…'), 'parse-evidence', {}, '', isBusy('parse'))}</div>
   </section>
-  <section class="card" style="padding:20px"><div class="card-title mb4">AI models per stage</div><div class="card-sub mb16">Keys stay server-side.${pr.require_free ? ' Free-only guard is on for OpenRouter.' : ''}</div>
+  <section class="card" style="padding:20px"><div class="card-title mb4">AI models per stage</div><div class="card-sub mb16">Keys stay server-side. Blank fields inherit the <span class="mono">.env</span> value shown as placeholder.${pr.require_free ? ' Free-only guard is on for OpenRouter.' : ''}</div>
     <div class="grid-auto" style="grid-template-columns:1fr 1fr;gap:10px">
-      <label class="field">Provider${selectF('ai', 'llm_provider', st.llm_provider, [['openrouter', 'OpenRouter'], ['openai', 'OpenAI'], ['anthropic', 'Anthropic'], ['mock', 'Mock / testing']])}</label>
-      <label class="field">Default model${inputF('ai', 'model', st.model)}</label></div>
-    <div class="col gap9 mt12">${pr.stage_models.map(s => `<div class="box row gap12" style="padding:10px 12px"><span class="small b none" style="width:74px">${esc(s.stage)}</span><span class="mono xs ink2 grow ellipsis" style="background:var(--line3);border-radius:6px;padding:4px 7px">${esc(s.model)}</span>${pill(s.badge, s.badge === 'free' ? 'good' : 'warn')}</div>`).join('')}</div>
+      <label class="field">Provider${selectF('ai', 'llm_provider', ai.saved.llm_provider, [['', `From .env (${ai.env.llm_provider})`], ['openrouter', 'OpenRouter'], ['openai', 'OpenAI'], ['anthropic', 'Anthropic'], ['mock', 'Mock / testing']], 'data-live="1"')}</label>
+      <label class="field">Default model${inputF('ai', 'model', ai.saved.model, `placeholder="${attr(ai.env.models[aiProvider] || '')}"`)}</label></div>
+    <div class="col gap9 mt12">${pr.stage_models.map(s => `<div class="box row gap12" style="padding:6px 12px"><span class="small b none" style="width:74px">${esc(s.stage)}</span><input class="input mono xs grow" style="margin:0;min-width:0" id="ai-stage-${s.id}" data-form="ai" data-field="stage_${s.id}" value="${attr(fv('ai', `stage_${s.id}`, ai.saved.stage_models[s.id] || ''))}" placeholder="${attr(stageFallback(s.id))}" ${aiProvider === 'mock' ? 'disabled' : ''}>${pill(s.badge, s.badge === 'free' ? 'good' : 'warn')}</div>`).join('')}</div>
+    <div class="row gap16 wrap mt10">${selectF('ai', 'require_free', ai.saved.require_free == null ? '' : String(ai.saved.require_free), [['', `Free-only guard: from .env (${ai.env.require_free ? 'on' : 'off'})`], ['true', 'Free-only guard: on'], ['false', 'Free-only guard: off']])}</div>
     <div class="xs faint mt8">${Object.entries(st.configured).filter(([k]) => k !== 'mock').map(([k, v]) => `${k}: ${v ? 'key set' : 'no key'}`).join(' · ')}</div>
     <div class="hr" style="margin:16px 0"></div>
     <div class="base b mb4">Approval &amp; submission mode</div><div class="small muted mb10">How far the workflow may run without you.</div>
@@ -1230,7 +1235,9 @@ const A = {
   'resume-primary': el => busy('primary', async () => { D.resumes = await api(`/api/profile/resumes/${el.dataset.id}/primary`, { method: 'POST' }); await load(); }, 'Primary resume updated'),
   'save-ai': () => busy('ai', async () => {
     const st = D.settings;
-    const body = { llm_provider: fv('ai', 'llm_provider', st.llm_provider), model: fv('ai', 'model', st.model), application_mode: fv('ai', 'application_mode', st.application_mode), min_review_score: Number(fv('ai', 'min_review_score', st.min_review_score)) };
+    const saved = st.ai.saved, rf = fv('ai', 'require_free', saved.require_free == null ? '' : String(saved.require_free));
+    const stage_models = {}; ['rank', 'tailor', 'review', 'followup'].forEach(k => { const v = String(fv('ai', `stage_${k}`, saved.stage_models[k] || '')).trim(); if (v) stage_models[k] = v; });
+    const body = { llm_provider: fv('ai', 'llm_provider', saved.llm_provider), model: String(fv('ai', 'model', saved.model)).trim(), stage_models, require_free: rf === '' ? null : rf === 'true', application_mode: fv('ai', 'application_mode', st.application_mode), min_review_score: Number(fv('ai', 'min_review_score', st.min_review_score)) };
     if (body.application_mode === 'automatic' && st.application_mode !== 'automatic' && !confirm('Auto-approval skips the manual queue once a resume passes review. Submitting stays your action. Continue?')) return;
     await api('/api/settings', { method: 'PUT', body }); delete S.forms.ai; await load();
   }, 'AI settings saved'),
