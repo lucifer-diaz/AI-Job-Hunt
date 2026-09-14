@@ -41,6 +41,8 @@ class AppSetting(Base):
     model: Mapped[str] = mapped_column(String(300), default="openrouter/free")
     application_mode: Mapped[str] = mapped_column(String(30), default="manual_approval")
     min_review_score: Mapped[int] = mapped_column(Integer, default=70)
+    # Cadence, tracker stages and other small UI preferences.
+    preferences: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=dict, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
 
 
@@ -107,6 +109,8 @@ class Job(Base):
     fit_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     fit_analysis: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(50), default="discovered")
+    search_run_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    triaged_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     resumes: Mapped[list[ResumeVariant]] = relationship(back_populates="job", cascade="all, delete-orphan")
     application: Mapped[Application | None] = relationship(back_populates="job", uselist=False, cascade="all, delete-orphan")
@@ -158,10 +162,28 @@ class Application(Base):
     recruiter_email: Mapped[str] = mapped_column(String(300), default="")
     notes: Mapped[str] = mapped_column(Text, default="")
     approved_resume_id: Mapped[int | None] = mapped_column(ForeignKey("resume_variants.id", ondelete="SET NULL"), nullable=True)
+    # Post-submission tracker column: applied, acknowledged, screening, interviewing, ..., closed.
+    stage: Mapped[str | None] = mapped_column(String(50), default="applied", nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
     job: Mapped[Job] = relationship(back_populates="application")
     followups: Mapped[list[FollowUp]] = relationship(back_populates="application", cascade="all, delete-orphan")
+    events: Mapped[list[ApplicationEvent]] = relationship(back_populates="application", cascade="all, delete-orphan",
+                                                          order_by="ApplicationEvent.occurred_at")
+
+
+class ApplicationEvent(Base):
+    __tablename__ = "application_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    application_id: Mapped[int] = mapped_column(ForeignKey("applications.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(40), default="note")
+    title: Mapped[str] = mapped_column(String(300), default="")
+    detail: Mapped[str] = mapped_column(Text, default="")
+    occurred_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+    application: Mapped[Application] = relationship(back_populates="events")
 
 
 class FollowUp(Base):

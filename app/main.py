@@ -10,13 +10,14 @@ from io import BytesIO
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from app.db import Base, engine, get_db
 from app.db_migrations import migrate
-from app.models import (AppSetting, Application, CandidateProfile, Evidence, FollowUp, Job,
+from app.models import (AppSetting, Application, CandidateProfile, Evidence, Job,
                         KnowledgeAnswer, ResumeDocument, ResumeVariant, SearchRun)
 from app.schemas import (ApplicationUpdateIn, ApifySearchIn, EvidenceIn, KnowledgeIn,
                          ManualJobIn, ProfileIn, RecruiterIn, SettingsIn)
@@ -24,11 +25,14 @@ from app.services.exports import markdown_to_simple_pdf
 from app.services.sources import import_greenhouse, import_lever, refresh_apify_run, start_apify_search, upsert_job
 from app.services.workflow import approve_job, create_due_followups, get_profile, mark_applied, rank_job, tailor_job
 from app.settings import get_settings
+from app.workspace import router as workspace_router, run_search_profile, get_search_profile
 
 Base.metadata.create_all(bind=engine)
 migrate(engine)
 settings = get_settings()
-app = FastAPI(title=settings.app_name, version="0.3.0")
+app = FastAPI(title=settings.app_name, version="0.5.0")
+app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
+app.include_router(workspace_router)
 
 
 @app.middleware("http")
@@ -84,25 +88,12 @@ def health():
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request, db: Session = Depends(get_db)):
-    jobs = db.scalars(select(Job).order_by(desc(Job.discovered_at)).limit(100)).all()
-    profile = get_profile(db)
-    evidence = db.scalars(select(Evidence).order_by(desc(Evidence.id)).limit(50)).all()
-    applications = db.scalars(select(Application).order_by(desc(Application.id)).limit(50)).all()
-    followups = db.scalars(select(FollowUp).order_by(desc(FollowUp.id)).limit(50)).all()
-    search_runs = db.scalars(select(SearchRun).order_by(desc(SearchRun.id)).limit(10)).all()
-    stats = {
-        "jobs": db.scalar(select(func.count(Job.id))) or 0,
-        "shortlisted": db.scalar(select(func.count(Job.id)).where(Job.status == "shortlisted")) or 0,
-        "tailored": db.scalar(select(func.count(Job.id)).where(Job.status == "tailored")) or 0,
-        "applied": db.scalar(select(func.count(Job.id)).where(Job.status == "applied")) or 0,
-    }
+    # The workspace is a client-rendered app; the shell only carries boot data.
     app_setting = get_app_setting(db)
-    knowledge = db.scalars(select(KnowledgeAnswer).order_by(desc(KnowledgeAnswer.updated_at)).limit(100)).all()
-    resume_document = db.scalar(select(ResumeDocument).where(ResumeDocument.active.is_(True)).order_by(desc(ResumeDocument.id)))
-    return templates.TemplateResponse(request=request, name="dashboard.html", context={ "jobs": jobs, "profile": profile, "evidence": evidence,
-        "applications": applications, "followups": followups, "search_runs": search_runs, "stats": stats,
-        "llm_provider": app_setting.llm_provider, "app_setting": app_setting, "knowledge": knowledge,
-        "resume_document": resume_document, "apify_actor_id": settings.apify_actor_id,
+    profile = get_profile(db)
+    return templates.TemplateResponse(request=request, name="dashboard.html", context={
+        "app_setting": app_setting, "profile": profile, "max_upload_mb": settings.max_resume_upload_mb,
+        "version": app.version,
     })
 
 
@@ -285,9 +276,10 @@ def applied(job_id: int, payload: RecruiterIn, db: Session = Depends(get_db)):
         app_obj = mark_applied(db, job)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    app_obj.recruiter_name = payload.recruiter_name
-    app_obj.recruiter_email = payload.recruiter_email
-    app_obj.notes = payload.notes
+    # Only overwrite what the confirmation step actually supplied.
+    app_obj.recruiter_name = payload.recruiter_name or app_obj.recruiter_name
+    app_obj.recruiter_email = payload.recruiter_email or app_obj.recruiter_email
+    app_obj.notes = payload.notes or app_obj.notes
     db.commit()
     return {"status": app_obj.status, "followup_due_at": app_obj.followup_due_at}
 
@@ -477,3 +469,20 @@ def cron_followups(x_cron_secret: str | None = Header(default=None), db: Session
         return {"created": count}
     except Exception as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/cron/searches")
+def cron_searches(x_cron_secret: str | None = Header(default=None), db: Session = Depends(get_db)):
+    """Run the saved search profile when its schedule is daily. Call once a day from a scheduler."""
+    if settings.cron_secret and x_cron_secret != settings.cron_secret:
+        raise HTTPException(401, "Invalid cron secret")
+    profile = get_search_profile(db)
+    if profile.get("schedule") != "daily":
+        return {"started": 0, "reason": "schedule is manual"}
+    try:
+        runs = run_search_profile(db, profile)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"started": len(runs), "run_ids": [r.id for r in runs]}

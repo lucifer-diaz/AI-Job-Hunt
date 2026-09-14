@@ -34,6 +34,8 @@ def _task_from_prompt(user: str) -> str:
         return "review"
     if "FOLLOW_UP" in user:
         return "followup"
+    if "EXTRACT_EVIDENCE" in user:
+        return "tailor"
     return "default"
 
 
@@ -181,6 +183,10 @@ class LLMClient:
             }
         if "FOLLOW_UP" in user:
             return {"draft": "Hi, I wanted to follow up on my application and reiterate my interest in the role. Best regards."}
+        if "EXTRACT_EVIDENCE" in user:
+            lines = [line.strip(" -•*\t") for line in user.split("MASTER RESUME:", 1)[-1].splitlines()]
+            claims = [line for line in lines if len(line) > 25 and re.search(r"\d", line)][:12]
+            return {"claims": [{"claim": c, "company": "", "role": "", "skills": []} for c in claims]}
         return {
             "summary": "Tailored engineering leader with production AI and backend experience.",
             "skills": ["Python", "FastAPI", "AWS", "Kubernetes"],

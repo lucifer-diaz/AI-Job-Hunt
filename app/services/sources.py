@@ -205,7 +205,7 @@ def normalize_apify_job(item: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def import_apify_items(db: Session, items: list[dict[str, Any]]) -> dict[str, int]:
+def import_apify_items(db: Session, items: list[dict[str, Any]], search_run_id: int | None = None) -> dict[str, int]:
     created = 0
     normalized = 0
     skipped = 0
@@ -215,7 +215,10 @@ def import_apify_items(db: Session, items: list[dict[str, Any]]) -> dict[str, in
             skipped += 1
             continue
         normalized += 1
-        _, is_new = upsert_job(db, **job_data)
+        job, is_new = upsert_job(db, **job_data)
+        if is_new and search_run_id is not None:
+            job.search_run_id = search_run_id
+            db.commit()
         created += int(is_new)
     return {"seen": len(items), "normalized": normalized, "created": created, "skipped": skipped}
 
@@ -324,7 +327,7 @@ def refresh_apify_run(db: Session, search_run: SearchRun) -> dict[str, Any]:
             items = payload.get("items", []) if isinstance(payload, dict) else payload
             if not isinstance(items, list):
                 items = []
-            import_stats = import_apify_items(db, items)
+            import_stats = import_apify_items(db, items, search_run.id)
             search_run.item_count = import_stats["seen"]
             search_run.created_jobs = import_stats["created"]
             search_run.completed_at = datetime.now(UTC).replace(tzinfo=None)
