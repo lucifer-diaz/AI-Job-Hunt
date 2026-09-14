@@ -8,6 +8,7 @@ from pathlib import Path
 from datetime import UTC, datetime
 from io import BytesIO
 
+import httpx
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -91,9 +92,12 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
     # The workspace is a client-rendered app; the shell only carries boot data.
     app_setting = get_app_setting(db)
     profile = get_profile(db)
+    # Cache-bust static assets whenever they change, not only on version bumps.
+    static = Path(__file__).parent / "static"
+    stamp = max(int((static / name).stat().st_mtime) for name in ("app.js", "app.css"))
     return templates.TemplateResponse(request=request, name="dashboard.html", context={
         "app_setting": app_setting, "profile": profile, "max_upload_mb": settings.max_resume_upload_mb,
-        "version": app.version,
+        "version": f"{app.version}-{stamp}",
     })
 
 
@@ -139,20 +143,27 @@ def add_job(payload: ManualJobIn, db: Session = Depends(get_db)):
     return {"created": created, "job": job_dict(job)}
 
 
-@app.post("/api/import/lever/{site}")
-def lever(site: str, db: Session = Depends(get_db)):
+def _board_import(importer, db: Session, token: str, label: str):
     try:
-        return import_lever(db, site)
+        return importer(db, token)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            raise HTTPException(404, f"No public {label} board named '{token}'") from exc
+        raise HTTPException(502, f"{label} returned HTTP {exc.response.status_code}") from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f"Could not reach {label}: {exc.__class__.__name__}") from exc
     except Exception as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/import/lever/{site}")
+def lever(site: str, db: Session = Depends(get_db)):
+    return _board_import(import_lever, db, site, "Lever")
 
 
 @app.post("/api/import/greenhouse/{board_token}")
 def greenhouse(board_token: str, db: Session = Depends(get_db)):
-    try:
-        return import_greenhouse(db, board_token)
-    except Exception as exc:
-        raise HTTPException(400, str(exc)) from exc
+    return _board_import(import_greenhouse, db, board_token, "Greenhouse")
 
 
 @app.post("/api/search/apify")

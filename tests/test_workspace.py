@@ -161,6 +161,25 @@ def test_knowledge_edit_and_url_guards():
     assert blocked.status_code == 422
 
 
+def test_board_import_errors_are_readable(monkeypatch):
+    import httpx
+
+    def missing_board(_db, token):
+        request = httpx.Request("GET", f"https://boards-api.greenhouse.io/v1/boards/{token}/jobs")
+        raise httpx.HTTPStatusError("404", request=request, response=httpx.Response(404, request=request))
+
+    monkeypatch.setattr("app.main.import_greenhouse", missing_board)
+    response = client.post("/api/import/greenhouse/nope")
+    assert response.status_code == 404
+    assert response.json()["detail"] == "No public Greenhouse board named 'nope'"
+
+
+def test_rank_batch_ranks_unranked_jobs():
+    job = make_job()
+    ranked = client.post("/api/jobs/rank-batch").json()
+    assert any(row["id"] == job["id"] and row["score"] == 80 for row in ranked)
+
+
 def test_extract_job_posting_reads_json_ld():
     html = """<html><head><title>Careers</title><script type="application/ld+json">
     {"@type": "JobPosting", "title": "Staff ML Engineer", "hiringOrganization": {"name": "Quantiphi"},

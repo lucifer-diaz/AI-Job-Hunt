@@ -370,7 +370,8 @@ function renderTriage() {
       <div class="col gap12"><label class="field strong">Minimum fit · <span class="mono">${S.triage.min_fit}</span><input type="range" min="0" max="100" step="5" id="triage-min" data-triage="min_fit" value="${S.triage.min_fit}"></label>
         <div><div class="xs muted mb4">Must mention (use / for either)</div>${tagBox('triage', 'keywords', S.triage.keywords, 'Hybrid, Lead/Principal…', 6)}</div>
         <label class="check"><input type="checkbox" data-triage="hide_agencies" ${S.triage.hide_agencies ? 'checked' : ''}>Hide staffing agencies</label>
-        <label class="check"><input type="checkbox" data-triage="hide_reposts" ${S.triage.hide_reposts ? 'checked' : ''}>Hide reposts I've seen</label></div></section>
+        <label class="check"><input type="checkbox" data-triage="hide_reposts" ${S.triage.hide_reposts ? 'checked' : ''}>Hide reposts I've seen</label>
+        ${q.items.some(i => i.fit == null) ? btn(label('rankBatch', 'Rank every unranked job', 'Ranking…'), 'rank-batch', {}, 'soft block', isBusy('rankBatch')) : ''}</div></section>
     <section class="card pad16"><div class="row between mb10"><div class="card-title sm">Saved search</div>${sp ? pill(sp.schedule === 'daily' ? 'daily' : 'manual', sp.schedule === 'daily' ? 'good' : 'muted') : ''}</div>
       ${sp ? `<div class="box"><div class="small b">${esc(sp.roles.join(' · ') || 'No roles yet')}</div><div class="xs muted mt4">${esc(sp.locations.join(' · ') || 'Any location')} · ${sp.sites.length} board${sp.sites.length === 1 ? '' : 's'}${sp.auto_rank ? ' · auto-rank on' : ''}</div></div>` : ''}
       <div class="col gap6 mt10">${(D.runs || []).slice(0, 3).map(r => `<div class="xs muted row gap8"><span class="dot" style="background:${r.status === 'SUCCEEDED' ? '#0f9c86' : r.completed_at ? '#c22f4e' : '#e0a136'}"></span>Run #${r.id} · ${r.created_jobs} new from ${r.item_count} · ${fmtDay(r.created_at)}</div>`).join('')}</div>
@@ -424,6 +425,7 @@ function renderTable() {
       <select class="select" id="flt-stage" data-filter="stage">${opts([['all', 'All stages'], ...['discovered', 'shortlisted', 'maybe', 'archived', 'dismissed', 'tailored', 'approved', 'applied'].map(s => [s, s[0].toUpperCase() + s.slice(1)])], f.stage)}</select>
       <select class="select" id="flt-sort" data-filter="sort">${opts([['fit', 'Sort: best fit'], ['new', 'Sort: newest'], ['company', 'Sort: company']], f.sort)}</select>
       ${btn('Reset', 'reset-filters', {}, 'sm')}
+      ${btn(label('rankBatch', 'Rank unranked', 'Ranking…'), 'rank-batch', {}, 'sm', isBusy('rankBatch'))}
       ${btn(`Bulk shortlist${S.checked.size ? ` (${S.checked.size})` : ''}`, 'bulk', { action: 'shortlist' }, 'sm soft', !S.checked.size)}
       ${S.checked.size ? btn('Dismiss', 'bulk', { action: 'dismiss' }, 'sm danger') : ''}
     </div>
@@ -493,6 +495,10 @@ function renderSetup() {
       ${inputF('manual', 'url', '', 'placeholder="https://…"')}
       ${S.manualMissing ? `<div class="col gap8 mt8"><div class="xs" style="color:var(--warn)">${esc(S.manualMissing)}</div>${inputF('manual', 'title', '', 'placeholder="Job title"')}${inputF('manual', 'company', '', 'placeholder="Company"')}${inputF('manual', 'location', '', 'placeholder="Location (optional)"')}${textareaF('manual', 'description', '', 'placeholder="Paste the description"')}</div>` : ''}
       ${btn(label('manual', 'Add to pipeline', 'Reading posting…'), 'add-manual', {}, 'block mt8', isBusy('manual'))}</section>
+    <section class="card pad16"><div class="card-title sm mb4">Import a company board</div><div class="small muted mb12">Pull every open role from a company's Greenhouse or Lever board. No Apify token needed.</div>
+      <div class="row gap8">${selectF('board', 'kind', 'greenhouse', [['greenhouse', 'Greenhouse'], ['lever', 'Lever']], 'style="width:auto"')}${inputF('board', 'token', '', 'placeholder="Board token, e.g. stripe"')}</div>
+      <div class="helper">The token is the company slug in boards.greenhouse.io/<b>stripe</b> or jobs.lever.co/<b>stripe</b>.</div>
+      ${btn(label('board', 'Import board', 'Importing…'), 'import-board', {}, 'block mt8', isBusy('board'))}</section>
   </div></div>`;
 }
 
@@ -997,6 +1003,19 @@ const A = {
       throw e;
     }
   }),
+  'import-board': () => busy('board', async () => {
+    const kind = fv('board', 'kind', 'greenhouse'), token = (fv('board', 'token', '') || '').trim();
+    if (!/^[\w.-]+$/.test(token)) throw new Error('Enter the board token — letters, numbers, dots or dashes');
+    const out = await api(`/api/import/${kind}/${encodeURIComponent(token)}`, { method: 'POST' });
+    delete S.forms.board; await load(); return out;
+  }, out => `Imported ${out.created} new of ${out.seen} open roles — they are in your triage queue`),
+  'rank-batch': () => busy('rankBatch', async () => {
+    const out = await api('/api/jobs/rank-batch', { method: 'POST' });
+    const failed = out.filter(r => r.error);
+    if (!out.length) throw new Error('Every job is already ranked');
+    if (failed.length === out.length) throw new Error(`Ranking failed: ${failed[0].error}`);
+    await load(); return { ranked: out.length - failed.length, failed: failed.length };
+  }, r => `Ranked ${r.ranked} job${r.ranked === 1 ? '' : 's'}${r.failed ? ` · ${r.failed} failed` : ''}`),
   // tailor
   'pick-tailor': el => go('tailor', { tailorJob: Number(el.value) }),
   'tailor-tab': el => { S.tailorTab = el.dataset.id; S.editing = null; render(); },
@@ -1006,11 +1025,11 @@ const A = {
   }, out => out.auto_approved ? `Packet scored ${Math.round(out.reviewer_score)} and was auto-approved` : `Packet ready · reviewer ${Math.round(out.reviewer_score)}`),
   'edit-start': el => { S.editing = Number(el.dataset.index); render(); document.getElementById(`edit-text-${el.dataset.index}`)?.focus(); },
   'edit-cancel': () => { S.editing = null; render(); },
-  'edit-save': el => busy('edit', async () => {
-    const text = document.getElementById(`edit-text-${el.dataset.index}`).value;
+  // Read typed values before busy() re-renders and replaces the inputs.
+  'edit-save': el => { const text = document.getElementById(`edit-text-${el.dataset.index}`).value; return busy('edit', async () => {
     D.packet = await api(`/api/resumes/${el.dataset.resume}/edits/${el.dataset.index}`, { method: 'PATCH', body: { text, status: 'accepted' } });
     S.editing = null;
-  }, 'Edit saved'),
+  }, 'Edit saved'); },
   'edit-status': el => busy('edit', async () => {
     D.packet = await api(`/api/resumes/${el.dataset.resume}/edits/${el.dataset.index}`, { method: 'PATCH', body: { status: el.dataset.status } });
   }),
@@ -1049,13 +1068,14 @@ const A = {
     if (D.tracker.applications.some(a => a.stage === removed)) throw new Error('Move the applications out of that stage first');
     D.tracker = await api('/api/tracker/stages', { method: 'PUT', body: { extra_stages: extras } });
   }),
-  'log-event': el => busy('log', async () => {
-    const text = document.getElementById('log-text').value.trim();
-    if (!text) throw new Error('Write something to log');
-    const kind = document.getElementById('log-kind').value;
-    await api(`/api/applications/${el.dataset.app}/events`, { method: 'POST', body: { kind, title: kind[0].toUpperCase() + kind.slice(1), detail: text } });
-    await load();
-  }, 'Logged'),
+  'log-event': el => {
+    const text = document.getElementById('log-text').value.trim(), kind = document.getElementById('log-kind').value;
+    if (!text) return toast('Write something to log', true);
+    return busy('log', async () => {
+      await api(`/api/applications/${el.dataset.app}/events`, { method: 'POST', body: { kind, title: kind[0].toUpperCase() + kind.slice(1), detail: text } });
+      await load();
+    }, 'Logged');
+  },
   'edit-recruiter': (el, e) => { e.preventDefault(); S.editingRecruiter = true; render(); },
   'edit-recruiter-cancel': () => { S.editingRecruiter = false; render(); },
   'save-recruiter': el => busy('recruiter', async () => {
@@ -1066,12 +1086,14 @@ const A = {
   'copy-draft': el => copyText(D.tracker.applications.find(a => a.id === Number(el.dataset.app)).draft),
   'schedule-start': () => { S.scheduling = true; render(); document.getElementById('iv-title')?.focus(); },
   'schedule-cancel': () => { S.scheduling = false; render(); },
-  'schedule-save': el => busy('schedule', async () => {
+  'schedule-save': el => {
     const title = document.getElementById('iv-title').value.trim() || 'Interview', at = document.getElementById('iv-at').value;
-    if (!at) throw new Error('Pick a date and time');
-    await api(`/api/applications/${el.dataset.app}/events`, { method: 'POST', body: { kind: 'interview', title, detail: 'Scheduled', occurred_at: new Date(at).toISOString() } });
-    S.scheduling = false; await load();
-  }, 'Interview scheduled'),
+    if (!at) return toast('Pick a date and time', true);
+    return busy('schedule', async () => {
+      await api(`/api/applications/${el.dataset.app}/events`, { method: 'POST', body: { kind: 'interview', title, detail: 'Scheduled', occurred_at: new Date(at).toISOString() } });
+      S.scheduling = false; await load();
+    }, 'Interview scheduled');
+  },
   // knowledge
   'kn-edit': el => { S.editKnowledge = Number(el.dataset.id); render(); },
   'kn-cancel': () => { delete S.forms['kn' + S.editKnowledge]; S.editKnowledge = null; render(); },
