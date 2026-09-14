@@ -981,6 +981,12 @@ def resume_docx(job_id: int, db: Session = Depends(get_db)):
     for line in resume.markdown.split("## Source Resume")[0].splitlines():
         if line.startswith("# "):
             document.add_heading(line[2:], level=0)
+        elif line.startswith("### "):
+            parts = [p.strip() for p in line[4:].split("|")]
+            paragraph = document.add_paragraph()
+            paragraph.add_run(parts[0]).bold = True
+            if len(parts) > 1:
+                paragraph.add_run("  |  " + "  |  ".join(parts[1:]))
         elif line.startswith("## "):
             document.add_heading(line[3:], level=1)
         elif line.startswith("- "):

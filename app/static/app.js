@@ -118,7 +118,10 @@ function miniMarkdown(md) {
   for (const line of body.split('\n')) {
     if (line.startsWith('- ')) { if (!inList) { html += '<ul>'; inList = true; } html += `<li>${esc(line.slice(2))}</li>`; continue; }
     if (inList) { html += '</ul>'; inList = false; }
-    if (line.startsWith('# ')) html += `<h3>${esc(line.slice(2))}</h3>`;
+    if (line.startsWith('### ')) {
+      const [title, ...rest] = line.slice(4).split('|').map(part => part.trim());
+      html += `<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;justify-content:space-between"><span><b style="color:var(--ink)">${esc(title)}</b>${rest.length > 1 ? ` <span class="muted">· ${esc(rest.slice(0, -1).join(' · '))}</span>` : ''}</span><span class="muted">${esc(rest.length ? rest[rest.length - 1] : '')}</span></div>`;
+    } else if (line.startsWith('# ')) html += `<h3>${esc(line.slice(2))}</h3>`;
     else if (line.startsWith('## ')) html += `<h4>${esc(line.slice(3))}</h4>`;
     else if (line.trim()) html += `<div>${esc(line)}</div>`;
   }
@@ -760,7 +763,7 @@ function renderSettings() {
       <div><div class="small b mb8">Work authorization &amp; visa notes</div>${textareaF(F, 'work_authorization', p.work_authorization, 'style="margin-top:0"')}
         <div class="row gap16 wrap mt10">${checkF(F, 'open_to_relocation', sp.open_to_relocation, 'Open to relocation')}${checkF(F, 'open_to_hybrid', sp.open_to_hybrid, 'Open to hybrid')}${checkF(F, 'open_to_contract', sp.open_to_contract, 'Open to contract')}</div>
         <div class="small b mb8 mt16">Master resume text</div>${textareaF(F, 'master_resume', p.master_resume, 'style="margin-top:0;min-height:120px;font-family:var(--mono);font-size:11.5px"')}
-        <div class="helper">Uploading a file replaces this text with what we extract.</div></div>
+        <div class="helper">Uploading a file replaces this text with what we extract. For clean tailoring use the agent-friendly format: <span class="mono">## Summary</span>, <span class="mono">## Skills</span>, <span class="mono">## Experience</span>, one <span class="mono">### Title | Company | Location | Mon YYYY - Mon YYYY</span> line per role, <span class="mono">- </span> bullets, plain punctuation.</div></div>
       <div><div class="small b mb8">Master resume &amp; variants</div><div class="col gap8">
         ${D.resumes.map(d => `<div class="box row gap12 ${d.active ? 'brand' : ''}"><div class="avatar" style="width:34px;height:34px;border-radius:8px;font-size:10px;${d.active ? '' : 'background:var(--soft);color:var(--muted)'}">${esc((d.filename.split('.').pop() || '').toUpperCase().slice(0, 4))}</div><div class="grow"><div class="small b ellipsis">${esc(d.filename)}</div><div class="xs muted">${Math.max(1, Math.round(d.size / 1024))} KB · ${d.words} words${d.active ? ' · primary' : ''}</div></div>${d.active ? `<a class="btn sm" href="/api/profile/resume">Download</a>` : btn('Set primary', 'resume-primary', { id: d.id }, 'sm')}</div>`).join('')}
         <label class="btn block" style="border-style:dashed;color:var(--brand);border-radius:11px;padding:11px">${isBusy('upload') ? 'Uploading…' : `+ Upload ${D.resumes.length ? 'another' : 'a'} resume (PDF, DOCX, TXT · max ${BOOT.max_upload_mb} MB)`}<input type="file" id="resume-file" accept=".txt,.pdf,.docx" hidden></label></div>

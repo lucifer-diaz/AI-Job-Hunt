@@ -190,6 +190,7 @@ class LLMClient:
         return {
             "summary": "Tailored engineering leader with production AI and backend experience.",
             "skills": ["Python", "FastAPI", "AWS", "Kubernetes"],
+            "experience": [{"role_index": 0, "bullets": ["Built and operated production backend and AI systems."]}],
             "experience_bullets": ["Built and operated production backend and AI systems."],
             "selected_evidence_ids": [],
             "cover_letter": "I am excited to apply because the role aligns with my production engineering and AI experience.",
