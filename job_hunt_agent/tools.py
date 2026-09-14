@@ -13,7 +13,7 @@ from sqlalchemy import desc, select
 
 from app.db import SessionLocal
 from app.models import Application, Evidence, FollowUp, Job, ResumeVariant
-from app.services.workflow import get_profile
+from app.services.workflow import build_resume_markdown, get_profile
 from app.settings import get_settings
 
 
@@ -115,10 +115,7 @@ def save_tailored_resume(job_id: int, summary: str, skills: list[str],
                        "experience_bullets": experience_bullets,
                        "selected_evidence_ids": selected_evidence_ids,
                        "cover_letter": str(cover_letter)}
-            markdown = "\n".join([f"# {profile.name or 'Candidate'}", profile.headline or "", "",
-                "## Summary", str(summary), "", "## Relevant Skills", ", ".join(skills), "",
-                "## Selected Experience", *[f"- {bullet}" for bullet in experience_bullets], "",
-                "## Source Resume", profile.master_resume])
+            markdown = build_resume_markdown(profile, content)
             version = (db.scalar(select(ResumeVariant.version).where(
                 ResumeVariant.job_id == job.id).order_by(desc(ResumeVariant.version)).limit(1)) or 0) + 1
             resume = ResumeVariant(job_id=job.id, version=version, content=content,

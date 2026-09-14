@@ -7,12 +7,25 @@ should still take a database backup before upgrading.
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine
 
+# table -> {column: DDL type}
+ADDED_COLUMNS = {
+    "applications": {"approved_resume_id": "INTEGER", "stage": "VARCHAR(50)"},
+    "jobs": {"search_run_id": "INTEGER", "triaged_at": "TIMESTAMP"},
+    "app_settings": {"preferences": "JSON"},
+}
+
 
 def migrate(engine: Engine) -> None:
     inspector = inspect(engine)
-    if "applications" not in inspector.get_table_names():
-        return
-    columns = {column["name"] for column in inspector.get_columns("applications")}
-    if "approved_resume_id" not in columns:
+    tables = set(inspector.get_table_names())
+    for table, added in ADDED_COLUMNS.items():
+        if table not in tables:
+            continue
+        columns = {column["name"] for column in inspector.get_columns(table)}
+        for name, ddl in added.items():
+            if name not in columns:
+                with engine.begin() as connection:
+                    connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+    if "applications" in tables:
         with engine.begin() as connection:
-            connection.execute(text("ALTER TABLE applications ADD COLUMN approved_resume_id INTEGER"))
+            connection.execute(text("UPDATE applications SET stage = 'applied' WHERE stage IS NULL"))

@@ -12,11 +12,13 @@ client = TestClient(app)
 def test_dashboard_has_workspace_navigation():
     response = client.get("/")
     assert response.status_code == 200
-    for label in ("Discovery", "Approvals", "Knowledge bank", "Settings"):
+    for label in ("Overview", "Today", "Discovery", "Tailor", "Approvals", "Tracker", "Knowledge bank", "Settings"):
         assert label in response.text
-    assert 'data-tag-input="roles"' in response.text
-    assert 'data-tag-input="locations"' in response.text
-    assert "Press Enter to add" in response.text
+    script = client.get("/static/app.js")
+    assert script.status_code == 200
+    assert 'data-tag-input="roles"' in script.text
+    assert 'data-tag-input="locations"' in script.text
+    assert "Press Enter to add" in script.text
 
 
 def test_settings_validation_and_secret_status():

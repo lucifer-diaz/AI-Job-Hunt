@@ -1,10 +1,32 @@
-# Job Hunt OS v0.4 — Guided application workspace
+# Job Hunt OS v0.5 — Guided application workspace
 
 A human-in-the-loop AI workflow for personal job hunting:
 
 **Apify Hunter → Ranker → Tailor → Reviewer → Approval → Application Tracker → Follow-up**
 
 It deliberately does **not** bypass anti-bot/CAPTCHA controls. It discovers and prepares applications, then either queues them for human approval or auto-approves reviewed materials according to your settings. External submission remains a user action.
+
+## Workspace (v0.5 redesign)
+
+The dashboard is a single-page workspace served from `app/static/app.js`; every number on it comes from the API.
+
+| Screen | What it does | Main endpoints |
+| --- | --- | --- |
+| Overview | 30-day funnel, reply rate per board, next 10 days, weekly trend, time in stage | `GET /api/workspace/overview` |
+| Today | "Do this next" (approve → tailor → follow up), follow-ups due, weekly pace; run-sheet variant | `GET /api/workspace/today` |
+| Discovery · triage | One job at a time with fit reasons; keys `S` shortlist, `M` maybe, `X` skip, `⏎` shortlist & tailor | `GET /api/jobs/search?queue=true`, `POST /api/jobs/{id}/triage` |
+| Discovery · table | Filter, sort, paginate and bulk-shortlist the whole pipeline | `GET /api/jobs/search`, `POST /api/jobs/bulk-triage` |
+| Discovery · setup | Saved search profile (roles × locations × boards), run history with what each run searched and pulled, add a job from a URL | `GET/PUT /api/search/profile`, `POST /api/search/profile/run`, `GET /api/search/apify/runs/{id}/detail`, `POST /api/jobs/from-url` |
+| Tailor | Before → after edits with the evidence each one cites; edit, accept or revert; cover letter; keyword coverage; PDF/DOCX/TXT exports | `GET /api/tailor/{job_id}`, `PATCH /api/resumes/{id}/edits/{n}` |
+| Approvals | Pre-submit checklist, resume preview, reusable answers, notes; approve opens the apply kit | `GET /api/approvals/{job_id}`, `POST /api/jobs/{id}/revision` |
+| Apply kit | Files to upload, answers to paste, link to the posting, confirm "mark applied" | `GET /api/jobs/{id}/apply-kit` |
+| Tracker | Kanban by post-submission stage (drag or "move to"), optional extra stages, timeline, recruiter, interview scheduling, AI follow-up draft | `GET /api/tracker`, `POST /api/applications/{id}/stage`, `POST /api/applications/{id}/events` |
+| Knowledge bank | ATS answer library with edit/verify, evidence bank with verify/remove | `/api/knowledge`, `/api/evidence` |
+| Settings & profile | Candidate details and chip fields, resume variants, re-parse resume into (unverified) evidence, provider/model, approval mode, cadence | `/api/profile`, `/api/settings`, `/api/preferences` |
+
+`⌘K` / `Ctrl+K` opens a command palette that searches every job.
+
+Auto-submit is intentionally not offered: approved packets always become an apply kit, and the submit click stays yours.
 
 ## What works
 
@@ -73,7 +95,20 @@ APIFY_API_TOKEN=apify_api_...
 APIFY_ACTOR_ID=openclawai/job-board-scraper
 ```
 
-The default Actor supports multi-term search plus filters such as location, boards, results per board, recency, remote-only, job type and Easy Apply.
+### Multiple actors
+
+Discovery → Search setup lets you tick one or more actors. One search profile is translated into each actor's own input schema (`app/services/actors.py`), and each actor gets the filters it supports:
+
+| Actor | Runs | Filters it receives |
+| --- | --- | --- |
+| `openclawai/job-board-scraper` (Multi Job Board) | one per location, all roles | `searchTerm`/`searchTerms`, `location`, `sites`, `maxResults`, `hoursOld`, `jobType`, `isRemote`, `easyApply`, `countryIndeed`, `distance`, `offset`, `linkedinFetchDescription`, `linkedinCompanyIds`, `enforceAnnualSalary`, `proxyConfiguration` |
+| `fantastic-jobs/advanced-linkedin-job-search-api` (Advanced LinkedIn) | one for everything | `titleSearch`, `locationSearch` (needs `City, State, Country`), `timeRange`, `limit`, `aiWorkArrangementFilter`, `aiEmploymentTypeFilter`, `seniorityFilter`, `directApply`, `hasSalary`, `aiVisaSponsorshipFilter`, `removeAgency`, `titleExclusionSearch` |
+| `benthepythondev/remote-jobs-aggregator` | one per role | `searchKeywords`, `platforms`, `maxJobsPerPlatform`, `postedWithinDays`, `locationKeywords`, `jobTypes`, `seniorityLevels`, `salaryOnly`, `excludeKeywords` |
+| `shahidirfan/Remoteok-Job-Scraper` | one per role | `startUrl`, `keyword`, `results_wanted` |
+
+Conflicting filters are reported before a run starts (for example, Multi Job Board drops `hoursOld` when Easy Apply is on). "Show exact inputs" displays the JSON each run will send, and one profile may start at most 30 runs.
+
+**Your own actors:** "+ Add your own actor" takes a Store actor ID, how it should fan out (per role × location, per location, per role, or once) and a JSON input template. "Look up on Apify" confirms the actor exists and pre-fills the template from its input schema. Placeholders: `{{role}}`, `{{roles}}`, `{{location}}`, `{{locations}}`, `{{max_results}}`, `{{hours_old}}`, `{{days_old}}`, `{{is_remote}}`, `{{job_type}}`, `{{sites}}`, `{{country}}`. A value that is only a placeholder keeps its type. Output items are normalized from common field names (title, company/organization, location/locations_derived, url/apply_url, description/description_text).
 
 The dashboard starts the Actor **asynchronously**. The app persists the Apify run ID, polls its status, and imports the default dataset after the run succeeds. This avoids keeping a Render/Railway HTTP request open while the scraper runs.
 
@@ -85,16 +120,24 @@ Apify Actors do not all use the same input/output schema. `APIFY_ACTOR_ID` can p
 
 ```json
 {
+  "searchTerm": "Engineering Manager",
   "searchTerms": ["Engineering Manager", "Lead AI Engineer"],
   "location": "Singapore",
   "sites": ["linkedin", "indeed", "glassdoor"],
   "maxResults": 20,
   "hoursOld": 168,
   "isRemote": false,
+  "easyApply": false,
+  "countryIndeed": "singapore",
+  "distance": 50,
   "linkedinFetchDescription": true,
-  "descriptionFormat": "markdown"
+  "enforceAnnualSalary": false,
+  "descriptionFormat": "markdown",
+  "proxyConfiguration": {"useApifyProxy": true, "apifyProxyGroups": ["RESIDENTIAL"]}
 }
 ```
+
+`searchTerms` is only sent when there is more than one role.
 
 Use smaller `maxResults` values while testing. Apify Actor pricing is Actor-specific, so check the chosen Actor's live pricing before large searches.
 
@@ -227,12 +270,11 @@ For one user, do **not** start with Redis, Celery, Kafka, a vector database, or 
 - DB: Neon Free or Railway Postgres
 - Job discovery: Apify Actor runs
 - LLM: OpenRouter free router for most tasks; optionally use a stronger paid model only for the best jobs
-- Follow-up scheduling: Render/Railway cron
-- Search scheduling: either Apify Schedules/Webhooks or a future Job Hunt OS search cron
+- Follow-up scheduling: Render/Railway cron running `python -m app.cron` (drafts only, never sends)
+- Search scheduling: a daily cron running `python -m app.cron searches`, or `POST /api/cron/searches` with the `X-Cron-Secret` header. It runs the saved search profile only when its schedule is set to daily.
 
 ## 6. Recommended next upgrades
 
-- Scheduled Apify search profiles (roles × locations × boards)
 - Apify webhook endpoint so completed runs are ingested without polling
 - Gmail integration for follow-up drafts and thread matching
 - Resume DOCX template preservation
