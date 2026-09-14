@@ -5,7 +5,7 @@ import sys
 from types import SimpleNamespace
 
 os.environ["LLM_PROVIDER"] = "mock"
-os.environ["DATABASE_URL"] = "sqlite:///./test_jobhunt.db"
+os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite:///./test_jobhunt.db")
 
 # The execution sandbox cannot download google-adk. This minimal test double lets
 # Python load the package while persistence tools are tested independently.

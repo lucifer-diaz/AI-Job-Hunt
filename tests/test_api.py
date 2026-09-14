@@ -1,6 +1,7 @@
 import os
 os.environ["LLM_PROVIDER"] = "mock"
-os.environ["DATABASE_URL"] = "sqlite:///./test_api.db"
+# Tests never use DATABASE_URL: set TEST_DATABASE_URL to run them against Postgres.
+os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite:///./test_api.db")
 
 from fastapi.testclient import TestClient
 from app.main import app
