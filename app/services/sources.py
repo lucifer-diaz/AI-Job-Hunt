@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlparse
 
 import httpx
 from bs4 import BeautifulSoup
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models import Job, SearchRun
@@ -199,23 +200,38 @@ def normalize_apify_job(item: dict[str, Any], default_site: str = "unknown") -> 
     }
 
 
+def dedupe_key(title: str, company: str, location: str = "") -> str:
+    """Same company + title + city is one job, whichever actor or board it came from."""
+    city = (location or "").split(",")[0]
+    return re.sub(r"[^a-z0-9]+", " ", f"{company}|{title}|{city}".lower()).strip()
+
+
 def import_apify_items(db: Session, items: list[dict[str, Any]], search_run_id: int | None = None,
                        default_site: str = "unknown") -> dict[str, int]:
-    created = 0
-    normalized = 0
-    skipped = 0
+    created = normalized = skipped = duplicates = 0
+    known = {dedupe_key(t, c, loc) for t, c, loc in db.execute(select(Job.title, Job.company, Job.location)).all()}
     for item in items:
         job_data = normalize_apify_job(item, default_site)
         if not job_data:
             skipped += 1
             continue
         normalized += 1
+        key = dedupe_key(job_data["title"], job_data["company"], job_data["location"])
+        same_listing = db.scalar(select(Job.id).where(Job.source == job_data["source"], Job.source_ref == job_data["source_ref"]))
+        if not same_listing and key in known:
+            duplicates += 1  # already in the pipeline from another actor or board
+            continue
         job, is_new = upsert_job(db, **job_data)
-        if is_new and search_run_id is not None:
+        if not is_new:
+            duplicates += 1
+            continue
+        known.add(key)
+        if search_run_id is not None:
             job.search_run_id = search_run_id
             db.commit()
-        created += int(is_new)
-    return {"seen": len(items), "normalized": normalized, "created": created, "skipped": skipped}
+        created += 1
+    return {"seen": len(items), "normalized": normalized, "created": created, "skipped": skipped,
+            "duplicates": duplicates}
 
 
 def build_apify_input(payload: dict[str, Any]) -> dict[str, Any]:
@@ -300,45 +316,132 @@ def start_apify_search(db: Session, payload: dict[str, Any]) -> SearchRun:
     return search_run
 
 
-def refresh_apify_run(db: Session, search_run: SearchRun) -> dict[str, Any]:
+APIFY_API = "https://api.apify.com/v2"
+
+
+def apify_get(path: str, params: dict[str, Any] | None = None) -> Any:
+    """GET an Apify API path with the server token. All Apify reads go through here."""
+    settings = get_settings()
+    if not settings.apify_api_token:
+        raise RuntimeError("APIFY_API_TOKEN is missing")
+    headers = {"Authorization": f"Bearer {settings.apify_api_token}", "User-Agent": UA}
+    with httpx.Client(timeout=30, headers=headers) as client:
+        resp = client.get(f"{APIFY_API}{path}", params=params)
+        resp.raise_for_status()
+        return resp.json()
+
+
+def _apify_time(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC).replace(tzinfo=None)
+    except ValueError:
+        return None
+
+
+def _actor_name(act_id: str, cache: dict[str, tuple[str, str]]) -> tuple[str, str]:
+    """Return (username/name, title) for an actor ID, falling back to the raw ID."""
+    if act_id not in cache:
+        try:
+            info = (apify_get(f"/acts/{act_id}") or {}).get("data") or {}
+            full = f"{info['username']}/{info['name']}" if info.get("username") and info.get("name") else act_id
+            cache[act_id] = (full, info.get("title") or info.get("name") or full)
+        except (httpx.HTTPError, TypeError, ValueError):
+            cache[act_id] = (act_id, act_id)
+    return cache[act_id]
+
+
+def list_remote_runs(db: Session, limit: int = 20) -> list[dict[str, Any]]:
+    """Recent runs in the Apify account, including ones started outside Job Hunt OS."""
+    items = ((apify_get("/actor-runs", {"desc": 1, "limit": limit}) or {}).get("data") or {}).get("items") or []
+    ids = [str(item.get("id")) for item in items if item.get("id")]
+    local = {r.external_run_id: r for r in db.scalars(select(SearchRun).where(SearchRun.external_run_id.in_(ids))).all()} if ids else {}
+    names: dict[str, tuple[str, str]] = {}
+    out = []
+    for item in items:
+        run_id = str(item.get("id") or "")
+        full, title = _actor_name(str(item.get("actId") or ""), names)
+        count = None
+        if item.get("defaultDatasetId") and item.get("status") in APIFY_TERMINAL_STATES:
+            try:
+                count = ((apify_get(f"/datasets/{item['defaultDatasetId']}") or {}).get("data") or {}).get("itemCount")
+            except httpx.HTTPError:
+                count = None
+        tracked = local.get(run_id)
+        out.append({
+            "external_run_id": run_id, "actor_id": full, "actor_title": title, "status": str(item.get("status") or ""),
+            "started_at": (_apify_time(item.get("startedAt")) or datetime.now(UTC).replace(tzinfo=None)).isoformat(),
+            "finished_at": (_apify_time(item.get("finishedAt")).isoformat() if item.get("finishedAt") else None),
+            "item_count": count, "origin": str((item.get("meta") or {}).get("origin") or ""),
+            "local_run_id": tracked.id if tracked else None, "imported": bool(tracked and tracked.completed_at),
+            "importable": not (tracked and tracked.completed_at),
+        })
+    return out
+
+
+def import_remote_run(db: Session, external_run_id: str, reimport: bool = False) -> dict[str, Any]:
+    """Track any Apify run by ID and import its dataset (normalized and deduplicated)."""
+    search_run = db.scalar(select(SearchRun).where(SearchRun.external_run_id == external_run_id))
+    if not search_run:
+        run = (apify_get(f"/actor-runs/{external_run_id}") or {}).get("data") or {}
+        if not run:
+            raise ValueError(f"Apify run {external_run_id} was not found")
+        actor_id, _ = _actor_name(str(run.get("actId") or ""), {})
+        actor_input: dict[str, Any] = {}
+        if run.get("defaultKeyValueStoreId"):
+            try:
+                record = apify_get(f"/key-value-stores/{run['defaultKeyValueStoreId']}/records/INPUT")
+                actor_input = record if isinstance(record, dict) else {}
+            except (httpx.HTTPError, ValueError):
+                actor_input = {}
+        search_run = SearchRun(provider="apify", external_run_id=external_run_id, actor_id=actor_id,
+                               input_json=actor_input, status=str(run.get("status") or "READY"),
+                               dataset_id=str(run.get("defaultDatasetId") or ""),
+                               created_at=_apify_time(run.get("startedAt")) or datetime.now(UTC).replace(tzinfo=None))
+        db.add(search_run)
+        db.commit()
+        db.refresh(search_run)
+    return refresh_apify_run(db, search_run, reimport=reimport)
+
+
+def refresh_apify_run(db: Session, search_run: SearchRun, reimport: bool = False) -> dict[str, Any]:
+    """Update a run's status and import its dataset once it finishes; reimport pulls it again."""
     settings = get_settings()
     if search_run.provider != "apify":
         raise ValueError("Search run is not an Apify run")
-    if not settings.apify_api_token:
-        raise RuntimeError("APIFY_API_TOKEN is missing")
 
-    headers = {"Authorization": f"Bearer {settings.apify_api_token}", "User-Agent": UA}
-    with httpx.Client(timeout=30, headers=headers) as client:
-        resp = client.get(f"https://api.apify.com/v2/actor-runs/{search_run.external_run_id}")
-        resp.raise_for_status()
-        run = (resp.json() or {}).get("data") or {}
+    run = (apify_get(f"/actor-runs/{search_run.external_run_id}") or {}).get("data") or {}
+    status = str(run.get("status") or search_run.status)
+    search_run.status = status
+    search_run.dataset_id = str(run.get("defaultDatasetId") or search_run.dataset_id or "")
 
-        status = str(run.get("status") or search_run.status)
-        search_run.status = status
-        search_run.dataset_id = str(run.get("defaultDatasetId") or search_run.dataset_id or "")
+    import_stats = None
+    finished = status in APIFY_TERMINAL_STATES
+    if finished and (search_run.completed_at is None or reimport):
+        if status == "SUCCEEDED" and not search_run.dataset_id:
+            raise RuntimeError("Apify run succeeded but no default dataset was returned")
+        items: list = []
+        if search_run.dataset_id:
+            try:
+                payload = apify_get(f"/datasets/{search_run.dataset_id}/items",
+                                    {"format": "json", "clean": "true", "limit": settings.apify_dataset_limit})
+                items = payload.get("items", []) if isinstance(payload, dict) else payload
+            except httpx.HTTPError:
+                if status == "SUCCEEDED":
+                    raise
+                items = []  # failed runs may have no dataset; keep the error below
+        if not isinstance(items, list):
+            items = []
+        from app.services.actors import default_site_for
 
-        import_stats = None
-        if status == "SUCCEEDED" and search_run.completed_at is None:
-            if not search_run.dataset_id:
-                raise RuntimeError("Apify run succeeded but no default dataset was returned")
-            items_resp = client.get(
-                f"https://api.apify.com/v2/datasets/{search_run.dataset_id}/items",
-                params={"format": "json", "clean": "true", "limit": settings.apify_dataset_limit},
-            )
-            items_resp.raise_for_status()
-            payload = items_resp.json()
-            items = payload.get("items", []) if isinstance(payload, dict) else payload
-            if not isinstance(items, list):
-                items = []
-            from app.services.actors import default_site_for
-
-            import_stats = import_apify_items(db, items, search_run.id, default_site_for(search_run.actor_id))
-            search_run.item_count = import_stats["seen"]
-            search_run.created_jobs = import_stats["created"]
-            search_run.completed_at = datetime.now(UTC).replace(tzinfo=None)
-        elif status in {"FAILED", "ABORTED", "TIMED-OUT"} and search_run.completed_at is None:
+        # Failed, aborted and timed-out runs still import whatever they collected.
+        import_stats = import_apify_items(db, items, search_run.id, default_site_for(search_run.actor_id))
+        search_run.item_count = import_stats["seen"]
+        search_run.created_jobs = db.scalar(select(func.count(Job.id)).where(Job.search_run_id == search_run.id)) or 0
+        if status != "SUCCEEDED":
             search_run.error = str((run.get("statusMessage") or run.get("errorMessage") or status))[:2000]
-            search_run.completed_at = datetime.now(UTC).replace(tzinfo=None)
+        search_run.completed_at = search_run.completed_at or datetime.now(UTC).replace(tzinfo=None)
 
     db.commit()
     db.refresh(search_run)
