@@ -48,6 +48,12 @@ class Settings(BaseSettings):
     followup_days: int = 5
     max_jobs_per_batch: int = 30
 
+    # Workflow workers (app.services.work_queue)
+    workflow_max_attempts: int = 3
+    workflow_lease_seconds: int = 900
+    workflow_retry_base_seconds: int = 60
+    workflow_retry_max_seconds: int = 3600
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
 

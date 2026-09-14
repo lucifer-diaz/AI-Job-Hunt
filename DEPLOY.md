@@ -28,7 +28,8 @@ MIN_FIT_SCORE=72
 FOLLOWUP_DAYS=5
 ```
 
-6. Health check: `/health`.
+6. Health check: `/health`. The web service applies database migrations on startup; to run them
+   by hand, use `python -m app.db_migrations`.
 7. Add a Render Cron Job for due follow-up drafts:
 
 ```bash
@@ -125,8 +126,8 @@ delegates to four specialist agents, whose prompts are kept in
    Credentials.
 2. Enable `aiplatform.googleapis.com` and create a regional Cloud Storage
    staging bucket.
-3. Provision PostgreSQL reachable from Agent Engine. Apply the normal app schema
-   by starting the web app once; this project does not yet use migrations.
+3. Provision PostgreSQL reachable from Agent Engine. Apply the schema with
+   `python -m app.db_migrations` (the web app also runs it on startup).
 4. Configure these runtime values using your deployment's secret/environment
    controls (never bake credentials into the source bundle):
 
@@ -161,7 +162,6 @@ marked `applied`; the tool saves a draft but never sends it.
 
 - Agent Engine does not host the FastAPI dashboard or the Apify polling worker;
   deploy those separately and point both services at the same PostgreSQL database.
-- Database tables are created directly rather than through versioned migrations.
 - The tool layer has no end-user identity/tenant boundary; deploy this personal
   agent with restricted IAM access rather than exposing it as a public multi-user bot.
 - Agent output quality depends on the selected Gemini model. Persistence tools

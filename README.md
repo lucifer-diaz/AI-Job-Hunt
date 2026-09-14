@@ -76,9 +76,10 @@ Uploaded resumes are stored in `./data/resumes` by default. Set `UPLOAD_DIR` to 
 persistent private volume in production and `MAX_RESUME_UPLOAD_MB` to change the
 default 8 MB limit. Files must not be placed on a publicly served path.
 
-On startup, the application creates the new settings, resume-document, and knowledge
-tables and applies its idempotent compatibility column migration. Back up an existing
-production database before the first v0.4 startup.
+On startup, the application runs its Alembic migrations (`app/migrations`) to the latest
+revision. You can also run them explicitly with `python -m app.db_migrations` or `alembic upgrade head`.
+Installs created before migrations existed are upgraded in place. Back up an existing production
+database before upgrading.
 
 For PostgreSQL:
 
@@ -273,7 +274,111 @@ For one user, do **not** start with Redis, Celery, Kafka, a vector database, or 
 - Follow-up scheduling: Render/Railway cron running `python -m app.cron` (drafts only, never sends)
 - Search scheduling: a daily cron running `python -m app.cron searches`, or `POST /api/cron/searches` with the `X-Cron-Secret` header. It runs the saved search profile only when its schedule is set to daily.
 
-## 6. Recommended next upgrades
+## 6. Workflow state engine
+
+PostgreSQL is the source of truth for where every job is in its lifecycle. The foundation is in
+place; the automated workers that move jobs through it are the next step.
+
+```text
+Scheduler (cron)
+  → Python Job Hunt OS
+  → PostgreSQL: jobs.state + retry/lease columns + workflow_transitions history
+  → deterministic workers that claim, work, then complete or fail   (app.services.work_queue)
+  → AI reasoning only inside a worker, never deciding the state      (not in this layer)
+```
+
+### States and transitions
+
+`app/services/lifecycle.py` is the only definition of the lifecycle. Nothing else decides
+whether a state change is legal.
+
+| From | Allowed next states |
+| --- | --- |
+| DISCOVERED | NORMALIZED, SKIPPED, FAILED |
+| NORMALIZED | FILTERED, SKIPPED, FAILED |
+| FILTERED | RANKED, SKIPPED, FAILED |
+| RANKED | QUALIFIED, ARCHIVED, SKIPPED, FAILED |
+| QUALIFIED | TAILORING, ARCHIVED, SKIPPED |
+| TAILORING | TAILORED, SKIPPED, FAILED |
+| TAILORED | REVIEWED, SKIPPED, FAILED |
+| REVIEWED | READY_TO_APPLY, TAILORING (revision), SKIPPED, FAILED |
+| READY_TO_APPLY | APPLYING, ARCHIVED, SKIPPED |
+| APPLYING | APPLIED, SKIPPED, FAILED |
+| APPLIED | FOLLOWUP_DUE, INTERVIEW, REJECTED, OFFER, ARCHIVED |
+| FOLLOWUP_DUE | FOLLOWED_UP, INTERVIEW, REJECTED, OFFER, ARCHIVED |
+| FOLLOWED_UP | FOLLOWUP_DUE, INTERVIEW, REJECTED, OFFER, ARCHIVED |
+| INTERVIEW | OFFER, REJECTED, ARCHIVED |
+| OFFER, REJECTED, ARCHIVED, SKIPPED, FAILED | terminal |
+
+- **No arbitrary states.** `jobs.state` accepts only these values. This is enforced three times:
+  a strict parser, an ORM validator that also rejects illegal moves on direct assignment, and
+  named PostgreSQL `CHECK` constraints.
+- **No shortcuts.** There is no path around NORMALIZED, FILTERED, RANKED, TAILORED or REVIEWED.
+- **FAILED only before submission.** Once a job is APPLIED it can never become FAILED, so a broken
+  follow-up can't erase the fact that you applied.
+- **Requeue.** FAILED is terminal for automation. An operator can call `requeue_failed`, which only
+  returns the job to the state it failed in.
+
+Every change is recorded in `workflow_transitions` with from/to state, actor, reason, attempt
+count and error category.
+
+### Claiming work safely
+
+Each job row carries `state`, `previous_state`, `attempt_count`, `last_error`, `error_category`,
+`retryable`, `last_attempt_at`, `next_attempt_at`, `locked_at`, `locked_by`, `lock_token`,
+`lock_expires_at`, `created_at` and `updated_at`.
+
+```python
+from app.services import work_queue as wq
+from app.services.lifecycle import ErrorCategory, WorkflowState as S
+
+for claim in wq.claim(db, [S.DISCOVERED], worker_id=wq.default_worker_id(), limit=10):
+    try:
+        ...  # deterministic work
+        wq.complete(db, claim, S.NORMALIZED)
+    except TimeoutError as exc:
+        wq.fail(db, claim, ErrorCategory.TIMEOUT, str(exc))
+```
+
+- **Claiming.** A claim uses `SELECT … FOR UPDATE SKIP LOCKED`. Concurrent workers never receive
+  the same job and never wait on each other. The claim writes a lease (`locked_by`, a random
+  `lock_token`, `lock_expires_at`) and counts the attempt.
+- **Ownership checks.** `complete`, `fail`, `advance` (for example QUALIFIED → TAILORING while
+  keeping the lease), `heartbeat` and `release` re-lock the row and verify the token. A worker whose
+  lease expired and was taken over gets `LeaseLost` and cannot write a stale result.
+- **Bounded retries.** `fail` keeps the job in place and retries with exponential backoff
+  (`WORKFLOW_RETRY_BASE_SECONDS`, capped by `WORKFLOW_RETRY_MAX_SECONDS`) until
+  `WORKFLOW_MAX_ATTEMPTS`. Non-retryable categories (VALIDATION, CONFIGURATION, BLOCKED) stop at
+  once. When a job gives up before submission it becomes FAILED with the category, message,
+  attempt count and `retryable = false`. After submission it stays in its state, parked.
+- **Crash recovery.** A crashed worker's job becomes claimable again when its lease
+  (`WORKFLOW_LEASE_SECONDS`) expires, and the crash is recorded as `LEASE_EXPIRED`.
+  `recover_expired_leases` sweeps expired leases, scheduling a retry or failing jobs that are out
+  of attempts. Attempts are counted at claim time, so a job that keeps crashing workers still
+  runs out of attempts.
+
+Claiming requires PostgreSQL. SQLite remains usable for the dashboard during local development.
+
+### Relationship to the dashboard
+
+The dashboard still reads and writes the legacy `jobs.status` column. Migration `0002` backfilled
+`state` from it (for example `shortlisted` → QUALIFIED, `approved` → READY_TO_APPLY, applied jobs
+from their tracker stage). New jobs start DISCOVERED. Dashboard actions do not yet move `state`;
+that happens as each stage gets a worker.
+
+### Tests
+
+The locking, retry and migration tests need a disposable PostgreSQL database whose name contains
+`test`. They wipe it.
+
+```bash
+createdb jobhunt_test
+TEST_DATABASE_URL=postgresql+psycopg://localhost/jobhunt_test pytest
+```
+
+Without `TEST_DATABASE_URL`, those tests are skipped and the rest of the suite runs on SQLite.
+
+## 7. Recommended next upgrades
 
 - Apify webhook endpoint so completed runs are ingested without polling
 - Gmail integration for follow-up drafts and thread matching
@@ -286,7 +391,7 @@ For one user, do **not** start with Redis, Celery, Kafka, a vector database, or 
 
 See [DEPLOY.md](DEPLOY.md) for hosting instructions.
 
-## 7. Google Gemini agent deployment
+## 8. Google Gemini agent deployment
 
 The repository includes a Google ADK package named `job_hunt_agent`. Its
 `root_agent` coordinates four narrowly scoped agents: `job_fit_ranker`,

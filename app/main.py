@@ -16,8 +16,8 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
-from app.db import Base, engine, get_db
-from app.db_migrations import migrate
+from app.db import engine, get_db
+from app.db_migrations import run_migrations
 from app.models import (AppSetting, Application, CandidateProfile, Evidence, Job,
                         KnowledgeAnswer, ResumeDocument, ResumeVariant, SearchRun)
 from app.schemas import (ApplicationUpdateIn, ApifySearchIn, EvidenceIn, KnowledgeIn,
@@ -28,8 +28,7 @@ from app.services.workflow import approve_job, create_due_followups, get_profile
 from app.settings import get_settings
 from app.workspace import router as workspace_router, run_search_profile, get_search_profile
 
-Base.metadata.create_all(bind=engine)
-migrate(engine)
+run_migrations(engine)
 settings = get_settings()
 app = FastAPI(title=settings.app_name, version="0.5.0")
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
