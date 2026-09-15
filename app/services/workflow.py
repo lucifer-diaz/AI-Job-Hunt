@@ -156,6 +156,33 @@ def tailor_job(db: Session, job: Job) -> ResumeVariant:
     return resume
 
 
+# Jobs that are in the Tailor queue and have not been approved or submitted yet.
+SKIP_TAILORING_STATUSES = ("shortlisted", "tailored", "pending_approval")
+
+
+def skip_tailoring(db: Session, job: Job) -> ResumeVariant:
+    """Use the master resume unchanged for a job that needs no tailoring. No AI edits; the reviewer still scores it."""
+    profile = get_profile(db)
+    if not (profile.master_resume or "").strip():
+        raise ValueError("Add a master resume in Settings before skipping tailoring")
+    markdown = render_resume(parse_resume(profile.master_resume), name=profile.name, headline=profile.headline)
+    version = (db.scalar(select(ResumeVariant.version).where(ResumeVariant.job_id == job.id).order_by(desc(ResumeVariant.version)).limit(1)) or 0) + 1
+    resume = ResumeVariant(
+        job_id=job.id,
+        version=version,
+        content={"untailored": True, "summary": "", "skills": [], "experience": [], "selected_evidence_ids": [],
+                 "cover_letter": ""},
+        markdown=markdown,
+        cover_letter="",
+    )
+    db.add(resume)
+    job.status = "tailored"
+    db.commit()
+    db.refresh(resume)
+    review_resume(db, resume)
+    return resume
+
+
 def _tokens(text: str) -> set[str]:
     return {w for w in re.findall(r"[a-z0-9+#.]{3,}", (text or "").lower())}
 
@@ -221,8 +248,10 @@ def edit_slots(profile: CandidateProfile, content: dict) -> tuple[ParsedResume, 
 
 def resume_edits(db: Session, resume: ResumeVariant) -> list[dict]:
     """Present a tailored resume as reviewable edits: before (master resume) → after (tailored)."""
-    profile = get_profile(db)
     content = resume.content or {}
+    if content.get("untailored"):
+        return []  # the master resume is used as-is: nothing was rewritten
+    profile = get_profile(db)
     state = content.get("edit_state") or {}
     evidence = db.scalars(select(Evidence).where(Evidence.verified.is_(True))).all()
     selected = set(content.get("selected_evidence_ids") or [])

@@ -24,7 +24,8 @@ from app.schemas import (ApplicationUpdateIn, ApifySearchIn, EvidenceIn, Knowled
                          ManualJobIn, ProfileIn, RecruiterIn, SettingsIn)
 from app.services.exports import markdown_to_simple_pdf
 from app.services.sources import import_greenhouse, import_lever, refresh_apify_run, start_apify_search, upsert_job
-from app.services.workflow import approve_job, create_due_followups, get_profile, mark_applied, rank_job, tailor_job
+from app.services.workflow import (SKIP_TAILORING_STATUSES, approve_job, create_due_followups, get_profile,
+                                   mark_applied, rank_job, skip_tailoring, tailor_job)
 from app.settings import get_settings
 from app.workspace import router as workspace_router, run_search_profile, get_search_profile
 
@@ -238,17 +239,35 @@ def tailor(job_id: int, db: Session = Depends(get_db)):
     if not job:
         raise HTTPException(404, "Job not found")
     try:
-        resume = tailor_job(db, job)
-        auto_approved = False
-        app_setting = get_app_setting(db)
-        if app_setting.application_mode == "automatic" and (resume.reviewer_score or 0) >= app_setting.min_review_score:
-            approve_job(db, job)
-            auto_approved = True
-        return {"resume_id": resume.id, "version": resume.version, "reviewer_score": resume.reviewer_score,
-                "markdown": resume.markdown, "cover_letter": resume.cover_letter,
-                "reviewer_notes": resume.reviewer_notes, "auto_approved": auto_approved}
+        return _packet_response(db, job, tailor_job(db, job))
     except Exception as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/jobs/{job_id}/skip-tailoring")
+def skip_tailor(job_id: int, db: Session = Depends(get_db)):
+    """Send the master resume unchanged for a job that needs no tailoring. It is still reviewed before approval."""
+    job = db.get(Job, job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if job.status not in SKIP_TAILORING_STATUSES:
+        raise HTTPException(409, "Only shortlisted or tailored jobs that are not yet approved can skip tailoring")
+    try:
+        return _packet_response(db, job, skip_tailoring(db, job))
+    except Exception as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+def _packet_response(db: Session, job: Job, resume: ResumeVariant) -> dict:
+    auto_approved = False
+    app_setting = get_app_setting(db)
+    if app_setting.application_mode == "automatic" and (resume.reviewer_score or 0) >= app_setting.min_review_score:
+        approve_job(db, job)
+        auto_approved = True
+    return {"resume_id": resume.id, "version": resume.version, "reviewer_score": resume.reviewer_score,
+            "markdown": resume.markdown, "cover_letter": resume.cover_letter,
+            "reviewer_notes": resume.reviewer_notes, "auto_approved": auto_approved,
+            "untailored": bool((resume.content or {}).get("untailored"))}
 
 
 @app.get("/api/jobs/{job_id}/resume.pdf")

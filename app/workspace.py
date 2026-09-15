@@ -819,6 +819,7 @@ def packet(db: Session, job: Job) -> dict:
     return {**base, "resume": {
         "id": resume.id, "version": resume.version, "created_at": resume.created_at.isoformat(),
         "generated": ago(resume.created_at), "reviewer_score": resume.reviewer_score, "markdown": resume.markdown,
+        "untailored": bool((resume.content or {}).get("untailored")),
         "cover_letter": resume.cover_letter, "cover_words": len(resume.cover_letter.split()),
         "edits": edits, "review": review, "keywords": coverage,
         "ats_pct": round(100 * covered / len(coverage)) if coverage else None,

@@ -94,6 +94,29 @@ def test_packet_flows_from_triage_to_tracker():
     assert summary["counts"]["tracker"] >= 1
 
 
+def test_skip_tailoring_uses_the_master_resume_unchanged():
+    master = ("# Test Candidate\nEngineer\n## Experience\n### Lead | Acme | Remote | 2020 - 2024\n"
+              "- Built Python FastAPI services handling 10k requests per second\n")
+    assert client.put("/api/profile", json={"name": "Test Candidate", "headline": "Engineer", "email": "t@example.com",
+                                            "phone": "123", "master_resume": master}).status_code == 200
+    job = make_job()
+    assert client.post(f"/api/jobs/{job['id']}/skip-tailoring").status_code == 409  # not shortlisted yet
+    client.post(f"/api/jobs/{job['id']}/triage", json={"action": "shortlist"})
+
+    out = client.post(f"/api/jobs/{job['id']}/skip-tailoring").json()
+    assert out["untailored"] is True and out["reviewer_score"] == 86 and out["cover_letter"] == ""
+    resume = client.get(f"/api/tailor/{job['id']}").json()["resume"]
+    assert resume["untailored"] is True and resume["edits"] == []
+    assert "### Lead | Acme | Remote | 2020 - 2024" in resume["markdown"]
+    assert "- Built Python FastAPI services handling 10k requests per second" in resume["markdown"]
+    assert client.patch(f"/api/resumes/{resume['id']}/edits/0", json={"status": "accepted"}).status_code == 404
+
+    assert any(row["id"] == job["id"] and row["waiting"] for row in client.get("/api/approvals").json())
+    assert client.post(f"/api/jobs/{job['id']}/approve").status_code == 200
+    assert client.post(f"/api/jobs/{job['id']}/skip-tailoring").status_code == 409  # already approved
+    assert client.post("/api/jobs/999999/skip-tailoring").status_code == 404
+
+
 def test_triage_actions_and_filters():
     job = make_job(company=f"Talent Staffing {uuid.uuid4().hex[:6]}")
     assert client.post(f"/api/jobs/{job['id']}/triage", json={"action": "explode"}).status_code == 422

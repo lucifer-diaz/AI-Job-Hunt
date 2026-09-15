@@ -541,17 +541,19 @@ function renderTailor() {
   const p = D.packet; if (!p) return loading();
   const job = p.job, r = p.resume;
   const picker = `<select class="select" style="margin:0;width:auto;max-width:320px" id="tailor-pick" data-act-change="pick-tailor">${queue.map(j => `<option value="${j.id}" ${j.id === S.tailorJob ? 'selected' : ''}>${esc(j.company)} — ${esc(j.title)}${j.has_resume ? '' : ' (not tailored)'}</option>`).join('')}</select>`;
-  const generating = isBusy('tailor' + job.id);
+  const generating = isBusy('tailor' + job.id), skipping = isBusy('skip' + job.id), working = generating || skipping;
   if (!r) {
     return `<div class="stack"><section class="card row gap16 wrap"><div class="grow" style="min-width:220px"><div class="card-title" style="font-size:16px">Tailoring for ${esc(job.title)} · ${esc(job.company)}</div><div class="card-sub">Fit ${fitTxt(job.fit)} · no packet generated yet</div></div>${picker}</section>
-      <section class="card">${empty(generating ? 'Drafting your packet…' : 'No packet yet', generating ? 'Ranking, tailoring and an independent review run back to back. This can take a minute.' : 'Generate a tailored resume, cover letter and reviewer score. Tailoring may only cite your master resume and verified evidence.', btn(generating ? 'Generating…' : 'Generate tailored packet', 'generate', { id: job.id }, 'primary lg', generating) + btn('Read the posting', 'open-job', { id: job.id }))}</section></div>`;
+      <section class="card">${empty(generating ? 'Drafting your packet…' : skipping ? 'Reviewing your master resume…' : 'No packet yet', generating ? 'Ranking, tailoring and an independent review run back to back. This can take a minute.' : skipping ? 'Your master resume is used unchanged; the reviewer is scoring it against this posting.' : 'Generate a tailored resume, cover letter and reviewer score. Tailoring may only cite your master resume and verified evidence. If this posting needs no tailoring, skip it and send your master resume as-is.', btn(generating ? 'Generating…' : 'Generate tailored packet', 'generate', { id: job.id }, 'primary lg', working) + btn(skipping ? 'Skipping…' : 'Skip tailoring', 'skip-tailor', { id: job.id }, 'lg', working) + btn('Read the posting', 'open-job', { id: job.id }))}</section></div>`;
   }
   const accepted = r.edits.filter(e => e.status === 'accepted').length;
   const threshold = p.application_mode === 'automatic'
     ? `Auto-approval threshold is ${p.min_review_score}. ${r.reviewer_score >= p.min_review_score ? 'This packet cleared it.' : 'This packet needs your sign-off.'}`
     : `Manual approval mode · minimum review score ${p.min_review_score}.`;
   let body = '';
-  if (S.tailorTab === 'diff') {
+  if (S.tailorTab === 'diff' && r.untailored) {
+    body = `<div style="padding:18px">${empty('Tailoring skipped', 'This packet uses your master resume unchanged, so there are no edits to review. Use “Tailor instead” to generate a tailored version.')}</div>`;
+  } else if (S.tailorTab === 'diff') {
     body = r.edits.map(e => {
       const tone = { accepted: 'good', review: 'warn', reverted: 'muted' }[e.status];
       const editing = S.editing === e.index;
@@ -572,11 +574,12 @@ function renderTailor() {
   }
   return `<div class="stack">
   <section class="card row gap16 wrap" style="padding:16px 20px">
-    <div class="grow" style="min-width:220px"><div class="card-title" style="font-size:16px">Tailoring for ${esc(job.title)} · ${esc(job.company)}</div><div class="card-sub">v${r.version} · generated ${esc(r.generated)} · edits must trace to verified evidence</div></div>
+    <div class="grow" style="min-width:220px"><div class="card-title" style="font-size:16px">Tailoring for ${esc(job.title)} · ${esc(job.company)}</div><div class="card-sub">v${r.version} · generated ${esc(r.generated)} · ${r.untailored ? 'master resume, not tailored' : 'edits must trace to verified evidence'}</div></div>
     ${picker}
     <div class="row gap14"><div class="metric"><div class="n" style="color:${r.reviewer_score >= p.min_review_score ? 'var(--good)' : 'var(--warn)'}">${fitTxt(r.reviewer_score)}</div><div class="l">REVIEWER</div></div>
       <div class="metric"><div class="n">${r.ats_pct == null ? '—' : r.ats_pct + '%'}</div><div class="l">ATS KEYWORDS</div></div>
-      ${btn(generating ? 'Regenerating…' : 'Regenerate', 'generate', { id: job.id }, '', generating)}
+      ${btn(generating ? (r.untailored ? 'Tailoring…' : 'Regenerating…') : (r.untailored ? 'Tailor instead' : 'Regenerate'), 'generate', { id: job.id }, '', working)}
+      ${r.untailored ? '' : btn(skipping ? 'Skipping…' : 'Skip tailoring', 'skip-tailor', { id: job.id }, '', working)}
       ${btn('Send to approval', 'go', { screen: 'approvals', approval: job.id }, 'primary')}</div>
   </section>
   <div class="split gap16">
@@ -1121,6 +1124,11 @@ const A = {
     const out = await api(`/api/jobs/${el.dataset.id}/tailor`, { method: 'POST' });
     await load(); return out;
   }, out => out.auto_approved ? `Packet scored ${Math.round(out.reviewer_score)} and was auto-approved` : `Packet ready · reviewer ${Math.round(out.reviewer_score)}`),
+  'skip-tailor': el => busy('skip' + el.dataset.id, async () => {
+    const out = await api(`/api/jobs/${el.dataset.id}/skip-tailoring`, { method: 'POST' });
+    S.tailorTab = 'resume';
+    await load(); return out;
+  }, out => out.auto_approved ? `Master resume scored ${Math.round(out.reviewer_score)} and was auto-approved` : `Tailoring skipped · master resume reviewed at ${Math.round(out.reviewer_score)}`),
   'edit-start': el => { S.editing = Number(el.dataset.index); render(); document.getElementById(`edit-text-${el.dataset.index}`)?.focus(); },
   'edit-cancel': () => { S.editing = null; render(); },
   // Read typed values before busy() re-renders and replaces the inputs.
