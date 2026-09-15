@@ -20,7 +20,7 @@ from app.db import engine, get_db
 from app.db_migrations import run_migrations
 from app.models import (AppSetting, Application, CandidateProfile, Evidence, Job,
                         KnowledgeAnswer, ResumeDocument, ResumeVariant, SearchRun)
-from app.schemas import (ApplicationUpdateIn, ApifySearchIn, EvidenceIn, KnowledgeIn,
+from app.schemas import (ApplicationUpdateIn, ApifySearchIn, BulkTailorIn, EvidenceIn, KnowledgeIn,
                          ManualJobIn, ProfileIn, RecruiterIn, SettingsIn)
 from app.services.exports import markdown_to_simple_pdf
 from app.services.sources import import_greenhouse, import_lever, refresh_apify_run, start_apify_search, upsert_job
@@ -271,6 +271,34 @@ def skip_tailor(job_id: int, db: Session = Depends(get_db)):
         return _packet_response(db, job, skip_tailoring(db, job))
     except Exception as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/jobs/bulk-tailor")
+def bulk_tailor(payload: BulkTailorIn, db: Session = Depends(get_db)):
+    """Tailor (or skip tailoring for) selected Tailor-queue jobs a batch at a time; call again with `remaining`.
+
+    Only shortlisted, tailored or sent-back jobs are processed, and jobs that already have a packet are
+    skipped unless `regenerate` is set. One job failing does not stop the batch.
+    """
+    wanted = list(dict.fromkeys(payload.ids))
+    jobs = {j.id: j for j in db.scalars(select(Job).where(Job.id.in_(wanted))).all()}
+    has_packet = set(db.scalars(select(ResumeVariant.job_id).where(ResumeVariant.job_id.in_(wanted))).all())
+    queue = [i for i in wanted if i in jobs and jobs[i].status in SKIP_TAILORING_STATUSES
+             and (payload.regenerate or i not in has_packet)]
+    batch, remaining = queue[:payload.batch_size], queue[payload.batch_size:]
+    run = skip_tailoring if payload.mode == "skip" else tailor_job
+    done, errors = [], []
+    for job_id in batch:
+        try:
+            out = _packet_response(db, jobs[job_id], run(db, jobs[job_id]))
+            done.append({"id": job_id, "reviewer_score": out["reviewer_score"], "auto_approved": out["auto_approved"],
+                         "untailored": out["untailored"]})
+        except Exception as exc:
+            db.rollback()
+            errors.append({"id": job_id, "error": str(exc)[:300]})
+    found = [i for i in wanted if i in jobs]
+    return {"done": done, "errors": errors, "remaining": remaining,
+            "skipped": len(found) - len(queue), "missing": len(wanted) - len(found)}
 
 
 def _packet_response(db: Session, job: Job, resume: ResumeVariant) -> dict:

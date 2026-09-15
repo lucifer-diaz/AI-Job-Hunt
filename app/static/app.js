@@ -14,6 +14,7 @@ const S = {
   checked: new Set(), selJob: null, jobOpen: null, jobTab: 'description',
   paletteOpen: false, paletteQuery: '', paletteJobs: [],
   kitJob: null, tailorJob: null, tailorTab: 'diff', editing: null,
+  tailorMode: 'single', tailorChecked: new Set(), tailorRegenerate: false, tailorProgress: '', tailorStop: false, tailorResult: null,
   approvalJob: null, selApp: null, trackerView: 'board', runSel: null,
   editKnowledge: null, scheduling: false, editingRecruiter: false, manualMissing: null,
   polling: null, busy: {}, forms: {}, apifyImport: false, importPick: new Set(), autoRefreshed: false,
@@ -287,6 +288,7 @@ function renderTop() {
   const [title, sub] = screenMeta();
   let seg = '';
   if (S.screen === 'today') seg = [['focus', 'Command centre'], ['run', 'Run sheet']].map(([id, t]) => `<button class="${S.todayVariant === id ? 'on' : ''}" data-act="variant" data-kind="today" data-id="${id}">${t}</button>`).join('');
+  if (S.screen === 'tailor') seg = [['single', 'One job'], ['bulk', 'Bulk tailor']].map(([id, t]) => `<button class="${S.tailorMode === id ? 'on' : ''}" data-act="variant" data-kind="tailor" data-id="${id}">${t}</button>`).join('');
   if (S.screen === 'discovery') seg = [['triage', 'Triage queue'], ['table', 'Table + detail'], ['setup', 'Search setup']].map(([id, t]) => `<button class="${S.discMode === id ? 'on' : ''}" data-act="variant" data-kind="discovery" data-id="${id}">${t}</button>`).join('');
   return `<div class="top-row"><div><h1>${esc(title)}</h1><div class="sub">${esc(sub)}</div></div>
     <div class="row gap8 wrap">${seg ? `<div class="seg">${seg}</div>` : ''}
@@ -590,9 +592,42 @@ function renderSetup() {
 }
 
 /* ───────────── tailor ───────────── */
+function renderBulkTailor(queue) {
+  const running = isBusy('bulkTailor');
+  const selected = queue.filter(j => S.tailorChecked.has(j.id));
+  const eligible = selected.filter(j => S.tailorRegenerate || !j.has_resume).length;
+  const untailored = queue.filter(j => !j.has_resume);
+  const allOn = queue.every(j => S.tailorChecked.has(j.id));
+  const titleOf = id => { const j = queue.find(q => q.id === id); return j ? `${j.company} — ${j.title}` : `Job ${id}`; };
+  const res = S.tailorResult;
+  const summary = res && !running ? `<div class="banner" style="border-radius:0;border-width:0 0 1px">
+      ${res.mode === 'skip' ? 'Skipped tailoring for' : 'Tailored'} ${res.done} job${res.done === 1 ? '' : 's'}${res.auto ? ` · ${res.auto} auto-approved` : ''}${res.stopped ? ` · stopped with ${res.stopped} left` : ''}${res.done ? ' · <a href="#approvals" data-act="go" data-screen="approvals">Review in Approvals</a>' : ''}
+      ${res.failed.length ? `<div class="xs mt6" style="color:var(--bad)">${res.failed.length} failed: ${res.failed.slice(0, 3).map(f => `${esc(titleOf(f.id))} (${esc(f.error)})`).join(' · ')}${res.failed.length > 3 ? ' …' : ''}</div>` : ''}</div>` : '';
+  const rows = queue.map(j => `<div class="lrow click" data-act="tailor-check" data-id="${j.id}" style="gap:12px">
+      <input type="checkbox" data-act="tailor-check" data-id="${j.id}" ${S.tailorChecked.has(j.id) ? 'checked' : ''} ${running ? 'disabled' : ''} aria-label="Select ${attr(j.title)}">
+      <span class="mono bb ${fitCls(j.fit)}" style="width:26px">${fitTxt(j.fit)}</span>
+      <div class="grow" style="min-width:0"><div class="small b ellipsis">${esc(j.title)}</div><div class="xs muted ellipsis">${esc(j.company)} · ${esc(j.board)}</div></div>
+      ${j.has_resume ? pill(j.status === 'pending_approval' ? 'sent back' : 'has packet', 'muted') : pill('not tailored', 'warn')}</div>`).join('');
+  return `<div class="stack"><section class="card flush">
+    <div class="row wrap gap10" style="padding:14px 18px;border-bottom:1px solid var(--line2)">
+      <div class="grow" style="min-width:220px"><div class="card-title" style="font-size:16px">Bulk tailor</div>
+        <div class="card-sub">${running ? esc(S.tailorProgress || 'Working…') : `${selected.length} of ${queue.length} selected · ${untailored.length} not tailored yet`}</div></div>
+      ${btn(`Select not tailored (${untailored.length})`, 'tailor-select', { which: 'untailored' }, 'sm', running || !untailored.length)}
+      ${btn(allOn ? 'Clear' : 'Select all', 'tailor-select', { which: allOn ? 'none' : 'all' }, 'sm', running)}
+      ${running ? btn(S.tailorStop ? 'Stopping…' : 'Stop', 'bulk-tailor-stop', {}, 'sm danger', S.tailorStop)
+        : btn(`Skip tailoring${eligible ? ` ${eligible}` : ''}`, 'bulk-tailor', { mode: 'skip' }, 'sm', !eligible) + btn(`Tailor${eligible ? ` ${eligible}` : ''}`, 'bulk-tailor', { mode: 'tailor' }, 'sm primary', !eligible)}
+    </div>
+    <div class="row wrap gap10 xs muted" style="padding:10px 18px;border-bottom:1px solid var(--line2)">
+      <label class="row gap6"><input type="checkbox" data-act="tailor-regenerate" ${S.tailorRegenerate ? 'checked' : ''} ${running ? 'disabled' : ''}> Redo jobs that already have a packet</label>
+      <span class="grow"></span><span>Jobs run one at a time: rank if needed, tailor, then an independent review. Keep this tab open.</span>
+    </div>
+    ${summary}${rows}</section></div>`;
+}
+
 function renderTailor() {
   const queue = D.tailorQueue; if (!queue) return loading();
   if (!queue.length) return `<section class="card">${empty('Nothing to tailor yet', 'Shortlist a job in Discovery and it will appear here.', btn('Go to triage', 'go', { screen: 'discovery', mode: 'triage' }, 'primary'))}</section>`;
+  if (S.tailorMode === 'bulk') return renderBulkTailor(queue);
   const p = D.packet; if (!p) return loading();
   const job = p.job, r = p.resume;
   const picker = `<select class="select" style="margin:0;width:auto;max-width:320px" id="tailor-pick" data-act-change="pick-tailor">${queue.map(j => `<option value="${j.id}" ${j.id === S.tailorJob ? 'selected' : ''}>${esc(j.company)} — ${esc(j.title)}${j.has_resume ? '' : ' (not tailored)'}</option>`).join('')}</select>`;
@@ -1034,7 +1069,12 @@ const A = {
     ...(el.dataset.approval ? { approvalJob: Number(el.dataset.approval) } : {}), ...(el.dataset.app ? { selApp: Number(el.dataset.app), trackerView: 'board' } : {}),
     jobOpen: null, kitJob: null, paletteOpen: false,
   }),
-  variant: el => { if (el.dataset.kind === 'today') S.todayVariant = el.dataset.id; else { S.discMode = el.dataset.id; S.manualMissing = null; } go(S.screen); },
+  variant: el => {
+    if (el.dataset.kind === 'today') S.todayVariant = el.dataset.id;
+    else if (el.dataset.kind === 'tailor') S.tailorMode = el.dataset.id;
+    else { S.discMode = el.dataset.id; S.manualMissing = null; }
+    go(S.screen);
+  },
   'go-triage': () => go('discovery', { discMode: 'triage' }),
   'do-action': el => {
     const { kind, job, app } = el.dataset;
@@ -1248,6 +1288,44 @@ const A = {
     const out = await api(`/api/jobs/${el.dataset.id}/tailor`, { method: 'POST' });
     await load(); return out;
   }, out => out.auto_approved ? `Packet scored ${Math.round(out.reviewer_score)} and was auto-approved` : `Packet ready · reviewer ${Math.round(out.reviewer_score)}`),
+  'tailor-check': (el, e) => {
+    e.stopPropagation();
+    if (isBusy('bulkTailor')) return;
+    const id = Number(el.dataset.id);
+    S.tailorChecked.has(id) ? S.tailorChecked.delete(id) : S.tailorChecked.add(id);
+    render();
+  },
+  'tailor-select': el => {
+    const queue = D.tailorQueue || [], which = el.dataset.which;
+    S.tailorChecked = new Set(which === 'all' ? queue.map(j => j.id) : which === 'untailored' ? queue.filter(j => !j.has_resume).map(j => j.id) : []);
+    render();
+  },
+  'tailor-regenerate': (el, e) => { e.stopPropagation(); S.tailorRegenerate = !S.tailorRegenerate; render(); },
+  'bulk-tailor-stop': () => { S.tailorStop = true; S.tailorProgress = 'Stopping after the current job…'; render(); },
+  'bulk-tailor': el => {
+    const mode = el.dataset.mode, verb = mode === 'skip' ? 'Skipping tailoring for' : 'Tailoring';
+    return busy('bulkTailor', async () => {
+      let ids = (D.tailorQueue || []).filter(j => S.tailorChecked.has(j.id) && (S.tailorRegenerate || !j.has_resume)).map(j => j.id);
+      const total = ids.length;
+      let done = [], failed = [], streak = 0;
+      S.tailorStop = false; S.tailorResult = null;
+      while (ids.length && !S.tailorStop) {
+        S.tailorProgress = `${verb} ${Math.min(total, done.length + failed.length + 1)} of ${total}…`; render();
+        const out = await api('/api/jobs/bulk-tailor', { method: 'POST', body: { ids, mode, regenerate: S.tailorRegenerate } });
+        done = done.concat(out.done); failed = failed.concat(out.errors);
+        streak = out.done.length ? 0 : streak + out.errors.length;
+        if (streak >= 3) break; // the provider is failing; stop instead of burning through the queue
+        ids = out.remaining;
+      }
+      const left = ids.length && (S.tailorStop || streak >= 3) ? ids.length : 0;
+      done.forEach(d => S.tailorChecked.delete(d.id));
+      S.tailorResult = { mode, done: done.length, auto: done.filter(d => d.auto_approved).length, failed, stopped: left };
+      S.tailorProgress = ''; S.tailorStop = false;
+      await load();
+      if (!done.length && failed.length) throw new Error(`${mode === 'skip' ? 'Skipping tailoring' : 'Tailoring'} failed: ${failed[0].error}`);
+      return S.tailorResult;
+    }, r => `${r.mode === 'skip' ? 'Skipped tailoring for' : 'Tailored'} ${r.done} job${r.done === 1 ? '' : 's'}${r.auto ? ` · ${r.auto} auto-approved` : ''}${r.failed.length ? ` · ${r.failed.length} failed` : ''}${r.stopped ? ` · stopped with ${r.stopped} left` : ''}`);
+  },
   'skip-tailor': el => busy('skip' + el.dataset.id, async () => {
     const out = await api(`/api/jobs/${el.dataset.id}/skip-tailoring`, { method: 'POST' });
     S.tailorTab = 'resume';

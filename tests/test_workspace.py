@@ -117,6 +117,45 @@ def test_skip_tailoring_uses_the_master_resume_unchanged():
     assert client.post("/api/jobs/999999/skip-tailoring").status_code == 404
 
 
+def test_bulk_tailor_processes_the_queue_in_batches(monkeypatch):
+    import app.main as main
+
+    assert client.put("/api/profile", json={"name": "Test Candidate", "headline": "Engineer",
+                                            "master_resume": "Built Python FastAPI services at 10k rps"}).status_code == 200
+    first, second, broken, has_packet, not_shortlisted = [make_job()["id"] for _ in range(5)]
+    for job_id in (first, second, broken, has_packet):
+        client.post(f"/api/jobs/{job_id}/triage", json={"action": "shortlist"})
+    assert client.post(f"/api/jobs/{has_packet}/tailor").status_code == 200
+
+    real_tailor = main.tailor_job
+
+    def flaky_tailor(db, job):
+        if job.id == broken:
+            raise RuntimeError("model timed out")
+        return real_tailor(db, job)
+
+    monkeypatch.setattr(main, "tailor_job", flaky_tailor)
+    ids = [first, second, broken, has_packet, not_shortlisted, 999999]
+    out = client.post("/api/jobs/bulk-tailor", json={"ids": ids}).json()
+    assert [d["id"] for d in out["done"]] == [first] and out["remaining"] == [second, broken]
+    assert out["skipped"] == 2 and out["missing"] == 1 and out["done"][0]["reviewer_score"] == 86
+
+    out = client.post("/api/jobs/bulk-tailor", json={"ids": out["remaining"], "batch_size": 5}).json()
+    assert [d["id"] for d in out["done"]] == [second] and out["remaining"] == []
+    assert out["errors"] == [{"id": broken, "error": "model timed out"}]
+    assert client.get(f"/api/tailor/{first}").json()["resume"]["untailored"] is False
+    assert client.get(f"/api/tailor/{broken}").json()["resume"] is None
+
+    skipped = client.post("/api/jobs/bulk-tailor", json={"ids": [broken, has_packet], "mode": "skip",
+                                                         "regenerate": True, "batch_size": 5}).json()
+    assert sorted(d["id"] for d in skipped["done"]) == sorted([broken, has_packet])
+    assert all(d["untailored"] for d in skipped["done"])
+    assert client.get(f"/api/tailor/{has_packet}").json()["resume"]["version"] == 2
+
+    assert client.post("/api/jobs/bulk-tailor", json={"ids": []}).status_code == 422
+    assert client.post("/api/jobs/bulk-tailor", json={"ids": [first], "mode": "nope"}).status_code == 422
+
+
 def test_triage_actions_and_filters():
     job = make_job(company=f"Talent Staffing {uuid.uuid4().hex[:6]}")
     assert client.post(f"/api/jobs/{job['id']}/triage", json={"action": "explode"}).status_code == 422
