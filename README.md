@@ -81,7 +81,21 @@ revision. You can also run them explicitly with `python -m app.db_migrations` or
 Installs created before migrations existed are upgraded in place. Back up an existing production
 database before upgrading.
 
-For PostgreSQL:
+### Local PostgreSQL (recommended)
+
+With a local Postgres (for example `brew install postgresql@16 && brew services start postgresql@16`):
+
+```bash
+scripts/setup_local_postgres.sh          # creates jobhunt and jobhunt_test for $USER
+```
+
+Then set `DATABASE_URL=postgresql+psycopg://<your-user>@localhost:5432/jobhunt` in `.env` and start the app; tables are created and migrated on startup. To run the tests on Postgres instead of throwaway SQLite files:
+
+```bash
+TEST_DATABASE_URL=postgresql+psycopg://<your-user>@localhost:5432/jobhunt_test pytest
+```
+
+Or run the app and Postgres in containers:
 
 ```bash
 docker compose up --build

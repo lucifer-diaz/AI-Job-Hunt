@@ -1,6 +1,6 @@
 import os
 os.environ["LLM_PROVIDER"] = "mock"
-os.environ["DATABASE_URL"] = "sqlite:///./test_apify.db"
+os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite:///./test_apify.db")
 
 from app.db import Base, SessionLocal, engine
 from app.models import Job

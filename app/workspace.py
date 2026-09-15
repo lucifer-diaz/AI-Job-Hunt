@@ -29,8 +29,10 @@ from app.models import (AppSetting, Application, ApplicationEvent, Evidence, Fol
                         ResumeDocument, ResumeVariant, SearchRun)
 from app.services.actors import (BUILTIN, DEFAULT_ACTORS, FAN_OUTS, MAX_RUNS, PLACEHOLDERS, REMOTE_PLATFORMS,
                                  SENIORITY_LEVELS, catalog as actor_catalog, describe_input, plan_runs)
+from app.services.ai_config import STAGES as AI_STAGES, is_free_model, resolve as resolve_ai_config
 from app.services.llm import LLMClient
-from app.services.sources import UA, start_apify_search, upsert_job
+from app.services.sources import (UA, import_remote_run, list_remote_runs, refresh_apify_run, start_apify_search,
+                                  upsert_job)
 from app.services.workflow import (draft_followup, followup_days, get_profile, rank_job, resume_edits,
                                    update_resume_edit)
 from app.settings import get_settings
@@ -363,7 +365,7 @@ def _dedupe_key(job: Job) -> str:
 def jobs_search(q: str = "", min_fit: int = 0, board: str = "all", stage: str = "all", sort: str = "fit",
                 page: int = Query(1, ge=1), per_page: int = Query(25, ge=1, le=200), queue: bool = False,
                 hide_agencies: bool = False, hide_reposts: bool = False, keywords: str = "",
-                db: Session = Depends(get_db)):
+                ids_only: bool = False, db: Session = Depends(get_db)):
     query = triage_query(db) if queue else select(Job)
     jobs = db.scalars(query.order_by(Job.id)).all()
     excluded = excluded_companies(db)
@@ -401,6 +403,8 @@ def jobs_search(q: str = "", min_fit: int = 0, board: str = "all", stage: str = 
     else:
         rows.sort(key=lambda j: (j.fit_score is None, -(j.fit_score or 0), -j.id))
     total = len(rows)
+    if ids_only:  # "select all matching" across every page
+        return {"ids": [j.id for j in rows[:5000]], "total": total}
     pages = max(1, -(-total // per_page))
     page = min(page, pages)
     boards = sorted({board_label(j.source) for j in jobs})
@@ -446,6 +450,48 @@ def bulk_triage(payload: BulkTriageIn, db: Session = Depends(get_db)):
             continue
     db.commit()
     return {"changed": changed}
+
+
+class BulkIdsIn(BaseModel):
+    ids: list[int] = Field(min_length=1, max_length=5000)
+    include_submitted: bool = False
+
+
+PROTECTED_STATUSES = ("approved", "applied")
+
+
+@router.post("/api/jobs/bulk-delete")
+def bulk_delete(payload: BulkIdsIn, db: Session = Depends(get_db)):
+    """Permanently delete jobs with their tailored packets. Approved or applied jobs need include_submitted."""
+    deleted, protected = 0, []
+    for job in db.scalars(select(Job).where(Job.id.in_(payload.ids))).all():
+        if job.status in PROTECTED_STATUSES and not payload.include_submitted:
+            protected.append(job.id)
+            continue
+        db.delete(job)
+        deleted += 1
+    db.commit()
+    return {"deleted": deleted, "protected": protected,
+            "missing": max(0, len(set(payload.ids)) - deleted - len(protected))}
+
+
+@router.post("/api/jobs/bulk-rank")
+def bulk_rank(payload: BulkIdsIn, rerank: bool = False, db: Session = Depends(get_db)):
+    """Rank selected jobs one batch at a time; call again with `remaining` until it is empty."""
+    wanted = list(dict.fromkeys(payload.ids))
+    jobs = {j.id: j for j in db.scalars(select(Job).where(Job.id.in_(wanted))).all()}
+    queue = [i for i in wanted if i in jobs and (rerank or jobs[i].fit_score is None)]
+    batch, remaining = queue[:get_settings().max_jobs_per_batch], queue[get_settings().max_jobs_per_batch:]
+    ranked, errors = [], []
+    for job_id in batch:
+        try:
+            result = rank_job(db, jobs[job_id])
+            ranked.append({"id": job_id, "score": result.get("score")})
+        except Exception as exc:
+            db.rollback()
+            errors.append({"id": job_id, "error": str(exc)[:300]})
+    return {"ranked": ranked, "errors": errors, "remaining": remaining,
+            "skipped": len(wanted) - len(queue) - len([i for i in wanted if i not in jobs])}
 
 
 @router.get("/api/jobs/{job_id}")
@@ -1169,21 +1215,14 @@ class PreferencesIn(BaseModel):
 
 @router.get("/api/preferences")
 def preferences_get(db: Session = Depends(get_db)):
-    settings = get_settings()
-    row = setting_row(db)
-    provider = row.llm_provider
-    def model_for(stage: str) -> str:
-        if provider == "openrouter":
-            return getattr(settings, f"openrouter_model_{stage}") or row.model or settings.openrouter_model
-        if provider == "mock":
-            return "mock (no API calls)"
-        return row.model or getattr(settings, f"{provider}_model", "")
+    config = resolve_ai_config(get_settings(), (setting_row(db).preferences or {}).get("ai") or {})
+    provider = config["llm_provider"]
     stage_models = []
-    for stage, label in (("rank", "Rank"), ("tailor", "Tailor"), ("review", "Review"), ("followup", "Follow-up")):
-        model = model_for(stage)
-        free = provider == "mock" or model == "openrouter/free" or ":free" in model
-        stage_models.append({"stage": label, "model": model, "badge": "free" if free else "paid"})
-    return {**prefs(db), "stage_models": stage_models, "require_free": settings.openrouter_require_free}
+    for stage, label in AI_STAGES:
+        model = "mock (no API calls)" if provider == "mock" else config["stage_models"][stage]
+        stage_models.append({"id": stage, "stage": label, "model": model, "source": config["stage_sources"][stage],
+                             "badge": "free" if is_free_model(provider, model) else "paid"})
+    return {**prefs(db), "stage_models": stage_models, "require_free": config["require_free"]}
 
 
 @router.put("/api/preferences")
@@ -1306,3 +1345,65 @@ def knowledge_put(item_id: int, payload: KnowledgeUpdateIn, db: Session = Depend
     item.question_key = key
     db.commit()
     return {"id": item.id, "verified": item.verified}
+
+
+# ───────────────────────────── Apify run sync ─────────────────────────────
+
+def _apify_error(exc: Exception) -> str:
+    if isinstance(exc, httpx.HTTPStatusError):
+        code = exc.response.status_code
+        return "Apify rejected the token" if code in (401, 403) else "Apify run not found" if code == 404 else f"Apify returned HTTP {code}"
+    if isinstance(exc, httpx.HTTPError):
+        return f"Could not reach Apify ({exc.__class__.__name__})"
+    return str(exc)
+
+
+@router.get("/api/search/apify/remote-runs")
+def remote_runs(limit: int = Query(20, ge=1, le=50), db: Session = Depends(get_db)):
+    """Runs in the connected Apify account, marked with whether Job Hunt OS has imported them."""
+    try:
+        return {"runs": list_remote_runs(db, limit)}
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, _apify_error(exc)) from exc
+
+
+class ImportRunsIn(BaseModel):
+    external_run_ids: list[str] = Field(min_length=1, max_length=25)
+    reimport: bool = False
+
+
+def _sync_results(db: Session, work) -> dict:
+    results = []
+    for label, action in work:
+        try:
+            results.append({**action(), "ok": True})
+        except Exception as exc:  # one bad run must not stop the others
+            db.rollback()
+            results.append({"external_run_id": label, "ok": False, "error": _apify_error(exc)})
+    ok = [r for r in results if r["ok"]]
+    return {"results": results, "created": sum((r.get("import") or {}).get("created", 0) for r in ok),
+            "duplicates": sum((r.get("import") or {}).get("duplicates", 0) for r in ok)}
+
+
+@router.post("/api/search/apify/import")
+def import_runs(payload: ImportRunsIn, db: Session = Depends(get_db)):
+    """Import runs by Apify run ID: track them, normalize their items and skip duplicates."""
+    if not get_settings().apify_api_token:
+        raise HTTPException(400, "APIFY_API_TOKEN is missing")
+    bad = [rid for rid in payload.external_run_ids if not re.fullmatch(r"[A-Za-z0-9]{6,40}", rid)]
+    if bad:
+        raise HTTPException(422, f"Invalid Apify run IDs: {', '.join(bad[:3])}")
+    work = [(rid, lambda rid=rid: import_remote_run(db, rid, payload.reimport)) for rid in dict.fromkeys(payload.external_run_ids)]
+    return _sync_results(db, work)
+
+
+@router.post("/api/search/apify/runs/refresh-pending")
+def refresh_pending_runs(db: Session = Depends(get_db)):
+    """Check every run that has not finished yet and import the ones that have."""
+    if not get_settings().apify_api_token:
+        raise HTTPException(400, "APIFY_API_TOKEN is missing")
+    pending = db.scalars(select(SearchRun).where(SearchRun.provider == "apify", SearchRun.completed_at.is_(None))
+                         .order_by(desc(SearchRun.id)).limit(25)).all()
+    return _sync_results(db, [(run.external_run_id, lambda run=run: refresh_apify_run(db, run)) for run in pending])

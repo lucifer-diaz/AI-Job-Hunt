@@ -16,7 +16,7 @@ const S = {
   kitJob: null, tailorJob: null, tailorTab: 'diff', editing: null,
   approvalJob: null, selApp: null, trackerView: 'board', runSel: null,
   editKnowledge: null, scheduling: false, editingRecruiter: false, manualMissing: null,
-  polling: null, busy: {}, forms: {},
+  polling: null, busy: {}, forms: {}, apifyImport: false, importPick: new Set(), autoRefreshed: false,
 };
 const D = {};
 const SCREENS = ['overview', 'today', 'discovery', 'tailor', 'approvals', 'tracker', 'knowledge', 'settings'];
@@ -195,6 +195,53 @@ async function loadSetup() {
   schedulePreview();
   if (!D.runs.some(r => r.id === S.runSel)) S.runSel = (D.runs[0] || {}).id || null;
   D.runDetail = S.runSel ? await api(`/api/search/apify/runs/${S.runSel}/detail`) : null;
+  // Runs left "ready" after a reload are checked once per visit, quietly.
+  if (!S.autoRefreshed && !S.polling && D.searchProfile.apify_configured && D.runs.some(r => !r.completed_at)) {
+    S.autoRefreshed = true;
+    api('/api/search/apify/runs/refresh-pending', { method: 'POST' }).then(async out => {
+      if (!out.results.some(r => r.ok && r.completed)) return;
+      await afterPull(out.results);
+      if (S.screen === 'discovery' && S.discMode === 'setup') { render(); toast(summarizePull(out.results)); }
+    }).catch(() => {});
+  }
+}
+function renderApifyImport() {
+  const remote = D.remoteRuns, chosen = S.importPick;
+  if (!remote) return `<div class="small muted" style="padding:14px 16px;background:#fbfbfe;border-bottom:1px solid var(--line2)">${isBusy('remoteRuns') ? 'Loading runs from your Apify account…' : 'Could not load Apify runs.'}</div>`;
+  return `<div style="padding:12px 16px;background:#fbfbfe;border-bottom:1px solid var(--line2)">
+    <div class="xs muted mb8">Runs in your Apify account, newest first — including ones started outside Job Hunt OS. Imported jobs are normalized and deduplicated against everything already in your pipeline.</div>
+    ${remote.length ? remote.map(r => `<label class="row gap9 top-align" style="padding:8px 0;border-bottom:1px solid var(--line3);cursor:${r.importable ? 'pointer' : 'default'}">
+      <input type="checkbox" data-act="pick-remote" data-id="${attr(r.external_run_id)}" ${chosen.has(r.external_run_id) ? 'checked' : ''} ${r.importable ? '' : 'disabled'} style="margin-top:3px;accent-color:var(--brand)">
+      <span class="grow" style="min-width:0"><span class="small b ellipsis" style="display:block">${esc(r.actor_title)}</span>
+        <span class="tiny muted" style="display:block"><span class="mono">${esc(r.actor_id)}</span> · ${fmtDateTime(r.started_at)}${r.item_count != null ? ` · ${r.item_count} items` : ''}${r.origin ? ` · ${esc(r.origin.toLowerCase())}` : ''}</span></span>
+      <span class="col gap4 none" style="align-items:flex-end">${pill(r.status.toLowerCase(), r.status === 'SUCCEEDED' ? 'good' : ['READY', 'RUNNING'].includes(r.status) ? 'warn' : 'bad')}${r.local_run_id ? `<span class="tiny faint">${r.imported ? 'imported' : 'tracking'} · #${r.local_run_id}</span>` : ''}</span></label>`).join('')
+      : '<div class="small muted">No runs found in your Apify account.</div>'}
+    <div class="row gap8 wrap mt10">${btn(label('importRuns', chosen.size ? `Import ${chosen.size} selected` : 'Select runs to import', 'Importing…'), 'import-remote', {}, 'sm primary', !chosen.size || isBusy('importRuns'))}${btn(label('remoteRuns', 'Reload', 'Loading…'), 'load-remote', {}, 'sm', isBusy('remoteRuns'))}
+      <span class="tiny faint grow">Already imported? Open the run and use Pull again.</span></div></div>`;
+}
+async function rankRuns(ids) {
+  for (const id of ids) {
+    for (let guard = 0; guard < 20; guard++) {
+      const out = await api(`/api/search/apify/runs/${id}/rank`, { method: 'POST' });
+      if (out.errors.length && !out.ranked) { toast(`Ranking stopped: ${out.errors[0]}`, true); return; }
+      if (!out.remaining || !out.ranked) break;
+    }
+  }
+}
+async function afterPull(results) {
+  const ok = results.filter(r => r.ok && r.id);
+  if (D.searchProfile?.profile?.auto_rank) await rankRuns(ok.filter(r => r.import && r.import.created).map(r => r.id));
+  if (ok[0]) S.runSel = ok[0].id;
+  await loadSetup();
+  api('/api/workspace/summary').then(s => { D.summary = s; render(); }).catch(() => {});
+}
+function summarizePull(results) {
+  const ok = results.filter(r => r.ok), failed = results.filter(r => !r.ok);
+  if (!ok.length && !failed.length) return 'No runs were waiting';
+  const created = ok.reduce((a, r) => a + (r.import?.created || 0), 0), dup = ok.reduce((a, r) => a + (r.import?.duplicates || 0), 0);
+  const running = ok.filter(r => !r.completed).length;
+  return [`${created} new job${created === 1 ? '' : 's'}`, dup ? `${dup} duplicate${dup === 1 ? '' : 's'} skipped` : '',
+    running ? `${running} still running` : '', failed.length ? `${failed.length} failed: ${failed[0].error}` : ''].filter(Boolean).join(' · ');
 }
 let loadSeq = 0;
 async function load() {
@@ -432,11 +479,16 @@ function renderTable() {
       <select class="select" id="flt-stage" data-filter="stage">${opts([['all', 'All stages'], ...['discovered', 'shortlisted', 'maybe', 'archived', 'dismissed', 'tailored', 'approved', 'applied'].map(s => [s, s[0].toUpperCase() + s.slice(1)])], f.stage)}</select>
       <select class="select" id="flt-sort" data-filter="sort">${opts([['fit', 'Sort: best fit'], ['new', 'Sort: newest'], ['company', 'Sort: company']], f.sort)}</select>
       ${btn('Reset', 'reset-filters', {}, 'sm')}
-      ${btn(label('rankBatch', 'Rank unranked', 'Ranking…'), 'rank-batch', {}, 'sm', isBusy('rankBatch'))}
-      ${btn(`Bulk shortlist${S.checked.size ? ` (${S.checked.size})` : ''}`, 'bulk', { action: 'shortlist' }, 'sm soft', !S.checked.size)}
-      ${S.checked.size ? btn('Dismiss', 'bulk', { action: 'dismiss' }, 'sm danger') : ''}
+      ${S.checked.size ? '' : btn(label('rankBatch', 'Rank unranked', 'Ranking…'), 'rank-batch', {}, 'sm', isBusy('rankBatch'))}
+      ${S.checked.size ? `<span class="small b" style="color:var(--brand-ink)">${S.checked.size} selected</span>` : ''}
+      ${btn(isBusy('bulkRank') ? esc(S.rankProgress || 'Ranking…') : `Rank${S.checked.size ? ` ${S.checked.size}` : ''}`, 'bulk-rank', {}, 'sm', !S.checked.size || isBusy('bulkRank'))}
+      ${btn(`Shortlist${S.checked.size ? ` ${S.checked.size}` : ''}`, 'bulk', { action: 'shortlist' }, 'sm soft', !S.checked.size)}
+      ${btn('Dismiss', 'bulk', { action: 'dismiss' }, 'sm', !S.checked.size)}
+      ${btn(label('bulkDelete', `Delete${S.checked.size ? ` ${S.checked.size}` : ''}`, 'Deleting…'), 'bulk-delete', {}, 'sm danger', !S.checked.size || isBusy('bulkDelete'))}
     </div>
     <div class="row between wrap" style="padding:9px 14px;border-bottom:1px solid var(--line2);background:#fbfbfe"><span class="small muted">${j.total ? `Showing ${start}–${Math.min(j.page * j.per_page, j.total)} of ${j.total} jobs` : 'No matches'}</span><span class="small muted">Page ${j.page} of ${j.pages} · ${j.total === j.total_all ? 'no filters applied' : `${j.total_all - j.total} hidden by filters`}</span></div>
+    ${allOnPage && j.total > j.items.length && S.checked.size < j.total ? `<div class="banner" style="border-radius:0;border-width:0 0 1px">All ${j.items.length} on this page are selected. <a href="#" data-act="select-all-matching">${isBusy('selectAll') ? 'Selecting…' : `Select all ${j.total} matching jobs`}</a></div>` : ''}
+    ${S.checked.size && S.checked.size >= j.total && j.total > j.items.length ? `<div class="banner" style="border-radius:0;border-width:0 0 1px">All ${S.checked.size} matching jobs are selected. <a href="#" data-act="clear-selection">Clear selection</a></div>` : ''}
     <div class="jgrid jhead"><input type="checkbox" data-act="check-all" ${allOnPage ? 'checked' : ''} aria-label="Select page"><span>OPPORTUNITY</span><span class="tr">FIT</span><span>STAGE</span><span>SOURCE</span><span class="tr">POSTED</span></div>
     ${j.items.map(r => `<div class="jgrid jrow ${r.id === S.selJob ? 'sel' : ''}" data-act="select-job" data-id="${r.id}">
       <input type="checkbox" data-act="check" data-id="${r.id}" ${S.checked.has(r.id) ? 'checked' : ''} aria-label="Select">
@@ -513,10 +565,13 @@ function renderSetup() {
     ${S.showInputs && preview?.runs?.length ? `<div style="margin:0 22px 18px" class="doc clip"><pre class="plain mono" style="font-size:11px">${esc(JSON.stringify(preview.runs.map(r => ({ actor: r.actor_id, location: r.location, input: r.input })), null, 2))}</pre></div>` : ''}
   </section>
   <div class="c-narrow col gap14">
-    <section class="card flush"><div class="card-head"><div class="card-title sm">Recent runs</div><div class="card-sub">Pick a run to see exactly what it searched and everything it pulled.</div></div>
+    <section class="card flush"><div class="card-head"><div class="row between wrap gap8"><div class="card-title sm">Recent runs</div>
+        <div class="row gap6">${D.runs.some(r => !r.completed_at) ? btn(label('refreshPending', `Refresh ${D.runs.filter(r => !r.completed_at).length} pending`, 'Checking…'), 'refresh-pending', {}, 'sm', isBusy('refreshPending') || !data.apify_configured) : ''}${btn(S.apifyImport ? 'Close import' : 'Import from Apify', 'toggle-apify-import', {}, 'sm soft', !data.apify_configured)}</div></div>
+        <div class="card-sub">Pick a run to see exactly what it searched and everything it pulled.</div></div>
+      ${S.apifyImport ? renderApifyImport() : ''}
       ${D.runs.length ? D.runs.slice(0, 6).map(r => `<div class="lrow click ${r.id === S.runSel ? 'sel' : ''}" data-act="select-run" data-id="${r.id}" style="align-items:flex-start"><span class="dot" style="width:7px;height:7px;margin-top:6px;background:${r.status === 'SUCCEEDED' ? '#0f9c86' : r.completed_at ? '#c22f4e' : '#e0a136'}"></span><div class="grow"><div class="small b">Run #${r.id} · ${esc(r.status.toLowerCase())}</div><div class="xs muted mt4"><span class="mono">${esc((r.actor_id || '').split('/').pop())}</span> · ${r.created_jobs} new from ${r.item_count} results · ${fmtDateTime(r.created_at)}</div></div></div>`).join('') : `<div class="small muted" style="padding:16px">No runs yet.</div>`}
       ${run ? `<div style="padding:16px;background:#fbfbfe">
-        <div class="row base between wrap mb12"><div class="base b">Run #${run.id}</div>${pill(run.status, run.status === 'SUCCEEDED' ? 'good' : run.completed ? 'bad' : 'warn')}</div>
+        <div class="row base between wrap gap8 mb12"><div class="base b">Run #${run.id}</div><div class="row gap6">${pill(run.status, run.status === 'SUCCEEDED' ? 'good' : run.completed ? 'bad' : 'warn')}${data.apify_configured ? btn(label('pull' + run.id, run.completed ? 'Pull again' : 'Check status &amp; pull', 'Checking…'), 'pull-run', { id: run.id, reimport: run.completed ? '1' : '' }, 'sm', isBusy('pull' + run.id)) : ''}</div></div>
         <div class="grid-auto w96 mb14">${[['pulled', 'Pulled', 'var(--ink)'], ['new', 'New', 'var(--good)'], ['duplicates', 'Duplicates', 'var(--muted)'], ['filtered', 'Filtered out', 'var(--warn)']].map(([k, l, c]) => `<div class="box" style="padding:9px 10px"><div class="mono bb" style="font-size:17px;color:${c}">${run.counts[k]}</div><div class="tiny muted">${l}</div></div>`).join('')}</div>
         <div class="box mb12"><div class="caps mb8" style="font-size:11px">WHAT IT SEARCHED</div><div class="col gap6">${run.context.map(([k, v]) => `<div class="row top-align small" style="gap:10px"><span class="faint none" style="width:72px">${esc(k)}</span><span class="ink2 grow pretty">${esc(v)}</span></div>`).join('')}</div></div>
         <div class="box" style="padding:0;overflow:hidden"><div class="row between" style="padding:10px 12px;border-bottom:1px solid var(--line3)"><span class="caps" style="font-size:11px">EVERYTHING IT PULLED</span><span class="tiny faint">showing ${Math.min(6, run.results.length)} of ${run.counts.new}</span></div>
@@ -754,6 +809,10 @@ function renderSettings() {
   const filled = [fv(F, 'name', p.name), fv(F, 'headline', p.headline), fv(F, 'email', p.email), fv(F, 'phone', p.phone), fv(F, 'location', p.location), fv(F, 'total_experience', sp.total_experience), fv(F, 'notice_period', sp.notice_period), fv(F, 'compensation_notes', p.compensation_notes), (fv(F, 'target_roles', p.target_roles) || []).length, (fv(F, 'primary_skills', sp.primary_skills) || []).length, fv(F, 'work_authorization', p.work_authorization), p.master_resume];
   const pct = Math.round(100 * filled.filter(Boolean).length / filled.length);
   const mode = fv('ai', 'application_mode', st.application_mode);
+  // AI editor: blank inputs inherit .env, so placeholders show what would be used.
+  const ai = st.ai, aiProvider = fv('ai', 'llm_provider', ai.saved.llm_provider) || ai.env.llm_provider;
+  const aiDefault = () => String(fv('ai', 'model', ai.saved.model)).trim() || ai.env.models[aiProvider] || '';
+  const stageFallback = id => aiProvider === 'mock' ? 'mock (no API calls)' : (aiProvider === 'openrouter' && !String(fv('ai', 'model', ai.saved.model)).trim() && ai.env.stage_models[id]) || aiDefault();
   const fields = [['name', 'Full name', p.name], ['headline', 'Headline', p.headline], ['email', 'Email', p.email], ['phone', 'Phone', p.phone], ['location', 'Current location', p.location], ['total_experience', 'Total experience', sp.total_experience], ['notice_period', 'Notice period', sp.notice_period], ['compensation_notes', 'Expected compensation', p.compensation_notes]];
   return `<div class="grid-auto" style="grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px;align-items:start">
   <section class="card" style="grid-column:1/-1;padding:20px">
@@ -774,11 +833,12 @@ function renderSettings() {
     </div>
     <div class="row gap9 wrap mt20">${btn(label('profile', 'Save profile', 'Saving…'), 'save-profile', {}, 'primary', isBusy('profile'))}${btn(label('parse', 'Re-parse resume into evidence', 'Parsing…'), 'parse-evidence', {}, '', isBusy('parse'))}</div>
   </section>
-  <section class="card" style="padding:20px"><div class="card-title mb4">AI models per stage</div><div class="card-sub mb16">Keys stay server-side.${pr.require_free ? ' Free-only guard is on for OpenRouter.' : ''}</div>
+  <section class="card" style="padding:20px"><div class="card-title mb4">AI models per stage</div><div class="card-sub mb16">Keys stay server-side. Blank fields inherit the <span class="mono">.env</span> value shown as placeholder.${pr.require_free ? ' Free-only guard is on for OpenRouter.' : ''}</div>
     <div class="grid-auto" style="grid-template-columns:1fr 1fr;gap:10px">
-      <label class="field">Provider${selectF('ai', 'llm_provider', st.llm_provider, [['openrouter', 'OpenRouter'], ['openai', 'OpenAI'], ['anthropic', 'Anthropic'], ['mock', 'Mock / testing']])}</label>
-      <label class="field">Default model${inputF('ai', 'model', st.model)}</label></div>
-    <div class="col gap9 mt12">${pr.stage_models.map(s => `<div class="box row gap12" style="padding:10px 12px"><span class="small b none" style="width:74px">${esc(s.stage)}</span><span class="mono xs ink2 grow ellipsis" style="background:var(--line3);border-radius:6px;padding:4px 7px">${esc(s.model)}</span>${pill(s.badge, s.badge === 'free' ? 'good' : 'warn')}</div>`).join('')}</div>
+      <label class="field">Provider${selectF('ai', 'llm_provider', ai.saved.llm_provider, [['', `From .env (${ai.env.llm_provider})`], ['openrouter', 'OpenRouter'], ['openai', 'OpenAI'], ['anthropic', 'Anthropic'], ['mock', 'Mock / testing']], 'data-live="1"')}</label>
+      <label class="field">Default model${inputF('ai', 'model', ai.saved.model, `placeholder="${attr(ai.env.models[aiProvider] || '')}"`)}</label></div>
+    <div class="col gap9 mt12">${pr.stage_models.map(s => `<div class="box row gap12" style="padding:6px 12px"><span class="small b none" style="width:74px">${esc(s.stage)}</span><input class="input mono xs grow" style="margin:0;min-width:0" id="ai-stage-${s.id}" data-form="ai" data-field="stage_${s.id}" value="${attr(fv('ai', `stage_${s.id}`, ai.saved.stage_models[s.id] || ''))}" placeholder="${attr(stageFallback(s.id))}" ${aiProvider === 'mock' ? 'disabled' : ''}>${pill(s.badge, s.badge === 'free' ? 'good' : 'warn')}</div>`).join('')}</div>
+    <div class="row gap16 wrap mt10">${selectF('ai', 'require_free', ai.saved.require_free == null ? '' : String(ai.saved.require_free), [['', `Free-only guard: from .env (${ai.env.require_free ? 'on' : 'off'})`], ['true', 'Free-only guard: on'], ['false', 'Free-only guard: off']])}</div>
     <div class="xs faint mt8">${Object.entries(st.configured).filter(([k]) => k !== 'mock').map(([k, v]) => `${k}: ${v ? 'key set' : 'no key'}`).join(' · ')}</div>
     <div class="hr" style="margin:16px 0"></div>
     <div class="base b mb4">Approval &amp; submission mode</div><div class="small muted mb10">How far the workflow may run without you.</div>
@@ -1030,6 +1090,45 @@ const A = {
     const out = await api('/api/jobs/bulk-triage', { method: 'POST', body: { ids: [...S.checked], action: el.dataset.action } });
     S.checked.clear(); await load(); return out;
   }, out => `${out.changed} job${out.changed === 1 ? '' : 's'} updated`),
+  'select-all-matching': (el, e) => {
+    e.preventDefault();
+    return busy('selectAll', async () => {
+      const f = S.filters;
+      const out = await api('/api/jobs/search?' + qs({ ...f, min_fit: f.min_fit || '', ids_only: true }));
+      out.ids.forEach(id => S.checked.add(id));
+    });
+  },
+  'clear-selection': (el, e) => { e.preventDefault(); S.checked.clear(); render(); },
+  'bulk-rank': () => busy('bulkRank', async () => {
+    let ids = [...S.checked], ranked = 0, failed = [], skipped = 0;
+    const total = ids.length;
+    while (ids.length) {
+      S.rankProgress = `Ranking ${Math.min(total, ranked + failed.length + 1)} of ${total}…`; render();
+      const out = await api('/api/jobs/bulk-rank?rerank=true', { method: 'POST', body: { ids } });
+      ranked += out.ranked.length; failed = failed.concat(out.errors); skipped += out.skipped;
+      if (!out.ranked.length && out.errors.length) break; // provider is failing; stop instead of looping
+      ids = out.remaining;
+    }
+    S.rankProgress = ''; S.checked.clear(); await load();
+    if (!ranked && failed.length) throw new Error(`Ranking failed: ${failed[0].error}`);
+    return { ranked, failed };
+  }, r => `Ranked ${r.ranked} job${r.ranked === 1 ? '' : 's'}${r.failed.length ? ` · ${r.failed.length} failed: ${r.failed[0].error}` : ''}`),
+  'bulk-delete': () => {
+    const count = S.checked.size;
+    if (!confirm(`Permanently delete ${count} job${count === 1 ? '' : 's'}? Tailored resumes for them are deleted too. Approved or applied jobs are kept unless you confirm again.`)) return;
+    return busy('bulkDelete', async () => {
+      const ids = [...S.checked];
+      let out = await api('/api/jobs/bulk-delete', { method: 'POST', body: { ids } });
+      if (out.protected.length && confirm(`${out.protected.length} of them are approved or applied and have tracker history. Delete those too?`)) {
+        const more = await api('/api/jobs/bulk-delete', { method: 'POST', body: { ids: out.protected, include_submitted: true } });
+        out = { ...out, deleted: out.deleted + more.deleted, protected: [] };
+      }
+      S.checked = new Set(out.protected);
+      if (!S.checked.has(S.selJob)) S.selJob = null;
+      await load();
+      return out;
+    }, out => `Deleted ${out.deleted} job${out.deleted === 1 ? '' : 's'}${out.protected.length ? ` · kept ${out.protected.length} approved or applied` : ''}`);
+  },
   'reset-filters': (el, e) => { e.preventDefault(); S.filters = { q: '', min_fit: 0, board: 'all', stage: 'all', sort: 'fit', page: 1, per_page: S.filters.per_page }; load(); },
   page: el => { S.filters.page = Number(el.dataset.page); load(); },
   // setup
@@ -1087,6 +1186,31 @@ const A = {
     setTimeout(pollRuns, 3000);
     return out;
   }, out => out.warnings?.length ? `Started · note: ${out.warnings[0]}` : null),
+  'toggle-apify-import': () => { S.apifyImport = !S.apifyImport; if (S.apifyImport && !D.remoteRuns) A['load-remote'](); else render(); },
+  'load-remote': () => busy('remoteRuns', async () => {
+    D.remoteRuns = null; render();
+    D.remoteRuns = (await api('/api/search/apify/remote-runs?limit=20')).runs;
+  }),
+  'pick-remote': el => { const id = el.dataset.id; S.importPick.has(id) ? S.importPick.delete(id) : S.importPick.add(id); render(); },
+  'import-remote': () => busy('importRuns', async () => {
+    const out = await api('/api/search/apify/import', { method: 'POST', body: { external_run_ids: [...S.importPick] } });
+    if (out.results.every(r => !r.ok)) throw new Error(out.results[0].error);
+    S.importPick.clear();
+    D.remoteRuns = (await api('/api/search/apify/remote-runs?limit=20')).runs;
+    await afterPull(out.results);
+    return out;
+  }, out => summarizePull(out.results)),
+  'refresh-pending': () => busy('refreshPending', async () => {
+    const out = await api('/api/search/apify/runs/refresh-pending', { method: 'POST' });
+    if (out.results.length && out.results.every(r => !r.ok)) throw new Error(out.results[0].error);
+    await afterPull(out.results);
+    return out;
+  }, out => summarizePull(out.results)),
+  'pull-run': el => busy('pull' + el.dataset.id, async () => {
+    const run = await api(`/api/search/apify/runs/${el.dataset.id}${el.dataset.reimport ? '?reimport=true' : ''}`);
+    await afterPull([{ ...run, ok: true }]);
+    return run;
+  }, run => run.completed ? summarizePull([{ ...run, ok: true }]) : `Still ${run.status.toLowerCase()} on Apify — check again shortly`),
   'select-run': async el => { S.runSel = Number(el.dataset.id); render(); D.runDetail = await api(`/api/search/apify/runs/${S.runSel}/detail`).catch(e => { toast(e.message, true); return null; }); render(); },
   'add-manual': () => busy('manual', async () => {
     const m = S.forms.manual || {};
@@ -1238,7 +1362,9 @@ const A = {
   'resume-primary': el => busy('primary', async () => { D.resumes = await api(`/api/profile/resumes/${el.dataset.id}/primary`, { method: 'POST' }); await load(); }, 'Primary resume updated'),
   'save-ai': () => busy('ai', async () => {
     const st = D.settings;
-    const body = { llm_provider: fv('ai', 'llm_provider', st.llm_provider), model: fv('ai', 'model', st.model), application_mode: fv('ai', 'application_mode', st.application_mode), min_review_score: Number(fv('ai', 'min_review_score', st.min_review_score)) };
+    const saved = st.ai.saved, rf = fv('ai', 'require_free', saved.require_free == null ? '' : String(saved.require_free));
+    const stage_models = {}; ['rank', 'tailor', 'review', 'followup'].forEach(k => { const v = String(fv('ai', `stage_${k}`, saved.stage_models[k] || '')).trim(); if (v) stage_models[k] = v; });
+    const body = { llm_provider: fv('ai', 'llm_provider', saved.llm_provider), model: String(fv('ai', 'model', saved.model)).trim(), stage_models, require_free: rf === '' ? null : rf === 'true', application_mode: fv('ai', 'application_mode', st.application_mode), min_review_score: Number(fv('ai', 'min_review_score', st.min_review_score)) };
     if (body.application_mode === 'automatic' && st.application_mode !== 'automatic' && !confirm('Auto-approval skips the manual queue once a resume passes review. Submitting stays your action. Continue?')) return;
     await api('/api/settings', { method: 'PUT', body }); delete S.forms.ai; await load();
   }, 'AI settings saved'),
