@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.orm import Session
 
-from app.db import get_db
+from app.auth import get_user_db
 from app.models import (AppSetting, Application, ApplicationEvent, Evidence, FollowUp, Job, KnowledgeAnswer,
                         ResumeDocument, ResumeVariant, SearchRun)
 from app.services.actors import (BUILTIN, DEFAULT_ACTORS, FAN_OUTS, MAX_RUNS, PLACEHOLDERS, REMOTE_PLATFORMS,
@@ -33,6 +33,7 @@ from app.services.ai_config import STAGES as AI_STAGES, is_free_model, resolve a
 from app.services.llm import LLMClient
 from app.services.sources import (UA, import_remote_run, list_remote_runs, refresh_apify_run, start_apify_search,
                                   upsert_job)
+from app.services.user_settings import apify_token, settings_for
 from app.services.workflow import (draft_followup, followup_days, get_profile, rank_job, resume_edits,
                                    update_resume_edit)
 from app.settings import get_settings
@@ -72,15 +73,7 @@ def utcnow() -> datetime:
 
 
 def setting_row(db: Session) -> AppSetting:
-    row = db.get(AppSetting, 1)
-    if not row:
-        settings = get_settings()
-        row = AppSetting(id=1, llm_provider=settings.llm_provider,
-                         model=getattr(settings, f"{settings.llm_provider}_model", ""))
-        db.add(row)
-        db.commit()
-        db.refresh(row)
-    return row
+    return settings_for(db)
 
 
 def prefs(db: Session) -> dict:
@@ -173,7 +166,7 @@ def live_apps(db: Session) -> list[Application]:
 
 
 @router.get("/api/workspace/summary")
-def summary(db: Session = Depends(get_db)):
+def summary(db: Session = Depends(get_user_db)):
     row = setting_row(db)
     profile = get_profile(db)
     sp = search_prefs(db).get("search_profile") or {}
@@ -200,7 +193,7 @@ def _pct(n: int, total: int) -> str:
 
 
 @router.get("/api/workspace/overview")
-def overview(db: Session = Depends(get_db)):
+def overview(db: Session = Depends(get_user_db)):
     since = utcnow() - timedelta(days=30)
     jobs = db.scalars(select(Job).where(Job.discovered_at >= since)).all()
     total = len(jobs)
@@ -316,7 +309,7 @@ def today_actions(db: Session) -> list[dict]:
 
 
 @router.get("/api/workspace/today")
-def today(db: Session = Depends(get_db)):
+def today(db: Session = Depends(get_user_db)):
     now = utcnow()
     week_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
     apps = live_apps(db)
@@ -365,7 +358,7 @@ def _dedupe_key(job: Job) -> str:
 def jobs_search(q: str = "", min_fit: int = 0, board: str = "all", stage: str = "all", sort: str = "fit",
                 page: int = Query(1, ge=1), per_page: int = Query(25, ge=1, le=200), queue: bool = False,
                 hide_agencies: bool = False, hide_reposts: bool = False, keywords: str = "",
-                ids_only: bool = False, db: Session = Depends(get_db)):
+                ids_only: bool = False, db: Session = Depends(get_user_db)):
     query = triage_query(db) if queue else select(Job)
     jobs = db.scalars(query.order_by(Job.id)).all()
     excluded = excluded_companies(db)
@@ -384,7 +377,10 @@ def jobs_search(q: str = "", min_fit: int = 0, board: str = "all", stage: str = 
             continue
         if board != "all" and board_label(job.source) != board:
             continue
-        if stage != "all" and job.status != stage:
+        if stage == "unranked":  # not a status: any job without a fit score yet
+            if job.fit_score is not None:
+                continue
+        elif stage != "all" and job.status != stage:
             continue
         haystack = f"{job.title} {job.company} {job.location}".lower()
         if needle and needle not in haystack:
@@ -432,7 +428,7 @@ def apply_triage(job: Job, action: str) -> None:
 
 
 @router.post("/api/jobs/{job_id}/triage")
-def triage(job_id: int, payload: TriageIn, db: Session = Depends(get_db)):
+def triage(job_id: int, payload: TriageIn, db: Session = Depends(get_user_db)):
     job = get_job(db, job_id)
     apply_triage(job, payload.action)
     db.commit()
@@ -440,7 +436,7 @@ def triage(job_id: int, payload: TriageIn, db: Session = Depends(get_db)):
 
 
 @router.post("/api/jobs/bulk-triage")
-def bulk_triage(payload: BulkTriageIn, db: Session = Depends(get_db)):
+def bulk_triage(payload: BulkTriageIn, db: Session = Depends(get_user_db)):
     changed = 0
     for job in db.scalars(select(Job).where(Job.id.in_(payload.ids))).all():
         try:
@@ -461,7 +457,7 @@ PROTECTED_STATUSES = ("approved", "applied")
 
 
 @router.post("/api/jobs/bulk-delete")
-def bulk_delete(payload: BulkIdsIn, db: Session = Depends(get_db)):
+def bulk_delete(payload: BulkIdsIn, db: Session = Depends(get_user_db)):
     """Permanently delete jobs with their tailored packets. Approved or applied jobs need include_submitted."""
     deleted, protected = 0, []
     for job in db.scalars(select(Job).where(Job.id.in_(payload.ids))).all():
@@ -476,7 +472,7 @@ def bulk_delete(payload: BulkIdsIn, db: Session = Depends(get_db)):
 
 
 @router.post("/api/jobs/bulk-rank")
-def bulk_rank(payload: BulkIdsIn, rerank: bool = False, db: Session = Depends(get_db)):
+def bulk_rank(payload: BulkIdsIn, rerank: bool = False, db: Session = Depends(get_user_db)):
     """Rank selected jobs one batch at a time; call again with `remaining` until it is empty."""
     wanted = list(dict.fromkeys(payload.ids))
     jobs = {j.id: j for j in db.scalars(select(Job).where(Job.id.in_(wanted))).all()}
@@ -495,7 +491,7 @@ def bulk_rank(payload: BulkIdsIn, rerank: bool = False, db: Session = Depends(ge
 
 
 @router.get("/api/jobs/{job_id}")
-def job_detail(job_id: int, db: Session = Depends(get_db)):
+def job_detail(job_id: int, db: Session = Depends(get_user_db)):
     job = get_job(db, job_id)
     resume = latest_resume(db, job.id)
     app = job.application
@@ -575,7 +571,7 @@ def extract_job_posting(html: str) -> dict:
 
 
 @router.post("/api/jobs/from-url")
-def job_from_url(payload: JobUrlIn, db: Session = Depends(get_db)):
+def job_from_url(payload: JobUrlIn, db: Session = Depends(get_user_db)):
     data = {"title": payload.title, "company": payload.company, "location": payload.location,
             "description": payload.description}
     fetch_error = ""
@@ -676,7 +672,7 @@ def validate_search_profile(payload: SearchProfileIn) -> None:
 
 
 @router.get("/api/search/actors")
-def search_actors(db: Session = Depends(get_db)):
+def search_actors(db: Session = Depends(get_user_db)):
     sp = get_search_profile(db)
     return {"actors": [spec.public() for spec in actor_catalog(sp).values()], "placeholders": list(PLACEHOLDERS),
             "fan_outs": list(FAN_OUTS), "boards": BOARDS, "remote_platforms": REMOTE_PLATFORMS,
@@ -698,11 +694,11 @@ GUESSES = [(re.compile(r"^(search_?term|keywords?|query|search|search_?keywords?
 
 
 @router.post("/api/search/actors/lookup")
-def lookup_actor(payload: ActorLookupIn):
+def lookup_actor(payload: ActorLookupIn, db: Session = Depends(get_user_db)):
     """Confirm a Store actor exists and suggest an input template from its input schema."""
-    token = get_settings().apify_api_token
+    token = apify_token(db)
     if not token:
-        raise HTTPException(400, "Set APIFY_API_TOKEN on the server to look actors up")
+        raise HTTPException(400, "Add your Apify API token in Settings to look actors up")
     api_id = payload.id.replace("/", "~")
     headers = {"Authorization": f"Bearer {token}", "User-Agent": UA}
     try:
@@ -738,7 +734,7 @@ def lookup_actor(payload: ActorLookupIn):
 
 
 @router.get("/api/search/profile")
-def search_profile_get(db: Session = Depends(get_db)):
+def search_profile_get(db: Session = Depends(get_user_db)):
     since = utcnow() - timedelta(days=30)
     jobs = db.scalars(select(Job).where(Job.discovered_at >= since, Job.source.like("apify:%"))).all()
     stats = {}
@@ -747,11 +743,11 @@ def search_profile_get(db: Session = Depends(get_db)):
         kept = [j for j in mine if j.status not in ("discovered", "archived", "dismissed")]
         stats[site] = round(100 * len(kept) / len(mine)) if mine else None
     return {"profile": get_search_profile(db), "board_yield": stats,
-            "apify_configured": bool(get_settings().apify_api_token), "actor_id": get_settings().apify_actor_id}
+            "apify_configured": bool(apify_token(db)), "actor_id": get_settings().apify_actor_id}
 
 
 @router.put("/api/search/profile")
-def search_profile_put(payload: SearchProfileIn, db: Session = Depends(get_db)):
+def search_profile_put(payload: SearchProfileIn, db: Session = Depends(get_user_db)):
     validate_search_profile(payload)
     profile = get_profile(db)
     prefs_value = dict(profile.search_preferences or {})
@@ -784,7 +780,7 @@ def run_search_profile(db: Session, sp: dict) -> list[SearchRun]:
 
 
 @router.post("/api/search/profile/run")
-def search_profile_run(db: Session = Depends(get_db)):
+def search_profile_run(db: Session = Depends(get_user_db)):
     sp = get_search_profile(db)
     try:
         runs = run_search_profile(db, sp)
@@ -798,7 +794,7 @@ def search_profile_run(db: Session = Depends(get_db)):
 
 
 @router.get("/api/search/apify/runs/{run_id}/detail")
-def run_detail(run_id: int, db: Session = Depends(get_db)):
+def run_detail(run_id: int, db: Session = Depends(get_user_db)):
     run = db.get(SearchRun, run_id)
     if not run:
         raise HTTPException(404, "Search run not found")
@@ -840,7 +836,7 @@ def keyword_coverage(job: Job, resume: ResumeVariant | None) -> list[dict]:
 
 
 @router.get("/api/tailor/queue")
-def tailor_queue(db: Session = Depends(get_db)):
+def tailor_queue(db: Session = Depends(get_user_db)):
     # AI-ranked jobs only reach Tailor once you have confirmed the shortlist in triage.
     jobs = db.scalars(select(Job).where(or_(and_(Job.status == "shortlisted", Job.triaged_at.is_not(None)),
                                             Job.status.in_(("tailored", "pending_approval"))))
@@ -873,7 +869,7 @@ def packet(db: Session, job: Job) -> dict:
 
 
 @router.get("/api/tailor/{job_id}")
-def tailor_detail(job_id: int, db: Session = Depends(get_db)):
+def tailor_detail(job_id: int, db: Session = Depends(get_user_db)):
     return packet(db, get_job(db, job_id))
 
 
@@ -883,7 +879,7 @@ class EditIn(BaseModel):
 
 
 @router.patch("/api/resumes/{resume_id}/edits/{index}")
-def edit_resume(resume_id: int, index: int, payload: EditIn, db: Session = Depends(get_db)):
+def edit_resume(resume_id: int, index: int, payload: EditIn, db: Session = Depends(get_user_db)):
     resume = db.get(ResumeVariant, resume_id)
     if not resume:
         raise HTTPException(404, "Resume not found")
@@ -896,7 +892,7 @@ def edit_resume(resume_id: int, index: int, payload: EditIn, db: Session = Depen
 
 
 @router.put("/api/resumes/{resume_id}/cover-letter")
-def edit_cover_letter(resume_id: int, payload: EditIn, db: Session = Depends(get_db)):
+def edit_cover_letter(resume_id: int, payload: EditIn, db: Session = Depends(get_user_db)):
     resume = db.get(ResumeVariant, resume_id)
     if not resume:
         raise HTTPException(404, "Resume not found")
@@ -910,7 +906,7 @@ def answers_for(db: Session) -> list[KnowledgeAnswer]:
 
 
 @router.get("/api/approvals")
-def approvals(db: Session = Depends(get_db)):
+def approvals(db: Session = Depends(get_user_db)):
     jobs = db.scalars(select(Job).where(Job.status.in_(("tailored", "pending_approval", "approved", "rejected")))
                       .order_by(desc(Job.id))).all()
     rows = []
@@ -926,7 +922,7 @@ def approvals(db: Session = Depends(get_db)):
 
 
 @router.get("/api/approvals/{job_id}")
-def approval_detail(job_id: int, db: Session = Depends(get_db)):
+def approval_detail(job_id: int, db: Session = Depends(get_user_db)):
     job = get_job(db, job_id)
     data = packet(db, job)
     resume = data["resume"]
@@ -960,7 +956,7 @@ class NotesIn(BaseModel):
 
 
 @router.post("/api/jobs/{job_id}/revision")
-def send_back(job_id: int, payload: NotesIn, db: Session = Depends(get_db)):
+def send_back(job_id: int, payload: NotesIn, db: Session = Depends(get_user_db)):
     job = get_job(db, job_id)
     if not job.resumes:
         raise HTTPException(400, "There is no tailored packet to send back")
@@ -974,7 +970,7 @@ def send_back(job_id: int, payload: NotesIn, db: Session = Depends(get_db)):
 
 
 @router.put("/api/jobs/{job_id}/notes")
-def save_notes(job_id: int, payload: NotesIn, db: Session = Depends(get_db)):
+def save_notes(job_id: int, payload: NotesIn, db: Session = Depends(get_user_db)):
     job = get_job(db, job_id)
     app = job.application
     if not app:
@@ -986,7 +982,7 @@ def save_notes(job_id: int, payload: NotesIn, db: Session = Depends(get_db)):
 
 
 @router.get("/api/jobs/{job_id}/apply-kit")
-def apply_kit(job_id: int, db: Session = Depends(get_db)):
+def apply_kit(job_id: int, db: Session = Depends(get_user_db)):
     job = get_job(db, job_id)
     app = job.application
     if not app or app.status not in ("approved", "applied"):
@@ -1008,7 +1004,7 @@ def apply_kit(job_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/api/knowledge/{item_id}/used")
-def knowledge_used(item_id: int, db: Session = Depends(get_db)):
+def knowledge_used(item_id: int, db: Session = Depends(get_user_db)):
     item = db.get(KnowledgeAnswer, item_id)
     if not item:
         raise HTTPException(404, "Knowledge answer not found")
@@ -1018,7 +1014,7 @@ def knowledge_used(item_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/api/jobs/{job_id}/resume.docx")
-def resume_docx(job_id: int, db: Session = Depends(get_db)):
+def resume_docx(job_id: int, db: Session = Depends(get_user_db)):
     resume = latest_resume(db, job_id)
     if not resume:
         raise HTTPException(404, "No tailored resume for this job")
@@ -1047,7 +1043,7 @@ def resume_docx(job_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/api/jobs/{job_id}/cover-letter.txt")
-def cover_letter_txt(job_id: int, db: Session = Depends(get_db)):
+def cover_letter_txt(job_id: int, db: Session = Depends(get_user_db)):
     resume = latest_resume(db, job_id)
     if not resume:
         raise HTTPException(404, "No tailored resume for this job")
@@ -1098,7 +1094,7 @@ def app_payload(db: Session, app: Application) -> dict:
 
 
 @router.get("/api/tracker")
-def tracker(db: Session = Depends(get_db)):
+def tracker(db: Session = Depends(get_user_db)):
     apps = db.scalars(select(Application).where(Application.applied_at.is_not(None)).order_by(desc(Application.applied_at))).all()
     payload = [app_payload(db, a) for a in apps]
     live = [a for a in payload if a["stage"] not in INACTIVE_STAGES]
@@ -1116,7 +1112,7 @@ class StagesIn(BaseModel):
 
 
 @router.put("/api/tracker/stages")
-def tracker_stages(payload: StagesIn, db: Session = Depends(get_db)):
+def tracker_stages(payload: StagesIn, db: Session = Depends(get_user_db)):
     valid = {s["id"] for s in EXTRA_STAGES}
     if set(payload.extra_stages) - valid:
         raise HTTPException(422, "Unknown stage")
@@ -1140,7 +1136,7 @@ def get_app(db: Session, application_id: int) -> Application:
 
 
 @router.post("/api/applications/{application_id}/stage")
-def move_stage(application_id: int, payload: StageIn, db: Session = Depends(get_db)):
+def move_stage(application_id: int, payload: StageIn, db: Session = Depends(get_user_db)):
     app = get_app(db, application_id)
     if payload.stage not in ALL_STAGE_IDS:
         raise HTTPException(422, "Unknown stage")
@@ -1162,7 +1158,7 @@ class EventIn(BaseModel):
 
 
 @router.post("/api/applications/{application_id}/events")
-def add_event(application_id: int, payload: EventIn, db: Session = Depends(get_db)):
+def add_event(application_id: int, payload: EventIn, db: Session = Depends(get_user_db)):
     app = get_app(db, application_id)
     if payload.kind not in ("note", "call", "email", "referral", "interview"):
         raise HTTPException(422, "Unknown event kind")
@@ -1185,7 +1181,7 @@ class RecruiterPatchIn(BaseModel):
 
 
 @router.put("/api/applications/{application_id}/recruiter")
-def set_recruiter(application_id: int, payload: RecruiterPatchIn, db: Session = Depends(get_db)):
+def set_recruiter(application_id: int, payload: RecruiterPatchIn, db: Session = Depends(get_user_db)):
     app = get_app(db, application_id)
     app.recruiter_name, app.recruiter_email = payload.recruiter_name.strip(), payload.recruiter_email.strip()
     db.commit()
@@ -1193,7 +1189,7 @@ def set_recruiter(application_id: int, payload: RecruiterPatchIn, db: Session = 
 
 
 @router.post("/api/applications/{application_id}/followup-draft")
-def followup_draft(application_id: int, db: Session = Depends(get_db)):
+def followup_draft(application_id: int, db: Session = Depends(get_user_db)):
     app = get_app(db, application_id)
     if not app.applied_at:
         raise HTTPException(400, "Follow-ups are only drafted for submitted applications")
@@ -1214,7 +1210,7 @@ class PreferencesIn(BaseModel):
 
 
 @router.get("/api/preferences")
-def preferences_get(db: Session = Depends(get_db)):
+def preferences_get(db: Session = Depends(get_user_db)):
     config = resolve_ai_config(get_settings(), (setting_row(db).preferences or {}).get("ai") or {})
     provider = config["llm_provider"]
     stage_models = []
@@ -1226,7 +1222,7 @@ def preferences_get(db: Session = Depends(get_db)):
 
 
 @router.put("/api/preferences")
-def preferences_put(payload: PreferencesIn, db: Session = Depends(get_db)):
+def preferences_put(payload: PreferencesIn, db: Session = Depends(get_user_db)):
     row = setting_row(db)
     row.preferences = {**(row.preferences or {}), **payload.model_dump()}
     db.commit()
@@ -1234,14 +1230,14 @@ def preferences_put(payload: PreferencesIn, db: Session = Depends(get_db)):
 
 
 @router.get("/api/profile/resumes")
-def resume_list(db: Session = Depends(get_db)):
+def resume_list(db: Session = Depends(get_user_db)):
     docs = db.scalars(select(ResumeDocument).order_by(desc(ResumeDocument.active), desc(ResumeDocument.id))).all()
     return [{"id": d.id, "filename": d.original_filename, "size": d.size, "media_type": d.media_type,
              "active": d.active, "created_at": d.created_at.isoformat(), "words": len(d.extracted_text.split())} for d in docs]
 
 
 @router.post("/api/profile/resumes/{document_id}/primary")
-def resume_primary(document_id: int, db: Session = Depends(get_db)):
+def resume_primary(document_id: int, db: Session = Depends(get_user_db)):
     document = db.get(ResumeDocument, document_id)
     if not document:
         raise HTTPException(404, "Resume not found")
@@ -1254,14 +1250,14 @@ def resume_primary(document_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/api/profile/resume/parse-evidence")
-def parse_evidence(db: Session = Depends(get_db)):
+def parse_evidence(db: Session = Depends(get_user_db)):
     profile = get_profile(db)
     if not profile.master_resume.strip():
         raise HTTPException(400, "Upload or paste a master resume first")
     system = ("Extract concrete, factual achievement claims from the resume. Never invent or embellish. "
               "Return JSON with claims: array of {claim, company, role, skills (array)}.")
     try:
-        result = LLMClient().generate_json(system, f"EXTRACT_EVIDENCE\nMASTER RESUME:\n{profile.master_resume[:22000]}")
+        result = LLMClient.for_user(db).generate_json(system, f"EXTRACT_EVIDENCE\nMASTER RESUME:\n{profile.master_resume[:22000]}")
     except Exception as exc:
         raise HTTPException(400, str(exc)) from exc
     existing = {e.claim.strip().lower() for e in db.scalars(select(Evidence)).all()}
@@ -1284,7 +1280,7 @@ class EvidencePatchIn(BaseModel):
 
 
 @router.patch("/api/evidence/{evidence_id}")
-def evidence_patch(evidence_id: int, payload: EvidencePatchIn, db: Session = Depends(get_db)):
+def evidence_patch(evidence_id: int, payload: EvidencePatchIn, db: Session = Depends(get_user_db)):
     item = db.get(Evidence, evidence_id)
     if not item:
         raise HTTPException(404, "Evidence not found")
@@ -1294,7 +1290,7 @@ def evidence_patch(evidence_id: int, payload: EvidencePatchIn, db: Session = Dep
 
 
 @router.delete("/api/evidence/{evidence_id}")
-def evidence_delete(evidence_id: int, db: Session = Depends(get_db)):
+def evidence_delete(evidence_id: int, db: Session = Depends(get_user_db)):
     item = db.get(Evidence, evidence_id)
     if not item:
         raise HTTPException(404, "Evidence not found")
@@ -1304,7 +1300,7 @@ def evidence_delete(evidence_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/api/search/apify/runs/{run_id}/rank")
-def rank_run_jobs(run_id: int, db: Session = Depends(get_db)):
+def rank_run_jobs(run_id: int, db: Session = Depends(get_user_db)):
     """Auto-rank on import: score the unranked jobs a run pulled in, one batch per call."""
     run = db.get(SearchRun, run_id)
     if not run:
@@ -1332,7 +1328,7 @@ class KnowledgeUpdateIn(BaseModel):
 
 
 @router.put("/api/knowledge/{item_id}")
-def knowledge_put(item_id: int, payload: KnowledgeUpdateIn, db: Session = Depends(get_db)):
+def knowledge_put(item_id: int, payload: KnowledgeUpdateIn, db: Session = Depends(get_user_db)):
     item = db.get(KnowledgeAnswer, item_id)
     if not item:
         raise HTTPException(404, "Knowledge answer not found")
@@ -1359,7 +1355,7 @@ def _apify_error(exc: Exception) -> str:
 
 
 @router.get("/api/search/apify/remote-runs")
-def remote_runs(limit: int = Query(20, ge=1, le=50), db: Session = Depends(get_db)):
+def remote_runs(limit: int = Query(20, ge=1, le=50), db: Session = Depends(get_user_db)):
     """Runs in the connected Apify account, marked with whether Job Hunt OS has imported them."""
     try:
         return {"runs": list_remote_runs(db, limit)}
@@ -1388,10 +1384,10 @@ def _sync_results(db: Session, work) -> dict:
 
 
 @router.post("/api/search/apify/import")
-def import_runs(payload: ImportRunsIn, db: Session = Depends(get_db)):
+def import_runs(payload: ImportRunsIn, db: Session = Depends(get_user_db)):
     """Import runs by Apify run ID: track them, normalize their items and skip duplicates."""
-    if not get_settings().apify_api_token:
-        raise HTTPException(400, "APIFY_API_TOKEN is missing")
+    if not apify_token(db):
+        raise HTTPException(400, "Add your Apify API token in Settings")
     bad = [rid for rid in payload.external_run_ids if not re.fullmatch(r"[A-Za-z0-9]{6,40}", rid)]
     if bad:
         raise HTTPException(422, f"Invalid Apify run IDs: {', '.join(bad[:3])}")
@@ -1400,10 +1396,10 @@ def import_runs(payload: ImportRunsIn, db: Session = Depends(get_db)):
 
 
 @router.post("/api/search/apify/runs/refresh-pending")
-def refresh_pending_runs(db: Session = Depends(get_db)):
+def refresh_pending_runs(db: Session = Depends(get_user_db)):
     """Check every run that has not finished yet and import the ones that have."""
-    if not get_settings().apify_api_token:
-        raise HTTPException(400, "APIFY_API_TOKEN is missing")
+    if not apify_token(db):
+        raise HTTPException(400, "Add your Apify API token in Settings")
     pending = db.scalars(select(SearchRun).where(SearchRun.provider == "apify", SearchRun.completed_at.is_(None))
                          .order_by(desc(SearchRun.id)).limit(25)).all()
     return _sync_results(db, [(run.external_run_id, lambda run=run: refresh_apify_run(db, run)) for run in pending])

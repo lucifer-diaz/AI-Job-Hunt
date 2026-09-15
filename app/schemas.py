@@ -56,6 +56,14 @@ class ApifySearchIn(BaseModel):
     raw_actor_input: dict = Field(default_factory=dict)
 
 
+class ApiKeysIn(BaseModel):
+    """The user's own provider keys. Omitted (null) keys are unchanged; an empty string removes a key."""
+    openrouter: str | None = Field(default=None, max_length=500)
+    openai: str | None = Field(default=None, max_length=500)
+    anthropic: str | None = Field(default=None, max_length=500)
+    apify: str | None = Field(default=None, max_length=500)
+
+
 class BulkTailorIn(BaseModel):
     ids: list[int] = Field(min_length=1, max_length=500)
     mode: Literal["tailor", "skip"] = "tailor"  # skip = send the master resume unchanged

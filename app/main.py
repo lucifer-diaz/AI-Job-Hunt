@@ -1,74 +1,95 @@
 from __future__ import annotations
 
-import base64
 import hashlib
-import secrets
 import re
-from pathlib import Path
+import secrets
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from io import BytesIO
+from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
-from app.db import engine, get_db
+from app import auth
+from app.auth import PASSWORD_MIN_LENGTH, CurrentUser, current_user, get_user_db
+from app.auth import router as auth_router
+from app.db import engine
 from app.db_migrations import run_migrations
-from app.models import (AppSetting, Application, CandidateProfile, Evidence, Job,
+from app.models import (Application, CandidateProfile, Evidence, Job,
                         KnowledgeAnswer, ResumeDocument, ResumeVariant, SearchRun)
-from app.schemas import (ApplicationUpdateIn, ApifySearchIn, BulkTailorIn, EvidenceIn, KnowledgeIn,
+from app.schemas import (ApplicationUpdateIn, ApifySearchIn, ApiKeysIn, BulkTailorIn, EvidenceIn, KnowledgeIn,
                          ManualJobIn, ProfileIn, RecruiterIn, SettingsIn)
+from app.security import SecretsUnavailable
 from app.services.exports import markdown_to_simple_pdf
 from app.services.sources import import_greenhouse, import_lever, refresh_apify_run, start_apify_search, upsert_job
-from app.services.workflow import (SKIP_TAILORING_STATUSES, approve_job, create_due_followups, get_profile,
+from app.services.user_settings import key_status, set_user_keys, settings_for
+from app.services.workflow import (SKIP_TAILORING_STATUSES, approve_job, get_profile,
                                    mark_applied, rank_job, skip_tailoring, tailor_job)
 from app.services.ai_config import PROVIDERS as AI_PROVIDERS, STAGES as AI_STAGES, env_defaults as ai_env_defaults
 from app.services.ai_config import resolve as resolve_ai_config
+from app.scheduler import build_scheduler
 from app.settings import get_settings
-from app.workspace import router as workspace_router, run_search_profile, get_search_profile
+from app.tenancy import require_user_id
+from app.workspace import router as workspace_router
 
 run_migrations(engine)
 settings = get_settings()
-app = FastAPI(title=settings.app_name, version="0.5.0")
+# One scheduler per process. Manual triggers use it even when the background loop is disabled.
+scheduler = build_scheduler()
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    if scheduler.enabled:
+        await scheduler.start()
+    try:
+        yield
+    finally:
+        await scheduler.stop()
+
+
+app = FastAPI(title=settings.app_name, version="0.5.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
+app.include_router(auth_router)
 app.include_router(workspace_router)
+
+# Reachable without signing in. Cron and admin routes are protected by their own secrets.
+PUBLIC_PATHS = {"/health", "/login", "/signup", "/api/auth/login", "/api/auth/signup", "/api/auth/logout"}
+TOKEN_PREFIXES = ("/api/cron/", "/api/admin/")
+SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+def _cross_site(request: Request) -> bool:
+    origin = request.headers.get("origin")
+    return bool(origin) and urlparse(origin).netloc != request.headers.get("host", "")
 
 
 @app.middleware("http")
-async def basic_auth(request: Request, call_next):
-    # Leave health checks public. If username/password are unset, auth is disabled for local development.
-    if request.url.path == "/health" or not (settings.app_username and settings.app_password):
-        return await call_next(request)
-    header = request.headers.get("authorization", "")
-    authenticated = False
-    if header.lower().startswith("basic "):
-        try:
-            decoded = base64.b64decode(header.split(" ", 1)[1]).decode("utf-8")
-            username, password = decoded.split(":", 1)
-            authenticated = secrets.compare_digest(username, settings.app_username) and secrets.compare_digest(password, settings.app_password)
-        except Exception:
-            authenticated = False
-    if not authenticated:
-        return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="Job Hunt OS"'})
+async def require_sign_in(request: Request, call_next):
+    """Every page and API call needs a signed-in user, except the sign-in flow, static files and health."""
+    path = request.url.path
+    if request.method not in SAFE_METHODS and _cross_site(request):
+        return JSONResponse({"detail": "Cross-site requests are not allowed"}, status_code=403)
+    request.state.user = None
+    if not (path == "/health" or path.startswith("/static/") or path.startswith(TOKEN_PREFIXES)):
+        request.state.user = await run_in_threadpool(auth.authenticate, request)
+    if request.state.user is None and not (path in PUBLIC_PATHS or path.startswith("/static/")
+                                           or path.startswith(TOKEN_PREFIXES)):
+        if path.startswith("/api/"):
+            return JSONResponse({"detail": "Sign in required"}, status_code=401)
+        return RedirectResponse("/login", status_code=303)
     return await call_next(request)
 
 
 templates = Jinja2Templates(directory="app/templates")
-
-
-def get_app_setting(db: Session) -> AppSetting:
-    value = db.get(AppSetting, 1)
-    if not value:
-        value = AppSetting(id=1, llm_provider=settings.llm_provider,
-                           model=getattr(settings, f"{settings.llm_provider}_model", ""))
-        db.add(value)
-        db.commit()
-        db.refresh(value)
-    return value
 
 
 def question_key(question: str) -> str:
@@ -84,38 +105,97 @@ def job_dict(j: Job) -> dict:
     }
 
 
+def _asset_version() -> str:
+    # Cache-bust static assets whenever they change, not only on version bumps.
+    static = Path(__file__).parent / "static"
+    return f"{app.version}-{max(int((static / name).stat().st_mtime) for name in ('app.js', 'app.css'))}"
+
+
 @app.get("/health")
 def health():
     return {"ok": True, "time": datetime.now(UTC).isoformat()}
 
 
+# ───────────── sign-in pages ─────────────
+
+def _auth_page(request: Request, mode: str):
+    if request.state.user is not None:
+        return RedirectResponse("/", status_code=303)
+    return templates.TemplateResponse(request=request, name="auth.html", context={
+        "mode": mode, "endpoint": f"/api/auth/{mode}", "allow_signup": settings.allow_signup,
+        "password_min": PASSWORD_MIN_LENGTH, "version": _asset_version()})
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_page(request: Request):
+    return _auth_page(request, "login")
+
+
+@app.get("/signup", response_class=HTMLResponse)
+def signup_page(request: Request):
+    return _auth_page(request, "signup")
+
+
+# ───────────── scheduler ─────────────
+
+@app.get("/api/system/scheduler")
+def scheduler_status(user: CurrentUser = Depends(current_user)):
+    """Scheduler state on this instance plus each job's lease and last run, shared by all instances.
+
+    Job results and errors span every account, so only the admin sees them.
+    """
+    status = scheduler.status()
+    if not user.is_admin:
+        for job in status["jobs"]:
+            job.update(last_result=None, last_error=None, locked_by=None)
+    return status
+
+
+def require_admin(x_admin_token: str | None = Header(default=None)) -> None:
+    expected = settings.admin_token
+    if not expected:
+        raise HTTPException(403, "Manual scheduler triggers are disabled until ADMIN_TOKEN is set")
+    if not x_admin_token or not secrets.compare_digest(x_admin_token, expected):
+        raise HTTPException(401, "Invalid admin token")
+
+
+@app.post("/api/admin/scheduler/{job_name}/run", dependencies=[Depends(require_admin)])
+async def scheduler_run(job_name: str):
+    """Run one scheduled job now, with the same code and database lease as the scheduler."""
+    name = job_name.replace("-", "_")
+    if name not in scheduler.specs:
+        raise HTTPException(404, f"Unknown scheduled job '{job_name}'. Jobs: {', '.join(scheduler.specs)}")
+    outcome = await scheduler.run_job(name, trigger="manual")
+    if outcome.status == "busy":
+        raise HTTPException(409, outcome.error)
+    return outcome.public()
+
+
+# ───────────── workspace shell and settings ─────────────
+
 @app.get("/", response_class=HTMLResponse)
-def dashboard(request: Request, db: Session = Depends(get_db)):
+def dashboard(request: Request, db: Session = Depends(get_user_db)):
     # The workspace is a client-rendered app; the shell only carries boot data.
-    app_setting = get_app_setting(db)
+    app_setting = settings_for(db)
     profile = get_profile(db)
-    # Cache-bust static assets whenever they change, not only on version bumps.
-    static = Path(__file__).parent / "static"
-    stamp = max(int((static / name).stat().st_mtime) for name in ("app.js", "app.css"))
     return templates.TemplateResponse(request=request, name="dashboard.html", context={
         "app_setting": app_setting, "profile": profile, "max_upload_mb": settings.max_resume_upload_mb,
-        "version": f"{app.version}-{stamp}",
+        "version": _asset_version(), "user": request.state.user.public(),
     })
 
 
 @app.get("/api/settings")
-def settings_get(db: Session = Depends(get_db)):
-    value = get_app_setting(db)
-    configured = {
-        "openrouter": bool(settings.openrouter_api_key), "openai": bool(settings.openai_api_key),
-        "anthropic": bool(settings.anthropic_api_key), "mock": True,
-    }
+def settings_get(db: Session = Depends(get_user_db)):
+    value = settings_for(db)
+    keys = key_status(db)
+    configured = {name: keys[name]["configured"] for name in ("openrouter", "openai", "anthropic", "apify")}
     overrides = (value.preferences or {}).get("ai") or {}
     effective = resolve_ai_config(settings, overrides)
     return {"llm_provider": effective["llm_provider"], "model": effective["model"],
             "application_mode": value.application_mode, "min_review_score": value.min_review_score,
-            "configured": configured,
-            # Raw saved values (blank = inherit) plus what .env would supply, for the editor.
+            "configured": {**configured, "mock": True}, "keys": keys,
+            "secret_storage": bool(settings.secret_key),
+            # Raw saved values (blank = inherit) plus the server defaults, for the editor.
             "ai": {"saved": {"llm_provider": overrides.get("llm_provider") or "", "model": overrides.get("model") or "",
                              "stage_models": overrides.get("stage_models") or {},
                              "require_free": overrides.get("require_free")},
@@ -123,7 +203,7 @@ def settings_get(db: Session = Depends(get_db)):
 
 
 @app.put("/api/settings")
-def settings_put(payload: SettingsIn, db: Session = Depends(get_db)):
+def settings_put(payload: SettingsIn, db: Session = Depends(get_user_db)):
     provider = payload.llm_provider.strip().lower()
     if provider and provider not in AI_PROVIDERS:
         raise HTTPException(422, "Unsupported LLM provider")
@@ -132,7 +212,7 @@ def settings_put(payload: SettingsIn, db: Session = Depends(get_db)):
     unknown = set(payload.stage_models) - {stage for stage, _ in AI_STAGES}
     if unknown:
         raise HTTPException(422, f"Unknown stage(s): {', '.join(sorted(unknown))}")
-    value = get_app_setting(db)
+    value = settings_for(db)
     ai = {"llm_provider": provider, "model": payload.model.strip(),
           "stage_models": {k: v.strip()[:300] for k, v in payload.stage_models.items() if v.strip()},
           "require_free": payload.require_free}
@@ -144,13 +224,25 @@ def settings_put(payload: SettingsIn, db: Session = Depends(get_db)):
     return settings_get(db)
 
 
+@app.put("/api/settings/keys")
+def settings_keys_put(payload: ApiKeysIn, db: Session = Depends(get_user_db)):
+    """Save or remove the signed-in user's own API keys. Omitted keys are unchanged; "" removes one."""
+    try:
+        set_user_keys(db, payload.model_dump())
+    except SecretsUnavailable as exc:
+        raise HTTPException(400, f"{exc}. Ask the server admin to set SECRET_KEY.") from exc
+    return settings_get(db)
+
+
+# ───────────── jobs ─────────────
+
 @app.get("/api/jobs")
-def list_jobs(db: Session = Depends(get_db)):
+def list_jobs(db: Session = Depends(get_user_db)):
     return [job_dict(j) for j in db.scalars(select(Job).order_by(desc(Job.discovered_at))).all()]
 
 
 @app.post("/api/jobs/manual")
-def add_job(payload: ManualJobIn, db: Session = Depends(get_db)):
+def add_job(payload: ManualJobIn, db: Session = Depends(get_user_db)):
     ref = hashlib.sha256(f"{payload.company}|{payload.title}|{payload.url}".encode()).hexdigest()[:40]
     job, created = upsert_job(db, source="manual", source_ref=ref, title=payload.title,
                               company=payload.company, location=payload.location, url=payload.url,
@@ -172,17 +264,17 @@ def _board_import(importer, db: Session, token: str, label: str):
 
 
 @app.post("/api/import/lever/{site}")
-def lever(site: str, db: Session = Depends(get_db)):
+def lever(site: str, db: Session = Depends(get_user_db)):
     return _board_import(import_lever, db, site, "Lever")
 
 
 @app.post("/api/import/greenhouse/{board_token}")
-def greenhouse(board_token: str, db: Session = Depends(get_db)):
+def greenhouse(board_token: str, db: Session = Depends(get_user_db)):
     return _board_import(import_greenhouse, db, board_token, "Greenhouse")
 
 
 @app.post("/api/search/apify")
-def apify_search(payload: ApifySearchIn, db: Session = Depends(get_db)):
+def apify_search(payload: ApifySearchIn, db: Session = Depends(get_user_db)):
     values = payload.model_dump()
     locations = list(dict.fromkeys(location.strip() for location in payload.locations if location.strip()))
     if not locations:
@@ -200,7 +292,7 @@ def apify_search(payload: ApifySearchIn, db: Session = Depends(get_db)):
 
 
 @app.get("/api/search/apify/runs/{run_id}")
-def apify_run_status(run_id: int, reimport: bool = False, db: Session = Depends(get_db)):
+def apify_run_status(run_id: int, reimport: bool = False, db: Session = Depends(get_user_db)):
     run = db.get(SearchRun, run_id)
     if not run:
         raise HTTPException(404, "Search run not found")
@@ -211,7 +303,7 @@ def apify_run_status(run_id: int, reimport: bool = False, db: Session = Depends(
 
 
 @app.get("/api/search/apify/runs")
-def apify_runs(db: Session = Depends(get_db)):
+def apify_runs(db: Session = Depends(get_user_db)):
     runs = db.scalars(select(SearchRun).order_by(desc(SearchRun.id)).limit(50)).all()
     return [
         {
@@ -225,7 +317,7 @@ def apify_runs(db: Session = Depends(get_db)):
 
 
 @app.post("/api/jobs/{job_id}/rank")
-def rank(job_id: int, db: Session = Depends(get_db)):
+def rank(job_id: int, db: Session = Depends(get_user_db)):
     job = db.get(Job, job_id)
     if not job:
         raise HTTPException(404, "Job not found")
@@ -236,7 +328,7 @@ def rank(job_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/api/jobs/rank-batch")
-def rank_batch(db: Session = Depends(get_db)):
+def rank_batch(db: Session = Depends(get_user_db)):
     jobs = db.scalars(select(Job).where(Job.fit_score.is_(None)).limit(settings.max_jobs_per_batch)).all()
     done = []
     for job in jobs:
@@ -249,7 +341,7 @@ def rank_batch(db: Session = Depends(get_db)):
 
 
 @app.post("/api/jobs/{job_id}/tailor")
-def tailor(job_id: int, db: Session = Depends(get_db)):
+def tailor(job_id: int, db: Session = Depends(get_user_db)):
     job = db.get(Job, job_id)
     if not job:
         raise HTTPException(404, "Job not found")
@@ -260,7 +352,7 @@ def tailor(job_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/api/jobs/{job_id}/skip-tailoring")
-def skip_tailor(job_id: int, db: Session = Depends(get_db)):
+def skip_tailor(job_id: int, db: Session = Depends(get_user_db)):
     """Send the master resume unchanged for a job that needs no tailoring. It is still reviewed before approval."""
     job = db.get(Job, job_id)
     if not job:
@@ -274,7 +366,7 @@ def skip_tailor(job_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/api/jobs/bulk-tailor")
-def bulk_tailor(payload: BulkTailorIn, db: Session = Depends(get_db)):
+def bulk_tailor(payload: BulkTailorIn, db: Session = Depends(get_user_db)):
     """Tailor (or skip tailoring for) selected Tailor-queue jobs a batch at a time; call again with `remaining`.
 
     Only shortlisted, tailored or sent-back jobs are processed, and jobs that already have a packet are
@@ -303,7 +395,7 @@ def bulk_tailor(payload: BulkTailorIn, db: Session = Depends(get_db)):
 
 def _packet_response(db: Session, job: Job, resume: ResumeVariant) -> dict:
     auto_approved = False
-    app_setting = get_app_setting(db)
+    app_setting = settings_for(db)
     if app_setting.application_mode == "automatic" and (resume.reviewer_score or 0) >= app_setting.min_review_score:
         approve_job(db, job)
         auto_approved = True
@@ -314,7 +406,7 @@ def _packet_response(db: Session, job: Job, resume: ResumeVariant) -> dict:
 
 
 @app.get("/api/jobs/{job_id}/resume.pdf")
-def resume_pdf(job_id: int, db: Session = Depends(get_db)):
+def resume_pdf(job_id: int, db: Session = Depends(get_user_db)):
     resume = db.scalar(select(ResumeVariant).where(ResumeVariant.job_id == job_id).order_by(desc(ResumeVariant.version)).limit(1))
     if not resume:
         raise HTTPException(404, "No tailored resume for this job")
@@ -323,15 +415,16 @@ def resume_pdf(job_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/api/jobs/{job_id}/approve")
-def approve(job_id: int, db: Session = Depends(get_db)):
+def approve(job_id: int, db: Session = Depends(get_user_db)):
     job = db.get(Job, job_id)
     if not job:
         raise HTTPException(404, "Job not found")
     if not job.resumes:
         raise HTTPException(400, "Tailor and review a resume before approval")
     latest = max(job.resumes, key=lambda item: item.version)
-    if latest.reviewer_score is None or latest.reviewer_score < get_app_setting(db).min_review_score:
-        raise HTTPException(400, f"Resume review score must be at least {get_app_setting(db).min_review_score}")
+    min_score = settings_for(db).min_review_score
+    if latest.reviewer_score is None or latest.reviewer_score < min_score:
+        raise HTTPException(400, f"Resume review score must be at least {min_score}")
     try:
         app_obj = approve_job(db, job)
     except ValueError as exc:
@@ -340,7 +433,7 @@ def approve(job_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/api/jobs/{job_id}/applied")
-def applied(job_id: int, payload: RecruiterIn, db: Session = Depends(get_db)):
+def applied(job_id: int, payload: RecruiterIn, db: Session = Depends(get_user_db)):
     job = db.get(Job, job_id)
     if not job:
         raise HTTPException(404, "Job not found")
@@ -357,7 +450,7 @@ def applied(job_id: int, payload: RecruiterIn, db: Session = Depends(get_db)):
 
 
 @app.get("/api/applications")
-def application_list(db: Session = Depends(get_db)):
+def application_list(db: Session = Depends(get_user_db)):
     rows = db.scalars(select(Application).order_by(desc(Application.id))).all()
     return [{"id": item.id, "job_id": item.job_id, "status": item.status,
              "notes": item.notes, "recruiter_name": item.recruiter_name,
@@ -366,7 +459,7 @@ def application_list(db: Session = Depends(get_db)):
 
 
 @app.get("/api/jobs/{job_id}/application-detail")
-def application_detail(job_id: int, db: Session = Depends(get_db)):
+def application_detail(job_id: int, db: Session = Depends(get_user_db)):
     job = db.get(Job, job_id)
     if not job:
         raise HTTPException(404, "Job not found")
@@ -386,7 +479,7 @@ def application_detail(job_id: int, db: Session = Depends(get_db)):
 
 
 @app.patch("/api/applications/{application_id}")
-def application_update(application_id: int, payload: ApplicationUpdateIn, db: Session = Depends(get_db)):
+def application_update(application_id: int, payload: ApplicationUpdateIn, db: Session = Depends(get_user_db)):
     item = db.get(Application, application_id)
     if not item:
         raise HTTPException(404, "Application not found")
@@ -400,14 +493,16 @@ def application_update(application_id: int, payload: ApplicationUpdateIn, db: Se
     return {"ok": True, "status": item.status}
 
 
+# ───────────── profile, resumes, evidence, knowledge ─────────────
+
 @app.get("/api/profile")
-def profile_get(db: Session = Depends(get_db)):
+def profile_get(db: Session = Depends(get_user_db)):
     p = get_profile(db)
-    return {c.name: getattr(p, c.name) for c in CandidateProfile.__table__.columns if c.name not in {"updated_at"}}
+    return {c.name: getattr(p, c.name) for c in CandidateProfile.__table__.columns if c.name not in {"updated_at", "user_id"}}
 
 
 @app.put("/api/profile")
-def profile_put(payload: ProfileIn, db: Session = Depends(get_db)):
+def profile_put(payload: ProfileIn, db: Session = Depends(get_user_db)):
     p = get_profile(db)
     for key, value in payload.model_dump().items():
         setattr(p, key, value)
@@ -416,7 +511,7 @@ def profile_put(payload: ProfileIn, db: Session = Depends(get_db)):
 
 
 @app.post("/api/profile/resume")
-async def resume_upload(file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def resume_upload(file: UploadFile = File(...), db: Session = Depends(get_user_db)):
     allowed = {"text/plain", "application/pdf",
                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"}
     if file.content_type not in allowed:
@@ -440,7 +535,7 @@ async def resume_upload(file: UploadFile = File(...), db: Session = Depends(get_
     if not extracted.strip():
         raise HTTPException(422, "No readable text was found in the resume")
     digest = hashlib.sha256(data).hexdigest()
-    root = Path(settings.upload_dir)
+    root = Path(settings.upload_dir) / str(require_user_id(db))  # each account's files in its own folder
     root.mkdir(parents=True, exist_ok=True)
     path = root / digest
     path.write_bytes(data)
@@ -451,7 +546,7 @@ async def resume_upload(file: UploadFile = File(...), db: Session = Depends(get_
                               size=len(data), extracted_text=extracted, active=True)
     existing = db.scalar(select(ResumeDocument).where(ResumeDocument.checksum == digest))
     if existing:
-        existing.active, existing.extracted_text = True, extracted
+        existing.active, existing.extracted_text, existing.storage_path = True, extracted, str(path)
         document = existing
     else:
         db.add(document)
@@ -463,7 +558,7 @@ async def resume_upload(file: UploadFile = File(...), db: Session = Depends(get_
 
 
 @app.get("/api/profile/resume")
-def resume_download(db: Session = Depends(get_db)):
+def resume_download(db: Session = Depends(get_user_db)):
     document = db.scalar(select(ResumeDocument).where(ResumeDocument.active.is_(True)).order_by(desc(ResumeDocument.id)))
     if not document or not Path(document.storage_path).is_file():
         raise HTTPException(404, "No uploaded resume")
@@ -472,7 +567,7 @@ def resume_download(db: Session = Depends(get_db)):
 
 
 @app.delete("/api/profile/resume")
-def resume_delete(db: Session = Depends(get_db)):
+def resume_delete(db: Session = Depends(get_user_db)):
     document = db.scalar(select(ResumeDocument).where(ResumeDocument.active.is_(True)).order_by(desc(ResumeDocument.id)))
     if not document:
         raise HTTPException(404, "No uploaded resume")
@@ -482,14 +577,14 @@ def resume_delete(db: Session = Depends(get_db)):
 
 
 @app.get("/api/evidence")
-def evidence_get(db: Session = Depends(get_db)):
+def evidence_get(db: Session = Depends(get_user_db)):
     items = db.scalars(select(Evidence).order_by(desc(Evidence.id))).all()
     return [{"id": e.id, "company": e.company, "role": e.role, "claim": e.claim,
              "context": e.context, "skills": e.skills, "tags": e.tags, "verified": e.verified} for e in items]
 
 
 @app.post("/api/evidence")
-def evidence_post(payload: EvidenceIn, db: Session = Depends(get_db)):
+def evidence_post(payload: EvidenceIn, db: Session = Depends(get_user_db)):
     e = Evidence(**payload.model_dump())
     db.add(e)
     db.commit()
@@ -498,7 +593,7 @@ def evidence_post(payload: EvidenceIn, db: Session = Depends(get_db)):
 
 
 @app.get("/api/knowledge")
-def knowledge_get(db: Session = Depends(get_db)):
+def knowledge_get(db: Session = Depends(get_user_db)):
     rows = db.scalars(select(KnowledgeAnswer).order_by(desc(KnowledgeAnswer.updated_at))).all()
     return [{"id": q.id, "question": q.question, "answer": q.answer, "category": q.category,
              "answer_type": q.answer_type, "verified": q.verified, "sensitive": q.sensitive,
@@ -506,7 +601,7 @@ def knowledge_get(db: Session = Depends(get_db)):
 
 
 @app.post("/api/knowledge")
-def knowledge_post(payload: KnowledgeIn, db: Session = Depends(get_db)):
+def knowledge_post(payload: KnowledgeIn, db: Session = Depends(get_user_db)):
     key = question_key(payload.question)
     item = db.scalar(select(KnowledgeAnswer).where(KnowledgeAnswer.question_key == key))
     if item:
@@ -523,7 +618,7 @@ def knowledge_post(payload: KnowledgeIn, db: Session = Depends(get_db)):
 
 
 @app.delete("/api/knowledge/{item_id}")
-def knowledge_delete(item_id: int, db: Session = Depends(get_db)):
+def knowledge_delete(item_id: int, db: Session = Depends(get_user_db)):
     item = db.get(KnowledgeAnswer, item_id)
     if not item:
         raise HTTPException(404, "Knowledge answer not found")
@@ -532,29 +627,29 @@ def knowledge_delete(item_id: int, db: Session = Depends(get_db)):
     return {"ok": True}
 
 
-@app.post("/api/cron/followups")
-def cron_followups(x_cron_secret: str | None = Header(default=None), db: Session = Depends(get_db)):
-    if settings.cron_secret and x_cron_secret != settings.cron_secret:
+# ───────────── cron (external schedulers) ─────────────
+
+def _check_cron_secret(x_cron_secret: str | None) -> None:
+    if settings.cron_secret and not secrets.compare_digest(x_cron_secret or "", settings.cron_secret):
         raise HTTPException(401, "Invalid cron secret")
-    try:
-        count = create_due_followups(db)
-        return {"created": count}
-    except Exception as exc:
-        raise HTTPException(400, str(exc)) from exc
+
+
+async def _cron_run(name: str) -> dict:
+    outcome = await scheduler.run_job(name, trigger="cron")
+    if outcome.status == "busy":
+        raise HTTPException(409, outcome.error)
+    return outcome.public()
+
+
+@app.post("/api/cron/followups")
+async def cron_followups(x_cron_secret: str | None = Header(default=None)):
+    """Draft due follow-ups for every account, with each account's own AI key."""
+    _check_cron_secret(x_cron_secret)
+    return await _cron_run("followups")
 
 
 @app.post("/api/cron/searches")
-def cron_searches(x_cron_secret: str | None = Header(default=None), db: Session = Depends(get_db)):
-    """Run the saved search profile when its schedule is daily. Call once a day from a scheduler."""
-    if settings.cron_secret and x_cron_secret != settings.cron_secret:
-        raise HTTPException(401, "Invalid cron secret")
-    profile = get_search_profile(db)
-    if profile.get("schedule") != "daily":
-        return {"started": 0, "reason": "schedule is manual"}
-    try:
-        runs = run_search_profile(db, profile)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(400, str(exc)) from exc
-    return {"started": len(runs), "run_ids": [r.id for r in runs]}
+async def cron_searches(x_cron_secret: str | None = Header(default=None)):
+    """Start the saved searches of every account whose schedule is not manual."""
+    _check_cron_secret(x_cron_secret)
+    return await _cron_run("hunter")

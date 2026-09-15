@@ -40,6 +40,9 @@ def get_job_context(job_id: int) -> dict[str, Any]:
         job = db.get(Job, job_id)
         if not job:
             return _failure(f"Job {job_id} was not found")
+        if job.user_id is None:
+            return _failure(f"Job {job_id} does not belong to an account yet")
+        db.info["user_id"] = job.user_id  # only this candidate's profile and evidence from here on
         profile = get_profile(db)
         evidence = db.scalars(
             select(Evidence).where(Evidence.verified.is_(True)).order_by(desc(Evidence.id))
@@ -104,6 +107,9 @@ def save_tailored_resume(job_id: int, summary: str, skills: list[str],
                 return _failure(f"Job {job_id} was not found")
             if job.fit_score is None:
                 return _failure("Job must be ranked before tailoring")
+            if job.user_id is None:
+                return _failure(f"Job {job_id} does not belong to an account yet")
+            db.info["user_id"] = job.user_id  # evidence IDs must belong to this candidate
             valid_ids = set(db.scalars(select(Evidence.id).where(
                 Evidence.id.in_(selected_evidence_ids), Evidence.verified.is_(True)
             )).all()) if selected_evidence_ids else set()

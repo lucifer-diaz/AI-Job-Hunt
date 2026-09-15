@@ -25,6 +25,7 @@ import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
@@ -114,8 +115,11 @@ def _clear_lease(job: Job) -> None:
 
 
 def claim(db: Session, states: Iterable[object], *, worker_id: str, limit: int = 1, lease_seconds: int | None = None,
-          policy: RetryPolicy | None = None, now: datetime | None = None) -> list[Claim]:
-    """Lease up to ``limit`` jobs in ``states`` that are due and not held by a live lease. Commits."""
+          policy: RetryPolicy | None = None, now: datetime | None = None, where: Iterable[Any] = ()) -> list[Claim]:
+    """Lease up to ``limit`` jobs in ``states`` that are due and not held by a live lease. Commits.
+
+    ``where`` adds conditions, e.g. only jobs of accounts that can currently be served.
+    """
     _require_postgres(db)
     targets = parse_states(states)
     if not targets:
@@ -135,7 +139,8 @@ def claim(db: Session, states: Iterable[object], *, worker_id: str, limit: int =
                or_(Job.lock_expires_at.is_(None), Job.lock_expires_at <= now),
                or_(Job.next_attempt_at.is_(None), Job.next_attempt_at <= now),
                or_(Job.retryable.is_(None), Job.retryable.is_(True)),
-               Job.attempt_count < policy.max_attempts)
+               Job.attempt_count < policy.max_attempts,
+               *where)
         .order_by(Job.next_attempt_at.asc().nulls_first(), Job.id)
         .limit(limit)
         .with_for_update(skip_locked=True, of=Job)

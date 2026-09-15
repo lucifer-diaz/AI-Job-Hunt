@@ -28,6 +28,10 @@ async function api(url, { method = 'GET', body, form } = {}) {
   if (form) opt.body = form;
   else if (body !== undefined) { opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
   const res = await fetch(url, opt);
+  if (res.status === 401 && !url.startsWith('/api/auth/')) {
+    window.location.href = '/login'; // session expired or signed out in another tab
+    throw new Error('Sign in required');
+  }
   const text = await res.text();
   let data; try { data = JSON.parse(text); } catch { data = text; }
   if (!res.ok) {
@@ -263,12 +267,14 @@ function renderNav() {
     <div class="nav-group"><div class="nav-caps">SETUP</div>${NAV2.map(([id, text]) => `<a class="nav-btn ${S.screen === id ? 'on' : ''}" href="#${id}" data-act="go" data-screen="${id}"><span>${text}</span></a>`).join('')}</div>`;
 }
 function renderSideFoot() {
-  const s = D.summary; if (!s) return '';
+  const account = BOOT.user ? `<div class="side-card"><div class="side-card-title ellipsis" title="${attr(BOOT.user.email)}">${esc(BOOT.user.email)}</div>
+    <div class="side-card-body">${btn(label('logout', 'Sign out', 'Signing out…'), 'logout', {}, 'sm', isBusy('logout'))}</div></div>` : '';
+  const s = D.summary; if (!s) return account;
   const a = s.auto_search;
   const on = a.schedule === 'daily';
   const last = a.last_run ? `Last run ${fmtDay(a.last_run)} · ${a.last_run_status.toLowerCase()}.` : 'No searches have run yet.';
   return `<div class="side-card"><div class="side-card-title"><span class="dot" style="background:${on ? '#4ade80' : '#6a7388'}"></span>Auto-search ${on ? 'on' : 'off'}</div>
-    <div class="side-card-body">${on ? `${a.roles} role${a.roles === 1 ? '' : 's'} × ${Math.max(1, a.locations)} location${a.locations === 1 ? '' : 's'} run daily via the cron job.` : 'Searches run when you start them.'} ${esc(last)}</div></div>`;
+    <div class="side-card-body">${on ? `${a.roles} role${a.roles === 1 ? '' : 's'} × ${Math.max(1, a.locations)} location${a.locations === 1 ? '' : 's'} run on the scheduler with your Apify key.` : 'Searches run when you start them.'} ${esc(last)}</div></div>${account}`;
 }
 function screenMeta() {
   const s = D.summary, c = s?.counts || {};
@@ -478,7 +484,7 @@ function renderTable() {
       <input class="input grow" style="min-width:180px" id="flt-q" data-filter="q" value="${attr(f.q)}" placeholder="Search title, company or location…">
       <select class="select" id="flt-min" data-filter="min_fit">${opts([[0, 'Any fit'], [50, 'Fit ≥ 50'], [70, 'Fit ≥ 70'], [80, 'Fit ≥ 80']], f.min_fit)}</select>
       <select class="select" id="flt-board" data-filter="board">${opts([['all', 'All boards'], ...j.boards.map(b => [b, b])], f.board)}</select>
-      <select class="select" id="flt-stage" data-filter="stage">${opts([['all', 'All stages'], ...['discovered', 'shortlisted', 'maybe', 'archived', 'dismissed', 'tailored', 'approved', 'applied'].map(s => [s, s[0].toUpperCase() + s.slice(1)])], f.stage)}</select>
+      <select class="select" id="flt-stage" data-filter="stage">${opts([['all', 'All stages'], ['unranked', 'Unranked'], ...['discovered', 'shortlisted', 'maybe', 'archived', 'dismissed', 'tailored', 'approved', 'applied'].map(s => [s, s[0].toUpperCase() + s.slice(1)])], f.stage)}</select>
       <select class="select" id="flt-sort" data-filter="sort">${opts([['fit', 'Sort: best fit'], ['new', 'Sort: newest'], ['company', 'Sort: company']], f.sort)}</select>
       ${btn('Reset', 'reset-filters', {}, 'sm')}
       ${S.checked.size ? '' : btn(label('rankBatch', 'Rank unranked', 'Ranking…'), 'rank-batch', {}, 'sm', isBusy('rankBatch'))}
@@ -837,6 +843,15 @@ const CHIP_FIELDS = [
   ['exclude_companies', 'Exclude companies', 'never show these again', 'Add a company…', 'bad', 'sp'],
   ['languages', 'Languages', 'for ATS answers', 'Add a language…', 'grey', 'sp'],
 ];
+const API_KEYS = [['openrouter', 'OpenRouter', 'sk-or-v1-…'], ['openai', 'OpenAI', 'sk-…'], ['anthropic', 'Anthropic', 'sk-ant-…'], ['apify', 'Apify', 'apify_api_…']];
+function renderKeys(st) {
+  return `<section class="card" style="padding:20px"><div class="card-title mb4">Your API keys</div><div class="card-sub mb16">Used only for your own searches, ranking, tailoring and follow-ups. Keys are stored encrypted and never shown again; saved keys show their last four characters.</div>
+    ${st.secret_storage ? '' : '<div class="box warn small mb12">This server has no <span class="mono">SECRET_KEY</span>, so keys cannot be saved yet.</div>'}
+    <div class="col gap12">${API_KEYS.map(([id, name, placeholder]) => { const k = st.keys[id]; return `<div><div class="row base between mb4"><span class="small b">${name}</span>${k.configured ? pill(`saved ${k.hint}`.trim(), 'good') : pill('not set', 'warn')}</div>
+      <div class="row gap8"><input class="input mono grow" style="margin:0;min-width:0" type="password" autocomplete="off" spellcheck="false" id="key-${id}" data-form="keys" data-field="${id}" value="${attr(fv('keys', id, ''))}" placeholder="${attr(k.configured ? 'Enter a new key to replace it' : placeholder)}" ${st.secret_storage ? '' : 'disabled'}>${k.configured ? btn('Remove', 'key-remove', { id }, 'sm') : ''}</div></div>`; }).join('')}</div>
+    ${btn(label('keys', 'Save keys', 'Saving…'), 'save-keys', {}, 'primary mt12', isBusy('keys') || !st.secret_storage)}
+  </section>`;
+}
 function renderSettings() {
   const p = D.profile, st = D.settings, pr = D.prefs; if (!p || !st || !pr) return loading();
   const sp = p.search_preferences || {}, F = 'profile';
@@ -868,13 +883,13 @@ function renderSettings() {
     </div>
     <div class="row gap9 wrap mt20">${btn(label('profile', 'Save profile', 'Saving…'), 'save-profile', {}, 'primary', isBusy('profile'))}${btn(label('parse', 'Re-parse resume into evidence', 'Parsing…'), 'parse-evidence', {}, '', isBusy('parse'))}</div>
   </section>
-  <section class="card" style="padding:20px"><div class="card-title mb4">AI models per stage</div><div class="card-sub mb16">Keys stay server-side. Blank fields inherit the <span class="mono">.env</span> value shown as placeholder.${pr.require_free ? ' Free-only guard is on for OpenRouter.' : ''}</div>
+  <section class="card" style="padding:20px"><div class="card-title mb4">AI models per stage</div><div class="card-sub mb16">Blank fields use the server default shown as placeholder. Calls use the provider key you save under Your API keys.${pr.require_free ? ' Free-only guard is on for OpenRouter.' : ''}</div>
     <div class="grid-auto" style="grid-template-columns:1fr 1fr;gap:10px">
       <label class="field">Provider${selectF('ai', 'llm_provider', ai.saved.llm_provider, [['', `From .env (${ai.env.llm_provider})`], ['openrouter', 'OpenRouter'], ['openai', 'OpenAI'], ['anthropic', 'Anthropic'], ['mock', 'Mock / testing']], 'data-live="1"')}</label>
       <label class="field">Default model${inputF('ai', 'model', ai.saved.model, `placeholder="${attr(ai.env.models[aiProvider] || '')}"`)}</label></div>
     <div class="col gap9 mt12">${pr.stage_models.map(s => `<div class="box row gap12" style="padding:6px 12px"><span class="small b none" style="width:74px">${esc(s.stage)}</span><input class="input mono xs grow" style="margin:0;min-width:0" id="ai-stage-${s.id}" data-form="ai" data-field="stage_${s.id}" value="${attr(fv('ai', `stage_${s.id}`, ai.saved.stage_models[s.id] || ''))}" placeholder="${attr(stageFallback(s.id))}" ${aiProvider === 'mock' ? 'disabled' : ''}>${pill(s.badge, s.badge === 'free' ? 'good' : 'warn')}</div>`).join('')}</div>
     <div class="row gap16 wrap mt10">${selectF('ai', 'require_free', ai.saved.require_free == null ? '' : String(ai.saved.require_free), [['', `Free-only guard: from .env (${ai.env.require_free ? 'on' : 'off'})`], ['true', 'Free-only guard: on'], ['false', 'Free-only guard: off']])}</div>
-    <div class="xs faint mt8">${Object.entries(st.configured).filter(([k]) => k !== 'mock').map(([k, v]) => `${k}: ${v ? 'key set' : 'no key'}`).join(' · ')}</div>
+    <div class="xs faint mt8">${Object.entries(st.configured).filter(([k]) => k !== 'mock').map(([k, v]) => `${k}: ${v ? 'key saved' : 'no key'}`).join(' · ')}</div>
     <div class="hr" style="margin:16px 0"></div>
     <div class="base b mb4">Approval &amp; submission mode</div><div class="small muted mb10">How far the workflow may run without you.</div>
     <div class="col gap8">
@@ -884,6 +899,7 @@ function renderSettings() {
     <label class="field mt12">Minimum reviewer score${inputF('ai', 'min_review_score', st.min_review_score, 'type="number" min="0" max="100"')}</label>
     ${btn(label('ai', 'Save AI settings', 'Saving…'), 'save-ai', {}, 'primary mt12', isBusy('ai'))}
   </section>
+  ${renderKeys(st)}
   <section class="card" style="padding:20px"><div class="card-title mb4">Cadence &amp; nudges</div><div class="card-sub mb16">What the run sheet asks of you each day.</div>
     <div class="col gap14">
       <label class="field strong">Weekly application target<input type="range" min="1" max="25" id="cad-weekly_target" data-form="cadence" data-field="weekly_target" data-live="1" value="${fv('cadence', 'weekly_target', pr.weekly_target)}" style="margin-top:8px"><span class="xs muted" style="font-weight:400">${fv('cadence', 'weekly_target', pr.weekly_target)} per week · about ${Math.max(1, Math.round(fv('cadence', 'weekly_target', pr.weekly_target) / 5))} a working day</span></label>
@@ -1446,6 +1462,23 @@ const A = {
     if (body.application_mode === 'automatic' && st.application_mode !== 'automatic' && !confirm('Auto-approval skips the manual queue once a resume passes review. Submitting stays your action. Continue?')) return;
     await api('/api/settings', { method: 'PUT', body }); delete S.forms.ai; await load();
   }, 'AI settings saved'),
+  'save-keys': () => busy('keys', async () => {
+    const body = {};
+    API_KEYS.forEach(([id]) => { const value = String(fv('keys', id, '')).trim(); if (value) body[id] = value; });
+    if (!Object.keys(body).length) throw new Error('Paste a key into at least one field first');
+    D.settings = await api('/api/settings/keys', { method: 'PUT', body }); delete S.forms.keys; await load();
+  }, 'Keys saved'),
+  'key-remove': el => {
+    const name = (API_KEYS.find(k => k[0] === el.dataset.id) || [])[1] || el.dataset.id;
+    if (!confirm(`Remove your ${name} key? Work that needs it pauses until you add one again.`)) return;
+    return busy('keys', async () => {
+      D.settings = await api('/api/settings/keys', { method: 'PUT', body: { [el.dataset.id]: '' } }); await load();
+    }, `${name} key removed`);
+  },
+  logout: () => busy('logout', async () => {
+    await api('/api/auth/logout', { method: 'POST' });
+    window.location.href = '/login';
+  }),
   'save-cadence': () => busy('cadence', async () => {
     const pr = D.prefs;
     await api('/api/preferences', { method: 'PUT', body: { weekly_target: Number(fv('cadence', 'weekly_target', pr.weekly_target)), followup_days: Number(fv('cadence', 'followup_days', pr.followup_days)), email_run_sheet: !!pr.email_run_sheet, warn_closing: pr.warn_closing !== false } });

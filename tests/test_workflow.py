@@ -13,7 +13,10 @@ def setup_function():
 
 
 def test_core_happy_path():
+    from tests.conftest import ensure_test_user
+
     db = SessionLocal()
+    db.info["user_id"] = ensure_test_user().id  # services act for the account the session belongs to
     p = get_profile(db)
     p.name = "Test Candidate"
     p.headline = "Senior Python Engineer"

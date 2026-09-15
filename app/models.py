@@ -25,10 +25,44 @@ def _in_check(column: str, enum: type) -> str:
     return f"{column} IN ({', '.join(repr(m.value) for m in enum)})"
 
 
+def _owner(table: str, unique: bool = False):
+    """The account that owns a row. Nullable only for data created before accounts existed (see migration 0004)."""
+    return mapped_column(ForeignKey("users.id", ondelete="CASCADE", name=f"fk_{table}_user_id"), nullable=True,
+                         index=True, unique=unique)
+
+
+class User(Base):
+    __tablename__ = "users"
+    __table_args__ = (UniqueConstraint("email", name="uq_users_email"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    email: Mapped[str] = mapped_column(String(320))
+    password_hash: Mapped[str] = mapped_column(String(300))
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class UserSession(Base):
+    """A signed-in browser. Only the SHA-256 of the cookie token is stored."""
+
+    __tablename__ = "user_sessions"
+    __table_args__ = (UniqueConstraint("token_hash", name="uq_user_sessions_token_hash"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE", name="fk_user_sessions_user_id"),
+                                         index=True)
+    token_hash: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+
+
 class CandidateProfile(Base):
     __tablename__ = "candidate_profiles"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int | None] = _owner("candidate_profiles", unique=True)
     name: Mapped[str] = mapped_column(String(200), default="")
     email: Mapped[str] = mapped_column(String(300), default="")
     phone: Mapped[str] = mapped_column(String(100), default="")
@@ -48,24 +82,32 @@ class CandidateProfile(Base):
 class AppSetting(Base):
     __tablename__ = "app_settings"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int | None] = _owner("app_settings", unique=True)
     llm_provider: Mapped[str] = mapped_column(String(30), default="openrouter")
     model: Mapped[str] = mapped_column(String(300), default="openrouter/free")
     application_mode: Mapped[str] = mapped_column(String(30), default="manual_approval")
     min_review_score: Mapped[int] = mapped_column(Integer, default=70)
     # Cadence, tracker stages and other small UI preferences.
     preferences: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=dict, nullable=True)
+    # The user's own API keys, encrypted with SECRET_KEY (app.security). Never returned by the API.
+    openrouter_api_key_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    openai_api_key_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    anthropic_api_key_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    apify_api_token_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
 
 
 class ResumeDocument(Base):
     __tablename__ = "resume_documents"
+    __table_args__ = (UniqueConstraint("user_id", "checksum", name="uq_resume_documents_user_checksum"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int | None] = _owner("resume_documents")
     original_filename: Mapped[str] = mapped_column(String(500))
     media_type: Mapped[str] = mapped_column(String(150))
     storage_path: Mapped[str] = mapped_column(String(1000))
-    checksum: Mapped[str] = mapped_column(String(64), unique=True)
+    checksum: Mapped[str] = mapped_column(String(64))
     size: Mapped[int] = mapped_column(Integer)
     extracted_text: Mapped[str] = mapped_column(Text, default="")
     active: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -74,9 +116,10 @@ class ResumeDocument(Base):
 
 class KnowledgeAnswer(Base):
     __tablename__ = "knowledge_answers"
-    __table_args__ = (UniqueConstraint("question_key", name="uq_knowledge_question_key"),)
+    __table_args__ = (UniqueConstraint("user_id", "question_key", name="uq_knowledge_user_question_key"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int | None] = _owner("knowledge_answers")
     question: Mapped[str] = mapped_column(Text)
     question_key: Mapped[str] = mapped_column(String(64), index=True)
     answer: Mapped[str] = mapped_column(Text, default="")
@@ -94,6 +137,7 @@ class Evidence(Base):
     __tablename__ = "evidence"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int | None] = _owner("evidence")
     company: Mapped[str] = mapped_column(String(200), default="")
     role: Mapped[str] = mapped_column(String(200), default="")
     claim: Mapped[str] = mapped_column(Text)
@@ -107,7 +151,7 @@ class Evidence(Base):
 class Job(Base):
     __tablename__ = "jobs"
     __table_args__ = (
-        UniqueConstraint("source", "source_ref", name="uq_job_source_ref"),
+        UniqueConstraint("user_id", "source", "source_ref", name="uq_jobs_user_source_ref"),
         CheckConstraint(_in_check("state", WorkflowState), name="ck_jobs_state"),
         CheckConstraint(_in_check("previous_state", WorkflowState), name="ck_jobs_previous_state"),
         CheckConstraint(_in_check("error_category", ErrorCategory), name="ck_jobs_error_category"),
@@ -117,9 +161,11 @@ class Job(Base):
                         " AND lock_expires_at IS NOT NULL)", name="ck_jobs_lease"),
         Index("ix_jobs_workflow_claim", "state", "next_attempt_at"),
         Index("ix_jobs_lock_expires_at", "lock_expires_at"),
+        Index("ix_jobs_compensation_checked_at", "compensation_checked_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int | None] = _owner("jobs")
     source: Mapped[str] = mapped_column(String(50), default="manual")
     source_ref: Mapped[str] = mapped_column(String(500))
     title: Mapped[str] = mapped_column(String(300))
@@ -149,6 +195,9 @@ class Job(Base):
     locked_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
     lock_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
     lock_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Salary enrichment (app.services.compensation): posting salary plus the status of other sources.
+    compensation: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    compensation_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
 
@@ -195,12 +244,36 @@ class WorkflowTransition(Base):
     job: Mapped[Job] = relationship(back_populates="transitions")
 
 
+class SchedulerJob(Base):
+    """One row per scheduled job: the lease that stops two app instances running it at once, and its last run."""
+
+    __tablename__ = "scheduler_jobs"
+
+    name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    locked_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    lock_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    last_trigger: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    last_duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    run_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    failure_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+
 class SearchRun(Base):
     __tablename__ = "search_runs"
+    __table_args__ = (UniqueConstraint("user_id", "external_run_id", name="uq_search_runs_user_external_run_id"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int | None] = _owner("search_runs")
     provider: Mapped[str] = mapped_column(String(50), default="apify")
-    external_run_id: Mapped[str] = mapped_column(String(200), unique=True, index=True)
+    external_run_id: Mapped[str] = mapped_column(String(200), index=True)
     actor_id: Mapped[str] = mapped_column(String(300), default="")
     input_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(50), default="READY")
@@ -278,3 +351,7 @@ class FollowUp(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
     application: Mapped[Application] = relationship(back_populates="followups")
+
+
+# Registers the per-user isolation hooks on every session; needs the models above.
+from app import tenancy  # noqa: E402,F401

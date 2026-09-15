@@ -4,8 +4,13 @@ import json
 import re
 from typing import Any
 
-from app.services.ai_config import is_free_model, load_overrides, resolve as resolve_ai_config
+from typing import TYPE_CHECKING
+
+from app.services.ai_config import is_free_model, resolve as resolve_ai_config
 from app.settings import get_settings
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
 
 
 class LLMError(RuntimeError):
@@ -50,13 +55,22 @@ def _is_free_openrouter_model(model: str) -> bool:
 
 
 class LLMClient:
-    def __init__(self, overrides: dict[str, Any] | None = None):
+    """Calls the AI provider chosen in a user's settings, with that user's own API key."""
+
+    def __init__(self, overrides: dict[str, Any] | None = None, keys: dict[str, str | None] | None = None):
         self.settings = get_settings()
-        # None = read saved Settings from the database on each call.
-        self.overrides = overrides
+        self.overrides = overrides or {}
+        self.keys = keys or {}
+
+    @classmethod
+    def for_user(cls, db: Session, user_id: int | None = None) -> LLMClient:
+        """A client for the user the session belongs to (or an explicit user)."""
+        from app.services.user_settings import ai_overrides, user_keys
+
+        return cls(overrides=ai_overrides(db, user_id), keys=user_keys(db, user_id))
 
     def _config(self) -> dict[str, Any]:
-        return resolve_ai_config(self.settings, load_overrides() if self.overrides is None else self.overrides)
+        return resolve_ai_config(self.settings, self.overrides)
 
     def generate_json(self, system: str, user: str) -> dict[str, Any]:
         config = self._config()
@@ -74,11 +88,11 @@ class LLMClient:
         raise LLMError(f"Unsupported LLM_PROVIDER={provider}")
 
     def _openai(self, system: str, user: str, model: str) -> dict[str, Any]:
-        if not self.settings.openai_api_key:
-            raise LLMError("OPENAI_API_KEY is missing")
+        if not self.keys.get("openai"):
+            raise LLMError("OPENAI_API_KEY is missing: add your OpenAI API key in Settings")
         from openai import OpenAI
 
-        client = OpenAI(api_key=self.settings.openai_api_key)
+        client = OpenAI(api_key=self.keys["openai"])
         response = client.chat.completions.create(
             model=model,
             messages=[
@@ -90,11 +104,11 @@ class LLMClient:
         return _extract_json(response.choices[0].message.content or "{}")
 
     def _anthropic(self, system: str, user: str, model: str) -> dict[str, Any]:
-        if not self.settings.anthropic_api_key:
-            raise LLMError("ANTHROPIC_API_KEY is missing")
+        if not self.keys.get("anthropic"):
+            raise LLMError("ANTHROPIC_API_KEY is missing: add your Anthropic API key in Settings")
         from anthropic import Anthropic
 
-        client = Anthropic(api_key=self.settings.anthropic_api_key)
+        client = Anthropic(api_key=self.keys["anthropic"])
         msg = client.messages.create(
             model=model,
             max_tokens=5000,
@@ -105,8 +119,8 @@ class LLMClient:
         return _extract_json(text)
 
     def _openrouter(self, system: str, user: str, task: str, model: str, require_free: bool) -> dict[str, Any]:
-        if not self.settings.openrouter_api_key:
-            raise LLMError("OPENROUTER_API_KEY is missing")
+        if not self.keys.get("openrouter"):
+            raise LLMError("OPENROUTER_API_KEY is missing: add your OpenRouter API key in Settings")
 
         primary = model
         fallbacks = _csv_models(self.settings.openrouter_fallback_models)
@@ -129,7 +143,7 @@ class LLMClient:
             headers["HTTP-Referer"] = self.settings.openrouter_site_url
 
         client = OpenAI(
-            api_key=self.settings.openrouter_api_key,
+            api_key=self.keys["openrouter"],
             base_url=self.settings.openrouter_base_url,
             default_headers=headers,
         )

@@ -21,7 +21,8 @@ dependencies = [
   "reportlab>=4.4,<5",
   "email-validator>=2.2,<3",
   "google-adk>=1.15,<2",
-  "alembic>=1.13,<2"
+  "alembic>=1.13,<2",
+  "cryptography>=42,<51"
 ]
 
 [project.optional-dependencies]

@@ -12,9 +12,11 @@ This is the lowest-fixed-cost topology for personal use when cold starts are acc
 
 ```env
 DATABASE_URL=postgresql+psycopg://<user>:<password>@<host>/<db>?sslmode=require
-APP_USERNAME=<your username>
-APP_PASSWORD=<long random password>
+# Encrypts the API keys people save. Keep it stable; every service (web, cron) needs the same value.
+SECRET_KEY=<python -c "import secrets; print(secrets.token_urlsafe(48))">
 CRON_SECRET=<another random secret>
+# Anyone who can reach the site can sign up while this is true.
+ALLOW_SIGNUP=true
 
 APIFY_API_TOKEN=<token>
 APIFY_ACTOR_ID=openclawai/job-board-scraper
@@ -30,13 +32,21 @@ FOLLOWUP_DAYS=5
 
 6. Health check: `/health`. The web service applies database migrations on startup; to run them
    by hand, use `python -m app.db_migrations`.
-7. Add a Render Cron Job for due follow-up drafts:
+7. Scheduling is built in: the web service starts the scheduler on boot (`SCHEDULER_ENABLED=true`) and runs Apify search and sync, ranking, salary enrichment, follow-ups, analytics and cleanup on the intervals in `.env.example`. Check it at `GET /api/system/scheduler`. Set `ADMIN_TOKEN` to enable the manual triggers, `POST /api/admin/scheduler/{job}/run` with header `X-Admin-Token`.
+
+   Render's free web services sleep when idle, and a sleeping instance runs no jobs. On a free plan, either keep the service awake or add a Render Cron Job that runs one job at a time:
 
 ```bash
-python -m app.cron
+python -m app.cron ranking
+python -m app.cron apify_sync
+python -m app.cron followups
 ```
 
-A once-daily run is sufficient for follow-ups.
+   Cron runs use the same code and the same database lease as the in-app scheduler, so the two never overlap.
+
+### Running more than one instance
+
+Every instance runs the scheduler. The `scheduler_jobs` table decides which instance runs each job: a conditional UPDATE takes a lease, and it only succeeds when the job is due and no other instance holds a live lease. Row-level work (ranking) is claimed with `FOR UPDATE SKIP LOCKED`. You can scale the web service horizontally, or run several uvicorn workers, without jobs running twice. PostgreSQL is required for this; SQLite is only for single-process local use.
 
 ## Railway alternative
 
@@ -45,7 +55,7 @@ Railway is convenient if you prefer a single platform for web + database + cron.
 1. Deploy the Dockerfile from GitHub.
 2. Add Railway Postgres or connect Neon.
 3. Add the same environment variables above.
-4. Create a second service using `python -m app.cron` as the start command and configure a daily cron schedule.
+4. No separate cron service is needed: the web service runs the scheduler (see "Running more than one instance" above). Railway services do not sleep, so the in-app intervals apply as configured.
 
 
 ## OpenRouter deployment options
@@ -101,7 +111,10 @@ This separation is friendlier to low-cost hosting request timeouts.
 
 ## Security checklist
 
-- Always set `APP_USERNAME` and `APP_PASSWORD` on a public host.
+- Set `SECRET_KEY` before anyone saves API keys, keep it private, and use the same value on every service. Changing it makes saved keys unreadable.
+- Sign up first: the first account becomes the admin and takes over existing data and any `.env` API keys. Then decide whether to keep sign-up open; set `ALLOW_SIGNUP=false` to close it.
+- Serve the app over HTTPS so session cookies are sent with the `Secure` flag (or set `SESSION_COOKIE_SECURE=true` behind a TLS-terminating proxy).
+- Each account uses its own API keys, so other people's usage is billed to their keys, not yours.
 - Never commit `.env` or the Apify/LLM API tokens.
 - Keep tokens only in host secrets/environment variables.
 - Keep the human approval step before external application submission.
@@ -162,8 +175,9 @@ marked `applied`; the tool saves a draft but never sends it.
 
 - Agent Engine does not host the FastAPI dashboard or the Apify polling worker;
   deploy those separately and point both services at the same PostgreSQL database.
-- The tool layer has no end-user identity/tenant boundary; deploy this personal
-  agent with restricted IAM access rather than exposing it as a public multi-user bot.
+- The agent tools act as the account that owns the job they are given, but the
+  agent itself has no sign-in: anyone who can call it can name any job ID. Deploy
+  it with restricted IAM access rather than exposing it as a public multi-user bot.
 - Agent output quality depends on the selected Gemini model. Persistence tools
   validate ranges, types, workflow order, and evidence IDs, but cannot prove that
   every paraphrase is semantically faithful; human review remains required.

@@ -1,6 +1,6 @@
 """Effective AI configuration: values saved in Settings win, `.env` fills every gap.
 
-Overrides live in `AppSetting.preferences["ai"]`. A blank or missing value means
+Overrides live in each user's `AppSetting.preferences["ai"]` (app.services.user_settings.ai_overrides). A blank or missing value means
 "not set in the app" and falls back to the matching environment variable.
 """
 
@@ -34,19 +34,6 @@ def env_defaults(settings: Any) -> dict[str, Any]:
         "stage_models": stages,
         "require_free": bool(settings.openrouter_require_free),
     }
-
-
-def load_overrides() -> dict[str, Any]:
-    """Read saved AI overrides; never let a DB problem block an LLM call."""
-    try:
-        from app.db import SessionLocal
-        from app.models import AppSetting
-
-        with SessionLocal() as db:
-            row = db.get(AppSetting, 1)
-            return dict((row.preferences or {}).get("ai") or {}) if row else {}
-    except Exception:
-        return {}
 
 
 def resolve(settings: Any, overrides: dict[str, Any] | None = None) -> dict[str, Any]:

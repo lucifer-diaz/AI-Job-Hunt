@@ -57,7 +57,7 @@ def test_openrouter_stage_model_and_fallbacks(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=FakeOpenAI))
 
-    client = LLMClient(overrides={})
+    client = LLMClient(overrides={}, keys={"openrouter": "sk-or-user"})
     client.settings = _settings(
         openrouter_model_rank="nvidia/example:free",
         openrouter_fallback_models="vendor/backup:free,openrouter/free",
@@ -65,6 +65,7 @@ def test_openrouter_stage_model_and_fallbacks(monkeypatch):
     result = client.generate_json("system", "FIT_ANALYSIS\njob")
 
     assert result["score"] == 91
+    assert captured["client"]["api_key"] == "sk-or-user"  # the user's own key, never the server's
     assert captured["client"]["base_url"] == "https://openrouter.ai/api/v1"
     assert captured["client"]["default_headers"]["HTTP-Referer"] == "https://example.com"
     assert captured["request"]["model"] == "nvidia/example:free"
@@ -72,8 +73,15 @@ def test_openrouter_stage_model_and_fallbacks(monkeypatch):
     assert captured["request"]["response_format"] == {"type": "json_object"}
 
 
-def test_require_free_blocks_accidental_paid_model():
+def test_missing_user_key_is_a_clear_error():
     client = LLMClient(overrides={})
+    client.settings = _settings()
+    with pytest.raises(LLMError, match="add your OpenRouter API key in Settings"):
+        client.generate_json("system", "FIT_ANALYSIS\njob")
+
+
+def test_require_free_blocks_accidental_paid_model():
+    client = LLMClient(overrides={}, keys={"openrouter": "sk-or-user"})
     client.settings = _settings(openrouter_model_review="anthropic/some-paid-model")
 
     with pytest.raises(LLMError, match="OPENROUTER_REQUIRE_FREE=true"):

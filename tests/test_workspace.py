@@ -156,6 +156,22 @@ def test_bulk_tailor_processes_the_queue_in_batches(monkeypatch):
     assert client.post("/api/jobs/bulk-tailor", json={"ids": [first], "mode": "nope"}).status_code == 422
 
 
+def test_search_filters_unranked_jobs():
+    tag = uuid.uuid4().hex[:8]
+    ranked = make_job(company=f"Rankco {tag} A")
+    unranked = make_job(company=f"Rankco {tag} B")
+    assert client.post(f"/api/jobs/{ranked['id']}/rank").status_code == 200
+
+    out = client.get("/api/jobs/search", params={"q": f"Rankco {tag}", "stage": "unranked"}).json()
+    assert [item["id"] for item in out["items"]] == [unranked["id"]] and out["total"] == 1
+    selected = client.get("/api/jobs/search", params={"q": f"Rankco {tag}", "stage": "unranked", "ids_only": True}).json()
+    assert selected["ids"] == [unranked["id"]]
+    assert [item["id"] for item in client.get("/api/jobs/search", params={"q": f"Rankco {tag}", "stage": "all"}).json()["items"]] \
+        == [ranked["id"], unranked["id"]]
+    shortlisted = client.get("/api/jobs/search", params={"q": f"Rankco {tag}", "stage": "shortlisted"}).json()
+    assert [item["id"] for item in shortlisted["items"]] == [ranked["id"]]
+
+
 def test_triage_actions_and_filters():
     job = make_job(company=f"Talent Staffing {uuid.uuid4().hex[:6]}")
     assert client.post(f"/api/jobs/{job['id']}/triage", json={"action": "explode"}).status_code == 422
@@ -182,7 +198,10 @@ def test_search_profile_save_run_and_detail(monkeypatch):
     response = client.post("/api/search/profile/run")
     assert response.status_code == 200 and started == ["Remote", "Pune"]
 
+    from tests.conftest import ensure_test_user
+
     db = SessionLocal()
+    db.info["user_id"] = ensure_test_user().id  # rows created here belong to the account the API acts as
     run = SearchRun(external_run_id=uuid.uuid4().hex, actor_id="actor",
                     input_json={"searchTerms": ["AI Engineer"], "location": "Remote", "sites": ["linkedin"]},
                     status="SUCCEEDED", item_count=5, created_jobs=1)
@@ -205,18 +224,20 @@ def test_tracker_stages_preferences_and_evidence_parsing():
     prefs = client.put("/api/preferences", json={"weekly_target": 12, "followup_days": 9}).json()
     assert prefs["weekly_target"] == 12 and prefs["followup_days"] == 9 and len(prefs["stage_models"]) == 4
 
-    client.put("/api/profile", json={"master_resume": "Cut cloud spend by 35% across 3 regions in 2024\nshort"})
+    # Unique text: a persistent TEST_DATABASE_URL keeps claims from earlier runs.
+    text = f"Cut cloud spend by 35% across 3 regions in 2024 ({uuid.uuid4().hex[:8]})"
+    client.put("/api/profile", json={"master_resume": f"{text}\nshort"})
     parsed = client.post("/api/profile/resume/parse-evidence").json()
     assert parsed["added"] >= 1
     evidence = client.get("/api/evidence").json()
-    claim = next(e for e in evidence if e["claim"].startswith("Cut cloud spend"))
+    claim = next(e for e in evidence if e["claim"] == text)
     assert claim["verified"] is False
     assert client.patch(f"/api/evidence/{claim['id']}", json={"verified": True}).json()["verified"] is True
 
 
 def test_knowledge_edit_and_url_guards():
     created = client.post("/api/knowledge", json={"question": f"Notice period {uuid.uuid4().hex}", "answer": "60 days"}).json()
-    updated = client.put(f"/api/knowledge/{created['id']}", json={"question": "Notice period?", "answer": "45 days",
+    updated = client.put(f"/api/knowledge/{created['id']}", json={"question": f"Notice period {uuid.uuid4().hex}?", "answer": "45 days",
                                                                    "verified": True})
     assert updated.status_code == 200 and updated.json()["verified"] is True
     blocked = client.post("/api/jobs/from-url", json={"url": "http://127.0.0.1:8000/admin"})
