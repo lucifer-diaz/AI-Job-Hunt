@@ -7,13 +7,13 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, func, select, update
+from sqlalchemy import create_engine, func, select, text, update
 from sqlalchemy.orm import sessionmaker
 
 import app.main as main
 from app import auth
 from app.db import AppSession, SessionLocal
-from app.db_migrations import run_migrations
+from app.db_migrations import enforce_ownership, run_migrations
 from app.models import AppSetting, CandidateProfile, Evidence, Job, KnowledgeAnswer, User, UserSession
 from app.security import decrypt_secret
 from app.services.user_settings import user_keys
@@ -179,30 +179,53 @@ def test_each_account_only_sees_and_changes_its_own_data():
     assert alice.get("/api/profile/resume").content == b"Alice's resume"
 
 
-def test_first_account_owns_existing_data_and_the_servers_keys(tmp_path, monkeypatch):
-    engine = create_engine(f"sqlite:///{tmp_path / 'legacy.db'}", connect_args={"check_same_thread": False})
+def test_the_first_account_is_the_admin_and_gets_the_servers_keys(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite:///{tmp_path / 'fresh.db'}", connect_args={"check_same_thread": False})
     run_migrations(engine)
     sessions = sessionmaker(bind=engine, class_=AppSession)
-    with sessions() as db:  # a single-user install from before accounts existed
-        db.add_all([CandidateProfile(name="Legacy owner"), AppSetting(llm_provider="openrouter", model="openrouter/free"),
-                    Job(source="manual", source_ref="old", title="Old job", company="Co"), Evidence(claim="Old claim"),
-                    KnowledgeAnswer(question="Q", question_key="k", answer="A")])
-        db.commit()
     monkeypatch.setattr(get_settings(), "openrouter_api_key", "sk-or-from-env")
 
     with sessions() as db:
         first = auth.register_user(db, "Owner@Example.com", PASSWORD)
         second = auth.register_user(db, "second@example.com", PASSWORD)
         assert first.is_admin and not second.is_admin and first.email == "owner@example.com"
-        for model in (CandidateProfile, AppSetting, Job, Evidence, KnowledgeAnswer):
-            assert db.scalar(select(func.count()).select_from(model).where(model.user_id == first.id)) == 1, model
-            assert db.scalar(select(func.count()).select_from(model).where(model.user_id.is_(None))) == 0, model
-        assert db.scalar(select(CandidateProfile.name).where(CandidateProfile.user_id == first.id)) == "Legacy owner"
         assert user_keys(db, first.id)["openrouter"] == "sk-or-from-env"
         assert user_keys(db, second.id)["openrouter"] is None
         with pytest.raises(auth.AccountExists):
             auth.register_user(db, "OWNER@example.com", PASSWORD)
     engine.dispose()
+
+
+OWNED_BEFORE_ACCOUNTS = (CandidateProfile, AppSetting, Job, Evidence, KnowledgeAnswer)
+
+
+def test_first_account_claims_the_data_of_a_pre_accounts_install(pg_engine, pg_sessions):
+    """Such an install upgrades with its rows unowned; the first account takes them over, then the
+    columns are tightened on the next start (app.db_migrations.enforce_ownership)."""
+    tables = [model.__tablename__ for model in OWNED_BEFORE_ACCOUNTS]
+    with pg_engine.begin() as connection:
+        for table in tables:
+            connection.execute(text(f"DELETE FROM {table}"))
+            connection.execute(text(f"ALTER TABLE {table} ALTER COLUMN user_id DROP NOT NULL"))
+
+    with pg_sessions() as db:  # a single-user install from before accounts existed
+        db.add_all([CandidateProfile(name="Legacy owner"), AppSetting(llm_provider="openrouter", model="openrouter/free"),
+                    Job(source="manual", source_ref="old", title="Old job", company="Co"), Evidence(claim="Old claim"),
+                    KnowledgeAnswer(question="Q", question_key="k", answer="A")])
+        db.commit()
+
+    with pg_sessions() as db:
+        first = auth.register_user(db, "owner@example.com", PASSWORD)
+        second = auth.register_user(db, "second@example.com", PASSWORD)
+        db.commit()
+        for model in OWNED_BEFORE_ACCOUNTS:
+            assert db.scalar(select(func.count()).select_from(model).where(model.user_id == first.id)) == 1, model
+            assert db.scalar(select(func.count()).select_from(model).where(model.user_id.is_(None))) == 0, model
+        assert db.scalar(select(CandidateProfile.name).where(CandidateProfile.user_id == first.id)) == "Legacy owner"
+        assert db.scalar(select(func.count()).select_from(Job).where(Job.user_id == second.id)) == 0
+
+    with pg_engine.begin() as connection:
+        assert set(enforce_ownership(connection)) >= set(tables), "every claimed table becomes NOT NULL again"
 
 
 # ───────────── per-account API keys ─────────────

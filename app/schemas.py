@@ -17,7 +17,8 @@ class ProfileIn(BaseModel):
     preferred_locations: list[str] = Field(default_factory=list)
     work_authorization: str = ""
     compensation_notes: str = ""
-    master_resume: str = ""
+    # Left out means "leave the saved text alone", so a stale form cannot overwrite a newer resume.
+    master_resume: str | None = None
     search_preferences: dict = Field(default_factory=dict)
 
 

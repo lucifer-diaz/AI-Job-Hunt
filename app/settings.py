@@ -49,6 +49,18 @@ class Settings(BaseSettings):
     apify_actor_id: str = "openclawai/job-board-scraper"
     apify_dataset_limit: int = 5000
 
+    # Hunter actors (app.services.apify_adapters). Each has its own adapter; IDs are never hard-coded elsewhere.
+    apify_primary_job_actor: str = "openclawai/job-board-scraper"
+    apify_linkedin_actor: str = "thirdwatch/linkedin-jobs-scraper"
+    apify_indeed_actor: str = "crawlerbros/indeed-jobs-scraper"
+    apify_glassdoor_actor: str = "crawlerbros/glassdoor-jobs-scraper"
+    apify_naukri_actor: str = "crawlerbros/naukri-scraper"
+    # When a multi-board run fails, search its boards again with their dedicated actors (once).
+    apify_auto_fallback: bool = True
+    apify_request_timeout_seconds: int = 30
+    hunter_max_runs_per_search: int = 30
+    apify_sync_batch_size: int = 25
+
     min_fit_score: int = 72
     followup_days: int = 5
     max_jobs_per_batch: int = 30

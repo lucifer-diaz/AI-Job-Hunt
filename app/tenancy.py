@@ -4,11 +4,12 @@ A session belongs to a user when `session.info["user_id"]` is set: app.auth.get_
 every signed-in request, and the scheduler does it for the work it runs on a user's behalf. For such a
 session:
 
-* every ORM SELECT, UPDATE and DELETE only touches that user's rows, including child rows (tailored
-  resumes, applications, application events, follow-ups, workflow history) that are owned via their job;
+* every ORM SELECT, UPDATE and DELETE only touches that user's rows, in every owned table;
 * `Session.get()` returns None for another user's row, even when it is already in the identity map
   (see app.db.AppSession);
-* new rows of owned models are stamped with the user automatically.
+* new rows are stamped with the user automatically. A row that hangs off a job or an application (a
+  tailored resume, an application, its events, follow-ups, workflow history) takes its owner from that
+  parent, so work done by the scheduler and the workers — whose sessions belong to no one — is owned too.
 
 Sessions without a user (migrations, the scheduler's system-wide passes, tests of internals) see all rows.
 Because the filter lives here rather than in each endpoint, a query that forgets to filter by user
@@ -18,18 +19,22 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import event, select
+from sqlalchemy import event
 from sqlalchemy.orm import Session, with_loader_criteria
 
 from app.models import (AppSetting, Application, ApplicationEvent, CandidateProfile, Evidence, FollowUp, Job,
-                        KnowledgeAnswer, ResumeDocument, ResumeVariant, SearchRun, WorkflowTransition)
+                        KnowledgeAnswer, ResumeDocument, ResumeVariant, SearchProfile, SearchRun, WorkflowTransition)
 
-OWNED_MODELS = (CandidateProfile, AppSetting, ResumeDocument, KnowledgeAnswer, Evidence, Job, SearchRun)
-JOB_CHILDREN = (ResumeVariant, Application, WorkflowTransition)
-APPLICATION_CHILDREN = (ApplicationEvent, FollowUp)
-# Core tables (not ORM entities) inside criteria, so the criteria never re-apply to their own subqueries.
-_jobs = Job.__table__
-_applications = Application.__table__
+OWNED_MODELS = (CandidateProfile, AppSetting, ResumeDocument, KnowledgeAnswer, Evidence, Job, SearchRun, SearchProfile,
+                Application, ResumeVariant, WorkflowTransition, ApplicationEvent, FollowUp)
+# Rows that inherit their owner from a parent row: model -> (relationship, foreign key, parent model).
+INHERITED_OWNER = {
+    Application: ("job", "job_id", Job),
+    ResumeVariant: ("job", "job_id", Job),
+    WorkflowTransition: ("job", "job_id", Job),
+    ApplicationEvent: ("application", "application_id", Application),
+    FollowUp: ("application", "application_id", Application),
+}
 
 
 class NoUserContext(RuntimeError):
@@ -44,13 +49,17 @@ def require_user_id(db: Session) -> int:
 
 
 def owned_by(obj: Any, user_id: int) -> bool:
-    if isinstance(obj, OWNED_MODELS):
-        return obj.user_id == user_id
-    if isinstance(obj, JOB_CHILDREN):
-        return obj.job is not None and obj.job.user_id == user_id
-    if isinstance(obj, APPLICATION_CHILDREN):
-        return obj.application is not None and obj.application.job is not None and obj.application.job.user_id == user_id
-    return True
+    return obj.user_id == user_id if isinstance(obj, OWNED_MODELS) else True
+
+
+def inherited_owner(session: Session, obj: Any) -> int | None:
+    """The owner of a child row, taken from the parent it belongs to."""
+    relationship, foreign_key, parent_model = INHERITED_OWNER[type(obj)]
+    parent = getattr(obj, relationship, None)
+    if parent is None:
+        parent_id = getattr(obj, foreign_key, None)
+        parent = session.get(parent_model, parent_id) if parent_id is not None else None
+    return getattr(parent, "user_id", None)
 
 
 @event.listens_for(Session, "do_orm_execute")
@@ -62,22 +71,14 @@ def _only_the_users_rows(state) -> None:
         return
     state.statement = state.statement.options(
         *[with_loader_criteria(model, lambda cls: cls.user_id == user_id, include_aliases=True)
-          for model in OWNED_MODELS],
-        *[with_loader_criteria(model, lambda cls: cls.job_id.in_(
-            select(_jobs.c.id).where(_jobs.c.user_id == user_id)), include_aliases=True)
-          for model in JOB_CHILDREN],
-        *[with_loader_criteria(model, lambda cls: cls.application_id.in_(
-            select(_applications.c.id).join(_jobs, _jobs.c.id == _applications.c.job_id)
-            .where(_jobs.c.user_id == user_id)), include_aliases=True)
-          for model in APPLICATION_CHILDREN],
-    )
+          for model in OWNED_MODELS])
 
 
 @event.listens_for(Session, "before_flush")
 def _stamp_owner(session: Session, _flush_context, _instances) -> None:
     user_id = session.info.get("user_id")
-    if user_id is None:
-        return
     for obj in session.new:
-        if isinstance(obj, OWNED_MODELS) and obj.user_id is None:
-            obj.user_id = user_id
+        if not isinstance(obj, OWNED_MODELS) or obj.user_id is not None:
+            continue
+        # A child row is owned by whoever owns its job, whether or not this session belongs to a user.
+        obj.user_id = inherited_owner(session, obj) if type(obj) in INHERITED_OWNER else user_id

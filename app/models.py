@@ -25,9 +25,13 @@ def _in_check(column: str, enum: type) -> str:
     return f"{column} IN ({', '.join(repr(m.value) for m in enum)})"
 
 
-def _owner(table: str, unique: bool = False):
-    """The account that owns a row. Nullable only for data created before accounts existed (see migration 0004)."""
-    return mapped_column(ForeignKey("users.id", ondelete="CASCADE", name=f"fk_{table}_user_id"), nullable=True,
+def _owner(table: str, unique: bool = False, required: bool = True):
+    """The account that owns a row: every owned table carries it, indexed, and the row dies with the account.
+
+    Migration 0007 makes it NOT NULL once every row has an owner; an install that still has pre-accounts
+    data keeps it nullable in the database until the first account claims that data.
+    """
+    return mapped_column(ForeignKey("users.id", ondelete="CASCADE", name=f"fk_{table}_user_id"), nullable=not required,
                          index=True, unique=unique)
 
 
@@ -41,6 +45,22 @@ class User(Base):
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    # Everything this account owns. Deleting an account cascades in the database, so these never load
+    # rows just to delete them (passive_deletes).
+    profile: Mapped[CandidateProfile | None] = relationship(back_populates="user", uselist=False, passive_deletes=True)
+    settings: Mapped[AppSetting | None] = relationship(back_populates="user", uselist=False, passive_deletes=True)
+    resumes: Mapped[list[ResumeDocument]] = relationship(back_populates="user", passive_deletes=True)
+    knowledge_answers: Mapped[list[KnowledgeAnswer]] = relationship(back_populates="user", passive_deletes=True)
+    evidence: Mapped[list[Evidence]] = relationship(back_populates="user", passive_deletes=True)
+    jobs: Mapped[list[Job]] = relationship(back_populates="user", passive_deletes=True)
+    search_runs: Mapped[list[SearchRun]] = relationship(back_populates="user", passive_deletes=True)
+    search_profiles: Mapped[list[SearchProfile]] = relationship(back_populates="user", passive_deletes=True)
+    applications: Mapped[list[Application]] = relationship(back_populates="user", passive_deletes=True)
+    resume_variants: Mapped[list[ResumeVariant]] = relationship(back_populates="user", passive_deletes=True)
+    followups: Mapped[list[FollowUp]] = relationship(back_populates="user", passive_deletes=True)
+    application_events: Mapped[list[ApplicationEvent]] = relationship(back_populates="user", passive_deletes=True)
+    transitions: Mapped[list[WorkflowTransition]] = relationship(back_populates="user", passive_deletes=True)
 
 
 class UserSession(Base):
@@ -62,7 +82,8 @@ class CandidateProfile(Base):
     __tablename__ = "candidate_profiles"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int | None] = _owner("candidate_profiles", unique=True)
+    user_id: Mapped[int] = _owner("candidate_profiles", unique=True)
+    user: Mapped[User] = relationship(back_populates="profile")
     name: Mapped[str] = mapped_column(String(200), default="")
     email: Mapped[str] = mapped_column(String(300), default="")
     phone: Mapped[str] = mapped_column(String(100), default="")
@@ -83,7 +104,8 @@ class AppSetting(Base):
     __tablename__ = "app_settings"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int | None] = _owner("app_settings", unique=True)
+    user_id: Mapped[int] = _owner("app_settings", unique=True)
+    user: Mapped[User] = relationship(back_populates="settings")
     llm_provider: Mapped[str] = mapped_column(String(30), default="openrouter")
     model: Mapped[str] = mapped_column(String(300), default="openrouter/free")
     application_mode: Mapped[str] = mapped_column(String(30), default="manual_approval")
@@ -103,7 +125,8 @@ class ResumeDocument(Base):
     __table_args__ = (UniqueConstraint("user_id", "checksum", name="uq_resume_documents_user_checksum"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int | None] = _owner("resume_documents")
+    user_id: Mapped[int] = _owner("resume_documents")
+    user: Mapped[User] = relationship(back_populates="resumes")
     original_filename: Mapped[str] = mapped_column(String(500))
     media_type: Mapped[str] = mapped_column(String(150))
     storage_path: Mapped[str] = mapped_column(String(1000))
@@ -119,7 +142,8 @@ class KnowledgeAnswer(Base):
     __table_args__ = (UniqueConstraint("user_id", "question_key", name="uq_knowledge_user_question_key"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int | None] = _owner("knowledge_answers")
+    user_id: Mapped[int] = _owner("knowledge_answers")
+    user: Mapped[User] = relationship(back_populates="knowledge_answers")
     question: Mapped[str] = mapped_column(Text)
     question_key: Mapped[str] = mapped_column(String(64), index=True)
     answer: Mapped[str] = mapped_column(Text, default="")
@@ -137,7 +161,8 @@ class Evidence(Base):
     __tablename__ = "evidence"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int | None] = _owner("evidence")
+    user_id: Mapped[int] = _owner("evidence")
+    user: Mapped[User] = relationship(back_populates="evidence")
     company: Mapped[str] = mapped_column(String(200), default="")
     role: Mapped[str] = mapped_column(String(200), default="")
     claim: Mapped[str] = mapped_column(Text)
@@ -146,6 +171,37 @@ class Evidence(Base):
     tags: Mapped[list[str]] = mapped_column(JSON, default=list)
     verified: Mapped[bool] = mapped_column(default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+
+class SearchProfile(Base):
+    """A saved Hunter search the scheduler re-runs on its own cadence (app.services.hunter)."""
+
+    __tablename__ = "search_profiles"
+    __table_args__ = (
+        UniqueConstraint("user_id", "name", name="uq_search_profiles_user_name"),
+        Index("ix_search_profiles_next_run_at", "next_run_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("search_profiles")
+    user: Mapped[User] = relationship(back_populates="search_profiles")
+    name: Mapped[str] = mapped_column(String(120))
+    roles: Mapped[list[str]] = mapped_column(JSON, default=list)
+    locations: Mapped[list[str]] = mapped_column(JSON, default=list)
+    sites: Mapped[list[str]] = mapped_column(JSON, default=list)
+    hours_old: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_results: Mapped[int] = mapped_column(Integer, default=20)
+    remote_only: Mapped[bool] = mapped_column(Boolean, default=False)
+    job_type: Mapped[str] = mapped_column(String(30), default="")
+    country: Mapped[str] = mapped_column(String(60), default="")
+    mode: Mapped[str] = mapped_column(String(20), default="primary")
+    require_posted_date: Mapped[bool] = mapped_column(Boolean, default=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    run_every_minutes: Mapped[int] = mapped_column(Integer, default=1440)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
 
 
 class Job(Base):
@@ -162,10 +218,16 @@ class Job(Base):
         Index("ix_jobs_workflow_claim", "state", "next_attempt_at"),
         Index("ix_jobs_lock_expires_at", "lock_expires_at"),
         Index("ix_jobs_compensation_checked_at", "compensation_checked_at"),
+        # Hunter deduplication: board job ID, then canonical URL, then company + title + city.
+        Index("ix_jobs_user_board_job_id", "user_id", "source_board", "source_job_id"),
+        Index("ix_jobs_user_canonical_url", "user_id", "canonical_url"),
+        Index("ix_jobs_user_canonical_apply_url", "user_id", "canonical_apply_url"),
+        Index("ix_jobs_user_dedupe_key", "user_id", "dedupe_key"),
+        Index("ix_jobs_posted_at", "posted_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int | None] = _owner("jobs")
+    user_id: Mapped[int] = _owner("jobs")
     source: Mapped[str] = mapped_column(String(50), default="manual")
     source_ref: Mapped[str] = mapped_column(String(500))
     title: Mapped[str] = mapped_column(String(300))
@@ -198,9 +260,41 @@ class Job(Base):
     # Salary enrichment (app.services.compensation): posting salary plus the status of other sources.
     compensation: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     compensation_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    # Hunter (app.services.hunter): the posting as the board stated it, and why this job was found.
+    # posted_at is the employer's posting date and is never replaced by discovered_at; unknown stays NULL.
+    source_board: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    source_job_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    source_url: Mapped[str | None] = mapped_column(String(1200), nullable=True)
+    direct_apply_url: Mapped[str | None] = mapped_column(String(1200), nullable=True)
+    canonical_url: Mapped[str | None] = mapped_column(String(1200), nullable=True)
+    canonical_apply_url: Mapped[str | None] = mapped_column(String(1200), nullable=True)
+    dedupe_key: Mapped[str | None] = mapped_column(String(700), nullable=True)
+    posted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    posted_date_raw: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    scraped_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    job_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    remote_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    seniority: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    skills: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    experience: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    salary_min: Mapped[float | None] = mapped_column(Float, nullable=True)
+    salary_max: Mapped[float | None] = mapped_column(Float, nullable=True)
+    salary_currency: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    salary_interval: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    salary_source: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    matched_search_role: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    matched_search_location: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    apify_actor_id: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    apify_run_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    search_profile_id: Mapped[int | None] = mapped_column(
+        ForeignKey("search_profiles.id", ondelete="SET NULL", name="fk_jobs_search_profile_id"), nullable=True, index=True)
+    # Every search that found this posting: role, location, board, actor and run.
+    discoveries: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
 
+    user: Mapped[User] = relationship(back_populates="jobs")
     resumes: Mapped[list[ResumeVariant]] = relationship(back_populates="job", cascade="all, delete-orphan")
     application: Mapped[Application | None] = relationship(back_populates="job", uselist=False, cascade="all, delete-orphan")
     transitions: Mapped[list[WorkflowTransition]] = relationship(back_populates="job", cascade="all, delete-orphan",
@@ -233,6 +327,7 @@ class WorkflowTransition(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = _owner("workflow_transitions")
     from_state: Mapped[WorkflowState | None] = mapped_column(_enum_type(WorkflowState), nullable=True)
     to_state: Mapped[WorkflowState] = mapped_column(_enum_type(WorkflowState))
     actor: Mapped[str] = mapped_column(String(200), default="system")
@@ -242,6 +337,7 @@ class WorkflowTransition(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
     job: Mapped[Job] = relationship(back_populates="transitions")
+    user: Mapped[User] = relationship(back_populates="transitions")
 
 
 class SchedulerJob(Base):
@@ -271,7 +367,8 @@ class SearchRun(Base):
     __table_args__ = (UniqueConstraint("user_id", "external_run_id", name="uq_search_runs_user_external_run_id"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int | None] = _owner("search_runs")
+    user_id: Mapped[int] = _owner("search_runs")
+    user: Mapped[User] = relationship(back_populates="search_runs")
     provider: Mapped[str] = mapped_column(String(50), default="apify")
     external_run_id: Mapped[str] = mapped_column(String(200), index=True)
     actor_id: Mapped[str] = mapped_column(String(300), default="")
@@ -284,12 +381,28 @@ class SearchRun(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
+    # Hunter run tracking (app.services.hunter). Runs started elsewhere leave these empty.
+    adapter: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    hunter_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    search_profile_id: Mapped[int | None] = mapped_column(
+        ForeignKey("search_profiles.id", ondelete="SET NULL", name="fk_search_runs_search_profile_id"),
+        nullable=True, index=True)
+    roles: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    location: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    sites: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    search_params: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    stats: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    fallback_for_run_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+
 
 class ResumeVariant(Base):
     __tablename__ = "resume_variants"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = _owner("resume_variants")
     version: Mapped[int] = mapped_column(Integer, default=1)
     content: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     markdown: Mapped[str] = mapped_column(Text, default="")
@@ -299,6 +412,7 @@ class ResumeVariant(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
     job: Mapped[Job] = relationship(back_populates="resumes")
+    user: Mapped[User] = relationship(back_populates="resume_variants")
 
 
 class Application(Base):
@@ -306,6 +420,7 @@ class Application(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"), unique=True)
+    user_id: Mapped[int] = _owner("applications")
     status: Mapped[str] = mapped_column(String(50), default="pending_approval")
     approved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     applied_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -319,6 +434,7 @@ class Application(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
     job: Mapped[Job] = relationship(back_populates="application")
+    user: Mapped[User] = relationship(back_populates="applications")
     followups: Mapped[list[FollowUp]] = relationship(back_populates="application", cascade="all, delete-orphan")
     events: Mapped[list[ApplicationEvent]] = relationship(back_populates="application", cascade="all, delete-orphan",
                                                           order_by="ApplicationEvent.occurred_at")
@@ -329,6 +445,7 @@ class ApplicationEvent(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     application_id: Mapped[int] = mapped_column(ForeignKey("applications.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = _owner("application_events")
     kind: Mapped[str] = mapped_column(String(40), default="note")
     title: Mapped[str] = mapped_column(String(300), default="")
     detail: Mapped[str] = mapped_column(Text, default="")
@@ -336,6 +453,7 @@ class ApplicationEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
     application: Mapped[Application] = relationship(back_populates="events")
+    user: Mapped[User] = relationship(back_populates="application_events")
 
 
 class FollowUp(Base):
@@ -343,6 +461,7 @@ class FollowUp(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     application_id: Mapped[int] = mapped_column(ForeignKey("applications.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = _owner("followups")
     due_at: Mapped[datetime] = mapped_column(DateTime)
     channel: Mapped[str] = mapped_column(String(30), default="email")
     draft: Mapped[str] = mapped_column(Text, default="")
@@ -351,6 +470,7 @@ class FollowUp(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
     application: Mapped[Application] = relationship(back_populates="followups")
+    user: Mapped[User] = relationship(back_populates="followups")
 
 
 # Registers the per-user isolation hooks on every session; needs the models above.

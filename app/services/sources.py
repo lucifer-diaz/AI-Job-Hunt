@@ -344,6 +344,17 @@ def apify_get(path: str, params: dict[str, Any] | None = None, token: str | None
         return resp.json()
 
 
+def apify_post(path: str, payload: dict[str, Any], token: str | None = None) -> Any:
+    """POST to an Apify API path with a user's token. Starting actor runs goes through here."""
+    if not token:
+        raise RuntimeError(MISSING_APIFY_TOKEN)
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "User-Agent": UA}
+    with httpx.Client(timeout=get_settings().apify_request_timeout_seconds, headers=headers) as client:
+        resp = client.post(f"{APIFY_API}{path}", json=payload)
+        resp.raise_for_status()
+        return resp.json()
+
+
 def _apify_time(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -429,6 +440,10 @@ def refresh_apify_run(db: Session, search_run: SearchRun, reimport: bool = False
     settings = get_settings()
     if search_run.provider != "apify":
         raise ValueError("Search run is not an Apify run")
+    if search_run.adapter:  # a Hunter run: its actor's adapter normalizes and deduplicates the dataset
+        from app.services.hunter import refresh_hunter_run
+
+        return refresh_hunter_run(db, search_run, reimport=reimport)
     if search_run.user_id is None:
         raise RuntimeError("This search run does not belong to an account")
     token = apify_token(db, search_run.user_id)

@@ -16,6 +16,10 @@ from sqlalchemy import inspect, text
 from sqlalchemy.engine import Connection, Engine
 
 MIGRATIONS_DIR = Path(__file__).parent / "migrations"
+# Tables whose rows belong to one account (app.tenancy.OWNED_MODELS), newest first in migration 0007.
+OWNED_TABLES = ("candidate_profiles", "app_settings", "resume_documents", "knowledge_answers", "evidence", "jobs",
+                "search_runs", "search_profiles", "applications", "resume_variants", "workflow_transitions",
+                "followups", "application_events")
 # Arbitrary constant: a PostgreSQL advisory lock so web, cron and workers never migrate concurrently.
 MIGRATION_LOCK_KEY = 7_220_310_001
 
@@ -53,6 +57,31 @@ def _bring_legacy_install_to_baseline(connection: Connection) -> None:
         connection.execute(text("UPDATE applications SET stage = 'applied' WHERE stage IS NULL"))
 
 
+def enforce_ownership(connection: Connection) -> list[str]:
+    """Make user_id NOT NULL in every owned table whose rows all have an owner. Returns the tables changed.
+
+    An install that still holds pre-accounts data upgrades before anyone has signed up, so migration 0007
+    has to leave those columns nullable. The first account claims that data (app.auth.claim_existing_data)
+    and the next start tightens the columns. PostgreSQL only: on SQLite this would rebuild every table,
+    and SQLite is only for single-user local runs.
+    """
+    if connection.dialect.name != "postgresql":
+        return []
+    inspector = inspect(connection)
+    tightened = []
+    for table in OWNED_TABLES:
+        if not inspector.has_table(table):
+            continue
+        column = next((c for c in inspector.get_columns(table) if c["name"] == "user_id"), None)
+        if column is None or not column["nullable"]:
+            continue
+        if connection.scalar(text(f"SELECT COUNT(*) FROM {table} WHERE user_id IS NULL")):
+            continue  # still unclaimed rows: leave it nullable so the first account can take them
+        connection.execute(text(f"ALTER TABLE {table} ALTER COLUMN user_id SET NOT NULL"))
+        tightened.append(table)
+    return tightened
+
+
 def run_migrations(engine: Engine, revision: str = "head") -> None:
     with engine.begin() as connection:
         if connection.dialect.name == "postgresql":
@@ -60,6 +89,7 @@ def run_migrations(engine: Engine, revision: str = "head") -> None:
         if not inspect(connection).has_table("alembic_version"):
             _bring_legacy_install_to_baseline(connection)
         command.upgrade(alembic_config(connection), revision)
+        enforce_ownership(connection)
 
 
 if __name__ == "__main__":

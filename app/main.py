@@ -38,6 +38,7 @@ from app.services.ai_config import resolve as resolve_ai_config
 from app.scheduler import build_scheduler
 from app.settings import get_settings
 from app.tenancy import require_user_id
+from app.hunter_api import router as hunter_router
 from app.workspace import router as workspace_router
 
 run_migrations(engine)
@@ -60,6 +61,7 @@ app = FastAPI(title=settings.app_name, version="0.5.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 app.include_router(auth_router)
 app.include_router(workspace_router)
+app.include_router(hunter_router)
 
 # Reachable without signing in. Cron and admin routes are protected by their own secrets.
 PUBLIC_PATHS = {"/health", "/login", "/signup", "/api/auth/login", "/api/auth/signup", "/api/auth/logout"}
@@ -504,7 +506,7 @@ def profile_get(db: Session = Depends(get_user_db)):
 @app.put("/api/profile")
 def profile_put(payload: ProfileIn, db: Session = Depends(get_user_db)):
     p = get_profile(db)
-    for key, value in payload.model_dump().items():
+    for key, value in payload.model_dump(exclude_none=True).items():
         setattr(p, key, value)
     db.commit()
     return {"ok": True}

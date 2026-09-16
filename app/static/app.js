@@ -600,6 +600,10 @@ function renderSetup() {
 /* ───────────── tailor ───────────── */
 function renderBulkTailor(queue) {
   const running = isBusy('bulkTailor');
+  const doneMap = S.tailorDone || (S.tailorDone = new Map());
+  const failMap = S.tailorFail || (S.tailorFail = new Map());
+  const workingSet = S.tailorWorking || (S.tailorWorking = new Set());
+  const finished = doneMap.size + failMap.size, total = S.tailorTotal || 0;
   const selected = queue.filter(j => S.tailorChecked.has(j.id));
   const eligible = selected.filter(j => S.tailorRegenerate || !j.has_resume).length;
   const untailored = queue.filter(j => !j.has_resume);
@@ -609,15 +613,27 @@ function renderBulkTailor(queue) {
   const summary = res && !running ? `<div class="banner" style="border-radius:0;border-width:0 0 1px">
       ${res.mode === 'skip' ? 'Skipped tailoring for' : 'Tailored'} ${res.done} job${res.done === 1 ? '' : 's'}${res.auto ? ` · ${res.auto} auto-approved` : ''}${res.stopped ? ` · stopped with ${res.stopped} left` : ''}${res.done ? ' · <a href="#approvals" data-act="go" data-screen="approvals">Review in Approvals</a>' : ''}
       ${res.failed.length ? `<div class="xs mt6" style="color:var(--bad)">${res.failed.length} failed: ${res.failed.slice(0, 3).map(f => `${esc(titleOf(f.id))} (${esc(f.error)})`).join(' · ')}${res.failed.length > 3 ? ' …' : ''}</div>` : ''}</div>` : '';
-  const rows = queue.map(j => `<div class="lrow click" data-act="tailor-check" data-id="${j.id}" style="gap:12px">
+  const rows = queue.map(j => {
+    const done = doneMap.get(j.id), failure = failMap.get(j.id), working = workingSet.has(j.id);
+    const reviewer = done ? done.reviewer_score : j.reviewer_score;
+    const status = failure ? pill('failed', 'warn')
+      : done ? pill(done.auto_approved ? 'auto-approved' : 'packet ready', 'good')
+      : working ? pill('tailoring…', 'brand')
+      : j.has_resume ? pill(j.status === 'pending_approval' ? 'sent back' : 'has packet', 'muted') : pill('not tailored', 'warn');
+    return `<div class="lrow click ${working ? 'sel' : ''}" data-act="tailor-check" data-id="${j.id}" style="gap:12px">
       <input type="checkbox" data-act="tailor-check" data-id="${j.id}" ${S.tailorChecked.has(j.id) ? 'checked' : ''} ${running ? 'disabled' : ''} aria-label="Select ${attr(j.title)}">
-      <span class="mono bb ${fitCls(j.fit)}" style="width:26px">${fitTxt(j.fit)}</span>
-      <div class="grow" style="min-width:0"><div class="small b ellipsis">${esc(j.title)}</div><div class="xs muted ellipsis">${esc(j.company)} · ${esc(j.board)}</div></div>
-      ${j.has_resume ? pill(j.status === 'pending_approval' ? 'sent back' : 'has packet', 'muted') : pill('not tailored', 'warn')}</div>`).join('');
+      <span class="mono bb ${fitCls(j.fit)}" style="width:26px" title="Fit score">${fitTxt(j.fit)}</span>
+      <div class="grow" style="min-width:0"><div class="small b ellipsis">${esc(j.title)}</div><div class="xs muted ellipsis">${esc(j.company)} · ${esc(j.board)}${j.location ? ' · ' + esc(j.location) : ''}${failure ? ` · ${esc(failure)}` : ''}</div></div>
+      <span class="mono xs none" style="width:54px;text-align:right" title="Reviewer score">${reviewer == null ? '<span class="faint">—</span>' : fitTxt(reviewer)}${j.untailored ? '<span class="faint"> ·m</span>' : ''}</span>
+      <span class="mono xs none" style="width:48px;text-align:right" title="ATS keyword coverage">${j.ats_pct == null ? '<span class="faint">—</span>' : j.ats_pct + '%'}</span>
+      ${btn('Description', 'open-job', { id: j.id }, 'sm')}${status}</div>`;
+  }).join('');
   return `<div class="stack"><section class="card flush">
     <div class="row wrap gap10" style="padding:14px 18px;border-bottom:1px solid var(--line2)">
       <div class="grow" style="min-width:220px"><div class="card-title" style="font-size:16px">Bulk tailor</div>
-        <div class="card-sub">${running ? esc(S.tailorProgress || 'Working…') : `${selected.length} of ${queue.length} selected · ${untailored.length} not tailored yet`}</div></div>
+        <div class="card-sub">${running ? esc(S.tailorProgress || 'Working…') : `${selected.length} of ${queue.length} selected · ${untailored.length} not tailored yet`}</div>
+        ${running && total ? `<div class="row base gap8 mt8"><span class="grow">${bar(Math.round(100 * finished / total) + '%', '#5b4ae8')}</span>
+          <span class="xs mono muted none">${finished}/${total}${failMap.size ? ` · ${failMap.size} failed` : ''}</span></div>` : ''}</div>
       ${btn(`Select not tailored (${untailored.length})`, 'tailor-select', { which: 'untailored' }, 'sm', running || !untailored.length)}
       ${btn(allOn ? 'Clear' : 'Select all', 'tailor-select', { which: allOn ? 'none' : 'all' }, 'sm', running)}
       ${running ? btn(S.tailorStop ? 'Stopping…' : 'Stop', 'bulk-tailor-stop', {}, 'sm danger', S.tailorStop)
@@ -676,6 +692,7 @@ function renderTailor() {
       <div class="metric"><div class="n">${r.ats_pct == null ? '—' : r.ats_pct + '%'}</div><div class="l">ATS KEYWORDS</div></div>
       ${btn(generating ? (r.untailored ? 'Tailoring…' : 'Regenerating…') : (r.untailored ? 'Tailor instead' : 'Regenerate'), 'generate', { id: job.id }, '', working)}
       ${r.untailored ? '' : btn(skipping ? 'Skipping…' : 'Skip tailoring', 'skip-tailor', { id: job.id }, '', working)}
+      ${btn('Job description', 'open-job', { id: job.id })}
       ${btn('Send to approval', 'go', { screen: 'approvals', approval: job.id }, 'primary')}</div>
   </section>
   <div class="split gap16">
@@ -877,7 +894,8 @@ function renderSettings() {
         <div class="small b mb8 mt16">Master resume text</div>${textareaF(F, 'master_resume', p.master_resume, 'style="margin-top:0;min-height:120px;font-family:var(--mono);font-size:11.5px"')}
         <div class="helper">Uploading a file replaces this text with what we extract. For clean tailoring use the agent-friendly format: <span class="mono">## Summary</span>, <span class="mono">## Skills</span>, <span class="mono">## Experience</span>, one <span class="mono">### Title | Company | Location | Mon YYYY - Mon YYYY</span> line per role, <span class="mono">- </span> bullets, plain punctuation.</div></div>
       <div><div class="small b mb8">Master resume &amp; variants</div><div class="col gap8">
-        ${D.resumes.map(d => `<div class="box row gap12 ${d.active ? 'brand' : ''}"><div class="avatar" style="width:34px;height:34px;border-radius:8px;font-size:10px;${d.active ? '' : 'background:var(--soft);color:var(--muted)'}">${esc((d.filename.split('.').pop() || '').toUpperCase().slice(0, 4))}</div><div class="grow"><div class="small b ellipsis">${esc(d.filename)}</div><div class="xs muted">${Math.max(1, Math.round(d.size / 1024))} KB · ${d.words} words${d.active ? ' · primary' : ''}</div></div>${d.active ? `<a class="btn sm" href="/api/profile/resume">Download</a>` : btn('Set primary', 'resume-primary', { id: d.id }, 'sm')}</div>`).join('')}
+        ${(D.resumes.find(d => d.active && !d.in_use) ? `<div class="box warn" style="padding:11px"><div class="small b" style="color:var(--warn-deep)">Tailoring is not using this file</div><div class="xs mt4" style="color:var(--warn-deep);line-height:1.5">The master resume text below was edited after <b>${esc(D.resumes.find(d => d.active && !d.in_use).filename)}</b> was uploaded, and tailoring only ever uses that text.</div>${btn("Use the file's text", 'resume-use', { id: D.resumes.find(d => d.active && !d.in_use).id }, 'sm mt8')}</div>` : '')}
+        ${D.resumes.map(d => `<div class="box row gap12 ${d.active ? 'brand' : ''}"><div class="avatar" style="width:34px;height:34px;border-radius:8px;font-size:10px;${d.active ? '' : 'background:var(--soft);color:var(--muted)'}">${esc((d.filename.split('.').pop() || '').toUpperCase().slice(0, 4))}</div><div class="grow" style="min-width:0"><div class="small b ellipsis">${esc(d.filename)}</div><div class="xs muted">${Math.max(1, Math.round(d.size / 1024))} KB · ${d.words} words${d.active ? ' · primary' : ''}${d.in_use ? ' · used for tailoring' : ''}</div></div>${d.active ? `<a class="btn sm" href="/api/profile/resume">Download</a>` : btn('Set primary', 'resume-primary', { id: d.id }, 'sm')}${btn('Delete', 'resume-delete', { id: d.id, name: d.filename }, 'sm')}</div>`).join('')}
         <label class="btn block" style="border-style:dashed;color:var(--brand);border-radius:11px;padding:11px">${isBusy('upload') ? 'Uploading…' : `+ Upload ${D.resumes.length ? 'another' : 'a'} resume (PDF, DOCX, TXT · max ${BOOT.max_upload_mb} MB)`}<input type="file" id="resume-file" accept=".txt,.pdf,.docx" hidden></label></div>
         <div class="grid-auto mt12" style="grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px"><label class="field">LinkedIn${inputF(F, 'linkedin_url', p.linkedin_url)}</label><label class="field">GitHub${inputF(F, 'github_url', p.github_url)}</label></div></div>
     </div>
@@ -1325,9 +1343,16 @@ const A = {
       const total = ids.length;
       let done = [], failed = [], streak = 0;
       S.tailorStop = false; S.tailorResult = null;
+      S.tailorTotal = total; S.tailorDone = new Map(); S.tailorFail = new Map(); S.tailorWorking = new Set();
+      let batch = 3;  // until the first reply says how many jobs the server takes at a time
       while (ids.length && !S.tailorStop) {
+        S.tailorWorking = new Set(ids.slice(0, batch));
         S.tailorProgress = `${verb} ${Math.min(total, done.length + failed.length + 1)} of ${total}…`; render();
         const out = await api('/api/jobs/bulk-tailor', { method: 'POST', body: { ids, mode, regenerate: S.tailorRegenerate } });
+        batch = out.done.length + out.errors.length || batch;
+        out.done.forEach(d => S.tailorDone.set(d.id, d));
+        out.errors.forEach(e => S.tailorFail.set(e.id, e.error));
+        S.tailorWorking = new Set();
         done = done.concat(out.done); failed = failed.concat(out.errors);
         streak = out.done.length ? 0 : streak + out.errors.length;
         if (streak >= 3) break; // the provider is failing; stop instead of burning through the queue
@@ -1454,6 +1479,15 @@ const A = {
   }, 'Profile saved'),
   'parse-evidence': () => busy('parse', () => api('/api/profile/resume/parse-evidence', { method: 'POST' }), out => `${out.added} new claim${out.added === 1 ? '' : 's'} added as unverified — verify them in the Knowledge bank`),
   'resume-primary': el => busy('primary', async () => { D.resumes = await api(`/api/profile/resumes/${el.dataset.id}/primary`, { method: 'POST' }); await load(); }, 'Primary resume updated'),
+  'resume-use': el => busy('primary', async () => { D.resumes = await api(`/api/profile/resumes/${el.dataset.id}/primary`, { method: 'POST' }); await load(); }, 'Tailoring now uses this file'),
+  'resume-delete': el => {
+    if (!confirm(`Delete ${el.dataset.name}? This cannot be undone.`)) return;
+    return busy('resumedel', async () => {
+      const out = await api(`/api/profile/resumes/${el.dataset.id}`, { method: 'DELETE' });
+      D.resumes = out.resumes; await load();
+      return out;
+    }, out => out.promoted ? 'Resume deleted · the next newest is now primary' : 'Resume deleted');
+  },
   'save-ai': () => busy('ai', async () => {
     const st = D.settings;
     const saved = st.ai.saved, rf = fv('ai', 'require_free', saved.require_free == null ? '' : String(saved.require_free));

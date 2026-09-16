@@ -13,6 +13,7 @@ import socket
 from collections import Counter, defaultdict
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
+from pathlib import Path
 from statistics import median
 from urllib.parse import urlparse
 
@@ -841,7 +842,24 @@ def tailor_queue(db: Session = Depends(get_user_db)):
     jobs = db.scalars(select(Job).where(or_(and_(Job.status == "shortlisted", Job.triaged_at.is_not(None)),
                                             Job.status.in_(("tailored", "pending_approval"))))
                       .order_by(desc(Job.fit_score))).all()
-    return [{**job_card(j), "has_resume": bool(j.resumes)} for j in jobs]
+    # The reviewer score and ATS keyword coverage of each job's latest packet, so the queue shows
+    # everything the single-job screen shows.
+    latest: dict[int, ResumeVariant] = {}
+    if jobs:
+        for variant in db.scalars(select(ResumeVariant).where(ResumeVariant.job_id.in_([j.id for j in jobs]))
+                                  .order_by(ResumeVariant.version)).all():
+            latest[variant.job_id] = variant
+    rows = []
+    for job in jobs:
+        resume = latest.get(job.id)
+        coverage = keyword_coverage(job, resume) if resume else []
+        covered = sum(1 for word in coverage if word["status"] == "covered")
+        rows.append({**job_card(job), "has_resume": resume is not None,
+                     "reviewer_score": resume.reviewer_score if resume else None,
+                     "ats_pct": round(100 * covered / len(coverage)) if coverage else None,
+                     "untailored": bool((resume.content or {}).get("untailored")) if resume else False,
+                     "resume_version": resume.version if resume else None})
+    return rows
 
 
 def packet(db: Session, job: Job) -> dict:
@@ -1232,8 +1250,12 @@ def preferences_put(payload: PreferencesIn, db: Session = Depends(get_user_db)):
 @router.get("/api/profile/resumes")
 def resume_list(db: Session = Depends(get_user_db)):
     docs = db.scalars(select(ResumeDocument).order_by(desc(ResumeDocument.active), desc(ResumeDocument.id))).all()
+    # in_use says whether tailoring actually uses this file's text: the master resume text can be
+    # edited by hand in Settings, and only the text is sent to the model.
+    master = (get_profile(db).master_resume or "").strip()
     return [{"id": d.id, "filename": d.original_filename, "size": d.size, "media_type": d.media_type,
-             "active": d.active, "created_at": d.created_at.isoformat(), "words": len(d.extracted_text.split())} for d in docs]
+             "active": d.active, "created_at": d.created_at.isoformat(), "words": len(d.extracted_text.split()),
+             "in_use": (d.extracted_text or "").strip() == master} for d in docs]
 
 
 @router.post("/api/profile/resumes/{document_id}/primary")
@@ -1247,6 +1269,28 @@ def resume_primary(document_id: int, db: Session = Depends(get_user_db)):
     get_profile(db).master_resume = document.extracted_text
     db.commit()
     return resume_list(db)
+
+
+@router.delete("/api/profile/resumes/{document_id}")
+def resume_document_delete(document_id: int, db: Session = Depends(get_user_db)):
+    """Delete an uploaded resume. Deleting the primary one promotes the next newest and uses its text."""
+    document = db.get(ResumeDocument, document_id)
+    if not document:
+        raise HTTPException(404, "Resume not found")
+    was_primary, path = document.active, Path(document.storage_path)
+    db.delete(document)
+    db.flush()
+    promoted = None
+    if was_primary:
+        promoted = db.scalars(select(ResumeDocument).order_by(desc(ResumeDocument.id)).limit(1)).first()
+        if promoted:
+            promoted.active = True
+            get_profile(db).master_resume = promoted.extracted_text
+    db.commit()
+    # Uploads of identical files share one stored file, so only remove it when no row still points at it.
+    if path.is_file() and not db.scalar(select(ResumeDocument.id).where(ResumeDocument.storage_path == str(path))):
+        path.unlink(missing_ok=True)
+    return {"deleted": document_id, "promoted": promoted.id if promoted else None, "resumes": resume_list(db)}
 
 
 @router.post("/api/profile/resume/parse-evidence")

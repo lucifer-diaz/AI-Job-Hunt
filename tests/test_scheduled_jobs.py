@@ -122,13 +122,13 @@ def test_ranking_claims_a_limited_batch_and_limits_concurrency(pg_sessions, owne
 
 
 def test_ranking_only_claims_jobs_of_accounts_that_want_it_and_can_pay_for_it(pg_sessions, fake_ranker):
-    ready, auto_rank_off, no_key, legacy = make_user(pg_sessions), make_user(pg_sessions), make_user(pg_sessions), None
+    ready, auto_rank_off, no_key = make_user(pg_sessions), make_user(pg_sessions), make_user(pg_sessions)
     with pg_sessions() as db:
         db.add(CandidateProfile(user_id=auto_rank_off, search_preferences={"search_profile": {"auto_rank": False}}))
         db.commit()
     use_provider(pg_sessions, no_key, "openrouter")
     ranked_ids = add_jobs(pg_sessions, 2, ready)
-    untouched = add_jobs(pg_sessions, 1, auto_rank_off) + add_jobs(pg_sessions, 1, no_key) + add_jobs(pg_sessions, 1, legacy)
+    untouched = add_jobs(pg_sessions, 1, auto_rank_off) + add_jobs(pg_sessions, 1, no_key)
 
     result = asyncio.run(sj.ranking(ctx(pg_sessions)))
     assert result["claimed"] == 2 and sorted(fake_ranker["calls"]) == ranked_ids

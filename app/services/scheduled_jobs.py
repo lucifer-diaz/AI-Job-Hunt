@@ -34,6 +34,7 @@ from app.services.compensation import enrich_compensation
 from app.services.lifecycle import ErrorCategory
 from app.services.lifecycle import WorkflowState as S
 from app.services.llm import LLMError
+from app.services.hunter import run_due_profiles
 from app.services.sources import refresh_apify_run
 from app.services.user_settings import KEY_LABELS, ai_overrides, apify_token, profile_for, user_keys
 from app.services.workflow import create_due_followups, rank_job
@@ -98,15 +99,14 @@ def ai_ready(db: Session, user_id: int) -> tuple[bool, str]:
 
 # ───────────── hunter / Apify ─────────────
 
-def _hunt_for_account(ctx: JobContext, db: Session) -> list[int] | str:
-    if not apify_token(db):
-        return "no Apify key"
+def _saved_search(ctx: JobContext, db: Session) -> list[int] | str:
+    """The Discovery screen's saved search profile (the older, single-profile one)."""
     profile = get_search_profile(db)
     if ctx.trigger != "manual" and profile.get("schedule") == "manual":
         return "schedule is manual"
     if not profile.get("roles"):
         return "no roles in search profile"
-    latest = db.scalar(select(func.max(SearchRun.created_at)))  # this account's runs only
+    latest = db.scalar(select(func.max(SearchRun.created_at)).where(SearchRun.adapter.is_(None)))
     if latest and latest > ctx.now - timedelta(minutes=max(1, ctx.interval_minutes)):
         return "searched recently"
     try:
@@ -115,8 +115,20 @@ def _hunt_for_account(ctx: JobContext, db: Session) -> list[int] | str:
         raise ValueError(str(exc.detail)) from exc
 
 
+def _hunt_for_account(ctx: JobContext, db: Session) -> tuple[list[int] | str, list[dict[str, Any]]]:
+    """Start this account's due Hunter search profiles and its saved Discovery search."""
+    if not apify_token(db):
+        return "no Apify key", []
+    saved = _saved_search(ctx, db)
+    profiles = run_due_profiles(db, db.info["user_id"], ctx.now)
+    started = profiles["run_ids"] + (saved if isinstance(saved, list) else [])
+    if not started and isinstance(saved, str):
+        return saved, profiles["errors"]
+    return started, profiles["errors"]
+
+
 def hunter(ctx: JobContext) -> dict[str, Any]:
-    """Start each account's saved Apify search, with its own token, at most once per interval."""
+    """Start each account's due searches, with its own Apify token, at most once per interval."""
     accounts = _account_ids(ctx)
     if not accounts:
         return skipped("No accounts yet")
@@ -124,10 +136,11 @@ def hunter(ctx: JobContext) -> dict[str, Any]:
     for user_id in accounts:
         try:
             with _as_user(ctx.sessions(), user_id) as db:
-                outcome = _hunt_for_account(ctx, db)
+                outcome, profile_errors = _hunt_for_account(ctx, db)
         except Exception as exc:  # one account's failure must not stop the others
             errors.append(_error(user_id, exc))
             continue
+        errors += [{"user_id": user_id, **problem} for problem in profile_errors]
         if isinstance(outcome, str):
             not_started[outcome] += 1
         else:
@@ -144,7 +157,7 @@ def apify_sync(ctx: JobContext) -> dict[str, Any]:
     with ctx.sessions() as db:
         pending = db.execute(select(SearchRun.id, SearchRun.user_id)
                              .where(SearchRun.provider == "apify", SearchRun.completed_at.is_(None))
-                             .order_by(SearchRun.id).limit(25)).all()
+                             .order_by(SearchRun.id).limit(max(1, get_settings().apify_sync_batch_size))).all()
         tokens: dict[int, bool] = {}
         for run_id, owner in pending:
             if owner is not None and owner not in tokens:

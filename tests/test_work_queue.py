@@ -15,7 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db import Base
-from app.models import Job, WorkflowTransition
+from app.models import Job, User, WorkflowTransition
 from app.services import work_queue as wq
 from app.services.lifecycle import TERMINAL_STATES, ErrorCategory, InvalidState, InvalidTransition
 from app.services.lifecycle import WorkflowState as S
@@ -35,8 +35,20 @@ def db(pg_sessions):
     session.close()
 
 
+def owner_id(db: Session) -> int:
+    """Every job belongs to an account; these tests only need one."""
+    existing = db.scalar(select(User.id).order_by(User.id))
+    if existing is not None:
+        return existing
+    user = User(email=f"worker-{uuid.uuid4().hex[:8]}@example.com", password_hash="x")
+    db.add(user)
+    db.flush()
+    return user.id
+
+
 def add_jobs(db: Session, count: int = 1, state: S = S.DISCOVERED) -> list[int]:
-    jobs = [Job(source="test", source_ref=uuid.uuid4().hex, title=f"Role {i}", company="Acme", state=state)
+    owner = owner_id(db)
+    jobs = [Job(user_id=owner, source="test", source_ref=uuid.uuid4().hex, title=f"Role {i}", company="Acme", state=state)
             for i in range(count)]
     db.add_all(jobs)
     db.commit()

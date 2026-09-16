@@ -98,7 +98,8 @@ def transition(db: Session, job: Job, target: object, *, actor: str = "system", 
     job.state = target_state
     job.previous_state = current
     job.updated_at = now or utcnow()
-    record = WorkflowTransition(job_id=job.id, from_state=current, to_state=target_state, actor=actor[:200],
+    record = WorkflowTransition(job_id=job.id, user_id=job.user_id, from_state=current, to_state=target_state,
+                                actor=actor[:200],
                                 reason=reason[:MAX_ERROR_LENGTH], attempt_count=job.attempt_count,
                                 error_category=job.error_category, created_at=job.updated_at)
     db.add(record)
