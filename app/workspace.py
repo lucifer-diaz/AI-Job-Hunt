@@ -37,7 +37,7 @@ from app.prompts import build_evidence_extraction_prompt
 from app.services.llm import LLMClient
 from app.services.sources import (UA, import_remote_run, list_remote_runs, refresh_apify_run, start_apify_search,
                                   upsert_job)
-from app.services.user_settings import apify_token, settings_for
+from app.services.user_settings import apify_token, lock_settings_row, settings_for
 from app.services.workflow import (draft_followup, followup_days, get_profile, rank_job, resume_edits,
                                    update_resume_edit)
 from app.settings import get_settings
@@ -1351,7 +1351,8 @@ def preferences_get(db: Session = Depends(get_user_db)):
 @router.put("/api/preferences")
 def preferences_put(payload: PreferencesIn, db: Session = Depends(get_user_db)):
     row = setting_row(db)
-    row.preferences = {**(row.preferences or {}), **payload.model_dump()}
+    row = lock_settings_row(db, row)
+    row.preferences = {**(row.preferences or {}), **payload.model_dump(exclude_unset=True)}
     db.commit()
     return preferences_get(db)
 
