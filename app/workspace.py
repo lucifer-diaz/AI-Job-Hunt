@@ -33,6 +33,7 @@ from app.services.actors import (BUILTIN, DEFAULT_ACTORS, FAN_OUTS, MAX_RUNS, PL
 from app.services.contacts import (MAX_RECRUITERS, ContactIn, clean_email, clean_phone, event_meta, format_in_zone,
                                    recruiters_of, set_primary_recruiter, set_recruiters, to_utc, zone)
 from app.services.ai_config import STAGES as AI_STAGES, is_free_model, resolve as resolve_ai_config
+from app.prompts import build_evidence_extraction_prompt
 from app.services.llm import LLMClient
 from app.services.sources import (UA, import_remote_run, list_remote_runs, refresh_apify_run, start_apify_search,
                                   upsert_job)
@@ -1406,10 +1407,8 @@ def parse_evidence(db: Session = Depends(get_user_db)):
     profile = get_profile(db)
     if not profile.master_resume.strip():
         raise HTTPException(400, "Upload or paste a master resume first")
-    system = ("Extract concrete, factual achievement claims from the resume. Never invent or embellish. "
-              "Return JSON with claims: array of {claim, company, role, skills (array)}.")
     try:
-        result = LLMClient.for_user(db).generate_json(system, f"EXTRACT_EVIDENCE\nMASTER RESUME:\n{profile.master_resume[:22000]}")
+        result = LLMClient.for_user(db).generate_prompt_json(build_evidence_extraction_prompt(profile.master_resume))
     except Exception as exc:
         raise HTTPException(400, str(exc)) from exc
     existing = {e.claim.strip().lower() for e in db.scalars(select(Evidence)).all()}

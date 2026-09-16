@@ -326,6 +326,29 @@ LLM_PROVIDER=mock
 
 The SDK/client libraries do not remove model inference cost. The model layer is isolated so providers can be switched without changing the workflow.
 
+### LLM prompts
+
+All production prompts live under `app/prompts/`. Backend services must not define long LLM prompts inline.
+
+Each prompt has:
+- a dedicated builder (`build_ranking_prompt`, `build_tailoring_prompt`, `build_review_prompt`, ...) that returns a provider-independent `Prompt`;
+- a version identifier (`RANKING_PROMPT_VERSION = "v1"`, ...), stored with the result where the data model has room (`jobs.fit_analysis`, `resume_variants.content` and `reviewer_notes`);
+- structured input: trusted instructions in the system message, data in labelled sections of the user message, with job descriptions, resumes and emails wrapped in `<untrusted_...>` tags;
+- a structured JSON output whose fields are listed in the instructions.
+
+| Module | Builders | Used by |
+|---|---|---|
+| `ranking.py` | `build_ranking_prompt` | `rank_job` |
+| `tailoring.py` | `build_tailoring_prompt` | `tailor_job` |
+| `review.py` | `build_review_prompt` | `review_resume` |
+| `followup.py` | `build_followup_prompt` | `draft_followup` |
+| `resume_parser.py` | `build_evidence_extraction_prompt`, `build_resume_parser_prompt` | evidence parsing; the structured parser is not wired in yet |
+| `application.py` | `build_application_question_prompt` | not wired in yet |
+| `inbox.py` | `build_inbox_classification_prompt` | not wired in yet (inbox sync is a placeholder) |
+| `agents.py` | ADK agent instructions | `job_hunt_agent` |
+
+When you change a prompt's wording or output fields, bump its version.
+
 ## 4. API endpoints
 
 Start a Hunter search (asynchronous; see "Hunter API and search profiles" above):

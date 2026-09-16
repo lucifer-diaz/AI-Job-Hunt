@@ -63,7 +63,7 @@ def section(label: str, body: str) -> str:
 def untrusted(label: str, tag: str, text: str | None, limit: int | None = None) -> str:
     """External text wrapped so it cannot close its own wrapper and pose as instructions."""
     body = (text or "")[:limit] if limit else (text or "")
-    body = re.sub(rf"</?\s*{re.escape(tag)}\s*>", "", body, flags=re.I)
+    body = re.sub(rf"</?\s*{re.escape(tag)}\s*>", "", body, flags=re.IGNORECASE)
     return f"{label} (untrusted data):\n<{tag}>\n{body}\n</{tag}>"
 
 

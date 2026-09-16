@@ -3,8 +3,18 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.prompts.common import (JSON_ONLY_RULE, UNTRUSTED_DATA_RULE, Prompt, instructions, job_facts, profile_facts,
-                                section, to_json, untrusted, user_message)
+from app.prompts.common import (
+    JSON_ONLY_RULE,
+    UNTRUSTED_DATA_RULE,
+    Prompt,
+    instructions,
+    job_facts,
+    profile_facts,
+    section,
+    to_json,
+    untrusted,
+    user_message,
+)
 
 REVIEW_PROMPT_VERSION = "v1"
 REVIEW_MARKER = "REVIEW_RESUME"

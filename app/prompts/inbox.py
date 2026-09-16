@@ -6,7 +6,16 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.prompts.common import JSON_ONLY_RULE, UNTRUSTED_DATA_RULE, Prompt, instructions, section, to_json, untrusted, user_message
+from app.prompts.common import (
+    JSON_ONLY_RULE,
+    UNTRUSTED_DATA_RULE,
+    Prompt,
+    instructions,
+    section,
+    to_json,
+    untrusted,
+    user_message,
+)
 
 INBOX_PROMPT_VERSION = "v1"
 INBOX_MARKER = "CLASSIFY_EMAIL"

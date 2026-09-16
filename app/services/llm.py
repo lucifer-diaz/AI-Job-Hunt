@@ -12,6 +12,8 @@ from app.settings import get_settings
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
 
+    from app.prompts.common import Prompt
+
 
 class LLMError(RuntimeError):
     pass
@@ -71,6 +73,10 @@ class LLMClient:
 
     def _config(self) -> dict[str, Any]:
         return resolve_ai_config(self.settings, self.overrides)
+
+    def generate_prompt_json(self, prompt: Prompt) -> dict[str, Any]:
+        """Run a prompt built in app.prompts and return its JSON result."""
+        return self.generate_json(prompt.system, prompt.user)
 
     def generate_json(self, system: str, user: str) -> dict[str, Any]:
         config = self._config()

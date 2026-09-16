@@ -6,8 +6,18 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.prompts.common import (JSON_ONLY_RULE, NO_INVENTION_RULE, UNTRUSTED_DATA_RULE, Prompt, instructions,
-                                profile_facts, section, to_json, untrusted, user_message)
+from app.prompts.common import (
+    JSON_ONLY_RULE,
+    NO_INVENTION_RULE,
+    UNTRUSTED_DATA_RULE,
+    Prompt,
+    instructions,
+    profile_facts,
+    section,
+    to_json,
+    untrusted,
+    user_message,
+)
 
 APPLICATION_QUESTION_PROMPT_VERSION = "v1"
 APPLICATION_QUESTION_MARKER = "APPLICATION_QUESTION"
@@ -19,7 +29,7 @@ APPLICATION_QUESTION_SYSTEM = instructions(
     NO_INVENTION_RULE + " Answer only from CANDIDATE PROFILE, CANDIDATE POLICY, RESUME and VERIFIED EVIDENCE. "
     "Never guess. Never invent work authorization, visa or sponsorship status, salary or compensation, years of "
     "experience, identity, demographic or contact data.",
-    f"""Decide:
+    """Decide:
   ANSWER when the supplied data answers the question directly,
   UNKNOWN when it does not,
   SKIP_APPLICATION when the question is required, cannot be answered from the data, or the true answer

@@ -3,14 +3,25 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.prompts.common import (JSON_ONLY_RULE, NO_INVENTION_RULE, UNTRUSTED_DATA_RULE, Prompt, instructions,
-                                job_facts, profile_facts, section, to_json, untrusted, user_message)
+from app.prompts.common import (
+    JSON_ONLY_RULE,
+    NO_INVENTION_RULE,
+    UNTRUSTED_DATA_RULE,
+    Prompt,
+    instructions,
+    job_facts,
+    profile_facts,
+    section,
+    to_json,
+    untrusted,
+    user_message,
+)
 
 TAILOR_PROMPT_VERSION = "v1"
 TAILOR_MARKER = "TAILOR_RESUME"
-# The fit-analysis fields tailoring uses; anything else stored with the analysis is left out.
-FIT_ANALYSIS_FIELDS = ("summary", "strong_matches", "gaps", "must_have_missing", "keywords", "application_strategy",
-                       "confidence")
+# The fit-analysis fields tailoring uses, with their defaults; anything else stored with the analysis is left out.
+FIT_ANALYSIS_DEFAULTS = {"summary": "", "strong_matches": [], "gaps": [], "must_have_missing": [], "keywords": [],
+                         "application_strategy": "", "confidence": 0}
 
 TAILOR_SYSTEM = instructions(
     "You are an expert resume editor.",
@@ -38,8 +49,7 @@ def build_tailoring_prompt(candidate_profile: Any, resume: str, roles: list[dict
                            evidence: list[dict[str, Any]], job: Any, fit_analysis: dict[str, Any] | None,
                            fit_score: float | None = None) -> Prompt:
     analysis = fit_analysis or {}
-    fit = {"score": fit_score, **{key: analysis.get(key, 0 if key == "confidence" else "" if key in (
-        "summary", "application_strategy") else []) for key in FIT_ANALYSIS_FIELDS}}
+    fit = {"score": fit_score, **{key: analysis.get(key, default) for key, default in FIT_ANALYSIS_DEFAULTS.items()}}
     user = user_message(
         TAILOR_MARKER,
         section("MASTER RESUME ROLES", to_json(roles, limit=20000)),

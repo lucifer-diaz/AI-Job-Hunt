@@ -1,8 +1,15 @@
 """Resume prompts: structured parsing of an uploaded resume, and evidence-claim extraction from the master resume."""
 from __future__ import annotations
 
-from app.prompts.common import (JSON_ONLY_RULE, NO_INVENTION_RULE, UNTRUSTED_DATA_RULE, Prompt, instructions,
-                                untrusted, user_message)
+from app.prompts.common import (
+    JSON_ONLY_RULE,
+    NO_INVENTION_RULE,
+    UNTRUSTED_DATA_RULE,
+    Prompt,
+    instructions,
+    untrusted,
+    user_message,
+)
 
 RESUME_PARSER_PROMPT_VERSION = "v1"
 RESUME_PARSER_MARKER = "PARSE_RESUME"
