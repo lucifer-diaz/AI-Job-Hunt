@@ -100,6 +100,25 @@ def test_every_prompt_keeps_data_out_of_its_instructions():
     assert "SKIP_APPLICATION" in all_prompts()["application_question"].system
 
 
+def test_resume_parser_prompt_asks_for_raw_text_and_the_structured_schema():
+    import json
+
+    from app.prompts.resume_parser import STRUCTURED_RESUME_TEMPLATE
+
+    prompt = all_prompts()["resume_parser"]
+    assert prompt.version == "v2"
+    assert '{"raw_text": "...", "structured_resume": {...}}' in prompt.system
+    schema = json.loads(prompt.system.split("or an empty list.\n", 1)[1].split("\n\nPARSING RULES", 1)[0])
+    assert schema == STRUCTURED_RESUME_TEMPLATE
+    assert set(schema) == {"candidate", "summary", "skills", "experience", "projects", "education", "certifications",
+                           "awards", "publications", "languages", "additional_information", "derived"}
+    assert set(schema["experience"][0]) >= {"start_date_raw", "end_date_raw", "is_current", "raw_bullets", "metrics"}
+    for rule in ("YYYY-MM", "raw_bullets", "K8s -> Kubernetes", "source_text", "total_experience_years",
+                 "Ka[ka -> Kafka", "Never invent", "visa"):
+        assert rule in prompt.system, rule
+    assert resume in prompt.user and "<untrusted_resume>" in prompt.user and resume not in prompt.system
+
+
 def test_stage_routing_markers_are_preserved():
     built = all_prompts()
     assert {name: _task_from_prompt(built[name].user) for name in ("ranking", "tailoring", "review", "followup",
