@@ -25,7 +25,7 @@ from app.db import engine
 from app.db_migrations import run_migrations
 from app.models import (Application, CandidateProfile, Evidence, Job,
                         KnowledgeAnswer, ResumeDocument, ResumeVariant, SearchRun)
-from app.schemas import (ApplicationUpdateIn, ApifySearchIn, ApiKeysIn, BulkTailorIn, EvidenceIn, KnowledgeIn,
+from app.schemas import (ApplicationUpdateIn, ApifySearchIn, ApiKeysIn, BulkTailorIn, TailorTasksCancelIn, TailorTasksIn, EvidenceIn, KnowledgeIn,
                          ManualJobIn, ProfileIn, RecruiterIn, SettingsIn)
 from app.security import SecretsUnavailable
 from app.services.exports import markdown_to_simple_pdf
@@ -36,6 +36,8 @@ from app.services.workflow import (SKIP_TAILORING_STATUSES, approve_job, get_pro
 from app.services.ai_config import PROVIDERS as AI_PROVIDERS, STAGES as AI_STAGES, env_defaults as ai_env_defaults
 from app.services.ai_config import resolve as resolve_ai_config
 from app.scheduler import build_scheduler
+from app.services import tailor_tasks
+from app.services.contacts import recruiters_of, set_primary_recruiter
 from app.settings import get_settings
 from app.tenancy import require_user_id
 from app.hunter_api import router as hunter_router
@@ -45,15 +47,19 @@ run_migrations(engine)
 settings = get_settings()
 # One scheduler per process. Manual triggers use it even when the background loop is disabled.
 scheduler = build_scheduler()
+tailor_worker = tailor_tasks.build_worker()
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     if scheduler.enabled:
         await scheduler.start()
+    if tailor_worker.enabled:
+        await tailor_worker.start()
     try:
         yield
     finally:
+        await tailor_worker.stop()
         await scheduler.stop()
 
 
@@ -396,15 +402,28 @@ def bulk_tailor(payload: BulkTailorIn, db: Session = Depends(get_user_db)):
 
 
 def _packet_response(db: Session, job: Job, resume: ResumeVariant) -> dict:
-    auto_approved = False
-    app_setting = settings_for(db)
-    if app_setting.application_mode == "automatic" and (resume.reviewer_score or 0) >= app_setting.min_review_score:
-        approve_job(db, job)
-        auto_approved = True
-    return {"resume_id": resume.id, "version": resume.version, "reviewer_score": resume.reviewer_score,
-            "markdown": resume.markdown, "cover_letter": resume.cover_letter,
-            "reviewer_notes": resume.reviewer_notes, "auto_approved": auto_approved,
-            "untailored": bool((resume.content or {}).get("untailored"))}
+    return tailor_tasks.packet_outcome(db, job, resume)
+
+
+@app.post("/api/tailor-tasks")
+def queue_tailor_tasks(payload: TailorTasksIn, db: Session = Depends(get_user_db)):
+    """Queue tailoring (or skip tailoring) for jobs; a background worker runs them, so the page can be left."""
+    return tailor_tasks.enqueue(db, payload.ids, payload.mode, payload.regenerate)
+
+
+@app.get("/api/tailor-tasks")
+def list_tailor_tasks(db: Session = Depends(get_user_db)):
+    return tailor_tasks.list_tasks(db)
+
+
+@app.post("/api/tailor-tasks/cancel")
+def cancel_tailor_tasks(payload: TailorTasksCancelIn, db: Session = Depends(get_user_db)):
+    return {"cancelled": tailor_tasks.cancel_queued(db, payload.ids)}
+
+
+@app.post("/api/tailor-tasks/clear")
+def clear_tailor_tasks(db: Session = Depends(get_user_db)):
+    return {"cleared": tailor_tasks.clear_finished(db)}
 
 
 @app.get("/api/jobs/{job_id}/resume.pdf")
@@ -444,8 +463,9 @@ def applied(job_id: int, payload: RecruiterIn, db: Session = Depends(get_user_db
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     # Only overwrite what the confirmation step actually supplied.
-    app_obj.recruiter_name = payload.recruiter_name or app_obj.recruiter_name
-    app_obj.recruiter_email = payload.recruiter_email or app_obj.recruiter_email
+    if payload.recruiter_name or payload.recruiter_email:
+        set_primary_recruiter(app_obj, payload.recruiter_name or app_obj.recruiter_name,
+                              payload.recruiter_email or app_obj.recruiter_email)
     app_obj.notes = payload.notes or app_obj.notes
     db.commit()
     return {"status": app_obj.status, "followup_due_at": app_obj.followup_due_at}
@@ -456,7 +476,7 @@ def application_list(db: Session = Depends(get_user_db)):
     rows = db.scalars(select(Application).order_by(desc(Application.id))).all()
     return [{"id": item.id, "job_id": item.job_id, "status": item.status,
              "notes": item.notes, "recruiter_name": item.recruiter_name,
-             "recruiter_email": item.recruiter_email,
+             "recruiter_email": item.recruiter_email, "recruiters": recruiters_of(item),
              "approved_resume_id": item.approved_resume_id} for item in rows]
 
 
@@ -475,7 +495,7 @@ def application_detail(job_id: int, db: Session = Depends(get_user_db)):
                 "reviewer_score": resume.reviewer_score, "reviewer_notes": resume.reviewer_notes},
             "application": None if not app_obj else {"id": app_obj.id, "status": app_obj.status,
                 "notes": app_obj.notes, "recruiter_name": app_obj.recruiter_name,
-                "recruiter_email": app_obj.recruiter_email},
+                "recruiter_email": app_obj.recruiter_email, "recruiters": recruiters_of(app_obj)},
             "questions": [{"id": q.id, "question": q.question, "answer": q.answer,
                             "verified": q.verified, "sensitive": q.sensitive} for q in questions]}
 
@@ -485,7 +505,8 @@ def application_update(application_id: int, payload: ApplicationUpdateIn, db: Se
     item = db.get(Application, application_id)
     if not item:
         raise HTTPException(404, "Application not found")
-    item.notes, item.recruiter_name, item.recruiter_email = payload.notes, payload.recruiter_name, payload.recruiter_email
+    item.notes = payload.notes
+    set_primary_recruiter(item, payload.recruiter_name, payload.recruiter_email)
     if payload.status:
         if payload.status not in {"pending_approval", "rejected"}:
             raise HTTPException(422, "Only pending approval or rejected may be set here")

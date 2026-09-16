@@ -271,3 +271,102 @@ def test_extract_job_posting_reads_json_ld():
     data = extract_job_posting(html)
     assert data["title"] == "Staff ML Engineer" and data["company"] == "Quantiphi"
     assert data["location"] == "Bengaluru, IN" and "RAG" in data["description"]
+
+
+def test_tailor_and_approval_queues_filter_and_sort():
+    assert client.put("/api/profile", json={"name": "Test Candidate", "headline": "Engineer",
+                                            "master_resume": "Built Python FastAPI services at 10k rps"}).status_code == 200
+    tag = uuid.uuid4().hex[:8]
+    tailored, skipped, bare, approved = (make_job(title=f"Engineer {tag} {n}", company=f"Filter {tag} {n}")["id"]
+                                         for n in range(4))
+    for job_id in (tailored, skipped, bare, approved):
+        client.post(f"/api/jobs/{job_id}/triage", json={"action": "shortlist"})
+    assert client.post(f"/api/jobs/{tailored}/tailor").status_code == 200
+    assert client.post(f"/api/jobs/{skipped}/skip-tailoring").status_code == 200
+    assert client.post(f"/api/jobs/{approved}/tailor").status_code == 200
+    assert client.post(f"/api/jobs/{approved}/approve").status_code == 200
+
+    def tailor(**params):
+        out = client.get("/api/tailor/queue", params={"q": tag, "with_facets": True, **params}).json()
+        return {r["id"] for r in out["items"]}, out
+
+    ids, out = tailor()
+    assert ids == {tailored, skipped, bare} and out["total_all"] >= 3 and "Manual" in out["boards"]
+    assert tailor(status="not_tailored")[0] == {bare}
+    assert tailor(status="has_packet")[0] == {tailored, skipped}
+    assert tailor(status="untailored")[0] == {skipped}
+    assert tailor(min_review=1)[0] == {tailored, skipped}
+    assert tailor(q=f"Filter {tag} 2")[0] == {bare}
+    assert tailor(board="Greenhouse")[0] == set()
+    # Without with_facets the endpoint still returns a plain list.
+    assert isinstance(client.get("/api/tailor/queue", params={"q": tag}).json(), list)
+    assert client.get("/api/tailor/queue", params={"status": "nope"}).status_code == 422
+    assert client.get("/api/tailor/queue", params={"sort": "nope"}).status_code == 422
+
+    def approvals(**params):
+        return [r["id"] for r in client.get("/api/approvals", params={"q": tag, **params}).json()]
+
+    assert set(approvals()) == {tailored, skipped, approved}
+    assert approvals(status="approved") == [approved]
+    assert set(approvals(status="waiting")) == {tailored, skipped}
+    assert approvals(sort="company") == sorted([tailored, skipped, approved])
+    assert client.get("/api/approvals", params={"status": "not_tailored"}).status_code == 422
+
+
+def applied_application():
+    assert client.put("/api/profile", json={"name": "Test Candidate", "headline": "Engineer",
+                                            "master_resume": "Built Python FastAPI services at 10k rps"}).status_code == 200
+    job = make_job()
+    client.post(f"/api/jobs/{job['id']}/triage", json={"action": "shortlist"})
+    assert client.post(f"/api/jobs/{job['id']}/tailor").status_code == 200
+    assert client.post(f"/api/jobs/{job['id']}/approve").status_code == 200
+    assert client.post(f"/api/jobs/{job['id']}/applied", json={"recruiter_name": "Priya"}).status_code == 200
+    return next(a for a in client.get("/api/tracker").json()["applications"] if a["job_id"] == job["id"])
+
+
+def test_application_keeps_several_recruiters():
+    row = applied_application()
+    assert row["recruiters"] == [{"name": "Priya", "email": "", "phone": ""}]
+    url = f"/api/applications/{row['id']}/recruiters"
+    out = client.put(url, json={"recruiters": [
+        {"name": " Karan Gupta ", "email": "Karan.Gupta@Example.com", "phone": "+91 98765-43210"},
+        {"name": "Azhar Ahmed", "phone": "8904304811"},
+        {"email": "talent@example.com"}]}).json()
+    assert out["recruiters"] == [{"name": "Karan Gupta", "email": "Karan.Gupta@example.com", "phone": "+91 98765-43210"},
+                                 {"name": "Azhar Ahmed", "email": "", "phone": "8904304811"},
+                                 {"name": "", "email": "talent@example.com", "phone": ""}]
+    assert out["recruiter_name"] == "Karan Gupta"  # the first recruiter is mirrored for older readers
+
+    # The single-recruiter endpoint edits only the first one.
+    out = client.put(f"/api/applications/{row['id']}/recruiter", json={"recruiter_name": "Deepak", "recruiter_email": ""}).json()
+    assert [r["name"] for r in out["recruiters"]] == ["Deepak", "Azhar Ahmed", ""]
+    assert out["recruiters"][0]["phone"] == "+91 98765-43210"
+
+    assert client.put(url, json={"recruiters": [{"name": "X", "email": "not-an-email"}]}).status_code == 422
+    assert client.put(url, json={"recruiters": [{"name": "X", "phone": "call me"}]}).status_code == 422
+    assert client.put(url, json={"recruiters": [{}]}).status_code == 422
+    assert client.put(url, json={"recruiters": [{"name": str(n)} for n in range(21)]}).status_code == 422
+    assert client.put(url, json={"recruiters": []}).json()["recruiters"] == []
+
+
+def test_interview_is_scheduled_in_its_time_zone_with_a_contact():
+    row = applied_application()
+    url = f"/api/applications/{row['id']}/events"
+    local = (datetime.now(UTC) + timedelta(days=2)).replace(hour=16, minute=0, second=0, microsecond=0, tzinfo=None)
+    out = client.post(url, json={"kind": "interview", "title": "Telephonic", "local_time": local.isoformat(),
+                                 "timezone": "Asia/Kolkata", "contact_name": "Azhar Ahmed",
+                                 "contact_email": "azhar@example.com", "contact_phone": "+91 8904304811"}).json()
+    event = next(e for e in out["timeline"] if e["kind"] == "interview")
+    assert event["at"] == (local - timedelta(hours=5, minutes=30)).isoformat()  # stored as UTC
+    assert event["timezone"] == "Asia/Kolkata" and event["at_local"].endswith("16:00 IST")
+    assert (event["contact_name"], event["contact_email"], event["contact_phone"]) == (
+        "Azhar Ahmed", "azhar@example.com", "+91 8904304811")
+    assert out["next_date"].endswith("16:00 IST")
+
+    bad = {"kind": "interview", "title": "Panel", "local_time": local.isoformat()}
+    assert client.post(url, json={**bad, "timezone": "Mars/Olympus"}).status_code == 422
+    assert client.post(url, json=bad).status_code == 422  # a local time needs a zone
+    assert client.post(url, json={**bad, "timezone": "UTC", "contact_email": "nope"}).status_code == 422
+    # An offset-aware occurred_at is converted, not truncated.
+    out = client.post(url, json={"kind": "note", "title": "Call", "occurred_at": "2026-09-16T16:00:00+05:30"}).json()
+    assert any(e["at"] == "2026-09-16T10:30:00" for e in out["timeline"])

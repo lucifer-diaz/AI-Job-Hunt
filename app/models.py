@@ -58,6 +58,7 @@ class User(Base):
     search_profiles: Mapped[list[SearchProfile]] = relationship(back_populates="user", passive_deletes=True)
     applications: Mapped[list[Application]] = relationship(back_populates="user", passive_deletes=True)
     resume_variants: Mapped[list[ResumeVariant]] = relationship(back_populates="user", passive_deletes=True)
+    tailor_tasks: Mapped[list[TailorTask]] = relationship(back_populates="user", passive_deletes=True)
     followups: Mapped[list[FollowUp]] = relationship(back_populates="user", passive_deletes=True)
     application_events: Mapped[list[ApplicationEvent]] = relationship(back_populates="user", passive_deletes=True)
     transitions: Mapped[list[WorkflowTransition]] = relationship(back_populates="user", passive_deletes=True)
@@ -296,6 +297,7 @@ class Job(Base):
 
     user: Mapped[User] = relationship(back_populates="jobs")
     resumes: Mapped[list[ResumeVariant]] = relationship(back_populates="job", cascade="all, delete-orphan")
+    tailor_tasks: Mapped[list[TailorTask]] = relationship(back_populates="job", cascade="all, delete-orphan")
     application: Mapped[Application | None] = relationship(back_populates="job", uselist=False, cascade="all, delete-orphan")
     transitions: Mapped[list[WorkflowTransition]] = relationship(back_populates="job", cascade="all, delete-orphan",
                                                                  passive_deletes=True,
@@ -415,6 +417,36 @@ class ResumeVariant(Base):
     user: Mapped[User] = relationship(back_populates="resume_variants")
 
 
+class TailorTask(Base):
+    """One queued, running or finished background tailoring run for a job (app.services.tailor_tasks)."""
+
+    __tablename__ = "tailor_tasks"
+    __table_args__ = (
+        CheckConstraint("mode IN ('tailor', 'skip')", name="ck_tailor_tasks_mode"),
+        CheckConstraint("status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')", name="ck_tailor_tasks_status"),
+        Index("ix_tailor_tasks_status", "status", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = _owner("tailor_tasks")
+    mode: Mapped[str] = mapped_column(String(10), default="tailor")
+    regenerate: Mapped[bool] = mapped_column(Boolean, default=False)
+    status: Mapped[str] = mapped_column(String(20), default="queued")
+    stage: Mapped[str] = mapped_column(String(20), default="queued")  # queued | ranking | tailoring | reviewing | done
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    locked_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    lock_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    job: Mapped[Job] = relationship(back_populates="tailor_tasks")
+    user: Mapped[User] = relationship(back_populates="tailor_tasks")
+
+
 class Application(Base):
     __tablename__ = "applications"
 
@@ -427,6 +459,8 @@ class Application(Base):
     followup_due_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     recruiter_name: Mapped[str] = mapped_column(String(200), default="")
     recruiter_email: Mapped[str] = mapped_column(String(300), default="")
+    # Every recruiter for this application: [{name, email, phone}]. The first is mirrored above (app.services.contacts).
+    contacts: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
     notes: Mapped[str] = mapped_column(Text, default="")
     approved_resume_id: Mapped[int | None] = mapped_column(ForeignKey("resume_variants.id", ondelete="SET NULL"), nullable=True)
     # Post-submission tracker column: applied, acknowledged, screening, interviewing, ..., closed.
@@ -450,6 +484,9 @@ class ApplicationEvent(Base):
     title: Mapped[str] = mapped_column(String(300), default="")
     detail: Mapped[str] = mapped_column(Text, default="")
     occurred_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    # Interviews: the time zone they were scheduled in and an optional contact (timezone, contact_name,
+    # contact_email, contact_phone).
+    meta: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
     application: Mapped[Application] = relationship(back_populates="events")

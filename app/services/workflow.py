@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from app.models import Application, ApplicationEvent, CandidateProfile, Evidence, FollowUp, Job, ResumeVariant
+from app.services.contacts import recruiters_of
 from app.services.llm import LLMClient
 from app.services.resume_format import (ParsedResume, parse_resume, relevant_skills, render_legacy, render_resume,
                                         skills_text, summary_text, to_plain)
@@ -79,11 +81,22 @@ JOB:\n{json.dumps({'title': job.title, 'company': job.company, 'location': job.l
     return result
 
 
-def tailor_job(db: Session, job: Job) -> ResumeVariant:
+# Called with the stage a tailoring run is entering ("ranking", "tailoring", "reviewing") so background tasks can
+# report progress.
+Progress = Callable[[str], None]
+
+
+def _no_progress(_stage: str) -> None:
+    return None
+
+
+def tailor_job(db: Session, job: Job, progress: Progress = _no_progress) -> ResumeVariant:
     profile = get_profile(db)
     evidence = _evidence_payload(db)
     if job.fit_score is None:
+        progress("ranking")
         rank_job(db, job)
+    progress("tailoring")
     llm = LLMClient.for_user(db)
     parsed = parse_resume(profile.master_resume or "")
     roles_payload = [{"role_index": i, "title": r.title, "company": r.company, "dates": r.dates, "bullets": r.bullets}
@@ -147,6 +160,7 @@ def tailor_job(db: Session, job: Job) -> ResumeVariant:
     job.status = "tailored"
     db.commit()
     db.refresh(resume)
+    progress("reviewing")
     review_resume(db, resume)
     return resume
 
@@ -155,7 +169,7 @@ def tailor_job(db: Session, job: Job) -> ResumeVariant:
 SKIP_TAILORING_STATUSES = ("shortlisted", "tailored", "pending_approval")
 
 
-def skip_tailoring(db: Session, job: Job) -> ResumeVariant:
+def skip_tailoring(db: Session, job: Job, progress: Progress = _no_progress) -> ResumeVariant:
     """Use the master resume unchanged for a job that needs no tailoring. No AI edits; the reviewer still scores it."""
     profile = get_profile(db)
     if not (profile.master_resume or "").strip():
@@ -174,6 +188,7 @@ def skip_tailoring(db: Session, job: Job) -> ResumeVariant:
     job.status = "tailored"
     db.commit()
     db.refresh(resume)
+    progress("reviewing")
     review_resume(db, resume)
     return resume
 
@@ -440,7 +455,7 @@ def draft_followup(db: Session, app: Application, commit: bool = True) -> Follow
 
     APPLICATION:\n{json.dumps({'status': app.status, 'applied_at': app.applied_at.isoformat() if app.applied_at else ''}, ensure_ascii=False)}
 
-    RECRUITER:\n{json.dumps({'name': app.recruiter_name, 'email': app.recruiter_email}, ensure_ascii=False)}
+    RECRUITERS (the first is the primary contact):\n{json.dumps(recruiters_of(app), ensure_ascii=False)}
     """
     result = llm.generate_json(system, user)
     fu = db.scalar(select(FollowUp).where(FollowUp.application_id == app.id, FollowUp.status == "draft")
