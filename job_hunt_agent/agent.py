@@ -3,7 +3,7 @@
 from google.adk.agents import Agent
 
 from app.settings import get_settings
-from job_hunt_agent import prompts
+from app.prompts import agents as prompts
 from job_hunt_agent.tools import (
     get_application_context,
     get_job_context,

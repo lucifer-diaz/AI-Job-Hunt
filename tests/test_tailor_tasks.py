@@ -1,0 +1,116 @@
+import uuid
+from datetime import timedelta
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import delete, update
+
+from app.db import SessionLocal
+from app.main import app
+from app.models import TailorTask
+from app.services import tailor_tasks
+from app.settings import get_settings
+
+client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def mock_llm_and_empty_queue(monkeypatch):
+    monkeypatch.setattr(get_settings(), "llm_provider", "mock")
+    with SessionLocal() as db:
+        db.execute(delete(TailorTask))
+        db.commit()
+
+
+def shortlisted_job(client=client):
+    tag = uuid.uuid4().hex[:8]
+    job = client.post("/api/jobs/from-url", json={
+        "url": f"https://example.com/jobs/{tag}", "title": "Lead AI Engineer", "company": f"Acme {tag}",
+        "location": "Remote", "description": "Python FastAPI AWS and team leadership"}).json()["job"]
+    assert client.post(f"/api/jobs/{job['id']}/triage", json={"action": "shortlist"}).status_code == 200
+    return job["id"]
+
+
+def tasks_by_job():
+    return {t["job_id"]: t for t in client.get("/api/tailor-tasks").json()}
+
+
+def test_tasks_queue_run_in_the_background_and_report_progress(monkeypatch):
+    assert client.put("/api/profile", json={"name": "Test Candidate", "headline": "Engineer",
+                                            "master_resume": "Built Python FastAPI services at 10k rps"}).status_code == 200
+    first, second, broken, skip = (shortlisted_job() for _ in range(4))
+    not_shortlisted = client.post("/api/jobs/from-url", json={
+        "url": f"https://example.com/jobs/{uuid.uuid4().hex}", "title": "Engineer", "company": "Other",
+        "description": "Python"}).json()["job"]["id"]
+
+    out = client.post("/api/tailor-tasks", json={"ids": [first, second, broken, not_shortlisted, 999999]}).json()
+    assert [t["job_id"] for t in out["queued"]] == [first, second, broken]
+    assert {s["id"]: s["reason"] for s in out["skipped"]} == {not_shortlisted: "not in the Tailor queue", 999999: "not found"}
+    assert client.post("/api/tailor-tasks", json={"ids": [first]}).json()["skipped"] == [{"id": first, "reason": "already queued"}]
+    assert client.post("/api/tailor-tasks", json={"ids": [skip], "mode": "skip"}).json()["queued"][0]["mode"] == "skip"
+    assert {t["status"] for t in tasks_by_job().values()} == {"queued"}
+
+    stages = []
+    real_tailor = tailor_tasks.tailor_job
+
+    def flaky_tailor(db, job, progress):
+        if job.id == broken:
+            raise RuntimeError("model timed out")
+
+        def spy(stage):
+            progress(stage)
+            with SessionLocal() as s:
+                stages.append(s.get(TailorTask, next(t["id"] for t in tasks_by_job().values() if t["job_id"] == job.id)).stage)
+        return real_tailor(db, job, progress=spy)
+
+    monkeypatch.setattr(tailor_tasks, "tailor_job", flaky_tailor)
+    assert tailor_tasks.run_pending(SessionLocal) == 4
+    assert "tailoring" in stages and "reviewing" in stages
+
+    tasks = tasks_by_job()
+    assert tasks[first]["status"] == "succeeded" and tasks[first]["progress"] == 100
+    assert tasks[first]["result"]["reviewer_score"] == 86 and tasks[first]["result"]["untailored"] is False
+    assert tasks[broken]["status"] == "failed" and tasks[broken]["error"] == "model timed out"
+    assert tasks[skip]["result"]["untailored"] is True
+    assert client.get(f"/api/tailor/{second}").json()["resume"]["version"] == 1
+
+    # A job with a packet is only redone on request.
+    assert client.post("/api/tailor-tasks", json={"ids": [first]}).json()["skipped"][0]["reason"] == "already has a packet"
+    assert len(client.post("/api/tailor-tasks", json={"ids": [first], "regenerate": True}).json()["queued"]) == 1
+    assert client.post("/api/tailor-tasks/cancel", json={}).json() == {"cancelled": 1}
+    assert client.post("/api/tailor-tasks/clear").json()["cleared"] == 5
+    assert client.get("/api/tailor-tasks").json() == []
+
+
+def test_interrupted_task_is_requeued_then_failed():
+    job_id = shortlisted_job()
+    task_id = client.post("/api/tailor-tasks", json={"ids": [job_id]}).json()["queued"][0]["id"]
+    for attempt in range(tailor_tasks.MAX_ATTEMPTS):
+        assert tailor_tasks.claim_next(SessionLocal, "crashed-worker", 60) == task_id
+        assert tasks_by_job()[job_id]["status"] == "running"
+        with SessionLocal() as db:  # the worker died: its lease runs out
+            db.execute(update(TailorTask).where(TailorTask.id == task_id)
+                       .values(lock_expires_at=tailor_tasks.utcnow() - timedelta(seconds=1)))
+            db.commit()
+    assert tailor_tasks.claim_next(SessionLocal, "next-worker", 60) is None
+    task = tasks_by_job()[job_id]
+    assert task["status"] == "failed" and task["error"].startswith("Interrupted")
+
+
+def signed_up():
+    account = TestClient(app)
+    password = "correct horse battery"
+    assert account.post("/api/auth/signup", json={"email": f"{uuid.uuid4().hex[:8]}@example.com", "password": password,
+                                                  "confirm_password": password}).status_code == 201
+    return account
+
+
+def test_tasks_are_private_to_their_account(anonymous):
+    alice, bob = signed_up(), signed_up()
+    job_id = shortlisted_job(alice)
+    task_id = alice.post("/api/tailor-tasks", json={"ids": [job_id]}).json()["queued"][0]["id"]
+    assert bob.get("/api/tailor-tasks").json() == []
+    assert bob.post("/api/tailor-tasks", json={"ids": [job_id]}).json()["skipped"] == [{"id": job_id, "reason": "not found"}]
+    assert bob.post("/api/tailor-tasks/cancel", json={"ids": [task_id]}).json() == {"cancelled": 0}
+    assert [t["id"] for t in alice.get("/api/tailor-tasks").json()] == [task_id]
+    assert TestClient(app).get("/api/tailor-tasks").status_code == 401

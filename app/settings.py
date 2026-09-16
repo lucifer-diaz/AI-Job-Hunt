@@ -87,6 +87,10 @@ class Settings(BaseSettings):
     ranking_batch_size: int = 20
     ranking_concurrency: int = 5
     compensation_batch_size: int = 50
+    # Background tailoring worker (app.services.tailor_tasks)
+    tailor_worker_enabled: bool = True
+    tailor_concurrency: int = 2
+    tailor_lease_seconds: int = 900
     # Required header value (X-Admin-Token) for POST /api/admin/scheduler/{job}/run. Unset disables the triggers.
     admin_token: str | None = None
 

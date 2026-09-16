@@ -13,6 +13,7 @@ from sqlalchemy import desc, select
 
 from app.db import SessionLocal
 from app.models import Application, Evidence, FollowUp, Job, ResumeVariant
+from app.services.contacts import recruiters_of
 from app.services.workflow import build_resume_markdown, get_profile
 from app.settings import get_settings
 
@@ -178,7 +179,8 @@ def get_application_context(application_id: int) -> dict[str, Any]:
         return {"ok": True, "application": {"id": application.id, "status": application.status,
                 "applied_at": application.applied_at.isoformat() if application.applied_at else None,
                 "followup_due_at": application.followup_due_at.isoformat() if application.followup_due_at else None,
-                "recruiter_name": application.recruiter_name, "recruiter_email": application.recruiter_email},
+                "recruiter_name": application.recruiter_name, "recruiter_email": application.recruiter_email,
+                "recruiters": recruiters_of(application)},
                 "job": {"title": job.title, "company": job.company, "location": job.location},
                 "follow_up_exists": existing is not None}
 

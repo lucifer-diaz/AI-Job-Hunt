@@ -72,6 +72,16 @@ class BulkTailorIn(BaseModel):
     batch_size: int = Field(default=1, ge=1, le=5)  # tailoring is slow; small batches keep requests short
 
 
+class TailorTasksIn(BaseModel):
+    ids: list[int] = Field(min_length=1, max_length=500)
+    mode: Literal["tailor", "skip"] = "tailor"  # skip = send the master resume unchanged
+    regenerate: bool = False  # also redo jobs that already have a packet
+
+
+class TailorTasksCancelIn(BaseModel):
+    ids: list[int] | None = None  # None cancels every queued task
+
+
 class RecruiterIn(BaseModel):
     recruiter_name: str = ""
     recruiter_email: str = ""

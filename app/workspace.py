@@ -21,7 +21,7 @@ import httpx
 from bs4 import BeautifulSoup
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.orm import Session
 
@@ -30,7 +30,10 @@ from app.models import (AppSetting, Application, ApplicationEvent, Evidence, Fol
                         ResumeDocument, ResumeVariant, SearchRun)
 from app.services.actors import (BUILTIN, DEFAULT_ACTORS, FAN_OUTS, MAX_RUNS, PLACEHOLDERS, REMOTE_PLATFORMS,
                                  SENIORITY_LEVELS, catalog as actor_catalog, describe_input, plan_runs)
+from app.services.contacts import (MAX_RECRUITERS, ContactIn, clean_email, clean_phone, event_meta, format_in_zone,
+                                   recruiters_of, set_primary_recruiter, set_recruiters, to_utc, zone)
 from app.services.ai_config import STAGES as AI_STAGES, is_free_model, resolve as resolve_ai_config
+from app.prompts import build_evidence_extraction_prompt
 from app.services.llm import LLMClient
 from app.services.sources import (UA, import_remote_run, list_remote_runs, refresh_apify_run, start_apify_search,
                                   upsert_job)
@@ -836,8 +839,53 @@ def keyword_coverage(job: Job, resume: ResumeVariant | None) -> list[dict]:
     return out
 
 
+# Status filters for the Tailor and Approvals screens: filter name -> test on a row.
+TAILOR_STATUS_FILTERS = {
+    "not_tailored": lambda r: not r["has_resume"],
+    "has_packet": lambda r: r["has_resume"] and r["status"] != "pending_approval",
+    "sent_back": lambda r: r["status"] == "pending_approval",
+    "untailored": lambda r: r["untailored"],  # packet uses the master resume unchanged
+}
+APPROVAL_STATUS_FILTERS = {
+    "waiting": lambda r: r["status"] == "tailored",
+    "sent_back": lambda r: r["status"] in ("pending_approval", "rejected"),
+    "approved": lambda r: r["status"] == "approved",
+}
+PACKET_SORTS = {
+    "fit": lambda r: (r["fit"] is None, -(r["fit"] or 0), -r["id"]),
+    "reviewer": lambda r: (r["reviewer_score"] is None, -(r["reviewer_score"] or 0), -r["id"]),
+    "company": lambda r: (r["company"].lower(), -r["id"]),
+    "new": lambda r: (r["discovered_at"],),  # reversed below
+}
+
+
+def filter_packet_rows(rows: list[dict], *, q: str, min_fit: int, min_review: int, board: str, status: str,
+                       sort: str, status_filters: dict, with_facets: bool):
+    """Filter and sort Tailor or Approvals rows. The unfiltered order is kept for sort="" (the screen's default).
+
+    Returns the plain list unless `with_facets`, which adds totals and the boards present before filtering.
+    """
+    if status not in ("all", "") and status not in status_filters:
+        raise HTTPException(422, f"Unknown status filter: {status}")
+    if sort not in ("", "default") and sort not in PACKET_SORTS:
+        raise HTTPException(422, f"Unknown sort: {sort}")
+    needle = q.lower().strip()
+    out = [r for r in rows
+           if (not needle or needle in f"{r['title']} {r['company']} {r['location']}".lower())
+           and (not min_fit or (r["fit"] or 0) >= min_fit)
+           and (not min_review or (r["reviewer_score"] or 0) >= min_review)
+           and (board in ("all", "") or r["board"] == board)
+           and (status in ("all", "") or status_filters[status](r))]
+    if sort in PACKET_SORTS:
+        out.sort(key=PACKET_SORTS[sort], reverse=sort == "new")
+    if not with_facets:
+        return out
+    return {"items": out, "total": len(out), "total_all": len(rows), "boards": sorted({r["board"] for r in rows})}
+
+
 @router.get("/api/tailor/queue")
-def tailor_queue(db: Session = Depends(get_user_db)):
+def tailor_queue(q: str = "", min_fit: int = 0, min_review: int = 0, board: str = "all", status: str = "all",
+                 sort: str = "fit", with_facets: bool = False, db: Session = Depends(get_user_db)):
     # AI-ranked jobs only reach Tailor once you have confirmed the shortlist in triage.
     jobs = db.scalars(select(Job).where(or_(and_(Job.status == "shortlisted", Job.triaged_at.is_not(None)),
                                             Job.status.in_(("tailored", "pending_approval"))))
@@ -859,7 +907,8 @@ def tailor_queue(db: Session = Depends(get_user_db)):
                      "ats_pct": round(100 * covered / len(coverage)) if coverage else None,
                      "untailored": bool((resume.content or {}).get("untailored")) if resume else False,
                      "resume_version": resume.version if resume else None})
-    return rows
+    return filter_packet_rows(rows, q=q, min_fit=min_fit, min_review=min_review, board=board, status=status, sort=sort,
+                              status_filters=TAILOR_STATUS_FILTERS, with_facets=with_facets)
 
 
 def packet(db: Session, job: Job) -> dict:
@@ -924,7 +973,8 @@ def answers_for(db: Session) -> list[KnowledgeAnswer]:
 
 
 @router.get("/api/approvals")
-def approvals(db: Session = Depends(get_user_db)):
+def approvals(q: str = "", min_fit: int = 0, min_review: int = 0, board: str = "all", status: str = "all",
+              sort: str = "default", with_facets: bool = False, db: Session = Depends(get_user_db)):
     jobs = db.scalars(select(Job).where(Job.status.in_(("tailored", "pending_approval", "approved", "rejected")))
                       .order_by(desc(Job.id))).all()
     rows = []
@@ -936,7 +986,8 @@ def approvals(db: Session = Depends(get_user_db)):
         rows.append({**job_card(job), "reviewer_score": resume.reviewer_score if resume else None, "age": age,
                      "waiting": job.status == "tailored"})
     rows.sort(key=lambda r: (not r["waiting"], r["status"] == "approved"))
-    return rows
+    return filter_packet_rows(rows, q=q, min_fit=min_fit, min_review=min_review, board=board, status=status, sort=sort,
+                              status_filters=APPROVAL_STATUS_FILTERS, with_facets=with_facets)
 
 
 @router.get("/api/approvals/{job_id}")
@@ -1092,7 +1143,8 @@ def app_payload(db: Session, app: Application) -> dict:
     if stage == "applied" and app.followup_due_at:
         next_step = ("Send the follow-up", f"due {day_label(app.followup_due_at)}")
     elif upcoming:
-        next_step = (f"Prepare for {upcoming.title.lower()}", upcoming.occurred_at.strftime("%-d %b %H:%M"))
+        next_step = (f"Prepare for {upcoming.title.lower()}",
+                     format_in_zone(upcoming.occurred_at, event_meta(upcoming.meta)["timezone"]))
     elif stage in INACTIVE_STAGES:
         next_step = ("Archive or reopen", "")
     else:
@@ -1103,11 +1155,14 @@ def app_payload(db: Session, app: Application) -> dict:
         "age": ago(app.applied_at), "tag": tag, "tone": tone,
         "meta": f"applied {day_label(app.applied_at)}" + (f" · follow-up {day_label(app.followup_due_at)}" if app.followup_due_at and stage == "applied" else ""),
         "recruiter_name": app.recruiter_name, "recruiter_email": app.recruiter_email, "notes": app.notes,
+        "recruiters": recruiters_of(app),
         "docs": " · ".join(filter(None, [f"resume v{resume.version}" if resume else "", "cover letter" if resume and resume.cover_letter else ""])) or "not recorded",
         "draft": draft.draft if draft else "", "draft_id": draft.id if draft else None,
         "next": next_step[0], "next_date": next_step[1],
         "timeline": [{"id": e.id, "kind": e.kind, "title": e.title, "detail": e.detail,
-                      "at": e.occurred_at.isoformat()} for e in app.events],
+                      "at": e.occurred_at.isoformat(), **event_meta(e.meta),
+                      "at_local": format_in_zone(e.occurred_at, event_meta(e.meta)["timezone"], "%-d %b %Y, %H:%M")
+                      if event_meta(e.meta)["timezone"] else ""} for e in app.events],
     }
 
 
@@ -1173,6 +1228,37 @@ class EventIn(BaseModel):
     title: str = Field(default="", max_length=300)
     detail: str = Field(default="", max_length=4000)
     occurred_at: datetime | None = None
+    # Interviews: a wall-clock time in a named IANA time zone (e.g. "2026-09-16T16:00" in "Asia/Kolkata"),
+    # used instead of occurred_at, plus an optional contact.
+    local_time: datetime | None = None
+    timezone: str = Field(default="", max_length=64)
+    contact_name: str = Field(default="", max_length=200)
+    contact_email: str = Field(default="", max_length=300)
+    contact_phone: str = Field(default="", max_length=40)
+
+    @field_validator("contact_email")
+    @classmethod
+    def _email(cls, value: str) -> str:
+        return clean_email(value)
+
+    @field_validator("contact_phone")
+    @classmethod
+    def _phone(cls, value: str) -> str:
+        return clean_phone(value)
+
+    @field_validator("timezone")
+    @classmethod
+    def _timezone(cls, value: str) -> str:
+        value = value.strip()
+        if value:
+            zone(value)
+        return value
+
+    @model_validator(mode="after")
+    def _local_time_needs_zone(self) -> EventIn:
+        if self.local_time is not None and self.local_time.tzinfo is None and not self.timezone:
+            raise ValueError("A local time needs a time zone")
+        return self
 
 
 @router.post("/api/applications/{application_id}/events")
@@ -1182,9 +1268,18 @@ def add_event(application_id: int, payload: EventIn, db: Session = Depends(get_u
         raise HTTPException(422, "Unknown event kind")
     if not (payload.title.strip() or payload.detail.strip()):
         raise HTTPException(422, "Write something to log")
-    occurred = payload.occurred_at.replace(tzinfo=None) if payload.occurred_at else utcnow()
+    if payload.local_time is not None:
+        occurred = to_utc(payload.local_time, payload.timezone)
+    elif payload.occurred_at is not None:
+        occurred = (payload.occurred_at.astimezone(UTC).replace(tzinfo=None) if payload.occurred_at.tzinfo
+                    else payload.occurred_at)
+    else:
+        occurred = utcnow()
+    meta = {key: value for key, value in (("timezone", payload.timezone), ("contact_name", payload.contact_name.strip()),
+                                          ("contact_email", payload.contact_email),
+                                          ("contact_phone", payload.contact_phone)) if value}
     db.add(ApplicationEvent(application=app, kind=payload.kind, title=payload.title.strip() or payload.kind.title(),
-                            detail=payload.detail.strip(), occurred_at=occurred))
+                            detail=payload.detail.strip(), occurred_at=occurred, meta=meta or None))
     if payload.kind == "interview" and (app.stage or "applied") in ("applied", "acknowledged", "screening"):
         db.add(ApplicationEvent(application=app, kind="stage", title="Moved to Interviewing", detail="interviewing"))
         app.stage = "interviewing"
@@ -1200,8 +1295,22 @@ class RecruiterPatchIn(BaseModel):
 
 @router.put("/api/applications/{application_id}/recruiter")
 def set_recruiter(application_id: int, payload: RecruiterPatchIn, db: Session = Depends(get_user_db)):
+    """Set the first recruiter's name and email. Other recruiters are kept."""
     app = get_app(db, application_id)
-    app.recruiter_name, app.recruiter_email = payload.recruiter_name.strip(), payload.recruiter_email.strip()
+    set_primary_recruiter(app, payload.recruiter_name, payload.recruiter_email)
+    db.commit()
+    return app_payload(db, app)
+
+
+class RecruitersIn(BaseModel):
+    recruiters: list[ContactIn] = Field(default_factory=list, max_length=MAX_RECRUITERS)
+
+
+@router.put("/api/applications/{application_id}/recruiters")
+def replace_recruiters(application_id: int, payload: RecruitersIn, db: Session = Depends(get_user_db)):
+    """Replace every recruiter on an application, in order. The first is the primary contact."""
+    app = get_app(db, application_id)
+    set_recruiters(app, [r.model_dump() for r in payload.recruiters])
     db.commit()
     return app_payload(db, app)
 
@@ -1298,10 +1407,8 @@ def parse_evidence(db: Session = Depends(get_user_db)):
     profile = get_profile(db)
     if not profile.master_resume.strip():
         raise HTTPException(400, "Upload or paste a master resume first")
-    system = ("Extract concrete, factual achievement claims from the resume. Never invent or embellish. "
-              "Return JSON with claims: array of {claim, company, role, skills (array)}.")
     try:
-        result = LLMClient.for_user(db).generate_json(system, f"EXTRACT_EVIDENCE\nMASTER RESUME:\n{profile.master_resume[:22000]}")
+        result = LLMClient.for_user(db).generate_prompt_json(build_evidence_extraction_prompt(profile.master_resume))
     except Exception as exc:
         raise HTTPException(400, str(exc)) from exc
     existing = {e.claim.strip().lower() for e in db.scalars(select(Evidence)).all()}
