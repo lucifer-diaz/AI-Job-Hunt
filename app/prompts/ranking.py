@@ -49,12 +49,13 @@ RANKING_SYSTEM = instructions(
 )
 
 
-def build_ranking_prompt(candidate_profile: Any, resume: str, evidence: list[dict[str, Any]], job: Any) -> Prompt:
+def build_ranking_prompt(candidate_profile: Any, resume: str, evidence: list[dict[str, Any]], knowledge: list[dict[str, Any]], job: Any) -> Prompt:
     user = user_message(
         RANKING_MARKER,
         section("CANDIDATE PROFILE", to_json(profile_facts(candidate_profile))),
         untrusted("RESUME", "untrusted_resume", resume, limit=16000),
         section("VERIFIED EVIDENCE", to_json(evidence, limit=30000)),
+        section("KNOWN FACTS", to_json(knowledge, limit=30000)),
         section("JOB", to_json(job_facts(job))),
         untrusted("JOB DESCRIPTION", "untrusted_job_description", getattr(job, "description", ""), limit=24000),
     )

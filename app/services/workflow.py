@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
-from app.models import Application, ApplicationEvent, CandidateProfile, Evidence, FollowUp, Job, ResumeVariant
+from app.models import Application, ApplicationEvent, CandidateProfile, Evidence, FollowUp, Job, ResumeVariant, KnowledgeAnswer
 from app.prompts import build_followup_prompt, build_ranking_prompt, build_review_prompt, build_tailoring_prompt
 from app.services.contacts import recruiters_of
 from app.services.llm import LLMClient
@@ -36,10 +36,16 @@ def _evidence_payload(db: Session) -> list[dict]:
     ]
 
 
+def _knowledge_payload(db: Session) -> list[dict]:
+    items = db.scalars(select(KnowledgeAnswer).order_by(desc(KnowledgeAnswer.id))).all()
+    return [{"id": k.id, "question": k.question, "answer": k.answer, "category": k.category, "answer_type": k.answer_type, "verified": k.verified, "sensitive": k.sensitive, "source_job_id": k.source_job_id, "use_count": k.use_count} for k in items]
+
+
 def rank_job(db: Session, job: Job) -> dict:
     profile = get_profile(db)
     evidence = _evidence_payload(db)
-    prompt = build_ranking_prompt(candidate_profile=profile, resume=profile.master_resume, evidence=evidence, job=job)
+    knowledge = _knowledge_payload(db)
+    prompt = build_ranking_prompt(candidate_profile=profile, resume=profile.master_resume, evidence=evidence, knowledge=knowledge, job=job)
     result = LLMClient.for_user(db).generate_prompt_json(prompt)
     job.fit_score = float(result.get("score", 0))
     job.fit_analysis = {**result, "prompt_version": prompt.version}
