@@ -20,7 +20,10 @@ dependencies = [
   "anthropic>=0.67,<1",
   "reportlab>=4.4,<5",
   "email-validator>=2.2,<3",
-  "google-adk>=1.15,<2"
+  "google-adk>=1.15,<2",
+  "alembic>=1.13,<2",
+  "cryptography>=42,<51",
+  "tzdata>=2024.1"
 ]
 
 [project.optional-dependencies]

@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{ 'Create your account' if mode == 'signup' else 'Sign in' }} · Job Hunt OS</title>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/app.css?v={{ version }}">
+<style>
+  .auth-page { min-height: 100vh; display: grid; place-items: center; padding: 32px 16px; }
+  .auth-card { width: 100%; max-width: 400px; padding: 28px; }
+  .auth-brand { display: flex; align-items: center; gap: 10px; margin-bottom: 22px; }
+  .auth-card .field + .field { margin-top: 12px; }
+  .auth-error { color: var(--bad); font-size: 12.5px; min-height: 18px; margin: 10px 0 4px; }
+  .auth-submit { width: 100%; justify-content: center; }
+</style>
+</head>
+<body>
+<main class="auth-page">
+  <section class="card auth-card">
+    <div class="auth-brand"><div class="brand-mark">J</div><div class="card-title">Job Hunt OS</div></div>
+    {% if mode == 'signup' %}
+    <h1 class="card-title" style="font-size:20px;margin:0 0 4px">Create your account</h1>
+    <p class="small muted" style="margin:0 0 18px">Your jobs, resumes, settings and API keys stay private to your account.</p>
+    {% else %}
+    <h1 class="card-title" style="font-size:20px;margin:0 0 4px">Sign in</h1>
+    <p class="small muted" style="margin:0 0 18px">Welcome back.</p>
+    {% endif %}
+    {% if mode == 'signup' and not allow_signup %}
+    <p class="small">Sign-up is closed on this server. <a href="/login">Sign in</a> instead.</p>
+    {% else %}
+    <form id="auth-form" novalidate>
+      <label class="field">Email<input class="input" type="email" name="email" autocomplete="email" required autofocus></label>
+      <label class="field">Password<input class="input" type="password" name="password" required
+        autocomplete="{{ 'new-password' if mode == 'signup' else 'current-password' }}"
+        {% if mode == 'signup' %}minlength="{{ password_min }}"{% endif %}></label>
+      {% if mode == 'signup' %}
+      <label class="field">Confirm password<input class="input" type="password" name="confirm_password" autocomplete="new-password" required minlength="{{ password_min }}"></label>
+      <div class="xs muted" style="margin-top:6px">At least {{ password_min }} characters.</div>
+      {% endif %}
+      <div class="auth-error" id="auth-error" role="alert" aria-live="polite"></div>
+      <button class="btn primary auth-submit" type="submit">{{ 'Create account' if mode == 'signup' else 'Sign in' }}</button>
+    </form>
+    <p class="small muted" style="margin:16px 0 0">
+      {% if mode == 'signup' %}Already have an account? <a href="/login">Sign in</a>
+      {% elif allow_signup %}New here? <a href="/signup">Create an account</a>{% endif %}
+    </p>
+    {% endif %}
+  </section>
+</main>
+<script>
+(() => {
+  const form = document.getElementById('auth-form');
+  if (!form) return;
+  const error = document.getElementById('auth-error');
+  form.addEventListener('submit', async event => {
+    event.preventDefault();
+    error.textContent = '';
+    const body = Object.fromEntries(new FormData(form));
+    if (!body.email || !body.password) { error.textContent = 'Enter your email and password.'; return; }
+    if ('confirm_password' in body && body.password !== body.confirm_password) { error.textContent = 'Passwords do not match.'; return; }
+    const button = form.querySelector('button');
+    button.disabled = true;
+    try {
+      const res = await fetch({{ endpoint|tojson }}, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      if (res.ok) { window.location.href = '/'; return; }
+      const data = await res.json().catch(() => ({}));
+      const detail = data.detail;
+      error.textContent = typeof detail === 'string' ? detail
+        : Array.isArray(detail) ? detail.map(item => String(item.msg).replace(/^Value error, /, '')).join('. ')
+        : 'Something went wrong. Try again.';
+    } catch {
+      error.textContent = 'Could not reach the server. Try again.';
+    } finally {
+      button.disabled = false;
+    }
+  });
+})();
+</script>
+</body>
+</html>

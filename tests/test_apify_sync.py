@@ -8,7 +8,8 @@ from app.db import SessionLocal
 from app.main import app
 from app.models import SearchRun
 from app.services.sources import dedupe_key, import_apify_items
-from app.settings import get_settings
+from app.services.user_settings import set_user_keys
+from tests.conftest import ensure_test_user
 
 client = TestClient(app)
 
@@ -31,7 +32,8 @@ class FakeApify:
         self.runs[run_id]["_input"] = input_ or {"searchTerm": "Staff AI Engineer", "location": "Pune"}
         return run_id
 
-    def __call__(self, path, params=None):
+    def __call__(self, path, params=None, token=None):
+        assert token == "test-token", "Apify calls must use the account's own token"
         if path == "/actor-runs":
             return {"data": {"items": [dict(r) for r in reversed(list(self.runs.values()))]}}
         if path.startswith("/actor-runs/"):
@@ -47,12 +49,18 @@ class FakeApify:
         raise AssertionError(f"unexpected Apify call {path}")
 
 
+def set_apify_key(value):
+    with SessionLocal() as db:
+        set_user_keys(db, {"apify": value}, user_id=ensure_test_user().id)
+
+
 @pytest.fixture
 def apify(monkeypatch):
     fake = FakeApify(uuid.uuid4().hex[:8])
     monkeypatch.setattr("app.services.sources.apify_get", fake)
-    monkeypatch.setattr(get_settings(), "apify_api_token", "test-token")
-    return fake
+    set_apify_key("test-token")
+    yield fake
+    set_apify_key("")
 
 
 def listing(fake, site, ref, title="Staff AI Engineer", location="Pune, Maharashtra, India"):
@@ -62,6 +70,7 @@ def listing(fake, site, ref, title="Staff AI Engineer", location="Pune, Maharash
 
 def test_cross_actor_duplicates_are_skipped(apify):
     db = SessionLocal()
+    db.info["user_id"] = ensure_test_user().id
     first = import_apify_items(db, [listing(apify, "linkedin", "li1")])
     same_job_other_board = listing(apify, "indeed", "in9", location="Pune, MH")
     second = import_apify_items(db, [same_job_other_board, listing(apify, "indeed", "in9"),
@@ -115,7 +124,7 @@ def test_refresh_pending_imports_finished_runs_and_keeps_partial_results(apify):
     assert timed["created_jobs"] == 1 and timed["error"] == "TIMED-OUT"
 
 
-def test_sync_requires_token(monkeypatch):
-    monkeypatch.setattr(get_settings(), "apify_api_token", "")
+def test_sync_requires_the_accounts_own_token():
+    set_apify_key("")
     assert client.get("/api/search/apify/remote-runs").status_code == 400
     assert client.post("/api/search/apify/runs/refresh-pending").status_code == 400

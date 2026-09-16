@@ -45,7 +45,10 @@ def test_normalize_and_dedupe_apify_results():
     assert normalized["source"] == "apify:indeed"
     assert normalized["url"].endswith("/apply/abc123")
 
+    from tests.conftest import ensure_test_user
+
     db = SessionLocal()
+    db.info["user_id"] = ensure_test_user().id
     first = import_apify_items(db, [item])
     second = import_apify_items(db, [item])
     assert first["created"] == 1

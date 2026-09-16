@@ -7,9 +7,8 @@ services:
     envVars:
       - key: DATABASE_URL
         sync: false
-      - key: APP_USERNAME
-        sync: false
-      - key: APP_PASSWORD
+      # Encrypts saved API keys; set the same value on the cron service.
+      - key: SECRET_KEY
         sync: false
       - key: LLM_PROVIDER
         value: openai
@@ -28,6 +27,8 @@ services:
     dockerCommand: python -m app.cron
     envVars:
       - key: DATABASE_URL
+        sync: false
+      - key: SECRET_KEY
         sync: false
       - key: LLM_PROVIDER
         value: openai

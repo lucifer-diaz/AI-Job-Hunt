@@ -1,8 +1,10 @@
-"""Prompt instructions for the deployable Google ADK agent hierarchy.
+"""Instructions for the deployable Google ADK agent hierarchy (job_hunt_agent).
 
-Keeping instructions separate from agent construction follows the organization
-used by Google's ADK samples and makes prompts independently reviewable.
+Agents read and write data through tools, so these instructions carry no dynamic data; the tool schemas
+define the structured outputs.
 """
+
+AGENT_PROMPT_VERSION = "v1"
 
 ROOT_AGENT_INSTRUCTION = """
 <role>You are the Job Hunt OS workflow coordinator.</role>

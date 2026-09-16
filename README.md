@@ -15,14 +15,15 @@ The dashboard is a single-page workspace served from `app/static/app.js`; every 
 | Overview | 30-day funnel, reply rate per board, next 10 days, weekly trend, time in stage | `GET /api/workspace/overview` |
 | Today | "Do this next" (approve → tailor → follow up), follow-ups due, weekly pace; run-sheet variant | `GET /api/workspace/today` |
 | Discovery · triage | One job at a time with fit reasons; keys `S` shortlist, `M` maybe, `X` skip, `⏎` shortlist & tailor | `GET /api/jobs/search?queue=true`, `POST /api/jobs/{id}/triage` |
-| Discovery · table | Filter, sort, paginate and bulk-shortlist the whole pipeline | `GET /api/jobs/search`, `POST /api/jobs/bulk-triage` |
+| Discovery · table | Filter, sort, paginate and bulk-shortlist the whole pipeline. The stage filter includes "Unranked" (`stage=unranked`: jobs without a fit score) | `GET /api/jobs/search`, `POST /api/jobs/bulk-triage` |
 | Discovery · setup | Saved search profile (roles × locations × boards), run history with what each run searched and pulled, add a job from a URL | `GET/PUT /api/search/profile`, `POST /api/search/profile/run`, `GET /api/search/apify/runs/{id}/detail`, `POST /api/jobs/from-url` |
-| Tailor | Before → after edits with the evidence each one cites; edit, accept or revert; cover letter; keyword coverage; PDF/DOCX/TXT exports | `GET /api/tailor/{job_id}`, `PATCH /api/resumes/{id}/edits/{n}` |
+| Tailor | Before → after edits with the evidence each one cites; edit, accept or revert; cover letter; keyword coverage; PDF/DOCX/TXT exports. "Skip tailoring" sends the master resume unchanged (still reviewed) for postings that need no tailoring. The "Bulk tailor" view tailors or skips tailoring for many queued jobs one at a time, with progress and stop | `GET /api/tailor/{job_id}`, `PATCH /api/resumes/{id}/edits/{n}`, `POST /api/jobs/{id}/tailor`, `POST /api/jobs/{id}/skip-tailoring`, `POST /api/jobs/bulk-tailor` |
 | Approvals | Pre-submit checklist, resume preview, reusable answers, notes; approve opens the apply kit | `GET /api/approvals/{job_id}`, `POST /api/jobs/{id}/revision` |
 | Apply kit | Files to upload, answers to paste, link to the posting, confirm "mark applied" | `GET /api/jobs/{id}/apply-kit` |
 | Tracker | Kanban by post-submission stage (drag or "move to"), optional extra stages, timeline, recruiter, interview scheduling, AI follow-up draft | `GET /api/tracker`, `POST /api/applications/{id}/stage`, `POST /api/applications/{id}/events` |
 | Knowledge bank | ATS answer library with edit/verify, evidence bank with verify/remove | `/api/knowledge`, `/api/evidence` |
-| Settings & profile | Candidate details and chip fields, resume variants, re-parse resume into (unverified) evidence, provider/model, approval mode, cadence | `/api/profile`, `/api/settings`, `/api/preferences` |
+| Settings & profile | Candidate details and chip fields, resume variants, re-parse resume into (unverified) evidence, provider/model, your own API keys (stored encrypted), approval mode, cadence | `/api/profile`, `/api/settings`, `PUT /api/settings/keys`, `/api/preferences` |
+| Sign-in | Create an account (email, password, confirm password), sign in, sign out | `/signup`, `/login`, `POST /api/auth/signup`, `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/auth/me` |
 
 `⌘K` / `Ctrl+K` opens a command palette that searches every job.
 
@@ -49,7 +50,7 @@ Auto-submit is intentionally not offered: approved packets always become an appl
 - Application tracking + follow-up due date
 - AI-generated follow-up drafts
 - Simple PDF export
-- HTTP Basic protection for public hosting
+- Email and password accounts: each account has its own jobs, resumes, settings, schedule and encrypted API keys
 - Prompt-injection hardening for untrusted job descriptions
 - OpenAI, Anthropic, **OpenRouter**, or no-cost mock provider
 - OpenRouter `openrouter/free` support plus arbitrary `:free` model slugs
@@ -70,15 +71,16 @@ pip install -e .
 uvicorn app.main:app --reload
 ```
 
-Open http://localhost:8000. For any public deployment, set `APP_USERNAME` and `APP_PASSWORD`.
+Set `SECRET_KEY` in `.env` first (it encrypts the API keys people save), then open http://localhost:8000 and create an account. See [Accounts and data isolation](#accounts-and-data-isolation).
 
 Uploaded resumes are stored in `./data/resumes` by default. Set `UPLOAD_DIR` to a
 persistent private volume in production and `MAX_RESUME_UPLOAD_MB` to change the
 default 8 MB limit. Files must not be placed on a publicly served path.
 
-On startup, the application creates the new settings, resume-document, and knowledge
-tables and applies its idempotent compatibility column migration. Back up an existing
-production database before the first v0.4 startup.
+On startup, the application runs its Alembic migrations (`app/migrations`) to the latest
+revision. You can also run them explicitly with `python -m app.db_migrations` or `alembic upgrade head`.
+Installs created before migrations existed are upgraded in place. Back up an existing production
+database before upgrading.
 
 ### Local PostgreSQL (recommended)
 
@@ -100,12 +102,40 @@ Or run the app and Postgres in containers:
 docker compose up --build
 ```
 
+## Accounts and data isolation
+
+Anyone who can reach the site can create an account at `/signup` with an email address, a password (at least 10 characters) and the password again. Set `ALLOW_SIGNUP=false` to close sign-up once everyone you want has joined.
+
+- **Your data is yours.** Jobs, resumes, evidence, knowledge answers, search profile and profiles, settings, search runs, applications, their events, tailored resumes, follow-ups and workflow history all belong to one account. Ownership is in the schema itself: every one of those tables has a `user_id` foreign key to `users`, indexed, `NOT NULL`, and `ON DELETE CASCADE`, so deleting an account removes its data and no row can exist without an owner.
+  - **In the ORM:** `user.jobs`, `user.applications`, `user.followups`, `user.search_profiles` and so on, with `job.user` in the other direction — no manual `user_id` filtering needed.
+  - **Enforced centrally** in `app/tenancy.py`, not endpoint by endpoint: every database session opened for a signed-in request only reads, updates and deletes that account's rows, and `get()` by ID returns nothing for another account's row, so another account's IDs simply return 404.
+  - **New rows are stamped automatically.** A row that hangs off a job or an application (a tailored resume, an application, its events, follow-ups, workflow history) takes its owner from that parent, so work done by the scheduler and the workers — whose sessions belong to no one — is owned too.
+  - An install that still holds data from before accounts existed upgrades with those rows unowned; the first account claims them, and `app.db_migrations.enforce_ownership` makes the columns `NOT NULL` on the next start.
+- **Your API keys.** Each account saves its own OpenRouter, OpenAI, Anthropic and Apify keys under **Settings → Your API keys**. Searches, ranking, tailoring and follow-ups always use the account's own keys, with no fallback to anyone else's.
+  - Keys are encrypted with `SECRET_KEY` and never returned by the API; only the last four characters are shown.
+  - Keep `SECRET_KEY` stable and private. Changing it makes saved keys unreadable, and everyone has to re-enter them.
+  - Generate one with `python -c "import secrets; print(secrets.token_urlsafe(48))"`.
+- **The first account.** The first account ever created becomes the admin. It takes ownership of everything that existed before accounts were introduced, so an existing install carries on unchanged. Any `*_API_KEY` / `APIFY_API_TOKEN` values in `.env` are copied into that account, encrypted. After that, server `.env` keys are not used for anyone's work.
+- **Running the system your way.** Every account's own settings control what the scheduler does for it:
+  - its search schedule (manual or daily);
+  - the **Auto-rank on import** switch;
+  - its AI provider and models;
+  - its approval mode and follow-up cadence.
+
+  Accounts without the needed key are simply skipped until they add one.
+- **Sessions.** Passwords are hashed with scrypt. Signing in sets an HttpOnly, SameSite=Lax cookie holding a random token.
+  - Only the token's SHA-256 is stored, and signing out revokes it on the server.
+  - Sessions last `SESSION_DAYS` (30).
+  - The cookie is `Secure` over HTTPS; force it with `SESSION_COOKIE_SECURE=true` behind a TLS proxy.
+  - Five wrong passwords for an email block sign-in for 15 minutes, counted per app process.
+  - Cross-site write requests are rejected.
+- **Admin-only views.** The scheduler status shows job results and errors to the admin only. `ADMIN_TOKEN` still protects manual scheduler triggers and `CRON_SECRET` still protects `/api/cron/*`.
+
 ## 2. Apify job discovery
 
-Set:
+Save your Apify API token under **Settings → Your API keys** (create one in Apify Console → Settings → Integrations). The server sets the default actor:
 
 ```env
-APIFY_API_TOKEN=apify_api_...
 APIFY_ACTOR_ID=openclawai/job-board-scraper
 ```
 
@@ -125,6 +155,60 @@ Conflicting filters are reported before a run starts (for example, Multi Job Boa
 **Your own actors:** "+ Add your own actor" takes a Store actor ID, how it should fan out (per role × location, per location, per role, or once) and a JSON input template. "Look up on Apify" confirms the actor exists and pre-fills the template from its input schema. Placeholders: `{{role}}`, `{{roles}}`, `{{location}}`, `{{locations}}`, `{{max_results}}`, `{{hours_old}}`, `{{days_old}}`, `{{is_remote}}`, `{{job_type}}`, `{{sites}}`, `{{country}}`. A value that is only a placeholder keeps its type. Output items are normalized from common field names (title, company/organization, location/locations_derived, url/apply_url, description/description_text).
 
 The dashboard starts the Actor **asynchronously**. The app persists the Apify run ID, polls its status, and imports the default dataset after the run succeeds. This avoids keeping a Render/Railway HTTP request open while the scraper runs.
+
+### Hunter API and search profiles
+
+The Hunter runs searches asynchronously and imports their results later:
+
+```text
+SearchProfile → Apify Hunter → async actor runs → sync results → normalize → deduplicate → RANK_PENDING
+```
+
+Start a search (it returns as soon as the actor runs are started, never waiting for the scraper):
+
+```http
+POST /api/hunter/search
+```
+
+```json
+{
+  "roles": ["Engineering Manager", "Head of Engineering", "Lead AI Engineer"],
+  "locations": ["Singapore", "Dubai"],
+  "sites": ["linkedin", "indeed", "glassdoor"],
+  "hours_old": 72,
+  "max_results": 20,
+  "remote_only": false
+}
+```
+
+One run is started per location, with up to 5 roles each (more roles are split into further runs). Every run is saved in `search_runs` with its Apify run ID and status: `PENDING`, `RUNNING`, `SUCCEEDED`, `FAILED` or `NEEDS_INVESTIGATION`. A run that fails to start never stops the others.
+
+**Actors and adapters.** Each actor has its own adapter in `app/services/apify_adapters.py`, which builds input using only the fields that actor's schema publishes and converts its output into the internal job. Actor IDs are configuration (`.env.example`), never hard-coded in the business logic.
+
+| Actor | Setting | Runs | Recency filter |
+| --- | --- | --- | --- |
+| `openclawai/job-board-scraper` | `APIFY_PRIMARY_JOB_ACTOR` | one per location, 5 roles each | `hoursOld` (exact) |
+| `thirdwatch/linkedin-jobs-scraper` | `APIFY_LINKEDIN_ACTOR` | one per location, 5 queries each | `datePosted` (24h/week/month) |
+| `crawlerbros/indeed-jobs-scraper` | `APIFY_INDEED_ACTOR` | one per role and location | none: filtered after import |
+| `crawlerbros/glassdoor-jobs-scraper` | `APIFY_GLASSDOOR_ACTOR` | one per role and location | none: filtered after import |
+| `crawlerbros/naukri-scraper` | `APIFY_NAUKRI_ACTOR` | one per role and city | `jobAge` (1/3/7/15/30 days) |
+
+`"mode": "fallback"` searches each board with its dedicated actor instead of the multi-board one (ZipRecruiter and Bayt have no dedicated actor, so they stay on the multi-board one). When a multi-board run fails, its boards are searched once more with their fallback actors automatically (`APIFY_AUTO_FALLBACK`).
+
+**Posting dates.** `posted_at` is the employer's posting date and is never replaced by `discovered_at`. Relative values ("3 days ago", Glassdoor's `ageInDays`) are counted back from the time the actor scraped the page, and the original value is kept in `posted_date_raw`. Values that are not exact ("30+ days ago", "2 months ago") leave `posted_at` empty rather than guessing, and a job is never dropped for being old when its date is unknown.
+
+**Deduplication** uses, in order: the board's own job ID, the canonical posting or apply URL, then company + title + city. A posting found again by another role, board, profile or scheduled run adds an entry to the job's `discoveries` (role, location, board, actor, run) and fills in details the first discovery lacked, instead of creating a second job. Every job records `matched_search_role`, `matched_search_location`, `source_board`, `apify_actor_id` and `apify_run_id`, so you can later ask which role, location or board produces the best results.
+
+**Search profiles** are reusable searches the scheduler runs on their own cadence:
+
+```http
+GET|POST /api/hunter/profiles          PUT|DELETE /api/hunter/profiles/{id}
+POST /api/hunter/profiles/{id}/run     GET /api/hunter/runs      POST /api/hunter/runs/sync
+```
+
+A profile stores its roles, locations, sites, `hours_old`, `remote_only`, `job_type`, `max_results`, whether it is `enabled`, and `last_run_at` / `next_run_at`. The scheduler's `hunter` job starts every enabled profile that is due (a guarded UPDATE means two app instances cannot start it twice), and the `apify_sync` job imports each finished run.
+
+**When something goes wrong:** a failed, aborted or timed-out run still imports whatever it collected; an empty dataset is a normal, successful run; items without a title or company are skipped and counted; and if a dataset no longer carries the fields an adapter needs, the run is marked `NEEDS_INVESTIGATION` and imports nothing rather than creating wrong jobs. Every run's counts (created, duplicates, missing dates, dropped as too old) are on the run itself.
 
 ### Why the Actor is configurable
 
@@ -156,6 +240,8 @@ Apify Actors do not all use the same input/output schema. `APIFY_ACTOR_ID` can p
 Use smaller `maxResults` values while testing. Apify Actor pricing is Actor-specific, so check the chosen Actor's live pricing before large searches.
 
 ## 3. LLM configuration
+
+API keys are saved per account under **Settings → Your API keys**. The `*_API_KEY` values below only seed the first account at sign-up; the other variables set server-wide defaults (provider, models, free-only guard) that each account can override in Settings.
 
 ### Default: OpenRouter free models
 
@@ -240,9 +326,38 @@ LLM_PROVIDER=mock
 
 The SDK/client libraries do not remove model inference cost. The model layer is isolated so providers can be switched without changing the workflow.
 
+### LLM prompts
+
+All production prompts live under `app/prompts/`. Backend services must not define long LLM prompts inline.
+
+Each prompt has:
+- a dedicated builder (`build_ranking_prompt`, `build_tailoring_prompt`, `build_review_prompt`, ...) that returns a provider-independent `Prompt`;
+- a version identifier (`RANKING_PROMPT_VERSION = "v1"`, ...), stored with the result where the data model has room (`jobs.fit_analysis`, `resume_variants.content` and `reviewer_notes`);
+- structured input: trusted instructions in the system message, data in labelled sections of the user message, with job descriptions, resumes and emails wrapped in `<untrusted_...>` tags;
+- a structured JSON output whose fields are listed in the instructions.
+
+| Module | Builders | Used by |
+|---|---|---|
+| `ranking.py` | `build_ranking_prompt` | `rank_job` |
+| `tailoring.py` | `build_tailoring_prompt` | `tailor_job` |
+| `review.py` | `build_review_prompt` | `review_resume` |
+| `followup.py` | `build_followup_prompt` | `draft_followup` |
+| `resume_parser.py` | `build_evidence_extraction_prompt`, `build_resume_parser_prompt` | evidence parsing; the structured parser is not wired in yet |
+| `application.py` | `build_application_question_prompt` | not wired in yet |
+| `inbox.py` | `build_inbox_classification_prompt` | not wired in yet (inbox sync is a placeholder) |
+| `agents.py` | ADK agent instructions | `job_hunt_agent` |
+
+When you change a prompt's wording or output fields, bump its version.
+
 ## 4. API endpoints
 
-Start an Apify search:
+Start a Hunter search (asynchronous; see "Hunter API and search profiles" above):
+
+```http
+POST /api/hunter/search
+```
+
+Older, single-actor search endpoint:
 
 ```http
 POST /api/search/apify
@@ -284,10 +399,167 @@ For one user, do **not** start with Redis, Celery, Kafka, a vector database, or 
 - DB: Neon Free or Railway Postgres
 - Job discovery: Apify Actor runs
 - LLM: OpenRouter free router for most tasks; optionally use a stronger paid model only for the best jobs
-- Follow-up scheduling: Render/Railway cron running `python -m app.cron` (drafts only, never sends)
-- Search scheduling: a daily cron running `python -m app.cron searches`, or `POST /api/cron/searches` with the `X-Cron-Secret` header. It runs the saved search profile only when its schedule is set to daily.
+- Scheduling: built into the web app (see section 7). No separate cron service is required; `python -m app.cron <job>` remains available for hosts that sleep between requests.
 
-## 6. Recommended next upgrades
+## 6. Workflow state engine
+
+PostgreSQL is the source of truth for where every job is in its lifecycle. The foundation is in
+place; the automated workers that move jobs through it are the next step.
+
+```text
+Scheduler (cron)
+  → Python Job Hunt OS
+  → PostgreSQL: jobs.state + retry/lease columns + workflow_transitions history
+  → deterministic workers that claim, work, then complete or fail   (app.services.work_queue)
+  → AI reasoning only inside a worker, never deciding the state      (not in this layer)
+```
+
+### States and transitions
+
+`app/services/lifecycle.py` is the only definition of the lifecycle. Nothing else decides
+whether a state change is legal.
+
+| From | Allowed next states |
+| --- | --- |
+| DISCOVERED | NORMALIZED, SKIPPED, FAILED |
+| NORMALIZED | FILTERED, SKIPPED, FAILED |
+| FILTERED | RANKED, SKIPPED, FAILED |
+| RANKED | QUALIFIED, ARCHIVED, SKIPPED, FAILED |
+| QUALIFIED | TAILORING, ARCHIVED, SKIPPED |
+| TAILORING | TAILORED, SKIPPED, FAILED |
+| TAILORED | REVIEWED, SKIPPED, FAILED |
+| REVIEWED | READY_TO_APPLY, TAILORING (revision), SKIPPED, FAILED |
+| READY_TO_APPLY | APPLYING, ARCHIVED, SKIPPED |
+| APPLYING | APPLIED, SKIPPED, FAILED |
+| APPLIED | FOLLOWUP_DUE, INTERVIEW, REJECTED, OFFER, ARCHIVED |
+| FOLLOWUP_DUE | FOLLOWED_UP, INTERVIEW, REJECTED, OFFER, ARCHIVED |
+| FOLLOWED_UP | FOLLOWUP_DUE, INTERVIEW, REJECTED, OFFER, ARCHIVED |
+| INTERVIEW | OFFER, REJECTED, ARCHIVED |
+| OFFER, REJECTED, ARCHIVED, SKIPPED, FAILED | terminal |
+
+- **No arbitrary states.** `jobs.state` accepts only these values. This is enforced three times:
+  a strict parser, an ORM validator that also rejects illegal moves on direct assignment, and
+  named PostgreSQL `CHECK` constraints.
+- **No shortcuts.** There is no path around NORMALIZED, FILTERED, RANKED, TAILORED or REVIEWED.
+- **FAILED only before submission.** Once a job is APPLIED it can never become FAILED, so a broken
+  follow-up can't erase the fact that you applied.
+- **Requeue.** FAILED is terminal for automation. An operator can call `requeue_failed`, which only
+  returns the job to the state it failed in.
+
+Every change is recorded in `workflow_transitions` with from/to state, actor, reason, attempt
+count and error category.
+
+### Claiming work safely
+
+Each job row carries `state`, `previous_state`, `attempt_count`, `last_error`, `error_category`,
+`retryable`, `last_attempt_at`, `next_attempt_at`, `locked_at`, `locked_by`, `lock_token`,
+`lock_expires_at`, `created_at` and `updated_at`.
+
+```python
+from app.services import work_queue as wq
+from app.services.lifecycle import ErrorCategory, WorkflowState as S
+
+for claim in wq.claim(db, [S.DISCOVERED], worker_id=wq.default_worker_id(), limit=10):
+    try:
+        ...  # deterministic work
+        wq.complete(db, claim, S.NORMALIZED)
+    except TimeoutError as exc:
+        wq.fail(db, claim, ErrorCategory.TIMEOUT, str(exc))
+```
+
+- **Claiming.** A claim uses `SELECT … FOR UPDATE SKIP LOCKED`. Concurrent workers never receive
+  the same job and never wait on each other. The claim writes a lease (`locked_by`, a random
+  `lock_token`, `lock_expires_at`) and counts the attempt.
+- **Ownership checks.** `complete`, `fail`, `advance` (for example QUALIFIED → TAILORING while
+  keeping the lease), `heartbeat` and `release` re-lock the row and verify the token. A worker whose
+  lease expired and was taken over gets `LeaseLost` and cannot write a stale result.
+- **Bounded retries.** `fail` keeps the job in place and retries with exponential backoff
+  (`WORKFLOW_RETRY_BASE_SECONDS`, capped by `WORKFLOW_RETRY_MAX_SECONDS`) until
+  `WORKFLOW_MAX_ATTEMPTS`. Non-retryable categories (VALIDATION, CONFIGURATION, BLOCKED) stop at
+  once. When a job gives up before submission it becomes FAILED with the category, message,
+  attempt count and `retryable = false`. After submission it stays in its state, parked.
+- **Crash recovery.** A crashed worker's job becomes claimable again when its lease
+  (`WORKFLOW_LEASE_SECONDS`) expires, and the crash is recorded as `LEASE_EXPIRED`.
+  `recover_expired_leases` sweeps expired leases, scheduling a retry or failing jobs that are out
+  of attempts. Attempts are counted at claim time, so a job that keeps crashing workers still
+  runs out of attempts.
+
+Claiming requires PostgreSQL. SQLite remains usable for the dashboard during local development.
+
+### Relationship to the dashboard
+
+The dashboard still reads and writes the legacy `jobs.status` column. Migration `0002` backfilled
+`state` from it (for example `shortlisted` → QUALIFIED, `approved` → READY_TO_APPLY, applied jobs
+from their tracker stage). New jobs start DISCOVERED. Dashboard actions do not yet move `state`;
+that happens as each stage gets a worker.
+
+### Tests
+
+The locking, retry and migration tests need a disposable PostgreSQL database whose name contains
+`test`. They wipe it.
+
+```bash
+createdb jobhunt_test
+TEST_DATABASE_URL=postgresql+psycopg://localhost/jobhunt_test pytest
+```
+
+Without `TEST_DATABASE_URL`, those tests are skipped and the rest of the suite runs on SQLite.
+
+## 7. Scheduler
+
+The scheduler runs inside FastAPI. It starts when the app starts and stops when it shuts down, and scheduled jobs call Python services directly. There is no n8n, Redis, Celery or separate worker process.
+
+```text
+FastAPI starts → scheduler loop (every SCHEDULER_TICK_SECONDS)
+  → for each due job: take its row in scheduler_jobs (one conditional UPDATE, a row lock)
+  → run the job's service function, e.g. ranking:
+        claim a limited batch of waiting jobs (FOR UPDATE SKIP LOCKED leases)
+        → process at most RANKING_CONCURRENCY at a time → save each result on its own
+  → record status, result, error and next run time; release the lease
+```
+
+| Job | Interval setting (minutes) | What it does |
+| --- | --- | --- |
+| `hunter` | `HUNTER_INTERVAL_MINUTES=240` | Starts the saved search profile's Apify runs when its schedule is not `manual`, and never twice within the interval |
+| `apify_sync` | `APIFY_SYNC_INTERVAL_MINUTES=5` | Imports datasets of Apify runs that finished; each run is imported once |
+| `ranking` | `RANKING_INTERVAL_MINUTES=2` | Claims up to `RANKING_BATCH_SIZE` jobs waiting for ranking (DISCOVERED / NORMALIZED / FILTERED). Normalizes and filters them deterministically (dismissed or excluded companies become SKIPPED), then ranks up to `RANKING_CONCURRENCY` at a time. Jobs are moved to RANKED |
+| `compensation` | `COMPENSATION_INTERVAL_MINUTES=5` | Records the salary stated in the original posting (structured actor fields or explicit salary text) in `jobs.compensation`. Glassdoor and PayScale are recorded as `not_configured` until those actors are integrated |
+| `applications` | `APPLICATION_INTERVAL_MINUTES=5` | Reports READY_TO_APPLY / APPLYING counts. Automatic submission is not enabled, so it always reports `skipped` |
+| `followups` | `FOLLOWUP_INTERVAL_MINUTES=60` | Drafts due follow-ups (never sends) |
+| `inbox` | `INBOX_INTERVAL_MINUTES=5` | Reserved for an email provider; reports `skipped` until one is configured |
+| `analytics` | `ANALYTICS_INTERVAL_MINUTES=60` | Stores a pipeline snapshot (jobs by state and status, pending work, failures) as its last result |
+| `cleanup` | `CLEANUP_INTERVAL_MINUTES=15` | Recovers jobs left leased by crashed workers: retries them or marks them FAILED |
+
+Set an interval to `0` to disable that job, or `SCHEDULER_ENABLED=false` to disable the loop entirely. Jobs that need an LLM report `skipped` instead of using up attempts when the provider's key is missing. Ranking and cleanup need PostgreSQL and report `skipped` on SQLite.
+
+### Safety guarantees
+
+- **Multiple instances:** every instance runs the loop. A job runs only on the instance that wins its `scheduler_jobs` row. The conditional UPDATE succeeds only when the job is due and no live lease exists, so two instances never run the same job at once.
+- **Duplicate runs:** a job runs at most once per interval, and a second trigger while it runs gets `busy`. Within a job, row-level work is claimed with PostgreSQL locks, and finished work is detected before acting, so running any job twice is harmless.
+- **Failures:** a job that raises is recorded as `failed` with its error. Other jobs and the loop keep running.
+- **Restarts:** pending work lives only in PostgreSQL. Leases held by a crashed instance expire after `SCHEDULER_LEASE_MINUTES` (job level) or `WORKFLOW_LEASE_SECONDS` (row level), and the next instance picks the work up. The status endpoint shows such runs as `interrupted`.
+
+### Status and manual triggers
+
+```http
+GET /api/system/scheduler
+```
+
+Returns whether the loop runs on this instance, plus each job's interval, lease holder, next run, last status, trigger, error, duration, result and run and failure counts.
+
+```http
+POST /api/admin/scheduler/{job}/run        X-Admin-Token: <ADMIN_TOKEN>
+```
+
+Examples: `/api/admin/scheduler/hunter/run`, `/api/admin/scheduler/ranking/run`, `/api/admin/scheduler/compensation/run`. Hyphens work too (`apify-sync`). A manual trigger runs the same job function and takes the same lease as the scheduler, but does not wait for the interval.
+- The response carries the run's status (`succeeded`, `skipped` or `failed`) and result.
+- It returns `409` while the job runs elsewhere.
+- Triggers are disabled (`403`) until `ADMIN_TOKEN` is set.
+- The status endpoint needs a signed-in account; job results and errors span all accounts, so only the admin sees them. Work for people runs per account with that account's keys: the hunter starts each account's due search, ranking claims only jobs of accounts with auto-ranking on and an AI key saved, and follow-ups are drafted per account.
+
+`python -m app.cron <job>` runs one job once through the same path, which is useful on hosts that sleep between requests. With no argument it runs `followups`; `searches` is an alias for `hunter`.
+
+## 8. Recommended next upgrades
 
 - Apify webhook endpoint so completed runs are ingested without polling
 - Gmail integration for follow-up drafts and thread matching
@@ -300,7 +572,7 @@ For one user, do **not** start with Redis, Celery, Kafka, a vector database, or 
 
 See [DEPLOY.md](DEPLOY.md) for hosting instructions.
 
-## 7. Google Gemini agent deployment
+## 9. Google Gemini agent deployment
 
 The repository includes a Google ADK package named `job_hunt_agent`. Its
 `root_agent` coordinates four narrowly scoped agents: `job_fit_ranker`,

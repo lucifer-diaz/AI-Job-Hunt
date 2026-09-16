@@ -7,8 +7,13 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./jobhunt.db"
     app_base_url: str = "http://localhost:8000"
     cron_secret: str = "change-me"
-    app_username: str | None = None
-    app_password: str | None = None
+
+    # Accounts (app.auth). SECRET_KEY encrypts the API keys users save; keep it stable and private.
+    secret_key: str | None = None
+    allow_signup: bool = True
+    session_days: int = 30
+    # Secure cookie flag. Unset = on when the request arrives over HTTPS.
+    session_cookie_secure: bool | None = None
 
     # LLM provider: openai | anthropic | openrouter | mock
     llm_provider: str = "openrouter"
@@ -44,9 +49,50 @@ class Settings(BaseSettings):
     apify_actor_id: str = "openclawai/job-board-scraper"
     apify_dataset_limit: int = 5000
 
+    # Hunter actors (app.services.apify_adapters). Each has its own adapter; IDs are never hard-coded elsewhere.
+    apify_primary_job_actor: str = "openclawai/job-board-scraper"
+    apify_linkedin_actor: str = "thirdwatch/linkedin-jobs-scraper"
+    apify_indeed_actor: str = "crawlerbros/indeed-jobs-scraper"
+    apify_glassdoor_actor: str = "crawlerbros/glassdoor-jobs-scraper"
+    apify_naukri_actor: str = "crawlerbros/naukri-scraper"
+    # When a multi-board run fails, search its boards again with their dedicated actors (once).
+    apify_auto_fallback: bool = True
+    apify_request_timeout_seconds: int = 30
+    hunter_max_runs_per_search: int = 30
+    apify_sync_batch_size: int = 25
+
     min_fit_score: int = 72
     followup_days: int = 5
     max_jobs_per_batch: int = 30
+
+    # Workflow workers (app.services.work_queue)
+    workflow_max_attempts: int = 3
+    workflow_lease_seconds: int = 900
+    workflow_retry_base_seconds: int = 60
+    workflow_retry_max_seconds: int = 3600
+
+    # In-app scheduler (app.scheduler). Intervals are in minutes; 0 disables that job.
+    scheduler_enabled: bool = True
+    scheduler_tick_seconds: int = 30
+    scheduler_lease_minutes: int = 30
+    hunter_interval_minutes: int = 240
+    apify_sync_interval_minutes: int = 5
+    ranking_interval_minutes: int = 2
+    compensation_interval_minutes: int = 5
+    application_interval_minutes: int = 5
+    followup_interval_minutes: int = 60
+    inbox_interval_minutes: int = 5
+    analytics_interval_minutes: int = 60
+    cleanup_interval_minutes: int = 15
+    ranking_batch_size: int = 20
+    ranking_concurrency: int = 5
+    compensation_batch_size: int = 50
+    # Background tailoring worker (app.services.tailor_tasks)
+    tailor_worker_enabled: bool = True
+    tailor_concurrency: int = 2
+    tailor_lease_seconds: int = 900
+    # Required header value (X-Admin-Token) for POST /api/admin/scheduler/{job}/run. Unset disables the triggers.
+    admin_token: str | None = None
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 

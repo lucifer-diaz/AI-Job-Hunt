@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -15,7 +17,8 @@ class ProfileIn(BaseModel):
     preferred_locations: list[str] = Field(default_factory=list)
     work_authorization: str = ""
     compensation_notes: str = ""
-    master_resume: str = ""
+    # Left out means "leave the saved text alone", so a stale form cannot overwrite a newer resume.
+    master_resume: str | None = None
     search_preferences: dict = Field(default_factory=dict)
 
 
@@ -52,6 +55,31 @@ class ApifySearchIn(BaseModel):
     actor_id: str = ""
     custom_input: dict = Field(default_factory=dict)
     raw_actor_input: dict = Field(default_factory=dict)
+
+
+class ApiKeysIn(BaseModel):
+    """The user's own provider keys. Omitted (null) keys are unchanged; an empty string removes a key."""
+    openrouter: str | None = Field(default=None, max_length=500)
+    openai: str | None = Field(default=None, max_length=500)
+    anthropic: str | None = Field(default=None, max_length=500)
+    apify: str | None = Field(default=None, max_length=500)
+
+
+class BulkTailorIn(BaseModel):
+    ids: list[int] = Field(min_length=1, max_length=500)
+    mode: Literal["tailor", "skip"] = "tailor"  # skip = send the master resume unchanged
+    regenerate: bool = False  # also redo jobs that already have a packet
+    batch_size: int = Field(default=1, ge=1, le=5)  # tailoring is slow; small batches keep requests short
+
+
+class TailorTasksIn(BaseModel):
+    ids: list[int] = Field(min_length=1, max_length=500)
+    mode: Literal["tailor", "skip"] = "tailor"  # skip = send the master resume unchanged
+    regenerate: bool = False  # also redo jobs that already have a packet
+
+
+class TailorTasksCancelIn(BaseModel):
+    ids: list[int] | None = None  # None cancels every queued task
 
 
 class RecruiterIn(BaseModel):
