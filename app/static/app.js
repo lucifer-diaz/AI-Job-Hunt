@@ -173,10 +173,11 @@ const LOADERS = {
     [D.tailorFacets] = await Promise.all([api('/api/tailor/queue?' + qs({ ...S.pf.tailor, with_facets: true })), refreshTasks()]);
     D.tailorQueue = D.tailorFacets.items;
     D.packet = null;
-    // An approved or applied packet is not in the queue but can still be opened and edited (e.g. from Approvals).
+    // A job opened from elsewhere (Discovery, Today, Approvals) or hidden by the current filter is still
+    // shown: asking for a specific job must never land on a different one.
     if (S.tailorJob && !D.tailorQueue.some(j => j.id === S.tailorJob)) {
       const p = await api(`/api/tailor/${S.tailorJob}`).catch(() => null);
-      if (p?.resume && PACKET_LOCKED.includes(p.job.status)) D.packet = p; else S.tailorJob = null;
+      if (p) D.packet = p; else S.tailorJob = null;
     }
     if (!S.tailorJob) S.tailorJob = (D.tailorQueue.find(j => j.has_resume) || D.tailorQueue[0] || {}).id || null;
     if (!D.packet && S.tailorJob) D.packet = await api(`/api/tailor/${S.tailorJob}`);
@@ -847,7 +848,7 @@ function renderBulkTailor(queue) {
 
 function renderTailor() {
   const queue = D.tailorQueue; if (!queue) return loading();
-  const outside = S.tailorMode === 'single' && D.packet && PACKET_LOCKED.includes(D.packet.job.status);
+  const outside = S.tailorMode === 'single' && D.packet && !queue.some(j => j.id === D.packet.job.id);
   if (outside) return renderTailorSingle(queue);
   if (!queue.length && D.tailorFacets.total_all) return `<div class="stack">${renderTaskStack()}${renderPacketFilters('tailor', D.tailorFacets)}${pfNoMatch('tailor')}</div>`;
   if (!queue.length) return `<section class="card">${empty('Nothing to tailor yet', 'Shortlist a job in Discovery and it will appear here.', btn('Go to triage', 'go', { screen: 'discovery', mode: 'triage' }, 'primary'))}</section>`;
@@ -858,7 +859,9 @@ function renderTailorSingle(queue) {
   const p = D.packet; if (!p) return loading();
   const job = p.job, r = p.resume;
   const locked = PACKET_LOCKED.includes(job.status);
-  const extra = locked ? `<option value="${job.id}" selected>${esc(job.company)} — ${esc(job.title)} (${esc(job.status)})</option>` : '';
+  // The open job keeps its place in the picker even when the queue filter hides it.
+  const extra = queue.some(j => j.id === job.id) ? ''
+    : `<option value="${job.id}" selected>${esc(job.company)} — ${esc(job.title)} (${esc(statusText(job.status))})</option>`;
   const picker = `<select class="select" style="margin:0;width:auto;max-width:320px" id="tailor-pick" data-act-change="pick-tailor">${extra}${queue.map(j => `<option value="${j.id}" ${j.id === S.tailorJob ? 'selected' : ''}>${esc(j.company)} — ${esc(j.title)}${j.status === 'needs_retailor' ? ' (re-tailor)' : j.has_resume ? '' : ' (not tailored)'}</option>`).join('')}</select>`;
   const task = activeTask(job.id), working = !!task || isBusy('queue' + job.id);
   const generating = working && task?.mode !== 'skip', skipping = task?.mode === 'skip';

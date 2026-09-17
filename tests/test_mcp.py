@@ -386,6 +386,10 @@ def test_the_workspace_shows_a_sent_back_packet_as_work_to_redo(account, monkeyp
     todo = next(a for a in client.get("/api/workspace/today").json()["actions"]
                 if a["kind"] == "tailor" and a["job_id"] == grab)
     assert todo["reason"].startswith("Review sent this packet back")
+    # The packet itself still opens, with the review's reasons on it.
+    packet = client.get(f"/api/tailor/{grab}").json()
+    assert packet["job"]["status"] == "needs_retailor" and packet["resume"]["version"] == 1
+    assert any(item["tone"] == "bad" for item in packet["resume"]["review"])
     # Discovery can filter for it too, and triage leaves a job that already has a packet alone.
     found = client.get("/api/jobs/search?stage=needs_retailor").json()
     assert [item["id"] for item in found["items"]] == [grab] and found["items"][0]["status"] == "needs_retailor"
