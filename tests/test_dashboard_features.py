@@ -14,6 +14,8 @@ def test_dashboard_has_workspace_navigation():
     assert response.status_code == 200
     for label in ("Overview", "Today", "Discovery", "Tailor", "Approvals", "Tracker", "Knowledge bank", "Settings"):
         assert label in response.text
+    assert response.text.index("/static/knowledge.js") < response.text.index("/static/app.js")
+    assert client.get("/static/knowledge.js").status_code == 200
     script = client.get("/static/app.js")
     assert script.status_code == 200
     assert 'data-tag-input="roles"' in script.text
