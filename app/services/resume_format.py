@@ -34,8 +34,6 @@ REPLACEMENTS = {
     " ": " ", " ": " ", " ": " ", " ": " ", " ": " ", " ": " ",
     "​": "", "‌": "", "‍": "", "﻿": "", "­": "",
 }
-# How many tailored "most relevant" skills a resume leads with: a readable line, not a copy of the skills section.
-TOP_SKILLS = 12
 BULLET_RE = re.compile(r"^\s*(?:[-*•●▪‣⁃◦]|\d+[.)])\s+")
 SECTION_KINDS = [
     ("summary", ("summary", "profile", "about", "objective")),
@@ -256,6 +254,35 @@ def relevant_skills(parsed: ParsedResume, tailored: list[str]) -> list[str]:
     return kept
 
 
+# "**Data and Streaming:** Kafka, Spark" or "Data and Streaming: Kafka, Spark" -> label, then the comma list.
+SKILL_GROUP_RE = re.compile(r"^(?P<label>(?:\*\*)?[^:]{1,80}:(?:\*\*)?\s*)(?P<values>.+,.+)$")
+
+
+def _mentioned(text: str, skills: list[str]) -> int:
+    """How many of the tailored skills this line names."""
+    haystack = f" {to_plain(text).lower()} "
+    return sum(bool(re.search(rf"(?<![\w+#]){re.escape(skill.lower())}(?![\w+#])", haystack)) for skill in skills)
+
+
+def order_skills(lines: list[str], top_skills: list[str]) -> list[str]:
+    """The skills section as bullets, most relevant first.
+
+    Nothing is added, removed or reworded: the groups this job asks for lead, and inside each group the skills
+    it asks for come first. A tailored resume therefore never repeats a "most relevant" list of its own.
+    """
+    ordered = sorted(lines, key=lambda line: -_mentioned(line, top_skills)) if top_skills else list(lines)
+    out = []
+    for line in ordered:
+        body = line.removeprefix("- ")
+        group = SKILL_GROUP_RE.match(body)
+        if group and top_skills:
+            items = [item.strip() for item in group.group("values").split(",") if item.strip()]
+            wanted = [item for skill in top_skills for item in items if item.lower() == skill.lower()]
+            body = f"{group.group('label')}{', '.join(dict.fromkeys(wanted + items))}"
+        out.append(f"- {body}")
+    return out
+
+
 def render_resume(parsed: ParsedResume, *, name: str = "", headline: str = "", summary: str | None = None,
                   top_skills: list[str] | None = None, role_bullets: dict[int, list[str]] | None = None,
                   highlights: list[str] | None = None) -> str:
@@ -273,13 +300,7 @@ def render_resume(parsed: ParsedResume, *, name: str = "", headline: str = "", s
                 out += ["", "## Highlights", *[f"- {to_plain(h).strip()}" for h in highlights if h.strip()]]
             continue
         if section.kind == "skills":
-            categorised = [line for line in section.lines if ":" in line]
-            if top_skills and not categorised:
-                out.append(f"- Most relevant: {', '.join(top_skills[:TOP_SKILLS])}")
-            elif top_skills:
-                # The master resume already groups skills; lead with the ones this job asks for, then the groups.
-                out.append(f"- **Most relevant:** {', '.join(top_skills[:TOP_SKILLS])}")
-            out.extend(line if line.startswith("- ") else f"- {line}" for line in section.lines)
+            out.extend(order_skills(section.lines, top_skills or []))
             continue
         if section.kind == "experience":
             out.extend(section.lines)

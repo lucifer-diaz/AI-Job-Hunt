@@ -67,8 +67,9 @@ def test_render_keeps_every_role_project_and_education():
     parsed = parse_resume(MASTER)
     markdown = render_resume(parsed, summary="Tailored summary.", top_skills=["LangGraph"],
                              role_bullets={0: ["Rewritten agent bullet with 28% conversion lift."]})
-    assert "Tailored summary." in markdown and "- **Most relevant:** LangGraph" in markdown
+    assert "Tailored summary." in markdown
     assert "- AI Engineering: LangGraph, OpenRouter, RAG pipelines" in markdown  # every skills line is a bullet
+    assert "Most relevant" not in markdown  # the groups are ordered instead of repeated in a lead line
     assert "### AI Consultant | Flow AI | Remote, USA | Oct 2025 - Present" in markdown
     assert "- Rewritten agent bullet with 28% conversion lift." in markdown
     assert "Designed a vendor-agnostic" not in markdown  # replaced bullets are not duplicated
@@ -176,11 +177,19 @@ def test_tailored_roles_keep_their_employer_location_and_dates():
     assert "**" not in text  # emphasis is drawn, not printed
 
 
-def test_the_most_relevant_line_is_a_short_lead_not_a_copy_of_every_skill():
-    skills = [f"Skill {i}" for i in range(40)]
-    markdown = render_resume(parse_resume(STACKED), top_skills=skills)
-    lead = next(line for line in markdown.splitlines() if "Most relevant" in line)
-    assert lead.count(",") == 11 and "Skill 12" not in lead
+def test_skills_are_ordered_by_relevance_instead_of_being_repeated():
+    markdown = render_resume(parse_resume(STACKED), top_skills=["Kafka", "Spark"])
+    skills = [line for line in markdown.split("## Core Skills")[1].split("##")[0].splitlines() if line.startswith("- ")]
+    # The group this job asks for leads, and nothing is duplicated into a "most relevant" line.
+    assert skills == ["- **Data and Streaming:** Kafka, Spark", "- **AI and Generative AI:** LangGraph, RAG, MCP"]
+    assert "Most relevant" not in markdown
+
+    # Inside a group, the skills this job asks for come first; the rest keep their order and wording.
+    reordered = render_resume(parse_resume(STACKED), top_skills=["MCP"])
+    assert "- **AI and Generative AI:** MCP, LangGraph, RAG" in reordered
+
+    untailored = render_resume(parse_resume(STACKED))
+    assert untailored.split("## Core Skills")[1].strip().splitlines()[0] == "- **AI and Generative AI:** LangGraph, RAG, MCP"
 
 
 def test_exports_show_contact_details_not_markdown_link_syntax():
