@@ -116,15 +116,15 @@ def test_resume_parser_prompt_asks_for_raw_text_and_the_structured_schema():
     from app.prompts.resume_parser import STRUCTURED_RESUME_TEMPLATE
 
     prompt = all_prompts()["resume_parser"]
-    assert prompt.version == "v2"
+    assert prompt.version == "v3"
     assert '{"raw_text": "...", "structured_resume": {...}}' in prompt.system
     schema = json.loads(prompt.system.split("or an empty list.\n", 1)[1].split("\n\nPARSING RULES", 1)[0])
     assert schema == STRUCTURED_RESUME_TEMPLATE
-    assert set(schema) == {"candidate", "summary", "skills", "experience", "projects", "education", "certifications",
-                           "awards", "publications", "languages", "additional_information", "derived"}
-    assert set(schema["experience"][0]) >= {"start_date_raw", "end_date_raw", "is_current", "raw_bullets", "metrics"}
-    for rule in ("YYYY-MM", "raw_bullets", "K8s -> Kubernetes", "source_text", "total_experience_years",
-                 "Ka[ka -> Kafka", "Never invent", "visa"):
+    assert set(schema) == {"personal_information", "summary", "skills", "experience", "projects", "education",
+                           "certifications", "awards", "languages", "additional_information"}
+    assert set(schema["experience"][0]) >= {"raw_start_date", "raw_end_date", "is_current", "raw_bullets",
+                                            "responsibilities", "achievements", "technologies"}
+    for rule in ("YYYY-MM", "raw_bullets", "K8s -> Kubernetes", "Ka[ka -> Kafka", "Never invent", "visa"):
         assert rule in prompt.system, rule
     assert resume in prompt.user and "<untrusted_resume>" in prompt.user and resume not in prompt.system
 

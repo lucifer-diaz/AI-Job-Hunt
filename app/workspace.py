@@ -38,8 +38,9 @@ from app.prompts import build_evidence_extraction_prompt
 from app.services.llm import LLMCall, LLMClient
 from app.services.sources import (UA, import_remote_run, list_remote_runs, refresh_apify_run, start_apify_search,
                                   upsert_job)
+from app.services.resume_format import flatten_links, unbold
 from app.services.user_settings import apify_token, lock_settings_row, settings_for
-from app.services import ranker
+from app.services import ranker, resume_verification
 from app.services.workflow import draft_followup, followup_days, get_profile, resume_edits, update_resume_edit
 from app.settings import get_settings
 
@@ -1081,21 +1082,29 @@ def resume_docx(job_id: int, db: Session = Depends(get_user_db)):
     from docx import Document
 
     document = Document()
+
+    def write(paragraph, text: str) -> None:
+        """Markdown emphasis becomes real bold runs instead of literal ** markers."""
+        for index, part in enumerate(text.split("**")):
+            if part:
+                paragraph.add_run(part).bold = index % 2 == 1
+
     for line in resume.markdown.split("## Source Resume")[0].splitlines():
+        line = flatten_links(line)
         if line.startswith("# "):
-            document.add_heading(line[2:], level=0)
+            document.add_heading(unbold(line[2:]), level=0)
         elif line.startswith("### "):
-            parts = [p.strip() for p in line[4:].split("|")]
+            parts = [p.strip() for p in unbold(line[4:]).split("|")]
             paragraph = document.add_paragraph()
             paragraph.add_run(parts[0]).bold = True
             if len(parts) > 1:
                 paragraph.add_run("  |  " + "  |  ".join(parts[1:]))
         elif line.startswith("## "):
-            document.add_heading(line[3:], level=1)
+            document.add_heading(unbold(line[3:]), level=1)
         elif line.startswith("- "):
-            document.add_paragraph(line[2:], style="List Bullet")
+            write(document.add_paragraph(style="List Bullet"), line[2:])
         elif line.strip():
-            document.add_paragraph(line)
+            write(document.add_paragraph(), line)
     buffer = BytesIO()
     document.save(buffer)
     return Response(buffer.getvalue(), media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -1367,7 +1376,10 @@ def resume_primary(document_id: int, db: Session = Depends(get_user_db)):
     for other in db.scalars(select(ResumeDocument).where(ResumeDocument.active.is_(True))).all():
         other.active = False
     document.active = True
-    get_profile(db).master_resume = document.extracted_text
+    profile = get_profile(db)
+    profile.master_resume = document.extracted_text
+    db.flush()
+    resume_verification.record_version(db, profile, document.extracted_text, document=document)
     db.commit()
     return resume_list(db)
 
@@ -1386,10 +1398,15 @@ def resume_document_delete(document_id: int, db: Session = Depends(get_user_db))
         promoted = db.scalars(select(ResumeDocument).order_by(desc(ResumeDocument.id)).limit(1)).first()
         if promoted:
             promoted.active = True
-            get_profile(db).master_resume = promoted.extracted_text
+            profile = get_profile(db)
+            profile.master_resume = promoted.extracted_text
+            db.flush()
+            resume_verification.record_version(db, profile, promoted.extracted_text, document=promoted)
     db.commit()
     # Uploads of identical files share one stored file, so only remove it when no row still points at it.
-    if path.is_file() and not db.scalar(select(ResumeDocument.id).where(ResumeDocument.storage_path == str(path))):
+    # A resume version keeps its original file: the uploaded original is never lost while a version uses it.
+    if (path.is_file() and not db.scalar(select(ResumeDocument.id).where(ResumeDocument.storage_path == str(path)))
+            and not resume_verification.storage_in_use(db, str(path))):
         path.unlink(missing_ok=True)
     return {"deleted": document_id, "promoted": promoted.id if promoted else None, "resumes": resume_list(db)}
 

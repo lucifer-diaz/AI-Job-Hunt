@@ -41,6 +41,7 @@ from app.models import (ACTIVE_RANKING_TASK_STATUSES, AppSetting, CandidateProfi
                         JobRankingTask, ResumeDocument, ResumeVersion)
 from app.prompts.ranking import (QUALIFICATION_RECOMMENDATIONS, RANKING_PROMPT_VERSION, build_ranking_prompt,
                                  posting_facts, ranking_profile_facts)
+from app.services.context_builder import build_ranking_context, latest_ranking_context_hash
 from app.services.lifecycle import ErrorCategory, InvalidTransition
 from app.services.lifecycle import WorkflowState as S
 from app.services.llm import (LLMCall, LLMClient, LLMConfigError, LLMError, LLMRateLimitError, LLMResponseError,
@@ -771,22 +772,28 @@ def _process(db: Session, claimed: TaskClaim, clock: Callable[[], datetime]) -> 
         return _wait(db, claimed, problem, clock())
     snapshot = resume_snapshot(db, profile)
     job, profile = db.get(Job, claimed.job_id), _profile(db, claimed.user_id)  # reloaded after the snapshot commit
-    evidence = relevant_evidence(db, claimed.user_id, job, get_settings().ranking_max_evidence)
+    # Only the facts relevant to this job: selected structured resume data and verified evidence.
+    context = build_ranking_context(db, profile, job, get_settings().ranking_max_evidence)
+    db.commit()  # a first use may have parsed the active resume version
+    job, profile = db.get(Job, claimed.job_id), _profile(db, claimed.user_id)
+    evidence = context.relevant_evidence
     inputs = RankingInputs(
         profile_id=profile.id, resume_id=snapshot.id, resume_version=snapshot.version,
         resume_content_hash=snapshot.content_hash, profile_hash=_hash(ranking_profile_facts(profile)),
-        evidence_hash=_hash(evidence), job_hash=_hash({**posting_facts(job), "description": job.description or ""}),
+        # Covers the selected resume facts and their verification too, so verifying data leads to a fresh ranking.
+        evidence_hash=_hash({"evidence": evidence, "context": latest_ranking_context_hash(context)}),
+        job_hash=_hash({**posting_facts(job), "description": job.description or ""}),
         verified_ids=frozenset(item["id"] for item in evidence), policy=policy_for(db, claimed.user_id))
     if not claimed.force:
         existing = _identical(db, job.id, inputs)
         if existing is not None:  # the same inputs were already ranked: no second model call
             return _complete(db, claimed, inputs, clock(), existing=existing)
-    prompt = build_ranking_prompt(candidate_profile=profile, resume=snapshot.content, evidence=evidence, job=job)
+    prompt = build_ranking_prompt(candidate_profile=profile, job=job, context=context)
     try:
         verified, job_id = set(inputs.verified_ids), job.id
         result = LLMClient.for_user(db, claimed.user_id).generate_prompt(prompt, LLMCall(
             workflow_type="job", entity_id=job_id, attempt=claimed.attempt,
-            validate=lambda data: validate_output(data, job_id, verified)))
+            validate=lambda data: validate_output(data, job_id, verified), context_stats=context.stats.as_dict()))
         output, discarded = result.validated
     except Exception as exc:  # classified below; a provider failure never archives a job
         db.rollback()

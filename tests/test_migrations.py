@@ -148,3 +148,55 @@ def test_sqlite_local_installs_migrate_too(tmp_path):
     with pytest.raises(IntegrityError), engine.begin() as connection:
         connection.execute(text("UPDATE jobs SET state = 'BOGUS'"))
     engine.dispose()
+
+
+def _insert(connection, table, **values):
+    """Insert a row filling every other NOT NULL column with an empty value of its type."""
+    import json as _json
+
+    from sqlalchemy import JSON, Boolean, DateTime, Integer, MetaData, Numeric
+    from sqlalchemy import Table as _Table
+
+    reflected = _Table(table, MetaData(), autoload_with=connection)
+    row = {}
+    for column in reflected.columns:
+        if column.name in values or column.nullable or column.primary_key or column.server_default is not None:
+            continue
+        kind = column.type
+        row[column.name] = (False if isinstance(kind, Boolean) else 0 if isinstance(kind, (Integer, Numeric))
+                            else DISCOVERED_AT if isinstance(kind, DateTime) else _json.dumps([]) if isinstance(kind, JSON)
+                            else "")
+    return connection.execute(reflected.insert().values(**row, **values)).inserted_primary_key[0]
+
+
+def test_0012_turns_existing_resumes_into_unverified_versions(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'resumes.db'}")
+    with engine.begin() as connection:
+        command.upgrade(alembic_config(connection), "0011")
+        user = _insert(connection, "users", email="legacy@example.com", password_hash="!")
+        _insert(connection, "candidate_profiles", user_id=user, master_resume="Hand edited resume text")
+        old = _insert(connection, "resume_documents", user_id=user, original_filename="old.pdf", media_type="application/pdf",
+                      storage_path="/files/old", checksum="a" * 64, size=1, extracted_text="Old resume", active=False)
+        _insert(connection, "resume_documents", user_id=user, original_filename="new.pdf", media_type="application/pdf",
+                storage_path="/files/new", checksum="b" * 64, size=1, extracted_text="New resume", active=True)
+        evidence = _insert(connection, "evidence", user_id=user, claim="Verified by hand", verified=True)
+    with engine.begin() as connection:
+        command.upgrade(alembic_config(connection), "0012")
+    with engine.connect() as connection:
+        rows = connection.execute(text(
+            "SELECT version, source, resume_document_id, source_file_hash, raw_text, is_active, is_default,"
+            " verification_status, structured_data FROM resumes ORDER BY version")).all()
+        kept = connection.execute(text("SELECT source, verified FROM evidence WHERE id = :id"), {"id": evidence}).one()
+        master = connection.scalar(text("SELECT master_resume FROM candidate_profiles"))
+    assert [(r.version, r.source, r.raw_text, bool(r.is_active)) for r in rows] == [
+        (1, "migration", "Old resume", False), (2, "migration", "New resume", False),
+        (3, "manual_text", "Hand edited resume text", True)]
+    assert rows[0].resume_document_id == old and rows[0].source_file_hash == "a" * 64
+    assert {r.verification_status for r in rows} == {"UNVERIFIED"} and all(r.structured_data is None for r in rows)
+    assert [bool(r.is_default) for r in rows] == [False, False, True]
+    assert (kept.source, bool(kept.verified)) == ("manual", True) and master == "Hand edited resume text"
+    with engine.begin() as connection:
+        command.downgrade(alembic_config(connection), "0011")
+    assert not inspect(engine).has_table("resumes")
+    assert "fact_key" not in {c["name"] for c in inspect(engine).get_columns("evidence")}
+    engine.dispose()

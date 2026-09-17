@@ -1,6 +1,8 @@
 """Resume prompts: parsing an uploaded resume into clean raw_text and structured JSON, and evidence-claim extraction.
 
-The parser prompt is not wired in yet: uploads are currently parsed deterministically (app.services.resume_format).
+Uploads are parsed deterministically (app.services.structured_resume). This parser prompt runs when the user asks
+for an AI re-parse in Settings → Resume Data; its output is only ever shown as a comparison against the current
+structured data (app.services.resume_verification.reparse), never written over it.
 """
 from __future__ import annotations
 
@@ -17,39 +19,33 @@ from app.prompts.common import (
     user_message,
 )
 
-RESUME_PARSER_PROMPT_VERSION = "v2"
+RESUME_PARSER_PROMPT_VERSION = "v3"
 RESUME_PARSER_MARKER = "PARSE_RESUME"
 EVIDENCE_EXTRACTION_PROMPT_VERSION = "v1"
 EVIDENCE_EXTRACTION_MARKER = "EXTRACT_EVIDENCE"
 
 # The shape of `structured_resume`. A list holding one object shows the shape of each item.
 STRUCTURED_RESUME_TEMPLATE: dict[str, Any] = {
-    "candidate": {"full_name": None, "headline": None, "location": None, "email": None, "phone": None,
-                  "linkedin": None, "github": None, "portfolio": None, "other_links": []},
+    "personal_information": {"full_name": None, "headline": None, "location": None, "email": None, "phone": None,
+                             "linkedin": None, "github": None, "portfolio": None, "other_links": []},
     "summary": None,
-    "skills": {"ai_and_generative_ai": [], "backend_and_architecture": [], "cloud_and_devops": [],
-               "data_and_streaming": [], "frontend_and_tools": [], "leadership": [], "other": []},
+    "skills": [{"name": None, "category": None}],
     "experience": [{
         "company": None, "job_title": None, "location": None, "employment_type": None,
-        "start_date": None, "end_date": None, "is_current": False, "start_date_raw": None, "end_date_raw": None,
+        "start_date": None, "end_date": None, "is_current": False, "raw_start_date": None, "raw_end_date": None,
         "responsibilities": [], "achievements": [], "technologies": [], "skills": [],
-        "metrics": [{"value": None, "unit": None, "description": None, "source_text": None}],
         "raw_bullets": [],
     }],
-    "projects": [{"name": None, "description": None, "technologies": [], "skills": [], "achievements": [],
-                  "raw_text": None}],
+    "projects": [{"name": None, "description": None, "url": None, "technologies": [], "skills": [], "achievements": []}],
     "education": [{"degree": None, "field_of_study": None, "institution": None, "location": None,
-                   "start_date": None, "end_date": None, "start_date_raw": None, "end_date_raw": None}],
+                   "start_date": None, "end_date": None, "raw_start_date": None, "raw_end_date": None}],
     "certifications": [{"name": None, "issuer": None, "issue_date": None, "expiration_date": None,
                         "credential_id": None, "url": None}],
-    "awards": [],
-    "publications": [],
-    "languages": [],
+    "awards": [{"title": None, "issuer": None, "date": None, "description": None}],
+    "languages": [{"name": None, "proficiency": None}],
     "additional_information": [],
-    "derived": {"total_experience_years": None, "current_role": None, "current_company": None,
-                "primary_roles": [], "primary_skills": [], "leadership_experience": False, "ai_experience": False,
-                "cloud_experience": False, "data_platform_experience": False},
 }
+
 
 RESUME_PARSER_SYSTEM = instructions(
     "You are a resume parser. Convert the uploaded resume in RESUME TEXT into (1) clean raw_text and "
@@ -76,7 +72,7 @@ A clean, machine-readable version of the resume:
 
 Dates
 - Normalize to YYYY-MM when possible (Oct 2025 -> 2025-10, June 2024 -> 2024-06, Present -> null).
-- Always keep the original text in start_date_raw and end_date_raw.
+- Always keep the original text in raw_start_date and raw_end_date.
 - Current roles: "is_current": true and "end_date": null.
 - Do not guess missing months or years: when a date cannot be normalized to YYYY-MM without guessing, set the
   normalized field to null and keep the original in the _raw field.
@@ -96,19 +92,11 @@ Skills
   Do not copy every global skill into every job.
 
 Metrics
-- Extract each measurable outcome separately, for example
-  {"value": "20", "unit": "x", "description": "latency reduction", "source_text": "..."}.
-- Keep the exact wording in source_text. Do not reinterpret or recalculate metrics.
-- If a role has no metrics, return an empty metrics list.
+- Do not reinterpret or recalculate metrics: keep every number exactly as written inside its bullet. Metrics and
+  derived information are computed by the application from your bullets.
 
-Derived fields
-- Summarize only what the resume clearly supports.
-- leadership_experience is true only when the resume explicitly shows leading teams, hiring, mentoring,
-  performance management, roadmap ownership or technical leadership.
-- ai_experience is true only when the resume explicitly mentions AI, ML, LLM or GenAI work.
-- cloud_experience and data_platform_experience follow the same standard.
-- total_experience_years: approximate total professional experience as a decimal rounded to one place,
-  without double-counting overlapping roles; null when dates are too incomplete or ambiguous.
+Skills list
+- Each skill is {"name", "category"}; use the resume's own category heading when there is one.
 
 Duplicates
 - Remove accidental duplicate bullets caused by PDF extraction. Keep skills that are intentionally repeated

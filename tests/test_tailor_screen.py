@@ -91,7 +91,7 @@ def test_a_stale_profile_form_cannot_overwrite_a_newer_resume():
     assert master_resume() == "hand written", "an explicit edit still wins"
 
 
-def test_deleting_a_resume_promotes_the_next_one_and_removes_the_file():
+def test_deleting_a_resume_promotes_the_next_one_and_keeps_the_original_file():
     from pathlib import Path
 
     first, second = f"Delta {uuid.uuid4().hex[:8]}", f"Epsilon {uuid.uuid4().hex[:8]}"
@@ -106,7 +106,7 @@ def test_deleting_a_resume_promotes_the_next_one_and_removes_the_file():
     out = client.delete(f"/api/profile/resumes/{newer}")
     assert out.status_code == 200 and out.json()["promoted"] == older
     assert master_resume() == first, "deleting the primary falls back to the next newest"
-    assert not stored.exists()
+    assert stored.exists(), "a resume version still references its original upload, so the file is kept"
     assert newer not in [r["id"] for r in client.get("/api/profile/resumes").json()]
 
     assert client.delete(f"/api/profile/resumes/{older}").status_code == 200

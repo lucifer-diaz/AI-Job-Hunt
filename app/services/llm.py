@@ -419,6 +419,11 @@ class LLMClient:
         if task == "advisor":
             return {"summary": "Mock analysis of the supplied usage aggregates.", "recommendations": [],
                     "estimated_savings": "unknown"}
+        if "PARSE_RESUME" in user.split("\n", 1)[0]:
+            from app.services.structured_resume import parse_deterministic
+
+            text = user.split("<untrusted_resume>", 1)[-1].rsplit("</untrusted_resume>", 1)[0].strip()
+            return {"raw_text": text, "structured_resume": parse_deterministic(text)}
         if "EXTRACT_EVIDENCE" in user.split("\n", 1)[0]:
             lines = [line.strip(" -•*\t") for line in user.split("MASTER RESUME:", 1)[-1].splitlines()]
             claims = [line for line in lines if len(line) > 25 and re.search(r"\d", line)][:12]

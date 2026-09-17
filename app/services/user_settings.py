@@ -100,3 +100,17 @@ def ai_ready(db: Session, user_id: int) -> tuple[bool, str]:
     if provider == "mock" or user_keys(db, user_id).get(provider):
         return True, ""
     return False, f"No {KEY_LABELS.get(provider, provider)} API key saved in Settings"
+
+
+# CandidatePolicy: how AI workflows may use resume facts the user has not verified.
+CANDIDATE_POLICY_DEFAULTS = {
+    # Tailoring, review, follow-ups and application answers: verified facts only unless this is on.
+    "allow_unverified_resume_facts": False,
+    # Ranking may read unverified parsed facts as clearly marked, lower-confidence context.
+    "ranking_uses_unverified": True,
+}
+
+
+def candidate_policy(db: Session, user_id: int | None = None) -> dict[str, bool]:
+    stored = (settings_for(db, user_id).preferences or {}).get("candidate_policy") or {}
+    return {key: bool(stored.get(key, default)) for key, default in CANDIDATE_POLICY_DEFAULTS.items()}

@@ -46,6 +46,12 @@ function scheduleMonPoll() {
 /* ───────────── formatting ───────────── */
 const monUSD = v => v == null ? '—' : v === 0 ? '$0' : Math.abs(v) < 0.01 ? `$${v.toFixed(4)}` : `$${v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 const monTokens = n => n == null ? '—' : n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e4 ? `${Math.round(n / 1e3)}K` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}K` : String(Math.round(n));
+/* Dynamic context selection: what could have been sent versus what was, from the context builders. */
+function monSelection(sel) {
+  if (!sel || !sel.requests) return '';
+  const line = x => `${monTokens(x.full_available_context_tokens)} available · ${monTokens(x.selected_context_tokens)} sent · ${x.context_reduction_percent == null ? '—' : x.context_reduction_percent.toFixed(1) + '%'} reduction`;
+  return `<div class="mt10" data-mon-selection><div class="caps-sm mb8">Context selection</div><div class="small">${line(sel)}</div>${sel.by_stage.map(x => `<div class="xs muted">${esc(monStage(x.stage))}: ${line(x)}</div>`).join('')}</div>`;
+}
 const monMs = ms => ms == null ? '—' : ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`;
 const monPct = (r, digits = 1) => r == null ? '—' : `${(r * 100).toFixed(digits)}%`;
 const monStage = s => MON_STAGES[s] || s;
@@ -156,6 +162,7 @@ function renderMonitoring() {
       + (c.unknown_window ? `<div class="xs muted mt8">${c.unknown_window} request${c.unknown_window === 1 ? '' : 's'} used a model whose context window is not in the model catalog.</div>` : '')
       + (Object.keys(c.contributors).length ? `<div class="xs muted mt8">Context by source: ${Object.entries(c.contributors).map(([k, v]) => `${esc(k.replace(/_/g, ' '))} ${monPct(v, 0)}`).join(' · ')}</div>` : ''),
     monTable(['Utilisation', 'Requests'], buckets.map(x => [x.label, x.requests]).concat([['Window unknown', c.unknown_window]])),
+    monSelection(c.selection) +
     c.largest.length ? `<div class="mt10"><div class="caps-sm mb8">Largest contexts</div>${c.largest.slice(0, 5).map(x => `<div class="row between gap10 small click" data-act="mon-request" data-id="${x.id}" style="padding:4px 0;cursor:pointer" title="${attr(`${monStage(x.stage)} · ${x.model || ''}`)}"><span class="ellipsis" style="min-width:0">${esc(monStage(x.stage))} · ${esc(x.model || '')}</span><span class="mono none" style="white-space:nowrap">${monTokens(x.context_tokens)}/${monTokens(x.context_window_size)} · ${x.utilization_percent.toFixed(0)}%</span></div>`).join('')}</div>` : '');
 
   const errs = d.errors.by_type.map(x => ({ ...x, _label: MON_ERRORS[x.error_type] || x.error_type }));

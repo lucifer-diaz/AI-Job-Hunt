@@ -53,6 +53,8 @@ class User(Base):
     profile: Mapped[CandidateProfile | None] = relationship(back_populates="user", uselist=False, passive_deletes=True)
     settings: Mapped[AppSetting | None] = relationship(back_populates="user", uselist=False, passive_deletes=True)
     resumes: Mapped[list[ResumeDocument]] = relationship(back_populates="user", passive_deletes=True)
+    structured_resumes: Mapped[list[Resume]] = relationship(back_populates="user", passive_deletes=True)
+    resume_data_changes: Mapped[list[ResumeDataChange]] = relationship(back_populates="user", passive_deletes=True)
     knowledge_answers: Mapped[list[KnowledgeAnswer]] = relationship(back_populates="user", passive_deletes=True)
     evidence: Mapped[list[Evidence]] = relationship(back_populates="user", passive_deletes=True)
     jobs: Mapped[list[Job]] = relationship(back_populates="user", passive_deletes=True)
@@ -146,6 +148,89 @@ class ResumeDocument(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
 
+RESUME_VERIFICATION_STATUSES = ("UNVERIFIED", "PARTIALLY_VERIFIED", "VERIFIED", "NEEDS_REVIEW")
+RESUME_CHANGE_TYPES = ("ADD", "UPDATE", "REMOVE", "REORDER", "VERIFY", "REJECT", "UNVERIFY", "PARSE",
+                       "REPARSE_ACCEPT", "REPARSE_KEEP", "VERIFY_RESUME")
+RESUME_CHANGE_SOURCES = ("PARSER", "USER", "SYSTEM")
+
+
+class Resume(Base):
+    """One version of the candidate's resume: the original file, its cleaned raw text and the structured data.
+
+    Versions are never overwritten: a new upload (or new master text) is a new row. `raw_text` is the read-only
+    reference; `structured_data` (app.services.structured_resume) is what AI workflows read, and only the parts
+    the user verified are trusted (app.services.resume_verification).
+    """
+
+    __tablename__ = "resumes"
+    __table_args__ = (
+        UniqueConstraint("candidate_profile_id", "version", name="uq_resumes_profile_version"),
+        CheckConstraint(f"verification_status IN ({', '.join(repr(v) for v in RESUME_VERIFICATION_STATUSES)})",
+                        name="ck_resumes_verification_status"),
+        Index("uq_resumes_active_profile", "candidate_profile_id", unique=True,
+              postgresql_where=text("is_active IS TRUE"), sqlite_where=text("is_active = 1")),
+        Index("uq_resumes_default_profile", "candidate_profile_id", unique=True,
+              postgresql_where=text("is_default IS TRUE"), sqlite_where=text("is_default = 1")),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("resumes")
+    user: Mapped[User] = relationship(back_populates="structured_resumes")
+    candidate_profile_id: Mapped[int] = mapped_column(
+        ForeignKey("candidate_profiles.id", ondelete="CASCADE", name="fk_resumes_candidate_profile_id"), index=True)
+    # The uploaded file, while its row exists. The source_* columns keep the provenance after it is deleted.
+    resume_document_id: Mapped[int | None] = mapped_column(
+        ForeignKey("resume_documents.id", ondelete="SET NULL", name="fk_resumes_resume_document_id"), nullable=True)
+    name: Mapped[str] = mapped_column(String(300), default="")
+    version: Mapped[int] = mapped_column(Integer)
+    source: Mapped[str] = mapped_column(String(20), default="upload")  # upload | manual_text | migration
+    source_filename: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    source_media_type: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    source_file_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_storage_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    raw_text_hash: Mapped[str] = mapped_column(String(64))
+    raw_text: Mapped[str] = mapped_column(Text, default="")
+    structured_data: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    parser: Mapped[str | None] = mapped_column(String(20), nullable=True)  # deterministic | llm
+    parser_version: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # Incremented on every change to structured_data; edits must name the revision they started from.
+    revision: Mapped[int] = mapped_column(Integer, default=0)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False)
+    verification_status: Mapped[str] = mapped_column(String(20), default="UNVERIFIED")
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    verified_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # A re-parse waiting for the user to keep or replace each differing value.
+    pending_reparse: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+
+class ResumeDataChange(Base):
+    """Append-only history of how each structured resume field changed, and who changed it."""
+
+    __tablename__ = "resume_data_changes"
+    __table_args__ = (
+        CheckConstraint(f"change_type IN ({', '.join(repr(v) for v in RESUME_CHANGE_TYPES)})",
+                        name="ck_resume_data_changes_change_type"),
+        CheckConstraint(f"source IN ({', '.join(repr(v) for v in RESUME_CHANGE_SOURCES)})",
+                        name="ck_resume_data_changes_source"),
+        Index("ix_resume_data_changes_resume_changed", "resume_id", "changed_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("resume_data_changes")
+    user: Mapped[User] = relationship(back_populates="resume_data_changes")
+    resume_id: Mapped[int] = mapped_column(ForeignKey("resumes.id", ondelete="CASCADE", name="fk_resume_data_changes_resume_id"))
+    field_path: Mapped[str] = mapped_column(String(300))
+    item_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    old_value: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    new_value: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    change_type: Mapped[str] = mapped_column(String(20))
+    source: Mapped[str] = mapped_column(String(10), default="USER")
+    changed_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+
 class KnowledgeAnswer(Base):
     __tablename__ = "knowledge_answers"
     __table_args__ = (UniqueConstraint("user_id", "question_key", name="uq_knowledge_user_question_key"),)
@@ -179,6 +264,14 @@ class Evidence(Base):
     skills: Mapped[list[str]] = mapped_column(JSON, default=list)
     tags: Mapped[list[str]] = mapped_column(JSON, default=list)
     verified: Mapped[bool] = mapped_column(default=True)
+    # Provenance. `resume` evidence is created only from structured resume items the user verified
+    # (app.services.resume_verification); `fact_key` lets one fact be reused across resume versions.
+    source: Mapped[str] = mapped_column(String(20), default="manual", server_default="manual")  # manual | resume | llm_extraction
+    resume_id: Mapped[int | None] = mapped_column(
+        ForeignKey("resumes.id", ondelete="SET NULL", name="fk_evidence_resume_id"), nullable=True, index=True)
+    structured_item_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    source_file_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    fact_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
 
@@ -744,6 +837,10 @@ class LLMRequestLog(Base):
     cached: Mapped[bool] = mapped_column(Boolean, default=False)
     cache_read_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cache_write_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Dynamic context selection (app.services.context_builder): what could have been sent versus what was.
+    full_available_context_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    selected_context_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    context_reduction_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
     debug_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
     debug_response: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)

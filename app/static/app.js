@@ -1677,6 +1677,7 @@ const A = {
   'ev-verify': el => busy('evv', async () => { await api(`/api/evidence/${el.dataset.id}`, { method: 'PATCH', body: { verified: true } }); await load(); }, 'Verified — tailoring may now cite it'),
   'ev-delete': async (el, e) => { e.preventDefault(); if (!confirm('Remove this evidence claim?')) return; await api(`/api/evidence/${el.dataset.id}`, { method: 'DELETE' }).catch(err => toast(err.message, true)); refreshAfter('Evidence removed'); },
   ...SETTINGS_ACTIONS,
+  ...RESUME_DATA_ACTIONS,
   ...MONITORING_ACTIONS,
 };
 function tagFallback(form, key) {
@@ -1704,6 +1705,7 @@ let filterTimer, paletteTimer;
 document.addEventListener('input', e => {
   const el = e.target;
   if (el.dataset.authEntry || el.dataset.authNotes) { settingsAuthUpdate(); return; }
+  if (el.dataset.rdPath) { resumeDataInput(el); return; }
   if (el.dataset.form && el.dataset.field) {
     setF(el.dataset.form, el.dataset.field, el.type === 'checkbox' ? el.checked : el.value);
     if (el.dataset.live || el.type === 'radio') render();
@@ -1726,6 +1728,7 @@ document.addEventListener('input', e => {
 document.addEventListener('change', e => {
   const el = e.target;
   if (el.dataset.authEntry) { settingsAuthUpdate(); return; }
+  if (el.dataset.rdPath) { resumeDataInput(el); return; }
   if (el.dataset.form && el.dataset.field && (el.tagName === 'SELECT' || el.type === 'checkbox' || el.type === 'radio')) {
     setF(el.dataset.form, el.dataset.field, el.type === 'checkbox' ? el.checked : el.value);
     if (el.type === 'radio') render();

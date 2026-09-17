@@ -27,6 +27,7 @@ from app.db import engine
 from app.db_migrations import run_migrations
 from app.hunter_api import router as hunter_router
 from app.monitoring_api import router as monitoring_router
+from app.resume_api import router as resume_router
 from app.models import (
     Application,
     CandidateProfile,
@@ -57,13 +58,14 @@ from app.schemas import (
     TailorTasksIn,
 )
 from app.security import SecretsUnavailable
-from app.services import ranker, tailor_tasks
+from app.services import ranker, resume_verification, tailor_tasks
 from app.services.ai_config import PROVIDERS as AI_PROVIDERS
 from app.services.ai_config import STAGES as AI_STAGES
 from app.services.ai_config import env_defaults as ai_env_defaults
 from app.services.ai_config import resolve as resolve_ai_config
 from app.services.contacts import recruiters_of, set_primary_recruiter
 from app.services.exports import markdown_to_simple_pdf
+from app.services.structured_resume import clean_raw_text
 from app.services.sources import (
     import_greenhouse,
     import_lever,
@@ -121,6 +123,7 @@ app.include_router(auth_router)
 app.include_router(workspace_router)
 app.include_router(hunter_router)
 app.include_router(monitoring_router)
+app.include_router(resume_router)
 
 # Reachable without signing in. Cron and admin routes are protected by their own secrets.
 PUBLIC_PATHS = {"/health", "/login", "/signup", "/api/auth/login", "/api/auth/signup", "/api/auth/logout"}
@@ -628,8 +631,12 @@ def profile_get(db: Session = Depends(get_user_db)):
 @app.put("/api/profile")
 def profile_put(payload: ProfileIn, db: Session = Depends(get_user_db)):
     p = get_profile(db)
-    for key, value in payload.model_dump(exclude_none=True).items():
+    values = payload.model_dump(exclude_none=True)
+    for key, value in values.items():
         setattr(p, key, value)
+    if "master_resume" in values:
+        db.flush()
+        resume_verification.active_resume(db, p)  # edited master text becomes its own resume version
     db.commit()
     return {"ok": True}
 
@@ -644,6 +651,9 @@ def profile_patch(payload: ProfilePatch, db: Session = Depends(get_user_db)):
         changes["search_preferences"] = {**(row.search_preferences or {}), **changes["search_preferences"]}
     for key, value in changes.items():
         setattr(row, key, value)
+    if "master_resume" in changes:
+        db.flush()
+        resume_verification.active_resume(db, row)  # edited master text becomes its own resume version
     db.commit()
     return profile_get(db)
 
@@ -670,6 +680,7 @@ async def resume_upload(file: UploadFile = File(...), db: Session = Depends(get_
             extracted = "\n".join(p.text for p in Document(BytesIO(data)).paragraphs)
     except Exception as exc:
         raise HTTPException(422, f"Could not read resume: {exc}") from exc
+    extracted = clean_raw_text(extracted)
     if not extracted.strip():
         raise HTTPException(422, "No readable text was found in the resume")
     digest = hashlib.sha256(data).hexdigest()
@@ -690,9 +701,13 @@ async def resume_upload(file: UploadFile = File(...), db: Session = Depends(get_
         db.add(document)
     profile = get_profile(db)
     profile.master_resume = extracted
+    db.flush()
+    # A new resume version (or the existing one for this exact file), parsed and unverified until reviewed.
+    version = resume_verification.record_version(db, profile, extracted, document=document, source="upload")
     db.commit()
     db.refresh(document)
-    return {"id": document.id, "filename": document.original_filename, "size": document.size}
+    return {"id": document.id, "filename": document.original_filename, "size": document.size,
+            "resume_id": version.id, "resume_version": version.version}
 
 
 @app.get("/api/profile/resume")

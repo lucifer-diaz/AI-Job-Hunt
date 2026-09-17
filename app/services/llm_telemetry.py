@@ -42,7 +42,8 @@ CONTRIBUTORS = ("system_prompt", "candidate_profile", "resume", "evidence", "job
 SECTION_CONTRIBUTOR = {
     "CANDIDATE PROFILE": "candidate_profile", "CANDIDATE POLICY": "candidate_profile",
     "ACTIVE RESUME": "resume", "RESUME": "resume", "MASTER RESUME": "resume", "MASTER RESUME ROLES": "resume",
-    "RESUME TEXT": "resume", "TAILORED RESUME": "resume",
+    "RESUME TEXT": "resume", "TAILORED RESUME": "resume", "RELEVANT EXPERIENCE": "resume", "RELEVANT SKILLS": "resume",
+    "VERIFIED RESUME FACTS": "resume", "UNVERIFIED RESUME FACTS": "resume", "REJECTED RESUME FACTS": "resume",
     "VERIFIED EVIDENCE": "evidence",
     "JOB ID": "job_description", "JOB": "job_description", "JOB POSTING": "job_description",
     "JOB DESCRIPTION": "job_description", "FIT ANALYSIS": "job_description",
@@ -106,6 +107,8 @@ class LLMCall:
     # request as a structured-output failure and the exception reaches the caller unchanged.
     validate: Callable[[dict[str, Any]], Any] | None = None
     structured_output_retry_count: int = 0
+    # Set by services that build task-specific context (app.services.context_builder.ContextStats.as_dict()).
+    context_stats: dict[str, Any] | None = None
 
 
 @dataclass
@@ -208,10 +211,18 @@ def build_entry(attempt: Attempt, *, latency_ms: int, error: BaseException | Non
         "cached": bool(usage and usage.cache_read_tokens),
         "cache_read_tokens": usage.cache_read_tokens if usage else None,
         "cache_write_tokens": usage.cache_write_tokens if usage else None,
+        **_context_selection(call.context_stats),
         "debug_prompt": f"{attempt.system}\n\n{attempt.user}"[:DEBUG_TEXT_LIMIT] if debug else None,
         "debug_response": (attempt.response_text or "")[:DEBUG_TEXT_LIMIT] if debug and attempt.response_text else None,
         "created_at": attempt.started_at, "completed_at": completed_at or utcnow(),
     }
+
+
+def _context_selection(stats: dict[str, Any] | None) -> dict[str, Any]:
+    stats = stats or {}
+    return {"full_available_context_tokens": stats.get("full_available_context_tokens"),
+            "selected_context_tokens": stats.get("selected_context_tokens"),
+            "context_reduction_percent": stats.get("context_reduction_percent")}
 
 
 STRUCTURED_OUTPUT_ERRORS = ("SCHEMA_VALIDATION", "INVALID_JSON")

@@ -6,17 +6,20 @@ from typing import Any
 from app.prompts.common import (
     JSON_ONLY_RULE,
     UNTRUSTED_DATA_RULE,
+    UNVERIFIED_FACTS_RULE,
     Prompt,
+    context_value,
     instructions,
     job_facts,
     profile_facts,
+    resume_facts,
     section,
     to_json,
     untrusted,
     user_message,
 )
 
-REVIEW_PROMPT_VERSION = "v1"
+REVIEW_PROMPT_VERSION = "v2"
 REVIEW_MARKER = "REVIEW_RESUME"
 REVIEW_RECOMMENDATIONS = ("approve", "revise", "reject")
 
@@ -30,6 +33,11 @@ REVIEW_SYSTEM = instructions(
   - coverage of the job description's key requirements,
   - vague bullets.
 Penalize unsupported claims and vague bullets heavily. Do not rewrite the resume.""",
+    "When VERIFIED RESUME FACTS are given they are the candidate's confirmed truth: job titles, employers and dates "
+    "in the tailored resume must match them, and metrics must appear in them or in VERIFIED EVIDENCE. A claim that "
+    "repeats a REJECTED RESUME FACT, or that rests on unverified information while CANDIDATE POLICY does not allow "
+    "it, is an unsupported claim and a reject reason.",
+    UNVERIFIED_FACTS_RULE,
     JSON_ONLY_RULE,
     f"""Fields:
   score (number 0-100),
@@ -45,12 +53,24 @@ Penalize unsupported claims and vague bullets heavily. Do not rewrite the resume
 )
 
 
-def build_review_prompt(candidate_profile: Any, evidence: list[dict[str, Any]], job: Any,
-                        tailored_resume: str) -> Prompt:
+def build_review_prompt(candidate_profile: Any, evidence: list[dict[str, Any]] | None = None, job: Any = None,
+                        tailored_resume: str = "", context: Any = None) -> Prompt:
+    """With a review context (app.services.context_builder.build_review_context) the reviewer also gets the verified
+    structured truth, the rejected facts and the candidate policy to check the tailored text against."""
+    truth = []
+    if context is not None:
+        evidence = context_value(context, "relevant_evidence", [])
+        truth = [
+            untrusted("VERIFIED RESUME FACTS", "untrusted_resume_facts", to_json(resume_facts(context), limit=24000)),
+            untrusted("REJECTED RESUME FACTS", "untrusted_resume_facts",
+                      to_json(context_value(context, "rejected_facts", []), limit=6000)),
+            section("CANDIDATE POLICY", to_json(context_value(context, "policy", {}))),
+        ]
     user = user_message(
         REVIEW_MARKER,
         section("CANDIDATE PROFILE", to_json(profile_facts(candidate_profile, include_name=True))),
-        section("VERIFIED EVIDENCE", to_json(evidence, limit=32000)),
+        *truth,
+        section("VERIFIED EVIDENCE", to_json(evidence or [], limit=32000)),
         section("JOB", to_json(job_facts(job))),
         untrusted("JOB DESCRIPTION", "untrusted_job_description", getattr(job, "description", ""), limit=24000),
         untrusted("TAILORED RESUME", "untrusted_tailored_resume", tailored_resume, limit=24000),

@@ -64,6 +64,17 @@ def signed_in_as_test_user(monkeypatch):
     monkeypatch.setattr(auth, "authenticate", lambda request: real(request) or ensure_test_user())
 
 
+@pytest.fixture(autouse=True)
+def lenient_resume_policy(request, monkeypatch):
+    """Tests written before resume verification tailor from unverified resume text, as if the candidate had allowed
+    it. Tests marked `strict_resume_policy` use the production default: verified facts only."""
+    if request.node.get_closest_marker("strict_resume_policy"):
+        return
+    from app.services import user_settings
+
+    monkeypatch.setitem(user_settings.CANDIDATE_POLICY_DEFAULTS, "allow_unverified_resume_facts", True)
+
+
 @pytest.fixture
 def anonymous(monkeypatch):
     """Turn off the test account: requests are signed in only by a real session cookie."""

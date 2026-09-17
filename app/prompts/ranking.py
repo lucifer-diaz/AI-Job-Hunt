@@ -11,7 +11,10 @@ from app.prompts.common import (
     JSON_ONLY_RULE,
     NO_INVENTION_RULE,
     UNTRUSTED_DATA_RULE,
+    UNVERIFIED_FACTS_RULE,
     Prompt,
+    context_value,
+    experience_facts,
     instructions,
     profile_facts,
     section,
@@ -20,7 +23,7 @@ from app.prompts.common import (
     user_message,
 )
 
-RANKING_PROMPT_VERSION = "v2"
+RANKING_PROMPT_VERSION = "v3"
 RANKING_MARKER = "FIT_ANALYSIS"
 QUALIFICATION_RECOMMENDATIONS = ("QUALIFY", "ARCHIVE")
 SCORE_FIELDS = ("overall_fit_score", "candidate_fit_score", "resume_fit_score", "seniority_match_score",
@@ -48,6 +51,11 @@ resume fails to show in resume_gaps and where it should focus in recommended_res
     something as fatal because it is unknown; lower confidence instead.
   missing_requirements: requirements the candidate's facts do not show, that are not fatal.
   Unknown salary or compensation is never a gap.""",
+    "The candidate's facts are a selection made for this job (app context builder): RELEVANT EXPERIENCE keeps every "
+    "role header but only the bullets that relate to the posting, so do not penalize the absence of unrelated "
+    "detail. When only ACTIVE RESUME is given, it is the resume as written.",
+    UNVERIFIED_FACTS_RULE + " When a match rests only on unverified facts, count it as a partial match and lower "
+    "confidence. relevant_evidence_ids may only name VERIFIED EVIDENCE ids.",
     "confidence (0-1) is how sure you are of the analysis given how complete the posting and the candidate's facts "
     "are. When the posting is vague or the facts are thin, lower confidence rather than guessing.",
     JSON_ONLY_RULE,
@@ -91,13 +99,38 @@ def posting_facts(job: Any) -> dict[str, Any]:
     return facts
 
 
-def build_ranking_prompt(candidate_profile: Any, resume: str, evidence: list[dict[str, Any]], job: Any) -> Prompt:
+def build_ranking_prompt(candidate_profile: Any, resume: str = "", evidence: list[dict[str, Any]] | None = None,
+                         job: Any = None, context: Any = None) -> Prompt:
+    """With a ranking context (app.services.context_builder.build_ranking_context) only its selected facts are sent;
+    without one, the whole resume text and the given evidence are."""
+    if context is not None:
+        candidate = context_value(context, "candidate", {}) or {}
+        facts = {**ranking_profile_facts(candidate_profile), "summary": candidate.get("summary"),
+                 "verified_background": candidate.get("verified_background") or {},
+                 "education": context_value(context, "education", []),
+                 "certifications": context_value(context, "certifications", [])}
+        experience = experience_facts(context)
+        unverified = context_value(context, "unverified_facts", [])
+        data_sections = [
+            section("CANDIDATE PROFILE", to_json(facts)),
+            untrusted("RELEVANT EXPERIENCE", "untrusted_resume_facts", to_json(experience, limit=20000))
+            if experience else untrusted("ACTIVE RESUME", "untrusted_resume", context_value(context, "resume_text", ""),
+                                         limit=20000),
+            section("RELEVANT SKILLS", to_json(context_value(context, "relevant_skills", []))),
+            section("VERIFIED EVIDENCE", to_json(context_value(context, "relevant_evidence", []), limit=30000)),
+            untrusted("UNVERIFIED RESUME FACTS", "untrusted_resume_facts", to_json(unverified, limit=8000))
+            if unverified else "",
+        ]
+    else:
+        data_sections = [
+            section("CANDIDATE PROFILE", to_json(ranking_profile_facts(candidate_profile))),
+            untrusted("ACTIVE RESUME", "untrusted_resume", resume, limit=20000),
+            section("VERIFIED EVIDENCE", to_json(evidence or [], limit=30000)),
+        ]
     user = user_message(
         RANKING_MARKER,
         f"JOB ID: {int(getattr(job, 'id', None) or 0)}",
-        section("CANDIDATE PROFILE", to_json(ranking_profile_facts(candidate_profile))),
-        untrusted("ACTIVE RESUME", "untrusted_resume", resume, limit=20000),
-        section("VERIFIED EVIDENCE", to_json(evidence, limit=30000)),
+        *data_sections,
         section("JOB POSTING", to_json(posting_facts(job))),
         untrusted("JOB DESCRIPTION", "untrusted_job_description", getattr(job, "description", ""), limit=24000),
     )

@@ -34,6 +34,8 @@ REPLACEMENTS = {
     " ": " ", " ": " ", " ": " ", " ": " ", " ": " ", " ": " ",
     "​": "", "‌": "", "‍": "", "﻿": "", "­": "",
 }
+# How many tailored "most relevant" skills a resume leads with: a readable line, not a copy of the skills section.
+TOP_SKILLS = 12
 BULLET_RE = re.compile(r"^\s*(?:[-*•●▪‣⁃◦]|\d+[.)])\s+")
 SECTION_KINDS = [
     ("summary", ("summary", "profile", "about", "objective")),
@@ -58,14 +60,43 @@ def to_plain(text: str) -> str:
     return "".join(out)
 
 
+DATE_RANGE_RE = re.compile(
+    r"((?:[A-Za-z]{3,9}\.?\s+)?\d{4}|\d{1,2}/\d{4})\s*(?:-|–|—|to)\s*"
+    r"((?:[A-Za-z]{3,9}\.?\s+)?\d{4}|\d{1,2}/\d{4}|present|current|now|today)", re.IGNORECASE)
+
+
+LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+
+
+def unbold(text: str) -> str:
+    return re.sub(r"\*\*(.+?)\*\*", r"\1", text or "").strip()
+
+
+def flatten_links(text: str) -> str:
+    """`[rohan@x.com](mailto:rohan@x.com)` -> `rohan@x.com`: exports show the address, not Markdown syntax."""
+    def replace(match: re.Match[str]) -> str:
+        label, target = match.group(1).strip(), match.group(2).strip()
+        clean = re.sub(r"^(?:mailto:|tel:)", "", target)
+        return label if label.lower() in (clean.lower(), target.lower()) else f"{label} ({clean})"
+
+    return LINK_RE.sub(replace, text or "")
+
+
 @dataclass
 class Role:
     header: str
     bullets: list[str] = field(default_factory=list)
+    # Lines between the role heading and its first bullet, e.g. "**Flow AI** | Remote, USA" and "Oct 2025 - Present".
+    # Resumes that put the employer and dates under the title keep them here instead of losing them to the bullets.
+    meta: list[str] = field(default_factory=list)
 
     @property
     def parts(self) -> list[str]:
-        return [p.strip() for p in self.header.split("|")]
+        return [unbold(p) for p in self.header.split("|") if unbold(p)] or [""]
+
+    @property
+    def meta_parts(self) -> list[str]:
+        return [unbold(p) for line in self.meta for p in line.split("|") if unbold(p)]
 
     @property
     def title(self) -> str:
@@ -73,11 +104,30 @@ class Role:
 
     @property
     def company(self) -> str:
-        return self.parts[1] if len(self.parts) > 1 else ""
+        if len(self.parts) > 1:
+            return self.parts[1]
+        rest = [p for p in self.meta_parts if not DATE_RANGE_RE.search(p)]
+        return rest[0] if rest else ""
+
+    @property
+    def location(self) -> str:
+        if len(self.parts) > 3:
+            return self.parts[2]
+        if len(self.parts) > 1:
+            return ""
+        rest = [p for p in self.meta_parts if not DATE_RANGE_RE.search(p)]
+        return rest[1] if len(rest) > 1 else ""
 
     @property
     def dates(self) -> str:
-        return self.parts[-1] if len(self.parts) > 2 else ""
+        if len(self.parts) > 2:
+            return self.parts[-1]
+        return next((p for p in self.meta_parts if DATE_RANGE_RE.search(p)), "")
+
+    @property
+    def full_header(self) -> str:
+        """Title, employer, location and dates on one line, wherever the master resume put them."""
+        return " | ".join(p for p in (self.title, self.company, self.location, self.dates) if p)
 
 
 @dataclass
@@ -148,7 +198,7 @@ def parse_resume(text: str) -> ParsedResume:
                 current.roles.append(Role(header=line[4:].strip()))
             else:
                 current.lines.append(line)
-            last_kind = ""
+            last_kind = "role"
             continue
         if BULLET_RE.match(line):
             item = BULLET_RE.sub("", line).strip()
@@ -162,7 +212,11 @@ def parse_resume(text: str) -> ParsedResume:
         wrapped = line[:1].islower() or (last_kind == "bullet" and not re.search(r"[.;:!?)]$", _last_text(current)))
         if wrapped and append_continuation(line):
             continue
-        if current.kind == "experience" and current.roles and last_kind != "para":
+        if current.kind == "experience" and current.roles and not current.roles[-1].bullets:
+            # Employer, location and dates written under the role heading: role metadata, not an achievement.
+            current.roles[-1].meta.append(line)
+            last_kind = "meta"
+        elif current.kind == "experience" and current.roles and last_kind != "para":
             current.roles[-1].bullets.append(line)
             last_kind = "bullet"
         else:
@@ -218,13 +272,20 @@ def render_resume(parsed: ParsedResume, *, name: str = "", headline: str = "", s
             if highlights:
                 out += ["", "## Highlights", *[f"- {to_plain(h).strip()}" for h in highlights if h.strip()]]
             continue
-        if section.kind == "skills" and top_skills:
-            out.append(f"- Most relevant: {', '.join(top_skills)}")
+        if section.kind == "skills":
+            categorised = [line for line in section.lines if ":" in line]
+            if top_skills and not categorised:
+                out.append(f"- Most relevant: {', '.join(top_skills[:TOP_SKILLS])}")
+            elif top_skills:
+                # The master resume already groups skills; lead with the ones this job asks for, then the groups.
+                out.append(f"- **Most relevant:** {', '.join(top_skills[:TOP_SKILLS])}")
+            out.extend(line if line.startswith("- ") else f"- {line}" for line in section.lines)
+            continue
         if section.kind == "experience":
             out.extend(section.lines)
             for index, role in enumerate(section.roles):
                 bullets = [b for b in role_bullets.get(index, []) if b and b.strip()] or role.bullets
-                out += ["", f"### {role.header}", *[f"- {to_plain(b).strip()}" for b in bullets]]
+                out += ["", f"### {role.full_header}", *[f"- {to_plain(b).strip()}" for b in bullets]]
             continue
         out.extend(section.lines)
     return "\n".join(out).strip() + "\n"
