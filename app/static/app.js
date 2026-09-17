@@ -75,6 +75,8 @@ const fitTxt = n => n == null ? '—' : String(Math.round(n));
 const initials = s => (s || '?').split(/\s+/).filter(Boolean).slice(0, 2).map(w => w[0]).join('').toUpperCase();
 const STATUS_TONE = { discovered: 'muted', shortlisted: 'brand', maybe: 'muted', archived: 'muted', dismissed: 'bad', tailored: 'warn', needs_retailor: 'warn', pending_approval: 'warn', rejected: 'bad', approved: 'good', applied: 'good' };
 const STATUS_LABEL = { needs_retailor: 're-tailor' };
+const statusText = s => STATUS_LABEL[s] || (s || '').replace(/_/g, ' ');
+const statusTitle = s => statusText(s).charAt(0).toUpperCase() + statusText(s).slice(1);
 const statusPill = s => pill(STATUS_LABEL[s] || (s || '').replace(/_/g, ' '), STATUS_TONE[s] || 'muted');
 const toDate = iso => iso ? new Date(/Z|[+-]\d\d:\d\d$/.test(iso) ? iso : iso + 'Z') : null;
 const fmtDay = iso => iso ? toDate(iso).toLocaleDateString(undefined, { day: 'numeric', month: 'short' }) : '';
@@ -610,7 +612,7 @@ function renderTable() {
       <input class="input grow" style="min-width:180px" id="flt-q" data-filter="q" value="${attr(f.q)}" placeholder="Search title, company or location…">
       <select class="select" id="flt-min" data-filter="min_fit">${opts([[0, 'Any fit'], [50, 'Fit ≥ 50'], [70, 'Fit ≥ 70'], [80, 'Fit ≥ 80']], f.min_fit)}</select>
       <select class="select" id="flt-board" data-filter="board">${opts([['all', 'All boards'], ...j.boards.map(b => [b, b])], f.board)}</select>
-      <select class="select" id="flt-stage" data-filter="stage">${opts([['all', 'All stages'], ['unranked', 'Unranked'], ...['discovered', 'shortlisted', 'maybe', 'archived', 'dismissed', 'tailored', 'approved', 'applied'].map(s => [s, s[0].toUpperCase() + s.slice(1)])], f.stage)}</select>
+      <select class="select" id="flt-stage" data-filter="stage">${opts([['all', 'All stages'], ['unranked', 'Unranked'], ...['discovered', 'shortlisted', 'maybe', 'archived', 'dismissed', 'tailored', 'needs_retailor', 'pending_approval', 'approved', 'applied'].map(s => [s, statusTitle(s)])], f.stage)}</select>
       <select class="select" id="flt-sort" data-filter="sort">${opts([['fit', 'Sort: best fit'], ['new', 'Sort: newest'], ['company', 'Sort: company']], f.sort)}</select>
       ${btn('Reset', 'reset-filters', {}, 'sm')}
       ${S.checked.size ? '' : btn(label('rankBatch', 'Rank unranked', 'Queueing…'), 'rank-batch', {}, 'sm', isBusy('rankBatch'))}
@@ -637,7 +639,7 @@ function renderTable() {
     <div class="row top-align between gap10"><div class="grow"><div style="font-size:17px;font-weight:600">${esc(sel.title)}</div><div class="base muted mt4">${esc(sel.company)}${sel.location ? ' · ' + esc(sel.location) : ''}</div></div><div class="mono bb ${fitCls(sel.fit)}" style="font-size:24px">${fitTxt(sel.fit)}</div></div>
     <div class="row gap6 wrap" style="margin:14px 0">${statusPill(sel.status)}${pill(sel.board + ' · ' + sel.posted, 'plain', 'lg')}${pill(`${sel.matches.length} matched`, 'good', 'lg')}${pill(`${sel.gaps.length + sel.missing.length} gaps`, 'warn', 'lg')}</div>
     <div class="base pretty" style="color:var(--ink3);line-height:1.6;border-top:1px solid var(--line2);padding-top:14px">${esc(sel.summary || (sel.description || '').slice(0, 420) || 'No description captured.')}</div>
-    <div class="row gap8 mt16">${['tailored', 'approved', 'applied', 'pending_approval'].includes(sel.status) ? btn('Open packet', 'go', { screen: sel.status === 'applied' ? 'tracker' : sel.status === 'approved' ? 'approvals' : 'tailor', job: sel.id }, 'primary grow') : btn('Tailor', 'triage', { id: sel.id, action: 'shortlist', tailor: 1 }, 'primary grow')}${btn('Full description', 'open-job', { id: sel.id }, 'grow')}</div>` : empty('Select a job', 'Pick a row to see its details.')}
+    <div class="row gap8 mt16">${['tailored', 'needs_retailor', 'approved', 'applied', 'pending_approval'].includes(sel.status) ? btn(sel.status === 'needs_retailor' ? 'Re-tailor' : 'Open packet', 'go', { screen: sel.status === 'applied' ? 'tracker' : sel.status === 'approved' ? 'approvals' : 'tailor', job: sel.id }, 'primary grow') : btn('Tailor', 'triage', { id: sel.id, action: 'shortlist', tailor: 1 }, 'primary grow')}${btn('Full description', 'open-job', { id: sel.id }, 'grow')}</div>` : empty('Select a job', 'Pick a row to see its details.')}
   </section></div>`;
 }
 function renderSetup() {
@@ -1153,7 +1155,7 @@ function renderJobModal() {
           : `<div class="box warn"><div class="small b" style="color:var(--warn-deep)">${esc(g.gap)}</div><div class="small mt4" style="color:var(--warn-deep);line-height:1.5">No verified evidence. Add a claim or leave it out — tailoring never invents experience.</div>${btn('Add evidence', 'add-evidence-for', { gap: g.gap }, 'sm mt8')}</div>`).join('') : '<div class="small muted">No gaps flagged.</div>'}</div></section>
         <section class="card pad18"><div class="card-title sm mb10">Move this job</div><div class="row gap6 wrap">${actionable
           ? `${btn('Shortlist', 'modal-triage', { id: j.id, action: 'shortlist' }, 'sm soft')}${btn('Maybe later', 'modal-triage', { id: j.id, action: 'maybe' }, 'sm')}${btn('Dismiss', 'modal-triage', { id: j.id, action: 'dismiss' }, 'sm danger')}`
-          : `<span class="small muted">This job is ${esc(j.status.replace('_', ' '))} — manage it from ${j.status === 'applied' ? 'the Tracker' : 'Approvals'}.</span>`}</div></section>
+          : `<span class="small muted">This job is ${esc(statusText(j.status))} — manage it from ${j.status === 'applied' ? 'the Tracker' : ['tailored', 'needs_retailor'].includes(j.status) ? 'Tailor' : 'Approvals'}.</span>`}</div></section>
       </div></div></div></div>`;
 }
 function renderPalette() {

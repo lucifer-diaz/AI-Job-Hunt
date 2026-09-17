@@ -386,6 +386,10 @@ def test_the_workspace_shows_a_sent_back_packet_as_work_to_redo(account, monkeyp
     todo = next(a for a in client.get("/api/workspace/today").json()["actions"]
                 if a["kind"] == "tailor" and a["job_id"] == grab)
     assert todo["reason"].startswith("Review sent this packet back")
+    # Discovery can filter for it too, and triage leaves a job that already has a packet alone.
+    found = client.get("/api/jobs/search?stage=needs_retailor").json()
+    assert [item["id"] for item in found["items"]] == [grab] and found["items"][0]["status"] == "needs_retailor"
+    assert client.post(f"/api/jobs/{grab}/triage", json={"action": "maybe"}).status_code == 409
     # Queueing it needs no "regenerate": the packet under review is the one being replaced.
     assert [t["job_id"] for t in client.post("/api/tailor-tasks", json={"ids": [grab]}).json()["queued"]] == [grab]
 
