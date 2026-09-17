@@ -28,6 +28,44 @@ const SETTING_ERRORS = {};
 const SETTINGS_SUCCESS = {};
 const SETTING_DETAILS = new Set();
 let editingKey = null;
+let authorizationDraft = null;
+const AUTH_COUNTRIES = ['India', 'Singapore', 'Dubai (UAE)', 'United States', 'United Kingdom', 'Canada', 'Australia', 'Other'];
+const AUTH_STATUSES = ['Citizen', 'Permanent resident', 'EP (Employment Pass)', 'Work permit', 'Foreigner / visa required', 'Other'];
+
+function authorizationRows(value) {
+  const lines = String(value || '').split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  const notes = lines.filter(line => /^notes?:/i.test(line)).map(line => line.replace(/^notes?:\s*/i, '')).join('\n');
+  const rows = lines.filter(line => !/^notes?:/i.test(line)).map(line => {
+    const match = line.match(/^(.+?)\s*(?:—|-|,)\s*(.+)$/);
+    if (match) return { country: match[1].trim(), status: match[2].trim() };
+    return AUTH_STATUSES.includes(line) ? { country: '', status: line } : { country: line, status: '' };
+  });
+  return { rows: rows.length ? rows : [{ country: '', status: '' }], notes };
+}
+function authorizationValue() {
+  const rows = [...document.querySelectorAll('[data-auth-row]')].map(row => ({
+    country: row.querySelector('[data-auth-country]')?.value.trim() || '',
+    status: row.querySelector('[data-auth-status]')?.value.trim() || '',
+  })).filter(row => row.country || row.status);
+  const notes = document.getElementById('preferences-authorization-notes')?.value.trim() || '';
+  return [...rows.map(row => [row.country || 'Other', row.status || 'Other'].join(' — ')), notes ? `Notes: ${notes}` : ''].filter(Boolean).join('\n');
+}
+function settingsAuthUpdate() {
+  const rows = [...document.querySelectorAll('[data-auth-row]')].map(row => ({
+    country: row.querySelector('[data-auth-country]')?.value.trim() || '',
+    status: row.querySelector('[data-auth-status]')?.value.trim() || '',
+  }));
+  const notes = document.getElementById('preferences-authorization-notes')?.value.trim() || '';
+  authorizationDraft = { rows, notes };
+  setF('preferences', 'work_authorization', authorizationValue());
+}
+function authorizationOptions(options, selected) {
+  return options.map(option => `<option value="${attr(option)}" ${option === selected ? 'selected' : ''}>${esc(option)}</option>`).join('');
+}
+function authorizationEditor(value) {
+  const parsed = authorizationRows(value), { rows, notes } = authorizationDraft || parsed;
+  return `<div class="authorization-editor"><p class="settings-help">Add one entry for each country or market. This helps match roles to your actual right to work.</p><div class="authorization-rows">${rows.map((row, index) => `<div class="authorization-row" data-auth-row><label class="field" for="preferences-auth-country-${index}"><span>Country / market</span><select class="select" id="preferences-auth-country-${index}" data-auth-country data-auth-entry="1" data-auth-index="${index}"><option value="">Select a country</option>${authorizationOptions(AUTH_COUNTRIES, row.country)}</select></label><label class="field" for="preferences-auth-status-${index}"><span>Authorization</span><select class="select" id="preferences-auth-status-${index}" data-auth-status data-auth-entry="1" data-auth-index="${index}"><option value="">Select status</option>${authorizationOptions(AUTH_STATUSES, row.status)}</select></label>${rows.length > 1 ? btn('Remove', 'auth-remove', { index }, 'sm') : ''}</div>`).join('')}</div>${btn('+ Add country', 'auth-add', {}, 'sm')}<label class="field authorization-notes" for="preferences-authorization-notes"><span>Visa notes (optional)</span><textarea class="textarea" id="preferences-authorization-notes" data-auth-notes placeholder="e.g. Need sponsorship after EP expiry">${esc(notes)}</textarea></label></div>`;
+}
 
 function settingsSection(value) { return SETTINGS_SECTIONS.some(([id]) => id === value) ? value : 'profile'; }
 function settingsForm() { return S.settingsSection === 'api-keys' ? 'keys' : S.settingsSection; }
@@ -87,6 +125,7 @@ function settingsCanLeave(nextScreen, nextSection) {
   if (nextScreen !== 'settings' && settingsAnyDirty()) {
     if (!confirm('Leave Settings and discard unsaved changes?')) return false;
     SETTINGS_FORMS.forEach(f => { delete S.forms[f]; delete SETTING_ERRORS[f]; });
+    authorizationDraft = null;
   }
   if (nextScreen !== 'settings' || nextSection !== S.settingsSection) settingsClearSecrets();
   return true;
@@ -132,7 +171,7 @@ function renderPreferenceSettings() {
   return settingsGroup('Your next role', 'These preferences guide discovery and ranking.', settingsChips(['target_roles', 'preferred_locations', 'countries'])) +
     settingsGroup('Skills & interests', '', settingsChips(['primary_skills', 'secondary_skills', 'industries', 'exclude_companies', 'languages'])) +
     settingsGroup('Availability & expectations', '', `<div class="settings-grid">${settingsField('preferences', 'total_experience', 'Experience (years)', 'type="number" min="0" step="0.5"')}${settingsField('preferences', 'notice_period', 'Notice period (days)', 'type="number" min="0" step="1"', 'Use 0 if you are available immediately.')}${settingsField('preferences', 'compensation_notes', 'Expected compensation', 'placeholder="e.g. INR 75 lakh / year"', 'Include currency and pay period.')}</div>`) +
-    settingsGroup('Work arrangements', '', `<label class="field" for="preferences-work_authorization">Work authorization & visa notes${textareaF('preferences', 'work_authorization', sp.work_authorization)}</label><div class="settings-checks">${checkF('preferences', 'open_to_relocation', sp.open_to_relocation, 'Open to relocation')}${checkF('preferences', 'open_to_hybrid', sp.open_to_hybrid, 'Open to hybrid')}${checkF('preferences', 'open_to_contract', sp.open_to_contract, 'Open to contract')}</div>`) + settingsFooter('preferences');
+    settingsGroup('Work arrangements', '', `<div class="field"><span>Work authorization by country</span>${authorizationEditor(sp.work_authorization)}</div><div class="settings-checks">${checkF('preferences', 'open_to_relocation', sp.open_to_relocation, 'Open to relocation')}${checkF('preferences', 'open_to_hybrid', sp.open_to_hybrid, 'Open to hybrid')}${checkF('preferences', 'open_to_contract', sp.open_to_contract, 'Open to contract')}</div>`) + settingsFooter('preferences');
 }
 function renderResumeSettings() {
   const docs = D.resumes || [], stale = docs.find(d => d.active && !d.in_use);
@@ -215,6 +254,7 @@ async function settingsSave(form) {
     if (form === 'account') await api('/api/auth/password', { method: 'POST', body: S.forms.account });
     if (form === 'workflow') await saveWorkflowSettings();
     delete S.forms[form];
+    if (form === 'preferences') authorizationDraft = null;
     if (form === 'resumes') D.resumes = await api('/api/profile/resumes');
     if (['profile', 'preferences', 'ai'].includes(form)) await refreshSettingsSummary(form);
   }, form === 'account' ? 'Password updated. Other sessions are signed out.' : 'Changes saved');
@@ -257,7 +297,9 @@ const SETTINGS_ACTIONS = {
   'settings-retry': async () => { D.settingsLoadError = ''; render(); await load(); },
   'settings-section': el => settingsNavigate(el.value),
   'settings-save': el => settingsSave(el.dataset.form),
-  'settings-discard': el => { const f = el.dataset.form; delete S.forms[f]; delete SETTING_ERRORS[f]; delete SETTINGS_SUCCESS[f]; render(); },
+  'settings-discard': el => { const f = el.dataset.form; delete S.forms[f]; if (f === 'preferences') authorizationDraft = null; delete SETTING_ERRORS[f]; delete SETTINGS_SUCCESS[f]; render(); },
+  'auth-add': () => { settingsAuthUpdate(); authorizationDraft.rows.push({ country: '', status: '' }); render(); document.querySelector('[data-auth-row]:last-child [data-auth-country]')?.focus(); },
+  'auth-remove': el => { settingsAuthUpdate(); authorizationDraft.rows.splice(Number(el.dataset.index), 1); render(); },
   'settings-key-edit': el => { delete S.forms.keys; delete SETTING_ERRORS.keys; editingKey = editingKey === el.dataset.id ? null : el.dataset.id; render(); document.getElementById(`keys-${editingKey}`)?.focus(); },
   'key-remove': el => {
     if (!confirm('Remove this saved key? Work needing it pauses until a replacement is added.')) return;

@@ -170,6 +170,20 @@ describe('focused settings UI', () => {
     fetchMock.mockResolvedValueOnce(response(ui.D.profile)); await ui.settingsSave('preferences');
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ search_preferences: { primary_skills: ['Python', 'Rust'] } });
   });
+  it('captures country-specific work authorization and arrangement choices', () => {
+    section('preferences');
+    const country = document.getElementById('preferences-auth-country-0');
+    const status = document.getElementById('preferences-auth-status-0');
+    country.value = 'India'; country.dispatchEvent(new Event('change', { bubbles: true }));
+    status.value = 'Citizen'; status.dispatchEvent(new Event('change', { bubbles: true }));
+    ui.A['auth-add']({});
+    document.getElementById('preferences-auth-country-1').value = 'Singapore';
+    document.getElementById('preferences-auth-country-1').dispatchEvent(new Event('change', { bubbles: true }));
+    document.getElementById('preferences-auth-status-1').value = 'EP (Employment Pass)';
+    document.getElementById('preferences-auth-status-1').dispatchEvent(new Event('change', { bubbles: true }));
+    expect(ui.settingsPayload('preferences')).toMatchObject({ work_authorization: 'India — Citizen\nSingapore — EP (Employment Pass)' });
+    expect(document.querySelectorAll('[data-auth-row]').length).toBe(2);
+  });
   it('removes a saved key only after confirmation and clears cancelled editors', async () => {
     section('api-keys'); ui.A['settings-key-edit']({ dataset: { id: 'openai' } });
     input('keys-openai', 'discard-this');
