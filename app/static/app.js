@@ -1703,6 +1703,7 @@ document.addEventListener('click', e => {
 let filterTimer, paletteTimer;
 document.addEventListener('input', e => {
   const el = e.target;
+  if (el.dataset.authEntry || el.dataset.authNotes) { settingsAuthUpdate(); return; }
   if (el.dataset.form && el.dataset.field) {
     setF(el.dataset.form, el.dataset.field, el.type === 'checkbox' ? el.checked : el.value);
     if (el.dataset.live || el.type === 'radio') render();
@@ -1724,6 +1725,7 @@ document.addEventListener('input', e => {
 });
 document.addEventListener('change', e => {
   const el = e.target;
+  if (el.dataset.authEntry) { settingsAuthUpdate(); return; }
   if (el.dataset.form && el.dataset.field && (el.tagName === 'SELECT' || el.type === 'checkbox' || el.type === 'radio')) {
     setF(el.dataset.form, el.dataset.field, el.type === 'checkbox' ? el.checked : el.value);
     if (el.type === 'radio') render();
