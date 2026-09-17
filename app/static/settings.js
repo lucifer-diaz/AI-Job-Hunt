@@ -195,6 +195,10 @@ async function settingsRun(form, action, success) {
   catch (err) { SETTING_ERRORS[form] = err.message; }
   finally { delete S.busy[key]; render(); if (SETTING_ERRORS[form]) document.getElementById('settings-error')?.scrollIntoView?.({ block: 'nearest' }); }
 }
+async function refreshSettingsSummary(form) {
+  try { D.summary = await api('/api/workspace/summary'); }
+  catch (err) { SETTING_ERRORS[form] = `Changes saved, but the sidebar could not refresh: ${err.message}. Reload to refresh it.`; }
+}
 async function settingsSave(form) {
   settingsPendingTags(form).forEach(el => commitTag(el, false));
   try { if (!settingsValidate(form)) return; }
@@ -212,16 +216,22 @@ async function settingsSave(form) {
     if (form === 'workflow') await saveWorkflowSettings();
     delete S.forms[form];
     if (form === 'resumes') D.resumes = await api('/api/profile/resumes');
+    if (['profile', 'preferences', 'ai'].includes(form)) await refreshSettingsSummary(form);
   }, form === 'account' ? 'Password updated. Other sessions are signed out.' : 'Changes saved');
 }
 async function saveWorkflowSettings() {
   const changes = settingsChanges('workflow');
   const approval = Object.fromEntries(Object.entries(changes).filter(([k]) => ['application_mode', 'min_review_score'].includes(k)).map(([k, v]) => [k, k === 'min_review_score' ? Number(v) : v]));
   const cadence = Object.fromEntries(Object.entries(changes).filter(([k]) => ['weekly_target', 'followup_days'].includes(k)).map(([k, v]) => [k, Number(v)]));
-  if (Object.keys(approval).length) D.settings = await api('/api/settings', { method: 'PATCH', body: approval });
-  if (Object.keys(cadence).length) {
-    try { D.prefs = await api('/api/preferences', { method: 'PUT', body: cadence }); }
-    catch (err) { throw new Error(`${Object.keys(approval).length ? 'Approval settings saved. ' : ''}Cadence could not be saved: ${err.message}`); }
+  let saved = false;
+  try {
+    if (Object.keys(approval).length) { D.settings = await api('/api/settings', { method: 'PATCH', body: approval }); saved = true; }
+    if (Object.keys(cadence).length) {
+      try { D.prefs = await api('/api/preferences', { method: 'PUT', body: cadence }); saved = true; }
+      catch (err) { throw new Error(`${Object.keys(approval).length ? 'Approval settings saved. ' : ''}Cadence could not be saved: ${err.message}`); }
+    }
+  } finally {
+    if (saved) await refreshSettingsSummary('workflow');
   }
 }
 function settingsResumeGuard() {
@@ -257,9 +267,9 @@ const SETTINGS_ACTIONS = {
   'resume-use': el => settingsUseResume(el.dataset.id),
   'resume-delete': el => {
     if (!confirm(`Delete ${el.dataset.name}? This cannot be undone.`)) return;
-    const replacesText = D.resumes.some(d => d.id === Number(el.dataset.id) && d.active);
+    const replacesText = D.resumes.length > 1 && D.resumes.some(d => d.id === Number(el.dataset.id) && d.active);
     if (replacesText && !settingsResumeGuard()) return;
-    return settingsRun('resumes', async () => { const out = await api(`/api/profile/resumes/${el.dataset.id}`, { method: 'DELETE' }); D.resumes = out.resumes; if (replacesText) delete S.forms.resumes; D.profile = await api('/api/profile'); }, 'Resume deleted');
+    return settingsRun('resumes', async () => { const out = await api(`/api/profile/resumes/${el.dataset.id}`, { method: 'DELETE' }); D.resumes = out.resumes; if (replacesText && out.promoted != null) delete S.forms.resumes; D.profile = await api('/api/profile'); }, 'Resume deleted');
   },
   'parse-evidence': () => {
     if (settingsDirty('resumes')) { SETTING_ERRORS.resumes = 'Save your resume text before extracting evidence.'; render(); return; }

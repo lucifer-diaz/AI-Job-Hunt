@@ -8,7 +8,9 @@ Settings uses a section sidebar on desktop and a native section selector below 9
 
 Profile, preferences, resume text, AI, and workflow drafts are independent. Ordinary drafts survive section changes; navigating out of Settings or reloading warns before losing edits. API-key and password drafts are memory-only and are cleared when leaving their section, cancelling, or saving successfully. Saving disables that editor and blocks section navigation until the request finishes. Inline errors retain drafts for retry.
 
-The UI saves changed fields only. Pending chip input is committed before saving, including locations with commas. Valid numeric zero values count toward completeness. Uploading or selecting a primary resume warns before replacing unsaved master text. Parsing evidence requires saved text. Advanced AI overrides and master text are collapsible.
+Profile, preference, AI, and workflow saves refresh the workspace summary so the shell shows the saved identity, model, approval mode, and auto-search counts. A summary-refresh failure is reported separately from a successful save and does not restore an already-saved draft. Partial workflow saves also refresh the summary.
+
+The UI saves changed fields only. Pending chip input is committed before saving, including locations with commas. Valid numeric zero values count toward completeness. Uploading or selecting a primary resume warns before replacing unsaved master text. Deleting the only uploaded resume preserves master text and any draft; confirmed drafts are cleared only when the backend promotes a replacement. Parsing evidence requires saved text. Advanced AI overrides and master text are collapsible.
 
 ## API contracts
 
@@ -25,7 +27,7 @@ Existing profile/settings PUT routes remain available with their previous replac
 
 Partial JSON updates reload the row under a write lock. PostgreSQL uses `FOR UPDATE`; SQLite first acquires its single-writer lock with a no-op row update. This prevents simultaneous section saves from dropping each other's nested values. Concurrent writes to the same field remain last-write-wins.
 
-Password changes require 10–256 characters, matching confirmation, a correct current password, and a different new password. Hash replacement, revocation of all existing sessions, and creation of the replacement session commit atomically. A compare-and-swap check prevents a stale concurrent change from replacing a newer password. Password values are omitted from validation error responses.
+Password changes require 10–256 characters, matching confirmation, a correct current password, and a different new password. Hash replacement, revocation of all existing sessions, and creation of the replacement session commit atomically. A compare-and-swap check prevents a stale concurrent change from replacing a newer password. Login conditionally updates the account using the password hash it verified, then inserts its session in that same transaction. Its write lock spans the recheck and session insert: if rotation wins, the old-password login fails; if login wins, rotation revokes its newly created session. Scrypt verification never holds the global throttle bookkeeping lock. Password values are omitted from validation error responses.
 
 Errors: `401` unauthenticated, `403` incorrect current password, `409` conflicting password change, `422` invalid input, and `429` throttled attempts. Five failed current-password checks trigger the existing 15-minute, process-local throttle. Multi-worker installations should enforce a shared limit at the edge or replace the existing throttle with shared storage; this change does not introduce a distributed limiter.
 

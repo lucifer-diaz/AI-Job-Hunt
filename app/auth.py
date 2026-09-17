@@ -162,6 +162,16 @@ def start_session(db: Session, user_id: int) -> str:
     return token
 
 
+def _start_verified_session(db: Session, user: User) -> str:
+    """Hold the account write lock from hash recheck through session creation."""
+    changed = db.execute(update(User).where(User.id == user.id, User.password_hash == user.password_hash)
+                         .values(last_login_at=utcnow()))
+    if changed.rowcount != 1:
+        raise HTTPException(401, "Email or password is incorrect")
+    # start_session commits both this conditional update and the new session.
+    return start_session(db, user.id)
+
+
 def session_user(request: Request) -> CurrentUser | None:
     """The user whose valid session cookie came with this request."""
     token = request.cookies.get(SESSION_COOKIE)
@@ -252,11 +262,10 @@ def login(payload: LoginIn, request: Request, response: Response, db: Session = 
         with _failures_lock:
             _failures[email].append(now)
         raise HTTPException(401, "Email or password is incorrect")
+    token = _start_verified_session(db, user)
     with _failures_lock:
         _failures.pop(email, None)
-    user.last_login_at = utcnow()
-    db.commit()
-    _set_session_cookie(response, request, start_session(db, user.id))
+    _set_session_cookie(response, request, token)
     return {"user": CurrentUser(user.id, user.email, user.is_admin).public()}
 
 
@@ -280,9 +289,10 @@ def _check_current_password(user: User, password: str) -> None:
     with _failures_lock:
         if _recent_failures(key, now) >= LOGIN_FAILURE_LIMIT:
             raise HTTPException(429, "Too many failed attempts. Try again in 15 minutes.")
-        if not verify_password(password, user.password_hash):
-            _failures[key].append(now)
-            raise HTTPException(403, "Current password is incorrect")
+    if not verify_password(password, user.password_hash):
+        with _failures_lock:
+            _failures[key].append(time.monotonic())
+        raise HTTPException(403, "Current password is incorrect")
 
 
 def _replace_password_session(db: Session, user: User, password: str) -> str:

@@ -11,6 +11,7 @@ let ui, fetchMock, context;
 function response(data, status = 200) { return { ok: status < 400, status, text: async () => JSON.stringify(data) }; }
 function data() {
   return { profile: { name: 'Alex Morgan', headline: 'Engineering leader', email: 'alex@example.com', phone: '123', location: 'Mumbai', linkedin_url: '', github_url: '', master_resume: 'My resume', target_roles: ['Lead'], preferred_locations: ['Mumbai, India'], work_authorization: 'Citizen', compensation_notes: 'INR 75 lakh', search_preferences: { total_experience: 0, notice_period: 0, primary_skills: ['Python'] } },
+    summary: { profile: { name: 'Alex Morgan', headline: 'Engineering leader' }, counts: {}, model: 'default-model', llm_provider: 'openai', application_mode: 'manual_approval', auto_search: { schedule: 'daily', roles: 1, locations: 1, last_run: null } },
     resumes: [], prefs: { weekly_target: 10, followup_days: 7, warn_closing: false },
     settings: { secret_storage: true, keys: Object.fromEntries(['openai', 'openrouter', 'anthropic', 'apify'].map(k => [k, { configured: k === 'openai', hint: k === 'openai' ? '…1234' : '' }])), configured: { openai: true, mock: true }, application_mode: 'manual_approval', min_review_score: 70,
       ai: { saved: { llm_provider: '', model: '', require_free: null, stage_models: {} }, env: { llm_provider: 'openai', models: { openai: 'default-model' }, require_free: true, stage_models: {} } } } };
@@ -25,7 +26,7 @@ beforeEach(() => {
   document.body.innerHTML = '<script id="boot" type="application/json">{"user":{"email":"login@example.com"},"max_upload_mb":10}</script><div id="nav"></div><div id="side-foot"></div><div id="side-meta"></div><div id="brand-sub"></div><div id="top"></div><div id="view"></div><div id="overlays"></div><div id="toast"></div>';
   vi.stubGlobal('confirm', vi.fn(() => true));
   vi.stubGlobal('scrollTo', vi.fn());
-  fetchMock = vi.fn(async () => response({})); vi.stubGlobal('fetch', fetchMock);
+  fetchMock = vi.fn(async url => response(url === '/api/workspace/summary' ? ui.D.summary : {})); vi.stubGlobal('fetch', fetchMock);
   // Each isolated iframe-like jsdom document needs the same production event registration just once.
   if (!ui) {
     context = createContext({ document, window, location, history, navigator, URLSearchParams, FormData, File, setTimeout, clearTimeout, setInterval, clearInterval, console });
@@ -217,7 +218,7 @@ describe('focused settings UI', () => {
   it('saves cadence alone and never writes untouched approval settings', async () => {
     section('workflow'); ui.setF('workflow', 'followup_days', '14');
     fetchMock.mockResolvedValueOnce(response({ ...ui.D.prefs, followup_days: 14 }));
-    await ui.settingsSave('workflow'); expect(fetchMock).toHaveBeenCalledTimes(1);
+    await ui.settingsSave('workflow'); expect(fetchMock.mock.calls.filter(([, options]) => options.method !== 'GET')).toHaveLength(1);
     expect(fetchMock.mock.calls[0][0]).toBe('/api/preferences'); expect(ui.D.prefs.followup_days).toBe(14);
   });
   it('supports section selector changes and password reuse validation', async () => {
@@ -245,6 +246,77 @@ describe('focused settings UI', () => {
     window.dispatchEvent(new HashChangeEvent('hashchange'));
     await new Promise(resolve => setTimeout(resolve, 0));
     expect(ui.S.forms.profile.name).toBe('Still editing');
+  });
+
+  it('refreshes saved identity without clearing other section drafts', async () => {
+    input('profile-name', 'Updated identity');
+    ui.setF('preferences', 'notice_period', '14');
+    const summary = { ...ui.D.summary, profile: { name: 'Updated identity', headline: 'Updated headline' } };
+    fetchMock.mockResolvedValueOnce(response({ ...ui.D.profile, name: 'Updated identity' })).mockResolvedValueOnce(response(summary));
+    await ui.settingsSave('profile');
+    expect(fetchMock.mock.calls[1][0]).toBe('/api/workspace/summary');
+    expect(document.getElementById('brand-sub').textContent).toBe('Updated identity · Updated headline');
+    expect(ui.S.forms.preferences.notice_period).toBe('14');
+  });
+  it('refreshes the effective model shown in the shell after an AI save', async () => {
+    section('ai'); ui.setF('ai', 'model', 'updated-model');
+    fetchMock.mockResolvedValueOnce(response({ ...ui.D.settings, model: 'updated-model' }));
+    fetchMock.mockResolvedValueOnce(response({ ...ui.D.summary, model: 'updated-model' }));
+    await ui.settingsSave('ai');
+    expect(document.getElementById('side-meta').textContent).toContain('updated-model');
+  });
+  it('refreshes auto-search counts after preference saves', async () => {
+    section('preferences'); ui.setF('preferences', 'target_roles', ['Staff', 'Lead']);
+    const summary = { ...ui.D.summary, auto_search: { ...ui.D.summary.auto_search, roles: 2, locations: 3 } };
+    fetchMock.mockResolvedValueOnce(response({ ...ui.D.profile, target_roles: ['Staff', 'Lead'] })).mockResolvedValueOnce(response(summary));
+    await ui.settingsSave('preferences');
+    expect(document.getElementById('side-foot').textContent).toContain('2 roles × 3 locations');
+  });
+  it('refreshes the shell even if cadence fails after approval settings save', async () => {
+    section('workflow'); ui.setF('workflow', 'application_mode', 'automatic'); ui.setF('workflow', 'followup_days', '14');
+    fetchMock.mockResolvedValueOnce(response({ ...ui.D.settings, application_mode: 'automatic' }));
+    fetchMock.mockResolvedValueOnce(response({ detail: 'Cadence offline' }, 503));
+    fetchMock.mockResolvedValueOnce(response({ ...ui.D.summary, application_mode: 'automatic' }));
+    await ui.settingsSave('workflow');
+    expect(document.getElementById('side-meta').textContent).toContain('automatic');
+    expect(ui.SETTING_ERRORS.workflow).toContain('Approval settings saved');
+    expect(ui.settingsChanges('workflow')).toEqual({ followup_days: '14' });
+  });
+  it('distinguishes summary-refresh failure from save failure', async () => {
+    input('profile-name', 'Already saved');
+    fetchMock.mockResolvedValueOnce(response({ ...ui.D.profile, name: 'Already saved' }));
+    fetchMock.mockResolvedValueOnce(response({ detail: 'Offline' }, 503));
+    await ui.settingsSave('profile');
+    expect(ui.D.profile.name).toBe('Already saved');
+    expect(ui.S.forms.profile).toBeUndefined();
+    expect(ui.SETTING_ERRORS.profile).toContain('Changes saved, but the sidebar could not refresh');
+    expect(document.querySelector('[data-settings-save]').disabled).toBe(true);
+    expect(ui.D.summary.profile.name).toBe('Alex Morgan');
+  });
+  it('preserves unsaved edits when the only uploaded resume is deleted', async () => {
+    section('resumes'); ui.D.resumes = [{ id: 1, filename: 'only.txt', active: true }];
+    ui.setF('resumes', 'master_resume', 'Do not discard this draft');
+    fetchMock.mockResolvedValueOnce(response({ promoted: null, resumes: [] })).mockResolvedValueOnce(response(ui.D.profile));
+    await ui.A['resume-delete']({ dataset: { id: '1', name: 'only.txt' } });
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(ui.S.forms.resumes.master_resume).toBe('Do not discard this draft');
+    expect(ui.settingsDirty('resumes')).toBe(true);
+  });
+  it('clears a confirmed draft only when the backend actually promotes a replacement', async () => {
+    section('resumes'); ui.D.resumes = [{ id: 1, filename: 'primary.txt', active: true }, { id: 2, filename: 'replacement.txt', active: false }];
+    ui.setF('resumes', 'master_resume', 'Draft');
+    fetchMock.mockResolvedValueOnce(response({ promoted: 2, resumes: [] })).mockResolvedValueOnce(response({ ...ui.D.profile, master_resume: 'Replacement text' }));
+    await ui.A['resume-delete']({ dataset: { id: '1', name: 'primary.txt' } });
+    expect(confirm).toHaveBeenCalledTimes(2);
+    expect(ui.S.forms.resumes).toBeUndefined();
+    expect(ui.D.profile.master_resume).toBe('Replacement text');
+  });
+  it('retains a draft when an expected replacement disappeared before deletion', async () => {
+    section('resumes'); ui.D.resumes = [{ id: 1, filename: 'primary.txt', active: true }, { id: 2, filename: 'replacement.txt', active: false }];
+    ui.setF('resumes', 'master_resume', 'Draft');
+    fetchMock.mockResolvedValueOnce(response({ promoted: null, resumes: [] })).mockResolvedValueOnce(response(ui.D.profile));
+    await ui.A['resume-delete']({ dataset: { id: '1', name: 'primary.txt' } });
+    expect(ui.S.forms.resumes.master_resume).toBe('Draft');
   });
 
 });

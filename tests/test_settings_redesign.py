@@ -215,3 +215,134 @@ def test_concurrent_nested_edits_take_a_write_lock(account, kind):
     with SessionLocal() as db:
         value = getattr(factory(db, user_id), field)
         assert value['first_editor'] and value['second_editor']
+
+
+def test_login_verified_before_rotation_cannot_create_a_session_afterward(account, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    client, email, user_id = account
+    attacker = TestClient(app)
+    verified, release = Event(), Event()
+    original_verify = auth.verify_password
+
+    def pause_after_verification(password, stored):
+        valid = original_verify(password, stored)
+        if password == OLD and not verified.is_set():
+            verified.set()
+            assert release.wait(5)
+        return valid
+
+    monkeypatch.setattr(auth, 'verify_password', pause_after_verification)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        login = pool.submit(attacker.post, '/api/auth/login', json={'email': email, 'password': OLD})
+        try:
+            assert verified.wait(3)
+            assert client.post('/api/auth/password', json=password_body()).status_code == 200
+        finally:
+            release.set()
+        result = login.result(timeout=5)
+    assert result.status_code == 401
+    assert 'set-cookie' not in result.headers
+    assert attacker.get('/api/auth/me').status_code == 401
+    assert client.get('/api/auth/me').status_code == 200
+    with SessionLocal() as db:
+        assert len(db.scalars(select(UserSession).where(UserSession.user_id == user_id)).all()) == 1
+
+
+def test_rotation_waits_for_an_inflight_login_and_revokes_its_session(account, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    client, email, _ = account
+    attacker = TestClient(app)
+    creating_session, release, rotating = Event(), Event(), Event()
+    original_start = auth.start_session
+
+    def pause_session_creation(db, user_id):
+        creating_session.set()
+        assert release.wait(5)
+        return original_start(db, user_id)
+
+    def rotate():
+        rotating.set()
+        return client.post('/api/auth/password', json=password_body())
+
+    monkeypatch.setattr(auth, 'start_session', pause_session_creation)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        login = pool.submit(attacker.post, '/api/auth/login', json={'email': email, 'password': OLD})
+        try:
+            assert creating_session.wait(3)
+            rotation = pool.submit(rotate)
+            assert rotating.wait(3)
+            # The account lock must span session insertion, not only last_login_at.
+            from concurrent.futures import TimeoutError
+            with pytest.raises(TimeoutError):
+                rotation.result(timeout=0.15)
+        finally:
+            release.set()
+        assert login.result(timeout=5).status_code == 200
+        assert rotation.result(timeout=5).status_code == 200
+    assert attacker.get('/api/auth/me').status_code == 401
+    assert client.get('/api/auth/me').status_code == 200
+
+
+def test_password_scrypt_does_not_block_other_accounts_login(account, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    _, _, user_id = account
+    other = TestClient(app)
+    email = f'independent-{uuid.uuid4().hex}@example.com'
+    assert other.post('/api/auth/signup', json={
+        'email': email, 'password': OLD, 'confirm_password': OLD}).status_code == 201
+    with SessionLocal() as db:
+        user = db.get(User, user_id)
+    verifying, release = Event(), Event()
+    original_verify = auth.verify_password
+
+    def slow_password_check(password, stored):
+        if stored == user.password_hash:
+            verifying.set()
+            assert release.wait(5)
+        return original_verify(password, stored)
+
+    monkeypatch.setattr(auth, 'verify_password', slow_password_check)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        check = pool.submit(auth._check_current_password, user, OLD)
+        try:
+            assert verifying.wait(3)
+            login = pool.submit(other.post, '/api/auth/login', json={'email': email, 'password': OLD})
+            assert login.result(timeout=2).status_code == 200
+        finally:
+            release.set()
+        check.result(timeout=5)
+
+
+def test_login_session_failure_rolls_back_last_login_update(account, monkeypatch):
+    _, email, user_id = account
+    with SessionLocal() as db:
+        before = db.get(User, user_id).last_login_at
+
+    def fail_session(db, user_id):
+        raise RuntimeError('session insert failed')
+
+    monkeypatch.setattr(auth, 'start_session', fail_session)
+    with pytest.raises(RuntimeError, match='session insert failed'):
+        TestClient(app).post('/api/auth/login', json={'email': email, 'password': OLD})
+    with SessionLocal() as db:
+        assert db.get(User, user_id).last_login_at == before
+        assert len(db.scalars(select(UserSession).where(UserSession.user_id == user_id)).all()) == 1
+
+
+def test_deleting_the_only_resume_preserves_saved_master_text(account):
+    client, _, _ = account
+    uploaded = client.post('/api/profile/resume', files={
+        'file': ('only.txt', b'Uploaded text', 'text/plain')})
+    assert uploaded.status_code == 200
+    client.patch('/api/profile', json={'master_resume': 'Edited saved text'})
+    deleted = client.delete(f"/api/profile/resumes/{uploaded.json()['id']}")
+    assert deleted.status_code == 200
+    assert deleted.json()['promoted'] is None
+    assert deleted.json()['resumes'] == []
+    assert client.get('/api/profile').json()['master_resume'] == 'Edited saved text'
