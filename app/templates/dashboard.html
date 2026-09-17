@@ -17,7 +17,7 @@
     </div>
     <nav id="nav">
       <div class="nav-group"><div class="nav-caps">WORKSPACE</div>
-        {% for id, label in [('overview','Overview'),('today','Today'),('discovery','Discovery'),('tailor','Tailor'),('approvals','Approvals'),('tracker','Tracker')] %}
+        {% for id, label in [('overview','Overview'),('today','Today'),('discovery','Discovery'),('tailor','Tailor'),('approvals','Approvals'),('tracker','Tracker'),('monitoring','Monitoring')] %}
         <a class="nav-btn" href="#{{ id }}"><span>{{ label }}</span></a>
         {% endfor %}
       </div>
@@ -38,6 +38,7 @@
 <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 <script type="application/json" id="boot">{{ {"max_upload_mb": max_upload_mb, "version": version, "user": user}|tojson }}</script>
 <script src="/static/settings.js?v={{ version }}"></script>
+<script src="/static/monitoring.js?v={{ version }}"></script>
 <script src="/static/app.js?v={{ version }}"></script>
 </body>
 </html>

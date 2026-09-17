@@ -13,12 +13,14 @@ from sqlalchemy.orm import Session
 
 from app.models import AppSetting, CandidateProfile
 from app.security import decrypt_secret, encrypt_secret
+from app.services.ai_config import resolve as resolve_ai_config
 from app.settings import get_settings
 from app.tenancy import require_user_id
 
 KEY_COLUMNS = {"openrouter": "openrouter_api_key_enc", "openai": "openai_api_key_enc",
-               "anthropic": "anthropic_api_key_enc", "apify": "apify_api_token_enc"}
-KEY_LABELS = {"openrouter": "OpenRouter", "openai": "OpenAI", "anthropic": "Anthropic", "apify": "Apify"}
+               "anthropic": "anthropic_api_key_enc", "gemini": "gemini_api_key_enc", "apify": "apify_api_token_enc"}
+KEY_LABELS = {"openrouter": "OpenRouter", "openai": "OpenAI", "anthropic": "Anthropic", "gemini": "Gemini",
+              "apify": "Apify"}
 
 Row = TypeVar("Row", CandidateProfile, AppSetting)
 
@@ -90,3 +92,11 @@ def set_user_keys(db: Session, updates: dict[str, str | None], user_id: int | No
         clean = value.strip()
         setattr(row, KEY_COLUMNS[name], encrypt_secret(clean) if clean else None)
     db.commit()
+
+
+def ai_ready(db: Session, user_id: int) -> tuple[bool, str]:
+    """Whether this account's chosen AI provider can be called, so workers never burn attempts on a missing key."""
+    provider = resolve_ai_config(get_settings(), ai_overrides(db, user_id))["llm_provider"]
+    if provider == "mock" or user_keys(db, user_id).get(provider):
+        return True, ""
+    return False, f"No {KEY_LABELS.get(provider, provider)} API key saved in Settings"

@@ -4,7 +4,7 @@ os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite:///./te
 
 from app.db import Base, SessionLocal, engine
 from app.models import Evidence, Job
-from app.services.workflow import approve_job, get_profile, mark_applied, rank_job, tailor_job
+from app.services.workflow import approve_job, get_profile, mark_applied, tailor_job
 
 
 def setup_function():
@@ -28,9 +28,8 @@ def test_core_happy_path():
     db.commit()
     db.refresh(job)
 
-    result = rank_job(db, job)
-    assert result["score"] == 80
-    resume = tailor_job(db, job)
+    resume = tailor_job(db, job)  # ranking is asynchronous and not needed to tailor
+    assert job.fit_score is None
     assert resume.reviewer_score == 86
     app = approve_job(db, job)
     assert app.status == "approved"

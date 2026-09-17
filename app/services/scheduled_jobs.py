@@ -9,14 +9,13 @@ with that account's own API keys and preferences: its search schedule, auto-rank
 provider. One account failing never stops the others.
 
 Every job is safe to run twice, including at the same moment from two app instances:
-- row-level work is claimed with PostgreSQL locks (work_queue leases or FOR UPDATE SKIP LOCKED);
-- finished work is detected from the database before acting (fit_score, compensation_checked_at,
+- row-level work is claimed with PostgreSQL locks (ranking task and work_queue leases, FOR UPDATE SKIP LOCKED);
+- finished work is detected from the database before acting (ranking tasks and inputs, compensation_checked_at,
   SearchRun.completed_at, existing follow-up drafts, a search run started within the interval).
 """
 from __future__ import annotations
 
 import asyncio
-import re
 from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -28,24 +27,20 @@ from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from app.models import Application, Job, SearchRun, User
+from app.services import ai_advisor, monitoring, ranker
 from app.services import work_queue as wq
-from app.services.ai_config import resolve as resolve_ai_config
 from app.services.compensation import enrich_compensation
-from app.services.lifecycle import ErrorCategory
 from app.services.lifecycle import WorkflowState as S
-from app.services.llm import LLMError
 from app.services.hunter import run_due_profiles
 from app.services.sources import refresh_apify_run
-from app.services.user_settings import KEY_LABELS, ai_overrides, apify_token, profile_for, user_keys
-from app.services.workflow import create_due_followups, rank_job
+from app.services.user_settings import ai_ready, apify_token
+from app.services.workflow import create_due_followups
 from app.settings import get_settings
 from app.workspace import get_search_profile, run_search_profile
 
 SessionFactory = Callable[[], Session]
-# Jobs waiting for ranking: the deterministic normalize and filter steps run first, then the LLM.
-RANK_PENDING_STATES = (S.DISCOVERED, S.NORMALIZED, S.FILTERED)
-RANK_OUTCOMES = ("ranked", "filtered_out", "retrying", "failed", "released", "lost")
-CONFIG_ERROR = re.compile(r"is missing|REQUIRE_FREE|Unsupported LLM_PROVIDER", re.I)
+# Jobs not ranked yet: before the ranker's hard filters, waiting for it, or being ranked.
+RANK_PENDING_STATES = ranker.RANK_WAITING_STATES
 
 
 @dataclass(frozen=True)
@@ -87,14 +82,6 @@ def _account_ids(ctx: JobContext) -> list[int]:
 
 def _error(user_id: int, exc: Exception) -> dict[str, Any]:
     return {"user_id": user_id, "error": f"{type(exc).__name__}: {exc}"[:300]}
-
-
-def ai_ready(db: Session, user_id: int) -> tuple[bool, str]:
-    """Whether this account's chosen AI provider can be called, so workers never burn attempts on a missing key."""
-    provider = resolve_ai_config(get_settings(), ai_overrides(db, user_id))["llm_provider"]
-    if provider == "mock" or user_keys(db, user_id).get(provider):
-        return True, ""
-    return False, f"No {KEY_LABELS.get(provider, provider)} API key saved in Settings"
 
 
 # ───────────── hunter / Apify ─────────────
@@ -183,93 +170,35 @@ def apify_sync(ctx: JobContext) -> dict[str, Any]:
 
 # ───────────── ranking ─────────────
 
-def filter_reason(db: Session, job: Job) -> str | None:
-    if job.status == "dismissed":
-        return "Dismissed in triage"
-    preferences = profile_for(db, job.user_id).search_preferences or {}
-    excluded = {str(c).strip().lower() for c in preferences.get("exclude_companies") or [] if str(c).strip()}
-    if (job.company or "").strip().lower() in excluded:
-        return f"{job.company} is an excluded company"
-    return None
-
-
-def _record_failure(db: Session, claimed: wq.Claim, exc: Exception) -> str:
-    try:
-        if isinstance(exc, LLMError) and CONFIG_ERROR.search(str(exc)):
-            wq.release(db, claimed)  # configuration problem: hand the job back without using an attempt
-            return "released"
-        category = ErrorCategory.EXTERNAL_SERVICE if isinstance(exc, LLMError) else ErrorCategory.UNKNOWN
-        job = wq.fail(db, claimed, category, f"{type(exc).__name__}: {exc}")
-        return "failed" if job.state is S.FAILED else "retrying"
-    except wq.LeaseLost:
-        return "lost"
-
-
-def rank_claimed_job(sessions: SessionFactory, claimed: wq.Claim) -> str:
-    """Normalize, filter and rank one claimed job as its owner, committing each step on its own."""
-    current = claimed
-    with sessions() as db:
-        try:
-            job = db.get(Job, claimed.job_id)
-            if job is None or job.user_id is None:
-                return "lost"
-            _as_user(db, job.user_id)  # the owner's profile, evidence and AI key from here on
-            if job.state is S.DISCOVERED:
-                if not (job.title or "").strip() or not (job.company or "").strip():
-                    wq.complete(db, current, S.SKIPPED, reason="Missing title or company")
-                    return "filtered_out"
-                current = wq.advance(db, current, S.NORMALIZED, reason="Title and company present")
-            if job.state is S.NORMALIZED:
-                reason = filter_reason(db, job)
-                if reason:
-                    wq.complete(db, current, S.SKIPPED, reason=reason)
-                    return "filtered_out"
-                current = wq.advance(db, current, S.FILTERED, reason="Passed search filters")
-            if job.fit_score is None:  # already-ranked jobs (e.g. from the dashboard) are not re-billed
-                rank_job(db, job)
-            wq.complete(db, current, S.RANKED, reason=f"Fit score {job.fit_score:.0f}")
-            return "ranked"
-        except wq.LeaseLost:
-            return "lost"
-        except Exception as exc:
-            db.rollback()
-            return _record_failure(db, current, exc)
-
-
-def ranking_accounts(db: Session) -> list[int]:
-    """Accounts whose jobs may be ranked now: auto-ranking on and a usable AI key saved."""
-    eligible = []
-    for user_id in db.scalars(select(User.id).order_by(User.id)).all():
-        search = (profile_for(db, user_id).search_preferences or {}).get("search_profile") or {}
-        if search.get("auto_rank", True) and ai_ready(db, user_id)[0]:
-            eligible.append(user_id)
-    return eligible
-
-
-def _claim_rank_batch(ctx: JobContext) -> list[wq.Claim] | str:
+def _prepare_ranking(ctx: JobContext) -> tuple[list[ranker.TaskClaim], dict[str, Any]] | str:
+    """Deterministic sweep (filter, queue, recover, re-rank), then claim a bounded batch of ranking tasks."""
     with ctx.sessions() as db:
         if not _is_postgres(db):
             return "Ranking workers need PostgreSQL (FOR UPDATE SKIP LOCKED)"
-        accounts = ranking_accounts(db)  # also creates missing profiles here, not from several threads at once
-        if not accounts:
-            return "No account has auto-ranking on with an AI key saved"
-        return wq.claim(db, RANK_PENDING_STATES, worker_id=ctx.worker_id,
-                        limit=max(1, get_settings().ranking_batch_size), where=[Job.user_id.in_(accounts)])
+        queue = ranker.sweep(db)
+        ready, auto, waiting = ranker.accounts(db)
+        claims = ranker.claim(db, worker_id=ctx.worker_id, limit=max(1, get_settings().ranking_batch_size),
+                              ready_accounts=ready, auto_rank_accounts=auto)
+    return claims, {"queue": queue, "accounts_waiting": waiting}
 
 
 async def ranking(ctx: JobContext) -> dict[str, Any]:
-    """Claim a limited batch of jobs waiting for ranking and process a few at a time."""
-    claims = await asyncio.to_thread(_claim_rank_batch, ctx)
-    if isinstance(claims, str):
-        return skipped(claims)
+    """Claim a limited batch of ranking tasks and run at most RANKING_CONCURRENCY model calls at a time."""
+    prepared = await asyncio.to_thread(_prepare_ranking, ctx)
+    if isinstance(prepared, str):
+        return skipped(prepared)
+    claims, details = prepared
     semaphore = asyncio.Semaphore(max(1, get_settings().ranking_concurrency))
 
-    async def process(claimed: wq.Claim) -> str:
+    async def run(claimed: ranker.TaskClaim) -> str:
         async with semaphore:
-            return await asyncio.to_thread(rank_claimed_job, ctx.sessions, claimed)
+            return await asyncio.to_thread(ranker.process, ctx.sessions, claimed)
 
-    outcomes = Counter(await asyncio.gather(*(process(c) for c in claims)))
-    return {"claimed": len(claims), **{name: outcomes.get(name, 0) for name in RANK_OUTCOMES}}
+    outcomes = Counter(await asyncio.gather(*(run(c) for c in claims)))
+    summary = {"claimed": len(claims), **{name: outcomes.get(name, 0) for name in ranker.OUTCOMES}, **details}
+    if not claims and not any(details["queue"].values()):
+        return skipped("Nothing to rank", **summary)
+    return summary
 
 
 # ───────────── enrichment, applications, follow-ups, inbox ─────────────
@@ -351,11 +280,33 @@ def analytics(ctx: JobContext) -> dict[str, Any]:
 
 
 def cleanup(ctx: JobContext) -> dict[str, Any]:
-    """Recover work whose worker crashed: expired leases are retried or failed."""
+    """Recover work whose worker crashed, and apply LLM telemetry retention (roll up, then delete old rows)."""
     with ctx.sessions() as db:
+        telemetry = monitoring.prune(db, ctx.now)
         if not _is_postgres(db):
-            return skipped("Lease recovery needs PostgreSQL")
-        return {"recovered_leases": wq.recover_expired_leases(db)}
+            return skipped("Lease recovery needs PostgreSQL", telemetry=telemetry)
+        return {"recovered_leases": wq.recover_expired_leases(db), "telemetry": telemetry}
+
+
+ADVISOR_BATCH = 5
+
+
+def ai_optimization(ctx: JobContext) -> dict[str, Any]:
+    """Queue scheduled analyses, then process a few waiting AI optimization tasks. Recommendations only."""
+    with ctx.sessions() as db:
+        queued = ai_advisor.enqueue_scheduled(db, ctx.now)
+        recovered = ai_advisor.recover_expired(db, ctx.now)
+    outcomes: Counter = Counter()
+    for _ in range(ADVISOR_BATCH):
+        claim = ai_advisor.claim_next(ctx.sessions, ctx.worker_id)
+        if claim is None:
+            break
+        outcomes[ai_advisor.process(ctx.sessions, claim)] += 1
+    summary = {"scheduled": queued, "recovered": recovered, **{k: outcomes.get(k, 0) for k in
+                                                               ("completed", "retrying", "failed", "lost")}}
+    if not queued and not recovered and not outcomes:
+        return skipped("No analyses waiting", **summary)
+    return summary
 
 
 JOBS: list[JobSpec] = [
@@ -364,7 +315,7 @@ JOBS: list[JobSpec] = [
     JobSpec("apify_sync", "Apify result sync", "apify_sync_interval_minutes", apify_sync,
             "Imports datasets of Apify runs that finished."),
     JobSpec("ranking", "Job ranking", "ranking_interval_minutes", ranking,
-            "Normalizes, filters and ranks waiting jobs of accounts with auto-ranking on, a few at a time."),
+            "Filters and queues new jobs, then ranks a bounded batch of ranking tasks, a few at a time."),
     JobSpec("compensation", "Salary enrichment", "compensation_interval_minutes", compensation,
             "Records the salary stated in each posting."),
     JobSpec("applications", "Application processing", "application_interval_minutes", applications,
@@ -375,6 +326,8 @@ JOBS: list[JobSpec] = [
             "Reserved for an email provider; currently not configured."),
     JobSpec("analytics", "Analytics", "analytics_interval_minutes", analytics,
             "Stores a pipeline snapshot."),
+    JobSpec("ai_optimization", "AI optimization advisor", "ai_optimization_interval_minutes", ai_optimization,
+            "Analyses LLM usage and writes recommendations; never changes configuration."),
     JobSpec("cleanup", "Cleanup", "cleanup_interval_minutes", cleanup,
-            "Recovers jobs left locked by crashed workers."),
+            "Recovers jobs left locked by crashed workers and applies LLM telemetry retention."),
 ]

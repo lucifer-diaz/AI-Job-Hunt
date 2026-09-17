@@ -10,7 +10,7 @@ const SETTINGS_SECTIONS = [
   ['workflow', 'Workflow & cadence', 'Set a pace that works for you', '07'],
 ];
 const SETTINGS_FORMS = ['profile', 'preferences', 'resumes', 'account', 'keys', 'ai', 'workflow'];
-const API_KEYS = [['openrouter', 'OpenRouter', 'AI model marketplace'], ['openai', 'OpenAI', 'GPT models'], ['anthropic', 'Anthropic', 'Claude models'], ['apify', 'Apify', 'Job discovery']];
+const API_KEYS = [['openrouter', 'OpenRouter', 'AI model marketplace'], ['openai', 'OpenAI', 'GPT models'], ['anthropic', 'Anthropic', 'Claude models'], ['gemini', 'Gemini', 'Gemini models (Google AI Studio key)'], ['apify', 'Apify', 'Job discovery']];
 const CHIP_FIELDS = [
   ['target_roles', 'Target roles', 'Choose up to 5 roles', 'Add a role…', '', 'top'],
   ['preferred_locations', 'Target locations', 'Cities, regions or Remote', 'Add a location…', '', 'top'],
@@ -150,7 +150,7 @@ function renderAccountSettings() {
 function renderKeySettings() {
   const st = D.settings;
   return `<p class="settings-intro">Keys are encrypted and used only for your workspace. Saved keys are never shown again.</p>${st.secret_storage ? '' : '<div class="settings-notice">Key storage is unavailable. Ask your server administrator to enable encrypted key storage.</div>'}<div class="settings-providers">${API_KEYS.map(([id, name, purpose]) => {
-    const key = st.keys[id];
+    const key = st.keys[id] || { configured: false, hint: '' };
     return `<section class="settings-provider"><div class="settings-provider-row"><div class="settings-provider-mark" aria-hidden="true">${name.slice(0, 1)}</div><div class="grow"><h3>${name}</h3><p>${purpose}</p></div><span class="settings-key-status ${key.configured ? 'saved' : ''}">${key.configured ? `Saved ${esc(key.hint)}` : 'Not configured'}</span>${btn(editingKey === id ? 'Cancel' : key.configured ? 'Replace' : 'Add key', 'settings-key-edit', { id }, 'sm', !st.secret_storage)}</div>${editingKey === id ? `<div class="settings-key-editor"><label class="field" for="keys-${id}">${name} API key${inputF('keys', id, '', 'type="password" autocomplete="off" spellcheck="false" maxlength="500" required')}</label><p class="settings-help">Saving replaces only this provider’s key.</p><div class="row gap8">${btn('Save key', 'settings-save', { form: 'keys', id }, 'primary', isBusy('settings-keys'))}${key.configured ? btn('Remove saved key', 'key-remove', { id }, '') : ''}</div></div>` : ''}</section>`;
   }).join('')}</div>`;
 }
@@ -161,7 +161,7 @@ function renderAISettings() {
     const fallback = provider === 'mock' ? 'Mock (no API calls)' : (provider === 'openrouter' && !String(fv('ai', 'model', base.model)).trim() && ai.env.stage_models[k]) || defaultModel;
     return settingsField('ai', `stage_${k}`, { rank: 'Ranking', tailor: 'Tailoring', review: 'Review', followup: 'Follow-up' }[k], `placeholder="${attr(fallback)}" ${provider === 'mock' ? 'disabled' : ''}`, `Default: ${esc(fallback || 'Not set')}`);
   }).join('');
-  return settingsGroup('Model defaults', 'Leave an override blank to use the server default.', `<div class="settings-grid"><label class="field" for="ai-llm_provider">Provider${selectF('ai', 'llm_provider', base.llm_provider, [['', `Server default (${ai.env.llm_provider})`], ['openrouter', 'OpenRouter'], ['openai', 'OpenAI'], ['anthropic', 'Anthropic'], ['mock', 'Mock / testing']], 'data-live="1"')}</label>${settingsField('ai', 'model', 'Default model', `placeholder="${attr(ai.env.models[provider] || '')}" data-live="1"`)}</div><p class="settings-help">${provider === 'mock' ? 'Mock mode makes no provider calls.' : `${esc(provider)}: ${D.settings.configured[provider] ? 'API key saved' : 'API key needed'}.`} <a href="#settings/api-keys">Manage API keys</a></p>`) +
+  return settingsGroup('Model defaults', 'Leave an override blank to use the server default.', `<div class="settings-grid"><label class="field" for="ai-llm_provider">Provider${selectF('ai', 'llm_provider', base.llm_provider, [['', `Server default (${ai.env.llm_provider})`], ['openrouter', 'OpenRouter'], ['openai', 'OpenAI'], ['anthropic', 'Anthropic'], ['gemini', 'Gemini'], ['mock', 'Mock / testing']], 'data-live="1"')}</label>${settingsField('ai', 'model', 'Default model', `placeholder="${attr(ai.env.models[provider] || '')}" data-live="1"`)}</div><p class="settings-help">${provider === 'mock' ? 'Mock mode makes no provider calls.' : `${esc(provider)}: ${D.settings.configured[provider] ? 'API key saved' : 'API key needed'}.`} <a href="#settings/api-keys">Manage API keys</a></p>`) +
     settingsDetails('ai-stages', 'Advanced · models per stage', `<div class="settings-grid">${stages}</div>`) +
     settingsGroup('Cost control', 'The free-only guard applies to OpenRouter.', `<label class="field" for="ai-require_free">Free-only guard${selectF('ai', 'require_free', base.require_free, [['', `Server default (${ai.env.require_free ? 'on' : 'off'})`], ['true', 'On — free models only'], ['false', 'Off — allow paid models']])}</label>`) + settingsFooter('ai');
 }

@@ -119,7 +119,8 @@ def test_new_jobs_start_discovered_with_clean_workflow_fields(db):
 
 def test_full_lifecycle_through_claims_records_history(db):
     job_id, = add_jobs(db)
-    path = [S.DISCOVERED, S.NORMALIZED, S.FILTERED, S.RANKED, S.QUALIFIED, S.TAILORING, S.TAILORED, S.REVIEWED,
+    path = [S.DISCOVERED, S.NORMALIZED, S.FILTERED, S.RANK_PENDING, S.RANKING, S.RANKED, S.QUALIFIED, S.TAILORING,
+            S.TAILORED, S.REVIEWED,
             S.READY_TO_APPLY, S.APPLYING, S.APPLIED, S.FOLLOWUP_DUE, S.FOLLOWED_UP, S.INTERVIEW, S.OFFER]
     for step, (current, target) in enumerate(zip(path, path[1:], strict=False)):
         claimed, = claim(db, [current], now=at(step * 100))

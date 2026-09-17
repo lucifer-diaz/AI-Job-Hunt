@@ -19,13 +19,14 @@ from urllib.parse import urlparse
 
 import httpx
 from bs4 import BeautifulSoup
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.auth import get_user_db
+from app.scheduler_hooks import run_soon
 from app.models import (AppSetting, Application, ApplicationEvent, Evidence, FollowUp, Job, KnowledgeAnswer,
                         ResumeDocument, ResumeVariant, SearchRun)
 from app.services.actors import (BUILTIN, DEFAULT_ACTORS, FAN_OUTS, MAX_RUNS, PLACEHOLDERS, REMOTE_PLATFORMS,
@@ -34,12 +35,12 @@ from app.services.contacts import (MAX_RECRUITERS, ContactIn, clean_email, clean
                                    recruiters_of, set_primary_recruiter, set_recruiters, to_utc, zone)
 from app.services.ai_config import STAGES as AI_STAGES, is_free_model, resolve as resolve_ai_config
 from app.prompts import build_evidence_extraction_prompt
-from app.services.llm import LLMClient
+from app.services.llm import LLMCall, LLMClient
 from app.services.sources import (UA, import_remote_run, list_remote_runs, refresh_apify_run, start_apify_search,
                                   upsert_job)
 from app.services.user_settings import apify_token, lock_settings_row, settings_for
-from app.services.workflow import (draft_followup, followup_days, get_profile, rank_job, resume_edits,
-                                   update_resume_edit)
+from app.services import ranker
+from app.services.workflow import draft_followup, followup_days, get_profile, resume_edits, update_resume_edit
 from app.settings import get_settings
 
 router = APIRouter()
@@ -475,23 +476,13 @@ def bulk_delete(payload: BulkIdsIn, db: Session = Depends(get_user_db)):
             "missing": max(0, len(set(payload.ids)) - deleted - len(protected))}
 
 
-@router.post("/api/jobs/bulk-rank")
-def bulk_rank(payload: BulkIdsIn, rerank: bool = False, db: Session = Depends(get_user_db)):
-    """Rank selected jobs one batch at a time; call again with `remaining` until it is empty."""
-    wanted = list(dict.fromkeys(payload.ids))
-    jobs = {j.id: j for j in db.scalars(select(Job).where(Job.id.in_(wanted))).all()}
-    queue = [i for i in wanted if i in jobs and (rerank or jobs[i].fit_score is None)]
-    batch, remaining = queue[:get_settings().max_jobs_per_batch], queue[get_settings().max_jobs_per_batch:]
-    ranked, errors = [], []
-    for job_id in batch:
-        try:
-            result = rank_job(db, jobs[job_id])
-            ranked.append({"id": job_id, "score": result.get("score")})
-        except Exception as exc:
-            db.rollback()
-            errors.append({"id": job_id, "error": str(exc)[:300]})
-    return {"ranked": ranked, "errors": errors, "remaining": remaining,
-            "skipped": len(wanted) - len(queue) - len([i for i in wanted if i not in jobs])}
+@router.post("/api/jobs/bulk-rank", status_code=202)
+def bulk_rank(payload: BulkIdsIn, request: Request, background: BackgroundTasks, rerank: bool = False,
+              db: Session = Depends(get_user_db)):
+    """Queue ranking for selected jobs. `rerank` also re-ranks ranked jobs as a new version."""
+    out = ranker.request_ranking(db, payload.ids, force=rerank, only_unranked=not rerank, actor=f"user:{db.info['user_id']}")
+    run_soon(background, request.app, "ranking")
+    return out
 
 
 @router.get("/api/jobs/{job_id}")
@@ -1409,7 +1400,8 @@ def parse_evidence(db: Session = Depends(get_user_db)):
     if not profile.master_resume.strip():
         raise HTTPException(400, "Upload or paste a master resume first")
     try:
-        result = LLMClient.for_user(db).generate_prompt_json(build_evidence_extraction_prompt(profile.master_resume))
+        result = LLMClient.for_user(db).generate_prompt_json(build_evidence_extraction_prompt(profile.master_resume),
+                                                            LLMCall(workflow_type="profile", entity_id=profile.id))
     except Exception as exc:
         raise HTTPException(400, str(exc)) from exc
     existing = {e.claim.strip().lower() for e in db.scalars(select(Evidence)).all()}
@@ -1451,23 +1443,17 @@ def evidence_delete(evidence_id: int, db: Session = Depends(get_user_db)):
     return {"ok": True}
 
 
-@router.post("/api/search/apify/runs/{run_id}/rank")
-def rank_run_jobs(run_id: int, db: Session = Depends(get_user_db)):
-    """Auto-rank on import: score the unranked jobs a run pulled in, one batch per call."""
+@router.post("/api/search/apify/runs/{run_id}/rank", status_code=202)
+def rank_run_jobs(run_id: int, request: Request, background: BackgroundTasks, db: Session = Depends(get_user_db)):
+    """Queue the unranked jobs a run pulled in. Imports already queue new jobs; this only catches older ones."""
     run = db.get(SearchRun, run_id)
     if not run:
         raise HTTPException(404, "Search run not found")
-    ranked, errors = 0, []
-    limit = get_settings().max_jobs_per_batch
-    for job in db.scalars(select(Job).where(Job.search_run_id == run.id, Job.fit_score.is_(None)).limit(limit)).all():
-        try:
-            rank_job(db, job)
-            ranked += 1
-        except Exception as exc:
-            db.rollback()
-            errors.append(str(exc))
-    remaining = db.scalar(select(func.count(Job.id)).where(Job.search_run_id == run.id, Job.fit_score.is_(None))) or 0
-    return {"ranked": ranked, "remaining": remaining, "errors": errors[:3]}
+    ids = db.scalars(select(Job.id).where(Job.search_run_id == run.id, Job.fit_score.is_(None),
+                                          Job.state.in_(ranker.RANK_WAITING_STATES))).all()
+    out = ranker.request_ranking(db, ids, force=False, only_unranked=True, actor=f"user:{db.info['user_id']}")
+    run_soon(background, request.app, "ranking")
+    return out
 
 
 class KnowledgeUpdateIn(BaseModel):

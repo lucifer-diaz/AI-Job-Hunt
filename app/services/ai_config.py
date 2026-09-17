@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-PROVIDERS = ("openrouter", "openai", "anthropic", "mock")
+PROVIDERS = ("openrouter", "openai", "anthropic", "gemini", "mock")
 STAGES = (("rank", "Rank"), ("tailor", "Tailor"), ("review", "Review"), ("followup", "Follow-up"))
 
 
@@ -30,8 +30,10 @@ def env_defaults(settings: Any) -> dict[str, Any]:
     return {
         "llm_provider": provider,
         "models": {name: _clean(getattr(settings, f"{name}_model", "")) for name in PROVIDERS if name != "mock"},
-        # Per-stage env overrides only exist for OpenRouter.
+        # OPENROUTER_MODEL_<STAGE> overrides only apply to OpenRouter.
         "stage_models": stages,
+        # Provider-independent stage overrides (RANK_MODEL), used with any provider.
+        "any_provider_stage_models": {"rank": _clean(getattr(settings, "rank_model", None))},
         "require_free": bool(settings.openrouter_require_free),
     }
 
@@ -52,7 +54,8 @@ def resolve(settings: Any, overrides: dict[str, Any] | None = None) -> dict[str,
     stage_sources: dict[str, str] = {}
     for stage, _ in STAGES:
         saved = _clean(saved_stages.get(stage))
-        env_stage = env["stage_models"][stage] if provider == "openrouter" else ""
+        env_stage = (env["any_provider_stage_models"].get(stage)
+                     or (env["stage_models"][stage] if provider == "openrouter" else ""))
         if provider == "mock":
             stage_models[stage], stage_sources[stage] = "mock", "default"
         elif saved:

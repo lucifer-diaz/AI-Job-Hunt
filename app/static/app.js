@@ -23,7 +23,7 @@ const S = {
   polling: null, busy: {}, forms: {}, apifyImport: false, importPick: new Set(), autoRefreshed: false,
 };
 const D = {};
-const SCREENS = ['overview', 'today', 'discovery', 'tailor', 'approvals', 'tracker', 'knowledge', 'settings'];
+const SCREENS = ['overview', 'today', 'discovery', 'tailor', 'approvals', 'tracker', 'monitoring', 'knowledge', 'settings'];
 
 /* ───────────── helpers ───────────── */
 async function api(url, { method = 'GET', body, form } = {}) {
@@ -148,7 +148,7 @@ function readHash() {
   const [screen, sub] = location.hash.replace(/^#/, '').split('/');
   if (SCREENS.includes(screen)) S.screen = screen;
   if (screen === 'settings') S.settingsSection = settingsSection(sub);
-  if (screen === 'discovery' && ['triage', 'table', 'setup'].includes(sub)) S.discMode = sub;
+  if (screen === 'discovery' && ['triage', 'table', 'setup', 'ranking'].includes(sub)) S.discMode = sub;
   if (screen === 'today' && ['focus', 'run'].includes(sub)) S.todayVariant = sub;
 }
 function go(screen, extra = {}) {
@@ -163,6 +163,7 @@ const LOADERS = {
   async discovery() {
     if (S.discMode === 'triage') await loadQueue();
     else if (S.discMode === 'table') await loadTable();
+    else if (S.discMode === 'ranking') await loadRanking();
     else await loadSetup();
   },
   async tailor() {
@@ -190,6 +191,7 @@ const LOADERS = {
     if (!apps.some(a => a.id === S.selApp)) S.selApp = (apps[0] || {}).id || null;
   },
   async knowledge() { [D.knowledge, D.evidence] = await Promise.all([api('/api/knowledge'), api('/api/evidence')]); },
+  async monitoring() { await loadMonitoring(); },
   async settings() {
     D.settingsLoadError = '';
     try {
@@ -240,18 +242,25 @@ function renderApifyImport() {
     <div class="row gap8 wrap mt10">${btn(label('importRuns', chosen.size ? `Import ${chosen.size} selected` : 'Select runs to import', 'Importing…'), 'import-remote', {}, 'sm primary', !chosen.size || isBusy('importRuns'))}${btn(label('remoteRuns', 'Reload', 'Loading…'), 'load-remote', {}, 'sm', isBusy('remoteRuns'))}
       <span class="tiny faint grow">Already imported? Open the run and use Pull again.</span></div></div>`;
 }
-async function rankRuns(ids) {
-  for (const id of ids) {
-    for (let guard = 0; guard < 20; guard++) {
-      const out = await api(`/api/search/apify/runs/${id}/rank`, { method: 'POST' });
-      if (out.errors.length && !out.ranked) { toast(`Ranking stopped: ${out.errors[0]}`, true); return; }
-      if (!out.remaining || !out.ranked) break;
-    }
+// Ranking runs on the server: imports queue new jobs and the ranking worker scores them in the background.
+// After queueing, poll the jobs' ranking tasks for a while and refresh once none are waiting or running.
+async function watchRanking(ids) {
+  const watched = ids.slice(0, 200);
+  if (!watched.length) return;
+  for (let i = 0; i < 40; i++) {
+    await new Promise(r => setTimeout(r, 3000));
+    const out = await api(`/api/ranking/tasks?job_ids=${watched.join(',')}`).catch(() => null);
+    if (!out || !out.active) break;
   }
+  if (S.jobOpen) D.jobModal = await api(`/api/jobs/${S.jobOpen}`).catch(() => D.jobModal);
+  await load();
+}
+function rankQueuedMsg(out) {
+  const n = out.queued.length;
+  return `${n ? `Queued ${n} job${n === 1 ? '' : 's'} for ranking` : 'Nothing new to rank'}${out.skipped.length ? ` · ${out.skipped.length} skipped` : ''}${out.blocked ? ` · waiting: ${out.blocked}` : ''}`;
 }
 async function afterPull(results) {
   const ok = results.filter(r => r.ok && r.id);
-  if (D.searchProfile?.profile?.auto_rank) await rankRuns(ok.filter(r => r.import && r.import.created).map(r => r.id));
   if (ok[0]) S.runSel = ok[0].id;
   await loadSetup();
   api('/api/workspace/summary').then(s => { D.summary = s; render(); }).catch(() => {});
@@ -274,7 +283,7 @@ async function load() {
 }
 
 /* ───────────── shell ───────────── */
-const NAV = [['overview', 'Overview', null], ['today', 'Today', 'today'], ['discovery', 'Discovery', 'discovery'], ['tailor', 'Tailor', 'tailor'], ['approvals', 'Approvals', 'approvals'], ['tracker', 'Tracker', 'tracker']];
+const NAV = [['overview', 'Overview', null], ['today', 'Today', 'today'], ['discovery', 'Discovery', 'discovery'], ['tailor', 'Tailor', 'tailor'], ['approvals', 'Approvals', 'approvals'], ['tracker', 'Tracker', 'tracker'], ['monitoring', 'Monitoring', null]];
 const NAV2 = [['knowledge', 'Knowledge bank'], ['settings', 'Settings & profile']];
 function renderNav() {
   const c = D.summary?.counts || {};
@@ -302,6 +311,7 @@ function screenMeta() {
     tailor: ['Tailor & review', 'AI drafts, you approve every claim'],
     approvals: ['Approvals', 'Nothing leaves this queue without your sign-off'],
     tracker: ['Tracker', D.tracker ? `${D.tracker.stats.live} live applications · ${D.tracker.stats.due} follow-ups due` : 'Every submitted application'],
+    monitoring: ['Monitoring', 'Every LLM request: tokens, context, latency, cost and failures · recommendations never change anything automatically'],
     knowledge: ['Knowledge bank', 'Answer once, reuse in every ATS form'],
     settings: ['Settings', 'A workspace that works your way'],
   }[S.screen];
@@ -311,7 +321,7 @@ function renderTop() {
   let seg = '';
   if (S.screen === 'today') seg = [['focus', 'Command centre'], ['run', 'Run sheet']].map(([id, t]) => `<button class="${S.todayVariant === id ? 'on' : ''}" data-act="variant" data-kind="today" data-id="${id}">${t}</button>`).join('');
   if (S.screen === 'tailor') seg = [['single', 'One job'], ['bulk', 'Bulk tailor']].map(([id, t]) => `<button class="${S.tailorMode === id ? 'on' : ''}" data-act="variant" data-kind="tailor" data-id="${id}">${t}</button>`).join('');
-  if (S.screen === 'discovery') seg = [['triage', 'Triage queue'], ['table', 'Table + detail'], ['setup', 'Search setup']].map(([id, t]) => `<button class="${S.discMode === id ? 'on' : ''}" data-act="variant" data-kind="discovery" data-id="${id}">${t}</button>`).join('');
+  if (S.screen === 'discovery') seg = [['triage', 'Triage queue'], ['table', 'Table + detail'], ['ranking', 'Ranking tracker'], ['setup', 'Search setup']].map(([id, t]) => `<button class="${S.discMode === id ? 'on' : ''}" data-act="variant" data-kind="discovery" data-id="${id}">${t}</button>`).join('');
   return `<div class="top-row"><div><h1>${esc(title)}</h1><div class="sub">${esc(sub)}</div></div>
     <div class="row gap8 wrap">${seg ? `<div class="seg">${seg}</div>` : ''}
       <button class="btn" data-act="palette">Search · ⌘K</button>
@@ -429,7 +439,106 @@ function renderDiscovery() {
   const banner = S.polling ? `<div class="banner mb14"><span class="dot" style="background:var(--brand)"></span><span class="grow">${esc(S.polling.text)}</span></div>` : '';
   if (S.discMode === 'table') return banner + renderTable();
   if (S.discMode === 'setup') return banner + renderSetup();
+  if (S.discMode === 'ranking') return banner + renderRanking();
   return banner + renderTriage();
+}
+
+/* ───────────── ranking tracker ───────────── */
+// The asynchronous ranker's work for this account (/api/ranking/tracker): waiting, running, retrying and finished.
+let rankingTimer = null;
+const onRankingTab = () => S.screen === 'discovery' && S.discMode === 'ranking';
+const RANK_REASON = { new: 'New job', user_request: 'You asked', resume_changed: 'Resume changed', profile_changed: 'Profile changed', prompt_changed: 'Ranking prompt updated' };
+const until = iso => {
+  if (!iso) return '';
+  const sec = Math.round((new Date(iso.slice(0, 23) + 'Z') - Date.now()) / 1000);
+  return sec <= 0 ? 'now' : sec < 60 ? `in ${sec}s` : sec < 3600 ? `in ${Math.round(sec / 60)}m` : `in ${Math.round(sec / 3600)}h`;
+};
+const later = iso => !!iso && until(iso) !== 'now';
+async function loadRanking() {
+  const before = new Set((D.ranking?.active || []).map(t => t.id));
+  D.ranking = await api('/api/ranking/tracker');
+  const done = D.ranking.recent.filter(t => before.has(t.id));
+  if (done.length) {
+    const one = done.length === 1 ? done[0] : null, failed = done.filter(t => t.status === 'FAILED').length;
+    toast(one ? `${one.company}: ${rankTaskDetail(one)}` : `${done.length} rankings finished${failed ? ` · ${failed} failed` : ''}`, failed === done.length);
+  }
+  scheduleRankingPoll();
+}
+// Poll while the tracker is open: every few seconds while work is in flight, slowly otherwise.
+function scheduleRankingPoll() {
+  clearTimeout(rankingTimer); rankingTimer = null;
+  if (!onRankingTab()) return;
+  rankingTimer = setTimeout(async () => {
+    if (!onRankingTab()) return;
+    try { await loadRanking(); } catch { scheduleRankingPoll(); return; }
+    if (onRankingTab()) render();
+  }, D.ranking?.active.length ? 4000 : 20000);
+}
+function rankTaskPill(t) {
+  if (t.status === 'PROCESSING') return pill('ranking…', 'brand');
+  if (t.status === 'PENDING') return later(t.next_attempt_at) ? pill(t.attempt_count ? 'retry scheduled' : 'waiting', 'warn') : pill('queued', 'muted');
+  if (t.status === 'FAILED') return pill('failed', 'bad');
+  if (t.status === 'SKIPPED') return pill('skipped', 'muted');
+  return t.ranking?.decision === 'QUALIFIED' ? pill('qualified', 'good') : pill('archived', 'muted');
+}
+function rankTaskDetail(t) {
+  const category = t.error_category ? ` (${t.error_category.toLowerCase().replace(/_/g, ' ')})` : '';
+  if (t.status === 'PROCESSING') return `Ranking · attempt ${t.attempt_count} of ${t.max_attempts} · ${elapsed(t.started_at)}`;
+  if (t.status === 'PENDING') {
+    if (later(t.next_attempt_at) && t.attempt_count) return `Attempt ${t.attempt_count} of ${t.max_attempts} failed${category} · retry ${until(t.next_attempt_at)}${t.last_error ? ` · ${t.last_error}` : ''}`;
+    if (later(t.next_attempt_at)) return `Waiting: ${t.last_error || 'your account is not ready'} · checks again ${until(t.next_attempt_at)}`;
+    return 'Queued for the next ranking run';
+  }
+  if (t.status === 'FAILED') return `Gave up after ${t.attempt_count} attempt${t.attempt_count === 1 ? '' : 's'}${category}${t.last_error ? ` · ${t.last_error}` : ''}`;
+  if (t.status === 'SKIPPED') return t.last_error || 'Skipped';
+  const r = t.ranking;
+  if (!r) return 'Ranked';
+  return `${r.decision === 'QUALIFIED' ? 'Qualified' : 'Archived'} · fit ${fitTxt(r.overall_fit_score)} · candidate ${fitTxt(r.candidate_fit_score)} · resume ${fitTxt(r.resume_fit_score)} · confidence ${Math.round(r.confidence * 100)}% · v${r.version}`;
+}
+function renderRanking() {
+  const r = D.ranking; if (!r) return loading();
+  const c = r.counts, w = r.worker || {};
+  const tile = ([title, n, hint, tone]) => `<div class="box"><div class="xs muted">${esc(title)}</div>
+    <div class="mono bb" style="font-size:24px;line-height:1.3;color:${n ? { brand: 'var(--brand)', warn: 'var(--warn)', good: 'var(--good)', bad: 'var(--bad)' }[tone] || 'var(--ink)' : 'var(--grey)'}">${n}</div>
+    <div class="tiny faint">${esc(hint)}</div></div>`;
+  const tileGroup = (caption, items) => `<div class="grow" style="min-width:240px"><div class="caps-sm mb8">${esc(caption)}</div>
+    <div style="display:grid;grid-template-columns:repeat(${items.length},minmax(0,1fr));gap:8px">${items.map(tile).join('')}</div></div>`;
+  const tiles = tileGroup('Pipeline now', [['Filtering', c.filtering, 'hard filters', 'muted'], ['Queued', c.queued, 'next run', 'muted'],
+    ['Ranking', c.processing, 'model call', 'brand'], ['Retry / wait', c.retry_scheduled + c.waiting, 'backing off', 'warn']])
+    + tileGroup('Last 24 hours', [['Qualified', c.qualified, 'kept', 'good'], ['Archived', c.archived, 'by policy', 'muted'],
+      ['Failed', c.failed, 'gave up', 'bad']]);
+  const inFlight = r.active.length, { finished, total } = r.progress;
+  const pct = total ? Math.round(100 * finished / total) : 100;
+  const workerTxt = !w.enabled ? 'The ranking worker is turned off on this server'
+    : w.running ? 'A ranking run is in progress'
+    : w.next_run_at ? `Next ranking run ${until(w.next_run_at)} · every ${w.interval_minutes} min` : `Ranking runs every ${w.interval_minutes} min`;
+  const blocked = r.blocked ? `<div class="banner warn mb14"><span class="grow">Ranking is paused for your account: ${esc(r.blocked)}</span>${btn('Open settings', 'go', { screen: 'settings' }, 'sm')}</div>` : '';
+  const autoOff = r.auto_rank ? '' : `<div class="banner mb14"><span class="grow">Auto-rank on import is off, so only the jobs you ask to rank are ranked.</span>${btn('Search setup', 'go', { screen: 'discovery', mode: 'setup' }, 'sm')}</div>`;
+  const row = t => {
+    const retry = t.status !== 'FAILED' ? '' : t.retried ? btn('Retried', 'ranking-retry', {}, 'sm', true)
+      : btn(isBusy('rankRetry' + t.job_id) ? 'Queueing…' : 'Retry', 'ranking-retry', { job: t.job_id }, 'sm', isBusy('rankRetry' + t.job_id));
+    const detail = rankTaskDetail(t), why = RANK_REASON[t.reason] || t.reason;
+    return `<div class="lrow ${t.status === 'PROCESSING' ? 'sel' : ''}" style="gap:12px">
+      <div class="grow" style="min-width:0"><div class="small b ellipsis">${esc(t.title)} <span class="muted" style="font-weight:400">· ${esc(t.company)}</span></div>
+        <div class="xs ellipsis ${t.status === 'FAILED' ? '' : 'muted'}" style="${t.status === 'FAILED' ? 'color:var(--bad)' : ''}" title="${attr(detail)}">${esc(why)} · ${esc(detail)}</div></div>
+      ${retry}${btn('Job', 'open-job', { id: t.job_id }, 'sm')}${rankTaskPill(t)}</div>`;
+  };
+  const section = (title, sub, items) => `<section class="card flush">
+    <div style="padding:14px 18px;border-bottom:1px solid var(--line2)"><div class="card-title" style="font-size:16px">${esc(title)}</div><div class="card-sub">${esc(sub)}</div></div>
+    <div style="max-height:460px;overflow:auto">${items.map(row).join('')}</div></section>`;
+  const nothing = !inFlight && !r.recent.length && !c.filtering;
+  return `<div class="stack">${blocked}${autoOff}
+    <section class="card">
+      <div class="row wrap gap10 mb14"><div class="grow" style="min-width:220px"><div class="card-title">${inFlight || c.filtering ? 'Ranking in the background' : 'Ranking is idle'}</div>
+        <div class="card-sub">${esc(workerTxt)}${w.enabled ? ' · runs on the server, safe to leave this page' : ''}</div>
+        <div class="row base gap8 mt8"><span class="grow">${bar(pct + '%', '#5b4ae8')}</span><span class="xs mono muted none">${finished}/${total} in the last day</span></div></div>
+        ${btn(label('rankBatch', 'Queue unranked jobs', 'Queueing…'), 'rank-batch', {}, 'sm', isBusy('rankBatch'))}
+        ${btn(label('rankRefresh', 'Refresh', 'Refreshing…'), 'ranking-refresh', {}, 'sm', isBusy('rankRefresh'))}</div>
+      <div class="row wrap gap16" style="align-items:flex-start">${tiles}</div></section>
+    ${nothing ? `<section class="card">${empty('No ranking activity in the last day', 'Jobs from your searches are filtered and ranked automatically. Rankings you request from a job, the table or the triage queue show up here too.', btn('Go to triage', 'go-triage', {}, 'primary'))}</section>` : ''}
+    ${inFlight ? section('In progress', `${inFlight} job${inFlight === 1 ? '' : 's'} waiting, ranking or retrying`, r.active) : ''}
+    ${r.recent.length ? section('Finished in the last 24 hours', `${c.completed} ranked · ${c.failed} failed${c.skipped ? ` · ${c.skipped} skipped` : ''}`, r.recent) : ''}
+  </div>`;
 }
 function fitSummary(j) {
   return `<div class="row wrap gap10 mt16">
@@ -449,7 +558,7 @@ function renderTriage() {
         <div><div class="xs muted mb4">Must mention (use / for either)</div>${tagBox('triage', 'keywords', S.triage.keywords, 'Hybrid, Lead/Principal…', 6)}</div>
         <label class="check"><input type="checkbox" data-triage="hide_agencies" ${S.triage.hide_agencies ? 'checked' : ''}>Hide staffing agencies</label>
         <label class="check"><input type="checkbox" data-triage="hide_reposts" ${S.triage.hide_reposts ? 'checked' : ''}>Hide reposts I've seen</label>
-        ${q.items.some(i => i.fit == null) ? btn(label('rankBatch', 'Rank every unranked job', 'Ranking…'), 'rank-batch', {}, 'soft block', isBusy('rankBatch')) : ''}</div></section>
+        ${q.items.some(i => i.fit == null) ? btn(label('rankBatch', 'Rank every unranked job', 'Queueing…'), 'rank-batch', {}, 'soft block', isBusy('rankBatch')) : ''}</div></section>
     <section class="card pad16"><div class="row between mb10"><div class="card-title sm">Saved search</div>${sp ? pill(sp.schedule === 'daily' ? 'daily' : 'manual', sp.schedule === 'daily' ? 'good' : 'muted') : ''}</div>
       ${sp ? `<div class="box"><div class="small b">${esc(sp.roles.join(' · ') || 'No roles yet')}</div><div class="xs muted mt4">${esc(sp.locations.join(' · ') || 'Any location')} · ${sp.sites.length} board${sp.sites.length === 1 ? '' : 's'}${sp.auto_rank ? ' · auto-rank on' : ''}</div></div>` : ''}
       <div class="col gap6 mt10">${(D.runs || []).slice(0, 3).map(r => `<div class="xs muted row gap8"><span class="dot" style="background:${r.status === 'SUCCEEDED' ? '#0f9c86' : r.completed_at ? '#c22f4e' : '#e0a136'}"></span>Run #${r.id} · ${r.created_jobs} new from ${r.item_count} · ${fmtDay(r.created_at)}</div>`).join('')}</div>
@@ -466,7 +575,7 @@ function renderTriage() {
         <div class="avatar lg">${esc(initials(job.company))}</div>
         <div style="flex:1 1 210px;min-width:0"><div style="font-size:20px;font-weight:600;letter-spacing:-.01em">${esc(job.title)}</div><div class="muted mt4" style="font-size:13.5px">${esc(job.company)}${job.location ? ' · ' + esc(job.location) : ''}</div>
           <div class="row gap6 wrap mt10">${pill(`${job.board} · ${job.posted}`, 'plain', 'lg')}${job.agency ? pill('Likely agency', 'warn', 'lg') : ''}${job.url ? `<a class="pill plain lg" href="${attr(job.url)}" target="_blank" rel="noopener">Posting ↗</a>` : ''}</div></div>
-        ${job.fit == null ? `<div class="scorebox"><div class="n" style="color:var(--grey)">—</div><div class="l">NOT RANKED</div>${btn(label('rank' + job.id, 'Rank now', 'Ranking…'), 'rank-job', { id: job.id }, 'sm soft mt8', isBusy('rank' + job.id))}</div>` : `<div class="scorebox"><div class="n">${fitTxt(job.fit)}</div><div class="l">FIT SCORE</div></div>`}
+        ${job.fit == null ? `<div class="scorebox"><div class="n" style="color:var(--grey)">—</div><div class="l">NOT RANKED</div>${btn(label('rank' + job.id, 'Rank now', 'Queueing…'), 'rank-job', { id: job.id }, 'sm soft mt8', isBusy('rank' + job.id))}</div>` : `<div class="scorebox"><div class="n">${fitTxt(job.fit)}</div><div class="l">FIT SCORE</div></div>`}
       </div>
       <div style="padding:18px 24px;border-bottom:1px solid var(--line2)">
         <div class="row gap8 mb10">${pill('AI', 'brand')}<span class="base b">${job.fit == null ? 'Not ranked yet' : `Why this scores ${fitTxt(job.fit)}`}</span></div>
@@ -503,9 +612,9 @@ function renderTable() {
       <select class="select" id="flt-stage" data-filter="stage">${opts([['all', 'All stages'], ['unranked', 'Unranked'], ...['discovered', 'shortlisted', 'maybe', 'archived', 'dismissed', 'tailored', 'approved', 'applied'].map(s => [s, s[0].toUpperCase() + s.slice(1)])], f.stage)}</select>
       <select class="select" id="flt-sort" data-filter="sort">${opts([['fit', 'Sort: best fit'], ['new', 'Sort: newest'], ['company', 'Sort: company']], f.sort)}</select>
       ${btn('Reset', 'reset-filters', {}, 'sm')}
-      ${S.checked.size ? '' : btn(label('rankBatch', 'Rank unranked', 'Ranking…'), 'rank-batch', {}, 'sm', isBusy('rankBatch'))}
+      ${S.checked.size ? '' : btn(label('rankBatch', 'Rank unranked', 'Queueing…'), 'rank-batch', {}, 'sm', isBusy('rankBatch'))}
       ${S.checked.size ? `<span class="small b" style="color:var(--brand-ink)">${S.checked.size} selected</span>` : ''}
-      ${btn(isBusy('bulkRank') ? esc(S.rankProgress || 'Ranking…') : `Rank${S.checked.size ? ` ${S.checked.size}` : ''}`, 'bulk-rank', {}, 'sm', !S.checked.size || isBusy('bulkRank'))}
+      ${btn(isBusy('bulkRank') ? esc(S.rankProgress || 'Queueing…') : `Rank${S.checked.size ? ` ${S.checked.size}` : ''}`, 'bulk-rank', {}, 'sm', !S.checked.size || isBusy('bulkRank'))}
       ${btn(`Shortlist${S.checked.size ? ` ${S.checked.size}` : ''}`, 'bulk', { action: 'shortlist' }, 'sm soft', !S.checked.size)}
       ${btn(label('bulkToTailor', `Bulk tailor${S.checked.size ? ` ${S.checked.size}` : ''}`, 'Queueing…'), 'bulk-to-tailor', {}, 'sm primary', !S.checked.size || isBusy('bulkToTailor'))}
       ${btn('Dismiss', 'bulk', { action: 'dismiss' }, 'sm', !S.checked.size)}
@@ -725,7 +834,7 @@ function renderBulkTailor(queue) {
     </div>
     <div class="row wrap gap10 xs muted" style="padding:10px 18px;border-bottom:1px solid var(--line2)">
       <label class="row gap6"><input type="checkbox" data-act="tailor-regenerate" ${S.tailorRegenerate ? 'checked' : ''}> Redo jobs that already have a packet</label>
-      <span class="grow"></span><span>Each job is ranked if needed, tailored, then independently reviewed on the server. You can leave this page.</span>
+      <span class="grow"></span><span>Each job is tailored (guided by its ranking when it has one), then independently reviewed on the server. You can leave this page.</span>
     </div>
     ${head}${rows}</section></div>`;
 }
@@ -754,7 +863,7 @@ function renderTailorSingle(queue) {
       ${job.status === 'approved' ? btn(label('revise', 'Send back for revision', 'Sending back…'), 'revise', { id: job.id }, 'sm', isBusy('revise')) + btn('Open apply kit', 'open-kit', { id: job.id }, 'sm good') : ''}</section>` : '');
   if (!r) {
     return `<div class="stack">${stack}<section class="card row gap16 wrap"><div class="grow" style="min-width:220px"><div class="card-title" style="font-size:16px">Tailoring for ${esc(job.title)} · ${esc(job.company)}</div><div class="card-sub">Fit ${fitTxt(job.fit)} · no packet generated yet</div></div>${picker}</section>
-      <section class="card">${empty(generating ? 'Drafting your packet…' : skipping ? 'Reviewing your master resume…' : 'No packet yet', generating ? `${task ? `${STAGE_LABEL[task.stage]} · ${task.progress}%. ` : ''}Ranking, tailoring and an independent review run on the server. You can leave this page.` : skipping ? `${STAGE_LABEL[task.stage]}. Your master resume is used unchanged; the reviewer is scoring it against this posting.` : 'Generate a tailored resume, cover letter and reviewer score. Tailoring may only cite your master resume and verified evidence. If this posting needs no tailoring, skip it and send your master resume as-is.', btn(generating ? 'Generating…' : 'Generate tailored packet', 'generate', { id: job.id }, 'primary lg', working) + btn(skipping ? 'Skipping…' : 'Skip tailoring', 'skip-tailor', { id: job.id }, 'lg', working) + btn('Read the posting', 'open-job', { id: job.id }))}</section></div>`;
+      <section class="card">${empty(generating ? 'Drafting your packet…' : skipping ? 'Reviewing your master resume…' : 'No packet yet', generating ? `${task ? `${STAGE_LABEL[task.stage]} · ${task.progress}%. ` : ''}Tailoring and an independent review run on the server. You can leave this page.` : skipping ? `${STAGE_LABEL[task.stage]}. Your master resume is used unchanged; the reviewer is scoring it against this posting.` : 'Generate a tailored resume, cover letter and reviewer score. Tailoring may only cite your master resume and verified evidence. If this posting needs no tailoring, skip it and send your master resume as-is.', btn(generating ? 'Generating…' : 'Generate tailored packet', 'generate', { id: job.id }, 'primary lg', working) + btn(skipping ? 'Skipping…' : 'Skip tailoring', 'skip-tailor', { id: job.id }, 'lg', working) + btn('Read the posting', 'open-job', { id: job.id }))}</section></div>`;
   }
   const accepted = r.edits.filter(e => e.status === 'accepted').length;
   const threshold = p.application_mode === 'automatic'
@@ -1029,7 +1138,7 @@ function renderJobModal() {
       <section class="card flush" style="flex:1 1 420px;min-width:0"><div class="tabs under">${[['description', 'Description'], ['requirements', 'Requirements map'], ['notes', 'Notes']].map(([id, t]) => `<button class="${S.jobTab === id ? 'on' : ''}" data-act="job-tab" data-id="${id}">${t}</button>`).join('')}</div>${tab}</section>
       <div class="col gap14" style="flex:1 1 280px;min-width:0">
         <section class="card pad18"><div class="row gap8 mb14">${pill('AI', 'brand')}<span class="card-title sm">Fit breakdown</span></div>
-          ${j.fit == null ? `<div class="small muted mb12">Not ranked yet.</div>${btn(label('rank' + j.id, 'Rank this job', 'Ranking…'), 'rank-job', { id: j.id }, 'soft', isBusy('rank' + j.id))}` : `
+          ${j.fit == null ? `<div class="small muted mb12">Not ranked yet.</div>${btn(label('rank' + j.id, 'Rank this job', 'Queueing…'), 'rank-job', { id: j.id }, 'soft', isBusy('rank' + j.id))}` : `
           <div class="row base gap8 mb14"><span class="mono bb" style="font-size:34px;color:var(--brand-ink);line-height:1">${fitTxt(j.fit)}</span><span class="small muted">${j.rank_pct != null ? `top ${j.rank_pct}% of your ranked jobs` : ''}</span></div>
           <div class="col gap10"><div><div class="row between small mb4"><span class="muted">Strong matches</span><span class="mono b">${j.matches.length}</span></div>${bar(Math.min(100, j.matches.length * 15) + '%', '#5b4ae8')}</div>
             <div><div class="row between small mb4"><span class="muted">Gaps flagged</span><span class="mono b">${j.gaps.length + j.missing.length}</span></div>${bar(Math.min(100, (j.gaps.length + j.missing.length) * 20) + '%', '#e0a136')}</div>
@@ -1059,7 +1168,7 @@ function renderPalette() {
 }
 
 /* ───────────── render ───────────── */
-const RENDER = { overview: renderOverview, today: renderToday, discovery: renderDiscovery, tailor: renderTailor, approvals: renderApprovals, tracker: renderTracker, knowledge: renderKnowledge, settings: renderSettings };
+const RENDER = { overview: renderOverview, today: renderToday, discovery: renderDiscovery, tailor: renderTailor, approvals: renderApprovals, tracker: renderTracker, monitoring: renderMonitoring, knowledge: renderKnowledge, settings: renderSettings };
 function render() {
   const active = document.activeElement;
   const fid = active && active.id;
@@ -1071,8 +1180,8 @@ function render() {
   if (D.summary?.profile) $('#brand-sub').textContent = [D.summary.profile.name, D.summary.profile.headline].filter(Boolean).join(' · ') || 'Set up your profile';
   $('#top').innerHTML = renderTop();
   $('#view').innerHTML = RENDER[S.screen]();
-  $('#overlays').innerHTML = (S.jobOpen ? renderJobModal() : '') + (S.kitJob ? renderKit() : '') + (S.paletteOpen ? renderPalette() : '');
-  document.body.style.overflow = (S.jobOpen || S.kitJob || S.paletteOpen) ? 'hidden' : '';
+  $('#overlays').innerHTML = (S.jobOpen ? renderJobModal() : '') + (S.kitJob ? renderKit() : '') + (S.paletteOpen ? renderPalette() : '') + (S.mon?.request ? renderMonRequestModal() : '');
+  document.body.style.overflow = (S.jobOpen || S.kitJob || S.paletteOpen || S.mon?.request) ? 'hidden' : '';
   if (fid) {
     const el = document.getElementById(fid);
     if (el) { el.focus({ preventScroll: true }); if (selRange) { try { el.setSelectionRange(...selRange); } catch { /* ignore */ } } }
@@ -1147,16 +1256,6 @@ async function pollRuns() {
     p.text = `${done} of ${runs.length} searches complete · ${created} new jobs so far`;
     if (done < runs.length) { render(); setTimeout(pollRuns, 4000); return; }
     const failed = runs.filter(r => r.status !== 'SUCCEEDED');
-    if (D.searchProfile?.profile?.auto_rank) {
-      for (const r of runs.filter(x => x.status === 'SUCCEEDED')) {
-        for (let guard = 0; guard < 20; guard++) {
-          p.text = `Ranking new jobs from run #${r.id}…`; render();
-          const out = await api(`/api/search/apify/runs/${r.id}/rank`, { method: 'POST' });
-          if (out.errors.length && !out.ranked) { toast(`Ranking stopped: ${out.errors[0]}`, true); break; }
-          if (!out.remaining || !out.ranked) break;
-        }
-      }
-    }
     S.polling = null; D.runs = null;
     toast(failed.length ? `${failed.length} search${failed.length === 1 ? '' : 'es'} failed. Completed results were kept.` : `Discovery complete · ${created} new jobs`, !!failed.length);
     go('discovery', { discMode: 'triage', triagedThisSession: 0 });
@@ -1266,9 +1365,9 @@ const A = {
   'add-evidence-for': el => { S.jobOpen = null; S.evidencePrefill = `${el.dataset.gap}: `; go('knowledge'); },
   'rank-job': el => busy('rank' + el.dataset.id, async () => {
     const out = await api(`/api/jobs/${el.dataset.id}/rank`, { method: 'POST' });
-    if (S.jobOpen) D.jobModal = await api(`/api/jobs/${S.jobOpen}`);
-    await load(); return out;
-  }, out => `Ranked · fit ${Math.round(out.score)}`),
+    watchRanking(out.queued);
+    return out;
+  }, rankQueuedMsg),
   triage: el => triageJob(el.dataset.id, el.dataset.action, !!el.dataset.tailor),
   // table
   'select-job': async (el, e) => {
@@ -1302,19 +1401,10 @@ const A = {
   },
   'clear-selection': (el, e) => { e.preventDefault(); S.checked.clear(); render(); },
   'bulk-rank': () => busy('bulkRank', async () => {
-    let ids = [...S.checked], ranked = 0, failed = [], skipped = 0;
-    const total = ids.length;
-    while (ids.length) {
-      S.rankProgress = `Ranking ${Math.min(total, ranked + failed.length + 1)} of ${total}…`; render();
-      const out = await api('/api/jobs/bulk-rank?rerank=true', { method: 'POST', body: { ids } });
-      ranked += out.ranked.length; failed = failed.concat(out.errors); skipped += out.skipped;
-      if (!out.ranked.length && out.errors.length) break; // provider is failing; stop instead of looping
-      ids = out.remaining;
-    }
-    S.rankProgress = ''; S.checked.clear(); await load();
-    if (!ranked && failed.length) throw new Error(`Ranking failed: ${failed[0].error}`);
-    return { ranked, failed };
-  }, r => `Ranked ${r.ranked} job${r.ranked === 1 ? '' : 's'}${r.failed.length ? ` · ${r.failed.length} failed: ${r.failed[0].error}` : ''}`),
+    const out = await api('/api/jobs/bulk-rank?rerank=true', { method: 'POST', body: { ids: [...S.checked] } });
+    S.checked.clear(); await load(); watchRanking(out.queued);
+    return out;
+  }, rankQueuedMsg),
   'bulk-delete': () => {
     const count = S.checked.size;
     if (!confirm(`Permanently delete ${count} job${count === 1 ? '' : 's'}? Tailored resumes for them are deleted too. Approved or applied jobs are kept unless you confirm again.`)) return;
@@ -1437,13 +1527,18 @@ const A = {
     const out = await api(`/api/import/${kind}/${encodeURIComponent(token)}`, { method: 'POST' });
     delete S.forms.board; await load(); return out;
   }, out => `Imported ${out.created} new of ${out.seen} open roles — they are in your triage queue`),
+  'ranking-retry': el => busy('rankRetry' + el.dataset.job, async () => {
+    const out = await api(`/api/jobs/${el.dataset.job}/rank`, { method: 'POST' });
+    await loadRanking();
+    return out;
+  }, rankQueuedMsg),
+  'ranking-refresh': () => busy('rankRefresh', () => loadRanking()),
   'rank-batch': () => busy('rankBatch', async () => {
     const out = await api('/api/jobs/rank-batch', { method: 'POST' });
-    const failed = out.filter(r => r.error);
-    if (!out.length) throw new Error('Every job is already ranked');
-    if (failed.length === out.length) throw new Error(`Ranking failed: ${failed[0].error}`);
-    await load(); return { ranked: out.length - failed.length, failed: failed.length };
-  }, r => `Ranked ${r.ranked} job${r.ranked === 1 ? '' : 's'}${r.failed ? ` · ${r.failed} failed` : ''}`),
+    if (!out.queued.length && !out.skipped.length) throw new Error('Every job is already ranked');
+    await load(); watchRanking(out.queued);
+    return out;
+  }, rankQueuedMsg),
   // tailor
   'pick-tailor': el => go('tailor', { tailorJob: Number(el.value) }),
   'tailor-tab': el => { S.tailorTab = el.dataset.id; S.editing = null; render(); },
@@ -1582,6 +1677,7 @@ const A = {
   'ev-verify': el => busy('evv', async () => { await api(`/api/evidence/${el.dataset.id}`, { method: 'PATCH', body: { verified: true } }); await load(); }, 'Verified — tailoring may now cite it'),
   'ev-delete': async (el, e) => { e.preventDefault(); if (!confirm('Remove this evidence claim?')) return; await api(`/api/evidence/${el.dataset.id}`, { method: 'DELETE' }).catch(err => toast(err.message, true)); refreshAfter('Evidence removed'); },
   ...SETTINGS_ACTIONS,
+  ...MONITORING_ACTIONS,
 };
 function tagFallback(form, key) {
   if (form === 'sp') return D.searchProfile?.profile?.[key] || [];

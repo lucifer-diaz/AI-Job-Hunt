@@ -26,12 +26,18 @@ class Settings(BaseSettings):
     anthropic_api_key: str | None = None
     anthropic_model: str = "claude-sonnet-5"
 
+    # Direct Gemini (Google AI Studio / Gemini API key)
+    gemini_api_key: str | None = None
+    gemini_model: str = "gemini-2.5-flash"
+
     # OpenRouter is OpenAI-compatible. `openrouter/free` automatically routes
     # among currently available free models that can satisfy the request.
     openrouter_api_key: str | None = None
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_model: str = "openrouter/free"
     openrouter_model_rank: str | None = None
+    # Provider-independent model for the rank stage (any provider). A model saved in Settings still wins.
+    rank_model: str | None = None
     openrouter_model_tailor: str | None = None
     openrouter_model_review: str | None = None
     openrouter_model_followup: str | None = None
@@ -40,6 +46,17 @@ class Settings(BaseSettings):
     openrouter_max_tokens: int = 5000
     openrouter_site_url: str | None = None
     openrouter_app_name: str = "Job Hunt OS"
+    # Every provider call: request timeout and SDK-level retries (the workers retry on their own too).
+    llm_request_timeout_seconds: int = 120
+    llm_max_retries: int = 1
+
+    # LLM monitoring (app.services.llm_telemetry). Telemetry stores metadata and token counts, never prompt text,
+    # unless LLM_PROMPT_DEBUG is on. Raw request rows older than the retention are rolled up into daily totals.
+    llm_telemetry_enabled: bool = True
+    llm_telemetry_retention_days: int = 90
+    llm_prompt_debug: bool = False
+    # Model prices and context windows (app.services.model_catalog). Blank uses app/model_catalog.json.
+    model_catalog_file: str | None = None
 
     # Google ADK / Vertex AI Agent Engine. Authentication and project/location
     # are read by the Google SDK from standard GOOGLE_* environment variables.
@@ -84,8 +101,22 @@ class Settings(BaseSettings):
     inbox_interval_minutes: int = 5
     analytics_interval_minutes: int = 60
     cleanup_interval_minutes: int = 15
+    # AI Optimization Advisor (app.services.ai_advisor): processes queued and scheduled analyses.
+    ai_optimization_interval_minutes: int = 5
     ranking_batch_size: int = 20
     ranking_concurrency: int = 5
+    # Job Ranker (app.services.ranker)
+    min_ranking_confidence: float = 0.6
+    ranking_max_attempts: int = 3
+    ranking_lease_seconds: int = 900
+    ranking_retry_base_seconds: int = 60
+    ranking_retry_max_seconds: int = 3600
+    # How long a task waits before trying again when the account cannot be ranked yet (missing key or resume).
+    ranking_wait_seconds: int = 900
+    ranking_enqueue_batch_size: int = 200
+    ranking_max_evidence: int = 40
+    # Re-rank qualified jobs automatically when the profile, the active resume or the ranking prompt changes.
+    ranking_auto_rerank: bool = True
     compensation_batch_size: int = 50
     # Background tailoring worker (app.services.tailor_tasks)
     tailor_worker_enabled: bool = True

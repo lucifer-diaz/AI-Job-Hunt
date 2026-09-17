@@ -30,16 +30,26 @@ def test_select_all_matching_returns_every_id():
     assert sorted(out["ids"]) == sorted(ids) and out["total"] == 3
 
 
-def test_bulk_rank_batches_and_reports_remaining(monkeypatch):
-    monkeypatch.setattr(get_settings(), "max_jobs_per_batch", 2)
+def test_bulk_rank_queues_tasks_and_never_ranks_in_the_request():
     ids = make_jobs(3, uuid.uuid4().hex[:8])
-    first = client.post("/api/jobs/bulk-rank", json={"ids": ids + [999999]}).json()
-    assert len(first["ranked"]) == 2 and len(first["remaining"]) == 1 and first["errors"] == []
-    second = client.post("/api/jobs/bulk-rank", json={"ids": first["remaining"]}).json()
-    assert [r["score"] for r in second["ranked"]] == [80] and second["remaining"] == []
-    again = client.post("/api/jobs/bulk-rank", json={"ids": ids}).json()
-    assert again["ranked"] == [] and again["skipped"] == 3  # already ranked
-    assert len(client.post("/api/jobs/bulk-rank?rerank=true", json={"ids": ids}).json()["ranked"]) == 2
+    response = client.post("/api/jobs/bulk-rank", json={"ids": ids + [999999]})
+    assert response.status_code == 202
+    first = response.json()
+    assert first["queued"] == ids and first["skipped"] == [{"id": 999999, "reason": "not found"}]
+    assert [t["status"] for t in first["tasks"]] == ["PENDING"] * 3 and all(t["force"] is False for t in first["tasks"])
+    assert all(client.get(f"/api/jobs/{i}").json()["fit"] is None for i in ids)
+
+    again = client.post("/api/jobs/bulk-rank?rerank=true", json={"ids": ids}).json()
+    assert again["queued"] == ids and [t["id"] for t in again["tasks"]] == [t["id"] for t in first["tasks"]]
+    assert all(t["force"] for t in again["tasks"])  # a user request upgrades the waiting task instead of duplicating it
+
+    from app.db import SessionLocal
+    from app.models import Job
+    with SessionLocal() as db:
+        db.get(Job, ids[0]).fit_score = 80.0
+        db.commit()
+    unranked_only = client.post("/api/jobs/bulk-rank", json={"ids": ids}).json()
+    assert unranked_only["queued"] == ids  # jobs still waiting for the ranker stay queued
 
 
 def test_bulk_delete_protects_submitted_jobs_and_cascades():

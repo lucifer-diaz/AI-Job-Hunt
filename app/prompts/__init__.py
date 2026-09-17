@@ -5,6 +5,7 @@ Each prompt module has a builder that returns a provider-independent `Prompt` (t
 data model allows. Services must not define long prompts inline.
 """
 from app.prompts.agents import AGENT_PROMPT_VERSION
+from app.prompts.ai_optimization import AI_OPTIMIZATION_PROMPT_VERSION, build_ai_optimization_prompt
 from app.prompts.application import (
                                        APPLICATION_QUESTION_PROMPT_VERSION,
                                        build_application_question_prompt,
@@ -36,9 +37,11 @@ PROMPT_VERSIONS = {
     "application_question": APPLICATION_QUESTION_PROMPT_VERSION,
     "inbox": INBOX_PROMPT_VERSION,
     "agents": AGENT_PROMPT_VERSION,
+    "ai_optimization": AI_OPTIMIZATION_PROMPT_VERSION,
 }
 
 __all__ = [
+                                       "build_ai_optimization_prompt",
                                        "INBOX_CATEGORIES",
                                        "PROMPT_VERSIONS",
                                        "Prompt",

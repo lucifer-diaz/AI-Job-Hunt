@@ -261,23 +261,32 @@ def test_ai_calls_use_the_signed_in_accounts_own_key(monkeypatch):
     class FakeOpenAI:
         def __init__(self, **kwargs):
             captured.update(kwargs)
-            reply = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='{"score": 77}'))])
+            reply = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='{"claims": []}'))])
             self.chat = SimpleNamespace(completions=SimpleNamespace(create=lambda **_: reply))
 
     monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=FakeOpenAI))
+    resume = "Led platform engineering for machine learning products at Beta, owning Python services, data pipelines " \
+             "and a team of eight engineers across two time zones."
+    assert alice.put("/api/profile", json={"master_resume": resume}).status_code == 200
+    parsed = alice.post("/api/profile/resume/parse-evidence")
+    assert parsed.status_code == 200 and captured["api_key"] == "sk-or-v1-alice-key"
+
     job = alice.post("/api/jobs/from-url", json={"url": f"https://jobs.example/{uuid.uuid4().hex}", "title": "ML Lead",
                                                  "company": "Beta", "description": "Python"}).json()["job"]
-    ranked = alice.post(f"/api/jobs/{job['id']}/rank")
-    assert ranked.status_code == 200 and ranked.json()["score"] == 77
-    assert captured["api_key"] == "sk-or-v1-alice-key"
+    queued = alice.post(f"/api/jobs/{job['id']}/rank")  # ranking is queued for the ranker, never run in the request
+    assert queued.status_code == 202 and queued.json()["queued"] == [job["id"]] and queued.json()["blocked"] is None
 
     bob, _ = signed_up()  # no key saved: a clear error instead of borrowing anyone else's
     assert bob.put("/api/settings", json={"llm_provider": "openrouter", "model": "openrouter/free",
                                           "application_mode": "manual_approval", "min_review_score": 70}).status_code == 200
+    assert bob.put("/api/profile", json={"master_resume": resume}).status_code == 200
+    refused = bob.post("/api/profile/resume/parse-evidence")
+    assert refused.status_code == 400 and "add your OpenRouter API key" in refused.json()["detail"]
     bob_job = bob.post("/api/jobs/from-url", json={"url": f"https://jobs.example/{uuid.uuid4().hex}", "title": "ML Lead",
                                                    "company": "Beta", "description": "Python"}).json()["job"]
-    refused = bob.post(f"/api/jobs/{bob_job['id']}/rank")
-    assert refused.status_code == 400 and "add your OpenRouter API key" in refused.json()["detail"]
+    waiting = bob.post(f"/api/jobs/{bob_job['id']}/rank").json()
+    assert waiting["queued"] == [bob_job["id"]] and waiting["blocked"] == "No OpenRouter API key saved in Settings"
+    assert alice.post(f"/api/jobs/{bob_job['id']}/rank").status_code == 404  # another account's job
 
 
 def test_scheduler_status_hides_cross_account_details_from_non_admins():
@@ -298,7 +307,7 @@ def test_accounts_get_profiles_on_databases_whose_ids_had_no_sequence(pg_session
     repair = importlib.import_module("app.migrations.versions.0005_one_per_user_ids")
     with pg_sessions.begin() as db:
         for table in repair.ONE_PER_USER:
-            db.execute(text(f"TRUNCATE {table}"))
+            db.execute(text(f"TRUNCATE {table} CASCADE"))  # rankings and snapshots reference profiles
             db.execute(text(f"ALTER TABLE {table} ALTER COLUMN id DROP DEFAULT"))
             db.execute(text(f"DROP SEQUENCE IF EXISTS {table}_id_seq"))  # now shaped like the legacy table
     with pg_sessions() as db, pytest.raises(Exception):

@@ -160,7 +160,10 @@ def test_search_filters_unranked_jobs():
     tag = uuid.uuid4().hex[:8]
     ranked = make_job(company=f"Rankco {tag} A")
     unranked = make_job(company=f"Rankco {tag} B")
-    assert client.post(f"/api/jobs/{ranked['id']}/rank").status_code == 200
+    with SessionLocal() as db:  # what the asynchronous ranker leaves on a qualified job (tests/test_ranker.py)
+        row = db.get(Job, ranked["id"])
+        row.fit_score, row.status = 80.0, "shortlisted"
+        db.commit()
 
     out = client.get("/api/jobs/search", params={"q": f"Rankco {tag}", "stage": "unranked"}).json()
     assert [item["id"] for item in out["items"]] == [unranked["id"]] and out["total"] == 1
@@ -214,7 +217,8 @@ def test_search_profile_save_run_and_detail(monkeypatch):
     db.close()
     detail = client.get(f"/api/search/apify/runs/{run_id}/detail").json()
     assert detail["counts"]["duplicates"] == 4 and detail["results"][0]["company"] == "Pulled Co"
-    assert client.post(f"/api/search/apify/runs/{run_id}/rank").json()["ranked"] == 1
+    queued = client.post(f"/api/search/apify/runs/{run_id}/rank")
+    assert queued.status_code == 202 and len(queued.json()["queued"]) == 1
 
 
 def test_tracker_stages_preferences_and_evidence_parsing():
@@ -257,10 +261,17 @@ def test_board_import_errors_are_readable(monkeypatch):
     assert response.json()["detail"] == "No public Greenhouse board named 'nope'"
 
 
-def test_rank_batch_ranks_unranked_jobs():
+def test_rank_batch_queues_unranked_jobs_without_ranking_them():
     job = make_job()
-    ranked = client.post("/api/jobs/rank-batch").json()
-    assert any(row["id"] == job["id"] and row["score"] == 80 for row in ranked)
+    response = client.post("/api/jobs/rank-batch")
+    assert response.status_code == 202 and job["id"] in response.json()["queued"]
+    tasks = client.get("/api/ranking/tasks", params={"job_ids": str(job["id"])}).json()
+    assert tasks["active"] == 1 and tasks["tasks"][0]["status"] == "PENDING"
+    assert client.get(f"/api/jobs/{job['id']}").json()["fit"] is None  # nothing was ranked inside the request
+    again = client.post("/api/jobs/rank-batch").json()
+    assert job["id"] in again["queued"] and len(client.get("/api/ranking/tasks", params={
+        "job_ids": str(job["id"])}).json()["tasks"]) == 1  # queueing twice never creates a second task
+    assert client.get("/api/ranking/tasks", params={"job_ids": "1,x"}).status_code == 422
 
 
 def test_extract_job_posting_reads_json_ld():

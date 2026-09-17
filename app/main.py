@@ -10,7 +10,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
@@ -26,6 +26,7 @@ from app.auth import router as auth_router
 from app.db import engine
 from app.db_migrations import run_migrations
 from app.hunter_api import router as hunter_router
+from app.monitoring_api import router as monitoring_router
 from app.models import (
     Application,
     CandidateProfile,
@@ -34,9 +35,11 @@ from app.models import (
     KnowledgeAnswer,
     ResumeDocument,
     ResumeVariant,
+    SchedulerJob,
     SearchRun,
 )
 from app.scheduler import build_scheduler
+from app.scheduler_hooks import run_soon
 from app.schemas import (
     ApifySearchIn,
     ApiKeysIn,
@@ -54,7 +57,7 @@ from app.schemas import (
     TailorTasksIn,
 )
 from app.security import SecretsUnavailable
-from app.services import tailor_tasks
+from app.services import ranker, tailor_tasks
 from app.services.ai_config import PROVIDERS as AI_PROVIDERS
 from app.services.ai_config import STAGES as AI_STAGES
 from app.services.ai_config import env_defaults as ai_env_defaults
@@ -74,7 +77,6 @@ from app.services.workflow import (
     approve_job,
     get_profile,
     mark_applied,
-    rank_job,
     skip_tailoring,
     tailor_job,
 )
@@ -103,6 +105,7 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title=settings.app_name, version="0.5.0", lifespan=lifespan)
+app.state.scheduler = scheduler
 
 
 @app.exception_handler(RequestValidationError)
@@ -117,6 +120,7 @@ app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), na
 app.include_router(auth_router)
 app.include_router(workspace_router)
 app.include_router(hunter_router)
+app.include_router(monitoring_router)
 
 # Reachable without signing in. Cron and admin routes are protected by their own secrets.
 PUBLIC_PATHS = {"/health", "/login", "/signup", "/api/auth/login", "/api/auth/signup", "/api/auth/logout"}
@@ -245,7 +249,7 @@ def dashboard(request: Request, db: Session = Depends(get_user_db)):
 def settings_get(db: Session = Depends(get_user_db)):
     value = settings_for(db)
     keys = key_status(db)
-    configured = {name: keys[name]["configured"] for name in ("openrouter", "openai", "anthropic", "apify")}
+    configured = {name: keys[name]["configured"] for name in ("openrouter", "openai", "anthropic", "gemini", "apify")}
     overrides = (value.preferences or {}).get("ai") or {}
     effective = resolve_ai_config(settings, overrides)
     return {"llm_provider": effective["llm_provider"], "model": effective["model"],
@@ -386,28 +390,63 @@ def apify_runs(db: Session = Depends(get_user_db)):
     ]
 
 
-@app.post("/api/jobs/{job_id}/rank")
-def rank(job_id: int, db: Session = Depends(get_user_db)):
+@app.post("/api/jobs/{job_id}/rank", status_code=202)
+def rank(job_id: int, request: Request, background: BackgroundTasks, db: Session = Depends(get_user_db)):
+    """Queue a (re-)ranking of one job. The ranker runs asynchronously; poll /api/ranking/tasks for the result."""
+    if not db.get(Job, job_id):
+        raise HTTPException(404, "Job not found")
+    out = ranker.request_ranking(db, [job_id], force=True, actor=f"user:{require_user_id(db)}")
+    if out["skipped"]:
+        raise HTTPException(409, out["skipped"][0]["reason"])
+    run_soon(background, request.app, "ranking")
+    return out
+
+
+@app.post("/api/jobs/rank-batch", status_code=202)
+def rank_batch(request: Request, background: BackgroundTasks, db: Session = Depends(get_user_db)):
+    """Queue every job that has no ranking yet."""
+    ids = db.scalars(select(Job.id).where(Job.fit_score.is_(None), Job.state.in_(ranker.RANK_WAITING_STATES))
+                     .order_by(Job.id).limit(5000)).all()
+    out = ranker.request_ranking(db, ids, force=False, only_unranked=True, actor=f"user:{require_user_id(db)}")
+    run_soon(background, request.app, "ranking")
+    return out
+
+
+@app.get("/api/ranking/tasks")
+def ranking_tasks(job_ids: str = "", db: Session = Depends(get_user_db)):
+    """The latest ranking task of each listed job (comma-separated ids)."""
+    try:
+        ids = [int(part) for part in job_ids.split(",") if part.strip()][:500]
+    except ValueError as exc:
+        raise HTTPException(422, "job_ids must be comma-separated integers") from exc
+    tasks = ranker.task_summaries(db, ids)
+    return {"tasks": tasks, "active": sum(t["status"] in ("PENDING", "PROCESSING") for t in tasks)}
+
+
+@app.get("/api/ranking/tracker")
+def ranking_tracker(request: Request, db: Session = Depends(get_user_db)):
+    """The ranking tracker: this account's waiting, running, retrying and recently finished ranking work."""
+    out = ranker.tracker(db, require_user_id(db))
+    worker = getattr(request.app.state, "scheduler", None)
+    row = db.get(SchedulerJob, "ranking")
+    live = bool(row and row.lock_expires_at and row.lock_expires_at > datetime.now(UTC).replace(tzinfo=None))
+    # Only schedule facts: the job's results and errors span every account, so they stay admin-only.
+    out["worker"] = {"enabled": bool(worker and worker.enabled and worker.interval("ranking") > 0),
+                     "interval_minutes": worker.interval("ranking") if worker else 0, "running": live,
+                     "next_run_at": row.next_run_at.isoformat() if row and row.next_run_at else None,
+                     "last_finished_at": row.last_finished_at.isoformat() if row and row.last_finished_at else None}
+    return out
+
+
+@app.get("/api/jobs/{job_id}/rankings")
+def job_rankings(job_id: int, db: Session = Depends(get_user_db)):
+    """Every ranking version of a job, newest first. Earlier versions are never overwritten."""
     job = db.get(Job, job_id)
     if not job:
         raise HTTPException(404, "Job not found")
-    try:
-        return rank_job(db, job)
-    except Exception as exc:
-        raise HTTPException(400, str(exc)) from exc
-
-
-@app.post("/api/jobs/rank-batch")
-def rank_batch(db: Session = Depends(get_user_db)):
-    jobs = db.scalars(select(Job).where(Job.fit_score.is_(None)).limit(settings.max_jobs_per_batch)).all()
-    done = []
-    for job in jobs:
-        try:
-            rank_job(db, job)
-            done.append({"id": job.id, "score": job.fit_score})
-        except Exception as exc:
-            done.append({"id": job.id, "error": str(exc)})
-    return done
+    return {"job_id": job.id, "state": job.state.value,
+            "rankings": [ranker.ranking_dict(r) for r in sorted(job.rankings, key=lambda r: -r.version)],
+            "tasks": [ranker.task_dict(t) for t in sorted(job.ranking_tasks, key=lambda t: -t.id)]}
 
 
 @app.post("/api/jobs/{job_id}/tailor")

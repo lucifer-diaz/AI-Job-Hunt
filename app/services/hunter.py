@@ -6,7 +6,8 @@
       → SearchRun rows track PENDING / RUNNING / SUCCEEDED / FAILED / NEEDS_INVESTIGATION
     apify_sync (scheduler) → refresh_hunter_run
       → fetch dataset → schema check → normalize → recency filter → deduplicate → save
-      → new jobs DISCOVERED → NORMALIZED → FILTERED, where the ranker picks them up
+      → new jobs DISCOVERED → NORMALIZED → hard filters (app.services.ranker) → FILTERED → RANK_PENDING
+        with a ranking task. Nothing is ranked here: the scheduler's ranking worker does that later.
 
 Every step is safe to repeat: a re-imported dataset merges into the jobs it already created.
 """
@@ -25,11 +26,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import Job, SearchProfile, SearchRun
-from app.services import sources
+from app.services import ranker, sources
 from app.services.apify_adapters import (FALLBACK_FOR_SITE, PRIMARY, HunterSearch, PlannedRun, RunContext,
                                          SchemaMismatch, get_adapter, older_than, plan_runs)
 from app.services.lifecycle import WorkflowState as S
-from app.services.user_settings import apify_token, profile_for
+from app.services.user_settings import apify_token
 from app.services.work_queue import transition
 from app.settings import get_settings
 
@@ -221,11 +222,6 @@ def start_fallback(db: Session, run: SearchRun) -> list[int]:
 
 # ───────────── importing results ─────────────
 
-def _excluded_companies(db: Session, owner: int) -> set[str]:
-    preferences = profile_for(db, owner).search_preferences or {}
-    return {str(c).strip().lower() for c in preferences.get("exclude_companies") or [] if str(c).strip()}
-
-
 def import_run_items(db: Session, run: SearchRun, items: list[Any]) -> dict[str, Any]:
     """Normalize, filter, deduplicate and save one run's dataset. Raises SchemaMismatch before writing anything."""
     adapter = get_adapter(run.adapter)
@@ -236,7 +232,7 @@ def import_run_items(db: Session, run: SearchRun, items: list[Any]) -> dict[str,
     reference = run.finished_at or run.started_at or run.created_at
     ctx = RunContext(roles=tuple(run.roles or ()), location=run.location or "", actor_id=run.actor_id,
                      run_id=run.external_run_id, reference_time=reference, search_profile_id=run.search_profile_id)
-    excluded = _excluded_companies(db, run.user_id)
+    policy = ranker.policy_for(db, run.user_id)
     stats: Counter = Counter()
     for item in items:
         if not isinstance(item, dict):
@@ -256,7 +252,7 @@ def import_run_items(db: Session, run: SearchRun, items: list[Any]) -> dict[str,
                                                        job["scraped_at"] or reference, params.get("hours_old")):
             stats["too_old"] += 1
             continue
-        stats[_save(db, run, ctx, job, excluded)] += 1
+        stats[_save(db, run, ctx, job, policy)] += 1
     summary = {"seen": len(items), **{key: 0 for key in ("normalized", "created", "duplicates", "filtered_out",
                                                           "missing_title", "missing_company", "missing_posted_date",
                                                           "too_old")}}
@@ -332,24 +328,24 @@ def _new_job(run: SearchRun, ctx: RunContext, job: dict[str, Any]) -> Job:
     )
 
 
-def _save(db: Session, run: SearchRun, ctx: RunContext, job: dict[str, Any], excluded: set[str]) -> str:
-    """Save one normalized result and commit. Returns duplicates, created or created_filtered_out."""
+def _save(db: Session, run: SearchRun, ctx: RunContext, job: dict[str, Any], policy: ranker.RankingPolicy) -> str:
+    """Save one normalized result and commit. Returns duplicates, created or created_filtered_out.
+
+    A new job passes the ranker's hard filters and is queued for ranking in the same transaction; the model is
+    never called from an import.
+    """
     existing = find_duplicate(db, run.user_id, job)
     if existing is not None:
         _merge(existing, run, ctx, job)
         db.commit()
         return "duplicates"
     record = _new_job(run, ctx, job)
-    reason = f"{record.company} is an excluded company" if record.company.strip().lower() in excluded else None
     try:
         db.add(record)
         db.flush()
         transition(db, record, S.NORMALIZED, actor="hunter",
                    reason=f"Normalized from {run.actor_id} run {run.external_run_id}")
-        if reason:
-            transition(db, record, S.SKIPPED, actor="hunter", reason=reason)
-        else:
-            transition(db, record, S.FILTERED, actor="hunter", reason="Passed search filters; waiting for ranking")
+        reason = ranker.queue_job(db, record, policy=policy, actor="hunter")
         db.commit()
     except IntegrityError:  # another sync saved the same posting a moment ago
         db.rollback()
