@@ -24,7 +24,7 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
 
 from app.models import Job, ResumeVariant, TailorTask
-from app.services.user_settings import settings_for
+from app.services.user_settings import execution_mode_for, settings_for
 from app.services.workflow import SKIP_TAILORING_STATUSES, approve_job, skip_tailoring, tailor_job
 from app.settings import get_settings
 
@@ -39,6 +39,7 @@ STAGE_PROGRESS = {
     "tailor": {"queued": 0, "ranking": 5, "tailoring": 25, "reviewing": 70, "done": 100},
     "skip": {"queued": 0, "ranking": 0, "tailoring": 0, "reviewing": 30, "done": 100},
 }
+DESKTOP_MODE_REASON = "Claude Desktop mode: tailor and review this job from Claude Desktop"
 # Finished tasks stay on the Tailor screen this long unless cleared.
 RECENT = timedelta(hours=24)
 
@@ -86,9 +87,12 @@ def enqueue(db: Session, ids: list[int], mode: str = "tailor", regenerate: bool 
     active = set(db.scalars(select(TailorTask.job_id).where(TailorTask.job_id.in_(wanted),
                                                             TailorTask.status.in_(ACTIVE))).all())
     tasks, skipped = [], []
+    desktop = execution_mode_for(db) == "claude_desktop"
     for job_id in wanted:
         job = jobs.get(job_id)
         reason = ("not found" if job is None
+                  # Claude Desktop mode: the reasoning happens in Claude Desktop, so the backend makes no model calls.
+                  else DESKTOP_MODE_REASON if desktop
                   else "already queued" if job_id in active
                   else "not in the Tailor queue" if job.status not in SKIP_TAILORING_STATUSES
                   else "already has a packet" if job_id in has_packet and not regenerate

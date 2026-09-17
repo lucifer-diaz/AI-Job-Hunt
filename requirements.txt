@@ -18,3 +18,4 @@ google-adk>=1.15,<2
 alembic>=1.13,<2
 cryptography>=42,<51
 tzdata>=2024.1
+mcp>=1.12,<2
