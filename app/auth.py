@@ -19,7 +19,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from pydantic import BaseModel, EmailStr, Field, model_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -72,6 +72,21 @@ class SignupIn(BaseModel):
 class LoginIn(BaseModel):
     email: EmailStr
     password: str = Field(max_length=256)
+
+
+class PasswordChangeIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    current_password: str = Field(min_length=1, max_length=256, repr=False)
+    new_password: str = Field(min_length=PASSWORD_MIN_LENGTH, max_length=256, repr=False)
+    confirm_password: str = Field(max_length=256, repr=False)
+
+    @model_validator(mode="after")
+    def passwords_match(self) -> PasswordChangeIn:
+        if self.new_password != self.confirm_password:
+            raise ValueError("Passwords do not match")
+        if self.new_password == self.current_password:
+            raise ValueError("Choose a different new password")
+        return self
 
 
 class AccountExists(ValueError):
@@ -145,6 +160,16 @@ def start_session(db: Session, user_id: int) -> str:
                        expires_at=now + timedelta(days=get_settings().session_days)))
     db.commit()
     return token
+
+
+def _start_verified_session(db: Session, user: User) -> str:
+    """Hold the account write lock from hash recheck through session creation."""
+    changed = db.execute(update(User).where(User.id == user.id, User.password_hash == user.password_hash)
+                         .values(last_login_at=utcnow()))
+    if changed.rowcount != 1:
+        raise HTTPException(401, "Email or password is incorrect")
+    # start_session commits both this conditional update and the new session.
+    return start_session(db, user.id)
 
 
 def session_user(request: Request) -> CurrentUser | None:
@@ -237,11 +262,10 @@ def login(payload: LoginIn, request: Request, response: Response, db: Session = 
         with _failures_lock:
             _failures[email].append(now)
         raise HTTPException(401, "Email or password is incorrect")
+    token = _start_verified_session(db, user)
     with _failures_lock:
         _failures.pop(email, None)
-    user.last_login_at = utcnow()
-    db.commit()
-    _set_session_cookie(response, request, start_session(db, user.id))
+    _set_session_cookie(response, request, token)
     return {"user": CurrentUser(user.id, user.email, user.is_admin).public()}
 
 
@@ -258,3 +282,42 @@ def logout(request: Request, response: Response, db: Session = Depends(get_db)):
 @router.get("/api/auth/me")
 def me(user: CurrentUser = Depends(current_user)):
     return {"user": user.public()}
+
+
+def _check_current_password(user: User, password: str) -> None:
+    key, now = f"password:{user.id}", time.monotonic()
+    with _failures_lock:
+        if _recent_failures(key, now) >= LOGIN_FAILURE_LIMIT:
+            raise HTTPException(429, "Too many failed attempts. Try again in 15 minutes.")
+    if not verify_password(password, user.password_hash):
+        with _failures_lock:
+            _failures[key].append(time.monotonic())
+        raise HTTPException(403, "Current password is incorrect")
+
+
+def _replace_password_session(db: Session, user: User, password: str) -> str:
+    """Compare-and-swap also serializes competing changes on SQLite."""
+    changed = db.execute(update(User).where(User.id == user.id, User.password_hash == user.password_hash)
+                         .values(password_hash=hash_password(password)))
+    if changed.rowcount != 1:
+        raise HTTPException(409, "Password changed in another request. Sign in again.")
+    db.execute(delete(UserSession).where(UserSession.user_id == user.id))
+    token, now = secrets.token_urlsafe(32), utcnow()
+    db.add(UserSession(user_id=user.id, token_hash=_token_hash(token), created_at=now, last_seen_at=now,
+                       expires_at=now + timedelta(days=get_settings().session_days)))
+    return token
+
+
+@router.post("/api/auth/password")
+def change_password(payload: PasswordChangeIn, request: Request, response: Response,
+                    identity: CurrentUser = Depends(current_user), db: Session = Depends(get_db)):
+    user = db.scalar(select(User).where(User.id == identity.id).with_for_update())
+    if user is None:
+        raise HTTPException(401, "Sign in required")
+    _check_current_password(user, payload.current_password)
+    token = _replace_password_session(db, user, payload.new_password)
+    db.commit()  # hash, revocation and replacement succeed or roll back together
+    with _failures_lock:
+        _failures.pop(f"password:{user.id}", None)
+    _set_session_cookie(response, request, token)
+    return {"ok": True}

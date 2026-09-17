@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any, TypeVar
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -21,6 +21,15 @@ KEY_COLUMNS = {"openrouter": "openrouter_api_key_enc", "openai": "openai_api_key
 KEY_LABELS = {"openrouter": "OpenRouter", "openai": "OpenAI", "anthropic": "Anthropic", "apify": "Apify"}
 
 Row = TypeVar("Row", CandidateProfile, AppSetting)
+
+
+def lock_settings_row(db: Session, row: Row) -> Row:
+    """Reload after taking a write lock, including SQLite's single-writer lock."""
+    model = type(row)
+    if db.get_bind().dialect.name == "sqlite":
+        db.execute(update(model).where(model.id == row.id).values(id=row.id))
+    return db.scalar(select(model).where(model.id == row.id).with_for_update()
+                     .execution_options(populate_existing=True))
 
 
 def _owner(db: Session, user_id: int | None) -> int:

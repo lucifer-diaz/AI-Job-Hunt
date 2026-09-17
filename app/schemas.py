@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ProfileIn(BaseModel):
@@ -96,6 +96,24 @@ class SettingsIn(BaseModel):
     require_free: bool | None = None
     application_mode: str = "manual_approval"
     min_review_score: int = Field(default=70, ge=0, le=100)
+
+
+class ProfilePatch(ProfileIn):
+    """Only supplied fields are written; nested preferences are merged."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def reject_null_resume(self) -> ProfilePatch:
+        if "master_resume" in self.model_fields_set and self.master_resume is None:
+            raise ValueError("Use an empty string to clear resume text")
+        return self
+
+
+class SettingsPatch(SettingsIn):
+    """Omitted values remain saved; blank AI overrides restore inheritance."""
+
+    model_config = ConfigDict(extra="forbid")
 
 
 class ApplicationUpdateIn(BaseModel):
