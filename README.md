@@ -23,7 +23,7 @@ The dashboard is a single-page workspace served from `app/static/app.js`; every 
 | Apply kit | Files to upload, answers to paste, link to the posting, confirm "mark applied" | `GET /api/jobs/{id}/apply-kit` |
 | Tracker | Kanban by post-submission stage (drag or "move to"), optional extra stages, timeline, recruiter, interview scheduling, AI follow-up draft | `GET /api/tracker`, `POST /api/applications/{id}/stage`, `POST /api/applications/{id}/events` |
 | Monitoring | Every LLM request: requests, tokens, estimated cost, latency (avg/p50/p95/p99), failures by type, retries, context utilisation, usage by stage and cost by model, with filters (range, provider, model, stage, prompt version, status, job), a request detail view and the AI Optimization Advisor | `GET /api/monitoring/dashboard`, `POST /api/monitoring/analyze`, `GET /api/monitoring/recommendations` |
-| Knowledge bank | ATS answer library with edit/verify, evidence bank with verify/remove | `/api/knowledge`, `/api/evidence` |
+| Knowledge bank | Searchable Answer library and Evidence bank, focused editors, verification filters, copy and removal | `/api/knowledge`, `/api/evidence` |
 | Settings & profile | Candidate details and chip fields, resume variants, re-parse resume into (unverified) evidence, provider/model, your own API keys (stored encrypted), approval mode, cadence | `/api/profile`, `/api/settings`, `PUT /api/settings/keys`, `/api/preferences` |
 | Sign-in | Create an account (email, password, confirm password), sign in, sign out | `/signup`, `/login`, `POST /api/auth/signup`, `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/auth/me` |
 
@@ -832,3 +832,23 @@ and rollback notes](docs/settings.md).
 
 Frontend unit tests run with `npm ci && npm run test:coverage`; Node dependencies
 are development-only and the production UI still runs without a build step.
+
+### Knowledge bank workspace
+
+Open `#knowledge/answers` for reusable application answers or `#knowledge/evidence`
+for factual achievements. The original `#knowledge` link opens the Answer library.
+Each section keeps its own search, filters, and in-memory editor drafts while you
+switch sections. Reloading the page clears unsaved drafts.
+
+Answers can be filtered by verification, category, and sensitivity. Sensitive
+answers retain their confirmation requirement even when verified. Copying an
+answer records usage only after the clipboard operation succeeds. Delete is
+permanent and requires confirmation. Evidence supports search by claim, company,
+role, and skills; only verified claims may be cited by tailoring. Job-gap actions
+open the evidence editor directly and preserve existing claim input.
+
+Validation: `npm run test:coverage` covers the Knowledge bank and Settings flows.
+Relevant API regressions: `python -m pytest tests/test_workspace.py tests/test_api.py
+tests/test_dashboard_features.py -q`. No API or database migration is required.
+Rollback by reverting the Knowledge bank module, its dashboard script inclusion,
+and the associated routing and styles together.

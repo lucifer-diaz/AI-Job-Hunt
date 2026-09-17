@@ -10,7 +10,7 @@ const attr = esc;
 // Filters on the Tailor and Approvals screens, sent to /api/tailor/queue and /api/approvals.
 function pfDefaults(kind) { return { q: '', min_fit: 0, min_review: 0, board: 'all', status: 'all', sort: kind === 'tailor' ? 'fit' : 'default' }; }
 const S = {
-  screen: 'overview', settingsSection: 'profile', todayVariant: 'focus', discMode: 'triage',
+  screen: 'overview', knowledgeSection: 'answers', settingsSection: 'profile', todayVariant: 'focus', discMode: 'triage',
   filters: { q: '', min_fit: 0, board: 'all', stage: 'all', sort: 'fit', page: 1, per_page: 25 },
   triage: { min_fit: 0, hide_agencies: true, hide_reposts: true, keywords: [] }, triagedThisSession: 0,
   checked: new Set(), selJob: null, jobOpen: null, jobTab: 'description',
@@ -19,7 +19,7 @@ const S = {
   tailorMode: 'single', tailorChecked: new Set(), tailorRegenerate: false,
   pf: { tailor: pfDefaults('tailor'), approvals: pfDefaults('approvals') },
   approvalJob: null, selApp: null, trackerView: 'board', runSel: null,
-  editKnowledge: null, scheduling: false, editingRecruiter: false, recruiterDraft: [], ivDraft: null, manualMissing: null,
+  scheduling: false, editingRecruiter: false, recruiterDraft: [], ivDraft: null, manualMissing: null,
   polling: null, busy: {}, forms: {}, apifyImport: false, importPick: new Set(), autoRefreshed: false,
 };
 const D = {};
@@ -140,7 +140,7 @@ function miniMarkdown(md) {
 
 /* ───────────── routing + loading ───────────── */
 function setHash() {
-  const sub = S.screen === 'discovery' ? '/' + S.discMode : S.screen === 'today' ? '/' + S.todayVariant : S.screen === 'settings' ? '/' + S.settingsSection : '';
+  const sub = S.screen === 'discovery' ? '/' + S.discMode : S.screen === 'today' ? '/' + S.todayVariant : S.screen === 'settings' ? '/' + S.settingsSection : S.screen === 'knowledge' ? '/' + S.knowledgeSection : '';
   const next = '#' + S.screen + sub;
   if (location.hash !== next) history.replaceState(null, '', next);
 }
@@ -148,6 +148,7 @@ function readHash() {
   const [screen, sub] = location.hash.replace(/^#/, '').split('/');
   if (SCREENS.includes(screen)) S.screen = screen;
   if (screen === 'settings') S.settingsSection = settingsSection(sub);
+  if (screen === 'knowledge') S.knowledgeSection = knowledgeSection(sub);
   if (screen === 'discovery' && ['triage', 'table', 'setup', 'ranking'].includes(sub)) S.discMode = sub;
   if (screen === 'today' && ['focus', 'run'].includes(sub)) S.todayVariant = sub;
 }
@@ -190,7 +191,7 @@ const LOADERS = {
     const apps = D.tracker.applications;
     if (!apps.some(a => a.id === S.selApp)) S.selApp = (apps[0] || {}).id || null;
   },
-  async knowledge() { [D.knowledge, D.evidence] = await Promise.all([api('/api/knowledge'), api('/api/evidence')]); },
+  knowledge: loadKnowledge,
   async monitoring() { await loadMonitoring(); },
   async settings() {
     D.settingsLoadError = '';
@@ -1083,39 +1084,6 @@ function renderScheduleForm(sel) {
 }
 const KIND_DOT = { applied: '#5b4ae8', stage: '#0f9c86', note: '#c6cad8', call: '#0f9c86', email: '#a79bf0', referral: '#a79bf0', interview: '#e0a136' };
 
-/* ───────────── knowledge ───────────── */
-const CATEGORIES = ['general', 'work_authorization', 'compensation', 'notice_period', 'relocation', 'demographic'];
-function renderKnowledge() {
-  const k = D.knowledge; if (!k || !D.evidence) return loading();
-  const verified = k.filter(a => a.verified).length;
-  const editing = k.find(a => a.id === S.editKnowledge);
-  const F = 'kn' + (editing ? editing.id : 'new');
-  const ev = D.evidence;
-  return `<div class="split">
-  <section class="card flush c-main"><div class="row gap8 wrap" style="padding:14px 18px;border-bottom:1px solid var(--line2)"><div class="card-title grow">Answer library</div>${pill(`${verified} verified`, 'good', 'lg')}${pill(`${k.length - verified} need review`, 'warn', 'lg')}</div>
-    ${k.length ? k.map(a => `<div style="padding:15px 18px;border-bottom:1px solid var(--line3);${a.id === S.editKnowledge ? 'background:var(--brand-softer)' : ''}"><div class="row top-align gap10"><div class="grow">
-      <div class="base b pretty">${esc(a.question)}</div><div class="small ink2 mt4 pretty">${esc(a.answer || 'Awaiting answer')}</div>
-      <div class="row gap6 wrap mt8">${a.sensitive ? pill('sensitive', 'bad') : a.verified ? pill('verified', 'good') : pill('needs review', 'warn')}${pill(a.category, 'muted')}${pill(`used ${a.use_count}×`, 'muted')}</div></div>
-      <div class="col gap6 none">${btn('Edit', 'kn-edit', { id: a.id }, 'sm')}${btn('Archive', 'kn-delete', { id: a.id }, 'sm danger')}</div></div></div>`).join('') : empty('No answers yet', 'Save the questions ATS forms keep asking — work authorization, notice period, compensation.')}
-  </section>
-  <div class="c-side col gap14">
-    <section class="card pad18"><div class="card-title sm mb4">${editing ? 'Edit answer' : 'Add an answer'}</div><div class="small muted mb12">Answer once, reuse in every ATS form.</div>
-      ${textareaF(F, 'question', editing?.question, 'placeholder="Question, e.g. Are you authorized to work in India?" style="min-height:60px"')}
-      ${textareaF(F, 'answer', editing?.answer, 'placeholder="Your answer"')}
-      <div class="row gap9">${selectF(F, 'category', editing?.category || 'general', CATEGORIES.map(c => [c, c]))}${selectF(F, 'answer_type', editing?.answer_type || 'text', [['text', 'text'], ['boolean', 'boolean'], ['choice', 'choice'], ['number', 'number']])}</div>
-      <div class="col gap6 mt10">${checkF(F, 'verified', editing ? editing.verified : true, 'Human verified — eligible for reuse')}${checkF(F, 'sensitive', editing?.sensitive, 'Sensitive — always ask me first')}</div>
-      <div class="row gap8 mt12">${editing ? btn('Cancel', 'kn-cancel', {}, 'grow') : ''}${btn(label('kn', 'Save answer', 'Saving…'), 'kn-save', { id: editing?.id || '' }, 'primary grow', isBusy('kn'))}</div></section>
-    <section class="card pad18"><div class="card-title sm mb4">Evidence bank</div><div class="small muted mb12">Tailoring may only cite verified claims. ${ev.filter(e => e.verified).length} verified.</div>
-      <div class="col gap8">${ev.length ? ev.map(e => `<div class="box"><div class="row top-align gap8"><div class="grow"><div class="small b pretty">${esc(e.claim)}</div><div class="xs muted mt4">${esc([e.company, e.role, (e.skills || []).join(', ')].filter(Boolean).join(' · ') || 'no context')}</div></div>
-        <div class="col gap4 none">${e.verified ? pill('verified', 'good') : btn('Verify', 'ev-verify', { id: e.id }, 'sm soft')}<a href="#" class="xs danger tr" style="color:var(--bad)" data-act="ev-delete" data-id="${e.id}">Remove</a></div></div></div>`).join('') : '<div class="small muted">No evidence yet. Add claims below or re-parse your resume from Settings.</div>'}</div>
-      <div class="hr" style="margin:14px 0"></div>
-      ${textareaF('ev', 'claim', S.evidencePrefill || '', 'placeholder="A factual achievement, e.g. Cut cloud spend 35% in 2024" style="min-height:56px"')}
-      <div class="row gap8">${inputF('ev', 'company', '', 'placeholder="Company"')}${inputF('ev', 'role', '', 'placeholder="Role"')}</div>
-      ${inputF('ev', 'skills', '', 'placeholder="Skills, comma separated"')}
-      ${btn(label('ev', 'Add verified evidence', 'Adding…'), 'ev-add', {}, 'block mt10', isBusy('ev'))}</section>
-  </div></div>`;
-}
-
 /* ───────────── job modal + palette ───────────── */
 function renderJobModal() {
   const j = D.jobModal;
@@ -1362,7 +1330,16 @@ const A = {
   },
   'modal-triage': async el => { await triageJob(el.dataset.id, el.dataset.action); if (S.jobOpen) openJob(S.jobOpen); },
   'save-job-notes': el => busy('jobnotes', () => api(`/api/jobs/${el.dataset.id}/notes`, { method: 'PUT', body: { notes: fv('jobnotes', el.dataset.id, D.jobModal.notes) } }), 'Notes saved'),
-  'add-evidence-for': el => { S.jobOpen = null; S.evidencePrefill = `${el.dataset.gap}: `; go('knowledge'); },
+  'add-evidence-for': el => {
+    S.jobOpen = null;
+    // Preserve an existing claim draft while incorporating the new job gap.
+    const current = fv('ev', 'claim', S.evidencePrefill || '');
+    S.evidencePrefill = current ? current + '\n' + el.dataset.gap + ': ' : el.dataset.gap + ': ';
+    setF('ev', 'claim', S.evidencePrefill);
+    knowledgeState().editors.evidence = { id: null, form: 'ev' };
+    go('knowledge', { knowledgeSection: 'evidence' });
+    document.getElementById('ev-claim')?.focus();
+  },
   'rank-job': el => busy('rank' + el.dataset.id, async () => {
     const out = await api(`/api/jobs/${el.dataset.id}/rank`, { method: 'POST' });
     watchRanking(out.queued);
@@ -1656,26 +1633,7 @@ const A = {
       S.scheduling = false; await load();
     }, 'Interview scheduled');
   },
-  // knowledge
-  'kn-edit': el => { S.editKnowledge = Number(el.dataset.id); render(); },
-  'kn-cancel': () => { delete S.forms['kn' + S.editKnowledge]; S.editKnowledge = null; render(); },
-  'kn-save': el => busy('kn', async () => {
-    const id = el.dataset.id, F = 'kn' + (id || 'new'), cur = (D.knowledge || []).find(a => String(a.id) === id) || {};
-    const body = { question: fv(F, 'question', cur.question || ''), answer: fv(F, 'answer', cur.answer || ''), category: fv(F, 'category', cur.category || 'general'), answer_type: fv(F, 'answer_type', cur.answer_type || 'text'), verified: fv(F, 'verified', id ? cur.verified : true), sensitive: fv(F, 'sensitive', !!cur.sensitive) };
-    if (!body.question.trim()) throw new Error('Write the question first');
-    await api(id ? `/api/knowledge/${id}` : '/api/knowledge', { method: id ? 'PUT' : 'POST', body });
-    delete S.forms[F]; S.editKnowledge = null; await load();
-  }, 'Answer saved'),
-  'kn-delete': async el => { if (!confirm('Archive this answer? It will no longer be offered in apply kits.')) return; await api(`/api/knowledge/${el.dataset.id}`, { method: 'DELETE' }).catch(e => toast(e.message, true)); refreshAfter('Answer archived'); },
-  'ev-add': () => busy('ev', async () => {
-    const f = S.forms.ev || {};
-    const claim = (f.claim ?? S.evidencePrefill ?? '').trim();
-    if (!claim) throw new Error('Describe the claim first');
-    await api('/api/evidence', { method: 'POST', body: { claim, company: f.company || '', role: f.role || '', skills: (f.skills || '').split(',').map(s => s.trim()).filter(Boolean), verified: true } });
-    delete S.forms.ev; S.evidencePrefill = ''; await load();
-  }, 'Evidence added'),
-  'ev-verify': el => busy('evv', async () => { await api(`/api/evidence/${el.dataset.id}`, { method: 'PATCH', body: { verified: true } }); await load(); }, 'Verified — tailoring may now cite it'),
-  'ev-delete': async (el, e) => { e.preventDefault(); if (!confirm('Remove this evidence claim?')) return; await api(`/api/evidence/${el.dataset.id}`, { method: 'DELETE' }).catch(err => toast(err.message, true)); refreshAfter('Evidence removed'); },
+  ...KNOWLEDGE_ACTIONS,
   ...SETTINGS_ACTIONS,
   ...MONITORING_ACTIONS,
 };
@@ -1691,6 +1649,8 @@ async function moveStage(appId, stage) {
 
 /* ───────────── events ───────────── */
 document.addEventListener('click', e => {
+  const knowledgeLink = e.target.closest('a[href^="#knowledge/"]');
+  if (knowledgeLink && S.screen === 'knowledge' && !e.metaKey && !e.ctrlKey) { e.preventDefault(); knowledgeNavigate(knowledgeLink.hash.split('/')[1]); return; }
   const link = e.target.closest('a[href^="#settings/"]');
   if (link && S.screen === 'settings' && !e.metaKey && !e.ctrlKey) { e.preventDefault(); settingsNavigate(link.hash.split('/')[1]); return; }
   const el = e.target.closest('[data-act]');
@@ -1703,6 +1663,7 @@ document.addEventListener('click', e => {
 let filterTimer, paletteTimer;
 document.addEventListener('input', e => {
   const el = e.target;
+  if (knowledgeFilterEvent(el)) return;
   if (el.dataset.authEntry || el.dataset.authNotes) { settingsAuthUpdate(); return; }
   if (el.dataset.form && el.dataset.field) {
     setF(el.dataset.form, el.dataset.field, el.type === 'checkbox' ? el.checked : el.value);
@@ -1725,6 +1686,7 @@ document.addEventListener('input', e => {
 });
 document.addEventListener('change', e => {
   const el = e.target;
+  if (knowledgeFilterEvent(el)) return;
   if (el.dataset.authEntry) { settingsAuthUpdate(); return; }
   if (el.dataset.form && el.dataset.field && (el.tagName === 'SELECT' || el.type === 'checkbox' || el.type === 'radio')) {
     setF(el.dataset.form, el.dataset.field, el.type === 'checkbox' ? el.checked : el.value);
@@ -1790,17 +1752,19 @@ document.addEventListener('drop', e => { const col = e.target.closest?.('[data-d
 window.addEventListener('hashchange', () => {
   const [screen, section] = location.hash.slice(1).split('/');
   if (!settingsCanLeave(screen, settingsSection(section))) { setHash(); return; }
-  const before = S.screen + S.discMode + S.todayVariant + S.settingsSection;
+  const before = S.screen + S.discMode + S.todayVariant + S.settingsSection + S.knowledgeSection;
   readHash(); setHash();
-  if (before !== S.screen + S.discMode + S.todayVariant + S.settingsSection) {
+  if (before !== S.screen + S.discMode + S.todayVariant + S.settingsSection + S.knowledgeSection) {
     render(); load();
     if (S.screen === 'settings') document.getElementById('settings-heading')?.focus();
+    if (S.screen === 'knowledge') document.getElementById('knowledge-heading')?.focus();
   }
 });
 window.addEventListener('beforeunload', e => {
   if (S.screen === 'settings' && settingsAnyDirty()) { e.preventDefault(); e.returnValue = ''; }
 });
 document.addEventListener('submit', e => {
+  if (e.target.id === 'knowledge-editor-form') { e.preventDefault(); knowledgeSave(); }
   if (e.target.id === 'settings-editor') { e.preventDefault(); settingsSave(settingsForm()); }
 });
 document.addEventListener('toggle', e => {

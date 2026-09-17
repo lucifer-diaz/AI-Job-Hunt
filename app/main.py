@@ -169,7 +169,7 @@ def job_dict(j: Job) -> dict:
 def _asset_version() -> str:
     # Cache-bust static assets whenever they change, not only on version bumps.
     static = Path(__file__).parent / "static"
-    return f"{app.version}-{max(int((static / name).stat().st_mtime) for name in ('app.js', 'app.css', 'settings.js'))}"
+    return f"{app.version}-{max(int((static / name).stat().st_mtime) for name in ('app.js', 'app.css', 'settings.js', 'knowledge.js'))}"
 
 
 @app.get("/health")

@@ -30,7 +30,9 @@ beforeEach(() => {
   // Each isolated iframe-like jsdom document needs the same production event registration just once.
   if (!ui) {
     context = createContext({ document, window, location, history, navigator, URLSearchParams, FormData, File, setTimeout, clearTimeout, setInterval, clearInterval, console });
+    runInContext(readFileSync('app/static/monitoring.js', 'utf8'), context, { filename: 'monitoring.js' });
     runInContext(settingsSource, context, { filename: resolve('app/static/settings.js') });
+    runInContext(readFileSync('app/static/knowledge.js', 'utf8'), context, { filename: 'knowledge.js' });
     runInContext(appSource, context, { filename: resolve('app/static/app.js') });
     ui = runInContext(`({${names.join(',')}})`, context);
   }
