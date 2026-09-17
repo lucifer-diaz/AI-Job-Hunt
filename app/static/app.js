@@ -10,7 +10,7 @@ const attr = esc;
 // Filters on the Tailor and Approvals screens, sent to /api/tailor/queue and /api/approvals.
 function pfDefaults(kind) { return { q: '', min_fit: 0, min_review: 0, board: 'all', status: 'all', sort: kind === 'tailor' ? 'fit' : 'default' }; }
 const S = {
-  screen: 'overview', todayVariant: 'focus', discMode: 'triage',
+  screen: 'overview', settingsSection: 'profile', todayVariant: 'focus', discMode: 'triage',
   filters: { q: '', min_fit: 0, board: 'all', stage: 'all', sort: 'fit', page: 1, per_page: 25 },
   triage: { min_fit: 0, hide_agencies: true, hide_reposts: true, keywords: [] }, triagedThisSession: 0,
   checked: new Set(), selJob: null, jobOpen: null, jobTab: 'description',
@@ -85,7 +85,7 @@ const btn = (text, act, data = {}, cls = '', disabled = false) =>
 
 /* form drafts survive re-renders */
 const fv = (form, key, fallback) => (S.forms[form] && key in S.forms[form]) ? S.forms[form][key] : fallback;
-const setF = (form, key, value) => { (S.forms[form] = S.forms[form] || {})[key] = value; if (form === 'sp') schedulePreview(); };
+const setF = (form, key, value) => { (S.forms[form] = S.forms[form] || {})[key] = value; if (form === 'sp') schedulePreview(); settingsTouched(form); };
 function inputF(form, key, value, extra = '') { return `<input class="input" id="${form}-${key}" data-form="${form}" data-field="${key}" value="${attr(fv(form, key, value ?? ''))}" ${extra}>`; }
 function textareaF(form, key, value, extra = '') { return `<textarea class="textarea" id="${form}-${key}" data-form="${form}" data-field="${key}" ${extra}>${esc(fv(form, key, value ?? ''))}</textarea>`; }
 function checkF(form, key, value, text, extra = '') { const on = fv(form, key, !!value); return `<label class="check"><input type="checkbox" id="${form}-${key}" data-form="${form}" data-field="${key}" ${on ? 'checked' : ''} ${extra}>${text}</label>`; }
@@ -140,17 +140,19 @@ function miniMarkdown(md) {
 
 /* ───────────── routing + loading ───────────── */
 function setHash() {
-  const sub = S.screen === 'discovery' ? '/' + S.discMode : S.screen === 'today' ? '/' + S.todayVariant : '';
+  const sub = S.screen === 'discovery' ? '/' + S.discMode : S.screen === 'today' ? '/' + S.todayVariant : S.screen === 'settings' ? '/' + S.settingsSection : '';
   const next = '#' + S.screen + sub;
   if (location.hash !== next) history.replaceState(null, '', next);
 }
 function readHash() {
   const [screen, sub] = location.hash.replace(/^#/, '').split('/');
   if (SCREENS.includes(screen)) S.screen = screen;
+  if (screen === 'settings') S.settingsSection = settingsSection(sub);
   if (screen === 'discovery' && ['triage', 'table', 'setup', 'ranking'].includes(sub)) S.discMode = sub;
   if (screen === 'today' && ['focus', 'run'].includes(sub)) S.todayVariant = sub;
 }
 function go(screen, extra = {}) {
+  if (!settingsCanLeave(screen, extra.settingsSection || S.settingsSection)) return;
   Object.assign(S, { screen, editing: null, scheduling: false, editingRecruiter: false }, extra);
   setHash(); window.scrollTo(0, 0); render(); load();
 }
@@ -190,8 +192,11 @@ const LOADERS = {
   },
   async knowledge() { [D.knowledge, D.evidence] = await Promise.all([api('/api/knowledge'), api('/api/evidence')]); },
   async settings() {
-    [D.profile, D.settings, D.prefs, D.resumes] = await Promise.all([
-      api('/api/profile'), api('/api/settings'), api('/api/preferences'), api('/api/profile/resumes')]);
+    D.settingsLoadError = '';
+    try {
+      [D.profile, D.settings, D.prefs, D.resumes] = await Promise.all([
+        api('/api/profile'), api('/api/settings'), api('/api/preferences'), api('/api/profile/resumes')]);
+    } catch (err) { D.settingsLoadError = err.message; throw err; }
   },
 };
 async function loadQueue() {
@@ -306,7 +311,7 @@ function screenMeta() {
     approvals: ['Approvals', 'Nothing leaves this queue without your sign-off'],
     tracker: ['Tracker', D.tracker ? `${D.tracker.stats.live} live applications · ${D.tracker.stats.due} follow-ups due` : 'Every submitted application'],
     knowledge: ['Knowledge bank', 'Answer once, reuse in every ATS form'],
-    settings: ['Settings & profile', 'Models, cadence and what tailoring may cite'],
+    settings: ['Settings', 'A workspace that works your way'],
   }[S.screen];
 }
 function renderTop() {
@@ -318,7 +323,7 @@ function renderTop() {
   return `<div class="top-row"><div><h1>${esc(title)}</h1><div class="sub">${esc(sub)}</div></div>
     <div class="row gap8 wrap">${seg ? `<div class="seg">${seg}</div>` : ''}
       <button class="btn" data-act="palette">Search · ⌘K</button>
-      <button class="btn primary" data-act="go" data-screen="discovery" data-mode="setup">New search</button></div></div>`;
+      ${S.screen === 'settings' ? '' : '<button class="btn primary" data-act="go" data-screen="discovery" data-mode="setup">New search</button>'}</div></div>`;
 }
 
 /* ───────────── overview ───────────── */
@@ -1109,85 +1114,6 @@ function renderKnowledge() {
   </div></div>`;
 }
 
-/* ───────────── settings ───────────── */
-const CHIP_FIELDS = [
-  ['target_roles', 'Target roles', 'up to 5 · drives every search', 'Add a role…', '', 'top'],
-  ['preferred_locations', 'Target locations', 'cities, regions or Remote', 'Add a location…', '', 'top'],
-  ['countries', 'Countries', 'where you will consider working', 'Add a country…', 'good', 'sp'],
-  ['primary_skills', 'Primary skills', 'must appear in the job to rank well', 'Add a skill…', '', 'sp'],
-  ['secondary_skills', 'Secondary skills', 'nice to have', 'Add a skill…', 'grey', 'sp'],
-  ['industries', 'Industries', 'preferred domains', 'Add an industry…', 'grey', 'sp'],
-  ['exclude_companies', 'Exclude companies', 'never show these again', 'Add a company…', 'bad', 'sp'],
-  ['languages', 'Languages', 'for ATS answers', 'Add a language…', 'grey', 'sp'],
-];
-const API_KEYS = [['openrouter', 'OpenRouter', 'sk-or-v1-…'], ['openai', 'OpenAI', 'sk-…'], ['anthropic', 'Anthropic', 'sk-ant-…'], ['apify', 'Apify', 'apify_api_…']];
-function renderKeys(st) {
-  return `<section class="card" style="padding:20px"><div class="card-title mb4">Your API keys</div><div class="card-sub mb16">Used only for your own searches, ranking, tailoring and follow-ups. Keys are stored encrypted and never shown again; saved keys show their last four characters.</div>
-    ${st.secret_storage ? '' : '<div class="box warn small mb12">This server has no <span class="mono">SECRET_KEY</span>, so keys cannot be saved yet.</div>'}
-    <div class="col gap12">${API_KEYS.map(([id, name, placeholder]) => { const k = st.keys[id]; return `<div><div class="row base between mb4"><span class="small b">${name}</span>${k.configured ? pill(`saved ${k.hint}`.trim(), 'good') : pill('not set', 'warn')}</div>
-      <div class="row gap8"><input class="input mono grow" style="margin:0;min-width:0" type="password" autocomplete="off" spellcheck="false" id="key-${id}" data-form="keys" data-field="${id}" value="${attr(fv('keys', id, ''))}" placeholder="${attr(k.configured ? 'Enter a new key to replace it' : placeholder)}" ${st.secret_storage ? '' : 'disabled'}>${k.configured ? btn('Remove', 'key-remove', { id }, 'sm') : ''}</div></div>`; }).join('')}</div>
-    ${btn(label('keys', 'Save keys', 'Saving…'), 'save-keys', {}, 'primary mt12', isBusy('keys') || !st.secret_storage)}
-  </section>`;
-}
-function renderSettings() {
-  const p = D.profile, st = D.settings, pr = D.prefs; if (!p || !st || !pr) return loading();
-  const sp = p.search_preferences || {}, F = 'profile';
-  const val = (key, where) => where === 'sp' ? sp[key] : p[key];
-  const filled = [fv(F, 'name', p.name), fv(F, 'headline', p.headline), fv(F, 'email', p.email), fv(F, 'phone', p.phone), fv(F, 'location', p.location), fv(F, 'total_experience', sp.total_experience), fv(F, 'notice_period', sp.notice_period), fv(F, 'compensation_notes', p.compensation_notes), (fv(F, 'target_roles', p.target_roles) || []).length, (fv(F, 'primary_skills', sp.primary_skills) || []).length, fv(F, 'work_authorization', p.work_authorization), p.master_resume];
-  const pct = Math.round(100 * filled.filter(Boolean).length / filled.length);
-  const mode = fv('ai', 'application_mode', st.application_mode);
-  // AI editor: blank inputs inherit .env, so placeholders show what would be used.
-  const ai = st.ai, aiProvider = fv('ai', 'llm_provider', ai.saved.llm_provider) || ai.env.llm_provider;
-  const aiDefault = () => String(fv('ai', 'model', ai.saved.model)).trim() || ai.env.models[aiProvider] || '';
-  const stageFallback = id => aiProvider === 'mock' ? 'mock (no API calls)' : (aiProvider === 'openrouter' && !String(fv('ai', 'model', ai.saved.model)).trim() && ai.env.stage_models[id]) || aiDefault();
-  const fields = [['name', 'Full name', p.name], ['headline', 'Headline', p.headline], ['email', 'Email', p.email], ['phone', 'Phone', p.phone], ['location', 'Current location', p.location], ['total_experience', 'Total experience', sp.total_experience], ['notice_period', 'Notice period', sp.notice_period], ['compensation_notes', 'Expected compensation', p.compensation_notes]];
-  return `<div class="grid-auto" style="grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px;align-items:start">
-  <section class="card" style="grid-column:1/-1;padding:20px">
-    <div class="row base between wrap gap12 mb16"><div><div class="card-title">Search profile &amp; candidate details</div><div class="card-sub">This drives discovery, ranking and what tailoring may claim. Everything with chips accepts several values.</div></div>${pill(`${pct}% complete`, pct >= 80 ? 'good' : 'warn', 'lg')}</div>
-    <div class="grid-auto w240">${fields.map(([k, l, v]) => `<label class="field">${l}${inputF(F, k, v)}</label>`).join('')}</div>
-    <div class="hr"></div>
-    <div class="grid-auto w300">${CHIP_FIELDS.map(([k, l, hint, ph, tone, where]) => `<div><div class="row base gap8 mb8"><span class="small b">${l}</span><span class="tiny faint">${hint}</span></div>${tagBox(F, k, val(k, where) || [], ph, k === 'target_roles' ? 5 : 25, tone)}</div>`).join('')}</div>
-    <div class="hr"></div>
-    <div class="grid-auto" style="grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px;align-items:start">
-      <div><div class="small b mb8">Work authorization &amp; visa notes</div>${textareaF(F, 'work_authorization', p.work_authorization, 'style="margin-top:0"')}
-        <div class="row gap16 wrap mt10">${checkF(F, 'open_to_relocation', sp.open_to_relocation, 'Open to relocation')}${checkF(F, 'open_to_hybrid', sp.open_to_hybrid, 'Open to hybrid')}${checkF(F, 'open_to_contract', sp.open_to_contract, 'Open to contract')}</div>
-        <div class="small b mb8 mt16">Master resume text</div>${textareaF(F, 'master_resume', p.master_resume, 'style="margin-top:0;min-height:120px;font-family:var(--mono);font-size:11.5px"')}
-        <div class="helper">Uploading a file replaces this text with what we extract. For clean tailoring use the agent-friendly format: <span class="mono">## Summary</span>, <span class="mono">## Skills</span>, <span class="mono">## Experience</span>, one <span class="mono">### Title | Company | Location | Mon YYYY - Mon YYYY</span> line per role, <span class="mono">- </span> bullets, plain punctuation.</div></div>
-      <div><div class="small b mb8">Master resume &amp; variants</div><div class="col gap8">
-        ${(D.resumes.find(d => d.active && !d.in_use) ? `<div class="box warn" style="padding:11px"><div class="small b" style="color:var(--warn-deep)">Tailoring is not using this file</div><div class="xs mt4" style="color:var(--warn-deep);line-height:1.5">The master resume text below was edited after <b>${esc(D.resumes.find(d => d.active && !d.in_use).filename)}</b> was uploaded, and tailoring only ever uses that text.</div>${btn("Use the file's text", 'resume-use', { id: D.resumes.find(d => d.active && !d.in_use).id }, 'sm mt8')}</div>` : '')}
-        ${D.resumes.map(d => `<div class="box row gap12 ${d.active ? 'brand' : ''}"><div class="avatar" style="width:34px;height:34px;border-radius:8px;font-size:10px;${d.active ? '' : 'background:var(--soft);color:var(--muted)'}">${esc((d.filename.split('.').pop() || '').toUpperCase().slice(0, 4))}</div><div class="grow" style="min-width:0"><div class="small b ellipsis">${esc(d.filename)}</div><div class="xs muted">${Math.max(1, Math.round(d.size / 1024))} KB · ${d.words} words${d.active ? ' · primary' : ''}${d.in_use ? ' · used for tailoring' : ''}</div></div>${d.active ? `<a class="btn sm" href="/api/profile/resume">Download</a>` : btn('Set primary', 'resume-primary', { id: d.id }, 'sm')}${btn('Delete', 'resume-delete', { id: d.id, name: d.filename }, 'sm')}</div>`).join('')}
-        <label class="btn block" style="border-style:dashed;color:var(--brand);border-radius:11px;padding:11px">${isBusy('upload') ? 'Uploading…' : `+ Upload ${D.resumes.length ? 'another' : 'a'} resume (PDF, DOCX, TXT · max ${BOOT.max_upload_mb} MB)`}<input type="file" id="resume-file" accept=".txt,.pdf,.docx" hidden></label></div>
-        <div class="grid-auto mt12" style="grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px"><label class="field">LinkedIn${inputF(F, 'linkedin_url', p.linkedin_url)}</label><label class="field">GitHub${inputF(F, 'github_url', p.github_url)}</label></div></div>
-    </div>
-    <div class="row gap9 wrap mt20">${btn(label('profile', 'Save profile', 'Saving…'), 'save-profile', {}, 'primary', isBusy('profile'))}${btn(label('parse', 'Re-parse resume into evidence', 'Parsing…'), 'parse-evidence', {}, '', isBusy('parse'))}</div>
-  </section>
-  <section class="card" style="padding:20px"><div class="card-title mb4">AI models per stage</div><div class="card-sub mb16">Blank fields use the server default shown as placeholder. Calls use the provider key you save under Your API keys.${pr.require_free ? ' Free-only guard is on for OpenRouter.' : ''}</div>
-    <div class="grid-auto" style="grid-template-columns:1fr 1fr;gap:10px">
-      <label class="field">Provider${selectF('ai', 'llm_provider', ai.saved.llm_provider, [['', `From .env (${ai.env.llm_provider})`], ['openrouter', 'OpenRouter'], ['openai', 'OpenAI'], ['anthropic', 'Anthropic'], ['mock', 'Mock / testing']], 'data-live="1"')}</label>
-      <label class="field">Default model${inputF('ai', 'model', ai.saved.model, `placeholder="${attr(ai.env.models[aiProvider] || '')}"`)}</label></div>
-    <div class="col gap9 mt12">${pr.stage_models.map(s => `<div class="box row gap12" style="padding:6px 12px"><span class="small b none" style="width:74px">${esc(s.stage)}</span><input class="input mono xs grow" style="margin:0;min-width:0" id="ai-stage-${s.id}" data-form="ai" data-field="stage_${s.id}" value="${attr(fv('ai', `stage_${s.id}`, ai.saved.stage_models[s.id] || ''))}" placeholder="${attr(stageFallback(s.id))}" ${aiProvider === 'mock' ? 'disabled' : ''}>${pill(s.badge, s.badge === 'free' ? 'good' : 'warn')}</div>`).join('')}</div>
-    <div class="row gap16 wrap mt10">${selectF('ai', 'require_free', ai.saved.require_free == null ? '' : String(ai.saved.require_free), [['', `Free-only guard: from .env (${ai.env.require_free ? 'on' : 'off'})`], ['true', 'Free-only guard: on'], ['false', 'Free-only guard: off']])}</div>
-    <div class="xs faint mt8">${Object.entries(st.configured).filter(([k]) => k !== 'mock').map(([k, v]) => `${k}: ${v ? 'key saved' : 'no key'}`).join(' · ')}</div>
-    <div class="hr" style="margin:16px 0"></div>
-    <div class="base b mb4">Approval &amp; submission mode</div><div class="small muted mb10">How far the workflow may run without you.</div>
-    <div class="col gap8">
-      ${[['manual_approval', 'I approve every packet', 'Nothing reaches the apply kit without you.'], ['automatic', `Auto-approve above reviewer score ${fv('ai', 'min_review_score', st.min_review_score)}`, 'Packets skip the queue; submission stays your action.']].map(([id, l, d]) => `<label class="radio ${mode === id ? 'on' : ''}"><input type="radio" name="mode" data-form="ai" data-field="application_mode" value="${id}" ${mode === id ? 'checked' : ''}><span><span class="small b" style="display:block">${l}</span><span class="xs muted">${d}</span></span></label>`).join('')}
-      <label class="radio disabled"><input type="radio" disabled><span><span class="small b" style="display:block">Auto-submit on supported portals</span><span class="xs muted">Not available by design — Job Hunt OS never submits, bypasses logins or solves CAPTCHAs. Approved packets become an apply kit.</span></span></label>
-    </div>
-    <label class="field mt12">Minimum reviewer score${inputF('ai', 'min_review_score', st.min_review_score, 'type="number" min="0" max="100"')}</label>
-    ${btn(label('ai', 'Save AI settings', 'Saving…'), 'save-ai', {}, 'primary mt12', isBusy('ai'))}
-  </section>
-  ${renderKeys(st)}
-  <section class="card" style="padding:20px"><div class="card-title mb4">Cadence &amp; nudges</div><div class="card-sub mb16">What the run sheet asks of you each day.</div>
-    <div class="col gap14">
-      <label class="field strong">Weekly application target<input type="range" min="1" max="25" id="cad-weekly_target" data-form="cadence" data-field="weekly_target" data-live="1" value="${fv('cadence', 'weekly_target', pr.weekly_target)}" style="margin-top:8px"><span class="xs muted" style="font-weight:400">${fv('cadence', 'weekly_target', pr.weekly_target)} per week · about ${Math.max(1, Math.round(fv('cadence', 'weekly_target', pr.weekly_target) / 5))} a working day</span></label>
-      <label class="field strong">Follow-up after${selectF('cadence', 'followup_days', pr.followup_days, [[5, '5 days of silence'], [7, '7 days of silence'], [10, '10 days of silence'], [14, '14 days of silence']])}</label>
-      <div class="xs muted">Follow-up drafts are generated by <span class="mono">python -m app.cron</span> (or the Draft buttons) and never sent automatically. Daily searches run with <span class="mono">python -m app.cron searches</span>.</div>
-      ${btn(label('cadence', 'Save cadence', 'Saving…'), 'save-cadence', {}, 'primary', isBusy('cadence'))}
-    </div></section>
-  </div>`;
-}
-
 /* ───────────── job modal + palette ───────────── */
 function renderJobModal() {
   const j = D.jobModal;
@@ -1748,65 +1674,11 @@ const A = {
   }, 'Evidence added'),
   'ev-verify': el => busy('evv', async () => { await api(`/api/evidence/${el.dataset.id}`, { method: 'PATCH', body: { verified: true } }); await load(); }, 'Verified — tailoring may now cite it'),
   'ev-delete': async (el, e) => { e.preventDefault(); if (!confirm('Remove this evidence claim?')) return; await api(`/api/evidence/${el.dataset.id}`, { method: 'DELETE' }).catch(err => toast(err.message, true)); refreshAfter('Evidence removed'); },
-  // settings
-  'save-profile': () => busy('profile', async () => {
-    const p = D.profile, sp = p.search_preferences || {}, F = 'profile';
-    for (const [key, , , , , where] of CHIP_FIELDS) {
-      const pending = document.getElementById(`${F}-${key}`)?.value.trim();
-      if (pending) addTags(F, key, pending, key === 'target_roles' ? 5 : 25, where === 'sp' ? sp[key] || [] : p[key] || []);
-    }
-    const spKeys = ['total_experience', 'notice_period', 'open_to_relocation', 'open_to_hybrid', 'open_to_contract', ...CHIP_FIELDS.filter(c => c[5] === 'sp').map(c => c[0])];
-    const nextSp = { ...sp }; spKeys.forEach(k => { nextSp[k] = fv(F, k, sp[k] ?? (k.startsWith('open_') ? false : k.endsWith('_period') || k === 'total_experience' ? '' : [])); });
-    const top = ['name', 'headline', 'email', 'phone', 'location', 'compensation_notes', 'work_authorization', 'master_resume', 'linkedin_url', 'github_url', 'target_roles', 'preferred_locations'];
-    const body = { ...p, search_preferences: nextSp }; top.forEach(k => { body[k] = fv(F, k, p[k]); });
-    await api('/api/profile', { method: 'PUT', body });
-    delete S.forms[F]; await load();
-  }, 'Profile saved'),
-  'parse-evidence': () => busy('parse', () => api('/api/profile/resume/parse-evidence', { method: 'POST' }), out => `${out.added} new claim${out.added === 1 ? '' : 's'} added as unverified — verify them in the Knowledge bank`),
-  'resume-primary': el => busy('primary', async () => { D.resumes = await api(`/api/profile/resumes/${el.dataset.id}/primary`, { method: 'POST' }); await load(); }, 'Primary resume updated'),
-  'resume-use': el => busy('primary', async () => { D.resumes = await api(`/api/profile/resumes/${el.dataset.id}/primary`, { method: 'POST' }); await load(); }, 'Tailoring now uses this file'),
-  'resume-delete': el => {
-    if (!confirm(`Delete ${el.dataset.name}? This cannot be undone.`)) return;
-    return busy('resumedel', async () => {
-      const out = await api(`/api/profile/resumes/${el.dataset.id}`, { method: 'DELETE' });
-      D.resumes = out.resumes; await load();
-      return out;
-    }, out => out.promoted ? 'Resume deleted · the next newest is now primary' : 'Resume deleted');
-  },
-  'save-ai': () => busy('ai', async () => {
-    const st = D.settings;
-    const saved = st.ai.saved, rf = fv('ai', 'require_free', saved.require_free == null ? '' : String(saved.require_free));
-    const stage_models = {}; ['rank', 'tailor', 'review', 'followup'].forEach(k => { const v = String(fv('ai', `stage_${k}`, saved.stage_models[k] || '')).trim(); if (v) stage_models[k] = v; });
-    const body = { llm_provider: fv('ai', 'llm_provider', saved.llm_provider), model: String(fv('ai', 'model', saved.model)).trim(), stage_models, require_free: rf === '' ? null : rf === 'true', application_mode: fv('ai', 'application_mode', st.application_mode), min_review_score: Number(fv('ai', 'min_review_score', st.min_review_score)) };
-    if (body.application_mode === 'automatic' && st.application_mode !== 'automatic' && !confirm('Auto-approval skips the manual queue once a resume passes review. Submitting stays your action. Continue?')) return;
-    await api('/api/settings', { method: 'PUT', body }); delete S.forms.ai; await load();
-  }, 'AI settings saved'),
-  'save-keys': () => busy('keys', async () => {
-    const body = {};
-    API_KEYS.forEach(([id]) => { const value = String(fv('keys', id, '')).trim(); if (value) body[id] = value; });
-    if (!Object.keys(body).length) throw new Error('Paste a key into at least one field first');
-    D.settings = await api('/api/settings/keys', { method: 'PUT', body }); delete S.forms.keys; await load();
-  }, 'Keys saved'),
-  'key-remove': el => {
-    const name = (API_KEYS.find(k => k[0] === el.dataset.id) || [])[1] || el.dataset.id;
-    if (!confirm(`Remove your ${name} key? Work that needs it pauses until you add one again.`)) return;
-    return busy('keys', async () => {
-      D.settings = await api('/api/settings/keys', { method: 'PUT', body: { [el.dataset.id]: '' } }); await load();
-    }, `${name} key removed`);
-  },
-  logout: () => busy('logout', async () => {
-    await api('/api/auth/logout', { method: 'POST' });
-    window.location.href = '/login';
-  }),
-  'save-cadence': () => busy('cadence', async () => {
-    const pr = D.prefs;
-    await api('/api/preferences', { method: 'PUT', body: { weekly_target: Number(fv('cadence', 'weekly_target', pr.weekly_target)), followup_days: Number(fv('cadence', 'followup_days', pr.followup_days)), email_run_sheet: !!pr.email_run_sheet, warn_closing: pr.warn_closing !== false } });
-    delete S.forms.cadence; await load();
-  }, 'Cadence saved'),
+  ...SETTINGS_ACTIONS,
 };
 function tagFallback(form, key) {
   if (form === 'sp') return D.searchProfile?.profile?.[key] || [];
-  if (form === 'profile') { const c = CHIP_FIELDS.find(x => x[0] === key); return (c && c[5] === 'sp' ? D.profile?.search_preferences?.[key] : D.profile?.[key]) || []; }
+  if (form === 'preferences') { const c = CHIP_FIELDS.find(x => x[0] === key); return (c && c[5] === 'sp' ? D.profile?.search_preferences?.[key] : D.profile?.[key]) || []; }
   return [];
 }
 async function moveStage(appId, stage) {
@@ -1816,6 +1688,8 @@ async function moveStage(appId, stage) {
 
 /* ───────────── events ───────────── */
 document.addEventListener('click', e => {
+  const link = e.target.closest('a[href^="#settings/"]');
+  if (link && S.screen === 'settings' && !e.metaKey && !e.ctrlKey) { e.preventDefault(); settingsNavigate(link.hash.split('/')[1]); return; }
   const el = e.target.closest('[data-act]');
   if (!el || el.disabled) return;
   const fn = A[el.dataset.act]; if (!fn) return;
@@ -1830,6 +1704,7 @@ document.addEventListener('input', e => {
     setF(el.dataset.form, el.dataset.field, el.type === 'checkbox' ? el.checked : el.value);
     if (el.dataset.live || el.type === 'radio') render();
   }
+  if (el.dataset.tag && S.screen === 'settings') settingsTouched(el.dataset.form);
   if (el.dataset.rec !== undefined && S.recruiterDraft?.[el.dataset.rec]) S.recruiterDraft[el.dataset.rec][el.dataset.recfield] = el.value;
   if (el.dataset.iv && S.ivDraft) S.ivDraft[el.dataset.iv] = el.value;
   if (el.dataset.pf && el.dataset.pfkey === 'q') { S.pf[el.dataset.pf].q = el.value; clearTimeout(filterTimer); filterTimer = setTimeout(load, 250); }
@@ -1855,24 +1730,23 @@ document.addEventListener('change', e => {
   if (el.dataset.filter && el.dataset.filter !== 'q') { S.filters[el.dataset.filter] = el.dataset.filter === 'per_page' || el.dataset.filter === 'min_fit' ? Number(el.value) : el.value; S.filters.page = 1; load(); }
   if (el.dataset.triage && el.dataset.triage !== 'min_fit') { S.triage[el.dataset.triage] = el.checked; load(); }
   if (el.dataset.actChange) A[el.dataset.actChange](el, e);
-  if (el.id === 'resume-file' && el.files[0]) {
-    const form = new FormData(); form.append('file', el.files[0]);
-    busy('upload', async () => { await api('/api/profile/resume', { method: 'POST', form }); delete S.forms.profile?.master_resume; await load(); }, 'Resume uploaded and set as primary');
-  }
+  if (el.id === 'resume-file' && el.files[0]) { settingsUploadResume(el.files[0]); el.value = ''; }
 });
 document.addEventListener('focusout', e => {
   const el = e.target;
-  if (el.dataset && el.dataset.tag && el.value.trim()) commitTag(el);
+  if (el.dataset && el.dataset.tag && el.value.trim()) commitTag(el, false);
   if (el.dataset && el.dataset.actBlur === 'save-notes') {
     const id = el.dataset.id; if (el.value === (D.approval?.notes || '')) return;
     setF('approvalNotes', id, el.value);
     api(`/api/jobs/${id}/notes`, { method: 'PUT', body: { notes: el.value } }).then(() => { if (D.approval) D.approval.notes = el.value; toast('Notes saved'); }).catch(err => toast(err.message, true));
   }
 });
-function commitTag(el) {
+function commitTag(el, redraw = true) {
   const { form, tag } = el.dataset, max = Number(el.dataset.max || 20);
   if (form === 'triage') { const tmp = { keywords: S.triage.keywords }; S.forms.__t = tmp; addTags('__t', 'keywords', el.value, max, S.triage.keywords); S.triage.keywords = S.forms.__t.keywords; delete S.forms.__t; el.value = ''; load(); return; }
-  addTags(form, tag, el.value, max, tagFallback(form, tag)); el.value = ''; render();
+  addTags(form, tag, el.value, max, tagFallback(form, tag)); el.value = '';
+  if (redraw) render();
+  else { const box = el.closest('.tagbox'); if (box) { box.querySelectorAll('.chip').forEach(c => c.remove()); el.insertAdjacentHTML('beforebegin', chips(form, tag, tagFallback(form, tag))); } }
 }
 document.addEventListener('keydown', e => {
   const el = e.target;
@@ -1908,7 +1782,26 @@ document.addEventListener('dragstart', e => { const card = e.target.closest?.('[
 document.addEventListener('dragover', e => { const col = e.target.closest?.('[data-drop-stage]'); if (col) { e.preventDefault(); document.querySelectorAll('.kcol.drop').forEach(c => c !== col && c.classList.remove('drop')); col.classList.add('drop'); } });
 document.addEventListener('dragleave', e => { const col = e.target.closest?.('[data-drop-stage]'); if (col && !col.contains(e.relatedTarget)) col.classList.remove('drop'); });
 document.addEventListener('drop', e => { const col = e.target.closest?.('[data-drop-stage]'); if (!col) return; e.preventDefault(); col.classList.remove('drop'); const id = e.dataTransfer.getData('text/plain'); if (id) moveStage(id, col.dataset.dropStage); });
-window.addEventListener('hashchange', () => { const before = S.screen + S.discMode + S.todayVariant; readHash(); if (before !== S.screen + S.discMode + S.todayVariant) { render(); load(); } });
+window.addEventListener('hashchange', () => {
+  const [screen, section] = location.hash.slice(1).split('/');
+  if (!settingsCanLeave(screen, settingsSection(section))) { setHash(); return; }
+  const before = S.screen + S.discMode + S.todayVariant + S.settingsSection;
+  readHash(); setHash();
+  if (before !== S.screen + S.discMode + S.todayVariant + S.settingsSection) {
+    render(); load();
+    if (S.screen === 'settings') document.getElementById('settings-heading')?.focus();
+  }
+});
+window.addEventListener('beforeunload', e => {
+  if (S.screen === 'settings' && settingsAnyDirty()) { e.preventDefault(); e.returnValue = ''; }
+});
+document.addEventListener('submit', e => {
+  if (e.target.id === 'settings-editor') { e.preventDefault(); settingsSave(settingsForm()); }
+});
+document.addEventListener('toggle', e => {
+  const id = e.target.dataset?.settingsDetails;
+  if (id && e.target.isConnected) { if (e.target.open) SETTING_DETAILS.add(id); else SETTING_DETAILS.delete(id); }
+}, true);
 
 /* ───────────── boot ───────────── */
 readHash();

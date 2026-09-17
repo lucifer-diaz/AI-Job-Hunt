@@ -12,6 +12,8 @@ from urllib.parse import urlparse
 import httpx
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -23,25 +25,62 @@ from app.auth import PASSWORD_MIN_LENGTH, CurrentUser, current_user, get_user_db
 from app.auth import router as auth_router
 from app.db import engine
 from app.db_migrations import run_migrations
-from app.models import (Application, CandidateProfile, Evidence, Job,
-                        KnowledgeAnswer, ResumeDocument, ResumeVariant, SchedulerJob, SearchRun)
-from app.schemas import (ApplicationUpdateIn, ApifySearchIn, ApiKeysIn, BulkTailorIn, TailorTasksCancelIn, TailorTasksIn, EvidenceIn, KnowledgeIn,
-                         ManualJobIn, ProfileIn, RecruiterIn, SettingsIn)
-from app.security import SecretsUnavailable
-from app.services.exports import markdown_to_simple_pdf
-from app.services.sources import import_greenhouse, import_lever, refresh_apify_run, start_apify_search, upsert_job
-from app.services.user_settings import key_status, set_user_keys, settings_for
-from app.services.workflow import (SKIP_TAILORING_STATUSES, approve_job, get_profile,
-                                   mark_applied, skip_tailoring, tailor_job)
-from app.services.ai_config import PROVIDERS as AI_PROVIDERS, STAGES as AI_STAGES, env_defaults as ai_env_defaults
-from app.services.ai_config import resolve as resolve_ai_config
+from app.hunter_api import router as hunter_router
+from app.models import (
+    Application,
+    CandidateProfile,
+    Evidence,
+    Job,
+    KnowledgeAnswer,
+    ResumeDocument,
+    ResumeVariant,
+    SchedulerJob,
+    SearchRun,
+)
 from app.scheduler import build_scheduler
 from app.scheduler_hooks import run_soon
+from app.schemas import (
+    ApifySearchIn,
+    ApiKeysIn,
+    ApplicationUpdateIn,
+    BulkTailorIn,
+    EvidenceIn,
+    KnowledgeIn,
+    ManualJobIn,
+    ProfileIn,
+    ProfilePatch,
+    RecruiterIn,
+    SettingsIn,
+    SettingsPatch,
+    TailorTasksCancelIn,
+    TailorTasksIn,
+)
+from app.security import SecretsUnavailable
 from app.services import ranker, tailor_tasks
+from app.services.ai_config import PROVIDERS as AI_PROVIDERS
+from app.services.ai_config import STAGES as AI_STAGES
+from app.services.ai_config import env_defaults as ai_env_defaults
+from app.services.ai_config import resolve as resolve_ai_config
 from app.services.contacts import recruiters_of, set_primary_recruiter
+from app.services.exports import markdown_to_simple_pdf
+from app.services.sources import (
+    import_greenhouse,
+    import_lever,
+    refresh_apify_run,
+    start_apify_search,
+    upsert_job,
+)
+from app.services.user_settings import key_status, lock_settings_row, set_user_keys, settings_for
+from app.services.workflow import (
+    SKIP_TAILORING_STATUSES,
+    approve_job,
+    get_profile,
+    mark_applied,
+    skip_tailoring,
+    tailor_job,
+)
 from app.settings import get_settings
 from app.tenancy import require_user_id
-from app.hunter_api import router as hunter_router
 from app.workspace import router as workspace_router
 
 run_migrations(engine)
@@ -66,6 +105,16 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title=settings.app_name, version="0.5.0", lifespan=lifespan)
 app.state.scheduler = scheduler
+
+
+@app.exception_handler(RequestValidationError)
+async def safe_password_validation(request: Request, exc: RequestValidationError):
+    if request.url.path == "/api/auth/password":
+        errors = [{k: error[k] for k in ("loc", "msg", "type")} for error in exc.errors()]
+        return JSONResponse(status_code=422, content={"detail": errors})
+    return await request_validation_exception_handler(request, exc)
+
+
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 app.include_router(auth_router)
 app.include_router(workspace_router)
@@ -118,7 +167,7 @@ def job_dict(j: Job) -> dict:
 def _asset_version() -> str:
     # Cache-bust static assets whenever they change, not only on version bumps.
     static = Path(__file__).parent / "static"
-    return f"{app.version}-{max(int((static / name).stat().st_mtime) for name in ('app.js', 'app.css'))}"
+    return f"{app.version}-{max(int((static / name).stat().st_mtime) for name in ('app.js', 'app.css', 'settings.js'))}"
 
 
 @app.get("/health")
@@ -242,6 +291,19 @@ def settings_keys_put(payload: ApiKeysIn, db: Session = Depends(get_user_db)):
     except SecretsUnavailable as exc:
         raise HTTPException(400, f"{exc}. Ask the server admin to set SECRET_KEY.") from exc
     return settings_get(db)
+
+
+@app.patch("/api/settings")
+def settings_patch(payload: SettingsPatch, db: Session = Depends(get_user_db)):
+    """Merge independent settings editors without resetting other overrides."""
+    row = settings_for(db)
+    row = lock_settings_row(db, row)
+    changes = payload.model_dump(exclude_unset=True)
+    ai = dict((row.preferences or {}).get("ai") or {})
+    stages = {**ai.get("stage_models", {}), **changes.pop("stage_models", {})}
+    current = {**ai, "stage_models": stages, "application_mode": row.application_mode,
+               "min_review_score": row.min_review_score, **changes}
+    return settings_put(SettingsIn(**current), db)
 
 
 # ───────────── jobs ─────────────
@@ -568,6 +630,20 @@ def profile_put(payload: ProfileIn, db: Session = Depends(get_user_db)):
         setattr(p, key, value)
     db.commit()
     return {"ok": True}
+
+
+@app.patch("/api/profile")
+def profile_patch(payload: ProfilePatch, db: Session = Depends(get_user_db)):
+    """Save supplied fields only, preserving newer resume text and other editors."""
+    row = get_profile(db)
+    row = lock_settings_row(db, row)
+    changes = payload.model_dump(exclude_unset=True)
+    if "search_preferences" in changes:
+        changes["search_preferences"] = {**(row.search_preferences or {}), **changes["search_preferences"]}
+    for key, value in changes.items():
+        setattr(row, key, value)
+    db.commit()
+    return profile_get(db)
 
 
 @app.post("/api/profile/resume")

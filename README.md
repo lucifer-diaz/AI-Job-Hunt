@@ -704,3 +704,14 @@ local SQLite state is ephemeral and is not shared between deployed instances.
 Grant the deployment identity access to Vertex AI, the staging bucket, and the
 database/network secrets it needs. See [DEPLOY.md](DEPLOY.md) for limitations
 and operational checks.
+
+### Focused settings
+
+Settings now has separate Profile, Job preferences, Resumes, Account & security,
+API keys, AI models, and Workflow & cadence sections, with independent saves and
+mobile navigation. Account & security supports password changes that keep this
+browser signed in and revoke other sessions. See [settings contracts, testing,
+and rollback notes](docs/settings.md).
+
+Frontend unit tests run with `npm ci && npm run test:coverage`; Node dependencies
+are development-only and the production UI still runs without a build step.
