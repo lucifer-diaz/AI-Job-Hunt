@@ -7,12 +7,28 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
-from app.models import Application, ApplicationEvent, CandidateProfile, Evidence, FollowUp, Job, ResumeVariant
+from app.models import (
+    Application,
+    ApplicationEvent,
+    CandidateProfile,
+    Evidence,
+    FollowUp,
+    Job,
+    ResumeVariant,
+)
 from app.prompts import build_followup_prompt, build_review_prompt, build_tailoring_prompt
 from app.services.contacts import recruiters_of
 from app.services.llm import LLMCall, LLMClient
-from app.services.resume_format import (ParsedResume, parse_resume, relevant_skills, render_legacy, render_resume,
-                                        skills_text, summary_text, to_plain)
+from app.services.resume_format import (
+    ParsedResume,
+    parse_resume,
+    relevant_skills,
+    render_legacy,
+    render_resume,
+    skills_text,
+    summary_text,
+    to_plain,
+)
 from app.services.user_settings import profile_for, settings_for
 from app.settings import get_settings
 
@@ -79,8 +95,13 @@ def persist_tailored_resume(db: Session, job: Job, content: dict, *, markdown: s
     return resume
 
 
+# A packet that review sent back to be tailored again. It keeps its old version until a new one is saved,
+# and is distinct from "shortlisted", which means nothing has been tailored yet.
+NEEDS_RETAILOR = "needs_retailor"
 # Jobs that are in the Tailor queue and have not been approved or submitted yet.
-SKIP_TAILORING_STATUSES = ("shortlisted", "tailored", "pending_approval")
+SKIP_TAILORING_STATUSES = ("shortlisted", NEEDS_RETAILOR, "tailored", "pending_approval")
+# Of those, the ones still waiting for a (new) tailored packet.
+AWAITING_TAILORING_STATUSES = ("shortlisted", NEEDS_RETAILOR)
 
 
 def skip_tailoring(db: Session, job: Job, progress: Progress = _no_progress) -> ResumeVariant:

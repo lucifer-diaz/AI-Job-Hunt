@@ -73,8 +73,9 @@ const bar = (pct, color, cls = '') => `<div class="bar ${cls}"><i style="width:$
 const fitCls = n => n == null ? 'fit-none' : n >= 80 ? 'fit-high' : n >= 65 ? 'fit-mid' : 'fit-low';
 const fitTxt = n => n == null ? '—' : String(Math.round(n));
 const initials = s => (s || '?').split(/\s+/).filter(Boolean).slice(0, 2).map(w => w[0]).join('').toUpperCase();
-const STATUS_TONE = { discovered: 'muted', shortlisted: 'brand', maybe: 'muted', archived: 'muted', dismissed: 'bad', tailored: 'warn', pending_approval: 'warn', rejected: 'bad', approved: 'good', applied: 'good' };
-const statusPill = s => pill((s || '').replace(/_/g, ' '), STATUS_TONE[s] || 'muted');
+const STATUS_TONE = { discovered: 'muted', shortlisted: 'brand', maybe: 'muted', archived: 'muted', dismissed: 'bad', tailored: 'warn', needs_retailor: 'warn', pending_approval: 'warn', rejected: 'bad', approved: 'good', applied: 'good' };
+const STATUS_LABEL = { needs_retailor: 're-tailor' };
+const statusPill = s => pill(STATUS_LABEL[s] || (s || '').replace(/_/g, ' '), STATUS_TONE[s] || 'muted');
 const toDate = iso => iso ? new Date(/Z|[+-]\d\d:\d\d$/.test(iso) ? iso : iso + 'Z') : null;
 const fmtDay = iso => iso ? toDate(iso).toLocaleDateString(undefined, { day: 'numeric', month: 'short' }) : '';
 const fmtDateTime = iso => iso ? toDate(iso).toLocaleString(undefined, { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) : '';
@@ -725,7 +726,7 @@ function renderSetup() {
 
 /* ───────────── packet filters (Tailor, Approvals) ───────────── */
 const PF_STATUS = {
-  tailor: [['all', 'All packets'], ['not_tailored', 'Not tailored'], ['has_packet', 'Has packet'], ['sent_back', 'Sent back'], ['untailored', 'Master resume only']],
+  tailor: [['all', 'All packets'], ['not_tailored', 'Not tailored'], ['has_packet', 'Has packet'], ['needs_retailor', 'Needs re-tailoring'], ['sent_back', 'Sent back'], ['untailored', 'Master resume only']],
   approvals: [['all', 'All statuses'], ['waiting', 'Waiting'], ['sent_back', 'Sent back'], ['approved', 'Approved']],
 };
 const PF_SORT = {
@@ -801,8 +802,9 @@ function renderTaskStack() {
 
 function renderBulkTailor(queue) {
   const selected = queue.filter(j => S.tailorChecked.has(j.id));
-  const eligible = selected.filter(j => !activeTask(j.id) && (S.tailorRegenerate || !j.has_resume)).length;
-  const untailored = queue.filter(j => !j.has_resume);
+  const needsWork = j => !j.has_resume || j.status === 'needs_retailor';
+  const eligible = selected.filter(j => !activeTask(j.id) && (S.tailorRegenerate || needsWork(j))).length;
+  const untailored = queue.filter(needsWork);
   const allOn = queue.every(j => S.tailorChecked.has(j.id));
   const allToggle = `<input type="checkbox" data-act="tailor-select" data-which="${allOn ? 'none' : 'all'}" ${allOn ? 'checked' : ''} aria-label="Select all jobs">`;
   const head = `<div class="lrow caps" style="gap:12px;padding-top:9px;padding-bottom:9px;background:#fafbfe;font-size:10.5px;letter-spacing:.06em">
@@ -812,7 +814,9 @@ function renderBulkTailor(queue) {
       <span class="none" style="width:210px;text-align:right">STATUS</span></div>`;
   const rows = queue.map(j => {
     const task = activeTask(j.id);
+    const retailor = j.status === 'needs_retailor';
     const status = task ? taskPill(task)
+      : retailor ? `<span title="${attr((j.review_reasons || []).join(' · ') || 'Review sent this packet back to be tailored again')}">${pill('re-tailor', 'warn')}</span>`
       : j.has_resume ? pill(j.status === 'pending_approval' ? 'sent back' : 'has packet', 'muted') : pill('not tailored', 'warn');
     return `<div class="lrow click ${task?.status === 'running' ? 'sel' : ''}" data-act="tailor-check" data-id="${j.id}" style="gap:12px">
       <input type="checkbox" data-act="tailor-check" data-id="${j.id}" ${S.tailorChecked.has(j.id) ? 'checked' : ''} aria-label="Select ${attr(j.title)}">
@@ -853,7 +857,7 @@ function renderTailorSingle(queue) {
   const job = p.job, r = p.resume;
   const locked = PACKET_LOCKED.includes(job.status);
   const extra = locked ? `<option value="${job.id}" selected>${esc(job.company)} — ${esc(job.title)} (${esc(job.status)})</option>` : '';
-  const picker = `<select class="select" style="margin:0;width:auto;max-width:320px" id="tailor-pick" data-act-change="pick-tailor">${extra}${queue.map(j => `<option value="${j.id}" ${j.id === S.tailorJob ? 'selected' : ''}>${esc(j.company)} — ${esc(j.title)}${j.has_resume ? '' : ' (not tailored)'}</option>`).join('')}</select>`;
+  const picker = `<select class="select" style="margin:0;width:auto;max-width:320px" id="tailor-pick" data-act-change="pick-tailor">${extra}${queue.map(j => `<option value="${j.id}" ${j.id === S.tailorJob ? 'selected' : ''}>${esc(j.company)} — ${esc(j.title)}${j.status === 'needs_retailor' ? ' (re-tailor)' : j.has_resume ? '' : ' (not tailored)'}</option>`).join('')}</select>`;
   const task = activeTask(job.id), working = !!task || isBusy('queue' + job.id);
   const generating = working && task?.mode !== 'skip', skipping = task?.mode === 'skip';
   const stack = renderTaskStack() + renderPacketFilters('tailor', D.tailorFacets) + (locked ? `<section class="banner ${job.status === 'applied' ? '' : 'warn'} row wrap gap10" style="margin:0">
@@ -1560,12 +1564,12 @@ const A = {
   },
   'tailor-select': el => {
     const queue = D.tailorQueue || [], which = el.dataset.which;
-    S.tailorChecked = new Set(which === 'all' ? queue.map(j => j.id) : which === 'untailored' ? queue.filter(j => !j.has_resume).map(j => j.id) : []);
+    S.tailorChecked = new Set(which === 'all' ? queue.map(j => j.id) : which === 'untailored' ? queue.filter(j => !j.has_resume || j.status === 'needs_retailor').map(j => j.id) : []);
     render();
   },
   'tailor-regenerate': (el, e) => { e.stopPropagation(); S.tailorRegenerate = !S.tailorRegenerate; render(); },
   'bulk-tailor': el => {
-    const ids = (D.tailorQueue || []).filter(j => S.tailorChecked.has(j.id) && !activeTask(j.id) && (S.tailorRegenerate || !j.has_resume)).map(j => j.id);
+    const ids = (D.tailorQueue || []).filter(j => S.tailorChecked.has(j.id) && !activeTask(j.id) && (S.tailorRegenerate || !j.has_resume || j.status === 'needs_retailor')).map(j => j.id);
     return queueTailoring(ids, el.dataset.mode, S.tailorRegenerate, 'bulkTailor', () => ids.forEach(id => S.tailorChecked.delete(id)));
   },
   'skip-tailor': el => queueTailoring([Number(el.dataset.id)], 'skip', true, 'queue' + el.dataset.id),

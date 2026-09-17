@@ -25,7 +25,13 @@ from sqlalchemy.orm import Session
 
 from app.models import Job, ResumeVariant, TailorTask
 from app.services.user_settings import execution_mode_for, settings_for
-from app.services.workflow import SKIP_TAILORING_STATUSES, approve_job, skip_tailoring, tailor_job
+from app.services.workflow import (
+    NEEDS_RETAILOR,
+    SKIP_TAILORING_STATUSES,
+    approve_job,
+    skip_tailoring,
+    tailor_job,
+)
 from app.settings import get_settings
 
 log = logging.getLogger("jobhunt.tailor")
@@ -96,6 +102,7 @@ def enqueue(db: Session, ids: list[int], mode: str = "tailor", regenerate: bool 
                   else "already queued" if job_id in active
                   else "not in the Tailor queue" if job.status not in SKIP_TAILORING_STATUSES
                   else "already has a packet" if job_id in has_packet and not regenerate
+                  and job.status != NEEDS_RETAILOR
                   else None)
         if reason:
             skipped.append({"id": job_id, "reason": reason})

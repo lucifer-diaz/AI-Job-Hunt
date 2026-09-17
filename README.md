@@ -923,7 +923,7 @@ The recommendation is advice. **Job Hunt OS decides the state:** it re-runs the 
 
 | Result | Decision | Job goes to |
 | --- | --- | --- |
-| Evidence problems, or any unsupported or overstated claim | `RETAILOR` | back to the Tailor queue |
+| Evidence problems, or any unsupported or overstated claim | `RETAILOR` | back to the Tailor queue with status `needs_retailor` (shown as **re-tailor**), keeping the old version and the reasons until a new one is saved |
 | `PASS`, score ≥ your minimum reviewer score, confidence ≥ policy minimum, job still passes your hard filters | `PASS` | ready for approval (auto-approved only if you chose automatic approval) |
 | Anything else (`SKIP`, low score, policy failure) | `NEEDS_HUMAN` | sent back for your decision |
 

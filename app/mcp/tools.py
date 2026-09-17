@@ -30,7 +30,12 @@ from app.services.tailoring_results import (
     validate_tailored_resume,
 )
 from app.services.user_settings import settings_for
-from app.services.workflow import get_profile, persist_tailored_resume
+from app.services.workflow import (
+    AWAITING_TAILORING_STATUSES,
+    NEEDS_RETAILOR,
+    get_profile,
+    persist_tailored_resume,
+)
 from app.settings import get_settings
 
 DESCRIPTION_LIMIT = 12000
@@ -79,7 +84,8 @@ def _iso(value: datetime | None) -> str | None:
 
 
 def _in_tailor_queue(job: Job) -> bool:
-    return job.status == "shortlisted" and job.triaged_at is not None
+    """Never tailored (shortlisted), or tailored and sent back by review (needs_retailor)."""
+    return job.status in AWAITING_TAILORING_STATUSES and job.triaged_at is not None
 
 
 def _latest_ranking(db: Session, job_id: int) -> JobRanking | None:
@@ -125,7 +131,7 @@ def _operation_status(saved: int, total: int) -> str:
 def list_jobs_for_tailoring(db: Session, minimum_fit_score: float | None = None, posted_after: str | None = None,
                             location: str | None = None, company: str | None = None, limit: int = 10) -> dict[str, Any]:
     limit = _check_limit(limit, tailor_limit(), "MCP_BULK_TAILOR_LIMIT")
-    query = select(Job).where(Job.status == "shortlisted", Job.triaged_at.is_not(None))
+    query = select(Job).where(Job.status.in_(AWAITING_TAILORING_STATUSES), Job.triaged_at.is_not(None))
     if minimum_fit_score is not None:
         query = query.where(Job.fit_score >= float(minimum_fit_score))
     if posted_after:
@@ -143,7 +149,8 @@ def list_jobs_for_tailoring(db: Session, minimum_fit_score: float | None = None,
         ranking = _latest_ranking(db, job.id)
         out.append({"job_id": job.id, "title": job.title, "company": job.company, "location": job.location,
                     "fit_score": job.fit_score, "resume_fit_score": ranking.resume_fit_score if ranking else None,
-                    "posted_at": _iso(job.posted_at), "status": job.status})
+                    "posted_at": _iso(job.posted_at), "status": job.status,
+                    "needs_retailor": job.status == NEEDS_RETAILOR})
     return {"ok": True, "count": len(out), "jobs": out}
 
 
@@ -171,6 +178,7 @@ def get_tailoring_context(db: Session, job_ids: list[int]) -> dict[str, Any]:
             "recommended_resume_focus": (ranking.recommended_resume_focus if ranking
                                          else analysis.get("recommended_resume_focus") or []),
             "resume_gaps": ranking.resume_gaps if ranking else analysis.get("resume_gaps") or [],
+            **_retailor_feedback(db, job),
         })
     # The profile and the resume are the same for every job, so they are sent once.
     return {"ok": True, "prompt_version": MCP_TAILORING_PROMPT_VERSION, "rules": list(TAILORING_RULES),
@@ -179,6 +187,22 @@ def get_tailoring_context(db: Session, job_ids: list[int]) -> dict[str, Any]:
                               "roles": [{"role_index": i, "title": r.title, "company": r.company, "dates": r.dates,
                                          "bullets": r.bullets} for i, r in enumerate(parsed.roles)]},
             "jobs": jobs}
+
+
+def _retailor_feedback(db: Session, job: Job) -> dict[str, Any]:
+    """For a packet review sent back: what to fix this time. Empty for a job that has never been tailored."""
+    variant = latest_variant(db, job.id) if job.status == NEEDS_RETAILOR else None
+    if variant is None:
+        return {}
+    notes = variant.reviewer_notes or {}
+    return {"previous_review": {
+        "version": variant.version, "review_score": variant.reviewer_score,
+        "decision_reasons": notes.get("decision_reasons") or [],
+        "unsupported_claims": notes.get("unsupported_claims") or [],
+        "overstated_claims": notes.get("overstated_claims") or [],
+        "missing_requirements": notes.get("missing_requirements") or [],
+        "failed_checks": [i.get("code") for i in notes.get("deterministic_issues") or []],
+    }}
 
 
 def _save_one_tailored(db: Session, profile: Any, item: Any, seen: set[int]) -> dict[str, Any]:

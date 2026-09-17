@@ -10,6 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
+from app.auth import CurrentUser
 from app.db import SessionLocal, engine
 from app.main import app
 from app.mcp import tools
@@ -193,7 +194,7 @@ def test_list_jobs_for_tailoring_filters_and_orders(account):
     out = call(uid, "list_jobs_for_tailoring")
     assert [j["company"] for j in out["jobs"]] == ["Grab", "Stripe", "Shopee"]
     assert set(out["jobs"][0]) == {"job_id", "title", "company", "location", "fit_score", "resume_fit_score",
-                                   "posted_at", "status"}
+                                   "posted_at", "status", "needs_retailor"}
     assert [j["company"] for j in call(uid, "list_jobs_for_tailoring", minimum_fit_score=85)["jobs"]] == ["Grab", "Stripe"]
     assert [j["company"] for j in call(uid, "list_jobs_for_tailoring", location="singapore")["jobs"]] == ["Grab", "Shopee"]
     assert [j["company"] for j in call(uid, "list_jobs_for_tailoring", company="str")["jobs"]] == ["Stripe"]
@@ -334,13 +335,59 @@ def test_bulk_review_decisions_are_made_by_the_backend(account):
     decisions = {r["job_id"]: r for r in out["results"]}
     assert decisions[grab]["decision"] == "PASS" and decisions[grab]["job_status"] == "tailored"
     assert decisions[grab]["auto_approved"] is False
-    assert decisions[stripe]["decision"] == "RETAILOR" and decisions[stripe]["job_status"] == "shortlisted"
+    assert decisions[stripe]["decision"] == "RETAILOR" and decisions[stripe]["job_status"] == "needs_retailor"
     assert decisions[shopee]["decision"] == "NEEDS_HUMAN" and decisions[shopee]["job_status"] == "pending_approval"
     with session(uid) as db:
         variant = db.scalar(select(ResumeVariant).where(ResumeVariant.job_id == grab))
         assert variant.reviewer_score == 92 and variant.reviewer_notes["source"] == "claude_desktop"
     assert call(uid, "list_jobs_for_review")["jobs"] == []
     assert call(uid, "save_review", review=review(grab))["results"][0]["errors"][0]["code"] == "NOT_WAITING"
+
+
+def test_a_sent_back_packet_is_distinguishable_from_a_job_never_tailored(account):
+    """RETAILOR must not look like a fresh shortlist: the job carries needs_retailor and the reason why."""
+    uid, (grab, stripe, _shopee) = account["user_id"], account["jobs"]
+    tailor_all(account, 2)
+    call(uid, "save_review", review=review(grab, unsupported_claims=["GCP is not in the evidence store"]))
+
+    with session(uid) as db:
+        assert db.get(Job, grab).status == "needs_retailor"
+        assert db.get(Job, stripe).status == "tailored"
+
+    listed = {j["job_id"]: j for j in call(uid, "list_jobs_for_tailoring")["jobs"]}
+    assert listed[grab]["status"] == "needs_retailor" and listed[grab]["needs_retailor"] is True
+    assert listed[account["jobs"][2]]["needs_retailor"] is False
+
+    context = {j["job_id"]: j for j in call(uid, "get_tailoring_context", job_ids=[grab, account["jobs"][2]])["jobs"]}
+    previous = context[grab]["previous_review"]
+    assert previous["version"] == 1 and previous["unsupported_claims"] == ["GCP is not in the evidence store"]
+    assert previous["decision_reasons"] and "previous_review" not in context[account["jobs"][2]]
+
+    # Re-tailoring it saves version 2 and puts it back in front of the reviewer.
+    saved = call(uid, "save_tailored_resume", result=tailored(grab, account["acme"]))["results"][0]
+    assert saved["status"] == "SAVED" and saved["version"] == 2 and saved["job_status"] == "tailored"
+    assert grab in {j["job_id"] for j in call(uid, "list_jobs_for_review")["jobs"]}
+
+
+def test_the_workspace_shows_a_sent_back_packet_as_work_to_redo(account, monkeypatch):
+    """The Tailor screen and the sidebar count a re-tailor job, and the queue row says why."""
+    uid, grab = account["user_id"], account["jobs"][0]
+    tailor_all(account, 1)
+    call(uid, "save_review", review=review(grab, overstated_claims=["Led the whole platform"]))
+
+    signed_in = CurrentUser(uid, "mcp@jobhunt.test", False)
+    monkeypatch.setattr("app.auth.authenticate", lambda _request: signed_in)
+    client = TestClient(app)
+    row = next(r for r in client.get("/api/tailor/queue").json() if r["id"] == grab)
+    assert row["status"] == "needs_retailor" and row["review_decision"] == "RETAILOR" and row["review_reasons"]
+    assert [r["id"] for r in client.get("/api/tailor/queue?status=needs_retailor").json()] == [grab]
+    assert grab not in [r["id"] for r in client.get("/api/tailor/queue?status=has_packet").json()]
+    assert client.get("/api/workspace/summary").json()["counts"]["tailor"] == 3  # two untailored plus this one
+    todo = next(a for a in client.get("/api/workspace/today").json()["actions"]
+                if a["kind"] == "tailor" and a["job_id"] == grab)
+    assert todo["reason"].startswith("Review sent this packet back")
+    # Queueing it needs no "regenerate": the packet under review is the one being replaced.
+    assert [t["job_id"] for t in client.post("/api/tailor-tasks", json={"ids": [grab]}).json()["queued"]] == [grab]
 
 
 def test_review_enforces_scores_candidate_policy_and_schema(account):

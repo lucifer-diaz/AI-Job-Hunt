@@ -22,7 +22,7 @@ from app.models import Job, ResumeVariant
 from app.services.ranker import hard_filter_reason, policy_for
 from app.services.tailoring_results import from_variant_content, validate_tailored_resume
 from app.services.user_settings import settings_for
-from app.services.workflow import get_profile, store_review
+from app.services.workflow import NEEDS_RETAILOR, get_profile, store_review
 
 RECOMMENDATIONS = ("PASS", "RETAILOR", "SKIP")
 # The backend review prompt's recommendation vocabulary, mapped onto the shared one.
@@ -110,7 +110,7 @@ def decide_review(db: Session, job: Job, variant: ResumeVariant, review: ReviewI
 
 
 # Where a decision leaves the job (legacy dashboard status, the one the Tailor and Approve screens read).
-DECISION_STATUS = {"PASS": "tailored", "RETAILOR": "shortlisted", "NEEDS_HUMAN": "pending_approval"}
+DECISION_STATUS = {"PASS": "tailored", "RETAILOR": NEEDS_RETAILOR, "NEEDS_HUMAN": "pending_approval"}
 
 
 def apply_review(db: Session, job: Job, variant: ResumeVariant, review: ReviewIn, *, source: str) -> ReviewDecision:
