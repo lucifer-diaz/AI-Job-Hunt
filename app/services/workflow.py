@@ -7,8 +7,8 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
-from app.models import Application, ApplicationEvent, CandidateProfile, Evidence, FollowUp, Job, ResumeVariant, KnowledgeAnswer
-from app.prompts import build_followup_prompt, build_ranking_prompt, build_review_prompt, build_tailoring_prompt
+from app.models import Application, ApplicationEvent, CandidateProfile, Evidence, FollowUp, Job, ResumeVariant
+from app.prompts import build_followup_prompt, build_review_prompt, build_tailoring_prompt
 from app.services.contacts import recruiters_of
 from app.services.llm import LLMClient
 from app.services.resume_format import (ParsedResume, parse_resume, relevant_skills, render_legacy, render_resume,
@@ -36,29 +36,7 @@ def _evidence_payload(db: Session) -> list[dict]:
     ]
 
 
-def _knowledge_payload(db: Session) -> list[dict]:
-    items = db.scalars(select(KnowledgeAnswer).order_by(desc(KnowledgeAnswer.id))).all()
-    return [{"id": k.id, "question": k.question, "answer": k.answer, "category": k.category, "answer_type": k.answer_type, "verified": k.verified, "sensitive": k.sensitive, "source_job_id": k.source_job_id, "use_count": k.use_count} for k in items]
-
-
-def rank_job(db: Session, job: Job) -> dict:
-    profile = get_profile(db)
-    evidence = _evidence_payload(db)
-    knowledge = _knowledge_payload(db)
-    prompt = build_ranking_prompt(candidate_profile=profile, resume=profile.master_resume, evidence=evidence, knowledge=knowledge, job=job)
-    result = LLMClient.for_user(db).generate_prompt_json(prompt)
-    job.fit_score = float(result.get("score", 0))
-    job.fit_analysis = {**result, "prompt_version": prompt.version}
-    # Re-ranking must never pull a job back out of tailoring, approval or the tracker.
-    if job.status in ("discovered", "shortlisted", "archived"):
-        job.status = "shortlisted" if job.fit_score >= get_settings().min_fit_score else "archived"
-    db.commit()
-    db.refresh(job)
-    return result
-
-
-# Called with the stage a tailoring run is entering ("ranking", "tailoring", "reviewing") so background tasks can
-# report progress.
+# Called with the stage a tailoring run is entering ("tailoring", "reviewing") so background tasks can report progress.
 Progress = Callable[[str], None]
 
 
@@ -67,11 +45,10 @@ def _no_progress(_stage: str) -> None:
 
 
 def tailor_job(db: Session, job: Job, progress: Progress = _no_progress) -> ResumeVariant:
+    """Tailor from verified facts. Ranking never runs here: it is the asynchronous ranker's job (app.services.ranker),
+    and its latest fit analysis, when there is one, tells tailoring what the resume under-sells."""
     profile = get_profile(db)
     evidence = _evidence_payload(db)
-    if job.fit_score is None:
-        progress("ranking")
-        rank_job(db, job)
     progress("tailoring")
     llm = LLMClient.for_user(db)
     parsed = parse_resume(profile.master_resume or "")

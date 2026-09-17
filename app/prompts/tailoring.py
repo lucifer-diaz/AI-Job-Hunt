@@ -17,11 +17,13 @@ from app.prompts.common import (
     user_message,
 )
 
-TAILOR_PROMPT_VERSION = "v1"
+TAILOR_PROMPT_VERSION = "v2"
 TAILOR_MARKER = "TAILOR_RESUME"
 # The fit-analysis fields tailoring uses, with their defaults; anything else stored with the analysis is left out.
+# resume_fit_score, resume_gaps and recommended_resume_focus come from the ranker and say what the resume under-sells.
 FIT_ANALYSIS_DEFAULTS = {"summary": "", "strong_matches": [], "gaps": [], "must_have_missing": [], "keywords": [],
-                         "application_strategy": "", "confidence": 0}
+                         "application_strategy": "", "confidence": 0, "candidate_fit_score": None,
+                         "resume_fit_score": None, "resume_gaps": [], "recommended_resume_focus": []}
 
 TAILOR_SYSTEM = instructions(
     "You are an expert resume editor.",

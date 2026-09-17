@@ -14,7 +14,7 @@ from sqlalchemy import select
 import app.services.scheduled_jobs as sj
 from app.db import SessionLocal
 from app.main import app
-from app.models import Job, SearchProfile, SearchRun, WorkflowTransition
+from app.models import Job, JobRankingTask, SearchProfile, SearchRun, WorkflowTransition
 from app.services.apify_adapters import (ADAPTERS, AdapterError, GlassdoorAdapter, HunterSearch, parse_posted_date,
                                          plan_runs)
 from app.services.lifecycle import WorkflowState as S
@@ -375,7 +375,10 @@ def test_results_are_normalized_and_queued_for_ranking(apify):
     with SessionLocal() as db:
         states = db.scalars(select(WorkflowTransition.to_state).where(WorkflowTransition.job_id == job.id)
                             .order_by(WorkflowTransition.id)).all()
-    assert states == [S.NORMALIZED, S.FILTERED] and job.state is S.FILTERED
+        tasks = db.scalars(select(JobRankingTask).where(JobRankingTask.job_id == job.id)).all()
+    assert states == [S.NORMALIZED, S.FILTERED, S.RANK_PENDING] and job.state is S.RANK_PENDING
+    assert [(t.status, t.reason, t.attempt_count) for t in tasks] == [("PENDING", "new", 0)]  # queued, never ranked
+    assert job.fit_score is None
 
 
 def test_relative_dates_count_back_from_the_scrape_and_stale_postings_are_dropped(apify):
@@ -384,7 +387,7 @@ def test_relative_dates_count_back_from_the_scrape_and_stale_postings_are_droppe
     fresh = {"id": digits(), "positionName": f"Engineering Manager {t}", "company": f"Beta {t}",
              "location": "Singapore", "url": f"https://sg.indeed.com/viewjob?jk={digits()}", "postedAt": "3 days ago",
              "scrapedAt": "2026-09-15T10:00:00Z", "salary": "$9,000 - $12,000 a month",
-             "externalApplyLink": "https://apply.example/beta"}
+             "externalApplyLink": f"https://apply.example/beta-{t}"}
     stale = {**fresh, "id": digits(), "positionName": f"Old Manager {t}", "postedAt": "10 days ago",
              "url": f"https://sg.indeed.com/viewjob?jk={digits()}",
              "externalApplyLink": f"https://apply.example/beta-old-{t}"}

@@ -16,6 +16,7 @@ The dashboard is a single-page workspace served from `app/static/app.js`; every 
 | Today | "Do this next" (approve → tailor → follow up), follow-ups due, weekly pace; run-sheet variant | `GET /api/workspace/today` |
 | Discovery · triage | One job at a time with fit reasons; keys `S` shortlist, `M` maybe, `X` skip, `⏎` shortlist & tailor | `GET /api/jobs/search?queue=true`, `POST /api/jobs/{id}/triage` |
 | Discovery · table | Filter, sort, paginate and bulk-shortlist the whole pipeline. The stage filter includes "Unranked" (`stage=unranked`: jobs without a fit score) | `GET /api/jobs/search`, `POST /api/jobs/bulk-triage` |
+| Discovery · ranking tracker | The asynchronous ranker's progress for your account: jobs being filtered, queued, ranking now, retrying or waiting (with the reason and when it retries), and rankings finished in the last 24 hours with fit, candidate and resume scores and the qualify/archive decision. Retry failed rankings, queue unranked jobs; refreshes itself while work is in flight | `GET /api/ranking/tracker`, `POST /api/jobs/{id}/rank`, `POST /api/jobs/rank-batch` |
 | Discovery · setup | Saved search profile (roles × locations × boards), run history with what each run searched and pulled, add a job from a URL | `GET/PUT /api/search/profile`, `POST /api/search/profile/run`, `GET /api/search/apify/runs/{id}/detail`, `POST /api/jobs/from-url` |
 | Tailor | Before → after edits with the evidence each one cites; edit, accept or revert; cover letter; keyword coverage; PDF/DOCX/TXT exports. "Skip tailoring" sends the master resume unchanged (still reviewed) for postings that need no tailoring. The "Bulk tailor" view tailors or skips tailoring for many queued jobs one at a time, with progress and stop | `GET /api/tailor/{job_id}`, `PATCH /api/resumes/{id}/edits/{n}`, `POST /api/jobs/{id}/tailor`, `POST /api/jobs/{id}/skip-tailoring`, `POST /api/jobs/bulk-tailor` |
 | Approvals | Pre-submit checklist, resume preview, reusable answers, notes; approve opens the apply kit | `GET /api/approvals/{job_id}`, `POST /api/jobs/{id}/revision` |
@@ -338,7 +339,7 @@ Each prompt has:
 
 | Module | Builders | Used by |
 |---|---|---|
-| `ranking.py` | `build_ranking_prompt` | `rank_job` |
+| `ranking.py` | `build_ranking_prompt` | the Job Ranker (`app.services.ranker`) |
 | `tailoring.py` | `build_tailoring_prompt` | `tailor_job` |
 | `review.py` | `build_review_prompt` | `review_resume` |
 | `followup.py` | `build_followup_prompt` | `draft_followup` |
@@ -423,9 +424,11 @@ whether a state change is legal.
 | --- | --- |
 | DISCOVERED | NORMALIZED, SKIPPED, FAILED |
 | NORMALIZED | FILTERED, SKIPPED, FAILED |
-| FILTERED | RANKED, SKIPPED, FAILED |
-| RANKED | QUALIFIED, ARCHIVED, SKIPPED, FAILED |
-| QUALIFIED | TAILORING, ARCHIVED, SKIPPED |
+| FILTERED | RANK_PENDING, SKIPPED, FAILED |
+| RANK_PENDING | RANKING, SKIPPED, FAILED |
+| RANKING | RANKED, RANK_PENDING (retry or wait), SKIPPED |
+| RANKED | QUALIFIED, ARCHIVED, RANK_PENDING (re-rank), SKIPPED, FAILED |
+| QUALIFIED | TAILORING, ARCHIVED, RANK_PENDING (re-rank), SKIPPED |
 | TAILORING | TAILORED, SKIPPED, FAILED |
 | TAILORED | REVIEWED, SKIPPED, FAILED |
 | REVIEWED | READY_TO_APPLY, TAILORING (revision), SKIPPED, FAILED |
@@ -440,7 +443,9 @@ whether a state change is legal.
 - **No arbitrary states.** `jobs.state` accepts only these values. This is enforced three times:
   a strict parser, an ORM validator that also rejects illegal moves on direct assignment, and
   named PostgreSQL `CHECK` constraints.
-- **No shortcuts.** There is no path around NORMALIZED, FILTERED, RANKED, TAILORED or REVIEWED.
+- **No shortcuts.** There is no path around NORMALIZED, FILTERED, RANK_PENDING, RANKING, RANKED, TAILORED or REVIEWED.
+- **Re-ranking.** A job archived by ranking (from RANKED or QUALIFIED) may be reopened, only to RANK_PENDING. A job
+  archived for any other reason, for example after applying, cannot.
 - **FAILED only before submission.** Once a job is APPLIED it can never become FAILED, so a broken
   follow-up can't erase the fact that you applied.
 - **Requeue.** FAILED is terminal for automation. An operator can call `requeue_failed`, which only
@@ -490,8 +495,10 @@ Claiming requires PostgreSQL. SQLite remains usable for the dashboard during loc
 
 The dashboard still reads and writes the legacy `jobs.status` column. Migration `0002` backfilled
 `state` from it (for example `shortlisted` → QUALIFIED, `approved` → READY_TO_APPLY, applied jobs
-from their tracker stage). New jobs start DISCOVERED. Dashboard actions do not yet move `state`;
-that happens as each stage gets a worker.
+from their tracker stage). New jobs start DISCOVERED. The Job Ranker (section 8) moves `state` from
+DISCOVERED to QUALIFIED or ARCHIVED and mirrors its result into `fit_score`, `fit_analysis` and, for jobs
+nobody has triaged yet, `status`. Tailoring, approval and the tracker do not move `state` yet; that
+happens as each stage gets a worker.
 
 ### Tests
 
@@ -522,7 +529,7 @@ FastAPI starts → scheduler loop (every SCHEDULER_TICK_SECONDS)
 | --- | --- | --- |
 | `hunter` | `HUNTER_INTERVAL_MINUTES=240` | Starts the saved search profile's Apify runs when its schedule is not `manual`, and never twice within the interval |
 | `apify_sync` | `APIFY_SYNC_INTERVAL_MINUTES=5` | Imports datasets of Apify runs that finished; each run is imported once |
-| `ranking` | `RANKING_INTERVAL_MINUTES=2` | Claims up to `RANKING_BATCH_SIZE` jobs waiting for ranking (DISCOVERED / NORMALIZED / FILTERED). Normalizes and filters them deterministically (dismissed or excluded companies become SKIPPED), then ranks up to `RANKING_CONCURRENCY` at a time. Jobs are moved to RANKED |
+| `ranking` | `RANKING_INTERVAL_MINUTES=2` | The Job Ranker (section 8). A deterministic sweep hard-filters and queues new jobs, recovers crashed tasks and queues re-ranks; then it claims up to `RANKING_BATCH_SIZE` ranking tasks and runs at most `RANKING_CONCURRENCY` model calls at a time. Jobs move RANK_PENDING → RANKING → RANKED → QUALIFIED / ARCHIVED |
 | `compensation` | `COMPENSATION_INTERVAL_MINUTES=5` | Records the salary stated in the original posting (structured actor fields or explicit salary text) in `jobs.compensation`. Glassdoor and PayScale are recorded as `not_configured` until those actors are integrated |
 | `applications` | `APPLICATION_INTERVAL_MINUTES=5` | Reports READY_TO_APPLY / APPLYING counts. Automatic submission is not enabled, so it always reports `skipped` |
 | `followups` | `FOLLOWUP_INTERVAL_MINUTES=60` | Drafts due follow-ups (never sends) |
@@ -559,7 +566,93 @@ Examples: `/api/admin/scheduler/hunter/run`, `/api/admin/scheduler/ranking/run`,
 
 `python -m app.cron <job>` runs one job once through the same path, which is useful on hosts that sleep between requests. With no argument it runs `followups`; `searches` is an alias for `hunter`.
 
-## 8. Recommended next upgrades
+## 8. Job Ranker
+
+The ranker compares each job with the candidate: their **CandidateProfile**, the **active resume** saved on that
+profile, and **relevant verified Evidence**. It analyses fit only; it never tailors or changes the resume.
+
+It is asynchronous and database-backed. Apify ingestion, normalization, job search and the API requests that create
+jobs never call the model: they only put work in line.
+
+```text
+APIFY RESULT → NORMALIZE → DEDUPLICATE (hunter)
+→ HARD FILTER → RANK_PENDING + ranking task            (import, or the ranking sweep for jobs from other sources)
+→ ranking worker claims a task (FOR UPDATE SKIP LOCKED + lease) → RANKING
+→ load CandidateProfile + active resume snapshot + relevant verified evidence
+→ one model call (stage: rank) → validate structured output → store a new ranking version
+→ RANKED → QUALIFIED / ARCHIVED                          (decided in Python, not by the model)
+```
+
+**Hard filters** (`app.services.ranker.hard_filter_reason`) reject only clear mismatches, as SKIPPED with a reason:
+missing title or company, dismissed in triage, an excluded company, an excluded title keyword, an on-site role when
+the search is remote only, and a known yearly salary below the account's minimum. Unknown values never filter a job
+out. An unknown salary is only rejected when the account's policy sets `reject_unknown_salary` and salary enrichment
+has already looked.
+
+**Tasks** (`job_ranking_tasks`): `PENDING`, `PROCESSING`, `COMPLETED`, `FAILED`, `SKIPPED`, with attempt count, last
+error, backoff and lease columns. A partial unique index allows one waiting or running task per job. Claims use
+`FOR UPDATE SKIP LOCKED`, so two workers never rank the same task, and every write re-checks the lease token.
+
+**Inputs** are sent as separate sections: SYSTEM RANKING RULES (system message), CANDIDATE PROFILE, ACTIVE RESUME,
+VERIFIED EVIDENCE and JOB POSTING. The resume and the job description are wrapped as untrusted data, and the stage is
+routed from the prompt's marker, never from text inside the posting.
+
+**Resume snapshots** (`resume_versions`) keep each distinct resume text a profile used, with its version and content
+hash. Rankings point at their snapshot, so they stay reproducible after the resume is edited or its file deleted.
+
+**Rankings** (`job_rankings`) are append-only versions. Each stores the candidate profile, resume snapshot, version and
+content hash, hashes of the profile facts, evidence and posting, every score (`overall_fit_score`, `confidence`,
+`candidate_fit_score`, `resume_fit_score`, seniority, skills, leadership, domain and location match), the
+matches and gaps, `relevant_evidence_ids` (ids the model was not given are dropped and kept in
+`discarded_evidence_ids`), `recommended_resume_focus`, the model's `qualification_recommendation`, the decision and its
+reasons, the policy used, provider, model and prompt version.
+
+`candidate_fit_score` says whether the person fits; `resume_fit_score` says whether the resume shows it. Tailoring
+receives both, with `resume_gaps` and `recommended_resume_focus`, so it knows what to improve.
+
+**Qualification** is deterministic:
+
+```python
+qualified = (overall_fit_score >= policy.minimum_fit_score
+             and not fatal_gaps
+             and confidence >= policy.minimum_confidence)
+```
+
+Defaults come from `MIN_FIT_SCORE` and `MIN_RANKING_CONFIDENCE`; an account can override them in `app_settings.preferences["ranking"]` (`minimum_fit_score`, `minimum_confidence`, `minimum_salary`,
+`salary_currency`, `reject_unknown_salary`).
+
+**Compensation** never blocks ranking. When salary enrichment later finds a yearly salary below an account's minimum,
+the sweep archives the qualified job with that reason, without another model call.
+
+**Re-ranking** creates a new version and never overwrites an old one. Qualified jobs are re-queued automatically when
+the profile, the active resume or the ranking prompt version changes (`RANKING_AUTO_RERANK`), and any ranked or
+ranking-archived job can be re-ranked on request. Automatic work with inputs that were already ranked reuses the stored
+result (a unique index on job, profile, resume hash, prompt version and input hashes); a user request always stores a
+new version.
+
+**Failures**:
+
+| Problem | What happens |
+| --- | --- |
+| No profile, no readable resume, missing AI key, free-only guard (`OPENROUTER_REQUIRE_FREE`) | The account is not claimed until it is fixed; a task already running is handed back without using an attempt |
+| Timeout, rate limit, provider outage, malformed JSON, output that fails validation | Retried with exponential backoff (`RANKING_RETRY_*`) up to `RANKING_MAX_ATTEMPTS`, then the job becomes FAILED (never ARCHIVED) and can be queued again |
+| Worker crash | The lease (`RANKING_LEASE_SECONDS`) expires and the sweep retries or fails the task |
+
+**API** (ranking requests are queued and return `202`; poll the tasks for the result):
+
+```http
+POST /api/jobs/{id}/rank                  re-rank one job (a new version)
+POST /api/jobs/rank-batch                 queue every unranked job
+POST /api/jobs/bulk-rank?rerank=true      queue selected jobs
+GET  /api/ranking/tasks?job_ids=1,2,3     latest task per job
+GET  /api/jobs/{id}/rankings              every ranking version and task of a job
+GET  /api/ranking/tracker                 the ranking tracker: counts, work in progress, the last day's results
+```
+
+The model is `RANK_MODEL` when set (any provider), otherwise the rank-stage model from Settings or
+`OPENROUTER_MODEL_RANK`, through the provider-independent LLM layer.
+
+## 9. Recommended next upgrades
 
 - Apify webhook endpoint so completed runs are ingested without polling
 - Gmail integration for follow-up drafts and thread matching
@@ -572,7 +665,7 @@ Examples: `/api/admin/scheduler/hunter/run`, `/api/admin/scheduler/ranking/run`,
 
 See [DEPLOY.md](DEPLOY.md) for hosting instructions.
 
-## 9. Google Gemini agent deployment
+## 10. Google Gemini agent deployment
 
 The repository includes a Google ADK package named `job_hunt_agent`. Its
 `root_agent` coordinates four narrowly scoped agents: `job_fit_ranker`,

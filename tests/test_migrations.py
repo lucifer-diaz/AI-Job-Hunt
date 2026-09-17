@@ -48,9 +48,12 @@ def _migration_module(name: str):
 
 
 def test_frozen_migration_values_match_the_lifecycle():
-    module = _migration_module("0002_workflow_state")
-    assert module.WORKFLOW_STATES == tuple(WorkflowState)
-    assert module.ERROR_CATEGORIES == tuple(ErrorCategory)
+    latest = _migration_module("0010_job_ranker")
+    assert latest.WORKFLOW_STATES == tuple(WorkflowState)
+    assert latest.ERROR_CATEGORIES == tuple(ErrorCategory)
+    original = _migration_module("0002_workflow_state")
+    assert latest.PREVIOUS_WORKFLOW_STATES == original.WORKFLOW_STATES
+    assert set(original.WORKFLOW_STATES) == set(WorkflowState) - {WorkflowState.RANK_PENDING, WorkflowState.RANKING}
 
 
 @pytest.fixture

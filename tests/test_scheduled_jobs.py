@@ -4,27 +4,22 @@ Ranking and cleanup need PostgreSQL (TEST_DATABASE_URL); the rest also run on a 
 Work that belongs to a person runs per account, with that account's keys and preferences.
 """
 import asyncio
-import threading
-import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 import app.main as main
 from app.db import AppSession, SessionLocal
 from app.db_migrations import run_migrations
-from app.models import CandidateProfile, Job, SchedulerJob, SearchRun, WorkflowTransition
-from app.scheduler import Scheduler
+from app.models import Job, SchedulerJob, SearchRun
 from app.services import scheduled_jobs as sj
 from app.services import work_queue as wq
 from app.services.compensation import extract_posting_salary, parse_salary_text
 from app.services.lifecycle import WorkflowState as S
-from app.services.llm import LLMError
 from app.services.user_settings import apify_token, set_user_keys, settings_for
 from app.settings import get_settings
 from tests.conftest import make_user
@@ -71,166 +66,7 @@ def use_provider(sessions, user_id, provider, **preferences):
         db.commit()
 
 
-@pytest.fixture
-def fake_ranker(monkeypatch):
-    """A slow, deterministic stand-in for LLM ranking that records concurrency and can fail on demand."""
-    state = {"active": 0, "peak": 0, "calls": [], "users": set(), "fail": set()}
-    lock = threading.Lock()
-
-    def rank(db, job):
-        with lock:
-            state["active"] += 1
-            state["peak"] = max(state["peak"], state["active"])
-            state["calls"].append(job.id)
-            state["users"].add(db.info.get("user_id"))
-        try:
-            time.sleep(0.05)
-            if job.id in state["fail"]:
-                raise LLMError("provider timed out")
-            job.fit_score, job.fit_analysis = 80.0, {"score": 80}
-            db.commit()
-            return {"score": 80}
-        finally:
-            with lock:
-                state["active"] -= 1
-
-    monkeypatch.setattr(sj, "rank_job", rank)
-    return state
-
-
-# ───────────── ranking (PostgreSQL) ─────────────
-
-def test_ranking_claims_a_limited_batch_and_limits_concurrency(pg_sessions, owner, fake_ranker, monkeypatch):
-    monkeypatch.setattr(get_settings(), "ranking_batch_size", 12)
-    monkeypatch.setattr(get_settings(), "ranking_concurrency", 3)
-    ids = add_jobs(pg_sessions, 20, owner)
-
-    result = asyncio.run(sj.ranking(ctx(pg_sessions)))
-    assert result["claimed"] == 12 and result["ranked"] == 12
-    assert 1 < fake_ranker["peak"] <= 3
-    assert fake_ranker["users"] == {owner}  # each job is ranked in a session bound to its owner
-    with pg_sessions() as db:
-        assert dict(db.execute(select(Job.state, func.count()).group_by(Job.state)).all()) == {S.RANKED: 12, S.DISCOVERED: 8}
-        steps = db.scalars(select(WorkflowTransition).where(WorkflowTransition.job_id == ids[0])
-                           .order_by(WorkflowTransition.id)).all()
-        assert [(t.from_state, t.to_state) for t in steps] == [
-            (S.DISCOVERED, S.NORMALIZED), (S.NORMALIZED, S.FILTERED), (S.FILTERED, S.RANKED)]
-
-    assert asyncio.run(sj.ranking(ctx(pg_sessions)))["ranked"] == 8
-    assert asyncio.run(sj.ranking(ctx(pg_sessions)))["claimed"] == 0  # running again is harmless
-    assert sorted(fake_ranker["calls"]) == ids
-
-
-def test_ranking_only_claims_jobs_of_accounts_that_want_it_and_can_pay_for_it(pg_sessions, fake_ranker):
-    ready, auto_rank_off, no_key = make_user(pg_sessions), make_user(pg_sessions), make_user(pg_sessions)
-    with pg_sessions() as db:
-        db.add(CandidateProfile(user_id=auto_rank_off, search_preferences={"search_profile": {"auto_rank": False}}))
-        db.commit()
-    use_provider(pg_sessions, no_key, "openrouter")
-    ranked_ids = add_jobs(pg_sessions, 2, ready)
-    untouched = add_jobs(pg_sessions, 1, auto_rank_off) + add_jobs(pg_sessions, 1, no_key)
-
-    result = asyncio.run(sj.ranking(ctx(pg_sessions)))
-    assert result["claimed"] == 2 and sorted(fake_ranker["calls"]) == ranked_ids
-    with pg_sessions() as db:
-        assert all(db.get(Job, job_id).state is S.DISCOVERED and db.get(Job, job_id).attempt_count == 0
-                   for job_id in untouched)
-
-    with pg_sessions() as db:  # once the account saves its key, its jobs are picked up
-        set_user_keys(db, {"openrouter": "sk-or-v1-account"}, user_id=no_key)
-    assert asyncio.run(sj.ranking(ctx(pg_sessions)))["claimed"] == 1
-
-
-def test_each_ranking_result_is_saved_independently(pg_sessions, owner, fake_ranker):
-    good, broken, other = add_jobs(pg_sessions, 3, owner)
-    fake_ranker["fail"].add(broken)
-    result = asyncio.run(sj.ranking(ctx(pg_sessions)))
-    assert result["ranked"] == 2 and result["retrying"] == 1
-    with pg_sessions() as db:
-        assert db.get(Job, good).state is S.RANKED and db.get(Job, other).state is S.RANKED
-        job = db.get(Job, broken)
-        assert job.state is S.FILTERED and job.attempt_count == 1 and job.retryable is True
-        assert job.next_attempt_at is not None and "provider timed out" in job.last_error and job.lock_token is None
-
-
-def test_two_app_instances_do_not_rank_the_same_job(pg_sessions, owner, fake_ranker, monkeypatch):
-    monkeypatch.setattr(get_settings(), "ranking_batch_size", 5)
-    ids = add_jobs(pg_sessions, 30, owner)
-    barrier = threading.Barrier(3)
-
-    def instance(n):
-        barrier.wait()
-        ranked = 0
-        while (out := asyncio.run(sj.ranking(ctx(pg_sessions, worker=f"instance-{n}"))))["claimed"]:
-            ranked += out["ranked"]
-        return ranked
-
-    with ThreadPoolExecutor(3) as pool:
-        per_instance = list(pool.map(instance, range(3)))
-    assert sum(per_instance) == 30
-    assert sorted(fake_ranker["calls"]) == ids  # every job ranked exactly once across instances
-
-
-def test_restart_picks_up_work_left_by_a_crashed_instance(pg_sessions, owner, fake_ranker):
-    crashed_ids = add_jobs(pg_sessions, 3, owner)
-    waiting_ids = add_jobs(pg_sessions, 2, owner)
-    long_ago = utcnow() - timedelta(hours=2)
-    with pg_sessions() as db:
-        claims = wq.claim(db, [S.DISCOVERED], worker_id="crashed-instance", limit=3, lease_seconds=60, now=long_ago)
-        # The crashed instance also held the scheduler's lease for the ranking job.
-        db.add(SchedulerJob(name="ranking", locked_by="crashed-instance:run", locked_at=long_ago,
-                            lock_expires_at=long_ago + timedelta(minutes=30)))
-        db.commit()
-    assert [c.job_id for c in claims] == crashed_ids
-
-    restarted = Scheduler([s for s in sj.JOBS if s.name == "ranking"], pg_sessions, intervals={"ranking": 2},
-                          lease_seconds=600, instance_id="restarted")
-    outcome = asyncio.run(restarted.run_job("ranking", "schedule"))
-    assert outcome.status == "succeeded" and outcome.result["ranked"] == 5
-    with pg_sessions() as db:
-        for job_id in crashed_ids:
-            job = db.get(Job, job_id)
-            assert job.state is S.RANKED and job.lock_token is None and job.last_error is None
-    assert sorted(fake_ranker["calls"]) == crashed_ids + waiting_ids
-
-
-def test_ranking_filters_before_ranking_and_does_not_rerank(pg_sessions, owner, fake_ranker):
-    with pg_sessions() as db:
-        db.add(CandidateProfile(user_id=owner, search_preferences={"exclude_companies": ["Evil Corp"]}))
-        db.commit()
-    dismissed, = add_jobs(pg_sessions, 1, owner, status="dismissed")
-    excluded, = add_jobs(pg_sessions, 1, owner, company="Evil Corp")
-    already_ranked, = add_jobs(pg_sessions, 1, owner, fit_score=91.0)
-
-    result = asyncio.run(sj.ranking(ctx(pg_sessions)))
-    assert result["filtered_out"] == 2 and result["ranked"] == 1 and fake_ranker["calls"] == []
-    with pg_sessions() as db:
-        assert db.get(Job, dismissed).state is S.SKIPPED and db.get(Job, excluded).state is S.SKIPPED
-        assert db.get(Job, already_ranked).state is S.RANKED
-        reason = db.scalars(select(WorkflowTransition.reason).where(WorkflowTransition.job_id == excluded)
-                            .order_by(WorkflowTransition.id.desc())).first()
-        assert "excluded" in reason
-
-
-def test_salary_enrichment_never_blocks_the_ranking_claim(pg_sessions, owner, fake_ranker, monkeypatch):
-    """Both jobs start together on boot; enrichment must not hold locks that make ranking skip jobs."""
-    ids = add_jobs(pg_sessions, 6, owner, raw={"salary": "$150k-$180k a year"})
-    enriching = threading.Event()
-    real_enrich = sj.enrich_compensation
-
-    def slow_enrich(raw, now):
-        enriching.set()
-        time.sleep(0.1)
-        return real_enrich(raw, now)
-
-    monkeypatch.setattr(sj, "enrich_compensation", slow_enrich)
-    with ThreadPoolExecutor(1) as pool:
-        enrichment = pool.submit(sj.compensation, ctx(pg_sessions))
-        assert enriching.wait(5)
-        ranked = asyncio.run(sj.ranking(ctx(pg_sessions)))
-        assert enrichment.result()["salary_found"] == 6
-    assert ranked["claimed"] == 6 and ranked["ranked"] == 6
-    assert sorted(fake_ranker["calls"]) == ids
+# Ranking has its own tests: tests/test_ranker.py.
 
 
 def test_compensation_does_not_overwrite_a_job_checked_by_another_instance(pg_sessions, owner, monkeypatch):
@@ -248,14 +84,6 @@ def test_compensation_does_not_overwrite_a_job_checked_by_another_instance(pg_se
     assert sj.compensation(ctx(pg_sessions))["checked"] == 0
     with pg_sessions() as db:
         assert db.get(Job, job_id).compensation == {"status": "by-other-instance"}
-
-
-def test_ranking_waits_while_no_account_has_an_ai_key(pg_sessions, owner):
-    job_id, = add_jobs(pg_sessions, 1, owner)
-    use_provider(pg_sessions, owner, "openrouter")
-    assert asyncio.run(sj.ranking(ctx(pg_sessions))) == {"skipped": "No account has auto-ranking on with an AI key saved"}
-    with pg_sessions() as db:
-        assert db.get(Job, job_id).attempt_count == 0 and db.get(Job, job_id).state is S.DISCOVERED
 
 
 def test_ranking_needs_postgresql(sqlite_sessions):

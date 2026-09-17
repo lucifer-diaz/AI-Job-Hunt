@@ -20,14 +20,16 @@ from app.services.lifecycle import (
 )
 
 S = WorkflowState
-CANONICAL = ["DISCOVERED", "NORMALIZED", "FILTERED", "RANKED", "QUALIFIED", "TAILORING", "TAILORED", "REVIEWED",
+CANONICAL = ["DISCOVERED", "NORMALIZED", "FILTERED", "RANK_PENDING", "RANKING", "RANKED", "QUALIFIED", "TAILORING", "TAILORED", "REVIEWED",
              "READY_TO_APPLY", "APPLYING", "APPLIED", "FOLLOWUP_DUE", "FOLLOWED_UP", "INTERVIEW", "REJECTED", "OFFER",
              "ARCHIVED", "SKIPPED", "FAILED"]
 
 # The examples from the specification, all of which must be allowed.
 REQUIRED = [
-    (S.DISCOVERED, S.NORMALIZED), (S.NORMALIZED, S.FILTERED), (S.FILTERED, S.RANKED),
+    (S.DISCOVERED, S.NORMALIZED), (S.NORMALIZED, S.FILTERED), (S.FILTERED, S.RANK_PENDING),
+    (S.RANK_PENDING, S.RANKING), (S.RANKING, S.RANKED), (S.RANKING, S.RANK_PENDING),
     (S.RANKED, S.QUALIFIED), (S.RANKED, S.ARCHIVED), (S.QUALIFIED, S.TAILORING),
+    (S.QUALIFIED, S.RANK_PENDING), (S.RANKED, S.RANK_PENDING),
     (S.TAILORING, S.TAILORED), (S.TAILORING, S.FAILED), (S.TAILORED, S.REVIEWED),
     (S.REVIEWED, S.READY_TO_APPLY), (S.REVIEWED, S.SKIPPED), (S.READY_TO_APPLY, S.APPLYING),
     (S.APPLYING, S.APPLIED), (S.APPLYING, S.SKIPPED), (S.APPLYING, S.FAILED),
@@ -41,6 +43,9 @@ FORBIDDEN = [
     (S.TAILORED, S.READY_TO_APPLY), (S.TAILORING, S.APPLYING), (S.READY_TO_APPLY, S.APPLIED),
     (S.APPLIED, S.FAILED), (S.INTERVIEW, S.FAILED), (S.APPLIED, S.APPLYING), (S.OFFER, S.REJECTED),
     (S.SKIPPED, S.DISCOVERED), (S.ARCHIVED, S.QUALIFIED),
+    # Ranking always goes through the ranker's waiting and running states, and never fails in place.
+    (S.FILTERED, S.RANKED), (S.RANK_PENDING, S.RANKED), (S.DISCOVERED, S.RANK_PENDING), (S.RANKING, S.QUALIFIED),
+    (S.RANKING, S.FAILED), (S.TAILORING, S.RANK_PENDING),
 ]
 
 
@@ -131,3 +136,14 @@ def test_every_error_category_has_a_retry_default():
     assert set(DEFAULT_RETRYABLE) == set(ErrorCategory)
     assert DEFAULT_RETRYABLE[ErrorCategory.BLOCKED] is False
     assert DEFAULT_RETRYABLE[ErrorCategory.LEASE_EXPIRED] is True
+
+
+def test_only_a_job_archived_by_ranking_can_be_reopened_for_re_ranking():
+    assert can_transition(S.ARCHIVED, S.RANK_PENDING, previous_state=S.RANKED)
+    assert can_transition(S.ARCHIVED, S.RANK_PENDING, previous_state=S.QUALIFIED)
+    assert not can_transition(S.ARCHIVED, S.RANK_PENDING, previous_state=S.APPLIED)  # archived after applying
+    assert not can_transition(S.ARCHIVED, S.RANK_PENDING)
+    assert not can_transition(S.ARCHIVED, S.RANKING, previous_state=S.RANKED)
+    assert is_terminal(S.ARCHIVED)  # still terminal for automation
+    with pytest.raises(InvalidTransition, match="archived by ranking"):
+        validate_transition(S.ARCHIVED, S.RANK_PENDING, previous_state=S.FOLLOWED_UP)

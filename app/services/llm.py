@@ -1,10 +1,19 @@
+"""Provider-independent LLM layer: one call shape for OpenRouter, OpenAI, Anthropic and the no-cost mock.
+
+Failures are typed so workers can decide what to do without reading error text:
+
+* LLMConfigError: missing key, unsupported provider, or a paid model while OPENROUTER_REQUIRE_FREE is on.
+  Raised before any network call; retrying cannot help until the settings change.
+* LLMTimeoutError / LLMRateLimitError: the provider was slow or throttled; worth retrying later.
+* LLMResponseError: the model answered, but not with a JSON object.
+* LLMError: any other provider failure (outage, 5xx, connection error).
+"""
 from __future__ import annotations
 
 import json
 import re
-from typing import Any
-
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 from app.services.ai_config import is_free_model, resolve as resolve_ai_config
 from app.settings import get_settings
@@ -19,32 +28,55 @@ class LLMError(RuntimeError):
     pass
 
 
+class LLMConfigError(LLMError):
+    """The configured provider cannot be called as set up."""
+
+
+class LLMTimeoutError(LLMError):
+    pass
+
+
+class LLMRateLimitError(LLMError):
+    pass
+
+
+class LLMResponseError(LLMError):
+    """The provider answered, but the answer is not a usable JSON object."""
+
+
+@dataclass(frozen=True)
+class LLMResult:
+    data: dict[str, Any]
+    provider: str
+    model: str  # the model that answered when the provider reports it, otherwise the one requested
+
+
 def _extract_json(text: str) -> dict[str, Any]:
     text = text.strip()
     try:
-        return json.loads(text)
+        value = json.loads(text)
     except json.JSONDecodeError:
         match = re.search(r"\{.*\}", text, re.S)
         if not match:
-            raise LLMError("Model did not return JSON")
+            raise LLMResponseError("Model did not return JSON")
         try:
-            return json.loads(match.group(0))
+            value = json.loads(match.group(0))
         except json.JSONDecodeError as exc:
-            raise LLMError("Model returned malformed JSON") from exc
+            raise LLMResponseError("Model returned malformed JSON") from exc
+    if not isinstance(value, dict):
+        raise LLMResponseError(f"Model returned a JSON {type(value).__name__}, not an object")
+    return value
+
+
+# Prompt markers (app.prompts) → the stage whose model runs them.
+MARKER_TASKS = {"FIT_ANALYSIS": "rank", "TAILOR_RESUME": "tailor", "REVIEW_RESUME": "review", "FOLLOW_UP": "followup",
+                "EXTRACT_EVIDENCE": "tailor"}
 
 
 def _task_from_prompt(user: str) -> str:
-    if "FIT_ANALYSIS" in user:
-        return "rank"
-    if "TAILOR_RESUME" in user:
-        return "tailor"
-    if "REVIEW_RESUME" in user:
-        return "review"
-    if "FOLLOW_UP" in user:
-        return "followup"
-    if "EXTRACT_EVIDENCE" in user:
-        return "tailor"
-    return "default"
+    """The stage of a prompt, read from its first line only, so text inside the data can never reroute it."""
+    first_line = (user or "").lstrip().split("\n", 1)[0].strip()
+    return MARKER_TASKS.get(first_line, "default")
 
 
 def _csv_models(value: str) -> list[str]:
@@ -54,6 +86,18 @@ def _csv_models(value: str) -> list[str]:
 def _is_free_openrouter_model(model: str) -> bool:
     # The free router itself and explicit :free variants have zero token price.
     return is_free_model("openrouter", model)
+
+
+def _provider_error(provider: str, model: str, exc: Exception) -> LLMError:
+    """Map an SDK or transport exception to a typed LLMError without importing every SDK."""
+    name = type(exc).__name__
+    status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+    detail = f"{provider} request failed for model={model}: {exc}"
+    if isinstance(exc, TimeoutError) or "Timeout" in name:
+        return LLMTimeoutError(detail)
+    if status == 429 or "RateLimit" in name:
+        return LLMRateLimitError(detail)
+    return LLMError(detail)
 
 
 class LLMClient:
@@ -74,69 +118,93 @@ class LLMClient:
     def _config(self) -> dict[str, Any]:
         return resolve_ai_config(self.settings, self.overrides)
 
+    def _timeout(self) -> int:
+        return int(getattr(self.settings, "llm_request_timeout_seconds", 120) or 120)
+
+    def _retries(self) -> int:
+        return int(getattr(self.settings, "llm_max_retries", 1) or 0)
+
     def generate_prompt_json(self, prompt: Prompt) -> dict[str, Any]:
         """Run a prompt built in app.prompts and return its JSON result."""
-        return self.generate_json(prompt.system, prompt.user)
+        return self.generate_prompt(prompt).data
+
+    def generate_prompt(self, prompt: Prompt) -> LLMResult:
+        """Run a prompt built in app.prompts. The stage comes from the prompt's marker, never from its data."""
+        return self._generate(prompt.system, prompt.user, MARKER_TASKS.get(prompt.marker, "default"))
 
     def generate_json(self, system: str, user: str) -> dict[str, Any]:
+        return self._generate(system, user, _task_from_prompt(user)).data
+
+    def model_for(self, task: str) -> tuple[str, str]:
+        """The provider and model a stage would use."""
+        config = self._config()
+        return config["llm_provider"], config["stage_models"].get(task) or config["model"]
+
+    def _generate(self, system: str, user: str, task: str) -> LLMResult:
         config = self._config()
         provider = config["llm_provider"]
-        task = _task_from_prompt(user)
         model = config["stage_models"].get(task) or config["model"]
         if provider == "mock":
-            return self._mock(user)
+            return LLMResult(self._mock(task, user), "mock", "mock")
         if provider == "openai":
             return self._openai(system, user, model)
         if provider == "anthropic":
             return self._anthropic(system, user, model)
         if provider == "openrouter":
             return self._openrouter(system, user, task=task, model=model, require_free=config["require_free"])
-        raise LLMError(f"Unsupported LLM_PROVIDER={provider}")
+        raise LLMConfigError(f"Unsupported LLM_PROVIDER={provider}")
 
-    def _openai(self, system: str, user: str, model: str) -> dict[str, Any]:
+    def _openai(self, system: str, user: str, model: str) -> LLMResult:
         if not self.keys.get("openai"):
-            raise LLMError("OPENAI_API_KEY is missing: add your OpenAI API key in Settings")
+            raise LLMConfigError("OPENAI_API_KEY is missing: add your OpenAI API key in Settings")
         from openai import OpenAI
 
-        client = OpenAI(api_key=self.keys["openai"])
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            response_format={"type": "json_object"},
-        )
-        return _extract_json(response.choices[0].message.content or "{}")
+        client = OpenAI(api_key=self.keys["openai"], timeout=self._timeout(), max_retries=self._retries())
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                response_format={"type": "json_object"},
+            )
+        except Exception as exc:
+            raise _provider_error("OpenAI", model, exc) from exc
+        return LLMResult(_extract_json(response.choices[0].message.content or "{}"), "openai",
+                         _answered_model(response, model))
 
-    def _anthropic(self, system: str, user: str, model: str) -> dict[str, Any]:
+    def _anthropic(self, system: str, user: str, model: str) -> LLMResult:
         if not self.keys.get("anthropic"):
-            raise LLMError("ANTHROPIC_API_KEY is missing: add your Anthropic API key in Settings")
+            raise LLMConfigError("ANTHROPIC_API_KEY is missing: add your Anthropic API key in Settings")
         from anthropic import Anthropic
 
-        client = Anthropic(api_key=self.keys["anthropic"])
-        msg = client.messages.create(
-            model=model,
-            max_tokens=5000,
-            system=system + "\nReturn only valid JSON. No markdown fences.",
-            messages=[{"role": "user", "content": user}],
-        )
+        client = Anthropic(api_key=self.keys["anthropic"], timeout=self._timeout(), max_retries=self._retries())
+        try:
+            msg = client.messages.create(
+                model=model,
+                max_tokens=5000,
+                system=system + "\nReturn only valid JSON. No markdown fences.",
+                messages=[{"role": "user", "content": user}],
+            )
+        except Exception as exc:
+            raise _provider_error("Anthropic", model, exc) from exc
         text = "".join(getattr(block, "text", "") for block in msg.content)
-        return _extract_json(text)
+        return LLMResult(_extract_json(text), "anthropic", _answered_model(msg, model))
 
-    def _openrouter(self, system: str, user: str, task: str, model: str, require_free: bool) -> dict[str, Any]:
+    def _openrouter(self, system: str, user: str, task: str, model: str, require_free: bool) -> LLMResult:
         if not self.keys.get("openrouter"):
-            raise LLMError("OPENROUTER_API_KEY is missing: add your OpenRouter API key in Settings")
+            raise LLMConfigError("OPENROUTER_API_KEY is missing: add your OpenRouter API key in Settings")
 
         primary = model
         fallbacks = _csv_models(self.settings.openrouter_fallback_models)
         all_models = [primary, *fallbacks]
 
-        # Avoid accidental spend when the user intends to run on free inference.
+        # Avoid accidental spend when the user intends to run on free inference. Checked before any request.
         if require_free:
             paid = [name for name in all_models if not _is_free_openrouter_model(name)]
             if paid:
-                raise LLMError(
+                raise LLMConfigError(
                     "OPENROUTER_REQUIRE_FREE=true but paid/non-free model(s) were configured: "
                     + ", ".join(paid)
                     + ". Use openrouter/free or a :free model, or turn off the free-only guard in Settings."
@@ -152,6 +220,8 @@ class LLMClient:
             api_key=self.keys["openrouter"],
             base_url=self.settings.openrouter_base_url,
             default_headers=headers,
+            timeout=self._timeout(),
+            max_retries=self._retries(),
         )
 
         extra_body: dict[str, Any] = {}
@@ -175,34 +245,46 @@ class LLMClient:
         try:
             response = client.chat.completions.create(**request_kwargs)
         except Exception as exc:
-            raise LLMError(f"OpenRouter request failed for task={task}, model={primary}: {exc}") from exc
+            raise _provider_error(f"OpenRouter (task={task})", primary, exc) from exc
 
         content = response.choices[0].message.content or "{}"
-        return _extract_json(content)
+        return LLMResult(_extract_json(content), "openrouter", _answered_model(response, primary))
 
-    def _mock(self, user: str) -> dict[str, Any]:
+    def _mock(self, task: str, user: str) -> dict[str, Any]:
         # Useful for local smoke tests without API spend.
-        if "FIT_ANALYSIS" in user:
+        if task == "rank":
+            job_id = re.search(r"^JOB ID: (\d+)$", user, re.M)
             return {
-                "score": 80,
-                "summary": "Good overall fit based on the supplied profile.",
-                "strong_matches": ["Python", "backend systems"],
-                "gaps": [],
-                "must_have_missing": [],
-                "keywords": ["Python", "FastAPI"],
-                "application_strategy": "Emphasize production ownership and measurable outcomes.",
+                "job_id": int(job_id.group(1)) if job_id else 0,
+                "overall_fit_score": 80,
                 "confidence": 0.8,
+                "candidate_fit_score": 82,
+                "resume_fit_score": 74,
+                "seniority_match_score": 80,
+                "skills_match_score": 80,
+                "leadership_match_score": 70,
+                "domain_match_score": 75,
+                "location_match_score": 90,
+                "strong_matches": ["Python", "backend systems"],
+                "partial_matches": ["Cloud infrastructure"],
+                "missing_requirements": [],
+                "fatal_gaps": [],
+                "resume_gaps": ["Production ownership is not quantified on the resume"],
+                "relevant_evidence_ids": [],
+                "recommended_resume_focus": ["Lead with production ownership and measurable outcomes"],
+                "qualification_recommendation": "QUALIFY",
+                "reasoning_summary": "Good overall fit based on the supplied profile.",
             }
-        if "REVIEW_RESUME" in user:
+        if task == "review":
             return {
                 "score": 86,
                 "reject_reasons": [],
                 "strengths": ["Relevant evidence", "Clear outcomes"],
                 "improvements": ["Keep bullets concise"],
             }
-        if "FOLLOW_UP" in user:
+        if task == "followup":
             return {"draft": "Hi, I wanted to follow up on my application and reiterate my interest in the role. Best regards."}
-        if "EXTRACT_EVIDENCE" in user:
+        if "EXTRACT_EVIDENCE" in user.split("\n", 1)[0]:
             lines = [line.strip(" -•*\t") for line in user.split("MASTER RESUME:", 1)[-1].splitlines()]
             claims = [line for line in lines if len(line) > 25 and re.search(r"\d", line)][:12]
             return {"claims": [{"claim": c, "company": "", "role": "", "skills": []} for c in claims]}
@@ -214,3 +296,8 @@ class LLMClient:
             "selected_evidence_ids": [],
             "cover_letter": "I am excited to apply because the role aligns with my production engineering and AI experience.",
         }
+
+
+def _answered_model(response: Any, requested: str) -> str:
+    answered = getattr(response, "model", None)
+    return answered if isinstance(answered, str) and answered else requested

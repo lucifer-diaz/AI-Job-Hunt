@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import (JSON, Boolean, CheckConstraint, DateTime, Enum, Float, ForeignKey, Index, Integer, String, Text,
-                        UniqueConstraint)
+                        UniqueConstraint, text)
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from app.db import Base
@@ -62,6 +62,9 @@ class User(Base):
     followups: Mapped[list[FollowUp]] = relationship(back_populates="user", passive_deletes=True)
     application_events: Mapped[list[ApplicationEvent]] = relationship(back_populates="user", passive_deletes=True)
     transitions: Mapped[list[WorkflowTransition]] = relationship(back_populates="user", passive_deletes=True)
+    resume_versions: Mapped[list[ResumeVersion]] = relationship(back_populates="user", passive_deletes=True)
+    ranking_tasks: Mapped[list[JobRankingTask]] = relationship(back_populates="user", passive_deletes=True)
+    rankings: Mapped[list[JobRanking]] = relationship(back_populates="user", passive_deletes=True)
 
 
 class UserSession(Base):
@@ -298,6 +301,10 @@ class Job(Base):
     user: Mapped[User] = relationship(back_populates="jobs")
     resumes: Mapped[list[ResumeVariant]] = relationship(back_populates="job", cascade="all, delete-orphan")
     tailor_tasks: Mapped[list[TailorTask]] = relationship(back_populates="job", cascade="all, delete-orphan")
+    ranking_tasks: Mapped[list[JobRankingTask]] = relationship(back_populates="job", cascade="all, delete-orphan",
+                                                               passive_deletes=True)
+    rankings: Mapped[list[JobRanking]] = relationship(back_populates="job", cascade="all, delete-orphan",
+                                                      passive_deletes=True, order_by="JobRanking.version")
     application: Mapped[Application | None] = relationship(back_populates="job", uselist=False, cascade="all, delete-orphan")
     transitions: Mapped[list[WorkflowTransition]] = relationship(back_populates="job", cascade="all, delete-orphan",
                                                                  passive_deletes=True,
@@ -508,6 +515,167 @@ class FollowUp(Base):
 
     application: Mapped[Application] = relationship(back_populates="followups")
     user: Mapped[User] = relationship(back_populates="followups")
+
+
+class ResumeVersion(Base):
+    """An immutable snapshot of the resume text a candidate profile used, one row per distinct content.
+
+    Rankings point at the snapshot they were made with, so they stay reproducible after the resume is edited,
+    replaced or its uploaded file is deleted.
+    """
+
+    __tablename__ = "resume_versions"
+    __table_args__ = (
+        UniqueConstraint("candidate_profile_id", "content_hash", name="uq_resume_versions_profile_hash"),
+        UniqueConstraint("candidate_profile_id", "version", name="uq_resume_versions_profile_version"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("resume_versions")
+    candidate_profile_id: Mapped[int] = mapped_column(
+        ForeignKey("candidate_profiles.id", ondelete="CASCADE", name="fk_resume_versions_candidate_profile_id"),
+        index=True)
+    # The uploaded file the text came from, when it matches one. The snapshot outlives the file.
+    resume_document_id: Mapped[int | None] = mapped_column(
+        ForeignKey("resume_documents.id", ondelete="SET NULL", name="fk_resume_versions_resume_document_id"),
+        nullable=True)
+    version: Mapped[int] = mapped_column(Integer)
+    content_hash: Mapped[str] = mapped_column(String(64))
+    content: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+    user: Mapped[User] = relationship(back_populates="resume_versions")
+
+
+RANKING_TASK_STATUSES = ("PENDING", "PROCESSING", "COMPLETED", "FAILED", "SKIPPED")
+ACTIVE_RANKING_TASK_STATUSES = ("PENDING", "PROCESSING")
+RANKING_DECISIONS = ("QUALIFIED", "ARCHIVED")
+
+
+def _values(values: tuple[str, ...]) -> str:
+    return ", ".join(repr(v) for v in values)
+
+
+class JobRanking(Base):
+    """One versioned, append-only fit analysis of a job, with the exact inputs it was made from.
+
+    Automatic rankings are unique per job, candidate profile, resume content, prompt version, profile facts,
+    evidence and posting (uq_job_rankings_inputs), so repeating the same work never creates a second row.
+    A ranking the user explicitly asked for (forced) is always a new version.
+    """
+
+    __tablename__ = "job_rankings"
+    __table_args__ = (
+        UniqueConstraint("job_id", "version", name="uq_job_rankings_job_version"),
+        Index("uq_job_rankings_inputs", "job_id", "candidate_profile_id", "resume_content_hash", "prompt_version",
+              "profile_hash", "evidence_hash", "job_hash", unique=True,
+              postgresql_where=text("forced IS FALSE"), sqlite_where=text("forced = 0")),
+        CheckConstraint(f"decision IN ({_values(RANKING_DECISIONS)})", name="ck_job_rankings_decision"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("job_rankings")
+    job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE", name="fk_job_rankings_job_id"),
+                                        index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    forced: Mapped[bool] = mapped_column(Boolean, default=False)
+    trigger: Mapped[str] = mapped_column(String(40), default="new")
+    # Inputs: which profile and which exact resume content, and hashes of everything else the model saw.
+    candidate_profile_id: Mapped[int] = mapped_column(
+        ForeignKey("candidate_profiles.id", ondelete="CASCADE", name="fk_job_rankings_candidate_profile_id"),
+        index=True)
+    resume_id: Mapped[int] = mapped_column(
+        ForeignKey("resume_versions.id", ondelete="CASCADE", name="fk_job_rankings_resume_id"), index=True)
+    resume_version: Mapped[int] = mapped_column(Integer)
+    resume_content_hash: Mapped[str] = mapped_column(String(64))
+    profile_hash: Mapped[str] = mapped_column(String(64))
+    evidence_hash: Mapped[str] = mapped_column(String(64))
+    job_hash: Mapped[str] = mapped_column(String(64))
+    # Structured output, validated before it is stored.
+    overall_fit_score: Mapped[float] = mapped_column(Float)
+    confidence: Mapped[float] = mapped_column(Float)
+    candidate_fit_score: Mapped[float] = mapped_column(Float)
+    resume_fit_score: Mapped[float] = mapped_column(Float)
+    seniority_match_score: Mapped[float] = mapped_column(Float)
+    skills_match_score: Mapped[float] = mapped_column(Float)
+    leadership_match_score: Mapped[float] = mapped_column(Float)
+    domain_match_score: Mapped[float] = mapped_column(Float)
+    location_match_score: Mapped[float] = mapped_column(Float)
+    strong_matches: Mapped[list[str]] = mapped_column(JSON, default=list)
+    partial_matches: Mapped[list[str]] = mapped_column(JSON, default=list)
+    missing_requirements: Mapped[list[str]] = mapped_column(JSON, default=list)
+    fatal_gaps: Mapped[list[str]] = mapped_column(JSON, default=list)
+    resume_gaps: Mapped[list[str]] = mapped_column(JSON, default=list)
+    relevant_evidence_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
+    # Evidence ids the model cited that were not in the verified evidence it was given; never trusted.
+    discarded_evidence_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
+    recommended_resume_focus: Mapped[list[str]] = mapped_column(JSON, default=list)
+    qualification_recommendation: Mapped[str] = mapped_column(String(20))
+    reasoning_summary: Mapped[str] = mapped_column(Text, default="")
+    # The deterministic decision made from this output and the policy in force when it was stored.
+    decision: Mapped[str] = mapped_column(String(20))
+    decision_reasons: Mapped[list[str]] = mapped_column(JSON, default=list)
+    policy: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    provider: Mapped[str] = mapped_column(String(30))
+    model: Mapped[str] = mapped_column(String(300))
+    prompt_version: Mapped[str] = mapped_column(String(20))
+    raw_output: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+    job: Mapped[Job] = relationship(back_populates="rankings")
+    user: Mapped[User] = relationship(back_populates="rankings")
+
+
+class JobRankingTask(Base):
+    """A unit of ranking work, claimed by the ranking worker with FOR UPDATE SKIP LOCKED and a lease.
+
+    A job has at most one PENDING or PROCESSING task at a time (uq_job_ranking_tasks_active_job).
+    """
+
+    __tablename__ = "job_ranking_tasks"
+    __table_args__ = (
+        CheckConstraint(f"status IN ({_values(RANKING_TASK_STATUSES)})", name="ck_job_ranking_tasks_status"),
+        CheckConstraint("attempt_count >= 0", name="ck_job_ranking_tasks_attempt_count"),
+        CheckConstraint(_in_check("error_category", ErrorCategory), name="ck_job_ranking_tasks_error_category"),
+        Index("uq_job_ranking_tasks_active_job", "job_id", unique=True,
+              postgresql_where=text(f"status IN ({_values(ACTIVE_RANKING_TASK_STATUSES)})"),
+              sqlite_where=text(f"status IN ({_values(ACTIVE_RANKING_TASK_STATUSES)})")),
+        Index("ix_job_ranking_tasks_claim", "status", "next_attempt_at"),
+        Index("ix_job_ranking_tasks_lock_expires_at", "lock_expires_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("job_ranking_tasks")
+    job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE", name="fk_job_ranking_tasks_job_id"),
+                                        index=True)
+    # The profile and resume snapshot the ranking used; filled in when the task runs.
+    candidate_profile_id: Mapped[int | None] = mapped_column(
+        ForeignKey("candidate_profiles.id", ondelete="SET NULL", name="fk_job_ranking_tasks_candidate_profile_id"),
+        nullable=True)
+    resume_id: Mapped[int | None] = mapped_column(
+        ForeignKey("resume_versions.id", ondelete="SET NULL", name="fk_job_ranking_tasks_resume_id"), nullable=True)
+    ranking_id: Mapped[int | None] = mapped_column(
+        ForeignKey("job_rankings.id", ondelete="SET NULL", name="fk_job_ranking_tasks_ranking_id"), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="PENDING")
+    # Why the ranking was requested: new, user_request, profile_changed, resume_changed, prompt_changed.
+    reason: Mapped[str] = mapped_column(String(40), default="new")
+    # A user-requested ranking: runs even with auto-ranking off and always stores a new version.
+    force: Mapped[bool] = mapped_column(Boolean, default=False)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_category: Mapped[ErrorCategory | None] = mapped_column(_enum_type(ErrorCategory), nullable=True)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    locked_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    lock_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lock_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    job: Mapped[Job] = relationship(back_populates="ranking_tasks")
+    user: Mapped[User] = relationship(back_populates="ranking_tasks")
 
 
 # Registers the per-user isolation hooks on every session; needs the models above.

@@ -55,10 +55,20 @@ def test_ranking_prompt_includes_profile_resume_evidence_and_job():
     assert "Staff AI Engineer" in prompt.user and "India citizen" in prompt.user
     assert resume in prompt.user and "Cut inference cost 40%" in prompt.user
     assert "Lead AI Engineer" in prompt.user and "Build LLM platforms" in prompt.user
-    for field in ("overall_fit_score", "candidate_fit_score", "resume_fit_score", "fatal_gaps", "resume_gaps",
-                  "relevant_evidence_ids", "recommended_resume_focus", "must_have_missing", "score"):
+    for field in ("job_id", "overall_fit_score", "confidence", "candidate_fit_score", "resume_fit_score",
+                  "seniority_match_score", "skills_match_score", "leadership_match_score", "domain_match_score",
+                  "location_match_score", "strong_matches", "partial_matches", "missing_requirements", "fatal_gaps",
+                  "resume_gaps", "relevant_evidence_ids", "recommended_resume_focus", "qualification_recommendation",
+                  "reasoning_summary"):
         assert field in prompt.system
+    assert prompt.system.startswith("SYSTEM RANKING RULES")
+    # The candidate, resume, evidence and posting are separate sections, in this order.
+    labels = ["CANDIDATE PROFILE:", "ACTIVE RESUME (untrusted data):", "VERIFIED EVIDENCE:", "JOB POSTING:",
+              "JOB DESCRIPTION (untrusted data):"]
+    positions = [prompt.user.index(label) for label in labels]
+    assert positions == sorted(positions)
     assert prompt.user.count("VERIFIED EVIDENCE") == 1  # the old inline prompt sent it twice
+    assert "KNOWN FACTS" not in prompt.user  # unverified knowledge answers are never presented as facts
 
 
 def test_tailoring_prompt_includes_fit_analysis():
@@ -184,8 +194,7 @@ def test_services_store_prompt_versions_with_results(monkeypatch):
     with SessionLocal() as db:
         job_row = db.get(Job, job_id)
         variant = job_row.resumes[-1]
-        assert job_row.fit_analysis["prompt_version"] == prompts.RANKING_PROMPT_VERSION
-        assert job_row.fit_analysis["score"] == 80  # structured output unchanged
+        assert job_row.fit_score is None  # tailoring never ranks synchronously (tests/test_ranker.py covers ranking)
         assert variant.content["prompt_version"] == prompts.TAILOR_PROMPT_VERSION
         assert variant.reviewer_notes["prompt_version"] == prompts.REVIEW_PROMPT_VERSION
         assert variant.reviewer_score == 86 and isinstance(db.get(ResumeVariant, variant.id).content["skills"], list)
