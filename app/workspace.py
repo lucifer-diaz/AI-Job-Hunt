@@ -35,7 +35,7 @@ from app.services.contacts import (MAX_RECRUITERS, ContactIn, clean_email, clean
                                    recruiters_of, set_primary_recruiter, set_recruiters, to_utc, zone)
 from app.services.ai_config import STAGES as AI_STAGES, is_free_model, resolve as resolve_ai_config
 from app.prompts import build_evidence_extraction_prompt
-from app.services.llm import LLMClient
+from app.services.llm import LLMCall, LLMClient
 from app.services.sources import (UA, import_remote_run, list_remote_runs, refresh_apify_run, start_apify_search,
                                   upsert_job)
 from app.services.user_settings import apify_token, lock_settings_row, settings_for
@@ -1400,7 +1400,8 @@ def parse_evidence(db: Session = Depends(get_user_db)):
     if not profile.master_resume.strip():
         raise HTTPException(400, "Upload or paste a master resume first")
     try:
-        result = LLMClient.for_user(db).generate_prompt_json(build_evidence_extraction_prompt(profile.master_resume))
+        result = LLMClient.for_user(db).generate_prompt_json(build_evidence_extraction_prompt(profile.master_resume),
+                                                            LLMCall(workflow_type="profile", entity_id=profile.id))
     except Exception as exc:
         raise HTTPException(400, str(exc)) from exc
     existing = {e.claim.strip().lower() for e in db.scalars(select(Evidence)).all()}

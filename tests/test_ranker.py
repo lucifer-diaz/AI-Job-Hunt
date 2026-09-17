@@ -71,7 +71,7 @@ class FakeModel:
     def answer(self, job_id, *replies):
         self.answers[job_id] = list(replies)
 
-    def generate_prompt(self, prompt):
+    def generate_prompt(self, prompt, call=None):
         job_id = int(re.search(r"^JOB ID: (\d+)$", prompt.user, re.M).group(1))
         with self.lock:
             self.active += 1
@@ -84,9 +84,9 @@ class FakeModel:
             reply = replies.pop(0) if len(replies) > 1 else (replies[0] if replies else {})
             if isinstance(reply, Exception):
                 raise reply
-            if isinstance(reply, tuple) and reply[0] == "raw":
-                return LLMResult(reply[1], "fake", "fake/rank-model")
-            return LLMResult(output(job_id, **reply), "fake", "fake/rank-model")
+            data = reply[1] if isinstance(reply, tuple) and reply[0] == "raw" else output(job_id, **reply)
+            validated = call.validate(data) if call and call.validate else None  # as the real LLM layer does
+            return LLMResult(data, "fake", "fake/rank-model", None, validated)
         finally:
             with self.lock:
                 self.active -= 1

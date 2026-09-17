@@ -26,6 +26,7 @@ from app.auth import router as auth_router
 from app.db import engine
 from app.db_migrations import run_migrations
 from app.hunter_api import router as hunter_router
+from app.monitoring_api import router as monitoring_router
 from app.models import (
     Application,
     CandidateProfile,
@@ -119,6 +120,7 @@ app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), na
 app.include_router(auth_router)
 app.include_router(workspace_router)
 app.include_router(hunter_router)
+app.include_router(monitoring_router)
 
 # Reachable without signing in. Cron and admin routes are protected by their own secrets.
 PUBLIC_PATHS = {"/health", "/login", "/signup", "/api/auth/login", "/api/auth/signup", "/api/auth/logout"}
@@ -247,7 +249,7 @@ def dashboard(request: Request, db: Session = Depends(get_user_db)):
 def settings_get(db: Session = Depends(get_user_db)):
     value = settings_for(db)
     keys = key_status(db)
-    configured = {name: keys[name]["configured"] for name in ("openrouter", "openai", "anthropic", "apify")}
+    configured = {name: keys[name]["configured"] for name in ("openrouter", "openai", "anthropic", "gemini", "apify")}
     overrides = (value.preferences or {}).get("ai") or {}
     effective = resolve_ai_config(settings, overrides)
     return {"llm_provider": effective["llm_provider"], "model": effective["model"],

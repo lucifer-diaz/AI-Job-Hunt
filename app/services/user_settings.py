@@ -18,8 +18,9 @@ from app.settings import get_settings
 from app.tenancy import require_user_id
 
 KEY_COLUMNS = {"openrouter": "openrouter_api_key_enc", "openai": "openai_api_key_enc",
-               "anthropic": "anthropic_api_key_enc", "apify": "apify_api_token_enc"}
-KEY_LABELS = {"openrouter": "OpenRouter", "openai": "OpenAI", "anthropic": "Anthropic", "apify": "Apify"}
+               "anthropic": "anthropic_api_key_enc", "gemini": "gemini_api_key_enc", "apify": "apify_api_token_enc"}
+KEY_LABELS = {"openrouter": "OpenRouter", "openai": "OpenAI", "anthropic": "Anthropic", "gemini": "Gemini",
+              "apify": "Apify"}
 
 Row = TypeVar("Row", CandidateProfile, AppSetting)
 

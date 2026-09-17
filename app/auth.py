@@ -116,7 +116,8 @@ def claim_existing_data(db: Session, user_id: int) -> None:
 
     settings = get_settings()
     env_keys = {"openrouter": settings.openrouter_api_key, "openai": settings.openai_api_key,
-                "anthropic": settings.anthropic_api_key, "apify": settings.apify_api_token}
+                "anthropic": settings.anthropic_api_key, "gemini": settings.gemini_api_key,
+                "apify": settings.apify_api_token}
     if not settings.secret_key or not any(env_keys.values()):
         return
     row = db.scalar(select(AppSetting).where(AppSetting.user_id == user_id))

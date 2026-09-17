@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import (JSON, Boolean, CheckConstraint, DateTime, Enum, Float, ForeignKey, Index, Integer, String, Text,
+from sqlalchemy import (JSON, Boolean, CheckConstraint, Date, DateTime, Enum, Float, ForeignKey, Index, Integer, Numeric,
+                        String, Text,
                         UniqueConstraint, text)
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
@@ -65,6 +67,8 @@ class User(Base):
     resume_versions: Mapped[list[ResumeVersion]] = relationship(back_populates="user", passive_deletes=True)
     ranking_tasks: Mapped[list[JobRankingTask]] = relationship(back_populates="user", passive_deletes=True)
     rankings: Mapped[list[JobRanking]] = relationship(back_populates="user", passive_deletes=True)
+    optimization_tasks: Mapped[list[AIOptimizationTask]] = relationship(back_populates="user", passive_deletes=True)
+    optimization_reports: Mapped[list[AIOptimizationReport]] = relationship(back_populates="user", passive_deletes=True)
 
 
 class UserSession(Base):
@@ -120,6 +124,7 @@ class AppSetting(Base):
     openrouter_api_key_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
     openai_api_key_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
     anthropic_api_key_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    gemini_api_key_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
     apify_api_token_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
 
@@ -676,6 +681,166 @@ class JobRankingTask(Base):
 
     job: Mapped[Job] = relationship(back_populates="ranking_tasks")
     user: Mapped[User] = relationship(back_populates="ranking_tasks")
+
+
+LLM_STAGES = ("RANKER", "TAILOR", "REVIEWER", "RESUME_PARSER", "APPLICATION", "FOLLOW_UP", "INBOX", "COMPANY_INSIGHTS",
+              "ADVISOR", "OTHER")
+LLM_ERROR_TYPES = ("TIMEOUT", "RATE_LIMIT", "INVALID_JSON", "SCHEMA_VALIDATION", "PROVIDER_ERROR", "CONTEXT_OVERFLOW",
+                   "CONFIGURATION", "OTHER")
+OPTIMIZATION_TASK_STATUSES = ("PENDING", "PROCESSING", "COMPLETED", "FAILED")
+
+
+class LLMRequestLog(Base):
+    """One LLM request made anywhere in the system, recorded by the shared LLM layer (app.services.llm_telemetry).
+
+    Metadata and token counts only: prompt and response text are stored only when LLM_PROMPT_DEBUG is on.
+    Metrics a provider does not report stay NULL unless they can be estimated, and `usage_source` says which.
+    Not tenancy-filtered automatically (a request may belong to no account); app.services.monitoring always
+    filters by user_id.
+    """
+
+    __tablename__ = "llm_request_logs"
+    __table_args__ = (
+        CheckConstraint(f"stage IN ({_values(LLM_STAGES)})", name="ck_llm_request_logs_stage"),
+        CheckConstraint("status IN ('SUCCEEDED', 'FAILED')", name="ck_llm_request_logs_status"),
+        CheckConstraint(f"error_type IN ({_values(LLM_ERROR_TYPES)})", name="ck_llm_request_logs_error_type"),
+        Index("ix_llm_request_logs_user_created", "user_id", "created_at"),
+        Index("ix_llm_request_logs_stage_created", "stage", "created_at"),
+        Index("ix_llm_request_logs_model_created", "model", "created_at"),
+        Index("ix_llm_request_logs_created_at", "created_at"),
+        UniqueConstraint("request_id", name="uq_llm_request_logs_request_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    request_id: Mapped[str] = mapped_column(String(36))
+    user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE", name="fk_llm_request_logs_user_id"), nullable=True)
+    workflow_type: Mapped[str | None] = mapped_column(String(30), nullable=True)  # job | application | profile | system | agent
+    workflow_entity_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    stage: Mapped[str] = mapped_column(String(30), default="OTHER")
+    provider: Mapped[str] = mapped_column(String(30))
+    requested_model: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    prompt_name: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    prompt_version: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    usage_source: Mapped[str] = mapped_column(String(20), default="none")  # provider_reported | estimated | none
+    estimated_context_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    context_window_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    context_utilization_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
+    context_breakdown: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    estimated_cost: Mapped[Decimal | None] = mapped_column(Numeric(14, 8), nullable=True)
+    cost_source: Mapped[str] = mapped_column(String(20), default="unknown")  # free | pricing_table | provider_reported | unknown
+    pricing_effective_from: Mapped[date | None] = mapped_column(Date, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="SUCCEEDED")
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    error_type: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    structured_output_valid: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    structured_output_retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    cached: Mapped[bool] = mapped_column(Boolean, default=False)
+    cache_read_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cache_write_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    debug_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    debug_response: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class LLMUsageDaily(Base):
+    """Daily totals kept after raw request rows pass LLM_TELEMETRY_RETENTION_DAYS."""
+
+    __tablename__ = "llm_usage_daily"
+    __table_args__ = (
+        UniqueConstraint("user_id", "day", "stage", "provider", "model", "prompt_version", name="uq_llm_usage_daily_key"),
+        Index("ix_llm_usage_daily_user_day", "user_id", "day"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE", name="fk_llm_usage_daily_user_id"), nullable=True)
+    day: Mapped[date] = mapped_column(Date)
+    stage: Mapped[str] = mapped_column(String(30))
+    provider: Mapped[str] = mapped_column(String(30))
+    model: Mapped[str] = mapped_column(String(300), default="")
+    prompt_version: Mapped[str] = mapped_column(String(20), default="")
+    requests: Mapped[int] = mapped_column(Integer, default=0)
+    failures: Mapped[int] = mapped_column(Integer, default=0)
+    retries: Mapped[int] = mapped_column(Integer, default=0)
+    structured_output_failures: Mapped[int] = mapped_column(Integer, default=0)
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    estimated_cost: Mapped[Decimal | None] = mapped_column(Numeric(14, 8), nullable=True)
+    unpriced_requests: Mapped[int] = mapped_column(Integer, default=0)
+    latency_ms_sum: Mapped[int] = mapped_column(Integer, default=0)
+    latency_ms_max: Mapped[int] = mapped_column(Integer, default=0)
+    context_tokens_sum: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class AIOptimizationReport(Base):
+    """Recommendations from the AI Optimization Advisor. Advice only: nothing in it is ever applied automatically."""
+
+    __tablename__ = "ai_optimization_reports"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("ai_optimization_reports")
+    time_range_start: Mapped[datetime] = mapped_column(DateTime)
+    time_range_end: Mapped[datetime] = mapped_column(DateTime)
+    summary: Mapped[str] = mapped_column(Text, default="")
+    cost_findings: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    latency_findings: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    context_findings: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    model_findings: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    prompt_findings: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    reliability_findings: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    recommendations: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    estimated_savings: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # The exact deterministic aggregates the report was built from.
+    aggregates: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    generated_by: Mapped[str] = mapped_column(String(10), default="rules")  # llm | rules
+    model_provider: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    model_name: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    prompt_version: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+    user: Mapped[User] = relationship(back_populates="optimization_reports")
+
+
+class AIOptimizationTask(Base):
+    """A queued analysis of an account's LLM telemetry, processed by the scheduler's ai_optimization job."""
+
+    __tablename__ = "ai_optimization_tasks"
+    __table_args__ = (
+        CheckConstraint(f"status IN ({_values(OPTIMIZATION_TASK_STATUSES)})", name="ck_ai_optimization_tasks_status"),
+        Index("uq_ai_optimization_tasks_active_user", "user_id", unique=True,
+              postgresql_where=text("status IN ('PENDING', 'PROCESSING')"),
+              sqlite_where=text("status IN ('PENDING', 'PROCESSING')")),
+        Index("ix_ai_optimization_tasks_claim", "status", "next_attempt_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("ai_optimization_tasks")
+    time_range_start: Mapped[datetime] = mapped_column(DateTime)
+    time_range_end: Mapped[datetime] = mapped_column(DateTime)
+    status: Mapped[str] = mapped_column(String(20), default="PENDING")
+    trigger: Mapped[str] = mapped_column(String(20), default="manual")  # manual | scheduled
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    locked_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    lock_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lock_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    report_id: Mapped[int | None] = mapped_column(
+        ForeignKey("ai_optimization_reports.id", ondelete="SET NULL", name="fk_ai_optimization_tasks_report_id"),
+        nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    user: Mapped[User] = relationship(back_populates="optimization_tasks")
 
 
 # Registers the per-user isolation hooks on every session; needs the models above.

@@ -27,7 +27,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from app.models import Application, Job, SearchRun, User
-from app.services import ranker
+from app.services import ai_advisor, monitoring, ranker
 from app.services import work_queue as wq
 from app.services.compensation import enrich_compensation
 from app.services.lifecycle import WorkflowState as S
@@ -280,11 +280,33 @@ def analytics(ctx: JobContext) -> dict[str, Any]:
 
 
 def cleanup(ctx: JobContext) -> dict[str, Any]:
-    """Recover work whose worker crashed: expired leases are retried or failed."""
+    """Recover work whose worker crashed, and apply LLM telemetry retention (roll up, then delete old rows)."""
     with ctx.sessions() as db:
+        telemetry = monitoring.prune(db, ctx.now)
         if not _is_postgres(db):
-            return skipped("Lease recovery needs PostgreSQL")
-        return {"recovered_leases": wq.recover_expired_leases(db)}
+            return skipped("Lease recovery needs PostgreSQL", telemetry=telemetry)
+        return {"recovered_leases": wq.recover_expired_leases(db), "telemetry": telemetry}
+
+
+ADVISOR_BATCH = 5
+
+
+def ai_optimization(ctx: JobContext) -> dict[str, Any]:
+    """Queue scheduled analyses, then process a few waiting AI optimization tasks. Recommendations only."""
+    with ctx.sessions() as db:
+        queued = ai_advisor.enqueue_scheduled(db, ctx.now)
+        recovered = ai_advisor.recover_expired(db, ctx.now)
+    outcomes: Counter = Counter()
+    for _ in range(ADVISOR_BATCH):
+        claim = ai_advisor.claim_next(ctx.sessions, ctx.worker_id)
+        if claim is None:
+            break
+        outcomes[ai_advisor.process(ctx.sessions, claim)] += 1
+    summary = {"scheduled": queued, "recovered": recovered, **{k: outcomes.get(k, 0) for k in
+                                                               ("completed", "retrying", "failed", "lost")}}
+    if not queued and not recovered and not outcomes:
+        return skipped("No analyses waiting", **summary)
+    return summary
 
 
 JOBS: list[JobSpec] = [
@@ -304,6 +326,8 @@ JOBS: list[JobSpec] = [
             "Reserved for an email provider; currently not configured."),
     JobSpec("analytics", "Analytics", "analytics_interval_minutes", analytics,
             "Stores a pipeline snapshot."),
+    JobSpec("ai_optimization", "AI optimization advisor", "ai_optimization_interval_minutes", ai_optimization,
+            "Analyses LLM usage and writes recommendations; never changes configuration."),
     JobSpec("cleanup", "Cleanup", "cleanup_interval_minutes", cleanup,
-            "Recovers jobs left locked by crashed workers."),
+            "Recovers jobs left locked by crashed workers and applies LLM telemetry retention."),
 ]

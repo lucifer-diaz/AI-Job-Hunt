@@ -23,7 +23,7 @@ const S = {
   polling: null, busy: {}, forms: {}, apifyImport: false, importPick: new Set(), autoRefreshed: false,
 };
 const D = {};
-const SCREENS = ['overview', 'today', 'discovery', 'tailor', 'approvals', 'tracker', 'knowledge', 'settings'];
+const SCREENS = ['overview', 'today', 'discovery', 'tailor', 'approvals', 'tracker', 'monitoring', 'knowledge', 'settings'];
 
 /* ───────────── helpers ───────────── */
 async function api(url, { method = 'GET', body, form } = {}) {
@@ -191,6 +191,7 @@ const LOADERS = {
     if (!apps.some(a => a.id === S.selApp)) S.selApp = (apps[0] || {}).id || null;
   },
   async knowledge() { [D.knowledge, D.evidence] = await Promise.all([api('/api/knowledge'), api('/api/evidence')]); },
+  async monitoring() { await loadMonitoring(); },
   async settings() {
     D.settingsLoadError = '';
     try {
@@ -282,7 +283,7 @@ async function load() {
 }
 
 /* ───────────── shell ───────────── */
-const NAV = [['overview', 'Overview', null], ['today', 'Today', 'today'], ['discovery', 'Discovery', 'discovery'], ['tailor', 'Tailor', 'tailor'], ['approvals', 'Approvals', 'approvals'], ['tracker', 'Tracker', 'tracker']];
+const NAV = [['overview', 'Overview', null], ['today', 'Today', 'today'], ['discovery', 'Discovery', 'discovery'], ['tailor', 'Tailor', 'tailor'], ['approvals', 'Approvals', 'approvals'], ['tracker', 'Tracker', 'tracker'], ['monitoring', 'Monitoring', null]];
 const NAV2 = [['knowledge', 'Knowledge bank'], ['settings', 'Settings & profile']];
 function renderNav() {
   const c = D.summary?.counts || {};
@@ -310,6 +311,7 @@ function screenMeta() {
     tailor: ['Tailor & review', 'AI drafts, you approve every claim'],
     approvals: ['Approvals', 'Nothing leaves this queue without your sign-off'],
     tracker: ['Tracker', D.tracker ? `${D.tracker.stats.live} live applications · ${D.tracker.stats.due} follow-ups due` : 'Every submitted application'],
+    monitoring: ['Monitoring', 'Every LLM request: tokens, context, latency, cost and failures · recommendations never change anything automatically'],
     knowledge: ['Knowledge bank', 'Answer once, reuse in every ATS form'],
     settings: ['Settings', 'A workspace that works your way'],
   }[S.screen];
@@ -1166,7 +1168,7 @@ function renderPalette() {
 }
 
 /* ───────────── render ───────────── */
-const RENDER = { overview: renderOverview, today: renderToday, discovery: renderDiscovery, tailor: renderTailor, approvals: renderApprovals, tracker: renderTracker, knowledge: renderKnowledge, settings: renderSettings };
+const RENDER = { overview: renderOverview, today: renderToday, discovery: renderDiscovery, tailor: renderTailor, approvals: renderApprovals, tracker: renderTracker, monitoring: renderMonitoring, knowledge: renderKnowledge, settings: renderSettings };
 function render() {
   const active = document.activeElement;
   const fid = active && active.id;
@@ -1178,8 +1180,8 @@ function render() {
   if (D.summary?.profile) $('#brand-sub').textContent = [D.summary.profile.name, D.summary.profile.headline].filter(Boolean).join(' · ') || 'Set up your profile';
   $('#top').innerHTML = renderTop();
   $('#view').innerHTML = RENDER[S.screen]();
-  $('#overlays').innerHTML = (S.jobOpen ? renderJobModal() : '') + (S.kitJob ? renderKit() : '') + (S.paletteOpen ? renderPalette() : '');
-  document.body.style.overflow = (S.jobOpen || S.kitJob || S.paletteOpen) ? 'hidden' : '';
+  $('#overlays').innerHTML = (S.jobOpen ? renderJobModal() : '') + (S.kitJob ? renderKit() : '') + (S.paletteOpen ? renderPalette() : '') + (S.mon?.request ? renderMonRequestModal() : '');
+  document.body.style.overflow = (S.jobOpen || S.kitJob || S.paletteOpen || S.mon?.request) ? 'hidden' : '';
   if (fid) {
     const el = document.getElementById(fid);
     if (el) { el.focus({ preventScroll: true }); if (selRange) { try { el.setSelectionRange(...selRange); } catch { /* ignore */ } } }
@@ -1675,6 +1677,7 @@ const A = {
   'ev-verify': el => busy('evv', async () => { await api(`/api/evidence/${el.dataset.id}`, { method: 'PATCH', body: { verified: true } }); await load(); }, 'Verified — tailoring may now cite it'),
   'ev-delete': async (el, e) => { e.preventDefault(); if (!confirm('Remove this evidence claim?')) return; await api(`/api/evidence/${el.dataset.id}`, { method: 'DELETE' }).catch(err => toast(err.message, true)); refreshAfter('Evidence removed'); },
   ...SETTINGS_ACTIONS,
+  ...MONITORING_ACTIONS,
 };
 function tagFallback(form, key) {
   if (form === 'sp') return D.searchProfile?.profile?.[key] || [];

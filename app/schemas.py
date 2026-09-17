@@ -62,6 +62,7 @@ class ApiKeysIn(BaseModel):
     openrouter: str | None = Field(default=None, max_length=500)
     openai: str | None = Field(default=None, max_length=500)
     anthropic: str | None = Field(default=None, max_length=500)
+    gemini: str | None = Field(default=None, max_length=500)
     apify: str | None = Field(default=None, max_length=500)
 
 

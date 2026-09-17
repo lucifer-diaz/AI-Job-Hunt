@@ -106,8 +106,9 @@ def test_cleanup_recovers_expired_leases(pg_sessions, owner):
     job_id, = add_jobs(pg_sessions, 1, owner)
     with pg_sessions() as db:
         wq.claim(db, [S.DISCOVERED], worker_id="gone", lease_seconds=60, now=utcnow() - timedelta(hours=1))
-    assert sj.cleanup(ctx(pg_sessions)) == {"recovered_leases": 1}
-    assert sj.cleanup(ctx(pg_sessions)) == {"recovered_leases": 0}
+    first = sj.cleanup(ctx(pg_sessions))
+    assert first["recovered_leases"] == 1 and set(first["telemetry"]) == {"rolled_up", "deleted"}
+    assert sj.cleanup(ctx(pg_sessions))["recovered_leases"] == 0
     with pg_sessions() as db:
         assert db.get(Job, job_id).lock_token is None
 

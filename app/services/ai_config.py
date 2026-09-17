@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-PROVIDERS = ("openrouter", "openai", "anthropic", "mock")
+PROVIDERS = ("openrouter", "openai", "anthropic", "gemini", "mock")
 STAGES = (("rank", "Rank"), ("tailor", "Tailor"), ("review", "Review"), ("followup", "Follow-up"))
 
 

@@ -43,8 +43,8 @@ from app.prompts.ranking import (QUALIFICATION_RECOMMENDATIONS, RANKING_PROMPT_V
                                  posting_facts, ranking_profile_facts)
 from app.services.lifecycle import ErrorCategory, InvalidTransition
 from app.services.lifecycle import WorkflowState as S
-from app.services.llm import (LLMClient, LLMConfigError, LLMError, LLMRateLimitError, LLMResponseError, LLMResult,
-                              LLMTimeoutError)
+from app.services.llm import (LLMCall, LLMClient, LLMConfigError, LLMError, LLMRateLimitError, LLMResponseError,
+                              LLMResult, LLMTimeoutError)
 from app.services.user_settings import ai_ready
 from app.services.work_queue import transition
 from app.settings import get_settings
@@ -783,8 +783,11 @@ def _process(db: Session, claimed: TaskClaim, clock: Callable[[], datetime]) -> 
             return _complete(db, claimed, inputs, clock(), existing=existing)
     prompt = build_ranking_prompt(candidate_profile=profile, resume=snapshot.content, evidence=evidence, job=job)
     try:
-        result = LLMClient.for_user(db, claimed.user_id).generate_prompt(prompt)
-        output, discarded = validate_output(result.data, job.id, set(inputs.verified_ids))
+        verified, job_id = set(inputs.verified_ids), job.id
+        result = LLMClient.for_user(db, claimed.user_id).generate_prompt(prompt, LLMCall(
+            workflow_type="job", entity_id=job_id, attempt=claimed.attempt,
+            validate=lambda data: validate_output(data, job_id, verified)))
+        output, discarded = result.validated
     except Exception as exc:  # classified below; a provider failure never archives a job
         db.rollback()
         return _failed(db, claimed, exc, clock())

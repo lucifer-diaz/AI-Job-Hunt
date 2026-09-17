@@ -22,13 +22,13 @@ from typing import Any
 from sqlalchemy import event
 from sqlalchemy.orm import Session, with_loader_criteria
 
-from app.models import (AppSetting, Application, ApplicationEvent, CandidateProfile, Evidence, FollowUp, Job, JobRanking,
+from app.models import (AIOptimizationReport, AIOptimizationTask, AppSetting, Application, ApplicationEvent, CandidateProfile, Evidence, FollowUp, Job, JobRanking,
                         JobRankingTask, KnowledgeAnswer, ResumeDocument, ResumeVariant, ResumeVersion, SearchProfile,
                         SearchRun, TailorTask, WorkflowTransition)
 
 OWNED_MODELS = (CandidateProfile, AppSetting, ResumeDocument, KnowledgeAnswer, Evidence, Job, SearchRun, SearchProfile,
                 Application, ResumeVariant, WorkflowTransition, ApplicationEvent, FollowUp, TailorTask, ResumeVersion,
-                JobRankingTask, JobRanking)
+                JobRankingTask, JobRanking, AIOptimizationTask, AIOptimizationReport)
 # Rows that inherit their owner from a parent row: model -> (relationship, foreign key, parent model).
 INHERITED_OWNER = {
     Application: ("job", "job_id", Job),
