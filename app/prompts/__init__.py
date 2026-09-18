@@ -17,6 +17,8 @@ from app.prompts.inbox import (
                                        INBOX_PROMPT_VERSION,
                                        build_inbox_classification_prompt,
 )
+from app.prompts.mcp_review import MCP_REVIEW_PROMPT_VERSION
+from app.prompts.mcp_tailoring import MCP_TAILORING_PROMPT_VERSION
 from app.prompts.ranking import RANKING_PROMPT_VERSION, build_ranking_prompt
 from app.prompts.resume_parser import (
                                        EVIDENCE_EXTRACTION_PROMPT_VERSION,
@@ -38,6 +40,8 @@ PROMPT_VERSIONS = {
     "inbox": INBOX_PROMPT_VERSION,
     "agents": AGENT_PROMPT_VERSION,
     "ai_optimization": AI_OPTIMIZATION_PROMPT_VERSION,
+    "mcp_tailoring": MCP_TAILORING_PROMPT_VERSION,
+    "mcp_review": MCP_REVIEW_PROMPT_VERSION,
 }
 
 __all__ = [

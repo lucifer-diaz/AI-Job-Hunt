@@ -73,8 +73,11 @@ const bar = (pct, color, cls = '') => `<div class="bar ${cls}"><i style="width:$
 const fitCls = n => n == null ? 'fit-none' : n >= 80 ? 'fit-high' : n >= 65 ? 'fit-mid' : 'fit-low';
 const fitTxt = n => n == null ? '—' : String(Math.round(n));
 const initials = s => (s || '?').split(/\s+/).filter(Boolean).slice(0, 2).map(w => w[0]).join('').toUpperCase();
-const STATUS_TONE = { discovered: 'muted', shortlisted: 'brand', maybe: 'muted', archived: 'muted', dismissed: 'bad', tailored: 'warn', pending_approval: 'warn', rejected: 'bad', approved: 'good', applied: 'good' };
-const statusPill = s => pill((s || '').replace(/_/g, ' '), STATUS_TONE[s] || 'muted');
+const STATUS_TONE = { discovered: 'muted', shortlisted: 'brand', maybe: 'muted', archived: 'muted', dismissed: 'bad', tailored: 'warn', needs_retailor: 'warn', pending_approval: 'warn', rejected: 'bad', approved: 'good', applied: 'good' };
+const STATUS_LABEL = { needs_retailor: 're-tailor' };
+const statusText = s => STATUS_LABEL[s] || (s || '').replace(/_/g, ' ');
+const statusTitle = s => statusText(s).charAt(0).toUpperCase() + statusText(s).slice(1);
+const statusPill = s => pill(STATUS_LABEL[s] || (s || '').replace(/_/g, ' '), STATUS_TONE[s] || 'muted');
 const toDate = iso => iso ? new Date(/Z|[+-]\d\d:\d\d$/.test(iso) ? iso : iso + 'Z') : null;
 const fmtDay = iso => iso ? toDate(iso).toLocaleDateString(undefined, { day: 'numeric', month: 'short' }) : '';
 const fmtDateTime = iso => iso ? toDate(iso).toLocaleString(undefined, { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) : '';
@@ -171,10 +174,11 @@ const LOADERS = {
     [D.tailorFacets] = await Promise.all([api('/api/tailor/queue?' + qs({ ...S.pf.tailor, with_facets: true })), refreshTasks()]);
     D.tailorQueue = D.tailorFacets.items;
     D.packet = null;
-    // An approved or applied packet is not in the queue but can still be opened and edited (e.g. from Approvals).
+    // A job opened from elsewhere (Discovery, Today, Approvals) or hidden by the current filter is still
+    // shown: asking for a specific job must never land on a different one.
     if (S.tailorJob && !D.tailorQueue.some(j => j.id === S.tailorJob)) {
       const p = await api(`/api/tailor/${S.tailorJob}`).catch(() => null);
-      if (p?.resume && PACKET_LOCKED.includes(p.job.status)) D.packet = p; else S.tailorJob = null;
+      if (p) D.packet = p; else S.tailorJob = null;
     }
     if (!S.tailorJob) S.tailorJob = (D.tailorQueue.find(j => j.has_resume) || D.tailorQueue[0] || {}).id || null;
     if (!D.packet && S.tailorJob) D.packet = await api(`/api/tailor/${S.tailorJob}`);
@@ -610,7 +614,7 @@ function renderTable() {
       <input class="input grow" style="min-width:180px" id="flt-q" data-filter="q" value="${attr(f.q)}" placeholder="Search title, company or location…">
       <select class="select" id="flt-min" data-filter="min_fit">${opts([[0, 'Any fit'], [50, 'Fit ≥ 50'], [70, 'Fit ≥ 70'], [80, 'Fit ≥ 80']], f.min_fit)}</select>
       <select class="select" id="flt-board" data-filter="board">${opts([['all', 'All boards'], ...j.boards.map(b => [b, b])], f.board)}</select>
-      <select class="select" id="flt-stage" data-filter="stage">${opts([['all', 'All stages'], ['unranked', 'Unranked'], ...['discovered', 'shortlisted', 'maybe', 'archived', 'dismissed', 'tailored', 'approved', 'applied'].map(s => [s, s[0].toUpperCase() + s.slice(1)])], f.stage)}</select>
+      <select class="select" id="flt-stage" data-filter="stage">${opts([['all', 'All stages'], ['unranked', 'Unranked'], ...['discovered', 'shortlisted', 'maybe', 'archived', 'dismissed', 'tailored', 'needs_retailor', 'pending_approval', 'approved', 'applied'].map(s => [s, statusTitle(s)])], f.stage)}</select>
       <select class="select" id="flt-sort" data-filter="sort">${opts([['fit', 'Sort: best fit'], ['new', 'Sort: newest'], ['company', 'Sort: company']], f.sort)}</select>
       ${btn('Reset', 'reset-filters', {}, 'sm')}
       ${S.checked.size ? '' : btn(label('rankBatch', 'Rank unranked', 'Queueing…'), 'rank-batch', {}, 'sm', isBusy('rankBatch'))}
@@ -637,7 +641,7 @@ function renderTable() {
     <div class="row top-align between gap10"><div class="grow"><div style="font-size:17px;font-weight:600">${esc(sel.title)}</div><div class="base muted mt4">${esc(sel.company)}${sel.location ? ' · ' + esc(sel.location) : ''}</div></div><div class="mono bb ${fitCls(sel.fit)}" style="font-size:24px">${fitTxt(sel.fit)}</div></div>
     <div class="row gap6 wrap" style="margin:14px 0">${statusPill(sel.status)}${pill(sel.board + ' · ' + sel.posted, 'plain', 'lg')}${pill(`${sel.matches.length} matched`, 'good', 'lg')}${pill(`${sel.gaps.length + sel.missing.length} gaps`, 'warn', 'lg')}</div>
     <div class="base pretty" style="color:var(--ink3);line-height:1.6;border-top:1px solid var(--line2);padding-top:14px">${esc(sel.summary || (sel.description || '').slice(0, 420) || 'No description captured.')}</div>
-    <div class="row gap8 mt16">${['tailored', 'approved', 'applied', 'pending_approval'].includes(sel.status) ? btn('Open packet', 'go', { screen: sel.status === 'applied' ? 'tracker' : sel.status === 'approved' ? 'approvals' : 'tailor', job: sel.id }, 'primary grow') : btn('Tailor', 'triage', { id: sel.id, action: 'shortlist', tailor: 1 }, 'primary grow')}${btn('Full description', 'open-job', { id: sel.id }, 'grow')}</div>` : empty('Select a job', 'Pick a row to see its details.')}
+    <div class="row gap8 mt16">${['tailored', 'needs_retailor', 'approved', 'applied', 'pending_approval'].includes(sel.status) ? btn(sel.status === 'needs_retailor' ? 'Re-tailor' : 'Open packet', 'go', { screen: sel.status === 'applied' ? 'tracker' : sel.status === 'approved' ? 'approvals' : 'tailor', job: sel.id }, 'primary grow') : btn('Tailor', 'triage', { id: sel.id, action: 'shortlist', tailor: 1 }, 'primary grow')}${btn('Full description', 'open-job', { id: sel.id }, 'grow')}</div>` : empty('Select a job', 'Pick a row to see its details.')}
   </section></div>`;
 }
 function renderSetup() {
@@ -726,7 +730,7 @@ function renderSetup() {
 
 /* ───────────── packet filters (Tailor, Approvals) ───────────── */
 const PF_STATUS = {
-  tailor: [['all', 'All packets'], ['not_tailored', 'Not tailored'], ['has_packet', 'Has packet'], ['sent_back', 'Sent back'], ['untailored', 'Master resume only']],
+  tailor: [['all', 'All packets'], ['not_tailored', 'Not tailored'], ['has_packet', 'Has packet'], ['needs_retailor', 'Needs re-tailoring'], ['sent_back', 'Sent back'], ['untailored', 'Master resume only']],
   approvals: [['all', 'All statuses'], ['waiting', 'Waiting'], ['sent_back', 'Sent back'], ['approved', 'Approved']],
 };
 const PF_SORT = {
@@ -802,8 +806,9 @@ function renderTaskStack() {
 
 function renderBulkTailor(queue) {
   const selected = queue.filter(j => S.tailorChecked.has(j.id));
-  const eligible = selected.filter(j => !activeTask(j.id) && (S.tailorRegenerate || !j.has_resume)).length;
-  const untailored = queue.filter(j => !j.has_resume);
+  const needsWork = j => !j.has_resume || j.status === 'needs_retailor';
+  const eligible = selected.filter(j => !activeTask(j.id) && (S.tailorRegenerate || needsWork(j))).length;
+  const untailored = queue.filter(needsWork);
   const allOn = queue.every(j => S.tailorChecked.has(j.id));
   const allToggle = `<input type="checkbox" data-act="tailor-select" data-which="${allOn ? 'none' : 'all'}" ${allOn ? 'checked' : ''} aria-label="Select all jobs">`;
   const head = `<div class="lrow caps" style="gap:12px;padding-top:9px;padding-bottom:9px;background:#fafbfe;font-size:10.5px;letter-spacing:.06em">
@@ -813,7 +818,9 @@ function renderBulkTailor(queue) {
       <span class="none" style="width:210px;text-align:right">STATUS</span></div>`;
   const rows = queue.map(j => {
     const task = activeTask(j.id);
+    const retailor = j.status === 'needs_retailor';
     const status = task ? taskPill(task)
+      : retailor ? `<span title="${attr((j.review_reasons || []).join(' · ') || 'Review sent this packet back to be tailored again')}">${pill('re-tailor', 'warn')}</span>`
       : j.has_resume ? pill(j.status === 'pending_approval' ? 'sent back' : 'has packet', 'muted') : pill('not tailored', 'warn');
     return `<div class="lrow click ${task?.status === 'running' ? 'sel' : ''}" data-act="tailor-check" data-id="${j.id}" style="gap:12px">
       <input type="checkbox" data-act="tailor-check" data-id="${j.id}" ${S.tailorChecked.has(j.id) ? 'checked' : ''} aria-label="Select ${attr(j.title)}">
@@ -842,7 +849,7 @@ function renderBulkTailor(queue) {
 
 function renderTailor() {
   const queue = D.tailorQueue; if (!queue) return loading();
-  const outside = S.tailorMode === 'single' && D.packet && PACKET_LOCKED.includes(D.packet.job.status);
+  const outside = S.tailorMode === 'single' && D.packet && !queue.some(j => j.id === D.packet.job.id);
   if (outside) return renderTailorSingle(queue);
   if (!queue.length && D.tailorFacets.total_all) return `<div class="stack">${renderTaskStack()}${renderPacketFilters('tailor', D.tailorFacets)}${pfNoMatch('tailor')}</div>`;
   if (!queue.length) return `<section class="card">${empty('Nothing to tailor yet', 'Shortlist a job in Discovery and it will appear here.', btn('Go to triage', 'go', { screen: 'discovery', mode: 'triage' }, 'primary'))}</section>`;
@@ -853,8 +860,10 @@ function renderTailorSingle(queue) {
   const p = D.packet; if (!p) return loading();
   const job = p.job, r = p.resume;
   const locked = PACKET_LOCKED.includes(job.status);
-  const extra = locked ? `<option value="${job.id}" selected>${esc(job.company)} — ${esc(job.title)} (${esc(job.status)})</option>` : '';
-  const picker = `<select class="select" style="margin:0;width:auto;max-width:320px" id="tailor-pick" data-act-change="pick-tailor">${extra}${queue.map(j => `<option value="${j.id}" ${j.id === S.tailorJob ? 'selected' : ''}>${esc(j.company)} — ${esc(j.title)}${j.has_resume ? '' : ' (not tailored)'}</option>`).join('')}</select>`;
+  // The open job keeps its place in the picker even when the queue filter hides it.
+  const extra = queue.some(j => j.id === job.id) ? ''
+    : `<option value="${job.id}" selected>${esc(job.company)} — ${esc(job.title)} (${esc(statusText(job.status))})</option>`;
+  const picker = `<select class="select" style="margin:0;width:auto;max-width:320px" id="tailor-pick" data-act-change="pick-tailor">${extra}${queue.map(j => `<option value="${j.id}" ${j.id === S.tailorJob ? 'selected' : ''}>${esc(j.company)} — ${esc(j.title)}${j.status === 'needs_retailor' ? ' (re-tailor)' : j.has_resume ? '' : ' (not tailored)'}</option>`).join('')}</select>`;
   const task = activeTask(job.id), working = !!task || isBusy('queue' + job.id);
   const generating = working && task?.mode !== 'skip', skipping = task?.mode === 'skip';
   const stack = renderTaskStack() + renderPacketFilters('tailor', D.tailorFacets) + (locked ? `<section class="banner ${job.status === 'applied' ? '' : 'warn'} row wrap gap10" style="margin:0">
@@ -1117,7 +1126,7 @@ function renderJobModal() {
           : `<div class="box warn"><div class="small b" style="color:var(--warn-deep)">${esc(g.gap)}</div><div class="small mt4" style="color:var(--warn-deep);line-height:1.5">No verified evidence. Add a claim or leave it out — tailoring never invents experience.</div>${btn('Add evidence', 'add-evidence-for', { gap: g.gap }, 'sm mt8')}</div>`).join('') : '<div class="small muted">No gaps flagged.</div>'}</div></section>
         <section class="card pad18"><div class="card-title sm mb10">Move this job</div><div class="row gap6 wrap">${actionable
           ? `${btn('Shortlist', 'modal-triage', { id: j.id, action: 'shortlist' }, 'sm soft')}${btn('Maybe later', 'modal-triage', { id: j.id, action: 'maybe' }, 'sm')}${btn('Dismiss', 'modal-triage', { id: j.id, action: 'dismiss' }, 'sm danger')}`
-          : `<span class="small muted">This job is ${esc(j.status.replace('_', ' '))} — manage it from ${j.status === 'applied' ? 'the Tracker' : 'Approvals'}.</span>`}</div></section>
+          : `<span class="small muted">This job is ${esc(statusText(j.status))} — manage it from ${j.status === 'applied' ? 'the Tracker' : ['tailored', 'needs_retailor'].includes(j.status) ? 'Tailor' : 'Approvals'}.</span>`}</div></section>
       </div></div></div></div>`;
 }
 function renderPalette() {
@@ -1537,12 +1546,12 @@ const A = {
   },
   'tailor-select': el => {
     const queue = D.tailorQueue || [], which = el.dataset.which;
-    S.tailorChecked = new Set(which === 'all' ? queue.map(j => j.id) : which === 'untailored' ? queue.filter(j => !j.has_resume).map(j => j.id) : []);
+    S.tailorChecked = new Set(which === 'all' ? queue.map(j => j.id) : which === 'untailored' ? queue.filter(j => !j.has_resume || j.status === 'needs_retailor').map(j => j.id) : []);
     render();
   },
   'tailor-regenerate': (el, e) => { e.stopPropagation(); S.tailorRegenerate = !S.tailorRegenerate; render(); },
   'bulk-tailor': el => {
-    const ids = (D.tailorQueue || []).filter(j => S.tailorChecked.has(j.id) && !activeTask(j.id) && (S.tailorRegenerate || !j.has_resume)).map(j => j.id);
+    const ids = (D.tailorQueue || []).filter(j => S.tailorChecked.has(j.id) && !activeTask(j.id) && (S.tailorRegenerate || !j.has_resume || j.status === 'needs_retailor')).map(j => j.id);
     return queueTailoring(ids, el.dataset.mode, S.tailorRegenerate, 'bulkTailor', () => ids.forEach(id => S.tailorChecked.delete(id)));
   },
   'skip-tailor': el => queueTailoring([Number(el.dataset.id)], 'skip', true, 'queue' + el.dataset.id),
