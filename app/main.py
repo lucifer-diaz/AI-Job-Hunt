@@ -43,6 +43,7 @@ from app.models import (
 from app.scheduler import build_scheduler
 from app.scheduler_hooks import run_soon
 from app.schemas import (
+    McpTokenIn,
     ApifySearchIn,
     ApiKeysIn,
     ApplicationUpdateIn,
@@ -59,7 +60,7 @@ from app.schemas import (
     TailorTasksIn,
 )
 from app.security import SecretsUnavailable
-from app.services import ranker, resume_verification, tailor_tasks
+from app.services import mcp_tokens, ranker, resume_verification, tailor_tasks
 from app.services.ai_config import PROVIDERS as AI_PROVIDERS
 from app.services.ai_config import STAGES as AI_STAGES
 from app.services.ai_config import env_defaults as ai_env_defaults
@@ -74,7 +75,14 @@ from app.services.sources import (
     start_apify_search,
     upsert_job,
 )
-from app.services.user_settings import key_status, lock_settings_row, set_user_keys, settings_for
+from app.services.user_settings import (
+    EXECUTION_MODES,
+    execution_mode_for,
+    key_status,
+    lock_settings_row,
+    set_user_keys,
+    settings_for,
+)
 from app.services.workflow import (
     SKIP_TAILORING_STATUSES,
     approve_job,
@@ -174,7 +182,7 @@ def job_dict(j: Job) -> dict:
 def _asset_version() -> str:
     # Cache-bust static assets whenever they change, not only on version bumps.
     static = Path(__file__).parent / "static"
-    return f"{app.version}-{max(int((static / name).stat().st_mtime) for name in ('app.js', 'app.css', 'settings.js'))}"
+    return f"{app.version}-{max(int((static / name).stat().st_mtime) for name in ('app.js', 'app.css', 'settings.js', 'knowledge.js'))}"
 
 
 @app.get("/health")
@@ -259,6 +267,7 @@ def settings_get(db: Session = Depends(get_user_db)):
     effective = resolve_ai_config(settings, overrides)
     return {"llm_provider": effective["llm_provider"], "model": effective["model"],
             "application_mode": value.application_mode, "min_review_score": value.min_review_score,
+            "execution_mode": execution_mode_for(db),
             "configured": {**configured, "mock": True}, "keys": keys,
             "secret_storage": bool(settings.secret_key),
             # Raw saved values (blank = inherit) plus the server defaults, for the editor.
@@ -275,14 +284,17 @@ def settings_put(payload: SettingsIn, db: Session = Depends(get_user_db)):
         raise HTTPException(422, "Unsupported LLM provider")
     if payload.application_mode not in {"manual_approval", "automatic"}:
         raise HTTPException(422, "Unsupported application mode")
+    if payload.execution_mode is not None and payload.execution_mode not in EXECUTION_MODES:
+        raise HTTPException(422, "Unsupported execution mode")
     unknown = set(payload.stage_models) - {stage for stage, _ in AI_STAGES}
     if unknown:
         raise HTTPException(422, f"Unknown stage(s): {', '.join(sorted(unknown))}")
     value = settings_for(db)
+    execution_mode = payload.execution_mode or execution_mode_for(db)
     ai = {"llm_provider": provider, "model": payload.model.strip(),
           "stage_models": {k: v.strip()[:300] for k, v in payload.stage_models.items() if v.strip()},
           "require_free": payload.require_free}
-    value.preferences = {**(value.preferences or {}), "ai": ai}
+    value.preferences = {**(value.preferences or {}), "ai": ai, "execution_mode": execution_mode}
     effective = resolve_ai_config(settings, ai)
     value.llm_provider, value.model = effective["llm_provider"], effective["model"][:300]
     value.application_mode, value.min_review_score = payload.application_mode, payload.min_review_score
@@ -309,8 +321,29 @@ def settings_patch(payload: SettingsPatch, db: Session = Depends(get_user_db)):
     ai = dict((row.preferences or {}).get("ai") or {})
     stages = {**ai.get("stage_models", {}), **changes.pop("stage_models", {})}
     current = {**ai, "stage_models": stages, "application_mode": row.application_mode,
-               "min_review_score": row.min_review_score, **changes}
+               "min_review_score": row.min_review_score, "execution_mode": execution_mode_for(db), **changes}
     return settings_put(SettingsIn(**current), db)
+
+
+# ───────────── Claude Desktop MCP tokens ─────────────
+
+@app.get("/api/settings/mcp-tokens")
+def mcp_tokens_list(db: Session = Depends(get_user_db)):
+    return {"tokens": mcp_tokens.list_tokens(db)}
+
+
+@app.post("/api/settings/mcp-tokens")
+def mcp_tokens_create(payload: McpTokenIn, db: Session = Depends(get_user_db)):
+    """Create a token for the local MCP server. The plaintext is returned only in this response."""
+    row, token = mcp_tokens.create_token(db, payload.name)
+    return {**mcp_tokens.token_dict(row), "token": token}
+
+
+@app.delete("/api/settings/mcp-tokens/{token_id}")
+def mcp_tokens_revoke(token_id: int, db: Session = Depends(get_user_db)):
+    if not mcp_tokens.revoke_token(db, token_id):
+        raise HTTPException(404, "Token not found")
+    return {"revoked": True}
 
 
 # ───────────── jobs ─────────────

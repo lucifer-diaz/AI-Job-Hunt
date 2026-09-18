@@ -3,8 +3,8 @@
 Existing jobs keep their raw description untouched. They start at status RAW; the scheduler parses them in
 batches (app.services.job_description), so nothing blocks access to a job while it waits.
 
-Revision ID: 0013
-Revises: 0012
+Revision ID: 0015
+Revises: 0014
 Create Date: 2026-09-18 10:00:00
 """
 from collections.abc import Sequence
@@ -12,8 +12,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = '0013'
-down_revision: str | None = '0012'
+revision: str = '0015'
+down_revision: str | None = '0014'
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

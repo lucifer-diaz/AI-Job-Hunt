@@ -14,7 +14,7 @@ from sqlalchemy import desc, select
 from app.db import SessionLocal
 from app.models import Application, Evidence, FollowUp, Job, ResumeVariant
 from app.services.contacts import recruiters_of
-from app.services.workflow import build_resume_markdown, get_profile
+from app.services.workflow import get_profile, persist_tailored_resume
 from app.settings import get_settings
 
 
@@ -117,21 +117,12 @@ def save_tailored_resume(job_id: int, summary: str, skills: list[str],
             unknown = sorted(set(selected_evidence_ids) - valid_ids)
             if unknown:
                 return _failure(f"Unverified or unknown evidence IDs: {unknown}")
-            profile = get_profile(db)
             content = {"summary": str(summary), "skills": skills,
                        "experience_bullets": experience_bullets,
                        "selected_evidence_ids": selected_evidence_ids,
-                       "cover_letter": str(cover_letter)}
-            markdown = build_resume_markdown(profile, content)
-            version = (db.scalar(select(ResumeVariant.version).where(
-                ResumeVariant.job_id == job.id).order_by(desc(ResumeVariant.version)).limit(1)) or 0) + 1
-            resume = ResumeVariant(job_id=job.id, version=version, content=content,
-                                   markdown=markdown, cover_letter=str(cover_letter))
-            db.add(resume)
-            job.status = "tailored"
-            db.commit()
-            db.refresh(resume)
-            return {"ok": True, "resume_id": resume.id, "job_id": job.id, "version": version}
+                       "cover_letter": str(cover_letter), "source": "adk_agent"}
+            resume = persist_tailored_resume(db, job, content)
+            return {"ok": True, "resume_id": resume.id, "job_id": job.id, "version": resume.version}
     except (TypeError, ValueError) as exc:
         return _failure(str(exc))
 

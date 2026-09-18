@@ -64,6 +64,15 @@ def settings_for(db: Session, user_id: int | None = None) -> AppSetting:
                           model=getattr(settings, f"{settings.llm_provider}_model", "") or "")
 
 
+# Who does the tailoring and review reasoning: the configured model API (backend workers) or Claude Desktop over MCP.
+EXECUTION_MODES = ("backend", "claude_desktop")
+
+
+def execution_mode_for(db: Session, user_id: int | None = None) -> str:
+    mode = (settings_for(db, user_id).preferences or {}).get("execution_mode")
+    return mode if mode in EXECUTION_MODES else "backend"
+
+
 def ai_overrides(db: Session, user_id: int | None = None) -> dict[str, Any]:
     return dict((settings_for(db, user_id).preferences or {}).get("ai") or {})
 

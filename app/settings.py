@@ -134,6 +134,11 @@ class Settings(BaseSettings):
     tailor_worker_enabled: bool = True
     tailor_concurrency: int = 2
     tailor_lease_seconds: int = 900
+    # Claude Desktop MCP server (app.mcp): the most jobs one context request or bulk save may cover.
+    mcp_bulk_tailor_limit: int = 10
+    mcp_bulk_review_limit: int = 20
+    # The token `python -m app.mcp` authenticates with. The process environment wins over .env.
+    jobhunt_mcp_token: str | None = None
     # Required header value (X-Admin-Token) for POST /api/admin/scheduler/{job}/run. Unset disables the triggers.
     admin_token: str | None = None
 

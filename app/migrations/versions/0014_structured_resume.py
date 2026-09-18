@@ -3,8 +3,8 @@
 Existing uploaded resumes and master resume text become resume versions. Their structured data is left empty
 (the application parses it on first use) and nothing is marked verified: verification is always explicit.
 
-Revision ID: 0012
-Revises: 0011
+Revision ID: 0014
+Revises: 0013
 Create Date: 2026-09-17 18:00:00
 """
 import hashlib
@@ -14,8 +14,8 @@ from datetime import UTC, datetime
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = '0012'
-down_revision: str | None = '0011'
+revision: str = '0014'
+down_revision: str | None = '0013'
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

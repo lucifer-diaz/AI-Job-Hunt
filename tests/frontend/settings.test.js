@@ -6,7 +6,6 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 // Execute the production scripts together, omitting only automatic network boot.
 const settingsSource = readFileSync('app/static/settings.js', 'utf8');
 const resumeDataSource = readFileSync('app/static/resume_data.js', 'utf8');
-const monitoringSource = readFileSync('app/static/monitoring.js', 'utf8');
 const jobDataSource = readFileSync('app/static/job_data.js', 'utf8');
 const appSource = readFileSync('app/static/app.js', 'utf8').split('/* ───────────── boot ───────────── */')[0];
 const names = ['S', 'D', 'A', 'setF', 'render', 'readHash', 'setHash', 'settingsNavigate', 'settingsChanges', 'settingsPayload', 'settingsDirty', 'settingsCanLeave', 'settingsSave', 'settingsUploadResume', 'settingsUseResume', 'profileCompleteness', 'addTags', 'commitTag', 'SETTING_ERRORS', 'SETTINGS_SECTIONS', 'SETTINGS_ACTIONS', 'RD', 'resumeDataDirty', 'rdReset', 'JD', 'renderJobStructured', 'jobDataInput'];
@@ -33,10 +32,11 @@ beforeEach(() => {
   // Each isolated iframe-like jsdom document needs the same production event registration just once.
   if (!ui) {
     context = createContext({ document, window, location, history, navigator, URLSearchParams, FormData, File, setTimeout, clearTimeout, setInterval, clearInterval, console });
+    runInContext(readFileSync('app/static/monitoring.js', 'utf8'), context, { filename: 'monitoring.js' });
     runInContext(settingsSource, context, { filename: resolve('app/static/settings.js') });
     runInContext(resumeDataSource, context, { filename: resolve('app/static/resume_data.js') });
     runInContext(jobDataSource, context, { filename: resolve('app/static/job_data.js') });
-    runInContext(monitoringSource, context, { filename: resolve('app/static/monitoring.js') });
+    runInContext(readFileSync('app/static/knowledge.js', 'utf8'), context, { filename: 'knowledge.js' });
     runInContext(appSource, context, { filename: resolve('app/static/app.js') });
     ui = runInContext(`({${names.join(',')}})`, context);
   }

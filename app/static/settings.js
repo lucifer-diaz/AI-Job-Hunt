@@ -76,7 +76,7 @@ function settingsBaseline(form) {
   if (form === 'resumes') return { master_resume: p.master_resume || '' };
   if (form === 'preferences') return { ...Object.fromEntries(PREFERENCE_TOP.map(k => [k, p[k] ?? (k === 'target_roles' || k === 'preferred_locations' ? [] : '')])), ...Object.fromEntries(PREFERENCE_NESTED.map(k => [k, sp[k] ?? (k.startsWith('open_') ? false : ['total_experience', 'notice_period'].includes(k) ? '' : [])])) };
   if (form === 'ai') return { llm_provider: ai.llm_provider || '', model: ai.model || '', require_free: ai.require_free == null ? '' : String(ai.require_free), ...Object.fromEntries(['rank', 'tailor', 'review', 'followup'].map(k => [`stage_${k}`, ai.stage_models?.[k] || ''])) };
-  if (form === 'workflow') return { application_mode: st.application_mode, min_review_score: st.min_review_score, weekly_target: D.prefs?.weekly_target, followup_days: D.prefs?.followup_days };
+  if (form === 'workflow') return { application_mode: st.application_mode, min_review_score: st.min_review_score, execution_mode: st.execution_mode || 'backend', weekly_target: D.prefs?.weekly_target, followup_days: D.prefs?.followup_days };
   return {};
 }
 function sameSetting(a, b) {
@@ -209,8 +209,9 @@ function renderAISettings() {
     settingsGroup('Cost control', 'The free-only guard applies to OpenRouter.', `<label class="field" for="ai-require_free">Free-only guard${selectF('ai', 'require_free', base.require_free, [['', `Server default (${ai.env.require_free ? 'on' : 'off'})`], ['true', 'On — free models only'], ['false', 'Off — allow paid models']])}</label>`) + settingsFooter('ai');
 }
 function renderWorkflowSettings() {
-  const b = settingsBaseline('workflow'), mode = fv('workflow', 'application_mode', b.application_mode);
+  const b = settingsBaseline('workflow'), mode = fv('workflow', 'application_mode', b.application_mode), execution = fv('workflow', 'execution_mode', b.execution_mode);
   return settingsGroup('Approval preferences', 'You stay in control of every application.', `<div class="settings-options">${[['manual_approval', 'Review every packet', 'Approve each tailored packet before it reaches your apply kit.'], ['automatic', 'Auto-approve reviewed packets', 'Packets that meet your minimum score can skip the approval queue.']].map(([id, title, desc]) => `<label class="settings-option ${mode === id ? 'selected' : ''}"><input type="radio" name="settings-mode" data-form="workflow" data-field="application_mode" value="${id}" ${mode === id ? 'checked' : ''}><span><strong>${title}</strong><small>${desc}</small></span></label>`).join('')}</div><p class="settings-help">Submitting applications always stays your action.</p>${settingsField('workflow', 'min_review_score', 'Minimum reviewer score', 'type="number" min="0" max="100" required')}`) +
+    settingsGroup('Tailoring & review', 'Choose who does the tailoring and review reasoning.', `<div class="settings-options">${[['backend', 'Job Hunt OS workers', 'Your configured model API tailors and reviews in the background.'], ['claude_desktop', 'Claude Desktop', 'You tailor and review in bulk from Claude Desktop over MCP; the workers make no model calls for it.']].map(([id, title, desc]) => `<label class="settings-option ${execution === id ? 'selected' : ''}"><input type="radio" name="settings-execution" data-form="workflow" data-field="execution_mode" value="${id}" ${execution === id ? 'checked' : ''}><span><strong>${title}</strong><small>${desc}</small></span></label>`).join('')}</div><p class="settings-help">Every saved result is validated by Job Hunt OS in both modes. See the README section "Claude Desktop + MCP" to connect.</p>`) +
     settingsGroup('Your rhythm', 'Set realistic targets and a helpful follow-up cadence.', `<div class="settings-grid">${settingsField('workflow', 'weekly_target', 'Weekly application target', 'type="number" min="1" max="50" required')}${settingsField('workflow', 'followup_days', 'Follow-up after (days)', 'type="number" min="1" max="60" required')}</div><p class="settings-help">Follow-up drafts are never sent automatically.</p>`) + settingsFooter('workflow');
 }
 const SETTINGS_RENDERERS = { profile: renderProfileSettings, preferences: renderPreferenceSettings, resumes: renderResumeSettings, 'resume-data': () => renderResumeDataSettings(), account: renderAccountSettings, 'api-keys': renderKeySettings, ai: renderAISettings, workflow: renderWorkflowSettings };
@@ -266,7 +267,7 @@ async function settingsSave(form) {
 }
 async function saveWorkflowSettings() {
   const changes = settingsChanges('workflow');
-  const approval = Object.fromEntries(Object.entries(changes).filter(([k]) => ['application_mode', 'min_review_score'].includes(k)).map(([k, v]) => [k, k === 'min_review_score' ? Number(v) : v]));
+  const approval = Object.fromEntries(Object.entries(changes).filter(([k]) => ['application_mode', 'min_review_score', 'execution_mode'].includes(k)).map(([k, v]) => [k, k === 'min_review_score' ? Number(v) : v]));
   const cadence = Object.fromEntries(Object.entries(changes).filter(([k]) => ['weekly_target', 'followup_days'].includes(k)).map(([k, v]) => [k, Number(v)]));
   let saved = false;
   try {

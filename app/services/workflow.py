@@ -78,19 +78,7 @@ def tailor_job(db: Session, job: Job, progress: Progress = _no_progress) -> Resu
                "prompt_version": prompt.version}
     content = trusted_content(content, context)
     content["cover_letter"] = write_cover_letter(db, profile, job, llm)
-    markdown = build_resume_markdown(profile, content)
-    version = (db.scalar(select(ResumeVariant.version).where(ResumeVariant.job_id == job.id).order_by(desc(ResumeVariant.version)).limit(1)) or 0) + 1
-    resume = ResumeVariant(
-        job_id=job.id,
-        version=version,
-        content=content,
-        markdown=markdown,
-        cover_letter=content.get("cover_letter", ""),
-    )
-    db.add(resume)
-    job.status = "tailored"
-    db.commit()
-    db.refresh(resume)
+    resume = persist_tailored_resume(db, job, content)
     progress("reviewing")
     review_resume(db, resume)
     return resume
@@ -120,8 +108,28 @@ def trusted_content(content: dict, context: TaskContext) -> dict:
                         "allow_unverified_resume_facts": context.policy.get("allow_unverified_resume_facts", False)}}
 
 
+def persist_tailored_resume(db: Session, job: Job, content: dict, *, markdown: str | None = None) -> ResumeVariant:
+    """Store a new tailored version for a job. Every tailoring path (backend worker, Claude Desktop over MCP,
+    the ADK agent) saves through here. The master resume is only read, never written."""
+    version = (db.scalar(select(ResumeVariant.version).where(ResumeVariant.job_id == job.id)
+                         .order_by(desc(ResumeVariant.version)).limit(1)) or 0) + 1
+    resume = ResumeVariant(job_id=job.id, version=version, content=content,
+                           markdown=build_resume_markdown(get_profile(db), content) if markdown is None else markdown,
+                           cover_letter=content.get("cover_letter", "") or "")
+    db.add(resume)
+    job.status = "tailored"
+    db.commit()
+    db.refresh(resume)
+    return resume
+
+
+# A packet that review sent back to be tailored again. It keeps its old version until a new one is saved,
+# and is distinct from "shortlisted", which means nothing has been tailored yet.
+NEEDS_RETAILOR = "needs_retailor"
 # Jobs that are in the Tailor queue and have not been approved or submitted yet.
-SKIP_TAILORING_STATUSES = ("shortlisted", "tailored", "pending_approval")
+SKIP_TAILORING_STATUSES = ("shortlisted", NEEDS_RETAILOR, "tailored", "pending_approval")
+# Of those, the ones still waiting for a (new) tailored packet.
+AWAITING_TAILORING_STATUSES = ("shortlisted", NEEDS_RETAILOR)
 
 
 def skip_tailoring(db: Session, job: Job, progress: Progress = _no_progress) -> ResumeVariant:
@@ -130,19 +138,8 @@ def skip_tailoring(db: Session, job: Job, progress: Progress = _no_progress) -> 
     if not (profile.master_resume or "").strip():
         raise ValueError("Add a master resume in Settings before skipping tailoring")
     markdown = render_resume(parse_resume(profile.master_resume), name=profile.name, headline=profile.headline)
-    version = (db.scalar(select(ResumeVariant.version).where(ResumeVariant.job_id == job.id).order_by(desc(ResumeVariant.version)).limit(1)) or 0) + 1
-    resume = ResumeVariant(
-        job_id=job.id,
-        version=version,
-        content={"untailored": True, "summary": "", "skills": [], "experience": [], "selected_evidence_ids": [],
-                 "cover_letter": ""},
-        markdown=markdown,
-        cover_letter="",
-    )
-    db.add(resume)
-    job.status = "tailored"
-    db.commit()
-    db.refresh(resume)
+    resume = persist_tailored_resume(db, job, {"untailored": True, "summary": "", "skills": [], "experience": [],
+                                               "selected_evidence_ids": [], "cover_letter": ""}, markdown=markdown)
     progress("reviewing")
     review_resume(db, resume)
     return resume
@@ -298,13 +295,20 @@ def review_resume(db: Session, resume: ResumeVariant) -> dict:
     profile = get_profile(db)
     context = build_review_context(db, profile, job)  # verified structured truth to check the text against
     prompt = build_review_prompt(candidate_profile=profile, job=job, tailored_resume=resume.markdown, context=context)
-    result = {**llm.generate_prompt_json(prompt, LLMCall(workflow_type="job", entity_id=resume.job_id,
-                                                         context_stats=context.call_stats())),
-              "prompt_version": prompt.version}
-    resume.reviewer_score = float(result.get("score", 0))
-    resume.reviewer_notes = result
-    db.commit()
+    from app.services.review_results import normalize_backend_review
+
+    result = normalize_backend_review({**llm.generate_prompt_json(prompt, LLMCall(workflow_type="job", entity_id=resume.job_id,
+                                                                                  context_stats=context.call_stats())),
+                                       "prompt_version": prompt.version})
+    store_review(db, resume, result)
     return result
+
+
+def store_review(db: Session, resume: ResumeVariant, notes: dict) -> None:
+    """Persist a review on a tailored version. Backend and Claude Desktop reviews are stored the same way."""
+    resume.reviewer_score = float(notes.get("review_score", notes.get("score", 0)) or 0)
+    resume.reviewer_notes = notes
+    db.commit()
 
 
 def approve_job(db: Session, job: Job) -> Application:

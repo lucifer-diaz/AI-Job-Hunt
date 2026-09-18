@@ -12,7 +12,7 @@ os.environ["SCHEDULER_ENABLED"] = "false"  # tests start schedulers explicitly
 os.environ["TAILOR_WORKER_ENABLED"] = "false"  # tests run tailoring tasks with tailor_tasks.run_pending
 os.environ["SECRET_KEY"] = "test-secret-key-for-encrypting-api-keys"
 for key in ("APIFY_API_TOKEN", "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY",
-            "ADMIN_TOKEN"):
+            "ADMIN_TOKEN", "JOBHUNT_MCP_TOKEN"):
     os.environ[key] = ""
 
 import pytest  # noqa: E402

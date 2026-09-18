@@ -97,6 +97,9 @@ class SettingsIn(BaseModel):
     require_free: bool | None = None
     application_mode: str = "manual_approval"
     min_review_score: int = Field(default=70, ge=0, le=100)
+    # backend: the configured model API tailors and reviews. claude_desktop: Claude Desktop does it over MCP.
+    # Omitted keeps the saved mode.
+    execution_mode: str | None = None
 
 
 class ProfilePatch(ProfileIn):
@@ -132,3 +135,7 @@ class KnowledgeIn(BaseModel):
     verified: bool = False
     sensitive: bool = False
     source_job_id: int | None = None
+
+
+class McpTokenIn(BaseModel):
+    name: str = Field(default="Claude Desktop", min_length=1, max_length=100)
