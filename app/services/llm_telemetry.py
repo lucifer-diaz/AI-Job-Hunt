@@ -32,7 +32,7 @@ log = logging.getLogger("jobhunt.llm_telemetry")
 
 # Prompt name (app.prompts Prompt.name) → workflow stage shown on the Monitoring tab.
 STAGE_BY_PROMPT = {
-    "ranking": "RANKER", "tailoring": "TAILOR", "review": "REVIEWER", "resume_parser": "RESUME_PARSER",
+    "ranking": "RANKER", "tailoring": "TAILOR", "cover_letter": "TAILOR", "review": "REVIEWER", "resume_parser": "RESUME_PARSER",
     "evidence_extraction": "RESUME_PARSER", "application_question": "APPLICATION", "followup": "FOLLOW_UP",
     "inbox": "INBOX", "company_insights": "COMPANY_INSIGHTS", "ai_optimization": "ADVISOR",
 }
@@ -44,7 +44,7 @@ SECTION_CONTRIBUTOR = {
     "ACTIVE RESUME": "resume", "RESUME": "resume", "MASTER RESUME": "resume", "MASTER RESUME ROLES": "resume",
     "RESUME TEXT": "resume", "TAILORED RESUME": "resume", "RELEVANT EXPERIENCE": "resume", "RELEVANT SKILLS": "resume",
     "VERIFIED RESUME FACTS": "resume", "UNVERIFIED RESUME FACTS": "resume", "REJECTED RESUME FACTS": "resume",
-    "VERIFIED EVIDENCE": "evidence",
+    "VERIFIED EVIDENCE": "evidence", "KNOWN ANSWERS": "candidate_profile",
     "JOB ID": "job_description", "JOB": "job_description", "JOB POSTING": "job_description",
     "JOB DESCRIPTION": "job_description", "FIT ANALYSIS": "job_description",
     "PREVIOUS FOLLOW-UPS": "conversation", "EMAIL SENDER": "conversation", "EMAIL SUBJECT": "conversation",

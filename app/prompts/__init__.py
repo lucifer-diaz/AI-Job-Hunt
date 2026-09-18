@@ -11,6 +11,7 @@ from app.prompts.application import (
                                        build_application_question_prompt,
 )
 from app.prompts.common import Prompt
+from app.prompts.cover_letter import COVER_LETTER_PROMPT_VERSION, build_cover_letter_prompt
 from app.prompts.followup import FOLLOWUP_PROMPT_VERSION, build_followup_prompt
 from app.prompts.inbox import (
                                        INBOX_CATEGORIES,
@@ -30,6 +31,7 @@ from app.prompts.tailoring import TAILOR_PROMPT_VERSION, build_tailoring_prompt
 PROMPT_VERSIONS = {
     "ranking": RANKING_PROMPT_VERSION,
     "tailoring": TAILOR_PROMPT_VERSION,
+    "cover_letter": COVER_LETTER_PROMPT_VERSION,
     "review": REVIEW_PROMPT_VERSION,
     "followup": FOLLOWUP_PROMPT_VERSION,
     "resume_parser": RESUME_PARSER_PROMPT_VERSION,
@@ -46,6 +48,7 @@ __all__ = [
                                        "PROMPT_VERSIONS",
                                        "Prompt",
                                        "build_application_question_prompt",
+                                       "build_cover_letter_prompt",
                                        "build_evidence_extraction_prompt",
                                        "build_followup_prompt",
                                        "build_inbox_classification_prompt",

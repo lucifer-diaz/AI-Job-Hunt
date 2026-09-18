@@ -27,10 +27,10 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
-from app.models import CandidateProfile, Evidence, Job, Resume
+from app.models import CandidateProfile, Evidence, Job, KnowledgeAnswer, Resume
 from app.prompts.common import job_facts, profile_facts
 from app.services import resume_verification as rv
 from app.services import structured_resume as sr
@@ -56,6 +56,11 @@ BULLETS_RECENT_ROLE = 6
 EXTRA_SKILLS = 10
 TAILOR_EVIDENCE = 20
 REVIEW_EVIDENCE = 30
+LETTER_EVIDENCE = 12
+LETTER_KNOWLEDGE = 6
+# Answers a letter may raise only because the posting does: the words that show the posting raised them.
+KNOWLEDGE_TRIGGERS = ("visa", "sponsor", "sponsorship", "authorization", "authorisation", "work permit", "relocate",
+                      "relocation", "notice", "start date", "availability", "onsite", "on-site", "hybrid", "remote")
 
 
 class UnverifiedResumeError(ValueError):
@@ -89,6 +94,8 @@ class TaskContext:
     unverified_facts: list[dict[str, Any]] = field(default_factory=list)
     rejected_facts: list[dict[str, Any]] = field(default_factory=list)
     education: list[dict[str, Any]] = field(default_factory=list)
+    # Cover letters only: the candidate's own verified answers (notice period, work authorization, relocation).
+    knowledge: list[dict[str, Any]] = field(default_factory=list)
     certifications: list[dict[str, Any]] = field(default_factory=list)
     job: dict[str, Any] = field(default_factory=dict)
     fit_analysis: dict[str, Any] | None = None
@@ -353,6 +360,52 @@ def build_review_context(db: Session, profile: CandidateProfile, job: Job) -> Ta
                                                 "dates": _dates(role), "technologies": [], "verified": True, "bullets": []})
     context.rejected_facts = [{"id": u.item_id, "section": u.section, "text": u.node.get("text") or rv._label(u)}
                               for u in sr.iter_units(data) if u.status == "REJECTED"]
+    context.resume_text = _render(context)
+    _measure(context, resume.raw_text if resume is not None else profile.master_resume or "", every, job)
+    return context
+
+
+def select_knowledge(db: Session, user_id: int, job: Job, terms: JobTerms) -> list[dict[str, Any]]:
+    """Verified, non-sensitive answers the posting actually raises or shares vocabulary with."""
+    posting = f"{job.title or ''} {job.description or ''}".lower()
+    raised = {word for word in KNOWLEDGE_TRIGGERS if word in posting}
+    rows = db.scalars(select(KnowledgeAnswer).where(KnowledgeAnswer.user_id == user_id,
+                                                    KnowledgeAnswer.verified.is_(True),
+                                                    KnowledgeAnswer.sensitive.is_(False))
+                      .order_by(desc(KnowledgeAnswer.use_count), KnowledgeAnswer.id)).all()
+    scored = []
+    for row in rows:
+        text = f"{row.question} {row.answer}"
+        if not (row.answer or "").strip():
+            continue
+        score = terms.score(text) + 3 * sum(word in text.lower() for word in raised)
+        if score:
+            scored.append((score, row))
+    chosen = sorted(scored, key=lambda pair: (-pair[0], pair[1].id))[:LETTER_KNOWLEDGE]
+    return [{"question": row.question, "answer": row.answer, "category": row.category} for _, row in chosen]
+
+
+def build_cover_letter_context(db: Session, profile: CandidateProfile, job: Job) -> TaskContext:
+    """What a letter needs: the posting and its company facts, the candidate's verified proof points relevant to
+    it, and the verified answers the posting raises. Verified facts only, like every other final application text."""
+    policy = candidate_policy(db, profile.user_id)
+    allowed = WITH_UNVERIFIED if policy["allow_unverified_resume_facts"] else VERIFIED_ONLY
+    context, data, every, resume = _base(db, profile, job, "cover_letter", allowed, LETTER_EVIDENCE)
+    if not policy["allow_unverified_resume_facts"] and not has_verified_facts(data, every):
+        raise UnverifiedResumeError(
+            "A cover letter uses verified facts only. Verify your resume in Settings → Resume Data (or allow "
+            "unverified resume facts in your candidate policy) and try again.")
+    personal = (data or {}).get("personal_information") or {}
+    context.candidate = {**context.candidate,
+                         # The letter signs off with a name: the profile's, or the one on the resume itself.
+                         "name": context.candidate.get("name") or personal.get("full_name") or "",
+                         "location": profile.location or personal.get("location") or "",
+                         "work_authorization": profile.work_authorization or ""}
+    context.job = {**context.job, "description": job.description or "",
+                   **{field: getattr(job, field) for field in ("remote_type", "job_type", "seniority", "experience")
+                      if getattr(job, field, None)}}
+    context.knowledge = select_knowledge(db, profile.user_id, job, job_terms(job))
+    context.fit_analysis = job.fit_analysis or {}
     context.resume_text = _render(context)
     _measure(context, resume.raw_text if resume is not None else profile.master_resume or "", every, job)
     return context

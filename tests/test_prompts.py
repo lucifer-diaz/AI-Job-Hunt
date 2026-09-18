@@ -9,9 +9,10 @@ from fastapi.testclient import TestClient
 
 import app.prompts as prompts
 from app.main import app
-from app.prompts import (PROMPT_VERSIONS, build_application_question_prompt, build_evidence_extraction_prompt,
-                         build_followup_prompt, build_inbox_classification_prompt, build_ranking_prompt,
-                         build_resume_parser_prompt, build_review_prompt, build_tailoring_prompt)
+from app.prompts import (PROMPT_VERSIONS, build_application_question_prompt, build_cover_letter_prompt,
+                         build_evidence_extraction_prompt, build_followup_prompt, build_inbox_classification_prompt,
+                         build_ranking_prompt, build_resume_parser_prompt, build_review_prompt,
+                         build_tailoring_prompt)
 from app.prompts.common import Prompt
 from app.services.llm import _task_from_prompt
 from app.settings import get_settings
@@ -31,6 +32,17 @@ fit_analysis = {"summary": "Strong platform fit", "strong_matches": ["LLM platfo
                 "confidence": 0.7}
 
 
+letter_context = {
+    "candidate": {"name": "Asha Rao", "headline": "Staff AI Engineer", "target_roles": ["Lead AI Engineer"]},
+    "relevant_experience": [{"job_title": "Staff AI Engineer", "company": "Acme", "dates": "2022 - Present",
+                             "bullets": [{"id": "ach_1", "text": "Cut inference cost 40%"}], "verified": True}],
+    "relevant_skills": ["Python"], "relevant_evidence": evidence,
+    "knowledge": [{"question": "Notice period?", "answer": "30 days", "category": "availability"}],
+    "job": {"title": "Lead AI Engineer", "company": "Globex", "location": "Remote", "description": job.description},
+    "policy": {"allow_unverified_resume_facts": False}, "fit_analysis": {"strong_matches": ["LLM platforms"]},
+}
+
+
 def all_prompts() -> dict[str, Prompt]:
     return {
         "ranking": build_ranking_prompt(candidate_profile=profile, resume=resume, evidence=evidence, job=job),
@@ -42,6 +54,7 @@ def all_prompts() -> dict[str, Prompt]:
                                           application={"status": "applied", "applied_at": "2026-09-10"},
                                           recruiters=[{"name": "Karan", "email": "", "phone": ""}],
                                           previous_followups=["Just checking in on my application."]),
+        "cover_letter": build_cover_letter_prompt(letter_context),
         "resume_parser": build_resume_parser_prompt(resume),
         "evidence_extraction": build_evidence_extraction_prompt(resume),
         "application_question": build_application_question_prompt(
@@ -110,6 +123,21 @@ def test_every_prompt_keeps_data_out_of_its_instructions():
     assert "SKIP_APPLICATION" in all_prompts()["application_question"].system
 
 
+def test_cover_letter_prompt_asks_for_a_first_person_letter_from_verified_facts():
+    prompt = all_prompts()["cover_letter"]
+    assert prompt.version == PROMPT_VERSIONS["cover_letter"]
+    for rule in ("first person", "Dear Hiring Team", "Sincerely", "250-300 words", "passionate about",
+                 "placeholders such as [Company]"):
+        assert rule in prompt.system, rule
+    assert "third\nperson" in prompt.system or "third person" in prompt.system
+    assert "cover_letter (string)" in prompt.system and "selected_evidence_ids" in prompt.system
+    # The letter sees the company, the posting, the verified proof points and the candidate's own answers.
+    for fact in ("Globex", "Lead AI Engineer", "Cut inference cost 40%", "Notice period?", "30 days",
+                 "Build LLM platforms"):
+        assert fact in prompt.user, fact
+    assert "Asha" not in prompt.system
+
+
 def test_resume_parser_prompt_asks_for_raw_text_and_the_structured_schema():
     import json
 
@@ -131,6 +159,7 @@ def test_resume_parser_prompt_asks_for_raw_text_and_the_structured_schema():
 
 def test_stage_routing_markers_are_preserved():
     built = all_prompts()
+    assert _task_from_prompt(built["cover_letter"].user) == "tailor"  # the letter runs on the tailoring model
     assert {name: _task_from_prompt(built[name].user) for name in ("ranking", "tailoring", "review", "followup",
                                                                    "evidence_extraction")} == {
         "ranking": "rank", "tailoring": "tailor", "review": "review", "followup": "followup",

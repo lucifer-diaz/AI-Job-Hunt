@@ -263,3 +263,64 @@ def test_prompts_are_loaded_from_the_prompts_package():
         assert (root / "app" / "prompts" / f"{module}.py").is_file()
     source = (root / "app" / "services" / "context_builder.py").read_text()
     assert "from app.prompts" in source and "SYSTEM" not in source
+
+
+# ───────────── cover letter ─────────────
+
+def add_knowledge(user_id, rows):
+    from app.models import KnowledgeAnswer
+    with session(user_id) as db:
+        for question, answer, extra in rows:
+            db.add(KnowledgeAnswer(question=question, question_key=question.lower()[:64], answer=answer, **extra))
+        db.commit()
+
+
+@pytest.mark.strict_resume_policy
+def test_cover_letter_context_holds_the_posting_company_facts_and_answers_it_raises(user):
+    job_id = add_job(user, JOB_DESCRIPTION + " You must already hold work authorization; tell us your notice period.")
+    verify("experience", "summary", "skills")
+    add_knowledge(user, [
+        ("What is your notice period?", "30 days", {"verified": True, "category": "availability"}),
+        ("Do you need visa sponsorship?", "No, I am an Indian citizen", {"verified": True, "category": "authorization"}),
+        ("What is your expected salary?", "INR 90 lakh", {"verified": True, "sensitive": True, "category": "comp"}),
+        ("Favourite editor?", "Neovim", {"verified": True, "category": "other"}),
+        ("Unverified note about Kafka", "Something unconfirmed", {"verified": False, "category": "other"}),
+    ])
+    context = build(user, cb.build_cover_letter_context, job_id)
+    questions = [k["question"] for k in context.knowledge]
+    assert "What is your notice period?" in questions and "Do you need visa sponsorship?" in questions
+    # Sensitive and unverified answers never reach a letter, and irrelevant ones are left out.
+    assert all("salary" not in q.lower() and "editor" not in q.lower() and "Unverified" not in q for q in questions)
+    assert context.job["company"] == "Globex" and context.job["description"]
+    assert bullets(context) and context.candidate["name"]
+
+    from app.prompts import build_cover_letter_prompt
+    prompt = build_cover_letter_prompt(context)
+    assert "30 days" in prompt.user and "INR 90 lakh" not in prompt.user
+    assert "Dear Hiring Team" in prompt.system and "first person" in prompt.system
+
+
+@pytest.mark.strict_resume_policy
+def test_a_cover_letter_needs_verified_facts_too(user):
+    with pytest.raises(cb.UnverifiedResumeError):
+        build(user, cb.build_cover_letter_context, add_job(user))
+
+
+def test_tailoring_writes_the_letter_from_its_own_prompt(user, monkeypatch):
+    job_id = add_job(user)
+    verify("experience")
+    seen = {}
+    from app.services.llm import LLMClient
+    real = LLMClient.generate_prompt
+
+    def spy(self, prompt, call=None):
+        seen[prompt.name] = prompt
+        return real(self, prompt, call)
+    monkeypatch.setattr(LLMClient, "generate_prompt", spy)
+    out = client.post(f"/api/jobs/{job_id}/tailor")
+    assert out.status_code == 200
+    letter = out.json()["cover_letter"]
+    assert letter.startswith("Dear Hiring Team,") and "Globex" in letter and "Sincerely," in letter
+    assert "cover_letter" in seen and seen["cover_letter"].marker == "COVER_LETTER"
+    # The resume call no longer writes a letter of its own.
+    assert "cover_letter (string)" not in seen["tailoring"].system

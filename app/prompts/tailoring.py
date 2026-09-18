@@ -48,8 +48,8 @@ TAILOR_SYSTEM = instructions(
     the same company. Keep 1-5 bullets per role, one achievement per bullet, most relevant first.
     Titles, companies, locations and dates are kept automatically; do not repeat them.
   experience_bullets (array of strings): only when MASTER RESUME ROLES is empty,
-  selected_evidence_ids (array of ints),
-  cover_letter (string).""",
+  selected_evidence_ids (array of ints).
+The cover letter is written separately: do not produce one here.""",
     "Use plain ASCII punctuation (- for dashes, x for multipliers). Keep bullets concise and ATS-friendly.",
 )
 

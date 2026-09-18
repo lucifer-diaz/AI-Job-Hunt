@@ -7,14 +7,40 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
-from app.models import Application, ApplicationEvent, CandidateProfile, Evidence, FollowUp, Job, ResumeVariant
-from app.prompts import build_followup_prompt, build_review_prompt, build_tailoring_prompt
+from app.models import (
+    Application,
+    ApplicationEvent,
+    CandidateProfile,
+    Evidence,
+    FollowUp,
+    Job,
+    ResumeVariant,
+)
+from app.prompts import (
+    build_cover_letter_prompt,
+    build_followup_prompt,
+    build_review_prompt,
+    build_tailoring_prompt,
+)
 from app.services.contacts import recruiters_of
-from app.services.context_builder import (TaskContext, build_followup_context, build_review_context,
-                                          build_tailoring_context)
+from app.services.context_builder import (
+    TaskContext,
+    build_cover_letter_context,
+    build_followup_context,
+    build_review_context,
+    build_tailoring_context,
+)
 from app.services.llm import LLMCall, LLMClient
-from app.services.resume_format import (ParsedResume, parse_resume, relevant_skills, render_legacy, render_resume,
-                                        skills_text, summary_text, to_plain)
+from app.services.resume_format import (
+    ParsedResume,
+    parse_resume,
+    relevant_skills,
+    render_legacy,
+    render_resume,
+    skills_text,
+    summary_text,
+    to_plain,
+)
 from app.services.user_settings import profile_for, settings_for
 from app.settings import get_settings
 
@@ -51,6 +77,7 @@ def tailor_job(db: Session, job: Job, progress: Progress = _no_progress) -> Resu
                                                           context_stats=context.stats.as_dict())),
                "prompt_version": prompt.version}
     content = trusted_content(content, context)
+    content["cover_letter"] = write_cover_letter(db, profile, job, llm)
     markdown = build_resume_markdown(profile, content)
     version = (db.scalar(select(ResumeVariant.version).where(ResumeVariant.job_id == job.id).order_by(desc(ResumeVariant.version)).limit(1)) or 0) + 1
     resume = ResumeVariant(
@@ -67,6 +94,16 @@ def tailor_job(db: Session, job: Job, progress: Progress = _no_progress) -> Resu
     progress("reviewing")
     review_resume(db, resume)
     return resume
+
+
+def write_cover_letter(db: Session, profile: CandidateProfile, job: Job, llm: LLMClient) -> str:
+    """A letter in the candidate's own voice, from its own prompt and context (app.prompts.cover_letter): the
+    posting and its company facts, the verified proof points that fit it, and the answers the posting raises."""
+    context = build_cover_letter_context(db, profile, job)
+    prompt = build_cover_letter_prompt(context, recruiters=recruiters_of(job.application) if job.application else [])
+    result = llm.generate_prompt_json(prompt, LLMCall(workflow_type="job", entity_id=job.id,
+                                                      context_stats=context.stats.as_dict()))
+    return to_plain(str(result.get("cover_letter") or "")).strip()
 
 
 def trusted_content(content: dict, context: TaskContext) -> dict:

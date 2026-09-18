@@ -354,6 +354,7 @@ Each prompt has:
 |---|---|---|
 | `ranking.py` | `build_ranking_prompt` | the Job Ranker (`app.services.ranker`) |
 | `tailoring.py` | `build_tailoring_prompt` | `tailor_job` |
+| `cover_letter.py` | `build_cover_letter_prompt` | `write_cover_letter`, called by `tailor_job` |
 | `review.py` | `build_review_prompt` | `review_resume` |
 | `followup.py` | `build_followup_prompt` | `draft_followup` |
 | `resume_parser.py` | `build_evidence_extraction_prompt`, `build_resume_parser_prompt` | evidence parsing; the optional AI re-parse in Settings → Resume Data (shown as a comparison, never applied automatically) |
@@ -861,6 +862,13 @@ data. It produces a comparison — *current value* vs *new parser result* — an
 master resume text in Settings also creates a version. Old versions and their original files are kept. Verified
 facts live in the Evidence Bank, so they carry over between versions.
 
+### Cover letters
+
+The letter has its own prompt and its own model call, after the resume is tailored. It is written in the first
+person from verified facts only, addressed to the company in the posting, and closes with the candidate's name.
+The knowledge base reaches the letter and never the resume rewriting, and only when the posting raises the
+subject. A letter, like a tailored resume, is blocked when nothing is verified (see the candidate policy below).
+
 ### Candidate policy
 
 | Setting | Default | Effect |
@@ -883,6 +891,9 @@ Models no longer receive the whole resume and Evidence Bank. `app/services/conte
   it was not given, are dropped.
 - `build_review_context`: the verified structured truth (all verified roles and dates, bullets, education,
   certifications), rejected facts, candidate policy — alongside the tailored resume and the job description.
+- `build_cover_letter_context`: the posting and its company facts, the verified proof points that fit it, and the
+  verified, non-sensitive knowledge answers the posting actually raises (work authorization, notice period,
+  relocation, remote working).
 - `build_followup_context`: a few verified highlights.
 
 Selection is deterministic (no extra model call): overlap with the posting's words and skills, plus themes the
