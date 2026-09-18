@@ -470,6 +470,7 @@ class JobRequirementEvidence(Base):
         CheckConstraint(f"requirement_level IN ({_values(REQUIREMENT_LEVELS)})",
                         name="ck_job_requirement_evidence_level"),
         CheckConstraint("confidence >= 0 AND confidence <= 1", name="ck_job_requirement_evidence_confidence"),
+        CheckConstraint("origin IN ('PARSER', 'USER')", name="ck_job_requirement_evidence_origin"),
         Index("ix_job_requirement_evidence_job_type", "job_id", "requirement_type"),
     )
 
@@ -486,6 +487,9 @@ class JobRequirementEvidence(Base):
     confidence: Mapped[float] = mapped_column(Float, default=0.0)
     is_explicit: Mapped[bool] = mapped_column(Boolean, default=True)
     is_derived: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Who settled this row's level: the parser, or the user (a correction or a re-parse decision). A parser never
+    # replaces a USER row.
+    origin: Mapped[str] = mapped_column(String(10), default="PARSER", server_default="PARSER")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
 

@@ -205,7 +205,8 @@ def claim_for(job_id):
         db.commit()
         assert mine.rowcount, "nothing queued for this job"
         task_id = db.scalar(select(JobDescriptionParseTask.id).where(JobDescriptionParseTask.job_id == job_id))
-        return task_id if task_id in jd.claim(db, worker_id="test-worker", limit=200) else None
+        return next((claim for claim in jd.claim(db, worker_id="test-worker", limit=200)
+                     if claim.task_id == task_id), None)
 
 
 def test_a_new_job_is_queued_once_and_parsed_by_the_worker(user):
@@ -223,9 +224,9 @@ def test_a_new_job_is_queued_once_and_parsed_by_the_worker(user):
         tasks = db.scalars(select(JobDescriptionParseTask).where(JobDescriptionParseTask.job_id == job_id)).all()
         assert len(tasks) == 1 and tasks[0].status == "PENDING"
 
-    task_id = claim_for(job_id)
-    assert task_id is not None
-    assert jd.process(SessionLocal, task_id, "test-worker") == "parsed"
+    claim = claim_for(job_id)
+    assert claim is not None
+    assert jd.process(SessionLocal, claim) == "parsed"
     with session(user) as db:
         job = db.get(Job, job_id)
         task = db.scalar(select(JobDescriptionParseTask).where(JobDescriptionParseTask.job_id == job_id))
@@ -249,8 +250,7 @@ def test_a_failing_parse_retries_and_then_gives_up_without_blocking_the_job(user
         db.commit()
     outcomes = []
     for _ in range(get_settings().jd_parse_max_attempts):
-        task_id = claim_for(job_id)
-        outcomes.append(jd.process(SessionLocal, task_id, "test-worker"))
+        outcomes.append(jd.process(SessionLocal, claim_for(job_id)))
     assert outcomes == ["retrying"] * (len(outcomes) - 1) + ["failed"]
     with session(user) as db:
         job, task = db.get(Job, job_id), db.scalar(select(JobDescriptionParseTask)
@@ -478,3 +478,256 @@ def test_an_unparsed_posting_still_sends_the_description(user):
         db.commit()
         prompt = build_ranking_prompt(candidate_profile=profile, job=job, context=context)
     assert "<untrusted_job_description>" in prompt.user and "Kafka pipelines" in prompt.user
+
+
+# ───────────── review fixes (PR #44) ─────────────
+
+def _merge_fuller_description(user_id, job_id, text):
+    """Run Hunter's merge path, which updates descriptions without going through upsert_job."""
+    from types import SimpleNamespace
+
+    from app.services import hunter
+
+    run = SimpleNamespace(actor_id="actor", external_run_id="run", id=None, search_profile_id=None)
+    ctx = SimpleNamespace(location="Singapore")
+    found = {"matched_search_role": "Lead", "source_board": "linkedin", "posted_at": None, "posted_date_raw": None,
+             "source_job_id": None, "canonical_url": None, "description": text,
+             **{field: None for field in hunter.FILLABLE}}
+    with session(user_id) as db:
+        hunter._merge(db.get(Job, job_id), run, ctx, found)
+        db.commit()
+
+
+def test_a_hunter_merge_with_a_fuller_posting_is_reparsed_and_never_read_stale(user):
+    job_id = add_job(user)
+    parse(user, job_id)
+    fuller = JD_HTML + "<p>Requirements</p><ul><li>Hands-on Rust experience is required.</li></ul>"
+    _merge_fuller_description(user, job_id, fuller)
+    with session(user) as db:
+        job = db.get(Job, job_id)
+        task = db.scalar(select(JobDescriptionParseTask).where(JobDescriptionParseTask.job_id == job_id,
+                                                               JobDescriptionParseTask.status == "PENDING"))
+        assert task is not None and task.reason == "description_changed"
+        assert not jd.is_current(job)
+        # Until the new parse lands, every task reads the posting as it is now, not the old requirements.
+        context = jc.build_ranking_job_context(db, job)
+        assert not context.structured and "Rust experience" in context.raw_description
+        assert jd.waiting_reason(db, job) == "The job description is still being parsed"
+    assert structured(job_id)["stale"] is True
+
+
+def test_a_failed_reparse_of_changed_text_falls_back_to_the_raw_posting(user, monkeypatch):
+    from app.services.llm import LLMClient, LLMTimeoutError
+
+    job_id = add_job(user)
+    parse(user, job_id)
+    _merge_fuller_description(user, job_id, JD_HTML + "<p>Rust is required.</p>")
+    monkeypatch.setattr(LLMClient, "generate_prompt_json",
+                        lambda self, prompt, call=None: (_ for _ in ()).throw(LLMTimeoutError("down")))
+    for _ in range(get_settings().jd_parse_max_attempts):
+        jd.process(SessionLocal, claim_for(job_id))
+    with session(user) as db:
+        job = db.get(Job, job_id)
+        assert job.structured_description_status == "NEEDS_REVIEW"
+        assert jd.waiting_reason(db, job) is None
+        assert "Rust is required" in jc.build_tailoring_job_context(db, job).raw_description
+
+
+def test_ranking_keeps_waiting_through_the_final_attempt(user):
+    job_id = add_job(user)
+    with session(user) as db:
+        jd.queue_parse(db, db.get(Job, job_id))
+        db.commit()
+        db.execute(JobDescriptionParseTask.__table__.update().where(JobDescriptionParseTask.job_id == job_id)
+                   .values(status="PROCESSING", attempt_count=get_settings().jd_parse_max_attempts))
+        db.commit()
+        assert jd.waiting_reason(db, db.get(Job, job_id)) == "The job description is still being parsed"
+    # A dead worker's task on its final attempt fails instead of looping, which ends the wait.
+    with SessionLocal() as db:
+        db.execute(JobDescriptionParseTask.__table__.update().where(JobDescriptionParseTask.job_id == job_id)
+                   .values(lock_expires_at=jd.utcnow().replace(year=2000)))
+        db.commit()
+        jd.recover_expired(db)
+    with session(user) as db:
+        task = db.scalar(select(JobDescriptionParseTask).where(JobDescriptionParseTask.job_id == job_id))
+        assert task.status == "FAILED" and jd.waiting_reason(db, db.get(Job, job_id)) is None
+
+
+def test_a_worker_that_lost_its_lease_cannot_write(user):
+    job_id = add_job(user)
+    with session(user) as db:
+        jd.queue_parse(db, db.get(Job, job_id))
+        db.commit()
+    first = claim_for(job_id)
+    with SessionLocal() as db:  # the lease expires and another worker takes the task over
+        db.execute(JobDescriptionParseTask.__table__.update().where(JobDescriptionParseTask.id == first.task_id)
+                   .values(status="PENDING", lock_token=None))
+        db.commit()
+    second = claim_for(job_id)
+    assert first.lock_token != second.lock_token
+    assert jd.process(SessionLocal, first) == "lost"
+    with session(user) as db:
+        assert db.get(Job, job_id).structured_description is None, "the stale worker wrote nothing"
+    assert jd.process(SessionLocal, second) == "parsed"
+
+
+def test_a_missing_ai_key_waits_without_using_attempts(user, monkeypatch):
+    from app.services import user_settings
+
+    monkeypatch.setattr(user_settings, "ai_ready", lambda db, user_id: (False, "No OpenRouter API key saved"))
+    job_id = add_job(user)
+    with session(user) as db:
+        jd.queue_parse(db, db.get(Job, job_id))
+        db.commit()
+    for _ in range(get_settings().jd_parse_max_attempts + 1):
+        assert jd.process(SessionLocal, claim_for(job_id)) == "waiting"
+    with session(user) as db:
+        task = db.scalar(select(JobDescriptionParseTask).where(JobDescriptionParseTask.job_id == job_id))
+        assert task.status == "PENDING" and task.attempt_count == 0 and "API key" in task.last_error
+        assert task.error_category.value == "CONFIGURATION"
+    monkeypatch.setattr(user_settings, "ai_ready", lambda db, user_id: (True, ""))
+    assert jd.process(SessionLocal, claim_for(job_id)) == "parsed", "the backlog resumes once the key is added"
+
+
+def test_a_correction_saved_during_the_model_call_is_not_overwritten(user, monkeypatch):
+    from app.services.llm import LLMClient
+
+    job_id = add_job(user)
+    parse(user, job_id)
+    with session(user) as db:
+        jd.queue_parse(db, db.get(Job, job_id), reason="user_request")
+        db.commit()
+    real = LLMClient.generate_prompt_json
+
+    def slow_model(self, prompt, call=None):
+        out = real(self, prompt, call)
+        correct(job_id, lambda data: data["job_identity"].update(seniority="Staff"))  # the user saves meanwhile
+        return out
+    monkeypatch.setattr(LLMClient, "generate_prompt_json", slow_model)
+    assert jd.process(SessionLocal, claim_for(job_id)) == "parsed"
+    data = structured(job_id)
+    assert data["structured_description"]["job_identity"]["seniority"] == "Staff"
+    assert data["status"] == "MANUALLY_CORRECTED"
+
+
+def test_explicit_requirements_must_quote_the_posting(user, monkeypatch):
+    from app.services.llm import LLMClient
+
+    monkeypatch.setattr(LLMClient, "generate_prompt_json", lambda self, prompt, call=None: {
+        "structured_description": {"compensation": {"min": 250000, "max": 300000, "currency": "USD",
+                                                    "source_text": "Pay is $250k-$300k."}},
+        "requirements": [
+            {"type": "SKILL", "normalized_value": "Python", "requirement_level": "REQUIRED",
+             "source_text": "Strong experience with Python is required.", "confidence": 0.95, "is_explicit": True},
+            {"type": "SKILL", "normalized_value": "Go", "requirement_level": "REQUIRED",
+             "source_text": "Go is mandatory for this role.", "confidence": 0.95, "is_explicit": True}]})
+    job_id = add_job(user, description=JD_HTML.replace("<p>Salary: $180,000 - $220,000 per year.</p>", ""),
+                     salary_min=90000, salary_max=120000, salary_currency="SGD", salary_interval="year")
+    data = parse(user, job_id)
+    rows = {item["value"]: item for item in requirements(job_id, include_derived=True)}
+    assert rows["Python"]["derived"] is False and rows["Python"]["source_text"]
+    # A quote that is not in the posting is not the employer's word: it is kept only as a marked inference.
+    assert rows["Go"]["derived"] is True and rows["Go"]["source_text"] == "" and rows["Go"]["confidence"] <= 0.5
+    assert "Go" not in {item["value"] for item in requirements(job_id)}
+    # Salary without a sentence from the posting is dropped; the board's figure is used and labelled as such.
+    assert data["compensation"]["min"] == 90000 and data["compensation"]["source"] == "job_board"
+
+
+def test_the_parser_never_sees_board_salary_or_experience():
+    from app.prompts.job_description_parser import build_job_description_parser_prompt
+
+    class BoardJob:
+        id, title, company, location = 1, "Data Platform Lead", "Globex", "Singapore"
+        remote_type, job_type, seniority, experience = "remote", "full-time", "lead", "10+ years"
+        salary_min, salary_max, salary_currency, salary_interval = 90000, 120000, "SGD", "year"
+
+    prompt = build_job_description_parser_prompt(BoardJob(), "Strong Python experience is required.")
+    posting = prompt.user.split("JOB POSTING:\n", 1)[1].split("\n", 1)[0]
+    assert "Globex" in posting
+    for leaked in ("90000", "SGD", "10+ years", "salary", "experience"):
+        assert leaked not in posting, leaked
+
+
+def test_corrections_reach_the_requirement_rows_workflows_read(user):
+    job_id = add_job(user)
+    parse(user, job_id)
+    kubernetes = "Familiarity with Kubernetes is a plus."
+    python = "Strong experience with Python is required."
+
+    def change(data):
+        data["preferred_skills"].remove(kubernetes)
+        data["required_skills"].append(kubernetes)       # moved: the user says it is required
+        data["required_skills"].remove(python)           # removed: not a requirement after all
+        data["required_skills"].append("Terraform")      # added: not in the posting
+    correct(job_id, change)
+    rows = {item["value"]: item for item in requirements(job_id)}
+    assert rows[kubernetes]["level"] == "REQUIRED" and rows[kubernetes]["origin"] == "USER"
+    assert rows[python]["level"] == "INFORMATIONAL" and rows[python]["source_text"] == python  # quote kept
+    assert rows["Terraform"]["level"] == "REQUIRED" and rows["Terraform"]["origin"] == "USER"
+    assert rows["Terraform"]["source_text"] == "" and rows["Terraform"]["derived"] is False
+    with session(user) as db:
+        ranking = jc.build_ranking_job_context(db, db.get(Job, job_id))
+    required = {item["value"] for item in ranking.required}
+    assert kubernetes in required and "Terraform" in required and python not in required
+
+
+def test_resolving_a_reparse_only_applies_the_accepted_values(user, monkeypatch):
+    job_id = add_job(user)
+    parse(user, job_id)
+    correct(job_id, lambda data: data["job_identity"].update(seniority="Staff"))
+    before = {(item["value"], item["level"]) for item in requirements(job_id)}
+
+    # The next parse differs in the title and adds a requirement that never shows up as a comparison choice.
+    from app.services.llm import LLMClient
+    real = LLMClient.generate_prompt_json
+
+    def changed(self, prompt, call=None):
+        out = real(self, prompt, call)
+        out["structured_description"]["job_identity"]["title"] = "Principal Data Engineer"
+        out["requirements"].append({"type": "SKILL", "normalized_value": "Strong experience with Python is required.",
+                                    "requirement_level": "PREFERRED", "source_text": "Strong experience with Python "
+                                    "is required.", "confidence": 0.9, "is_explicit": True})
+        return out
+    monkeypatch.setattr(LLMClient, "generate_prompt_json", changed)
+    client.post(f"/api/jobs/{job_id}/structured-description/reparse")
+    title = next(c for c in structured(job_id)["candidate"]["changes"] if c["path"] == "job_identity.title")
+    out = client.post(f"/api/jobs/{job_id}/structured-description/reparse/resolve",
+                      json={"decisions": {title["id"]: "use_new"}}).json()
+    assert out["structured_description"]["job_identity"]["title"] == "Principal Data Engineer"
+    assert {(item["value"], item["level"]) for item in requirements(job_id)} == before, \
+        "accepting a title must not replace the requirement rows"
+
+
+def test_selected_tokens_do_not_count_an_unsent_posting(user):
+    import io
+
+    from app.services import context_builder as cb
+    from app.services.user_settings import profile_for
+
+    client.post("/api/profile/resume", files={"file": ("r.txt", io.BytesIO(
+        b"# Jane\n\n## Skills\n- Languages: Python\n\n## Experience\n### Lead | Zendrive | Remote | Jun 2024 - Oct 2025\n"
+        b"- Ran Kafka pipelines\n"), "text/plain")})
+    job_id = add_job(user, description=JD_HTML + "<p>" + "Benefits and perks paragraph. " * 400 + "</p>")
+    with session(user) as db:
+        raw = cb.build_ranking_context(db, profile_for(db), db.get(Job, job_id)).stats.selected_context_tokens
+        db.commit()
+    parse(user, job_id)
+    with session(user) as db:
+        context = cb.build_ranking_context(db, profile_for(db), db.get(Job, job_id))
+        db.commit()
+    assert context.stats.selected_context_tokens < raw - 1000, "the unsent advert is no longer counted as selected"
+    assert context.job_stats.raw_job_tokens > context.job_stats.selected_job_context_tokens
+
+
+def test_long_requirement_sections_stay_valid_json():
+    import json
+
+    from app.prompts.common import job_sections
+
+    context = {"job_context": {"structured": True, "required": [
+        {"id": f"req_{i}", "value": f"Requirement {i} " + "x" * 300, "level": "REQUIRED",
+         "source_text": "y" * 600} for i in range(200)]}}
+    section, = job_sections(context, with_source=True)
+    body = section.split("JOB REQUIREMENTS:\n", 1)[1]
+    parsed = json.loads(body)  # would raise on a string cut at an arbitrary character
+    assert len(body) <= 24000 and 0 < len(parsed["required"]) < 200

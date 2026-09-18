@@ -51,8 +51,45 @@ def instructions(*parts: str) -> str:
 # ───────────── data sections ─────────────
 
 def to_json(value: Any, limit: int | None = None) -> str:
+    """JSON for a prompt section. With a `limit`, the value is trimmed until it fits and the result is still valid
+    JSON: the longest lists lose their last items first, then the longest strings are shortened. It is never cut
+    at an arbitrary character, which would hand the model broken JSON."""
     text = json.dumps(value, ensure_ascii=False, default=str)
-    return text[:limit] if limit else text
+    if not limit or len(text) <= limit:
+        return text
+    return json.dumps(_fit(json.loads(text), limit), ensure_ascii=False)
+
+
+def _containers(value: Any) -> list[Any]:
+    found, stack = [], [value]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            found.append(node)
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            found.append(node)
+            stack.extend(node)
+    return found
+
+
+def _fit(value: Any, limit: int) -> Any:
+    def size(node: Any) -> int:
+        return len(json.dumps(node, ensure_ascii=False))
+
+    while size(value) > limit:
+        lists = [node for node in _containers(value) if isinstance(node, list) and node]
+        if lists:
+            longest = max(lists, key=size)
+            del longest[-max(1, len(longest) // 10):]  # the tail goes first, as it is the least relevant
+            continue
+        strings = [(node, key) for node in _containers(value) if isinstance(node, dict)
+                   for key, item in node.items() if isinstance(item, str) and len(item) > 40]
+        if not strings:
+            return value if size(value) <= limit else ([] if isinstance(value, list) else {})
+        node, key = max(strings, key=lambda pair: len(pair[0][pair[1]]))
+        node[key] = node[key][: len(node[key]) // 2] + "..."
+    return value
 
 
 def section(label: str, body: str) -> str:

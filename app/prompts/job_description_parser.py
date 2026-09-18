@@ -108,10 +108,12 @@ is_explicit false). Do not invent an interview process, interview questions or h
 
 
 def build_job_description_parser_prompt(job: Any, description: str, sections: list[str] | None = None) -> Prompt:
-    """Parse one posting. `description` is the cleaned text; board metadata is passed as separate, trusted facts."""
-    facts = {field: getattr(job, field, None) for field in
-             ("title", "company", "location", "remote_type", "job_type", "seniority", "experience", "salary_min",
-              "salary_max", "salary_currency", "salary_interval")}
+    """Parse one posting. `description` is the cleaned text.
+
+    Only the job's identity is passed beside it. Salary, experience, seniority and similar fields the job board
+    reported are deliberately left out: the model could copy them back as if the employer had written them. They
+    are filled in afterwards, marked as board data (app.services.job_description.with_board_facts)."""
+    facts = {field: getattr(job, field, None) for field in ("title", "company", "location")}
     user = user_message(
         JOB_DESCRIPTION_PARSER_MARKER,
         section("JOB POSTING", to_json({k: v for k, v in facts.items() if v not in (None, "", [])})),

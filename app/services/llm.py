@@ -428,8 +428,7 @@ class LLMClient:
             facts = json.loads(re.search(r"^JOB POSTING:\n(.*)$", user, re.MULTILINE).group(1))
             text = user.split("<untrusted_job_description>", 1)[-1].rsplit("</untrusted_job_description>", 1)[0]
             job = SimpleNamespace(**{field: facts.get(field) for field in
-                                     ("title", "company", "location", "remote_type", "job_type", "seniority",
-                                      "salary_min", "salary_max", "salary_currency", "salary_interval")},
+                                     ("title", "company", "location", "remote_type", "job_type", "seniority")},
                                   source_board=None, source="mock")
             return deterministic_parse(job, text.strip())
         if "COVER_LETTER" in user.split("\n", 1)[0]:

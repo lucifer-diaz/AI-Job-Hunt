@@ -991,9 +991,14 @@ Settings are not involved: open a job and use its **Structured JD** tab. Every p
 form fields (no raw JSON). A correction moves the job to `MANUALLY_CORRECTED` and is recorded in
 `job_structured_data_changes` with the field path, old and new value, and `change_source = USER`.
 
+Corrections to the required and preferred lists reach the requirement rows that ranking, tailoring and review
+read, value by value: a skill moved between the lists changes level, a skill added gets a row (quoted from the
+posting when the posting says it), and a skill removed stops being a requirement while its quote is kept. Those rows
+are marked `origin = USER`, and a later parse never replaces them.
+
 **Re-parse** never overwrites your corrections. For a corrected job it produces a candidate version and a
 field-by-field comparison — current value against new parser result — which you resolve with *Keep* or *Use new*.
-An uncorrected job is simply parsed again.
+Only the values you accept change, requirement rows included. An uncorrected job is simply parsed again.
 
 ### Parsing as a task
 
@@ -1002,8 +1007,19 @@ A new posting (and any posting whose text grows) is queued as a `JobDescriptionP
 active tasks, and the same text is never queued twice. Parsing failures retry with backoff and then stop at
 `FAILED`; the posting's status becomes `NEEDS_REVIEW` and the pipeline carries on with the raw description.
 
-Ranking waits for a parse only while one is queued or running and still has attempts left, so a posting that cannot
-be parsed never holds a job back. Re-ranking after a parse is off by default (`JD_RERANK_AFTER_PARSE=true` turns it
+Ranking waits for a parse while one is queued or running, and stops waiting once it completes or fails, so a
+posting that cannot be parsed never holds a job back. A posting whose text changes (Hunter merges a fuller copy, or
+an import updates it) is queued again, and until that parse lands every task reads the current raw text rather than
+requirements parsed from the old advert.
+
+A few safeguards keep the parse trustworthy:
+- the model sees only the posting and the job's title, company and location; salary, experience and seniority the
+  board reported are applied afterwards and marked `source = job_board`;
+- an "explicit" requirement whose quote is not actually in the posting is stored as a derived row with no quote,
+  and salary without a sentence from the posting is dropped;
+- the result is written against the job as it is after the model call, so a correction saved meanwhile survives,
+  and only while the worker still holds the task's lease;
+- a missing AI key hands the task back without using an attempt, so the backlog resumes when the key is added. Re-ranking after a parse is off by default (`JD_RERANK_AFTER_PARSE=true` turns it
 on), so parsing a backlog does not start a round of model calls.
 
 ### Candidate and job, side by side

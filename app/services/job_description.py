@@ -21,6 +21,7 @@ import hashlib
 import html
 import re
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -50,7 +51,7 @@ RAW, NORMALIZED, PARSED, NEEDS_REVIEW, MANUALLY_CORRECTED = ("RAW", "NORMALIZED"
                                                              "MANUALLY_CORRECTED")
 PARSER_VERSION = JOB_DESCRIPTION_PARSER_PROMPT_VERSION
 MAX_ERROR_LENGTH = 4000
-OUTCOMES = ("parsed", "retrying", "failed", "skipped", "lost")
+OUTCOMES = ("parsed", "retrying", "waiting", "failed", "skipped", "superseded", "lost")
 
 
 class ParseLost(RuntimeError):
@@ -389,24 +390,94 @@ def corrected_paths(db: Session, job: Job) -> set[str]:
     return set(rows)
 
 
+def _key(value: str) -> str:
+    return _plain(value)
+
+
 def store_requirements(db: Session, job: Job, requirements: list[RequirementIn]) -> list[JobRequirementEvidence]:
-    """Replace this job's requirement evidence with the current parse."""
+    """Replace the parser's requirement rows with this parse. Rows the user settled (origin USER) are kept, and a
+    parsed row for the same requirement never replaces them."""
+    kept = {}
     for row in db.scalars(select(JobRequirementEvidence).where(JobRequirementEvidence.job_id == job.id)).all():
-        db.delete(row)
+        if row.origin == "USER":
+            kept[_key(row.normalized_value)] = row
+        else:
+            db.delete(row)
     db.flush()
     stored = []
     for index, item in enumerate(requirements, start=1):
-        if not item.normalized_value:
+        if not item.normalized_value or _key(item.normalized_value) in kept:
             continue
         row = JobRequirementEvidence(
             user_id=job.user_id, job_id=job.id, item_id=item.id or f"req_{index:03d}", requirement_type=item.type,
             normalized_value=item.normalized_value[:300], requirement_level=item.requirement_level,
             source_text=item.source_text or "", source_section=item.source_section,
             confidence=float(item.confidence), is_explicit=bool(item.is_explicit) and not item.is_derived,
-            is_derived=bool(item.is_derived), created_at=utcnow(), updated_at=utcnow())
+            is_derived=bool(item.is_derived), origin="PARSER", created_at=utcnow(), updated_at=utcnow())
         db.add(row)
         stored.append(row)
     return stored
+
+
+# The editable lists that define what a posting requires, and the level each one means.
+REQUIREMENT_LISTS = {"required_skills": "REQUIRED", "preferred_skills": "PREFERRED"}
+
+
+def _sentence_with(posting: str, value: str) -> str:
+    """The posting sentence that names `value`, if there is one: a quote for a requirement the user added."""
+    needle = _plain(value)
+    for line in (posting or "").splitlines():
+        for sentence in sentences(line):
+            if needle and needle in _plain(sentence):
+                return sentence
+    return ""
+
+
+def reconcile_requirements(db: Session, job: Job, old: dict[str, Any], new: dict[str, Any], *,
+                           candidates: list[RequirementIn] | None = None) -> int:
+    """Bring the requirement rows in line with a change to the required/preferred lists. Returns rows touched.
+
+    Only what changed is touched, value by value: a value moved between the lists changes its row's level, a value
+    added gets a row (quoted from the posting when the posting says it), and a value removed from both lists stops
+    being a requirement (INFORMATIONAL) while its quote is kept. Every touched row becomes origin USER.
+    """
+    posting = normalize_description(job.description or "")
+    rows = {_key(row.normalized_value): row for row in db.scalars(
+        select(JobRequirementEvidence).where(JobRequirementEvidence.job_id == job.id,
+                                             JobRequirementEvidence.is_derived.is_(False))).all()}
+    quotes = {_key(item.normalized_value): item for item in candidates or []}
+    before = {_key(v): level for field, level in REQUIREMENT_LISTS.items() for v in old.get(field) or []}
+    after = {}
+    shown = {}
+    for field, level in REQUIREMENT_LISTS.items():
+        for value in new.get(field) or []:
+            after.setdefault(_key(value), level)
+            shown.setdefault(_key(value), value)
+    touched = 0
+    for key, level in after.items():
+        if before.get(key) == level:
+            continue
+        row = rows.get(key)
+        if row is None:
+            item = quotes.get(key)
+            quote = item.source_text if item is not None and quoted_in(posting, item.source_text) else \
+                _sentence_with(posting, shown[key])
+            row = JobRequirementEvidence(
+                user_id=job.user_id, job_id=job.id, item_id=f"usr_{uuid.uuid4().hex[:8]}", requirement_type="SKILL",
+                normalized_value=shown[key][:300], requirement_level=level, source_text=quote,
+                source_section=item.source_section if item is not None and quote else None, confidence=1.0,
+                # The user's own statement: not the employer's words unless the posting says it, and not an inference.
+                is_explicit=bool(quote), is_derived=False, origin="USER", created_at=utcnow(), updated_at=utcnow())
+            db.add(row)
+        else:
+            row.requirement_level, row.origin, row.updated_at = level, "USER", utcnow()
+        touched += 1
+    for key in before:
+        if key not in after and (row := rows.get(key)) is not None and row.requirement_level in ("REQUIRED",
+                                                                                                  "PREFERRED"):
+            row.requirement_level, row.origin, row.updated_at = "INFORMATIONAL", "USER", utcnow()
+            touched += 1
+    return touched
 
 
 def store_parse(db: Session, job: Job, parsed: ParsedJobDescription, *, source: str = "PARSER",
@@ -433,6 +504,11 @@ def store_parse(db: Session, job: Job, parsed: ParsedJobDescription, *, source: 
     job.structured_description_hash = description_hash(job.description or "")
     job.structured_description_status = MANUALLY_CORRECTED if protected else PARSED
     store_requirements(db, job, parsed.requirements)
+    if protected & set(REQUIREMENT_LISTS):
+        # The user's required/preferred lists survive the parse; the rows must agree with them.
+        db.flush()
+        reconcile_requirements(db, job, parsed.structured_description.model_dump(), structured,
+                               candidates=parsed.requirements)
     return structured
 
 
@@ -446,18 +522,35 @@ def normalize_job(db: Session, job: Job) -> str:
     return text
 
 
+def is_current(job: Job) -> bool:
+    """True when the structured description was parsed from the description the job has now.
+
+    A posting whose text changed after it was parsed is stale: workflows use the raw text until it is parsed again.
+    """
+    return bool(job.structured_description) and \
+        job.structured_description_hash == description_hash(job.description or "")
+
+
 def parse_job_description(db: Session, job: Job, *, user_id: int | None = None) -> ParsedJobDescription:
-    """Parse one posting with the account's model. Board metadata fills what the posting does not state."""
+    """Parse one posting with the account's model. Nothing on the job is written here: the caller stores the
+    result against a fresh copy of the row, so a slow model call never writes over newer data."""
     from app.services.llm import LLMCall, LLMClient
 
-    text = normalize_job(db, job)
+    text = normalize_description(job.description or "")
     if not text.strip():
         raise ValueError("This job has no description to parse")
     prompt = build_job_description_parser_prompt(job, text, [heading for heading, _ in sections_of(text) if heading])
     raw = LLMClient.for_user(db, user_id or job.user_id).generate_prompt_json(
         prompt, LLMCall(workflow_type="job", entity_id=job.id))
-    parsed = validated(raw if isinstance(raw, dict) else {})
-    return with_board_facts(job, parsed)
+    return with_board_facts(job, ground(validated(raw if isinstance(raw, dict) else {}), text))
+
+
+def lock_job(db: Session, job_id: int) -> Job | None:
+    """The job as the database has it now, locked for the write that follows (PostgreSQL; SQLite has one writer)."""
+    query = select(Job).where(Job.id == job_id).execution_options(populate_existing=True)
+    if db.get_bind().dialect.name == "postgresql":
+        query = query.with_for_update()
+    return db.scalar(query)
 
 
 def validated(raw: dict[str, Any]) -> ParsedJobDescription:
@@ -468,6 +561,34 @@ def validated(raw: dict[str, Any]) -> ParsedJobDescription:
     body["structured_description"] = within_limits(StructuredJobDescriptionIn, body.get("structured_description") or {})
     body["requirements"] = (body.get("requirements") or [])[:200]
     return ParsedJobDescription.model_validate(body)
+
+
+def _plain(text: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"^[-*•\s]+", "", (text or "").lower())).strip(" .;:")
+
+
+def quoted_in(posting: str, quote: str) -> bool:
+    """Whether `quote` really appears in the posting (ignoring case, spacing, bullets and end punctuation)."""
+    needle = _plain(quote)
+    return bool(needle) and needle in _plain(posting)
+
+
+def ground(parsed: ParsedJobDescription, posting: str) -> ParsedJobDescription:
+    """Hold the model to the posting. An "explicit" requirement whose source_text is not actually in the posting
+    is not an employer statement: it becomes a derived row with no quote and capped confidence. Salary the model
+    reports without a sentence from the posting is dropped (the job board may fill it in, marked as such)."""
+    for item in parsed.requirements:
+        if item.is_explicit and not item.is_derived and not quoted_in(posting, item.source_text):
+            item.is_explicit, item.is_derived = False, True
+            item.source_text, item.confidence = "", min(item.confidence, 0.5)
+        if item.is_derived:
+            item.is_explicit = False
+    salary = parsed.structured_description.compensation
+    if (salary.min is not None or salary.max is not None) and not quoted_in(posting, salary.source_text or ""):
+        parsed.structured_description.compensation = CompensationIn()
+    elif salary.min is not None or salary.max is not None:
+        salary.source = "job_description"
+    return parsed
 
 
 def with_board_facts(job: Job, parsed: ParsedJobDescription) -> ParsedJobDescription:
@@ -486,8 +607,6 @@ def with_board_facts(job: Job, parsed: ParsedJobDescription) -> ParsedJobDescrip
         salary.period = salary.period or job.salary_interval
         salary.source = "job_board"
         salary.source_text = salary.source_text or f"Salary reported by {job.source_board or job.source or 'the board'}"
-    elif salary.min is not None or salary.max is not None:
-        salary.source = salary.source or "job_description"
     return parsed
 
 
@@ -550,9 +669,19 @@ def sweep(db: Session, limit: int | None = None) -> dict[str, int]:
     return {"queued": queued, "waiting": len(candidates) - queued}
 
 
+@dataclass(frozen=True)
+class ParseClaim:
+    task_id: int
+    lock_token: str
+    worker_id: str
+
+
 def claim(db: Session, *, worker_id: str, limit: int, now: datetime | None = None,
-          lease_seconds: int | None = None) -> list[int]:
-    """Lease up to `limit` due tasks with FOR UPDATE SKIP LOCKED. Returns their ids. Commits."""
+          lease_seconds: int | None = None) -> list[ParseClaim]:
+    """Lease up to `limit` due tasks (FOR UPDATE SKIP LOCKED on PostgreSQL). Commits.
+
+    Each claim carries the lease token: a worker whose lease was taken over can no longer write its result.
+    """
     now = now or utcnow()
     lease = timedelta(seconds=lease_seconds or get_settings().jd_parse_lease_seconds)
     query = (select(JobDescriptionParseTask)
@@ -570,7 +699,7 @@ def claim(db: Session, *, worker_id: str, limit: int, now: datetime | None = Non
         task.lock_token, task.lock_expires_at = uuid.uuid4().hex, now + lease
         task.attempt_count += 1
         task.started_at, task.next_attempt_at = now, None
-        claimed.append(task.id)
+        claimed.append(ParseClaim(task.id, task.lock_token, worker_id[:200]))
     db.commit()
     return claimed
 
@@ -580,10 +709,14 @@ def recover_expired(db: Session, now: datetime | None = None) -> int:
     now = now or utcnow()
     rows = db.scalars(select(JobDescriptionParseTask).where(
         JobDescriptionParseTask.status == PROCESSING, JobDescriptionParseTask.lock_expires_at < now)).all()
+    message = "Interrupted: the worker stopped while parsing this description"
     for task in rows:
+        if task.attempt_count >= get_settings().jd_parse_max_attempts:
+            _finish(task, FAILED, now, message, ErrorCategory.LEASE_EXPIRED)
+            _mark_unparsed(db.get(Job, task.job_id))
+            continue
         task.status, task.locked_by, task.lock_token, task.lock_expires_at = PENDING, None, None, None
-        task.last_error = "Interrupted: the worker stopped while parsing this description"
-        task.error_category = ErrorCategory.LEASE_EXPIRED
+        task.last_error, task.error_category = message, ErrorCategory.LEASE_EXPIRED
     db.commit()
     return len(rows)
 
@@ -596,50 +729,108 @@ def _finish(task: JobDescriptionParseTask, status: str, now: datetime, error: st
     task.next_attempt_at = None
 
 
-def process(sessions: Any, task_id: int, worker_id: str = "inline") -> str:
-    """Parse one claimed task in a session bound to its owner. Returns the outcome."""
-    from app.services.llm import error_type
+def _held(db: Session, claim: ParseClaim) -> JobDescriptionParseTask | None:
+    """The task, only while this worker still holds its lease."""
+    return db.scalar(select(JobDescriptionParseTask).where(
+        JobDescriptionParseTask.id == claim.task_id, JobDescriptionParseTask.status == PROCESSING,
+        JobDescriptionParseTask.lock_token == claim.lock_token).execution_options(populate_existing=True))
+
+
+def _mark_unparsed(job: Job | None) -> None:
+    """A posting that could not be parsed in its current wording: workflows fall back to the raw text."""
+    if job is not None and (job.structured_description_status in (RAW, NORMALIZED) or not is_current(job)):
+        job.structured_description_status = NEEDS_REVIEW
+
+
+def _wait(task: JobDescriptionParseTask, message: str, now: datetime) -> str:
+    """Hand the task back without using an attempt (e.g. no AI key yet): it resumes once the account is ready."""
+    task.status, task.locked_by, task.lock_token, task.lock_expires_at = PENDING, None, None, None
+    task.attempt_count = max(0, task.attempt_count - 1)
+    task.last_error, task.error_category = message[:MAX_ERROR_LENGTH], ErrorCategory.CONFIGURATION
+    task.next_attempt_at = now + timedelta(seconds=get_settings().ranking_wait_seconds)
+    return "waiting"
+
+
+def process(sessions: Any, claim: ParseClaim) -> str:
+    """Parse one claimed task in a session bound to its owner. Returns the outcome.
+
+    The model is called without holding any row lock. The result is written against the job as it is afterwards,
+    and only while this worker still holds the task's lease.
+    """
+    from app.services.llm import LLMConfigError, error_type
+    from app.services.user_settings import ai_ready
 
     with sessions() as db:
-        task = db.get(JobDescriptionParseTask, task_id)
-        if task is None or task.status != PROCESSING:
+        task = _held(db, claim)
+        if task is None:
             return "lost"
         db.info["user_id"] = task.user_id
-        job = db.get(Job, task.job_id)
-        now = utcnow()
+        job, now = db.get(Job, task.job_id), utcnow()
         if job is None:
             _finish(task, FAILED, now, "The job was deleted")
             db.commit()
             return "skipped"
+        ready, reason = ai_ready(db, task.user_id)
+        if not ready:
+            outcome = _wait(task, reason, now)
+            db.commit()
+            return outcome
+        job_id, parsed_hash = job.id, description_hash(job.description or "")
         try:
             parsed = parse_job_description(db, job, user_id=task.user_id)
-            store_parse(db, job, parsed)
-            _finish(task, COMPLETED, now)
-            db.commit()
-            return "parsed"
         except Exception as exc:  # noqa: BLE001  one bad posting never stops the worker
             db.rollback()
-            task = db.get(JobDescriptionParseTask, task_id)
-            job = db.get(Job, task.job_id) if task else None
-            message = f"{type(exc).__name__}: {exc}"
-            category = ErrorCategory.VALIDATION if error_type(exc) == "SCHEMA_VALIDATION" else ErrorCategory.EXTERNAL_SERVICE
-            settings = get_settings()
-            if task.attempt_count >= settings.jd_parse_max_attempts:
-                _finish(task, FAILED, now, message, category)
-                if job is not None and job.structured_description_status in (RAW, NORMALIZED):
-                    job.structured_description_status = NEEDS_REVIEW
-                db.commit()
-                return "failed"
-            task.status, task.locked_by, task.lock_token, task.lock_expires_at = PENDING, None, None, None
-            task.last_error, task.error_category = message[:MAX_ERROR_LENGTH], category
-            task.next_attempt_at = now + timedelta(seconds=settings.jd_parse_retry_seconds * task.attempt_count)
+            return _failed(db, claim, exc, now, config=isinstance(exc, LLMConfigError),
+                           category=ErrorCategory.VALIDATION if error_type(exc) == "SCHEMA_VALIDATION"
+                           else ErrorCategory.EXTERNAL_SERVICE)
+        task, job = _held(db, claim), lock_job(db, job_id)
+        if task is None:
+            db.rollback()
+            return "lost"  # the lease expired and another worker took the task over: its result stands
+        if job is None:
+            _finish(task, FAILED, now, "The job was deleted")
             db.commit()
-            return "retrying"
+            return "skipped"
+        if description_hash(job.description or "") != parsed_hash:
+            # The posting changed while the model was reading it: this parse describes the old text.
+            _finish(task, COMPLETED, now, "Superseded: the description changed during parsing")
+            db.flush()
+            queue_parse(db, job, reason="description_changed")
+            db.commit()
+            return "superseded"
+        normalize_job(db, job)
+        store_parse(db, job, parsed)
+        _finish(task, COMPLETED, now)
+        db.commit()
+        return "parsed"
+
+
+def _failed(db: Session, claim: ParseClaim, exc: Exception, now: datetime, *, config: bool,
+            category: ErrorCategory) -> str:
+    task = _held(db, claim)
+    if task is None:
+        return "lost"
+    message = f"{type(exc).__name__}: {exc}"
+    if config:
+        outcome = _wait(task, message, now)
+    elif task.attempt_count >= get_settings().jd_parse_max_attempts:
+        _finish(task, FAILED, now, message, category)
+        _mark_unparsed(db.get(Job, task.job_id))
+        outcome = "failed"
+    else:
+        task.status, task.locked_by, task.lock_token, task.lock_expires_at = PENDING, None, None, None
+        task.last_error, task.error_category = message[:MAX_ERROR_LENGTH], category
+        task.next_attempt_at = now + timedelta(seconds=get_settings().jd_parse_retry_seconds * task.attempt_count)
+        outcome = "retrying"
+    db.commit()
+    return outcome
 
 
 def parse_now(db: Session, job: Job) -> ParsedJobDescription:
     """Parse and store one job in the caller's session (manual re-parse, tests)."""
     parsed = parse_job_description(db, job)
+    job = lock_job(db, job.id) or job
+    normalize_job(db, job)
     store_parse(db, job, parsed)
     return parsed
 
@@ -649,8 +840,8 @@ def parse_now(db: Session, job: Job) -> ParsedJobDescription:
 def waiting_reason(db: Session, job: Job) -> str | None:
     """Why ranking should wait for this job's description to be parsed, or None to go ahead.
 
-    Ranking waits only while a parse is actually queued or running and has attempts left. A failed or exhausted
-    parse never holds a job back: the ranker falls back to the raw description.
+    Ranking waits only while a parse is queued or running. A failed parse never holds a job back: the ranker
+    falls back to the raw description.
     """
     if not get_settings().jd_parse_enabled or not needs_parse(job):
         return None
@@ -658,8 +849,8 @@ def waiting_reason(db: Session, job: Job) -> str | None:
                      .order_by(desc(JobDescriptionParseTask.id)).limit(1))
     if task is None or task.status in (COMPLETED, FAILED):
         return None
-    if task.attempt_count >= get_settings().jd_parse_max_attempts:
-        return None
+    # Queued or running, including its final attempt. Every task ends COMPLETED or FAILED (lease recovery fails a
+    # task that used its last attempt), so this wait always ends.
     return "The job description is still being parsed"
 
 
@@ -676,6 +867,8 @@ def apply_correction(db: Session, job: Job, payload: StructuredJobDescriptionIn)
     if changed:
         job.structured_description = new
         job.structured_description_status = MANUALLY_CORRECTED
+        # Every workflow reads the requirement rows, not this document: a correction has to reach them too.
+        reconcile_requirements(db, job, old, new)
     return job.structured_description
 
 
@@ -686,6 +879,8 @@ def reparse(db: Session, job: Job) -> dict[str, Any]:
     comparison to resolve. Anything else is simply re-parsed.
     """
     parsed = parse_job_description(db, job)
+    job = lock_job(db, job.id) or job  # the row as it is after the model call, not as it was before
+    normalize_job(db, job)
     if job.structured_description_status != MANUALLY_CORRECTED or not job.structured_description:
         store_parse(db, job, parsed)
         job.structured_description_candidate = None
@@ -698,6 +893,7 @@ def reparse(db: Session, job: Job) -> dict[str, Any]:
                if current.get(path) != proposed.get(path)]
     job.structured_description_candidate = {
         "version": PARSER_VERSION, "created_at": utcnow().isoformat(), "changes": changes,
+        "description_hash": description_hash(job.description or ""),
         "structured_description": parsed.structured_description.model_dump(),
         "requirements": [item.model_dump() for item in parsed.requirements]}
     return {"applied": False, "structured_description": job.structured_description, "changes": changes}
@@ -720,10 +916,14 @@ def resolve_reparse(db: Session, job: Job, decisions: dict[str, str]) -> dict[st
         target[keys[-1]] = change["proposed"]
         record_change(db, job, change["path"], change["current"], change["proposed"], "PARSER")
         accepted += 1
+    previous = job.structured_description or {}
     job.structured_description = structured
-    job.structured_description_hash = description_hash(job.description or "")
     job.structured_description_parsed_at = utcnow()
-    if accepted:
-        store_requirements(db, job, [RequirementIn.model_validate(item) for item in candidate["requirements"]])
+    # The comparison was parsed from the posting as it was then; if the text has changed since, it stays stale.
+    job.structured_description_hash = candidate.get("description_hash") or job.structured_description_hash
+    # Requirement rows follow the individual decisions: only values the user accepted into the required or
+    # preferred lists change. Kept values, and parser rows that never appeared as a comparison, stay as they were.
+    reconcile_requirements(db, job, previous, structured,
+                           candidates=[RequirementIn.model_validate(item) for item in candidate["requirements"]])
     job.structured_description_candidate = None
     return {"accepted": accepted, "structured_description": structured}

@@ -32,8 +32,8 @@ from sqlalchemy.orm import Session
 
 from app.models import CandidateProfile, Evidence, Job, KnowledgeAnswer, Resume
 from app.prompts.common import job_facts, profile_facts
-from app.services import resume_verification as rv
 from app.services import job_context as jc
+from app.services import resume_verification as rv
 from app.services import structured_resume as sr
 from app.services.llm_telemetry import estimate_tokens
 from app.services.resume_format import parse_resume
@@ -317,7 +317,10 @@ def _measure(context: TaskContext, raw_text: str, every_evidence: list[dict[str,
     full = (estimate_tokens(json.dumps(context.candidate, default=str)) + estimate_tokens(raw_text)
             + estimate_tokens(json.dumps(every_evidence, default=str)) + job_tokens
             + estimate_tokens(json.dumps(context.fit_analysis or {}, default=str)))
-    selected = estimate_tokens(json.dumps(context.selected_payload(), default=str)) + job_tokens
+    # The raw posting counts as selected only when it is actually sent; a parsed posting travels as structured
+    # requirements, measured on the posting side (context.job_stats).
+    sent_job = 0 if (context.job_context or {}).get("structured") else job_tokens
+    selected = estimate_tokens(json.dumps(context.selected_payload(), default=str)) + sent_job
     context.stats = ContextStats.measure(max(full, selected), selected)
 
 

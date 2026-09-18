@@ -67,6 +67,7 @@ def upgrade() -> None:
         sa.Column('confidence', sa.Float(), nullable=False),
         sa.Column('is_explicit', sa.Boolean(), nullable=False),
         sa.Column('is_derived', sa.Boolean(), nullable=False),
+        sa.Column('origin', sa.String(length=10), nullable=False, server_default='PARSER'),
         sa.Column('created_at', sa.DateTime(), nullable=False),
         sa.Column('updated_at', sa.DateTime(), nullable=False),
         sa.CheckConstraint(f"requirement_type IN ({_values(REQUIREMENT_TYPES)})",
@@ -74,6 +75,7 @@ def upgrade() -> None:
         sa.CheckConstraint(f"requirement_level IN ({_values(REQUIREMENT_LEVELS)})",
                            name='ck_job_requirement_evidence_level'),
         sa.CheckConstraint('confidence >= 0 AND confidence <= 1', name='ck_job_requirement_evidence_confidence'),
+        sa.CheckConstraint("origin IN ('PARSER', 'USER')", name='ck_job_requirement_evidence_origin'),
     )
     op.create_index('ix_job_requirement_evidence_user_id', 'job_requirement_evidence', ['user_id'])
     op.create_index('ix_job_requirement_evidence_job_id', 'job_requirement_evidence', ['job_id'])

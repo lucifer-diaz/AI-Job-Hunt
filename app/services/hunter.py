@@ -23,10 +23,10 @@ from typing import Any
 import httpx
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, object_session
 
 from app.models import Job, SearchProfile, SearchRun
-from app.services import ranker, sources
+from app.services import job_description, ranker, sources
 from app.services.apify_adapters import (FALLBACK_FOR_SITE, PRIMARY, HunterSearch, PlannedRun, RunContext,
                                          SchemaMismatch, get_adapter, older_than, plan_runs)
 from app.services.lifecycle import WorkflowState as S
@@ -304,6 +304,11 @@ def _merge(existing: Job, run: SearchRun, ctx: RunContext, job: dict[str, Any]) 
         existing.canonical_url = job["canonical_url"]
     if len(job["description"]) > len(existing.description or ""):
         existing.description = job["description"]
+        # A fuller posting is new employer text: parse it again. Until then workflows use the raw text, because a
+        # structured description parsed from the old text no longer matches (job_description.is_current).
+        session = object_session(existing)
+        if session is not None:
+            job_description.queue_parse(session, existing, reason="description_changed")
 
 
 def _new_job(run: SearchRun, ctx: RunContext, job: dict[str, Any]) -> Job:
@@ -345,6 +350,8 @@ def _save(db: Session, run: SearchRun, ctx: RunContext, job: dict[str, Any], pol
         db.flush()
         transition(db, record, S.NORMALIZED, actor="hunter",
                    reason=f"Normalized from {run.actor_id} run {run.external_run_id}")
+        # Queued in the same transaction as the ranking task, so ranking waits for the parse from the start.
+        job_description.queue_parse(db, record)
         reason = ranker.queue_job(db, record, policy=policy, actor="hunter")
         db.commit()
     except IntegrityError:  # another sync saved the same posting a moment ago

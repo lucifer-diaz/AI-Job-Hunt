@@ -102,14 +102,22 @@ def requirements_of(db: Session, job: Job, *, levels: tuple[str, ...] | None = N
 
 def requirement_dict(row: JobRequirementEvidence, *, with_source: bool = False) -> dict[str, Any]:
     out = {"id": row.item_id, "type": row.requirement_type, "value": row.normalized_value,
-           "level": row.requirement_level, "confidence": round(row.confidence, 2), "derived": row.is_derived}
+           "level": row.requirement_level, "confidence": round(row.confidence, 2), "derived": row.is_derived,
+           "origin": row.origin}
     if with_source:
         out |= {"source_text": row.source_text, "source_section": row.source_section}
     return out
 
 
 def _structured(job: Job) -> dict[str, Any]:
-    return job.structured_description or {}
+    """The structured description, only when it was parsed from the description the job has now.
+
+    A posting whose text changed after parsing (and whose re-parse is pending or failed) is stale: every task
+    falls back to the current raw text rather than reading requirements from the old advert.
+    """
+    from app.services.job_description import is_current
+
+    return (job.structured_description or {}) if is_current(job) else {}
 
 
 # Words a requirement sentence uses to ask for something, rather than the thing itself.
@@ -170,8 +178,10 @@ def _base(db: Session, job: Job, task: str) -> JobContext:
     context = JobContext(task=task, job_id=job.id, status=job.structured_description_status,
                          structured=bool(data))
     if not data:
-        # Not parsed (or parsing failed): the task still gets the posting, as written.
-        context.raw_description = job.normalized_description or job.description or ""
+        # Not parsed, parsing failed, or the posting changed since: the task gets the posting as it is now.
+        from app.services.job_description import normalize_description
+
+        context.raw_description = normalize_description(job.description or "")
         context.identity = {"title": job.title, "company": job.company, "location": job.location}
         return context
     context.identity = {k: v for k, v in (data.get("job_identity") or {}).items() if v}
@@ -275,9 +285,12 @@ def build_interview_insights_job_context(db: Session, job: Job) -> JobContext:
 def summary(db: Session, job: Job) -> dict[str, Any]:
     """The structured description as the API and the UI show it, with its requirement evidence."""
     rows = requirements_of(db, job, derived=None)
-    data = _structured(job)
+    data = job.structured_description or {}
+    stale = bool(data) and not _structured(job)
     return {
         "job_id": job.id, "status": job.structured_description_status,
+        # The posting changed after it was parsed: workflows use the raw text until the new parse lands.
+        "stale": stale,
         "version": job.structured_description_version,
         "parsed_at": job.structured_description_parsed_at.isoformat() if job.structured_description_parsed_at else None,
         "structured_description": data or None,

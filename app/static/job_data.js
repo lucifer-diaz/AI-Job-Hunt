@@ -128,7 +128,8 @@ function renderJobStructured(job) {
   if (editing) {
     return `<div style="padding:20px 22px">${head}${error}<p class="settings-help mb12">Correct anything the parser got wrong. Corrected fields are never overwritten by a later parse.</p><div class="settings-grid">${JD_FIELDS.map(([path, fieldLabel, kind]) => jdField(path, fieldLabel, kind, jdGet(JD.draft, path))).join('')}</div></div>`;
   }
-  return `<div style="padding:20px 22px" class="col gap14">${head}${error}${jdComparison(data)}${jdSummary(data)}
+  const stale = data.stale ? `<div class="box warn small" data-jd-stale>The posting changed after it was parsed. Ranking and tailoring use the posting as written until it is parsed again.</div>` : '';
+  return `<div style="padding:20px 22px" class="col gap14">${head}${error}${stale}${jdComparison(data)}${jdSummary(data)}
     <div><div class="caps mb8">REQUIREMENTS · IN THE EMPLOYER'S WORDS</div>${requirements.length
       ? `<div class="col gap6">${requirements.map(jdRequirementRow).join('')}</div>`
       : '<div class="small muted">No requirements were extracted from this posting.</div>'}</div>

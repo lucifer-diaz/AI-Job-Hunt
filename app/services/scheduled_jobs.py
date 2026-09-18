@@ -201,7 +201,7 @@ async def ranking(ctx: JobContext) -> dict[str, Any]:
     return summary
 
 
-def _prepare_jd_parsing(ctx: JobContext) -> tuple[list[int], dict[str, Any]] | str:
+def _prepare_jd_parsing(ctx: JobContext) -> tuple[list[job_description.ParseClaim], dict[str, Any]] | str:
     """Queue postings that were never parsed, recover crashed workers, then claim a bounded batch."""
     with ctx.sessions() as db:
         if not _is_postgres(db):
@@ -223,11 +223,11 @@ async def jd_parsing(ctx: JobContext) -> dict[str, Any]:
     claims, details = prepared
     semaphore = asyncio.Semaphore(max(1, get_settings().jd_parse_concurrency))
 
-    async def run(task_id: int) -> str:
+    async def run(claim: job_description.ParseClaim) -> str:
         async with semaphore:
-            return await asyncio.to_thread(job_description.process, ctx.sessions, task_id, ctx.worker_id)
+            return await asyncio.to_thread(job_description.process, ctx.sessions, claim)
 
-    outcomes = Counter(await asyncio.gather(*(run(task_id) for task_id in claims)))
+    outcomes = Counter(await asyncio.gather(*(run(claim) for claim in claims)))
     summary = {"claimed": len(claims), **{name: outcomes.get(name, 0) for name in job_description.OUTCOMES}, **details}
     if not claims and not details["queue"]["queued"]:
         return skipped("No job descriptions waiting", **summary)
