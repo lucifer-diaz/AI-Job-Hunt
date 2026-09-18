@@ -169,10 +169,10 @@ def _insert(connection, table, **values):
     return connection.execute(reflected.insert().values(**row, **values)).inserted_primary_key[0]
 
 
-def test_0012_turns_existing_resumes_into_unverified_versions(tmp_path):
+def test_0014_turns_existing_resumes_into_unverified_versions(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'resumes.db'}")
     with engine.begin() as connection:
-        command.upgrade(alembic_config(connection), "0011")
+        command.upgrade(alembic_config(connection), "0013")
         user = _insert(connection, "users", email="legacy@example.com", password_hash="!")
         _insert(connection, "candidate_profiles", user_id=user, master_resume="Hand edited resume text")
         old = _insert(connection, "resume_documents", user_id=user, original_filename="old.pdf", media_type="application/pdf",
@@ -181,7 +181,7 @@ def test_0012_turns_existing_resumes_into_unverified_versions(tmp_path):
                 storage_path="/files/new", checksum="b" * 64, size=1, extracted_text="New resume", active=True)
         evidence = _insert(connection, "evidence", user_id=user, claim="Verified by hand", verified=True)
     with engine.begin() as connection:
-        command.upgrade(alembic_config(connection), "0012")
+        command.upgrade(alembic_config(connection), "0014")
     with engine.connect() as connection:
         rows = connection.execute(text(
             "SELECT version, source, resume_document_id, source_file_hash, raw_text, is_active, is_default,"
@@ -196,7 +196,7 @@ def test_0012_turns_existing_resumes_into_unverified_versions(tmp_path):
     assert [bool(r.is_default) for r in rows] == [False, False, True]
     assert (kept.source, bool(kept.verified)) == ("manual", True) and master == "Hand edited resume text"
     with engine.begin() as connection:
-        command.downgrade(alembic_config(connection), "0011")
+        command.downgrade(alembic_config(connection), "0013")
     assert not inspect(engine).has_table("resumes")
     assert "fact_key" not in {c["name"] for c in inspect(engine).get_columns("evidence")}
     engine.dispose()

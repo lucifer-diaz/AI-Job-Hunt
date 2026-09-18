@@ -23,7 +23,7 @@ The dashboard is a single-page workspace served from `app/static/app.js`; every 
 | Apply kit | Files to upload, answers to paste, link to the posting, confirm "mark applied" | `GET /api/jobs/{id}/apply-kit` |
 | Tracker | Kanban by post-submission stage (drag or "move to"), optional extra stages, timeline, recruiter, interview scheduling, AI follow-up draft | `GET /api/tracker`, `POST /api/applications/{id}/stage`, `POST /api/applications/{id}/events` |
 | Monitoring | Every LLM request: requests, tokens, estimated cost, latency (avg/p50/p95/p99), failures by type, retries, context utilisation, usage by stage and cost by model, with filters (range, provider, model, stage, prompt version, status, job), a request detail view and the AI Optimization Advisor | `GET /api/monitoring/dashboard`, `POST /api/monitoring/analyze`, `GET /api/monitoring/recommendations` |
-| Knowledge bank | ATS answer library with edit/verify, evidence bank with verify/remove | `/api/knowledge`, `/api/evidence` |
+| Knowledge bank | Searchable Answer library and Evidence bank, focused editors, verification filters, copy and removal | `/api/knowledge`, `/api/evidence` |
 | Settings & profile | Candidate details and chip fields, resume variants, re-parse resume into (unverified) evidence, provider/model, your own API keys (stored encrypted), approval mode, cadence | `/api/profile`, `/api/settings`, `PUT /api/settings/keys`, `/api/preferences` |
 | Sign-in | Create an account (email, password, confirm password), sign in, sign out | `/signup`, `/login`, `POST /api/auth/signup`, `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/auth/me` |
 
@@ -56,6 +56,7 @@ Auto-submit is intentionally not offered: approved packets always become an appl
 - Prompt-injection hardening for untrusted job descriptions
 - OpenAI, Anthropic, Gemini, **OpenRouter**, or no-cost mock provider
 - LLM monitoring (tokens, context size, latency, estimated cost, failures) and a recommend-only AI Optimization Advisor
+- Claude Desktop + MCP: bulk tailoring and review with your Claude subscription, validated by the backend
 - OpenRouter `openrouter/free` support plus arbitrary `:free` model slugs
 - Per-stage OpenRouter models for ranking, tailoring, review, and follow-up
 - OpenRouter model fallbacks and a free-only safety guard
@@ -774,7 +775,271 @@ Tests check this both ways: statically, that the module has no configuration wri
 the profile, the catalog and the prompts are unchanged after an analysis. Every recommendation needs a person to
 implement it.
 
-## 10. Resume Data & Verification
+## 10. Claude Desktop + MCP
+
+### What this feature does
+
+Job Hunt OS includes a local [MCP](https://modelcontextprotocol.io) server. With it, **Claude Desktop** can list the jobs waiting for tailoring or review, read compact context for them, write tailored resumes and reviews in the conversation, and save the results back to Job Hunt OS in batches.
+
+There are two ways to run tailoring and review, and they share the same validation and storage code:
+
+```text
+Claude Desktop mode
+→ Claude does the reasoning in your Claude Desktop conversation, using your Claude plan's normal usage
+→ Job Hunt OS makes no model API call for that work
+
+Backend mode
+→ the Job Hunt OS workers call your configured model API (OpenRouter, OpenAI, Anthropic, Gemini)
+```
+
+Claude Desktop mode does not give you Anthropic API access. Claude Desktop does the work in the conversation, subject to your plan's limits. Job Hunt OS stays the source of truth: it supplies the data, validates everything Claude saves, and decides every workflow state.
+
+### Prerequisites
+
+- Job Hunt OS installed locally (see [1. Local run](#1-local-run)), with its database running (local PostgreSQL, Docker, or the default SQLite file) and migrated. Starting the web app once runs the migrations.
+- An account with a **Candidate Profile** (Settings → Profile / Job preferences, including work authorization).
+- A **master resume** in Settings → Resumes. The context tools refuse to run without one.
+- **Verified evidence** in the Knowledge bank. Rewritten bullets must cite it.
+- For tailoring: jobs already discovered, ranked and **shortlisted** (in the Tailor queue).
+- [Claude Desktop](https://claude.ai/download) installed. It runs local MCP servers from its config file; nothing else needs to be enabled.
+
+### Starting Job Hunt OS
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt          # includes the `mcp` package
+uvicorn app.main:app --reload            # web app: sign up, profile, resume, token
+```
+
+Or run the app and PostgreSQL in containers with `docker compose up --build`. For a local PostgreSQL, see `scripts/setup_local_postgres.sh`. The MCP server only needs the **database**. The web app just has to be running when you set up your profile and create a token.
+
+### Connecting Claude Desktop
+
+**1. Create an MCP token.** Each token belongs to one account, so Claude only sees that account's data. Job Hunt OS stores only a SHA-256 hash of the token. Create one in either of these ways:
+
+```bash
+python -m app.mcp create-token --email you@example.com
+```
+
+or, while signed in, `POST /api/settings/mcp-tokens` (`GET` lists your tokens, `DELETE /api/settings/mcp-tokens/{id}` revokes one). The token is shown only once. Treat it like a password.
+
+**2. Add the server to Claude Desktop.** Open Claude Desktop → Settings → Developer → Edit Config. That opens `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS or `%APPDATA%\Claude\claude_desktop_config.json` on Windows. Add:
+
+```json
+{
+  "mcpServers": {
+    "job-hunt-os": {
+      "command": "/absolute/path/to/AI-Job-Hunt/.venv/bin/python",
+      "args": ["-m", "app.mcp"],
+      "env": {
+        "PYTHONPATH": "/absolute/path/to/AI-Job-Hunt",
+        "JOBHUNT_MCP_TOKEN": "jhos_mcp_paste-your-token-here"
+      }
+    }
+  }
+}
+```
+
+- Transport is **stdio**: Claude Desktop starts the process itself. No host, port or URL is involved, and nothing listens on the network.
+- The server switches to the repository directory, so it reads the same `.env` (`DATABASE_URL`) as the web app. If the database is configured somewhere else, add `"DATABASE_URL": "postgresql+psycopg://..."` to `env`.
+- **Authentication** is the `JOBHUNT_MCP_TOKEN` value, taken from `env` above or, if that's not set, from the repository's `.env`. If it's missing, unknown or revoked, the server refuses to start.
+- Fully quit and reopen Claude Desktop after editing the file.
+
+Optional limits, in `.env`:
+
+```env
+MCP_BULK_TAILOR_LIMIT=10
+MCP_BULK_REVIEW_LIMIT=20
+```
+
+Requests above these limits are rejected, not truncated.
+
+**3. Choose the mode (optional).** Settings → Workflow & cadence → *Tailoring & review* → **Claude Desktop**. In that mode, the background tailoring queue skips your jobs, so no model API is called for them. A task queued before you switched is cancelled rather than run. MCP saves never call a model API in either mode.
+
+### Verifying the connection
+
+In a new Claude Desktop chat, the tools menu should list **job-hunt-os**. Ask:
+
+```text
+Show me the available Job Hunt OS tools.
+```
+
+You should see `list_jobs_for_tailoring`, `get_tailoring_context`, `save_tailored_resume`, `save_bulk_tailored_resumes`, `list_jobs_for_review`, `get_review_context`, `save_review`, `save_bulk_reviews` and `get_bulk_operation_status`, plus the prompts `tailor_jobs` and `review_applications`. Then ask:
+
+```text
+Show me the top 5 jobs waiting for tailoring.
+```
+
+### Bulk tailoring workflow
+
+```text
+Show me jobs waiting for tailoring with a fit score above 85.
+```
+
+```text
+Tailor my resume for the top 5 jobs.
+```
+
+```text
+Tailor all eligible jobs above 90, maximum 5 jobs.
+```
+
+What happens:
+
+```text
+Claude
+→ list_jobs_for_tailoring           compact metadata (fit score, resume fit score, posted date)
+→ get_tailoring_context             CandidateProfile + active resume (once) and, per job, the description,
+                                    fit analysis, only the relevant verified evidence (with IDs),
+                                    recommended resume focus and resume gaps
+→ writes one tailored version per job
+→ save_bulk_tailored_resumes        each item saved or rejected on its own
+→ Job Hunt OS validates, then stores a new version (status: tailored, waiting for review)
+```
+
+Every rewritten factual bullet must cite `evidence_ids`, or restate an existing bullet of that role. Before saving, Job Hunt OS checks deterministically for:
+
+- unknown, unverified or other-account evidence IDs, or evidence from a different employer
+- numbers not found in the cited evidence or the resume
+- skills not found in the resume, profile or evidence (matched as whole words, so "Go" never passes on "Django")
+- technologies, employers and other names dropped into the summary, cover letter or a screening answer that
+  appear nowhere in the resume, profile or evidence (naming the job's own company and role is fine)
+- unknown roles
+- visa or work-authorization wording your profile doesn't state
+
+A rejected item comes back with error codes (`UNKNOWN_EVIDENCE`, `INVENTED_METRIC`, `INVENTED_SKILL`, `UNSUPPORTED_TERM`, `UNCITED_CLAIM`, `WORK_AUTHORIZATION`, …), so Claude can fix just that item. Employers, titles and dates are always taken from your master resume. **Your master resume is never modified**, and each save is a new version you can inspect and edit on the Tailor screen.
+
+### Bulk review workflow
+
+```text
+Show me all tailored jobs waiting for review.
+```
+
+```text
+Review the next 10 tailored applications.
+```
+
+```text
+Review only applications with fit score above 85.
+```
+
+Claude checks each tailored resume for factual accuracy against your profile and verified evidence, unsupported claims, missing requirements, exaggeration, and your candidate policy, including work authorization. It saves `review_score`, `confidence`, `unsupported_claims`, `missing_requirements`, `overstated_claims`, `risks` and a `recommendation` (`PASS`, `RETAILOR` or `SKIP`).
+
+The recommendation is advice. **Job Hunt OS decides the state:** it re-runs the evidence checks, then:
+
+| Result | Decision | Job goes to |
+| --- | --- | --- |
+| Evidence problems, or any unsupported or overstated claim | `RETAILOR` | back to the Tailor queue with status `needs_retailor` (shown as **re-tailor**), keeping the old version and the reasons until a new one is saved |
+| `PASS`, score ≥ your minimum reviewer score, confidence ≥ policy minimum, job still passes your hard filters | `PASS` | ready for approval (auto-approved only if you chose automatic approval) |
+| Anything else (`SKIP`, low score, policy failure) | `NEEDS_HUMAN` | sent back for your decision |
+
+A review can never archive, approve by itself, or submit an application.
+
+### Recommended batch sizes
+
+```text
+Tailoring: 5–10 jobs
+Review:    10–20 jobs
+```
+
+Each job adds its description, evidence and output to the conversation. Larger batches use more of Claude's context and your plan's usage, and long conversations are more likely to hit limits. Several small batches work better than one large one.
+
+### Useful Claude commands
+
+The tools cover jobs **waiting for tailoring** and **waiting for review**. The other commands below use what those tools return.
+
+- **Search:** `Show me the top 10 Singapore jobs ranked above 85.` (filters the tailoring queue by location and score)
+- **Tailor:** `Tailor the top 5 jobs waiting for tailoring.`
+- **Review:** `Review all tailored applications from today.` (each listed job includes `tailored_at`)
+- **Inspect:** `Why did the Grab job score 78?` (Claude explains from the fit analysis in the context. Jobs outside the two queues are on the Discovery screen.)
+- **Re-rank:** `Re-rank this job using my AI-focused resume.` Re-ranking is not an MCP tool. Make that resume your primary resume in Settings → Resumes, then select the job in the Discovery table and choose **Rank**, or call `POST /api/jobs/{id}/rank`.
+- **Failed reviews:** `Show me applications rejected during review because of unsupported claims.` (uses `get_bulk_operation_status` decisions and reasons)
+- **Status:** `Show me the status of my latest bulk tailoring operation.`
+
+The built-in MCP prompts **tailor_jobs** and **review_applications** (in Claude Desktop's prompt/attachment menu) start either workflow with the rules included.
+
+### Claude Desktop vs backend mode
+
+| Mode | Reasoning performed by | Best for |
+| --- | --- | --- |
+| Claude Desktop | Claude Desktop subscription | interactive bulk tailor/review |
+| Backend | configured API model | automated 24/7 processing |
+
+You can combine them. Ranking always runs in the backend, and the execution mode only affects tailoring and review:
+
+```text
+OpenRouter/free
+→ rank hundreds of jobs automatically
+
+Claude Desktop
+→ bulk tailor/review the highest-ranked jobs
+```
+
+### Troubleshooting
+
+Claude Desktop writes each MCP server's output to `~/Library/Logs/Claude/mcp-server-job-hunt-os.log` on macOS (`%APPDATA%\Claude\logs\` on Windows). The server logs only to stderr, so its messages end up there. To see startup errors directly, run the same command yourself:
+
+```bash
+JOBHUNT_MCP_TOKEN=jhos_mcp_... PYTHONPATH=$PWD .venv/bin/python -m app.mcp
+```
+
+(It waits silently for MCP messages when healthy. Stop it with Ctrl+C.)
+
+| Problem | What to check |
+| --- | --- |
+| MCP server unavailable / Claude cannot see tools | JSON syntax of the config file; absolute paths to the venv Python and repository in `command` and `PYTHONPATH`; `pip install -r requirements.txt` (the `mcp` package); fully restart Claude Desktop; check the log above |
+| `JOBHUNT_MCP_TOKEN is missing` although you exported it | MCP clients (Claude Desktop, the MCP Inspector) start the server with a minimal environment, not your shell's. Put the token in the client's `env` config, in `.env` (read automatically), or pass it explicitly: `npx @modelcontextprotocol/inspector -e JOBHUNT_MCP_TOKEN=jhos_mcp_... python -m app.mcp` |
+| MCP authentication failure | Log says `authentication failed`: the token is missing, mistyped or revoked. Create a new one with `python -m app.mcp create-token --email ...` |
+| Database is not running | Log says `database is unreachable or not migrated`: start PostgreSQL (`brew services start postgresql@16` or `docker compose up db`), check `DATABASE_URL`, and run the app once or `python -m app.db_migrations` |
+| No active resume | Add a master resume in Settings → Resumes |
+| No jobs waiting for tailoring | Jobs must be ranked and shortlisted (Discovery → triage). Check the ranking tracker for jobs still ranking |
+| Invalid evidence IDs | Use only IDs from `relevant_evidence` / `verified_evidence`. Unverified evidence must be verified in the Knowledge bank first |
+| Batch limit exceeded | Split the request, or raise `MCP_BULK_TAILOR_LIMIT` / `MCP_BULK_REVIEW_LIMIT` in `.env` |
+| Save rejected by deterministic validation | Read the item's `errors` (code, location, message), fix only what is flagged, and save that item again. Don't add facts to get past validation. |
+
+### Safety and data rules
+
+- Claude can't access arbitrary database records. The server exposes only the nine tools above, and every query is limited to the token's account.
+- No tool accepts SQL, file paths, shell commands or settings, and no tool returns API keys or environment variables.
+- Resume facts must come from your CandidateProfile, master resume and verified evidence. The backend enforces this before saving.
+- Claude can't bypass your candidate policy or control workflow state. Python code decides both.
+- Your original resume is never changed. Every result is validated before it is stored.
+- Every MCP call is recorded in the `conversation_actions` audit table (source `CLAUDE_DESKTOP`, tool, job, argument summary, result status, time). The summary holds IDs, counts and filters, never resume text or secrets.
+
+### Architecture
+
+```text
+Claude Desktop
+      │
+      │ MCP (stdio, JOBHUNT_MCP_TOKEN)
+      ▼
+Job Hunt OS MCP server  (python -m app.mcp)
+      │
+ ┌────┼───────────────┐
+ ▼    ▼               ▼
+Jobs  Candidate       Evidence
+      Profile
+      Resume
+      │
+      ▼
+Validation  (tailoring_results / review_results)
+      │
+      ▼
+PostgreSQL  (+ conversation_actions audit trail)
+```
+
+Backend automation:
+
+```text
+FastAPI Scheduler / Tailor worker
+      ↓
+Rank / Tailor / Review
+      ↓
+Configured Model API
+```
+
+## 11. Resume Data & Verification
 
 The resume is used in layers. The uploaded file and its raw text are kept for reference; a structured version of
 it is what AI workflows read; only the facts you verify are trusted when generating application content.
@@ -926,12 +1191,12 @@ posting) and `selected_context_tokens` (what it selected), and the LLM call reco
 
 ### Migration
 
-Migration `0012` creates `resumes` and `resume_data_changes`, adds provenance columns to `evidence` and context
+Migration `0014` creates `resumes` and `resume_data_changes`, adds provenance columns to `evidence` and context
 columns to `llm_request_logs`. Existing uploads become resume versions (plus one for hand-edited master text); their
 structured data is parsed on first use and nothing is marked verified. Existing evidence keeps its verified flag.
 Because the ranking prompt is now `v3`, qualified jobs are re-ranked once when auto re-ranking is on.
 
-## 11. Recommended next upgrades
+## 12. Recommended next upgrades
 
 - Apify webhook endpoint so completed runs are ingested without polling
 - Gmail integration for follow-up drafts and thread matching
@@ -944,7 +1209,9 @@ Because the ranking prompt is now `v3`, qualified jobs are re-ranked once when a
 
 See [DEPLOY.md](DEPLOY.md) for hosting instructions.
 
-## 12. Google Gemini agent deployment
+## 13. Google Gemini agent deployment
+
+To tailor and review from Claude Desktop instead, see [10. Claude Desktop + MCP](#10-claude-desktop--mcp).
 
 The repository includes a Google ADK package named `job_hunt_agent`. Its
 `root_agent` coordinates four narrowly scoped agents: `job_fit_ranker`,
@@ -994,3 +1261,23 @@ and rollback notes](docs/settings.md).
 
 Frontend unit tests run with `npm ci && npm run test:coverage`; Node dependencies
 are development-only and the production UI still runs without a build step.
+
+### Knowledge bank workspace
+
+Open `#knowledge/answers` for reusable application answers or `#knowledge/evidence`
+for factual achievements. The original `#knowledge` link opens the Answer library.
+Each section keeps its own search, filters, and in-memory editor drafts while you
+switch sections. Reloading the page clears unsaved drafts.
+
+Answers can be filtered by verification, category, and sensitivity. Sensitive
+answers retain their confirmation requirement even when verified. Copying an
+answer records usage only after the clipboard operation succeeds. Delete is
+permanent and requires confirmation. Evidence supports search by claim, company,
+role, and skills; only verified claims may be cited by tailoring. Job-gap actions
+open the evidence editor directly and preserve existing claim input.
+
+Validation: `npm run test:coverage` covers the Knowledge bank and Settings flows.
+Relevant API regressions: `python -m pytest tests/test_workspace.py tests/test_api.py
+tests/test_dashboard_features.py -q`. No API or database migration is required.
+Rollback by reverting the Knowledge bank module, its dashboard script inclusion,
+and the associated routing and styles together.

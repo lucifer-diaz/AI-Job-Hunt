@@ -71,6 +71,8 @@ class User(Base):
     rankings: Mapped[list[JobRanking]] = relationship(back_populates="user", passive_deletes=True)
     optimization_tasks: Mapped[list[AIOptimizationTask]] = relationship(back_populates="user", passive_deletes=True)
     optimization_reports: Mapped[list[AIOptimizationReport]] = relationship(back_populates="user", passive_deletes=True)
+    conversation_actions: Mapped[list[ConversationAction]] = relationship(back_populates="user", passive_deletes=True)
+    mcp_tokens: Mapped[list[McpToken]] = relationship(back_populates="user", passive_deletes=True)
 
 
 class UserSession(Base):
@@ -938,6 +940,56 @@ class AIOptimizationTask(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     user: Mapped[User] = relationship(back_populates="optimization_tasks")
+
+
+CONVERSATION_ACTION_STATUSES = ("OK", "PARTIAL", "REJECTED", "ERROR")
+
+
+class ConversationAction(Base):
+    """Audit trail of an operation requested from a conversation (Claude Desktop over MCP).
+
+    Stores which tool ran, on what, and how it ended. `arguments_summary` holds IDs, counts, filters and text
+    lengths only: never resume text, tokens or environment values. Bulk saves share one `operation_id`.
+    """
+
+    __tablename__ = "conversation_actions"
+    __table_args__ = (
+        CheckConstraint(f"result_status IN ({_values(CONVERSATION_ACTION_STATUSES)})",
+                        name="ck_conversation_actions_result_status"),
+        Index("ix_conversation_actions_user_created", "user_id", "created_at"),
+        Index("ix_conversation_actions_operation_id", "operation_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("conversation_actions")
+    source: Mapped[str] = mapped_column(String(30), default="CLAUDE_DESKTOP")
+    tool_name: Mapped[str] = mapped_column(String(80))
+    entity_type: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    entity_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    operation_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    arguments_summary: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    result_status: Mapped[str] = mapped_column(String(20), default="OK")
+    result_summary: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+    user: Mapped[User] = relationship(back_populates="conversation_actions")
+
+
+class McpToken(Base):
+    """A personal access token for the local MCP server. Only the SHA-256 of the token is stored."""
+
+    __tablename__ = "mcp_tokens"
+    __table_args__ = (UniqueConstraint("token_hash", name="uq_mcp_tokens_token_hash"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("mcp_tokens")
+    name: Mapped[str] = mapped_column(String(100), default="Claude Desktop")
+    token_hash: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    user: Mapped[User] = relationship(back_populates="mcp_tokens")
 
 
 # Registers the per-user isolation hooks on every session; needs the models above.

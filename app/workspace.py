@@ -26,22 +26,69 @@ from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.auth import get_user_db
-from app.scheduler_hooks import run_soon
-from app.models import (AppSetting, Application, ApplicationEvent, Evidence, FollowUp, Job, KnowledgeAnswer,
-                        ResumeDocument, ResumeVariant, SearchRun)
-from app.services.actors import (BUILTIN, DEFAULT_ACTORS, FAN_OUTS, MAX_RUNS, PLACEHOLDERS, REMOTE_PLATFORMS,
-                                 SENIORITY_LEVELS, catalog as actor_catalog, describe_input, plan_runs)
-from app.services.contacts import (MAX_RECRUITERS, ContactIn, clean_email, clean_phone, event_meta, format_in_zone,
-                                   recruiters_of, set_primary_recruiter, set_recruiters, to_utc, zone)
-from app.services.ai_config import STAGES as AI_STAGES, is_free_model, resolve as resolve_ai_config
+from app.models import (
+    Application,
+    ApplicationEvent,
+    AppSetting,
+    Evidence,
+    FollowUp,
+    Job,
+    KnowledgeAnswer,
+    ResumeDocument,
+    ResumeVariant,
+    SearchRun,
+)
 from app.prompts import build_evidence_extraction_prompt
-from app.services.llm import LLMCall, LLMClient
-from app.services.sources import (UA, import_remote_run, list_remote_runs, refresh_apify_run, start_apify_search,
-                                  upsert_job)
-from app.services.resume_format import flatten_links, unbold
-from app.services.user_settings import apify_token, lock_settings_row, settings_for
+from app.scheduler_hooks import run_soon
 from app.services import ranker, resume_verification
-from app.services.workflow import draft_followup, followup_days, get_profile, resume_edits, update_resume_edit
+from app.services.actors import (
+    BUILTIN,
+    DEFAULT_ACTORS,
+    FAN_OUTS,
+    MAX_RUNS,
+    PLACEHOLDERS,
+    REMOTE_PLATFORMS,
+    SENIORITY_LEVELS,
+    describe_input,
+    plan_runs,
+)
+from app.services.actors import catalog as actor_catalog
+from app.services.ai_config import STAGES as AI_STAGES
+from app.services.ai_config import is_free_model
+from app.services.ai_config import resolve as resolve_ai_config
+from app.services.contacts import (
+    MAX_RECRUITERS,
+    ContactIn,
+    clean_email,
+    clean_phone,
+    event_meta,
+    format_in_zone,
+    recruiters_of,
+    set_primary_recruiter,
+    set_recruiters,
+    to_utc,
+    zone,
+)
+from app.services.llm import LLMCall, LLMClient
+from app.services.resume_format import flatten_links, unbold
+from app.services.sources import (
+    UA,
+    import_remote_run,
+    list_remote_runs,
+    refresh_apify_run,
+    start_apify_search,
+    upsert_job,
+)
+from app.services.user_settings import apify_token, lock_settings_row, settings_for
+from app.services.workflow import (
+    AWAITING_TAILORING_STATUSES,
+    NEEDS_RETAILOR,
+    draft_followup,
+    followup_days,
+    get_profile,
+    resume_edits,
+    update_resume_edit,
+)
 from app.settings import get_settings
 
 router = APIRouter()
@@ -178,8 +225,9 @@ def summary(db: Session = Depends(get_user_db)):
     sp = search_prefs(db).get("search_profile") or {}
     apps = live_apps(db)
     live = [a for a in apps if (a.stage or "applied") not in INACTIVE_STAGES]
-    tailor_count = db.scalar(select(func.count(Job.id)).where(Job.status == "shortlisted", Job.triaged_at.is_not(None),
-                                                              ~Job.resumes.any())) or 0
+    tailor_count = db.scalar(select(func.count(Job.id)).where(Job.status.in_(AWAITING_TAILORING_STATUSES),
+                                                              Job.triaged_at.is_not(None),
+                                                              or_(Job.status == NEEDS_RETAILOR, ~Job.resumes.any()))) or 0
     last_run = db.scalar(select(SearchRun).order_by(desc(SearchRun.id)).limit(1))
     return {
         "counts": {"today": len(today_actions(db)), "discovery": db.scalar(select(func.count()).select_from(triage_query(db).subquery())) or 0,
@@ -296,13 +344,19 @@ def today_actions(db: Session) -> list[dict]:
                             "fit": job.fit_score, "priority": 0, "minutes": 6,
                             "reason": f"Tailored packet scored {resume.reviewer_score:.0f} with the reviewer."
                                       + (f" {gaps} gap flag{'s' if gaps != 1 else ''} to check." if gaps else "")})
-    for job in db.scalars(select(Job).where(Job.status == "shortlisted", Job.triaged_at.is_not(None), ~Job.resumes.any())
+    for job in db.scalars(select(Job).where(Job.status.in_(AWAITING_TAILORING_STATUSES), Job.triaged_at.is_not(None),
+                                            or_(Job.status == NEEDS_RETAILOR, ~Job.resumes.any()))
                           .order_by(desc(Job.fit_score)).limit(5)).all():
         matches = len((job.fit_analysis or {}).get("strong_matches") or [])
+        if job.status == NEEDS_RETAILOR:
+            resume = latest_resume(db, job.id)
+            reasons = (resume.reviewer_notes or {}).get("decision_reasons") if resume else None
+            reason = "Review sent this packet back to be tailored again." + (f" {reasons[0]}" if reasons else "")
+        else:
+            reason = (f"Shortlisted {ago(job.triaged_at or job.discovered_at)}."
+                      + (f" {matches} strong matches in your evidence." if matches else ""))
         actions.append({"kind": "tailor", "job_id": job.id, "company": job.company, "title": job.title,
-                        "fit": job.fit_score, "priority": 1, "minutes": 12,
-                        "reason": f"Shortlisted {ago(job.triaged_at or job.discovered_at)}."
-                                  + (f" {matches} strong matches in your evidence." if matches else "")})
+                        "fit": job.fit_score, "priority": 1, "minutes": 12, "reason": reason})
     for app in live_apps(db):
         if app.stage == "applied" and app.followup_due_at and app.followup_due_at <= now:
             days = (now - app.applied_at).days
@@ -426,9 +480,9 @@ class BulkTriageIn(BaseModel):
 def apply_triage(job: Job, action: str) -> None:
     if action not in TRIAGE_ACTIONS:
         raise HTTPException(422, "Unknown triage action")
-    if job.status in ("tailored", "approved", "applied", "pending_approval") and action != "shortlist":
+    if job.status in ("tailored", NEEDS_RETAILOR, "approved", "applied", "pending_approval") and action != "shortlist":
         raise HTTPException(409, "This job already has a tailored packet or application")
-    if job.status not in ("tailored", "approved", "applied", "pending_approval"):
+    if job.status not in ("tailored", NEEDS_RETAILOR, "approved", "applied", "pending_approval"):
         job.status = TRIAGE_ACTIONS[action]
     job.triaged_at = None if action == "restore" else utcnow()
 
@@ -834,7 +888,8 @@ def keyword_coverage(job: Job, resume: ResumeVariant | None) -> list[dict]:
 # Status filters for the Tailor and Approvals screens: filter name -> test on a row.
 TAILOR_STATUS_FILTERS = {
     "not_tailored": lambda r: not r["has_resume"],
-    "has_packet": lambda r: r["has_resume"] and r["status"] != "pending_approval",
+    "has_packet": lambda r: r["has_resume"] and r["status"] not in ("pending_approval", NEEDS_RETAILOR),
+    "needs_retailor": lambda r: r["status"] == NEEDS_RETAILOR,
     "sent_back": lambda r: r["status"] == "pending_approval",
     "untailored": lambda r: r["untailored"],  # packet uses the master resume unchanged
 }
@@ -879,7 +934,8 @@ def filter_packet_rows(rows: list[dict], *, q: str, min_fit: int, min_review: in
 def tailor_queue(q: str = "", min_fit: int = 0, min_review: int = 0, board: str = "all", status: str = "all",
                  sort: str = "fit", with_facets: bool = False, db: Session = Depends(get_user_db)):
     # AI-ranked jobs only reach Tailor once you have confirmed the shortlist in triage.
-    jobs = db.scalars(select(Job).where(or_(and_(Job.status == "shortlisted", Job.triaged_at.is_not(None)),
+    jobs = db.scalars(select(Job).where(or_(and_(Job.status.in_(AWAITING_TAILORING_STATUSES),
+                                                 Job.triaged_at.is_not(None)),
                                             Job.status.in_(("tailored", "pending_approval"))))
                       .order_by(desc(Job.fit_score))).all()
     # The reviewer score and ATS keyword coverage of each job's latest packet, so the queue shows
@@ -898,7 +954,9 @@ def tailor_queue(q: str = "", min_fit: int = 0, min_review: int = 0, board: str 
                      "reviewer_score": resume.reviewer_score if resume else None,
                      "ats_pct": round(100 * covered / len(coverage)) if coverage else None,
                      "untailored": bool((resume.content or {}).get("untailored")) if resume else False,
-                     "resume_version": resume.version if resume else None})
+                     "resume_version": resume.version if resume else None,
+                     "review_decision": (resume.reviewer_notes or {}).get("decision") if resume else None,
+                     "review_reasons": ((resume.reviewer_notes or {}).get("decision_reasons") or [])[:3] if resume else []})
     return filter_packet_rows(rows, q=q, min_fit=min_fit, min_review=min_review, board=board, status=status, sort=sort,
                               status_filters=TAILOR_STATUS_FILTERS, with_facets=with_facets)
 
