@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.prompts.common import (
+    JOB_REQUIREMENTS_RULE,
     JSON_ONLY_RULE,
     UNTRUSTED_DATA_RULE,
     UNVERIFIED_FACTS_RULE,
@@ -11,6 +12,7 @@ from app.prompts.common import (
     context_value,
     instructions,
     job_facts,
+    job_sections,
     profile_facts,
     resume_facts,
     section,
@@ -19,7 +21,7 @@ from app.prompts.common import (
     user_message,
 )
 
-REVIEW_PROMPT_VERSION = "v2"
+REVIEW_PROMPT_VERSION = "v3"
 REVIEW_MARKER = "REVIEW_RESUME"
 REVIEW_RECOMMENDATIONS = ("approve", "revise", "reject")
 
@@ -37,6 +39,8 @@ Penalize unsupported claims and vague bullets heavily. Do not rewrite the resume
     "in the tailored resume must match them, and metrics must appear in them or in VERIFIED EVIDENCE. A claim that "
     "repeats a REJECTED RESUME FACT, or that rests on unverified information while CANDIDATE POLICY does not allow "
     "it, is an unsupported claim and a reject reason.",
+    JOB_REQUIREMENTS_RULE + " Judge coverage against the REQUIRED requirements, and list the ones the resume does "
+    "not address in missing_requirements. source_text quotes the posting: use it when you doubt a requirement.",
     UNVERIFIED_FACTS_RULE,
     JSON_ONLY_RULE,
     f"""Fields:
@@ -72,7 +76,9 @@ def build_review_prompt(candidate_profile: Any, evidence: list[dict[str, Any]] |
         *truth,
         section("VERIFIED EVIDENCE", to_json(evidence or [], limit=32000)),
         section("JOB", to_json(job_facts(job))),
-        untrusted("JOB DESCRIPTION", "untrusted_job_description", getattr(job, "description", ""), limit=24000),
+        *job_sections(context, with_source=True),
+        "" if context is not None and (context_value(context, "job_context", {}) or {}).get("structured")
+        else untrusted("JOB DESCRIPTION", "untrusted_job_description", getattr(job, "description", ""), limit=24000),
         untrusted("TAILORED RESUME", "untrusted_tailored_resume", tailored_resume, limit=24000),
     )
     return Prompt("review", REVIEW_PROMPT_VERSION, REVIEW_MARKER, REVIEW_SYSTEM, user)

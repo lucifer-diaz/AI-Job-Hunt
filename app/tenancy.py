@@ -23,12 +23,13 @@ from sqlalchemy import event
 from sqlalchemy.orm import Session, with_loader_criteria
 
 from app.models import (AIOptimizationReport, AIOptimizationTask, AppSetting, Application, ApplicationEvent, CandidateProfile, Evidence, FollowUp, Job, JobRanking,
-                        JobRankingTask, KnowledgeAnswer, Resume, ResumeDataChange, ResumeDocument, ResumeVariant, ResumeVersion, SearchProfile,
+                        JobDescriptionParseTask, JobRankingTask, JobRequirementEvidence, JobStructuredDataChange, KnowledgeAnswer, Resume, ResumeDataChange, ResumeDocument, ResumeVariant, ResumeVersion, SearchProfile,
                         SearchRun, TailorTask, WorkflowTransition)
 
 OWNED_MODELS = (CandidateProfile, AppSetting, ResumeDocument, KnowledgeAnswer, Evidence, Job, SearchRun, SearchProfile,
                 Application, ResumeVariant, WorkflowTransition, ApplicationEvent, FollowUp, TailorTask, ResumeVersion,
-                JobRankingTask, JobRanking, AIOptimizationTask, AIOptimizationReport, Resume, ResumeDataChange)
+                JobRankingTask, JobRanking, AIOptimizationTask, AIOptimizationReport, Resume, ResumeDataChange, JobRequirementEvidence,
+                JobStructuredDataChange, JobDescriptionParseTask)
 # Rows that inherit their owner from a parent row: model -> (relationship, foreign key, parent model).
 INHERITED_OWNER = {
     Application: ("job", "job_id", Job),
@@ -36,6 +37,9 @@ INHERITED_OWNER = {
     TailorTask: ("job", "job_id", Job),
     JobRankingTask: ("job", "job_id", Job),
     JobRanking: ("job", "job_id", Job),
+    JobRequirementEvidence: ("job", "job_id", Job),
+    JobStructuredDataChange: ("job", "job_id", Job),
+    JobDescriptionParseTask: ("job", "job_id", Job),
     WorkflowTransition: ("job", "job_id", Job),
     ApplicationEvent: ("application", "application_id", Application),
     FollowUp: ("application", "application_id", Application),

@@ -18,6 +18,10 @@ from app.prompts.inbox import (
                                        INBOX_PROMPT_VERSION,
                                        build_inbox_classification_prompt,
 )
+from app.prompts.job_description_parser import (
+                                       JOB_DESCRIPTION_PARSER_PROMPT_VERSION,
+                                       build_job_description_parser_prompt,
+)
 from app.prompts.ranking import RANKING_PROMPT_VERSION, build_ranking_prompt
 from app.prompts.resume_parser import (
                                        EVIDENCE_EXTRACTION_PROMPT_VERSION,
@@ -35,6 +39,7 @@ PROMPT_VERSIONS = {
     "review": REVIEW_PROMPT_VERSION,
     "followup": FOLLOWUP_PROMPT_VERSION,
     "resume_parser": RESUME_PARSER_PROMPT_VERSION,
+    "job_description_parser": JOB_DESCRIPTION_PARSER_PROMPT_VERSION,
     "evidence_extraction": EVIDENCE_EXTRACTION_PROMPT_VERSION,
     "application_question": APPLICATION_QUESTION_PROMPT_VERSION,
     "inbox": INBOX_PROMPT_VERSION,
@@ -43,15 +48,16 @@ PROMPT_VERSIONS = {
 }
 
 __all__ = [
-                                       "build_ai_optimization_prompt",
                                        "INBOX_CATEGORIES",
                                        "PROMPT_VERSIONS",
                                        "Prompt",
+                                       "build_ai_optimization_prompt",
                                        "build_application_question_prompt",
                                        "build_cover_letter_prompt",
                                        "build_evidence_extraction_prompt",
                                        "build_followup_prompt",
                                        "build_inbox_classification_prompt",
+                                       "build_job_description_parser_prompt",
                                        "build_ranking_prompt",
                                        "build_resume_parser_prompt",
                                        "build_review_prompt",

@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.prompts.common import (
+    JOB_REQUIREMENTS_RULE,
     JSON_ONLY_RULE,
     NO_INVENTION_RULE,
     UNTRUSTED_DATA_RULE,
@@ -16,6 +17,7 @@ from app.prompts.common import (
     context_value,
     experience_facts,
     instructions,
+    job_sections,
     profile_facts,
     section,
     to_json,
@@ -23,7 +25,7 @@ from app.prompts.common import (
     user_message,
 )
 
-RANKING_PROMPT_VERSION = "v3"
+RANKING_PROMPT_VERSION = "v4"
 RANKING_MARKER = "FIT_ANALYSIS"
 QUALIFICATION_RECOMMENDATIONS = ("QUALIFY", "ARCHIVE")
 SCORE_FIELDS = ("overall_fit_score", "candidate_fit_score", "resume_fit_score", "seniority_match_score",
@@ -54,6 +56,7 @@ resume fails to show in resume_gaps and where it should focus in recommended_res
     "The candidate's facts are a selection made for this job (app context builder): RELEVANT EXPERIENCE keeps every "
     "role header but only the bullets that relate to the posting, so do not penalize the absence of unrelated "
     "detail. When only ACTIVE RESUME is given, it is the resume as written.",
+    JOB_REQUIREMENTS_RULE + " When only JOB DESCRIPTION is given, the posting has not been parsed: read it yourself.",
     UNVERIFIED_FACTS_RULE + " When a match rests only on unverified facts, count it as a partial match and lower "
     "confidence. relevant_evidence_ids may only name VERIFIED EVIDENCE ids.",
     "confidence (0-1) is how sure you are of the analysis given how complete the posting and the candidate's facts "
@@ -127,11 +130,14 @@ def build_ranking_prompt(candidate_profile: Any, resume: str = "", evidence: lis
             untrusted("ACTIVE RESUME", "untrusted_resume", resume, limit=20000),
             section("VERIFIED EVIDENCE", to_json(evidence or [], limit=30000)),
         ]
+    requirements = job_sections(context, with_source=True) if context is not None else []
     user = user_message(
         RANKING_MARKER,
         f"JOB ID: {int(getattr(job, 'id', None) or 0)}",
         *data_sections,
         section("JOB POSTING", to_json(posting_facts(job))),
-        untrusted("JOB DESCRIPTION", "untrusted_job_description", getattr(job, "description", ""), limit=24000),
+        *requirements,
+        "" if requirements else untrusted("JOB DESCRIPTION", "untrusted_job_description",
+                                          getattr(job, "description", ""), limit=24000),
     )
     return Prompt("ranking", RANKING_PROMPT_VERSION, RANKING_MARKER, RANKING_SYSTEM, user)

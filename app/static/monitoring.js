@@ -50,7 +50,8 @@ const monTokens = n => n == null ? '—' : n >= 1e6 ? `${(n / 1e6).toFixed(1)}M`
 function monSelection(sel) {
   if (!sel || !sel.requests) return '';
   const line = x => `${monTokens(x.full_available_context_tokens)} available · ${monTokens(x.selected_context_tokens)} sent · ${x.context_reduction_percent == null ? '—' : x.context_reduction_percent.toFixed(1) + '%'} reduction`;
-  return `<div class="mt10" data-mon-selection><div class="caps-sm mb8">Context selection</div><div class="small">${line(sel)}</div>${sel.by_stage.map(x => `<div class="xs muted">${esc(monStage(x.stage))}: ${line(x)}</div>`).join('')}</div>`;
+  const jobLine = x => !x.job_requests ? '' : ` · job description ${monTokens(x.raw_job_tokens)} → ${monTokens(x.selected_job_context_tokens)} (${x.job_context_reduction_percent == null ? '—' : x.job_context_reduction_percent.toFixed(1) + '%'})`;
+  return `<div class="mt10" data-mon-selection><div class="caps-sm mb8">Context selection</div><div class="small">${line(sel)}${jobLine(sel)}</div>${sel.by_stage.map(x => `<div class="xs muted">${esc(monStage(x.stage))}: ${line(x)}${jobLine(x)}</div>`).join('')}</div>`;
 }
 const monMs = ms => ms == null ? '—' : ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`;
 const monPct = (r, digits = 1) => r == null ? '—' : `${(r * 100).toFixed(digits)}%`;

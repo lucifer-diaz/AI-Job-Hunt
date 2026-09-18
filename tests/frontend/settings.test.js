@@ -7,8 +7,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const settingsSource = readFileSync('app/static/settings.js', 'utf8');
 const resumeDataSource = readFileSync('app/static/resume_data.js', 'utf8');
 const monitoringSource = readFileSync('app/static/monitoring.js', 'utf8');
+const jobDataSource = readFileSync('app/static/job_data.js', 'utf8');
 const appSource = readFileSync('app/static/app.js', 'utf8').split('/* ───────────── boot ───────────── */')[0];
-const names = ['S', 'D', 'A', 'setF', 'render', 'readHash', 'setHash', 'settingsNavigate', 'settingsChanges', 'settingsPayload', 'settingsDirty', 'settingsCanLeave', 'settingsSave', 'settingsUploadResume', 'settingsUseResume', 'profileCompleteness', 'addTags', 'commitTag', 'SETTING_ERRORS', 'SETTINGS_SECTIONS', 'SETTINGS_ACTIONS', 'RD', 'resumeDataDirty', 'rdReset'];
+const names = ['S', 'D', 'A', 'setF', 'render', 'readHash', 'setHash', 'settingsNavigate', 'settingsChanges', 'settingsPayload', 'settingsDirty', 'settingsCanLeave', 'settingsSave', 'settingsUploadResume', 'settingsUseResume', 'profileCompleteness', 'addTags', 'commitTag', 'SETTING_ERRORS', 'SETTINGS_SECTIONS', 'SETTINGS_ACTIONS', 'RD', 'resumeDataDirty', 'rdReset', 'JD', 'renderJobStructured', 'jobDataInput'];
 let ui, fetchMock, context;
 function response(data, status = 200) { return { ok: status < 400, status, text: async () => JSON.stringify(data) }; }
 function data() {
@@ -34,6 +35,7 @@ beforeEach(() => {
     context = createContext({ document, window, location, history, navigator, URLSearchParams, FormData, File, setTimeout, clearTimeout, setInterval, clearInterval, console });
     runInContext(settingsSource, context, { filename: resolve('app/static/settings.js') });
     runInContext(resumeDataSource, context, { filename: resolve('app/static/resume_data.js') });
+    runInContext(jobDataSource, context, { filename: resolve('app/static/job_data.js') });
     runInContext(monitoringSource, context, { filename: resolve('app/static/monitoring.js') });
     runInContext(appSource, context, { filename: resolve('app/static/app.js') });
     ui = runInContext(`({${names.join(',')}})`, context);
@@ -518,5 +520,106 @@ describe('resume data', () => {
     route({ 'GET /api/settings/resume': { __status: 500, body: { detail: 'boom' } } });
     await ui.A['rd-reload'](); 
     expect(document.getElementById('view').innerHTML).toContain('could not be loaded');
+  });
+});
+
+describe('structured job description', () => {
+  const requirement = (id, level, value, source) => ({ id, type: 'SKILL', value, level, confidence: 0.9, derived: false, source_text: source, source_section: 'Requirements' });
+  function payload(overrides = {}) {
+    return {
+      job_id: 7, status: 'PARSED', version: 'v1', parsed_at: '2026-09-18T10:00:00',
+      structured_description: {
+        job_identity: { title: 'Data Platform Lead', company: 'Globex', seniority: 'Lead', remote_type: 'hybrid' },
+        role_summary: 'Own the data platform.', responsibilities: ['Own the Kafka pipelines'],
+        required_skills: ['Strong experience with Python is required.'], preferred_skills: ['Familiarity with Kubernetes is a plus.'],
+        experience_requirements: { minimum_years: 8, maximum_years: null, leadership_required: true, management_required: null },
+        technical_domains: ['streaming'], leadership_expectations: ['Mentor engineers'], education_requirements: [],
+        location_requirements: { country: 'Singapore', city: null, relocation_supported: null, visa_sponsorship: null, work_authorization_required: null },
+        compensation: { min: 180000, max: 220000, currency: 'USD', period: 'year', source: 'job_description' },
+        hard_requirements: [], nice_to_have: [], keywords: [], company_context: [],
+        derived_signals: { likely_interview_domains: ['distributed systems'], likely_system_design_topics: [], likely_leadership_topics: [], likely_business_topics: [] },
+      },
+      requirements: [requirement('req_001', 'REQUIRED', 'Strong experience with Python is required.', 'Strong experience with Python is required.'),
+        requirement('req_002', 'PREFERRED', 'Familiarity with Kubernetes is a plus.', 'Familiarity with Kubernetes is a plus.')],
+      counts: { REQUIRED: 1, PREFERRED: 1, INFORMATIONAL: 0, UNKNOWN: 0 },
+      candidate: null, has_candidate: false, parse_task: { status: 'COMPLETED', attempt_count: 1, last_error: null },
+      derived_label: 'likely / inferred preparation topics, not stated by the employer', normalized_description: 'Requirements',
+      ...overrides,
+    };
+  }
+  function settle() { return new Promise(r => setTimeout(r, 0)); }
+  function routes(map) {
+    fetchMock.mockImplementation(async (url, opt = {}) => {
+      const key = `${opt.method || 'GET'} ${url}`;
+      const hit = Object.entries(map).find(([k]) => key === k);
+      if (!hit) return response({});
+      const value = typeof hit[1] === 'function' ? hit[1](JSON.parse(opt.body || 'null')) : hit[1];
+      return response(value);
+    });
+  }
+  async function open(data = payload()) {
+    routes({ 'GET /api/jobs/7/structured-description': data });
+    ui.S.screen = 'discovery'; ui.S.jobOpen = 7; ui.S.jobTab = 'structured';
+    ui.D.jobModal = { id: 7, title: 'Data Platform Lead', company: 'Globex', location: 'Singapore', board: 'linkedin',
+      posted: 'today', fit: 80, fit_analysis: {}, matches: [], gaps: [], missing: [], keywords: [], wizard: [],
+      gap_notes: [], status: 'discovered', description: 'raw', notes: '', summary: '', resume_id: null, rank_pct: null };
+    ui.JD.data = null; ui.JD.draft = null; ui.JD.view = 'summary'; ui.JD.jobId = null; ui.JD.error = '';
+    ui.render(); await settle();
+  }
+
+  it('shows requirements by level with the employer sentence behind each one', async () => {
+    await open();
+    const view = document.body.innerHTML;
+    expect(view).toContain('Structured JD');
+    expect(view).toContain('1 required · 1 preferred');
+    expect(document.querySelector('[data-jd-req="req_001"]').textContent).toContain('Required');
+    expect(document.querySelector('[data-jd-req="req_002"]').textContent).toContain('Preferred');
+    expect(document.querySelector('[data-jd-req="req_001"] blockquote').textContent).toContain('Strong experience with Python');
+    // Derived topics are labelled as inferred, never as employer statements.
+    const derived = document.querySelector('[data-jd-derived]').textContent;
+    expect(derived).toContain('Inferred');
+    expect(derived).toContain('not stated by the employer');
+    expect(derived).toContain('distributed systems');
+    // Unstated facts say so rather than guessing.
+    expect(view).toContain('sponsorship not stated');
+  });
+
+  it('corrects a value and sends typed structured data', async () => {
+    let sent;
+    await open();
+    routes({ 'PUT /api/jobs/7/structured-description': body => { sent = body; return payload({ status: 'MANUALLY_CORRECTED' }); } });
+    ui.A['jd-edit']();
+    input('jd-job_identity-seniority', 'Staff');
+    input('jd-experience_requirements-minimum_years', '10');
+    const tri = document.getElementById('jd-location_requirements-visa_sponsorship');
+    tri.value = 'false'; tri.dispatchEvent(new Event('input', { bubbles: true }));
+    await ui.A['jd-save']({ dataset: { id: '7' } });
+    expect(sent.structured_description.job_identity.seniority).toBe('Staff');
+    expect(sent.structured_description.experience_requirements.minimum_years).toBe(10);
+    expect(sent.structured_description.location_requirements.visa_sponsorship).toBe(false);
+    expect(ui.JD.data.status).toBe('MANUALLY_CORRECTED');
+    expect(ui.JD.draft).toBeNull();
+  });
+
+  it('compares a re-parse of a corrected job and sends only the chosen values', async () => {
+    let decisions;
+    const candidate = { version: 'v1', changes: [{ id: 'chg_1', path: 'job_identity.seniority', current: 'Staff', proposed: 'Lead', corrected: true }] };
+    await open(payload({ status: 'MANUALLY_CORRECTED' }));
+    routes({ 'POST /api/jobs/7/structured-description/reparse': payload({ status: 'MANUALLY_CORRECTED', candidate, has_candidate: true }),
+      'POST /api/jobs/7/structured-description/reparse/resolve': body => { decisions = body.decisions; return payload(); } });
+    await ui.A['jd-reparse']({ dataset: { id: '7' } });
+    expect(document.querySelector('[data-jd-compare]').textContent).toContain('your correction');
+    ui.A['jd-decide']({ dataset: { change: 'chg_1', choice: 'use_new' } });
+    await ui.A['jd-resolve']({ dataset: {} });
+    expect(decisions).toEqual({ chg_1: 'use_new' });
+  });
+
+  it('explains an unparsed posting and shows the change history', async () => {
+    await open(payload({ status: 'RAW', structured_description: null, requirements: [], parse_task: { status: 'PENDING', attempt_count: 0, last_error: null } }));
+    expect(document.body.innerHTML).toContain('queued for parsing');
+    expect(document.querySelector('[data-act="jd-edit"]').disabled).toBe(true);
+    routes({ 'GET /api/jobs/7/structured-description/history': { items: [{ id: 1, field_path: 'job_identity.seniority', old_value: 'Lead', new_value: 'Staff', change_source: 'USER', created_at: '2026-09-18T11:00:00' }] } });
+    await ui.A['jd-history']({ dataset: { id: '7' } });
+    expect(document.querySelector('[data-jd-change-source="USER"]').textContent).toContain('job_identity.seniority');
   });
 });

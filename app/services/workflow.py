@@ -74,7 +74,7 @@ def tailor_job(db: Session, job: Job, progress: Progress = _no_progress) -> Resu
     prompt = build_tailoring_prompt(candidate_profile=profile, job=job, fit_analysis=job.fit_analysis,
                                     fit_score=job.fit_score, context=context)
     content = {**llm.generate_prompt_json(prompt, LLMCall(workflow_type="job", entity_id=job.id,
-                                                          context_stats=context.stats.as_dict())),
+                                                          context_stats=context.call_stats())),
                "prompt_version": prompt.version}
     content = trusted_content(content, context)
     content["cover_letter"] = write_cover_letter(db, profile, job, llm)
@@ -102,7 +102,7 @@ def write_cover_letter(db: Session, profile: CandidateProfile, job: Job, llm: LL
     context = build_cover_letter_context(db, profile, job)
     prompt = build_cover_letter_prompt(context, recruiters=recruiters_of(job.application) if job.application else [])
     result = llm.generate_prompt_json(prompt, LLMCall(workflow_type="job", entity_id=job.id,
-                                                      context_stats=context.stats.as_dict()))
+                                                      context_stats=context.call_stats()))
     return to_plain(str(result.get("cover_letter") or "")).strip()
 
 
@@ -299,7 +299,7 @@ def review_resume(db: Session, resume: ResumeVariant) -> dict:
     context = build_review_context(db, profile, job)  # verified structured truth to check the text against
     prompt = build_review_prompt(candidate_profile=profile, job=job, tailored_resume=resume.markdown, context=context)
     result = {**llm.generate_prompt_json(prompt, LLMCall(workflow_type="job", entity_id=resume.job_id,
-                                                         context_stats=context.stats.as_dict())),
+                                                         context_stats=context.call_stats())),
               "prompt_version": prompt.version}
     resume.reviewer_score = float(result.get("score", 0))
     resume.reviewer_notes = result
@@ -376,7 +376,7 @@ def draft_followup(db: Session, app: Application, commit: bool = True) -> Follow
         application={"status": app.status, "applied_at": app.applied_at.isoformat() if app.applied_at else ""},
         recruiters=recruiters_of(app), previous_followups=[text for text in sent if text])
     result = llm.generate_prompt_json(prompt, LLMCall(workflow_type="application", entity_id=app.id,
-                                                      context_stats=context.stats.as_dict()))
+                                                      context_stats=context.call_stats()))
     fu = db.scalar(select(FollowUp).where(FollowUp.application_id == app.id, FollowUp.status == "draft")
                    .order_by(desc(FollowUp.id)).limit(1))
     if not fu:

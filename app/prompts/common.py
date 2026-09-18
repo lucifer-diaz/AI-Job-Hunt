@@ -116,3 +116,26 @@ def resume_facts(context: Any) -> dict[str, Any]:
             "experience": experience_facts(context), "skills": context_value(context, "relevant_skills", []),
             "education": context_value(context, "education", []),
             "certifications": context_value(context, "certifications", [])}
+
+
+JOB_REQUIREMENTS_RULE = (
+    "JOB REQUIREMENTS is the posting parsed into structured requirements, each taken from the posting's own words. "
+    "level REQUIRED is what the employer asks for; PREFERRED is a plus and is never treated as required; "
+    "INFORMATIONAL describes the role or company and asks nothing of the candidate. Entries with \"derived\": true "
+    "are the application's inference, not employer statements. candidate_matches and candidate_gaps are computed by "
+    "the application from verified candidate facts: check them, and spend your attention on what they cannot settle."
+)
+
+
+def job_sections(context: Any, *, with_source: bool = False) -> list[str]:
+    """The posting for a prompt: structured requirements when it has been parsed, the raw advert when it has not."""
+    job = context_value(context, "job_context", {}) or {}
+    if not job.get("structured"):
+        return []
+    fields = ("identity", "role_summary", "required", "preferred", "responsibilities", "leadership_expectations",
+              "technical_domains", "education_requirements", "experience_requirements", "location_requirements",
+              "compensation", "hard_requirements", "candidate_matches", "candidate_gaps")
+    body = {key: job[key] for key in fields if job.get(key)}
+    if with_source and job.get("source_evidence"):
+        body["source_evidence"] = job["source_evidence"]
+    return [section("JOB REQUIREMENTS", to_json(body, limit=24000))]

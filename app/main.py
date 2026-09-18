@@ -27,6 +27,7 @@ from app.db import engine
 from app.db_migrations import run_migrations
 from app.hunter_api import router as hunter_router
 from app.monitoring_api import router as monitoring_router
+from app.job_description_api import router as job_description_router
 from app.resume_api import router as resume_router
 from app.models import (
     Application,
@@ -124,6 +125,7 @@ app.include_router(workspace_router)
 app.include_router(hunter_router)
 app.include_router(monitoring_router)
 app.include_router(resume_router)
+app.include_router(job_description_router)
 
 # Reachable without signing in. Cron and admin routes are protected by their own secrets.
 PUBLIC_PATHS = {"/health", "/login", "/signup", "/api/auth/login", "/api/auth/signup", "/api/auth/logout"}

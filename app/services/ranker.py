@@ -37,15 +37,38 @@ from sqlalchemy import and_, desc, exists, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models import (ACTIVE_RANKING_TASK_STATUSES, AppSetting, CandidateProfile, Evidence, Job, JobRanking,
-                        JobRankingTask, ResumeDocument, ResumeVersion)
-from app.prompts.ranking import (QUALIFICATION_RECOMMENDATIONS, RANKING_PROMPT_VERSION, build_ranking_prompt,
-                                 posting_facts, ranking_profile_facts)
+from app.models import (
+    ACTIVE_RANKING_TASK_STATUSES,
+    AppSetting,
+    CandidateProfile,
+    Evidence,
+    Job,
+    JobRanking,
+    JobRankingTask,
+    ResumeDocument,
+    ResumeVersion,
+)
+from app.prompts.ranking import (
+    QUALIFICATION_RECOMMENDATIONS,
+    RANKING_PROMPT_VERSION,
+    build_ranking_prompt,
+    posting_facts,
+    ranking_profile_facts,
+)
+from app.services import job_description
 from app.services.context_builder import build_ranking_context, latest_ranking_context_hash
 from app.services.lifecycle import ErrorCategory, InvalidTransition
 from app.services.lifecycle import WorkflowState as S
-from app.services.llm import (LLMCall, LLMClient, LLMConfigError, LLMError, LLMRateLimitError, LLMResponseError,
-                              LLMResult, LLMTimeoutError)
+from app.services.llm import (
+    LLMCall,
+    LLMClient,
+    LLMConfigError,
+    LLMError,
+    LLMRateLimitError,
+    LLMResponseError,
+    LLMResult,
+    LLMTimeoutError,
+)
 from app.services.user_settings import ai_ready
 from app.services.work_queue import transition
 from app.settings import get_settings
@@ -770,6 +793,9 @@ def _process(db: Session, claimed: TaskClaim, clock: Callable[[], datetime]) -> 
         else resume_problem(profile.master_resume)
     if problem:
         return _wait(db, claimed, problem, clock())
+    waiting = job_description.waiting_reason(db, job)
+    if waiting:  # the posting is being parsed into requirements; the task waits without using an attempt
+        return _wait(db, claimed, waiting, clock())
     snapshot = resume_snapshot(db, profile)
     job, profile = db.get(Job, claimed.job_id), _profile(db, claimed.user_id)  # reloaded after the snapshot commit
     # Only the facts relevant to this job: selected structured resume data and verified evidence.
@@ -782,7 +808,10 @@ def _process(db: Session, claimed: TaskClaim, clock: Callable[[], datetime]) -> 
         resume_content_hash=snapshot.content_hash, profile_hash=_hash(ranking_profile_facts(profile)),
         # Covers the selected resume facts and their verification too, so verifying data leads to a fresh ranking.
         evidence_hash=_hash({"evidence": evidence, "context": latest_ranking_context_hash(context)}),
-        job_hash=_hash({**posting_facts(job), "description": job.description or ""}),
+        # The structured requirements are part of the input: a posting parsed after a ranking is a new input.
+        job_hash=_hash({**posting_facts(job), "description": job.description or "",
+                        "structured": job.structured_description_hash,
+                        "requirements": context.job_context.get("required", []) + context.job_context.get("preferred", [])}),
         verified_ids=frozenset(item["id"] for item in evidence), policy=policy_for(db, claimed.user_id))
     if not claimed.force:
         existing = _identical(db, job.id, inputs)
@@ -793,7 +822,7 @@ def _process(db: Session, claimed: TaskClaim, clock: Callable[[], datetime]) -> 
         verified, job_id = set(inputs.verified_ids), job.id
         result = LLMClient.for_user(db, claimed.user_id).generate_prompt(prompt, LLMCall(
             workflow_type="job", entity_id=job_id, attempt=claimed.attempt,
-            validate=lambda data: validate_output(data, job_id, verified), context_stats=context.stats.as_dict()))
+            validate=lambda data: validate_output(data, job_id, verified), context_stats=context.call_stats()))
         output, discarded = result.validated
     except Exception as exc:  # classified below; a provider failure never archives a job
         db.rollback()
@@ -849,13 +878,14 @@ def _queue_stale(db: Session, now: datetime, limit: int) -> int:
               .group_by(JobRanking.job_id).subquery())
     rows = db.execute(
         select(Job.id, Job.user_id, JobRanking.candidate_profile_id, JobRanking.resume_content_hash,
-               JobRanking.profile_hash, JobRanking.prompt_version)
+               JobRanking.profile_hash, JobRanking.prompt_version, Job.structured_description_parsed_at,
+               JobRanking.created_at)
         .join(latest, latest.c.job_id == Job.id)
         .join(JobRanking, and_(JobRanking.job_id == Job.id, JobRanking.version == latest.c.version))
         .where(Job.state == S.QUALIFIED).order_by(Job.id)).all()
     current: dict[int, CurrentInputs | None] = {}
     queued = 0
-    for job_id, user_id, profile_id, resume_hash, profile_hash, prompt_version in rows:
+    for job_id, user_id, profile_id, resume_hash, profile_hash, prompt_version, parsed_at, ranked_at in rows:
         if queued >= limit:
             break
         if user_id not in current:
@@ -863,7 +893,10 @@ def _queue_stale(db: Session, now: datetime, limit: int) -> int:
         now_inputs = current[user_id]
         if now_inputs is None:
             continue
-        reason = ("prompt_changed" if prompt_version != RANKING_PROMPT_VERSION
+        parsed_after = (get_settings().jd_rerank_after_parse and parsed_at is not None
+                        and ranked_at is not None and parsed_at > ranked_at)
+        reason = ("job_parsed" if parsed_after
+                  else "prompt_changed" if prompt_version != RANKING_PROMPT_VERSION
                   else "resume_changed" if resume_hash != now_inputs.resume_hash
                   else "profile_changed" if profile_hash != now_inputs.profile_hash or profile_id != now_inputs.profile_id
                   else None)
@@ -994,7 +1027,7 @@ def tracker(db: Session, user_id: int, now: datetime | None = None) -> dict[str,
     """
     now = now or utcnow()
     since = now - TRACKER_WINDOW
-    count = lambda *where: db.scalar(select(func.count()).select_from(JobRankingTask).where(  # noqa: E731
+    count = lambda *where: db.scalar(select(func.count()).select_from(JobRankingTask).where(
         JobRankingTask.user_id == user_id, *where)) or 0
     active_where = JobRankingTask.status.in_(ACTIVE_RANKING_TASK_STATUSES)
     finished_where = and_(JobRankingTask.status.in_((COMPLETED, FAILED, SKIPPED)), JobRankingTask.completed_at >= since)

@@ -115,6 +115,18 @@ class Settings(BaseSettings):
     ranking_wait_seconds: int = 900
     ranking_enqueue_batch_size: int = 200
     ranking_max_evidence: int = 40
+    # Structured job descriptions (app.services.job_description)
+    jd_parse_enabled: bool = True
+    jd_parse_interval_minutes: int = 3
+    jd_parse_batch_size: int = 10
+    jd_parse_concurrency: int = 3
+    jd_parse_enqueue_batch_size: int = 100
+    jd_parse_lease_seconds: int = 600
+    jd_parse_max_attempts: int = 3
+    jd_parse_retry_seconds: int = 120
+    # Re-rank qualified jobs once their description has been parsed. Off by default: parsing a backlog would
+    # otherwise start a round of ranking calls.
+    jd_rerank_after_parse: bool = False
     # Re-rank qualified jobs automatically when the profile, the active resume or the ranking prompt changes.
     ranking_auto_rerank: bool = True
     compensation_batch_size: int = 50

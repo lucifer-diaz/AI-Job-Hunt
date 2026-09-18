@@ -494,7 +494,7 @@ def _bullets(values: list[Any], ids: _Ids, prefix: str, parent: str) -> list[dic
     return out
 
 
-def _within_limits(model: type[BaseModel], value: Any) -> Any:
+def within_limits(model: type[BaseModel], value: Any) -> Any:
     """Parser output trimmed to the input model's list limits, so an unusually long resume still parses."""
     if not isinstance(value, dict):
         return value
@@ -510,14 +510,14 @@ def _within_limits(model: type[BaseModel], value: Any) -> Any:
                 args = getattr(field.annotation, "__args__", ())
                 inner = next((b for a in args for b in getattr(a, "__args__", ()) if isinstance(b, type)
                               and issubclass(b, BaseModel)), None)
-            out[name] = [_within_limits(inner, i) if inner else i for i in item]
+            out[name] = [within_limits(inner, i) if inner else i for i in item]
         elif isinstance(item, str) and limit:
             out[name] = item[:limit]
     return out
 
 
 def fit_parser_output(data: dict[str, Any]) -> dict[str, Any]:
-    return _within_limits(StructuredResumeIn, data)
+    return within_limits(StructuredResumeIn, data)
 
 
 def materialize(source: StructuredResumeIn | dict[str, Any], previous: dict[str, Any] | None = None) -> dict[str, Any]:

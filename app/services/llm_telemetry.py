@@ -34,7 +34,7 @@ log = logging.getLogger("jobhunt.llm_telemetry")
 STAGE_BY_PROMPT = {
     "ranking": "RANKER", "tailoring": "TAILOR", "cover_letter": "TAILOR", "review": "REVIEWER", "resume_parser": "RESUME_PARSER",
     "evidence_extraction": "RESUME_PARSER", "application_question": "APPLICATION", "followup": "FOLLOW_UP",
-    "inbox": "INBOX", "company_insights": "COMPANY_INSIGHTS", "ai_optimization": "ADVISOR",
+    "inbox": "INBOX", "company_insights": "COMPANY_INSIGHTS", "job_description_parser": "OTHER", "ai_optimization": "ADVISOR",
 }
 CONTRIBUTORS = ("system_prompt", "candidate_profile", "resume", "evidence", "job_description", "conversation",
                 "research", "other")
@@ -46,6 +46,7 @@ SECTION_CONTRIBUTOR = {
     "VERIFIED RESUME FACTS": "resume", "UNVERIFIED RESUME FACTS": "resume", "REJECTED RESUME FACTS": "resume",
     "VERIFIED EVIDENCE": "evidence", "KNOWN ANSWERS": "candidate_profile",
     "JOB ID": "job_description", "JOB": "job_description", "JOB POSTING": "job_description",
+    "JOB REQUIREMENTS": "job_description", "POSTING SECTIONS": "job_description",
     "JOB DESCRIPTION": "job_description", "FIT ANALYSIS": "job_description",
     "PREVIOUS FOLLOW-UPS": "conversation", "EMAIL SENDER": "conversation", "EMAIL SUBJECT": "conversation",
     "EMAIL BODY": "conversation", "APPLICATION": "conversation", "KNOWN APPLICATIONS": "conversation",
@@ -220,9 +221,9 @@ def build_entry(attempt: Attempt, *, latency_ms: int, error: BaseException | Non
 
 def _context_selection(stats: dict[str, Any] | None) -> dict[str, Any]:
     stats = stats or {}
-    return {"full_available_context_tokens": stats.get("full_available_context_tokens"),
-            "selected_context_tokens": stats.get("selected_context_tokens"),
-            "context_reduction_percent": stats.get("context_reduction_percent")}
+    return {key: stats.get(key) for key in ("full_available_context_tokens", "selected_context_tokens",
+                                            "context_reduction_percent", "raw_job_tokens",
+                                            "selected_job_context_tokens", "job_context_reduction_percent")}
 
 
 STRUCTURED_OUTPUT_ERRORS = ("SCHEMA_VALIDATION", "INVALID_JSON")

@@ -33,6 +33,7 @@ from sqlalchemy.orm import Session
 from app.models import CandidateProfile, Evidence, Job, KnowledgeAnswer, Resume
 from app.prompts.common import job_facts, profile_facts
 from app.services import resume_verification as rv
+from app.services import job_context as jc
 from app.services import structured_resume as sr
 from app.services.llm_telemetry import estimate_tokens
 from app.services.resume_format import parse_resume
@@ -98,12 +99,15 @@ class TaskContext:
     knowledge: list[dict[str, Any]] = field(default_factory=list)
     certifications: list[dict[str, Any]] = field(default_factory=list)
     job: dict[str, Any] = field(default_factory=dict)
+    # The posting as structured requirements (app.services.job_context), not the whole advert.
+    job_context: dict[str, Any] = field(default_factory=dict)
     fit_analysis: dict[str, Any] | None = None
     policy: dict[str, bool] = field(default_factory=dict)
     # Tailoring only: roles of the master resume as rendered, with the verified bullets tailoring may use.
     roles: list[dict[str, Any]] = field(default_factory=list)
     resume_text: str = ""  # a readable rendering of the selected facts (or the raw text when nothing is structured)
     stats: ContextStats = field(default_factory=ContextStats)
+    job_stats: jc.JobContextStats = field(default_factory=jc.JobContextStats)
 
     @property
     def evidence_ids(self) -> set[int]:
@@ -112,10 +116,16 @@ class TaskContext:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    def call_stats(self) -> dict[str, Any]:
+        """Both sides of context selection, for the LLM request log."""
+        return {**self.stats.as_dict(), **self.job_stats.as_dict()}
+
     def selected_payload(self) -> dict[str, Any]:
         """Everything the prompt receives from this context except the job description, which is measured apart."""
         out = self.to_dict()
         out.pop("stats")
+        out.pop("job_stats", None)
+        out.pop("job_context", None)  # measured by app.services.job_context, not counted twice here
         out["job"] = {k: v for k, v in out["job"].items() if k != "description"}
         return out
 
@@ -277,6 +287,15 @@ def _base(db: Session, profile: CandidateProfile, job: Job, task: str, allowed: 
     return context, data or {}, every, resume
 
 
+def _with_job(context: TaskContext, job: jc.JobContext) -> TaskContext:
+    """Attach the posting's structured requirements. The raw description travels only when nothing was parsed."""
+    context.job_context = job.to_dict()
+    context.job_stats = job.stats
+    if job.structured:
+        context.job = {k: v for k, v in context.job.items() if k != "description"}
+    return context
+
+
 def _render(context: TaskContext) -> str:
     """The selected facts as short readable text (used as the resume section of a prompt)."""
     lines = []
@@ -314,6 +333,7 @@ def build_ranking_context(db: Session, profile: CandidateProfile, job: Job, evid
     policy = candidate_policy(db, profile.user_id)
     allowed = WITH_UNVERIFIED if policy["ranking_uses_unverified"] else VERIFIED_ONLY
     context, _data, every, resume = _base(db, profile, job, "ranking", allowed, evidence_limit)
+    context = _with_job(context, jc.build_ranking_job_context(db, job, candidate=context))
     raw = resume.raw_text if resume is not None else profile.master_resume or ""
     if not context.relevant_experience:
         context.resume_text = raw  # nothing structured to select from: the resume as written
@@ -341,6 +361,7 @@ def build_tailoring_context(db: Session, profile: CandidateProfile, job: Job) ->
                          if r["job_title"] == fact["role"] and r["company"] == fact["company"]), None)
             if role is not None:
                 role["bullets"].append({"id": fact["id"], "text": fact["text"], "type": "unverified"})
+    context = _with_job(context, jc.build_tailoring_job_context(db, job, candidate=context))
     context.roles = master_roles(profile, data, context.relevant_experience)
     context.resume_text = _render(context)
     _measure(context, resume.raw_text if resume is not None else profile.master_resume or "", every, job)
@@ -358,6 +379,7 @@ def build_review_context(db: Session, profile: CandidateProfile, job: Job) -> Ta
             context.relevant_experience.append({"id": role["id"], "job_title": role.get("job_title") or "",
                                                 "company": role.get("company") or "", "location": role.get("location") or "",
                                                 "dates": _dates(role), "technologies": [], "verified": True, "bullets": []})
+    context = _with_job(context, jc.build_review_job_context(db, job))
     context.rejected_facts = [{"id": u.item_id, "section": u.section, "text": u.node.get("text") or rv._label(u)}
                               for u in sr.iter_units(data) if u.status == "REJECTED"]
     context.resume_text = _render(context)
