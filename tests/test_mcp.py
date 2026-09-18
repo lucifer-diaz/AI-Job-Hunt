@@ -107,13 +107,14 @@ def call(user_id, name, **arguments):
     return run_tool(SessionLocal, user_id, name, getattr(tools, name), arguments)
 
 
+def _refuse(*_args, **_kwargs):
+    raise AssertionError("Claude Desktop mode must not call the LLM layer")
+
+
 @pytest.fixture(autouse=True)
 def no_model_calls(monkeypatch):
     """Claude Desktop mode never calls a model API from Job Hunt OS."""
-    def refuse(*_args, **_kwargs):
-        raise AssertionError("MCP operations must not call the LLM layer")
-
-    monkeypatch.setattr(llm.LLMClient, "generate_prompt_json", refuse)
+    monkeypatch.setattr(llm.LLMClient, "generate_prompt_json", _refuse)
 
 
 # ───────────── server ─────────────
@@ -277,6 +278,47 @@ def test_deterministic_tailoring_checks(account, change, code):
     out = call(account["user_id"], "save_tailored_resume", result=result)
     assert out["results"][0]["status"] == "REJECTED"
     assert code in {e["code"] for e in out["results"][0]["errors"]}
+
+
+@pytest.mark.parametrize(("field", "value", "code"), [
+    ("summary", "Backend engineer working across AWS, GCP and Azure.", "UNSUPPORTED_TERM"),
+    ("cover_letter", "I built the payments platform on Kubernetes at Netflix.", "UNSUPPORTED_TERM"),
+    ("summary", "Backend engineer running Python services at 900k requests per second.", "INVENTED_METRIC"),
+    ("screening_answer_drafts", {"stack": "I ship on Bedrock and Vertex AI daily."}, "UNSUPPORTED_TERM"),
+    ("screening_answer_drafts", {"team": "I have led 63 engineers."}, "INVENTED_METRIC"),
+])
+def test_the_summary_cover_letter_and_screening_answers_are_grounded_too(account, field, value, code):
+    """Prose is read as fact, so its numbers and the names it drops are checked like a bullet's."""
+    out = call(account["user_id"], "save_tailored_resume",
+               result=tailored(account["jobs"][0], account["acme"], **{field: value}))
+    assert out["results"][0]["status"] == "REJECTED"
+    assert code in {e["code"] for e in out["results"][0]["errors"]}
+    assert out["results"][0]["errors"][0]["location"].startswith(field)
+
+
+def test_grounded_prose_is_accepted(account):
+    """Naming this job, yourself and your own evidence is fine; nothing here needs a retry."""
+    grab = account["jobs"][0]
+    result = tailored(grab, account["acme"],
+                      summary="Senior Engineer at Acme Corp scaling payments with Python and Kafka.",
+                      cover_letter="Dear Hiring Manager,\n\nI would love to build at Grab. My work on the "
+                                   "payments API at Acme Corp reached 25k requests per second.\n\nSincerely,\n"
+                                   "Test Candidate",
+                      screening_answer_drafts={"authorization": "Singapore: EP (Employment Pass).",
+                                               "stack": "Python, FastAPI and PostgreSQL, with Kafka for streaming."})
+    assert call(account["user_id"], "save_tailored_resume", result=result)["results"][0]["status"] == "SAVED"
+
+
+@pytest.mark.parametrize(("skill", "saved"), [("Go", False), ("Python", True), ("Kafka", True), ("R", False),
+                                              ("PostgreSQL", True), ("Vertex AI", False)])
+def test_skills_are_matched_as_words_not_as_fragments(account, skill, saved):
+    """'Go' must not pass because the corpus says 'Django', and 'R' must not pass on every word with an r."""
+    out = call(account["user_id"], "save_tailored_resume",
+               result=tailored(account["jobs"][0], account["acme"], skills_order=[skill]))
+    result = out["results"][0]
+    assert (result["status"] == "SAVED") is saved
+    if not saved:
+        assert "INVENTED_SKILL" in {e["code"] for e in result["errors"]}
 
 
 def test_unverified_and_other_account_evidence_ids_are_rejected(account):
@@ -475,6 +517,19 @@ def test_backend_mode_still_tailors_and_reviews_with_the_model(monkeypatch):
     client.post(f"/api/jobs/{other['id']}/triage", json={"action": "shortlist"})
     skipped = client.post("/api/tailor-tasks", json={"ids": [other["id"]]}).json()["skipped"]
     assert skipped == [{"id": other["id"], "reason": tailor_tasks.DESKTOP_MODE_REASON}]
+    # A task queued while the backend was in charge is cancelled rather than run with the model API.
+    queued = client.post("/api/jobs/from-url", json={"url": f"https://example.com/jobs/{uuid.uuid4().hex}",
+                                                     "title": "Engineer", "company": "Gamma", "description": "Python"}).json()["job"]
+    client.post(f"/api/jobs/{queued['id']}/triage", json={"action": "shortlist"})
+    client.patch("/api/settings", json={"execution_mode": "backend"})
+    assert len(client.post("/api/tailor-tasks", json={"ids": [queued["id"]]}).json()["queued"]) == 1
+    client.patch("/api/settings", json={"execution_mode": "claude_desktop"})
+    monkeypatch.setattr(llm.LLMClient, "generate_prompt_json", _refuse)
+    tailor_tasks.run_pending(SessionLocal)
+    task = next(t for t in client.get("/api/tailor-tasks").json() if t["job_id"] == queued["id"])
+    assert task["status"] == "cancelled" and task["error"] == tailor_tasks.DESKTOP_MODE_REASON
+    assert client.get(f"/api/tailor/{queued['id']}").json()["resume"] is None
+
     assert client.patch("/api/settings", json={"execution_mode": "cloud"}).status_code == 422
     assert client.patch("/api/settings", json={"min_review_score": 70}).json()["execution_mode"] == "claude_desktop"
     client.patch("/api/settings", json={"execution_mode": "backend"})

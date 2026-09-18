@@ -193,6 +193,12 @@ def run_task(sessions: SessionFactory, task_id: int, worker_id: str, lease_secon
 
     with sessions() as db:
         db.info["user_id"] = user_id
+        # The account may have moved to Claude Desktop mode after this task was queued: a task that was
+        # waiting then must not spend the configured model API now.
+        if execution_mode_for(db, user_id) == "claude_desktop":
+            _write(sessions, task_id, worker_id, status="cancelled", stage="done", error=DESKTOP_MODE_REASON,
+                   locked_by=None, lock_expires_at=None, finished_at=utcnow())
+            return "cancelled"
         try:
             job = db.get(Job, job_id)
             if job is None:

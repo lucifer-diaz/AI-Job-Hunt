@@ -17,6 +17,9 @@ TAILORING_RULES = (
     ("Every rewritten factual bullet cites the evidence it uses in evidence_ids. A bullet with no evidence_ids must "
      "restate a bullet of that role in the master resume."),
     "Only use numbers that appear in the cited evidence or the master resume.",
+    ("The summary, cover_letter and screening_answer_drafts are checked the same way: every number, technology, "
+     "employer and other name in them must already appear in the master resume, the candidate profile or the "
+     "verified evidence. Naming this job's company and role is fine."),
     "skills_order only reorders skills that already appear in the master resume, profile skills or evidence.",
     ("When active_resume.roles is not empty, put bullets in experience_sections under the role_index they belong "
      "to (1-5 per role); otherwise use resume_bullets."),

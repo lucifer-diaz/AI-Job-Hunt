@@ -850,7 +850,7 @@ MCP_BULK_REVIEW_LIMIT=20
 
 Requests above these limits are rejected, not truncated.
 
-**3. Choose the mode (optional).** Settings → Workflow & cadence → *Tailoring & review* → **Claude Desktop**. In that mode, the background tailoring queue skips your jobs, so no model API is called for them. MCP saves never call a model API in either mode.
+**3. Choose the mode (optional).** Settings → Workflow & cadence → *Tailoring & review* → **Claude Desktop**. In that mode, the background tailoring queue skips your jobs, so no model API is called for them. A task queued before you switched is cancelled rather than run. MCP saves never call a model API in either mode.
 
 ### Verifying the connection
 
@@ -897,11 +897,13 @@ Every rewritten factual bullet must cite `evidence_ids`, or restate an existing 
 
 - unknown, unverified or other-account evidence IDs, or evidence from a different employer
 - numbers not found in the cited evidence or the resume
-- skills not found in the resume, profile or evidence
+- skills not found in the resume, profile or evidence (matched as whole words, so "Go" never passes on "Django")
+- technologies, employers and other names dropped into the summary, cover letter or a screening answer that
+  appear nowhere in the resume, profile or evidence (naming the job's own company and role is fine)
 - unknown roles
 - visa or work-authorization wording your profile doesn't state
 
-A rejected item comes back with error codes (`UNKNOWN_EVIDENCE`, `INVENTED_METRIC`, `INVENTED_SKILL`, `UNCITED_CLAIM`, `WORK_AUTHORIZATION`, …), so Claude can fix just that item. Employers, titles and dates are always taken from your master resume. **Your master resume is never modified**, and each save is a new version you can inspect and edit on the Tailor screen.
+A rejected item comes back with error codes (`UNKNOWN_EVIDENCE`, `INVENTED_METRIC`, `INVENTED_SKILL`, `UNSUPPORTED_TERM`, `UNCITED_CLAIM`, `WORK_AUTHORIZATION`, …), so Claude can fix just that item. Employers, titles and dates are always taken from your master resume. **Your master resume is never modified**, and each save is a new version you can inspect and edit on the Tailor screen.
 
 ### Bulk review workflow
 

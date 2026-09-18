@@ -6,6 +6,8 @@ Claude writes the resume; this module decides whether it may be stored. Every ch
 * EVIDENCE_ROLE_MISMATCH  a role's bullet cites evidence recorded for a different employer
 * UNCITED_CLAIM           a bullet with no evidence ID that is not a close restatement of a master resume bullet
 * INVENTED_METRIC         a number that appears in neither the cited evidence nor the master resume
+* UNSUPPORTED_TERM        a technology, employer or other name in the summary, cover letter or a screening answer
+                          that appears nowhere in the master resume, the profile or verified evidence
 * INVENTED_SKILL          a skill found nowhere in the master resume, the profile skills or verified evidence
 * UNKNOWN_ROLE            a role_index the master resume does not have (titles, employers and dates are never taken
                           from the input, so they cannot be changed)
@@ -31,6 +33,19 @@ WORK_AUTH_RE = re.compile(
     r"\b(visas?|sponsor\w*|citizen\w*|permanent resident\w*|work permits?|work authori[sz]\w*|green card|"
     r"employment pass|right to work|h-?1b|pr status|residency)\b", re.IGNORECASE)
 NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)*")
+# Words as the corpus and the checked text are compared: "go" never matches inside "django", and "c++" survives.
+WORD_RE = re.compile(r"[a-z0-9][a-z0-9+#.]*")
+NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9+#./-]*")
+# A sentence, line or clause boundary: the word right after one may be capitalized for grammar alone.
+SEGMENT_RE = re.compile(r"[.!?:;\n]+")
+# Capitalized words that carry no factual claim, so they are never treated as a named technology or employer.
+PROSE_WORDS = frozenset(""" 
+i a an the and or but as at in on for to of with from by we our my your their this that these those it its
+dear hello hi sincerely regards best kind thank thanks thankyou yours respectfully hiring manager team role
+position opening application applicant candidate resume cv company please if when while where what which who
+january february march april may june july august september october november december monday tuesday
+wednesday thursday friday saturday sunday am pm ai ml
+""".split())  # noqa: SIM905 - a readable block, not a literal list
 
 
 class BulletIn(BaseModel):
@@ -88,6 +103,31 @@ def _issue(code: str, location: str, message: str) -> dict[str, str]:
 
 def _numbers(text: str) -> set[str]:
     return {n.replace(",", "") for n in NUMBER_RE.findall(text or "")}
+
+
+def _words(text: str) -> set[str]:
+    """Whole words, so a skill is matched as a word and never as a fragment of another one."""
+    return {word.rstrip(".") for word in WORD_RE.findall((text or "").lower())}
+
+
+def _skill_words(skill: str) -> list[str]:
+    return [word for word in _words(skill) if word]
+
+
+def _named_terms(text: str) -> set[str]:
+    """Names a reader would read as facts: acronyms (GCP, ETL) and words capitalized mid-sentence (Bedrock).
+
+    A word that only opens a sentence or a line is skipped: its capital says nothing about what it claims.
+    """
+    terms = set()
+    for segment in SEGMENT_RE.split(text or ""):
+        for index, token in enumerate(NAME_RE.findall(segment.strip())):
+            word = token.strip(".-").lower()
+            acronym = token.isupper() and len(token) > 1
+            capitalized = token[:1].isupper() and any(c.islower() for c in token[1:])
+            if word and word not in PROSE_WORDS and (acronym or (capitalized and index > 0)):
+                terms.add(word)
+    return terms
 
 
 def verified_evidence(db: Session, job: Job) -> dict[int, Evidence]:
@@ -161,13 +201,34 @@ def validate_tailored_resume(db: Session, profile: CandidateProfile, job: Job, d
         check_bullet(bullet, f"resume_bullets.{b_index}", all_master_lines, "")
 
     prefs = profile.search_preferences or {}
-    skill_corpus = " ".join([master_text, *(str(s) for s in prefs.get("primary_skills") or []),
-                             *(str(s) for s in prefs.get("secondary_skills") or []),
-                             *(" ".join(e.skills or []) + " " + e.claim for e in evidence.values())]).lower()
+    evidence_text = " ".join(f"{e.company} {e.role} {e.claim} {e.context} {' '.join(e.skills or [])} "
+                             f"{' '.join(e.tags or [])}" for e in evidence.values())
+    # Everything the candidate can be said to have done: the resume, their own profile, and verified evidence.
+    supported = _words(" ".join([master_text, evidence_text, profile.headline or "", profile.work_authorization or "",
+                                 *(str(s) for s in prefs.get("primary_skills") or []),
+                                 *(str(s) for s in prefs.get("secondary_skills") or [])]))
     for skill in data.skills_order:
-        if skill.lower() not in skill_corpus:
+        words = _skill_words(skill)
+        if not words or not set(words) <= supported:
             issues.append(_issue("INVENTED_SKILL", "skills_order",
                                  f"'{skill}' is not in the master resume, profile skills or verified evidence"))
+
+    # The summary, cover letter and screening answers are read as fact too, so their numbers and the names
+    # they drop must come from the same places a bullet's do. Naming this job and yourself is always fine.
+    allowed = supported | _words(f"{job.company} {job.title} {profile.name}")
+    supported_numbers = _numbers(master_text + " " + evidence_text)
+    prose = {"summary": data.summary, "cover_letter": data.cover_letter,
+             **{f"screening_answer_drafts.{key}": value for key, value in data.screening_answer_drafts.items()}}
+    for location, text in ({} if legacy else prose).items():
+        invented = sorted(_numbers(text) - supported_numbers)
+        if invented:
+            issues.append(_issue("INVENTED_METRIC", location,
+                                 f"Numbers {invented} are not in the master resume or your verified evidence"))
+        unsupported = sorted(term for term in _named_terms(text) if term not in allowed)
+        if unsupported:
+            issues.append(_issue("UNSUPPORTED_TERM", location,
+                                 f"{unsupported} appear nowhere in the master resume, your profile or verified "
+                                 "evidence; cite them there first or leave them out"))
 
     authorization = (profile.work_authorization or "").lower()
     texts = {"summary": data.summary, "cover_letter": data.cover_letter,
