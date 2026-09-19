@@ -282,6 +282,12 @@ def build_interview_insights_job_context(db: Session, job: Job) -> JobContext:
     return context
 
 
+def _hash_of(document: dict[str, Any] | None) -> str:
+    from app.services.job_description import structured_hash
+
+    return structured_hash(document)
+
+
 def summary(db: Session, job: Job) -> dict[str, Any]:
     """The structured description as the API and the UI show it, with its requirement evidence."""
     rows = requirements_of(db, job, derived=None)
@@ -294,6 +300,8 @@ def summary(db: Session, job: Job) -> dict[str, Any]:
         "version": job.structured_description_version,
         "parsed_at": job.structured_description_parsed_at.isoformat() if job.structured_description_parsed_at else None,
         "structured_description": data or None,
+        # Sent back with a correction, so a correction never writes over a parse that landed while editing.
+        "structured_hash": _hash_of(job.structured_description),
         "has_candidate": bool(job.structured_description_candidate),
         "candidate": job.structured_description_candidate,
         "requirements": [requirement_dict(r, with_source=True) for r in rows],

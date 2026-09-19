@@ -292,9 +292,12 @@ def test_existing_jobs_are_picked_up_in_batches(user):
 # ───────────── manual correction, re-parse and history ─────────────
 
 def correct(job_id, mutate):
-    data = structured(job_id)["structured_description"]
+    """Edit the current version, as the UI does: the save names the version it started from."""
+    current = structured(job_id)
+    data = current["structured_description"]
     mutate(data)
-    return client.put(f"/api/jobs/{job_id}/structured-description", json={"structured_description": data})
+    return client.put(f"/api/jobs/{job_id}/structured-description",
+                      json={"structured_description": data, "base_hash": current["structured_hash"]})
 
 
 def test_manual_corrections_are_recorded_and_survive_a_reparse(user):
@@ -790,3 +793,61 @@ def test_the_parser_must_name_list_skills_like_their_requirements():
 
     assert JOB_DESCRIPTION_PARSER_PROMPT_VERSION == "v2"
     assert "copied exactly from the normalized_value of a SKILL" in JOB_DESCRIPTION_PARSER_SYSTEM
+
+
+
+def test_a_correction_started_before_a_parse_landed_is_refused(user):
+    """The API side of the race: an edit of an older version must not revert a newer parse."""
+    job_id = add_job(user)
+    parse(user, job_id)
+    opened = structured(job_id)          # the user opens the edit form here
+    edited = opened["structured_description"]
+    edited["job_identity"]["seniority"] = "Staff"
+
+    with session(user) as db:            # ...and a scheduled parse lands before they save
+        job = db.get(Job, job_id)
+        job.structured_description = {**job.structured_description,
+                                      "role_summary": "Lead the data platform team (re-parsed)."}
+        db.commit()
+    newer = structured(job_id)
+
+    out = client.put(f"/api/jobs/{job_id}/structured-description",
+                     json={"structured_description": edited, "base_hash": opened["structured_hash"]})
+    assert out.status_code == 409 and "parsed again" in out.json()["detail"]
+    after = structured(job_id)
+    assert after["structured_description"] == newer["structured_description"], "nothing was written"
+    assert after["status"] == "PARSED"
+    history = client.get(f"/api/jobs/{job_id}/structured-description/history").json()["items"]
+    assert not [item for item in history if item["change_source"] == "USER"], \
+        "the parser's values were not recorded as user corrections"
+
+    # Editing the version that is actually stored works.
+    assert correct(job_id, lambda d: d["job_identity"].update(seniority="Staff")).status_code == 200
+
+
+def test_a_correction_must_name_the_version_it_edits(user):
+    job_id = add_job(user)
+    parse(user, job_id)
+    data = structured(job_id)["structured_description"]
+    assert client.put(f"/api/jobs/{job_id}/structured-description",
+                      json={"structured_description": data}).status_code == 422
+
+
+def test_the_parse_lock_holds_the_sqlite_writer_lock_until_commit(user):
+    """On SQLite a plain SELECT holds no lock, so the worker's re-read and its write could interleave with a save."""
+    import sqlite3
+
+    from app.db import engine
+
+    job_id = add_job(user)
+    if engine.dialect.name != "sqlite":
+        pytest.skip("SQLite-specific: PostgreSQL uses SELECT ... FOR UPDATE")
+    path = engine.url.database
+    with session(user) as db:
+        assert jd.lock_job(db, job_id) is not None
+        other = sqlite3.connect(path, timeout=0.1)
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            other.execute("UPDATE jobs SET title = title WHERE id = ?", (job_id,))
+            other.commit()
+        other.close()
+        db.rollback()

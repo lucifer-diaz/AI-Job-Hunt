@@ -22,6 +22,8 @@ router = APIRouter()
 
 class CorrectionIn(BaseModel):
     structured_description: StructuredJobDescriptionIn
+    # structured_hash of the version the edit started from (GET .../structured-description).
+    base_hash: str = Field(min_length=64, max_length=64)
 
 
 class ResolveIn(BaseModel):
@@ -60,7 +62,11 @@ def structured_description(job_id: int, db: Session = Depends(get_user_db)):
 def correct_structured_description(job_id: int, payload: CorrectionIn, db: Session = Depends(get_user_db)):
     """Correct parsed values. Corrected fields are never overwritten by a later parse."""
     job = _job(db, job_id)
-    reconciled = job_description.apply_correction(db, job, payload.structured_description)
+    try:
+        reconciled = job_description.apply_correction(db, job, payload.structured_description, payload.base_hash)
+    except job_description.StaleCorrection as exc:
+        db.rollback()
+        raise HTTPException(409, str(exc)) from exc
     db.commit()
     db.refresh(job)
     # Corrections that could not be tied to exactly one requirement: saved in the document, but ranking and

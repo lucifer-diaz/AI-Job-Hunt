@@ -543,7 +543,7 @@ describe('structured job description', () => {
         requirement('req_002', 'PREFERRED', 'Familiarity with Kubernetes is a plus.', 'Familiarity with Kubernetes is a plus.')],
       counts: { REQUIRED: 1, PREFERRED: 1, INFORMATIONAL: 0, UNKNOWN: 0 },
       candidate: null, has_candidate: false, parse_task: { status: 'COMPLETED', attempt_count: 1, last_error: null },
-      derived_label: 'likely / inferred preparation topics, not stated by the employer', normalized_description: 'Requirements',
+      derived_label: 'likely / inferred preparation topics, not stated by the employer', normalized_description: 'Requirements', structured_hash: 'a'.repeat(64),
       ...overrides,
     };
   }
@@ -597,8 +597,23 @@ describe('structured job description', () => {
     expect(sent.structured_description.job_identity.seniority).toBe('Staff');
     expect(sent.structured_description.experience_requirements.minimum_years).toBe(10);
     expect(sent.structured_description.location_requirements.visa_sponsorship).toBe(false);
+    expect(sent.base_hash).toBe('a'.repeat(64));
     expect(ui.JD.data.status).toBe('MANUALLY_CORRECTED');
     expect(ui.JD.draft).toBeNull();
+  });
+
+  it('reloads instead of overwriting when a parse landed while editing', async () => {
+    await open();
+    const newer = payload({ structured_hash: 'b'.repeat(64) });
+    newer.structured_description.job_identity.seniority = 'Principal';
+    fetchMock.mockImplementation(async (url, opt = {}) => opt.method === 'PUT'
+      ? response({ detail: 'This job description was parsed again while you were editing.' }, 409) : response(newer));
+    ui.A['jd-edit']();
+    input('jd-job_identity-seniority', 'Staff');
+    await ui.A['jd-save']({ dataset: { id: '7' } });
+    expect(ui.JD.draft).toBeNull();
+    expect(ui.JD.data.structured_description.job_identity.seniority).toBe('Principal');
+    expect(document.body.innerHTML).toContain('parsed again while you were editing');
   });
 
   it('tells the user when a correction could not be applied to the requirements', async () => {

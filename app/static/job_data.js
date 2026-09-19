@@ -142,7 +142,15 @@ const JOB_DATA_ACTIONS = {
   'jd-edit': () => { JD.draft = JSON.parse(JSON.stringify(JD.data.structured_description)); JD.view = 'summary'; render(); },
   'jd-cancel': () => { jdReset(); render(); },
   'jd-save': el => jdRun(async () => {
-    JD.data = await api(`/api/jobs/${el.dataset.id}/structured-description`, { method: 'PUT', body: { structured_description: JD.draft } });
+    try {
+      JD.data = await api(`/api/jobs/${el.dataset.id}/structured-description`, { method: 'PUT', body: { structured_description: JD.draft, base_hash: JD.data.structured_hash } });
+    } catch (err) {
+      if (err.status !== 409) throw err;
+      // A parse landed while editing: show the new values instead of overwriting them with an older document.
+      jdReset();
+      JD.data = await api(`/api/jobs/${el.dataset.id}/structured-description`);
+      throw err;
+    }
     jdReset();
     JD.unmatched = JD.data.unmatched_corrections || [];
   }, 'Corrections saved'),

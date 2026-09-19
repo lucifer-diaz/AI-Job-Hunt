@@ -19,6 +19,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import html
+import json
 import re
 import uuid
 from dataclasses import dataclass, field
@@ -26,7 +27,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import desc, or_, select
+from sqlalchemy import desc, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -591,11 +592,20 @@ def parse_job_description(db: Session, job: Job, *, user_id: int | None = None) 
 
 
 def lock_job(db: Session, job_id: int) -> Job | None:
-    """The job as the database has it now, locked for the write that follows (PostgreSQL; SQLite has one writer)."""
+    """The job as the database has it now, locked until the caller commits, so a read-then-write cannot interleave
+    with another writer. PostgreSQL locks the row; SQLite takes its single writer lock with a no-op update first,
+    as app.services.user_settings.lock_settings_row does (a plain SELECT would hold no lock at all)."""
+    if db.get_bind().dialect.name == "sqlite":
+        db.execute(update(Job).where(Job.id == job_id).values(id=Job.id).execution_options(synchronize_session=False))
     query = select(Job).where(Job.id == job_id).execution_options(populate_existing=True)
     if db.get_bind().dialect.name == "postgresql":
         query = query.with_for_update()
     return db.scalar(query)
+
+
+def structured_hash(document: dict[str, Any] | None) -> str:
+    """A version tag for the structured description: an edit names the version it started from."""
+    return hashlib.sha256(json.dumps(document or {}, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
 
 def validated(raw: dict[str, Any]) -> ParsedJobDescription:
@@ -901,9 +911,23 @@ def waiting_reason(db: Session, job: Job) -> str | None:
 
 # ───────────── manual correction and re-parse ─────────────
 
-def apply_correction(db: Session, job: Job, payload: StructuredJobDescriptionIn) -> Reconciled:
+class StaleCorrection(RuntimeError):
+    """The structured description changed (a parse landed) after the edit was started from it."""
+
+
+def apply_correction(db: Session, job: Job, payload: StructuredJobDescriptionIn,
+                     base_hash: str | None = None) -> Reconciled:
     """Save the user's corrections to the structured description. Corrected paths are protected from parsers.
-    Returns what reached the requirement rows, including corrections that could not be tied to one row."""
+    Returns what reached the requirement rows, including corrections that could not be tied to one row.
+
+    The row is locked and re-read first. When `base_hash` names an older version than the one stored (a parse
+    landed while the user was editing), nothing is written: the edit is a whole document, so saving it would revert
+    the parse and record every reverted value as a correction, protecting stale values from all later parses.
+    """
+    job = lock_job(db, job.id) or job
+    if base_hash is not None and base_hash != structured_hash(job.structured_description):
+        raise StaleCorrection("This job description was parsed again while you were editing. Your edits were not "
+                              "saved: review the new values and correct them again.")
     old = job.structured_description or StructuredJobDescriptionIn().model_dump()
     new = payload.model_dump()
     old_flat, new_flat = _flat(old), _flat(new)
@@ -948,6 +972,7 @@ def reparse(db: Session, job: Job) -> dict[str, Any]:
 
 def resolve_reparse(db: Session, job: Job, decisions: dict[str, str]) -> dict[str, Any]:
     """Apply the user's choice for each difference a re-parse found. "use_new" takes the parser's value."""
+    job = lock_job(db, job.id) or job
     candidate = job.structured_description_candidate
     if not candidate:
         raise ValueError("No re-parse is waiting for this job")

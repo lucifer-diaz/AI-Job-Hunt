@@ -1287,8 +1287,12 @@ A few safeguards keep the parse trustworthy:
   board reported are applied afterwards and marked `source = job_board`;
 - an "explicit" requirement whose quote is not actually in the posting is stored as a derived row with no quote,
   and salary without a sentence from the posting is dropped;
-- the result is written against the job as it is after the model call, so a correction saved meanwhile survives,
-  and only while the worker still holds the task's lease;
+- the result is written against the job as it is after the model call, re-read under a lock (a row lock on
+  PostgreSQL, the writer lock on SQLite), so a correction saved meanwhile survives, and only while the worker still
+  holds the task's lease;
+- the other way round, a correction names the version it was edited from (`base_hash`, the `structured_hash` the
+  API returns): if a parse landed while the form was open, the save is refused with 409 and the tab reloads the new
+  values, instead of silently reverting the parse and recording its values as your corrections;
 - a missing AI key hands the task back without using an attempt, so the backlog resumes when the key is added. Re-ranking after a parse is off by default (`JD_RERANK_AFTER_PARSE=true` turns it
 on), so parsing a backlog does not start a round of model calls.
 
@@ -1317,7 +1321,7 @@ context card shows both, for example *job description 4.2K → 1.5K (65.5%)*, ov
 | Route | Purpose |
 |---|---|
 | `GET /api/jobs/{id}/structured-description` | structured posting, requirement evidence, parse-task state |
-| `PUT /api/jobs/{id}/structured-description` | correct parsed values (typed fields, not raw JSON) |
+| `PUT /api/jobs/{id}/structured-description` | correct parsed values (typed fields, not raw JSON): `{structured_description, base_hash}`, 409 if the version changed |
 | `POST /api/jobs/{id}/structured-description/reparse` | parse again; a corrected job gets a comparison |
 | `POST /api/jobs/{id}/structured-description/reparse/resolve` | `{decisions: {change_id: keep \| use_new}}` |
 | `GET /api/jobs/{id}/requirements` | requirements with the employer's sentence; `include_derived=true` for signals |
