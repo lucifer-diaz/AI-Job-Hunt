@@ -33,7 +33,8 @@ ROW_COLUMNS = (LLMRequestLog.id, LLMRequestLog.created_at, LLMRequestLog.user_id
                LLMRequestLog.context_utilization_percent, LLMRequestLog.context_breakdown, LLMRequestLog.latency_ms,
                LLMRequestLog.estimated_cost, LLMRequestLog.cost_source, LLMRequestLog.retry_count,
                LLMRequestLog.error_type, LLMRequestLog.structured_output_valid, LLMRequestLog.workflow_type,
-               LLMRequestLog.workflow_entity_id, LLMRequestLog.cached)
+               LLMRequestLog.workflow_entity_id, LLMRequestLog.cached, LLMRequestLog.full_available_context_tokens,
+               LLMRequestLog.selected_context_tokens, LLMRequestLog.context_reduction_percent)
 
 
 def utcnow() -> datetime:
@@ -217,6 +218,7 @@ def context(items: list[Any]) -> dict[str, Any]:
     near = sorted((r for r in known if r.context_utilization_percent >= HIGH_CONTEXT_PERCENT),
                   key=lambda r: -r.context_utilization_percent)[:20]
     return {"buckets": [{"label": label, "requests": n} for label, n in buckets.items()],
+            "selection": context_selection(items),
             "unknown_window": unknown, "avg_utilization_percent": _mean([r.context_utilization_percent for r in known]),
             "avg_context_tokens": summary(items)["avg_context_tokens"],
             "high_context_requests": sum(r.context_utilization_percent >= HIGH_CONTEXT_PERCENT for r in known),
@@ -225,6 +227,23 @@ def context(items: list[Any]) -> dict[str, Any]:
             "largest": [{"id": r.id, "stage": r.stage, "model": r.model, "context_tokens": r.estimated_context_tokens,
                          "context_window_size": r.context_window_size,
                          "utilization_percent": r.context_utilization_percent} for r in near]}
+
+
+def context_selection(items: list[Any]) -> dict[str, Any]:
+    """How much dynamic context selection (app.services.context_builder) trimmed, overall and per stage."""
+    measured = [r for r in items if r.selected_context_tokens is not None and r.full_available_context_tokens]
+
+    def totals(group: list[Any]) -> dict[str, Any]:
+        full = sum(r.full_available_context_tokens for r in group)
+        sent = sum(r.selected_context_tokens for r in group)
+        return {"requests": len(group), "full_available_context_tokens": full, "selected_context_tokens": sent,
+                "context_reduction_percent": round(100 * (full - sent) / full, 1) if full else None,
+                "avg_reduction_percent": _mean([r.context_reduction_percent for r in group
+                                                if r.context_reduction_percent is not None])}
+
+    stages = sorted({r.stage for r in measured})
+    return {**totals(measured), "by_stage": [{"stage": stage, **totals([r for r in measured if r.stage == stage])}
+                                             for stage in stages]}
 
 
 def errors(items: list[Any]) -> dict[str, Any]:
@@ -277,7 +296,10 @@ def request_row(r: Any) -> dict[str, Any]:
             "context_utilization_percent": r.context_utilization_percent, "latency_ms": r.latency_ms,
             "estimated_cost": _money(r.estimated_cost), "cost_source": r.cost_source, "retry_count": r.retry_count,
             "error_type": r.error_type, "structured_output_valid": r.structured_output_valid,
-            "workflow_type": r.workflow_type, "workflow_entity_id": r.workflow_entity_id}
+            "workflow_type": r.workflow_type, "workflow_entity_id": r.workflow_entity_id,
+            "full_available_context_tokens": r.full_available_context_tokens,
+            "selected_context_tokens": r.selected_context_tokens,
+            "context_reduction_percent": r.context_reduction_percent}
 
 
 def list_requests(db: Session, f: MonitoringFilter, page: int = 1, per_page: int = 25) -> dict[str, Any]:

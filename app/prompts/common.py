@@ -88,3 +88,31 @@ def job_facts(job: Any) -> dict[str, Any]:
     """Job metadata. The description is untrusted and is passed separately."""
     return {"title": getattr(job, "title", "") or "", "company": getattr(job, "company", "") or "",
             "location": getattr(job, "location", "") or ""}
+
+
+UNVERIFIED_FACTS_RULE = (
+    "Resume facts are labelled by trust. VERIFIED facts were confirmed by the candidate. Roles marked "
+    "\"verified\": false and UNVERIFIED RESUME FACTS were parsed from the resume but not confirmed: treat them as "
+    "lower-confidence. REJECTED RESUME FACTS were rejected by the candidate and must never be claimed."
+)
+
+
+def context_value(context: Any, name: str, default: Any = None) -> Any:
+    """Read a field of an app.services.context_builder.TaskContext (or a plain dict with the same keys)."""
+    if isinstance(context, dict):
+        return context.get(name, default)
+    return getattr(context, name, default)
+
+
+def experience_facts(context: Any) -> list[dict[str, Any]]:
+    """Selected roles without the internal relevance score."""
+    return [{k: v for k, v in role.items() if k != "relevance"} for role in context_value(context, "relevant_experience", [])]
+
+
+def resume_facts(context: Any) -> dict[str, Any]:
+    """The structured resume facts a context selected, for prompts that check or use them."""
+    candidate = context_value(context, "candidate", {}) or {}
+    return {"summary": candidate.get("summary"), "background": candidate.get("verified_background") or {},
+            "experience": experience_facts(context), "skills": context_value(context, "relevant_skills", []),
+            "education": context_value(context, "education", []),
+            "certifications": context_value(context, "certifications", [])}

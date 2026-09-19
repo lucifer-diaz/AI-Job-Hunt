@@ -4,12 +4,13 @@ const SETTINGS_SECTIONS = [
   ['profile', 'Profile', 'Your professional identity', '01'],
   ['preferences', 'Job preferences', 'What your next role looks like', '02'],
   ['resumes', 'Resumes', 'The experience behind your applications', '03'],
-  ['account', 'Account & security', 'Manage access to your workspace', '04'],
-  ['api-keys', 'API keys', 'Connect your own providers', '05'],
-  ['ai', 'AI models', 'Choose how your assistant works', '06'],
-  ['workflow', 'Workflow & cadence', 'Set a pace that works for you', '07'],
+  ['resume-data', 'Resume Data', 'Review and verify the facts AI may use', '04'],
+  ['account', 'Account & security', 'Manage access to your workspace', '05'],
+  ['api-keys', 'API keys', 'Connect your own providers', '06'],
+  ['ai', 'AI models', 'Choose how your assistant works', '07'],
+  ['workflow', 'Workflow & cadence', 'Set a pace that works for you', '08'],
 ];
-const SETTINGS_FORMS = ['profile', 'preferences', 'resumes', 'account', 'keys', 'ai', 'workflow'];
+const SETTINGS_FORMS = ['profile', 'preferences', 'resumes', 'resume-data', 'account', 'keys', 'ai', 'workflow'];
 const API_KEYS = [['openrouter', 'OpenRouter', 'AI model marketplace'], ['openai', 'OpenAI', 'GPT models'], ['anthropic', 'Anthropic', 'Claude models'], ['gemini', 'Gemini', 'Gemini models (Google AI Studio key)'], ['apify', 'Apify', 'Job discovery']];
 const CHIP_FIELDS = [
   ['target_roles', 'Target roles', 'Choose up to 5 roles', 'Add a role…', '', 'top'],
@@ -89,7 +90,10 @@ function settingsChanges(form) {
 function settingsPendingTags(form) {
   return [...document.querySelectorAll(`input[data-tag][data-form="${form}"]`)].filter(el => el.value.trim());
 }
-function settingsDirty(form) { return Object.keys(settingsChanges(form)).length > 0 || settingsPendingTags(form).length > 0; }
+function settingsDirty(form) {
+  if (form === 'resume-data') return resumeDataDirty();
+  return Object.keys(settingsChanges(form)).length > 0 || settingsPendingTags(form).length > 0;
+}
 function settingsAnyDirty() { return SETTINGS_FORMS.some(settingsDirty); }
 function settingsSaving() { return SETTINGS_FORMS.some(f => isBusy(`settings-${f}`)); }
 function settingsPayload(form) {
@@ -125,7 +129,7 @@ function settingsCanLeave(nextScreen, nextSection) {
   if (nextScreen !== 'settings' && settingsAnyDirty()) {
     if (!confirm('Leave Settings and discard unsaved changes?')) return false;
     SETTINGS_FORMS.forEach(f => { delete S.forms[f]; delete SETTING_ERRORS[f]; });
-    authorizationDraft = null;
+    authorizationDraft = null; rdReset();
   }
   if (nextScreen !== 'settings' || nextSection !== S.settingsSection) settingsClearSecrets();
   return true;
@@ -179,7 +183,7 @@ function renderResumeSettings() {
     `${stale ? `<div class="settings-notice"><strong>Your edited text is being used for tailoring</strong><p>It differs from ${esc(stale.filename)}. Keep your edits or restore the file’s text.</p>${btn('Use file text', 'resume-use', { id: stale.id }, 'sm')}</div>` : ''}
     <div class="settings-resume-list">${docs.map(d => `<article class="settings-resume"><div class="settings-file-icon" aria-hidden="true">${esc(d.filename.split('.').pop().toUpperCase().slice(0, 4))}</div><div class="grow"><strong>${esc(d.filename)}</strong><p>${Math.max(1, Math.round(d.size / 1024))} KB · ${d.words} words${d.active ? ' · Primary' : ''}${d.in_use ? ' · Used for tailoring' : ''}</p></div><div class="row gap8 wrap">${d.active ? '<a class="btn sm" href="/api/profile/resume">Download</a>' : btn('Set primary', 'resume-primary', { id: d.id }, 'sm')}${btn('Delete', 'resume-delete', { id: d.id, name: d.filename }, 'sm')}</div></article>`).join('') || '<div class="settings-empty"><strong>Your experience starts here</strong><p>Upload a resume to make your applications more personal.</p></div>'}</div>
     <label class="settings-upload" for="resume-file"><strong>＋ Upload ${docs.length ? 'another resume' : 'your resume'}</strong><span>PDF, DOCX or TXT · up to ${BOOT.max_upload_mb} MB</span><input type="file" id="resume-file" accept=".txt,.pdf,.docx" aria-label="Upload resume"></label>`) +
-    settingsDetails('resume-text', 'Edit master resume text', `<p class="settings-help">This text is what tailoring uses. Uploading or choosing a primary file replaces it.</p><label class="field" for="resumes-master_resume">Master resume text${textareaF('resumes', 'master_resume', D.profile.master_resume)}</label>${settingsDetails('resume-format', 'Formatting tips', '<p>Use Summary, Skills, and Experience headings, a role heading for each position, and short bullet points. Include title, company, location and dates for each role.</p>')}`) +
+    settingsDetails('resume-text', 'Edit master resume text', `<p class="settings-help">Saving new text creates a new resume version. To correct parsed facts, edit them in <a href="#settings/resume-data">Resume Data</a> instead.</p><label class="field" for="resumes-master_resume">Master resume text${textareaF('resumes', 'master_resume', D.profile.master_resume)}</label>${settingsDetails('resume-format', 'Formatting tips', '<p>Use Summary, Skills, and Experience headings, a role heading for each position, and short bullet points. Include title, company, location and dates for each role.</p>')}`) +
     settingsGroup('Evidence for your applications', 'Extract claims from your saved resume, then verify them in the Knowledge bank.', btn('Re-parse resume into evidence', 'parse-evidence', {}, '', isBusy('settings-resumes'))) + settingsFooter('resumes', 'Save resume text');
 }
 function renderAccountSettings() {
@@ -210,7 +214,7 @@ function renderWorkflowSettings() {
     settingsGroup('Tailoring & review', 'Choose who does the tailoring and review reasoning.', `<div class="settings-options">${[['backend', 'Job Hunt OS workers', 'Your configured model API tailors and reviews in the background.'], ['claude_desktop', 'Claude Desktop', 'You tailor and review in bulk from Claude Desktop over MCP; the workers make no model calls for it.']].map(([id, title, desc]) => `<label class="settings-option ${execution === id ? 'selected' : ''}"><input type="radio" name="settings-execution" data-form="workflow" data-field="execution_mode" value="${id}" ${execution === id ? 'checked' : ''}><span><strong>${title}</strong><small>${desc}</small></span></label>`).join('')}</div><p class="settings-help">Every saved result is validated by Job Hunt OS in both modes. See the README section "Claude Desktop + MCP" to connect.</p>`) +
     settingsGroup('Your rhythm', 'Set realistic targets and a helpful follow-up cadence.', `<div class="settings-grid">${settingsField('workflow', 'weekly_target', 'Weekly application target', 'type="number" min="1" max="50" required')}${settingsField('workflow', 'followup_days', 'Follow-up after (days)', 'type="number" min="1" max="60" required')}</div><p class="settings-help">Follow-up drafts are never sent automatically.</p>`) + settingsFooter('workflow');
 }
-const SETTINGS_RENDERERS = { profile: renderProfileSettings, preferences: renderPreferenceSettings, resumes: renderResumeSettings, account: renderAccountSettings, 'api-keys': renderKeySettings, ai: renderAISettings, workflow: renderWorkflowSettings };
+const SETTINGS_RENDERERS = { profile: renderProfileSettings, preferences: renderPreferenceSettings, resumes: renderResumeSettings, 'resume-data': () => renderResumeDataSettings(), account: renderAccountSettings, 'api-keys': renderKeySettings, ai: renderAISettings, workflow: renderWorkflowSettings };
 function renderSettings() {
   if (D.settingsLoadError) return `<div class="settings-content"><div class="settings-error" role="alert">Settings could not be loaded: ${esc(D.settingsLoadError)}</div>${btn('Try again', 'settings-retry', {}, 'mt16')}</div>`;
   if (!D.profile || !D.settings || !D.prefs) return loading();
@@ -240,6 +244,7 @@ async function refreshSettingsSummary(form) {
   catch (err) { SETTING_ERRORS[form] = `Changes saved, but the sidebar could not refresh: ${err.message}. Reload to refresh it.`; }
 }
 async function settingsSave(form) {
+  if (form === 'resume-data') return resumeDataSave();
   settingsPendingTags(form).forEach(el => commitTag(el, false));
   try { if (!settingsValidate(form)) return; }
   catch (err) { SETTING_ERRORS[form] = err.message; render(); return; }
@@ -256,7 +261,7 @@ async function settingsSave(form) {
     if (form === 'workflow') await saveWorkflowSettings();
     delete S.forms[form];
     if (form === 'preferences') authorizationDraft = null;
-    if (form === 'resumes') D.resumes = await api('/api/profile/resumes');
+    if (form === 'resumes') { D.resumes = await api('/api/profile/resumes'); D.resumeData = undefined; }
     if (['profile', 'preferences', 'ai'].includes(form)) await refreshSettingsSummary(form);
   }, form === 'account' ? 'Password updated. Other sessions are signed out.' : 'Changes saved');
 }
@@ -282,7 +287,7 @@ async function settingsUseResume(id) {
   if (!settingsResumeGuard()) return;
   await settingsRun('resumes', async () => {
     D.resumes = await api(`/api/profile/resumes/${id}/primary`, { method: 'POST' });
-    delete S.forms.resumes; D.profile = await api('/api/profile');
+    delete S.forms.resumes; D.profile = await api('/api/profile'); D.resumeData = undefined;
   }, 'Primary resume updated');
 }
 async function settingsUploadResume(file) {
@@ -292,13 +297,14 @@ async function settingsUploadResume(file) {
     await api('/api/profile/resume', { method: 'POST', form });
     delete S.forms.resumes;
     [D.profile, D.resumes] = await Promise.all([api('/api/profile'), api('/api/profile/resumes')]);
-  }, 'Resume uploaded and set as primary');
+    D.resumeData = undefined;
+  }, 'Resume uploaded and set as primary — review its data in Resume Data');
 }
 const SETTINGS_ACTIONS = {
   'settings-retry': async () => { D.settingsLoadError = ''; render(); await load(); },
   'settings-section': el => settingsNavigate(el.value),
   'settings-save': el => settingsSave(el.dataset.form),
-  'settings-discard': el => { const f = el.dataset.form; delete S.forms[f]; if (f === 'preferences') authorizationDraft = null; delete SETTING_ERRORS[f]; delete SETTINGS_SUCCESS[f]; render(); },
+  'settings-discard': el => { const f = el.dataset.form; delete S.forms[f]; if (f === 'preferences') authorizationDraft = null; if (f === 'resume-data') rdReset(); delete SETTING_ERRORS[f]; delete SETTINGS_SUCCESS[f]; render(); },
   'auth-add': () => { settingsAuthUpdate(); authorizationDraft.rows.push({ country: '', status: '' }); render(); document.querySelector('[data-auth-row]:last-child [data-auth-country]')?.focus(); },
   'auth-remove': el => { settingsAuthUpdate(); authorizationDraft.rows.splice(Number(el.dataset.index), 1); render(); },
   'settings-key-edit': el => { delete S.forms.keys; delete SETTING_ERRORS.keys; editingKey = editingKey === el.dataset.id ? null : el.dataset.id; render(); document.getElementById(`keys-${editingKey}`)?.focus(); },
@@ -312,7 +318,7 @@ const SETTINGS_ACTIONS = {
     if (!confirm(`Delete ${el.dataset.name}? This cannot be undone.`)) return;
     const replacesText = D.resumes.length > 1 && D.resumes.some(d => d.id === Number(el.dataset.id) && d.active);
     if (replacesText && !settingsResumeGuard()) return;
-    return settingsRun('resumes', async () => { const out = await api(`/api/profile/resumes/${el.dataset.id}`, { method: 'DELETE' }); D.resumes = out.resumes; if (replacesText && out.promoted != null) delete S.forms.resumes; D.profile = await api('/api/profile'); }, 'Resume deleted');
+    return settingsRun('resumes', async () => { const out = await api(`/api/profile/resumes/${el.dataset.id}`, { method: 'DELETE' }); D.resumes = out.resumes; if (replacesText && out.promoted != null) delete S.forms.resumes; D.profile = await api('/api/profile'); D.resumeData = undefined; }, 'Resume deleted');
   },
   'parse-evidence': () => {
     if (settingsDirty('resumes')) { SETTING_ERRORS.resumes = 'Save your resume text before extracting evidence.'; render(); return; }

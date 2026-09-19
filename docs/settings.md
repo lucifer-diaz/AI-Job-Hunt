@@ -1,6 +1,6 @@
 # Focused settings editors
 
-Settings uses a section sidebar on desktop and a native section selector below 900px. The existing `#settings` URL opens Profile. Deep links use `#settings/profile`, `preferences`, `resumes`, `account`, `api-keys`, `ai`, and `workflow`.
+Settings uses a section sidebar on desktop and a native section selector below 900px. The existing `#settings` URL opens Profile. Deep links use `#settings/profile`, `preferences`, `resumes`, `resume-data`, `account`, `api-keys`, `ai`, and `workflow`.
 
 ## Frontend boundaries
 
@@ -11,6 +11,10 @@ Profile, preferences, resume text, AI, and workflow drafts are independent. Ordi
 Profile, preference, AI, and workflow saves refresh the workspace summary so the shell shows the saved identity, model, approval mode, and auto-search counts. A summary-refresh failure is reported separately from a successful save and does not restore an already-saved draft. Partial workflow saves also refresh the summary.
 
 The UI saves changed fields only. Pending chip input is committed before saving, including locations with commas. Valid numeric zero values count toward completeness. Uploading or selecting a primary resume warns before replacing unsaved master text. Deleting the only uploaded resume preserves master text and any draft; confirmed drafts are cleared only when the backend promotes a replacement. Parsing evidence requires saved text. Advanced AI overrides and master text are collapsible.
+
+`app/static/resume_data.js` owns the Resume Data section (structured resume review, editing and verification; see
+the README's "Resume Data & Verification"). It loads after `settings.js`. Its section edit draft counts as the
+`resume-data` form, so leaving Settings, switching tabs or cancelling warns before discarding it.
 
 ## API contracts
 
@@ -42,9 +46,10 @@ npm ci
 npm run test:coverage
 node --check app/static/app.js
 node --check app/static/settings.js
+node --check app/static/resume_data.js
 ```
 
-Python dev dependencies include pytest-cov and Ruff. Node is needed only for tests (Node 22.12+ or a compatible newer runtime). Vitest uses jsdom and Node VM contexts to exercise the actual production scripts without running automatic network boot. V8 coverage measures `settings.js`; thresholds are 85% for statements, branches, functions and lines.
+Python dev dependencies include pytest-cov and Ruff. Node is needed only for tests (Node 22.12+ or a compatible newer runtime). Vitest uses jsdom and Node VM contexts to exercise the actual production scripts without running automatic network boot. V8 coverage measures `settings.js` and `resume_data.js`; thresholds are 85% for statements, branches, functions and lines.
 
 Backend coverage includes partial updates, explicit clearing, inheritance, isolation, password policy, session rotation, rollback, stale password updates, and concurrent nested writes. Frontend coverage includes draft isolation, routing, pending tags, secret cleanup, validation, per-provider writes, resume safeguards, retry/error handling, and partial workflow saves.
 

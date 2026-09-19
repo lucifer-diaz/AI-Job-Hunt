@@ -3,15 +3,30 @@ from __future__ import annotations
 from io import BytesIO
 
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.utils import simpleSplit
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.pdfgen import canvas
 
-from app.services.resume_format import body_text, to_plain
+from app.services.resume_format import body_text, flatten_links, to_plain, unbold
 
 MARGIN = 48
 BODY, BOLD = "Helvetica", "Helvetica-Bold"
 INK, MUTED, RULE = (0.07, 0.08, 0.15), (0.35, 0.38, 0.45), (0.8, 0.82, 0.87)
+
+
+def _runs(text: str) -> list[tuple[str, bool]]:
+    """Split Markdown emphasis into (text, bold) runs: "**Data:** Kafka" -> [("Data:", True), (" Kafka", False)]."""
+    return [(part, index % 2 == 1) for index, part in enumerate((text or "").split("**")) if part] or [("", False)]
+
+
+def _segments(row: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Words of one wrapped line grouped into the fewest possible (text, font) runs."""
+    out: list[tuple[str, str]] = []
+    for word, word_font in row:
+        if out and out[-1][1] == word_font:
+            out[-1] = (f"{out[-1][0]} {word}", word_font)
+        else:
+            out.append((word, word_font))
+    return out
 
 
 def markdown_to_simple_pdf(markdown: str) -> bytes:
@@ -31,26 +46,46 @@ def markdown_to_simple_pdf(markdown: str) -> bytes:
 
     def paragraph(text: str, font: str = BODY, size: float = 9.5, indent: float = 0, color=INK,
                   leading: float | None = None, bullet: bool = False) -> None:
+        """One wrapped paragraph. **bold** spans are drawn bold, so skill groups and labels keep their emphasis."""
         nonlocal y
         leading = leading or size * 1.35
-        lines = simpleSplit(text, font, size, usable - indent) or [""]
-        for i, line in enumerate(lines):
+        bold = BOLD if font == BODY else font
+        space = stringWidth(" ", font, size)
+        limit = usable - indent
+        rows: list[list[tuple[str, str]]] = [[]]
+        used = 0.0
+        for chunk, is_bold in _runs(text):
+            for word in chunk.split():
+                word_font = bold if is_bold else font
+                word_width = stringWidth(word, word_font, size)
+                if rows[-1] and used + space + word_width > limit:
+                    rows.append([])
+                    used = 0.0
+                used += (space if rows[-1] else 0) + word_width
+                rows[-1].append((word, word_font))
+        for i, row in enumerate(rows):
             room(leading)
             c.setFillColorRGB(*color)
-            c.setFont(font, size)
             if bullet and i == 0:
-                c.drawString(MARGIN + indent - 9, y - size, "•")
-            c.drawString(MARGIN + indent, y - size, line)
+                c.setFont(font, size)
+                c.drawString(MARGIN + indent - 9, y - size, "\u2022")
+            x = MARGIN + indent
+            # Consecutive words in the same font are drawn as one string, so the PDF still extracts as real
+            # sentences (ATS parsers and pypdf read it the way a person does).
+            for segment, segment_font in _segments(row):
+                c.setFont(segment_font, size)
+                c.drawString(x, y - size, segment)
+                x += stringWidth(segment, segment_font, size) + space
             y -= leading
 
     for raw in body_text(markdown).splitlines():
-        line = to_plain(raw.rstrip()).replace("**", "")
+        line = flatten_links(to_plain(raw.rstrip()))
         stripped = line.strip()
         if not stripped:
             y -= 4
             continue
         if stripped.startswith("### "):
-            parts = [p.strip() for p in stripped[4:].split("|")]
+            parts = [p.strip() for p in unbold(stripped[4:]).split("|")]
             dates = parts[-1] if len(parts) > 2 else ""
             title = parts[0]
             rest = " | ".join(parts[1:-1] if dates else parts[1:])
@@ -78,7 +113,7 @@ def markdown_to_simple_pdf(markdown: str) -> bytes:
         if stripped.startswith("## "):
             y -= 8
             room(26)
-            paragraph(stripped[3:].upper(), BOLD, 10.5, color=INK, leading=14)
+            paragraph(unbold(stripped[3:]).upper(), BOLD, 10.5, color=INK, leading=14)
             c.setStrokeColorRGB(*RULE)
             c.setLineWidth(0.6)
             c.line(MARGIN, y + 2, width - MARGIN, y + 2)
@@ -86,7 +121,7 @@ def markdown_to_simple_pdf(markdown: str) -> bytes:
             after_name = False
             continue
         if stripped.startswith("# "):
-            paragraph(stripped[2:], BOLD, 18, leading=24)
+            paragraph(unbold(stripped[2:]), BOLD, 18, leading=24)
             after_name = True
             continue
         if stripped.startswith("- "):

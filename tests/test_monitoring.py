@@ -21,6 +21,7 @@ from app.db import SessionLocal
 from app.main import app
 from app.models import Job, LLMRequestLog, LLMUsageDaily
 from app.prompts import build_ranking_prompt, build_review_prompt
+from app.prompts.ranking import RANKING_PROMPT_VERSION
 from app.services import llm_telemetry, model_catalog, monitoring
 from app.services.llm import LLMCall, LLMClient, LLMConfigError, LLMContextOverflowError, LLMRateLimitError, \
     LLMResponseError, LLMTimeoutError
@@ -105,7 +106,7 @@ def test_openai_usage_latency_model_and_cost_are_recorded(user_id, fake_openai):
     assert (log.input_tokens, log.output_tokens, log.total_tokens, log.cache_read_tokens) == (1200, 300, 1500, 200)
     assert log.usage_source == "provider_reported" and log.cached is True
     assert log.latency_ms is not None and log.latency_ms >= 0 and log.completed_at >= log.created_at
-    assert log.status == "SUCCEEDED" and log.stage == "RANKER" and log.prompt_version == "v2"
+    assert log.status == "SUCCEEDED" and log.stage == "RANKER" and log.prompt_version == RANKING_PROMPT_VERSION
     # The dated snapshot has no catalog entry, so it is priced as the requested model.
     assert (log.estimated_cost, log.cost_source) == (Decimal("0.00056400"), "pricing_table")
     assert (log.workflow_type, log.workflow_entity_id) == ("job", 7)

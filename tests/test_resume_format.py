@@ -67,7 +67,9 @@ def test_render_keeps_every_role_project_and_education():
     parsed = parse_resume(MASTER)
     markdown = render_resume(parsed, summary="Tailored summary.", top_skills=["LangGraph"],
                              role_bullets={0: ["Rewritten agent bullet with 28% conversion lift."]})
-    assert "Tailored summary." in markdown and "- Most relevant: LangGraph" in markdown
+    assert "Tailored summary." in markdown
+    assert "- AI Engineering: LangGraph, OpenRouter, RAG pipelines" in markdown  # every skills line is a bullet
+    assert "Most relevant" not in markdown  # the groups are ordered instead of repeated in a lead line
     assert "### AI Consultant | Flow AI | Remote, USA | Oct 2025 - Present" in markdown
     assert "- Rewritten agent bullet with 28% conversion lift." in markdown
     assert "Designed a vendor-agnostic" not in markdown  # replaced bullets are not duplicated
@@ -114,3 +116,90 @@ def test_tailoring_keeps_structure_and_revert_restores_master_bullet():
     docx = client.get(f"/api/jobs/{job['id']}/resume.docx")
     pdf = client.get(f"/api/jobs/{job['id']}/resume.pdf")
     assert docx.status_code == 200 and pdf.status_code == 200
+
+
+# A resume that writes the employer, location and dates under the role heading instead of beside it.
+STACKED = """# Rohan Roy
+
+**AI Engineering Leader**
+
+Mumbai, India
+
+## Core Skills
+
+**AI and Generative AI:** LangGraph, RAG, MCP
+
+**Data and Streaming:** Kafka, Spark
+
+## Professional Experience
+
+### AI Consultant
+
+**Flow AI** | Remote, USA
+October 2025 - September 2026
+
+* Built production AI agents adopted by 100+ brands.
+* Designed a vendor-agnostic LLM orchestration layer.
+
+### Lead Engineer - Data Platform
+
+**Zendrive Inc.** | Remote, USA
+June 2024 - October 2025
+
+* Reduced production incidents by 45%.
+"""
+
+
+def test_employer_and_dates_written_under_the_title_are_role_facts_not_bullets():
+    parsed = parse_resume(STACKED)
+    first, second = parsed.roles
+    assert (first.title, first.company, first.location, first.dates) == (
+        "AI Consultant", "Flow AI", "Remote, USA", "October 2025 - September 2026")
+    assert (second.company, second.dates) == ("Zendrive Inc.", "June 2024 - October 2025")
+    # The employer line is metadata: it never becomes an achievement bullet that tailoring can overwrite.
+    assert first.bullets == ["Built production AI agents adopted by 100+ brands.",
+                             "Designed a vendor-agnostic LLM orchestration layer."]
+
+
+def test_tailored_roles_keep_their_employer_location_and_dates():
+    markdown = render_resume(parse_resume(STACKED), top_skills=["LangGraph"],
+                             role_bullets={0: ["Rewritten bullet about AI agents."]})
+    assert "### AI Consultant | Flow AI | Remote, USA | October 2025 - September 2026" in markdown
+    assert "### Lead Engineer - Data Platform | Zendrive Inc. | Remote, USA | June 2024 - October 2025" in markdown
+    assert "- Rewritten bullet about AI agents." in markdown
+    # Skill groups stay grouped, as bullets, and the tailored list stays short instead of repeating them all.
+    assert "- **AI and Generative AI:** LangGraph, RAG, MCP" in markdown
+    assert "- **Data and Streaming:** Kafka, Spark" in markdown
+
+    text = "\n".join(page.extract_text() for page in PdfReader(BytesIO(markdown_to_simple_pdf(markdown))).pages)
+    for fact in ("Flow AI", "Remote, USA", "October 2025 - September 2026", "Zendrive Inc.", "Kafka, Spark"):
+        assert fact in text, fact
+    assert "**" not in text  # emphasis is drawn, not printed
+
+
+def test_skills_are_ordered_by_relevance_instead_of_being_repeated():
+    markdown = render_resume(parse_resume(STACKED), top_skills=["Kafka", "Spark"])
+    skills = [line for line in markdown.split("## Core Skills")[1].split("##")[0].splitlines() if line.startswith("- ")]
+    # The group this job asks for leads, and nothing is duplicated into a "most relevant" line.
+    assert skills == ["- **Data and Streaming:** Kafka, Spark", "- **AI and Generative AI:** LangGraph, RAG, MCP"]
+    assert "Most relevant" not in markdown
+
+    # Inside a group, the skills this job asks for come first; the rest keep their order and wording.
+    reordered = render_resume(parse_resume(STACKED), top_skills=["MCP"])
+    assert "- **AI and Generative AI:** MCP, LangGraph, RAG" in reordered
+
+    untailored = render_resume(parse_resume(STACKED))
+    assert untailored.split("## Core Skills")[1].strip().splitlines()[0] == "- **AI and Generative AI:** LangGraph, RAG, MCP"
+
+
+def test_exports_show_contact_details_not_markdown_link_syntax():
+    pdf = markdown_to_simple_pdf("# Rohan Roy\nEmail: [rohan@example.com](mailto:rohan@example.com)\n"
+                                 "Portfolio: [my site](https://rohanroy.com)\n")
+    text = "\n".join(page.extract_text() for page in PdfReader(BytesIO(pdf)).pages)
+    assert "Email: rohan@example.com" in text and "](" not in text
+    assert "my site (https://rohanroy.com)" in text
+
+
+def test_pdf_draws_bold_runs_for_labels():
+    pdf = markdown_to_simple_pdf("## Core Skills\n- **Data and Streaming:** Kafka, Spark\n")
+    assert b"Helvetica-Bold" in pdf

@@ -86,7 +86,7 @@ def _extract_json(text: str) -> dict[str, Any]:
 
 
 # Prompt markers (app.prompts) → the stage whose model runs them.
-MARKER_TASKS = {"FIT_ANALYSIS": "rank", "TAILOR_RESUME": "tailor", "REVIEW_RESUME": "review", "FOLLOW_UP": "followup",
+MARKER_TASKS = {"FIT_ANALYSIS": "rank", "TAILOR_RESUME": "tailor", "COVER_LETTER": "tailor", "REVIEW_RESUME": "review", "FOLLOW_UP": "followup",
                 "EXTRACT_EVIDENCE": "tailor", "AI_OPTIMIZATION": "advisor"}
 CONTEXT_OVERFLOW = re.compile(r"context[_ ]length|context window|maximum context|prompt is too long|too many tokens", re.I)
 
@@ -419,6 +419,20 @@ class LLMClient:
         if task == "advisor":
             return {"summary": "Mock analysis of the supplied usage aggregates.", "recommendations": [],
                     "estimated_savings": "unknown"}
+        if "COVER_LETTER" in user.split("\n", 1)[0]:
+            company = re.search(r'^JOB:\n.*?"company": "([^"]*)"', user, re.MULTILINE | re.DOTALL)
+            return {"cover_letter": f"Dear Hiring Team,\n\nI am applying for this role at "
+                                    f"{company.group(1) if company else 'your company'}. I have built and run the "
+                                    "kind of systems the posting describes.\n\nIn my last role I led the work "
+                                    "behind it and cut production incidents by 45%.\n\nI would bring the same "
+                                    "focus here, and I am happy to talk whenever suits you.\n\nSincerely,\n"
+                                    "The Candidate",
+                    "selected_evidence_ids": []}
+        if "PARSE_RESUME" in user.split("\n", 1)[0]:
+            from app.services.structured_resume import parse_deterministic
+
+            text = user.split("<untrusted_resume>", 1)[-1].rsplit("</untrusted_resume>", 1)[0].strip()
+            return {"raw_text": text, "structured_resume": parse_deterministic(text)}
         if "EXTRACT_EVIDENCE" in user.split("\n", 1)[0]:
             lines = [line.strip(" -•*\t") for line in user.split("MASTER RESUME:", 1)[-1].splitlines()]
             claims = [line for line in lines if len(line) > 25 and re.search(r"\d", line)][:12]

@@ -33,6 +33,7 @@ dev = ["pytest>=8.4,<9", "pytest-asyncio>=1.1,<2", "ruff>=0.12,<1", "pytest-cov>
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+markers = ["strict_resume_policy: run with the production CandidatePolicy (verified resume facts only)"]
 
 [tool.ruff]
 line-length = 100

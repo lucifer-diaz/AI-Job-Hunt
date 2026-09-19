@@ -16,8 +16,20 @@ from app.models import (
     Job,
     ResumeVariant,
 )
-from app.prompts import build_followup_prompt, build_review_prompt, build_tailoring_prompt
+from app.prompts import (
+    build_cover_letter_prompt,
+    build_followup_prompt,
+    build_review_prompt,
+    build_tailoring_prompt,
+)
 from app.services.contacts import recruiters_of
+from app.services.context_builder import (
+    TaskContext,
+    build_cover_letter_context,
+    build_followup_context,
+    build_review_context,
+    build_tailoring_context,
+)
 from app.services.llm import LLMCall, LLMClient
 from app.services.resume_format import (
     ParsedResume,
@@ -43,15 +55,6 @@ def get_profile(db: Session) -> CandidateProfile:
     return profile_for(db)
 
 
-def _evidence_payload(db: Session) -> list[dict]:
-    items = db.scalars(select(Evidence).where(Evidence.verified.is_(True)).order_by(desc(Evidence.id))).all()
-    return [
-        {"id": e.id, "company": e.company, "role": e.role, "claim": e.claim,
-         "context": e.context, "skills": e.skills, "tags": e.tags}
-        for e in items
-    ]
-
-
 # Called with the stage a tailoring run is entering ("tailoring", "reviewing") so background tasks can report progress.
 Progress = Callable[[str], None]
 
@@ -64,20 +67,45 @@ def tailor_job(db: Session, job: Job, progress: Progress = _no_progress) -> Resu
     """Tailor from verified facts. Ranking never runs here: it is the asynchronous ranker's job (app.services.ranker),
     and its latest fit analysis, when there is one, tells tailoring what the resume under-sells."""
     profile = get_profile(db)
-    evidence = _evidence_payload(db)
+    # Verified facts relevant to this job only; raises UnverifiedResumeError when there are none to tailor from.
+    context = build_tailoring_context(db, profile, job)
     progress("tailoring")
     llm = LLMClient.for_user(db)
-    parsed = parse_resume(profile.master_resume or "")
-    roles_payload = [{"role_index": i, "title": r.title, "company": r.company, "dates": r.dates, "bullets": r.bullets}
-                     for i, r in enumerate(parsed.roles)]
-    prompt = build_tailoring_prompt(candidate_profile=profile, resume=profile.master_resume, roles=roles_payload,
-                                    evidence=evidence, job=job, fit_analysis=job.fit_analysis, fit_score=job.fit_score)
-    content = {**llm.generate_prompt_json(prompt, LLMCall(workflow_type="job", entity_id=job.id)),
+    prompt = build_tailoring_prompt(candidate_profile=profile, job=job, fit_analysis=job.fit_analysis,
+                                    fit_score=job.fit_score, context=context)
+    content = {**llm.generate_prompt_json(prompt, LLMCall(workflow_type="job", entity_id=job.id,
+                                                          context_stats=context.stats.as_dict())),
                "prompt_version": prompt.version}
+    content = trusted_content(content, context)
+    content["cover_letter"] = write_cover_letter(db, profile, job, llm)
     resume = persist_tailored_resume(db, job, content)
     progress("reviewing")
     review_resume(db, resume)
     return resume
+
+
+def write_cover_letter(db: Session, profile: CandidateProfile, job: Job, llm: LLMClient) -> str:
+    """A letter in the candidate's own voice, from its own prompt and context (app.prompts.cover_letter): the
+    posting and its company facts, the verified proof points that fit it, and the answers the posting raises."""
+    context = build_cover_letter_context(db, profile, job)
+    prompt = build_cover_letter_prompt(context, recruiters=recruiters_of(job.application) if job.application else [])
+    result = llm.generate_prompt_json(prompt, LLMCall(workflow_type="job", entity_id=job.id,
+                                                      context_stats=context.stats.as_dict()))
+    return to_plain(str(result.get("cover_letter") or "")).strip()
+
+
+def trusted_content(content: dict, context: TaskContext) -> dict:
+    """Keep only what the tailoring context supports: rewrites for roles it supplied bullets for, and evidence ids
+    it supplied. Records which resume version and how much context the packet was generated from."""
+    usable_roles = {role["role_index"] for role in context.roles if role["bullets"]}
+    experience = [item for item in content.get("experience") or []
+                  if isinstance(item, dict) and item.get("role_index") in usable_roles]
+    cited = [i for i in content.get("selected_evidence_ids") or [] if isinstance(i, int)]
+    return {**content, "experience": experience,
+            "selected_evidence_ids": [i for i in cited if i in context.evidence_ids],
+            "discarded_evidence_ids": [i for i in cited if i not in context.evidence_ids],
+            "context": {**context.resume, **context.stats.as_dict(), "evidence_ids": sorted(context.evidence_ids),
+                        "allow_unverified_resume_facts": context.policy.get("allow_unverified_resume_facts", False)}}
 
 
 def persist_tailored_resume(db: Session, job: Job, content: dict, *, markdown: str | None = None) -> ResumeVariant:
@@ -264,11 +292,13 @@ def update_resume_edit(db: Session, resume: ResumeVariant, index: int, status: s
 def review_resume(db: Session, resume: ResumeVariant) -> dict:
     llm = LLMClient.for_user(db)
     job = db.get(Job, resume.job_id)
-    prompt = build_review_prompt(candidate_profile=get_profile(db), evidence=_evidence_payload(db), job=job,
-                                 tailored_resume=resume.markdown)
+    profile = get_profile(db)
+    context = build_review_context(db, profile, job)  # verified structured truth to check the text against
+    prompt = build_review_prompt(candidate_profile=profile, job=job, tailored_resume=resume.markdown, context=context)
     from app.services.review_results import normalize_backend_review
 
-    result = normalize_backend_review({**llm.generate_prompt_json(prompt, LLMCall(workflow_type="job", entity_id=resume.job_id)),
+    result = normalize_backend_review({**llm.generate_prompt_json(prompt, LLMCall(workflow_type="job", entity_id=resume.job_id,
+                                                                                  context_stats=context.stats.as_dict())),
                                        "prompt_version": prompt.version})
     store_review(db, resume, result)
     return result
@@ -344,11 +374,13 @@ def draft_followup(db: Session, app: Application, commit: bool = True) -> Follow
     job = db.get(Job, app.job_id)
     sent = db.scalars(select(FollowUp.draft).where(FollowUp.application_id == app.id, FollowUp.status != "draft")
                       .order_by(FollowUp.id)).all()
+    context = build_followup_context(db, profile, job)
     prompt = build_followup_prompt(
-        candidate_profile=profile, resume=profile.master_resume, evidence=_evidence_payload(db), job=job,
+        candidate_profile=profile, job=job, context=context,
         application={"status": app.status, "applied_at": app.applied_at.isoformat() if app.applied_at else ""},
         recruiters=recruiters_of(app), previous_followups=[text for text in sent if text])
-    result = llm.generate_prompt_json(prompt, LLMCall(workflow_type="application", entity_id=app.id))
+    result = llm.generate_prompt_json(prompt, LLMCall(workflow_type="application", entity_id=app.id,
+                                                      context_stats=context.stats.as_dict()))
     fu = db.scalar(select(FollowUp).where(FollowUp.application_id == app.id, FollowUp.status == "draft")
                    .order_by(desc(FollowUp.id)).limit(1))
     if not fu:

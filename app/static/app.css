@@ -457,6 +457,28 @@ p.settings-help{margin:10px 0}
 @media (max-width:640px){.mon-grid,.mon-grid-3{grid-template-columns:1fr}.mon-tiles{grid-template-columns:repeat(2,minmax(0,1fr))}}
 .mon-select{width:auto;flex:0 1 auto;min-width:0;max-width:220px;margin-top:0}
 
+/* Settings → Resume Data */
+.rd-item{border:1px solid var(--line2);border-radius:10px;padding:12px 14px;margin-bottom:10px;background:#fff}
+.rd-item.rd-editing{background:var(--softer)}
+.rd-item-head{display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap}
+.rd-item-head p,.rd-text{font-size:12px;color:var(--muted);margin:4px 0 0;overflow-wrap:anywhere}
+.rd-badge{flex-shrink:0}
+.rd-bullets{margin-top:10px;display:flex;flex-direction:column;gap:6px}
+.rd-bullet{display:flex;gap:8px;align-items:flex-start;font-size:12.5px;flex-wrap:wrap}
+.rd-bullet .grow{min-width:200px}
+.rd-bullet-edit{display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap}
+.rd-bullet-edit .field{flex:1;min-width:220px}
+.rd-overview{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:6px 18px;margin:14px 0}
+.rd-overview-row{display:flex;justify-content:space-between;gap:8px;font-size:12.5px;padding:4px 0;border-bottom:1px dashed var(--line2);color:var(--ink2)}
+.rd-overview-entry{padding-left:12px;color:var(--muted)}
+.rd-counts{font-size:13px}
+.rd-raw{white-space:pre-wrap;font-family:var(--mono);font-size:12px;max-height:520px;overflow:auto;background:var(--softer);padding:14px;border-radius:8px;margin:0}
+.rd-compare{border:1px solid var(--line2);border-radius:10px;padding:10px 12px;margin-bottom:8px}
+.rd-compare-values{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:8px 0}
+.rd-compare-values p{font-size:12px;margin:2px 0 0;overflow-wrap:anywhere}
+.rd-history-row{padding:8px 0;border-bottom:1px solid var(--line2);min-width:0}
+@media (max-width:700px){.rd-compare-values{grid-template-columns:1fr}}
+
 /* Knowledge bank: focused libraries and inline editors. */
 .knowledge-workspace{max-width:1180px;margin:0 auto}
 .knowledge-nav{display:flex;gap:6px;border-bottom:1px solid var(--line);margin-bottom:28px}

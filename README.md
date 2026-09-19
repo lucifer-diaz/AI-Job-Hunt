@@ -355,14 +355,19 @@ Each prompt has:
 |---|---|---|
 | `ranking.py` | `build_ranking_prompt` | the Job Ranker (`app.services.ranker`) |
 | `tailoring.py` | `build_tailoring_prompt` | `tailor_job` |
+| `cover_letter.py` | `build_cover_letter_prompt` | `write_cover_letter`, called by `tailor_job` |
 | `review.py` | `build_review_prompt` | `review_resume` |
 | `followup.py` | `build_followup_prompt` | `draft_followup` |
-| `resume_parser.py` | `build_evidence_extraction_prompt`, `build_resume_parser_prompt` | evidence parsing; the structured parser is not wired in yet |
+| `resume_parser.py` | `build_evidence_extraction_prompt`, `build_resume_parser_prompt` | evidence parsing; the optional AI re-parse in Settings → Resume Data (shown as a comparison, never applied automatically) |
 | `application.py` | `build_application_question_prompt` | not wired in yet |
 | `inbox.py` | `build_inbox_classification_prompt` | not wired in yet (inbox sync is a placeholder) |
 | `agents.py` | ADK agent instructions | `job_hunt_agent` |
 
 When you change a prompt's wording or output fields, bump its version.
+
+Ranking, tailoring, review and follow-up builders take a `context=` built by `app/services/context_builder.py`
+(see "Resume Data & Verification"). Selecting that context is application logic, so there is no
+`context_selection` prompt.
 
 ## 4. API endpoints
 
@@ -1034,7 +1039,164 @@ Rank / Tailor / Review
 Configured Model API
 ```
 
-## 11. Recommended next upgrades
+## 11. Resume Data & Verification
+
+The resume is used in layers. The uploaded file and its raw text are kept for reference; a structured version of
+it is what AI workflows read; only the facts you verify are trusted when generating application content.
+
+```text
+ Upload (PDF / DOCX / TXT)
+        │  extract text, clean extraction noise (wording untouched)
+        ▼
+ Resume vN ── original file + raw text (read-only, never edited)
+        │  deterministic parser (or optional AI re-parse → comparison)
+        ▼
+ Structured resume ── stable ids, every item UNVERIFIED
+        │  you review, edit and verify in Settings → Resume Data
+        ▼
+ Verified facts ──► Evidence Bank (Evidence, source = resume, with provenance)
+        │
+        ▼
+ Context builders (app/services/context_builder.py) ── relevant subset per task, token-measured
+        │
+        ├─► Ranker    relevant experience + skills + verified evidence (+ unverified, marked lower-confidence)
+        ├─► Tailor    verified facts only + fit analysis + resume gaps
+        └─► Reviewer  verified truth + rejected facts + policy + tailored text
+```
+
+### Raw resume, structured resume and verified evidence
+
+| Layer | Stored in | Who changes it | Used for |
+|---|---|---|---|
+| Original file | `resumes.source_storage_path` | nobody | download / audit |
+| Raw text | `resumes.raw_text` | nobody (read-only) | reference, fallback when nothing could be structured |
+| Structured resume | `resumes.structured_data` | the parser once, then only you | canonical machine-readable data for AI workflows |
+| Verified evidence | `evidence` (`source = resume`) | created from items you verify | claims tailored content may make, cited by id |
+
+Generated resume text (tailored variants) is output, never a source of truth.
+
+### Uploading and reviewing
+
+1. **Settings → Resumes**: upload a PDF, DOCX or TXT. Each upload is a new resume version; uploading the exact same
+   file again reactivates its existing version instead of duplicating it.
+2. **Settings → Resume Data** shows the active version, how much of it is reviewed (verified, needing review, edited,
+   rejected), a per-section and per-role overview, and four tabs: **Structured Data**, **Raw Text**,
+   **Original Resume** and **Change History**.
+3. Each section (personal information, summary, skills, work experience, projects, education, certifications,
+   awards, languages) is a card. Every item — including each achievement or responsibility bullet — shows its status:
+   `✓ Verified`, `? Unverified`, `! Edited · needs review` or `✕ Rejected`.
+
+### Editing incorrect fields
+
+Click **Edit** on a section to correct it with form fields (no JSON): change values, add or remove items and bullets,
+and reorder them. Save sends typed data with the revision you started from; if the resume changed in the meantime
+the save is refused (409) rather than overwriting newer data. The raw text is never rewritten.
+
+### Verifying facts
+
+- **Item**: *Verify* or *Reject* any item or bullet; *Unverify* resets it.
+- **Section**: *Verify section* verifies every unverified or edited item in it (rejected items stay rejected).
+- **Whole resume**: **Verify Resume** succeeds only when every item in the required sections (personal information,
+  summary, skills, work experience including bullets, education) is verified or rejected. Otherwise the button lists
+  what still needs review. On success it shows *Resume verified · Last verified …*.
+
+A bullet becomes Evidence Bank evidence only when both the bullet and its role (or project) are verified. Evidence
+keeps its provenance (`resume_id`, `structured_item_id`, `source_file_hash`) and a `fact_key`, so the same fact
+verified in a later resume version reuses the same evidence row. Unverified or rejected data never creates evidence.
+
+### After verified data is edited
+
+1. The new value is saved.
+2. The item becomes **EDITED** (it is no longer trusted).
+3. A verified resume becomes **NEEDS_REVIEW**, and evidence created from that item is withdrawn (marked unverified).
+4. Verify the item again (and **Verify Resume**) to restore it.
+
+Every change — parse, edit, add, remove, reorder, verify, reject, re-parse choice — is written to
+`resume_data_changes` with the field path, old and new value, and its source (`PARSER`, `USER`, `SYSTEM`).
+
+### Re-parsing
+
+**Re-parse resume** (deterministic) or **Re-parse with AI** (uses `app/prompts/resume_parser.py`) never replaces
+data. It produces a comparison — *current value* vs *new parser result* — and you choose **Keep current** or
+**Use new** for each difference. Values taken from the parser start unverified.
+
+### Multiple resume versions
+
+`CandidateProfile` stays the candidate; each `Resume` row is one version (`version` 1, 2, 3 …). One version is
+**active** (what AI workflows use; the profile's master resume text follows it) and one is **default**. Saving new
+master resume text in Settings also creates a version. Old versions and their original files are kept. Verified
+facts live in the Evidence Bank, so they carry over between versions.
+
+### Cover letters
+
+The letter has its own prompt and its own model call, after the resume is tailored. It is written in the first
+person from verified facts only, addressed to the company in the posting, and closes with the candidate's name.
+The knowledge base reaches the letter and never the resume rewriting, and only when the posting raises the
+subject. A letter, like a tailored resume, is blocked when nothing is verified (see the candidate policy below).
+
+### Candidate policy
+
+| Setting | Default | Effect |
+|---|---|---|
+| `allow_unverified_resume_facts` | off | Tailoring, review and follow-ups use verified facts only. With nothing verified, tailoring stops with "Verify your resume in Settings → Resume Data". |
+| `ranking_uses_unverified` | on | Ranking may read unverified parsed facts, sent in a separate `UNVERIFIED RESUME FACTS` section and treated as lower-confidence. |
+
+Rejected facts are never used for generation; the reviewer receives them to flag any reuse.
+
+### Dynamic context
+
+Models no longer receive the whole resume and Evidence Bank. `app/services/context_builder.py` builds a structured
+`TaskContext` (`candidate`, `resume`, `relevant_experience`, `relevant_skills`, `relevant_evidence`,
+`unverified_facts`, `rejected_facts`, `job`, `fit_analysis`, `policy`, `stats`) before the prompt is rendered:
+
+- `build_ranking_context`: candidate summary and target roles, every role header, the bullets and skills relevant to
+  the posting, relevant verified evidence, and (per policy) marked unverified facts.
+- `build_tailoring_context`: the job, fit analysis and resume gaps, the master resume roles with their relevant
+  verified bullets, and relevant verified evidence. Model rewrites for roles it got no facts for, and evidence ids
+  it was not given, are dropped.
+- `build_review_context`: the verified structured truth (all verified roles and dates, bullets, education,
+  certifications), rejected facts, candidate policy — alongside the tailored resume and the job description.
+- `build_cover_letter_context`: the posting and its company facts, the verified proof points that fit it, and the
+  verified, non-sensitive knowledge answers the posting actually raises (work authorization, notice period,
+  relocation, remote working).
+- `build_followup_context`: a few verified highlights.
+
+Selection is deterministic (no extra model call): overlap with the posting's words and skills, plus themes the
+posting stresses (leadership, AI, reliability, data, cloud); the most recent role always keeps a few bullets.
+
+Each context estimates `full_available_context_tokens` (the whole resume text, all verified evidence and the
+posting) and `selected_context_tokens` (what it selected), and the LLM call records them with
+`context_reduction_percent` in `llm_request_logs`. The Monitoring tab's context card shows the totals, e.g.
+*19.4K available · 5.3K sent · 72.7% reduction*, overall and per stage.
+
+### Resume Data API
+
+`{id}` is a resume version id (the older `/api/resumes/{id}/edits` and `/cover-letter` routes address tailored variants).
+
+| Route | Purpose |
+|---|---|
+| `GET /api/settings/resume` | active version with structured data and progress, all versions, candidate policy |
+| `PUT /api/settings/resume/policy` | update the candidate policy |
+| `GET /api/resumes/{id}/structured` | structured data, progress, pending re-parse comparison |
+| `PUT /api/resumes/{id}/structured` | save typed structured data: `{revision, data}` (verification fields are ignored) |
+| `POST /api/resumes/{id}/verify-item` | `{item_id, status: VERIFIED \| REJECTED}` |
+| `POST /api/resumes/{id}/unverify-item` | `{item_id}` |
+| `POST /api/resumes/{id}/verify-section` | `{section}` |
+| `POST /api/resumes/{id}/verify` | verify the whole resume (422 with `blocking` items otherwise) |
+| `GET /api/resumes/{id}/changes` | change history, newest first |
+| `GET /api/resumes/{id}/raw`, `GET /api/resumes/{id}/original` | raw text, original file |
+| `POST /api/resumes/{id}/reparse` | `{use_ai}`: build a comparison |
+| `POST /api/resumes/{id}/reparse/resolve` | `{decisions: {change_id: keep \| use_new}}` |
+| `POST /api/resumes/{id}/activate`, `POST /api/resumes/{id}/default` | choose the active / default version |
+
+### Migration
+
+Migration `0014` creates `resumes` and `resume_data_changes`, adds provenance columns to `evidence` and context
+columns to `llm_request_logs`. Existing uploads become resume versions (plus one for hand-edited master text); their
+structured data is parsed on first use and nothing is marked verified. Existing evidence keeps its verified flag.
+Because the ranking prompt is now `v3`, qualified jobs are re-ranked once when auto re-ranking is on.
+
+## 12. Recommended next upgrades
 
 - Apify webhook endpoint so completed runs are ingested without polling
 - Gmail integration for follow-up drafts and thread matching
@@ -1047,7 +1209,7 @@ Configured Model API
 
 See [DEPLOY.md](DEPLOY.md) for hosting instructions.
 
-## 12. Google Gemini agent deployment
+## 13. Google Gemini agent deployment
 
 To tailor and review from Claude Desktop instead, see [10. Claude Desktop + MCP](#10-claude-desktop--mcp).
 
