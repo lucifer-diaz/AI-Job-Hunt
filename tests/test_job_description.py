@@ -731,3 +731,62 @@ def test_long_requirement_sections_stay_valid_json():
     body = section.split("JOB REQUIREMENTS:\n", 1)[1]
     parsed = json.loads(body)  # would raise on a string cut at an arbitrary character
     assert len(body) <= 24000 and 0 < len(parsed["required"]) < 200
+
+
+def _model_parse(monkeypatch, required, preferred, rows):
+    """Make the parser answer like a real model: short skill names in the lists, sentences in the requirements."""
+    from app.services.llm import LLMClient
+
+    monkeypatch.setattr(LLMClient, "generate_prompt_json", lambda self, prompt, call=None: {
+        "structured_description": {"required_skills": required, "preferred_skills": preferred},
+        "requirements": [{"type": "SKILL", "normalized_value": value, "requirement_level": level,
+                          "source_text": quote, "confidence": 0.9, "is_explicit": True}
+                         for value, level, quote in rows]})
+
+
+def test_corrections_reach_rows_whose_text_differs_from_the_list(user, monkeypatch):
+    _model_parse(monkeypatch, ["Python", "Kafka"], ["Kubernetes"], [
+        ("Strong experience with Python", "REQUIRED", "Strong experience with Python is required."),
+        ("Kafka pipelines", "REQUIRED", "You will own the Kafka pipelines behind our analytics platform."),
+        ("Familiarity with Kubernetes", "PREFERRED", "Familiarity with Kubernetes is a plus.")])
+    job_id = add_job(user)
+    parse(user, job_id)
+
+    out = correct(job_id, lambda d: d["required_skills"].remove("Python")).json()
+    assert out["unmatched_corrections"] == []
+    rows = {item["value"]: item for item in requirements(job_id)}
+    assert rows["Strong experience with Python"]["level"] == "INFORMATIONAL", "the removal reached the row"
+    assert rows["Strong experience with Python"]["origin"] == "USER"
+
+    correct(job_id, lambda d: (d["preferred_skills"].remove("Kubernetes"), d["required_skills"].append("Kubernetes")))
+    rows = requirements(job_id)
+    kubernetes = [item for item in rows if "Kubernetes" in item["value"]]
+    assert [(item["value"], item["level"]) for item in kubernetes] == [("Familiarity with Kubernetes", "REQUIRED")], \
+        "the move changed the existing row instead of adding a contradictory second one"
+    with session(user) as db:
+        required = {item["value"] for item in jc.build_ranking_job_context(db, db.get(Job, job_id)).required}
+    assert "Strong experience with Python" not in required and "Familiarity with Kubernetes" in required
+
+
+def test_an_ambiguous_correction_is_reported_and_changes_no_row(user, monkeypatch):
+    _model_parse(monkeypatch, ["Python", "Go"], [], [
+        ("Python services at scale", "REQUIRED", "Strong experience with Python is required."),
+        ("Python and Go", "REQUIRED", "Minimum of 8 years building distributed systems.")])
+    job_id = add_job(user)
+    parse(user, job_id)
+    before = {(item["value"], item["level"]) for item in requirements(job_id)}
+    out = correct(job_id, lambda d: d["required_skills"].remove("Python")).json()
+    # Demoting both rows would also demote Go, which the user kept: nothing is guessed, and the user is told.
+    assert out["unmatched_corrections"] == ["Python"]
+    assert {(item["value"], item["level"]) for item in requirements(job_id)} == before
+    assert out["structured_description"]["required_skills"] == ["Go"], "the correction itself is still saved"
+
+
+def test_the_parser_must_name_list_skills_like_their_requirements():
+    from app.prompts.job_description_parser import (
+        JOB_DESCRIPTION_PARSER_PROMPT_VERSION,
+        JOB_DESCRIPTION_PARSER_SYSTEM,
+    )
+
+    assert JOB_DESCRIPTION_PARSER_PROMPT_VERSION == "v2"
+    assert "copied exactly from the normalized_value of a SKILL" in JOB_DESCRIPTION_PARSER_SYSTEM

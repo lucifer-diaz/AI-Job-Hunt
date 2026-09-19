@@ -21,7 +21,7 @@ from app.prompts.common import (
     user_message,
 )
 
-JOB_DESCRIPTION_PARSER_PROMPT_VERSION = "v1"
+JOB_DESCRIPTION_PARSER_PROMPT_VERSION = "v2"
 JOB_DESCRIPTION_PARSER_MARKER = "PARSE_JOB_DESCRIPTION"
 REQUIREMENT_LEVELS = ("REQUIRED", "PREFERRED", "INFORMATIONAL", "UNKNOWN")
 REQUIREMENT_TYPES = ("SKILL", "EXPERIENCE", "RESPONSIBILITY", "LEADERSHIP", "EDUCATION", "LOCATION",
@@ -99,6 +99,10 @@ is_explicit false). Do not invent an interview process, interview questions or h
     cannot sponsor, otherwise null. work_authorization_required follows the same standard.
   compensation: only from the posting itself, with the sentence in source_text; null when it is not stated. Never
     estimate a market rate.
+  required_skills / preferred_skills: every entry is copied exactly from the normalized_value of a SKILL
+    requirement with level REQUIRED (for required_skills) or PREFERRED (for preferred_skills), and every such SKILL
+    requirement appears in its list. The lists and the requirements must name each skill identically, because a
+    user's correction to a list is applied to the requirement with the same value.
   hard_requirements: the small set a candidate would be rejected for missing (licences, clearances, authorization,
     a stated minimum of experience). nice_to_have: the preferred ones.
   keywords: words this posting would be searched by, drawn from the posting's own text.

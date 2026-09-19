@@ -60,10 +60,12 @@ def structured_description(job_id: int, db: Session = Depends(get_user_db)):
 def correct_structured_description(job_id: int, payload: CorrectionIn, db: Session = Depends(get_user_db)):
     """Correct parsed values. Corrected fields are never overwritten by a later parse."""
     job = _job(db, job_id)
-    job_description.apply_correction(db, job, payload.structured_description)
+    reconciled = job_description.apply_correction(db, job, payload.structured_description)
     db.commit()
     db.refresh(job)
-    return _detail(db, job)
+    # Corrections that could not be tied to exactly one requirement: saved in the document, but ranking and
+    # tailoring still read the requirement rows, so the user is told rather than left to assume.
+    return {**_detail(db, job), "unmatched_corrections": reconciled.unmatched}
 
 
 @router.post("/api/jobs/{job_id}/structured-description/reparse")
@@ -89,7 +91,7 @@ def resolve_reparse(job_id: int, payload: ResolveIn, db: Session = Depends(get_u
         raise HTTPException(404, str(exc)) from exc
     db.commit()
     db.refresh(job)
-    return {**_detail(db, job), "accepted": out["accepted"]}
+    return {**_detail(db, job), "accepted": out["accepted"], "unmatched_corrections": out["unmatched"]}
 
 
 @router.get("/api/jobs/{job_id}/requirements")

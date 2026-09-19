@@ -21,14 +21,14 @@ const JD_FIELDS = [
   ['compensation.currency', 'Currency'], ['compensation.period', 'Period'],
   ['hard_requirements', 'Hard requirements', 'lines'], ['nice_to_have', 'Nice to have', 'lines'],
 ];
-const JD = { data: null, jobId: null, loading: false, draft: null, decisions: {}, history: null, view: 'summary', error: '' };
+const JD = { data: null, jobId: null, loading: false, draft: null, decisions: {}, history: null, view: 'summary', error: '', unmatched: [] };
 
 const jdGet = (object, path) => path.split('.').reduce((node, key) => (node == null ? node : node[key]), object);
 function jdSet(object, path, value) {
   const keys = path.split('.'), last = keys.pop();
   keys.reduce((node, key) => (node[key] = node[key] || {}), object)[last] = value;
 }
-function jdReset() { JD.draft = null; JD.decisions = {}; JD.error = ''; }
+function jdReset() { JD.draft = null; JD.decisions = {}; JD.error = ''; JD.unmatched = []; }
 
 async function jobDataLoad(jobId, force = false) {
   if (JD.loading || (!force && JD.jobId === jobId && JD.data)) return;
@@ -128,8 +128,9 @@ function renderJobStructured(job) {
   if (editing) {
     return `<div style="padding:20px 22px">${head}${error}<p class="settings-help mb12">Correct anything the parser got wrong. Corrected fields are never overwritten by a later parse.</p><div class="settings-grid">${JD_FIELDS.map(([path, fieldLabel, kind]) => jdField(path, fieldLabel, kind, jdGet(JD.draft, path))).join('')}</div></div>`;
   }
+  const unmatched = JD.unmatched.length ? `<div class="box warn small" data-jd-unmatched role="status"><strong>Saved, but not applied to the requirements:</strong> ${JD.unmatched.map(v => esc(v)).join(' · ')}. Each matches no single requirement from the posting (or several), so ranking and tailoring still read the parsed requirements for it.</div>` : '';
   const stale = data.stale ? `<div class="box warn small" data-jd-stale>The posting changed after it was parsed. Ranking and tailoring use the posting as written until it is parsed again.</div>` : '';
-  return `<div style="padding:20px 22px" class="col gap14">${head}${error}${stale}${jdComparison(data)}${jdSummary(data)}
+  return `<div style="padding:20px 22px" class="col gap14">${head}${error}${unmatched}${stale}${jdComparison(data)}${jdSummary(data)}
     <div><div class="caps mb8">REQUIREMENTS · IN THE EMPLOYER'S WORDS</div>${requirements.length
       ? `<div class="col gap6">${requirements.map(jdRequirementRow).join('')}</div>`
       : '<div class="small muted">No requirements were extracted from this posting.</div>'}</div>
@@ -143,6 +144,7 @@ const JOB_DATA_ACTIONS = {
   'jd-save': el => jdRun(async () => {
     JD.data = await api(`/api/jobs/${el.dataset.id}/structured-description`, { method: 'PUT', body: { structured_description: JD.draft } });
     jdReset();
+    JD.unmatched = JD.data.unmatched_corrections || [];
   }, 'Corrections saved'),
   'jd-reparse': el => jdRun(async () => {
     JD.data = await api(`/api/jobs/${el.dataset.id}/structured-description/reparse`, { method: 'POST' });
@@ -154,6 +156,7 @@ const JOB_DATA_ACTIONS = {
     return jdRun(async () => {
       JD.data = await api(`/api/jobs/${JD.jobId}/structured-description/reparse/resolve`, { method: 'POST', body: { decisions } });
       JD.decisions = {};
+      JD.unmatched = JD.data.unmatched_corrections || [];
     }, 'Choices applied');
   },
   'jd-history': el => {

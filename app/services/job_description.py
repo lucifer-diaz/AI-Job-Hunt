@@ -21,7 +21,7 @@ import hashlib
 import html
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -433,31 +433,70 @@ def _sentence_with(posting: str, value: str) -> str:
     return ""
 
 
+@dataclass
+class Reconciled:
+    touched: int = 0
+    # Corrections that could not be tied to exactly one requirement row, so no row was changed for them.
+    unmatched: list[str] = field(default_factory=list)
+
+
+def _names(row: JobRequirementEvidence, value: str) -> bool:
+    """Whether the row's requirement names `value` as a whole word or phrase ("Python" in "Strong Python skills")."""
+    needle = _plain(value)
+    return bool(needle) and re.search(rf"(?<![\w+#]){re.escape(needle)}(?![\w+#])", _plain(row.normalized_value)) is not None
+
+
+def _row_for(rows: list[JobRequirementEvidence], value: str, level: str | None) -> JobRequirementEvidence | None | str:
+    """The one row a list value refers to: an exact match, otherwise the only row at `level` naming it.
+
+    Returns "ambiguous" when several rows name the value: changing all of them could demote an unrelated skill
+    written in the same sentence ("Python and Go"), so none is changed.
+    """
+    key = _key(value)
+    exact = [row for row in rows if _key(row.normalized_value) == key]
+    if exact:
+        return exact[0]
+    if level is None:
+        return None
+    named = [row for row in rows if row.requirement_level == level and _names(row, value)]
+    if len(named) > 1:
+        return "ambiguous"
+    return named[0] if named else None
+
+
 def reconcile_requirements(db: Session, job: Job, old: dict[str, Any], new: dict[str, Any], *,
-                           candidates: list[RequirementIn] | None = None) -> int:
-    """Bring the requirement rows in line with a change to the required/preferred lists. Returns rows touched.
+                           candidates: list[RequirementIn] | None = None) -> Reconciled:
+    """Bring the requirement rows in line with a change to the required/preferred lists.
 
     Only what changed is touched, value by value: a value moved between the lists changes its row's level, a value
     added gets a row (quoted from the posting when the posting says it), and a value removed from both lists stops
     being a requirement (INFORMATIONAL) while its quote is kept. Every touched row becomes origin USER.
+
+    A list value finds its row by exact text or, when the parser wrote a sentence ("Strong Python experience") for
+    a short skill ("Python"), by being the only row at its old level that names it. A change that matches no row, or
+    several, is reported in `unmatched` rather than guessed.
     """
     posting = normalize_description(job.description or "")
-    rows = {_key(row.normalized_value): row for row in db.scalars(
-        select(JobRequirementEvidence).where(JobRequirementEvidence.job_id == job.id,
-                                             JobRequirementEvidence.is_derived.is_(False))).all()}
+    rows = list(db.scalars(select(JobRequirementEvidence).where(
+        JobRequirementEvidence.job_id == job.id, JobRequirementEvidence.is_derived.is_(False))).all())
     quotes = {_key(item.normalized_value): item for item in candidates or []}
-    before = {_key(v): level for field, level in REQUIREMENT_LISTS.items() for v in old.get(field) or []}
-    after = {}
-    shown = {}
-    for field, level in REQUIREMENT_LISTS.items():
-        for value in new.get(field) or []:
-            after.setdefault(_key(value), level)
+    before, after, shown = {}, {}, {}
+    for field_name, level in REQUIREMENT_LISTS.items():
+        for value in old.get(field_name) or []:
+            before.setdefault(_key(value), level)
             shown.setdefault(_key(value), value)
-    touched = 0
+        for value in new.get(field_name) or []:
+            after.setdefault(_key(value), level)
+            shown[_key(value)] = value
+    result = Reconciled()
     for key, level in after.items():
         if before.get(key) == level:
             continue
-        row = rows.get(key)
+        # A moved value looks for its row at the level it had; a new one only takes an exact match.
+        row = _row_for(rows, shown[key], before.get(key))
+        if row == "ambiguous":
+            result.unmatched.append(shown[key])
+            continue
         if row is None:
             item = quotes.get(key)
             quote = item.source_text if item is not None and quoted_in(posting, item.source_text) else \
@@ -469,15 +508,21 @@ def reconcile_requirements(db: Session, job: Job, old: dict[str, Any], new: dict
                 # The user's own statement: not the employer's words unless the posting says it, and not an inference.
                 is_explicit=bool(quote), is_derived=False, origin="USER", created_at=utcnow(), updated_at=utcnow())
             db.add(row)
+            rows.append(row)
         else:
             row.requirement_level, row.origin, row.updated_at = level, "USER", utcnow()
-        touched += 1
-    for key in before:
-        if key not in after and (row := rows.get(key)) is not None and row.requirement_level in ("REQUIRED",
-                                                                                                  "PREFERRED"):
+        result.touched += 1
+    for key, level in before.items():
+        if key in after:
+            continue
+        row = _row_for(rows, shown[key], level)
+        if isinstance(row, JobRequirementEvidence) and row.requirement_level in ("REQUIRED", "PREFERRED"):
             row.requirement_level, row.origin, row.updated_at = "INFORMATIONAL", "USER", utcnow()
-            touched += 1
-    return touched
+            result.touched += 1
+        else:
+            # Removed from the lists, but no single requirement row says it: nothing downstream changed for it.
+            result.unmatched.append(shown[key])
+    return result
 
 
 def store_parse(db: Session, job: Job, parsed: ParsedJobDescription, *, source: str = "PARSER",
@@ -595,11 +640,11 @@ def with_board_facts(job: Job, parsed: ParsedJobDescription) -> ParsedJobDescrip
     """Fill identity and salary the job board reported when the posting text does not state them. Employer salary
     already in the structured data is never replaced (external estimates never reach this field)."""
     identity = parsed.structured_description.job_identity
-    for field, value in (("title", job.title), ("company", job.company), ("location", job.location),
-                         ("remote_type", job.remote_type), ("employment_type", job.job_type),
-                         ("seniority", job.seniority)):
-        if not getattr(identity, field) and value:
-            setattr(identity, field, value)
+    for name, value in (("title", job.title), ("company", job.company), ("location", job.location),
+                        ("remote_type", job.remote_type), ("employment_type", job.job_type),
+                        ("seniority", job.seniority)):
+        if not getattr(identity, name) and value:
+            setattr(identity, name, value)
     salary = parsed.structured_description.compensation
     if salary.min is None and salary.max is None and (job.salary_min or job.salary_max):
         salary.min, salary.max = job.salary_min, job.salary_max
@@ -856,20 +901,22 @@ def waiting_reason(db: Session, job: Job) -> str | None:
 
 # ───────────── manual correction and re-parse ─────────────
 
-def apply_correction(db: Session, job: Job, payload: StructuredJobDescriptionIn) -> dict[str, Any]:
-    """Save the user's corrections to the structured description. Corrected paths are protected from parsers."""
+def apply_correction(db: Session, job: Job, payload: StructuredJobDescriptionIn) -> Reconciled:
+    """Save the user's corrections to the structured description. Corrected paths are protected from parsers.
+    Returns what reached the requirement rows, including corrections that could not be tied to one row."""
     old = job.structured_description or StructuredJobDescriptionIn().model_dump()
     new = payload.model_dump()
     old_flat, new_flat = _flat(old), _flat(new)
     changed = [path for path in sorted(set(old_flat) | set(new_flat)) if old_flat.get(path) != new_flat.get(path)]
     for path in changed:
         record_change(db, job, path, old_flat.get(path), new_flat.get(path), "USER")
+    reconciled = Reconciled()
     if changed:
         job.structured_description = new
         job.structured_description_status = MANUALLY_CORRECTED
         # Every workflow reads the requirement rows, not this document: a correction has to reach them too.
-        reconcile_requirements(db, job, old, new)
-    return job.structured_description
+        reconciled = reconcile_requirements(db, job, old, new)
+    return reconciled
 
 
 def reparse(db: Session, job: Job) -> dict[str, Any]:
@@ -923,7 +970,8 @@ def resolve_reparse(db: Session, job: Job, decisions: dict[str, str]) -> dict[st
     job.structured_description_hash = candidate.get("description_hash") or job.structured_description_hash
     # Requirement rows follow the individual decisions: only values the user accepted into the required or
     # preferred lists change. Kept values, and parser rows that never appeared as a comparison, stay as they were.
-    reconcile_requirements(db, job, previous, structured,
-                           candidates=[RequirementIn.model_validate(item) for item in candidate["requirements"]])
+    reconciled = reconcile_requirements(db, job, previous, structured,
+                                        candidates=[RequirementIn.model_validate(item)
+                                                    for item in candidate["requirements"]])
     job.structured_description_candidate = None
-    return {"accepted": accepted, "structured_description": structured}
+    return {"accepted": accepted, "structured_description": structured, "unmatched": reconciled.unmatched}

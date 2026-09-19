@@ -1259,7 +1259,12 @@ form fields (no raw JSON). A correction moves the job to `MANUALLY_CORRECTED` an
 Corrections to the required and preferred lists reach the requirement rows that ranking, tailoring and review
 read, value by value: a skill moved between the lists changes level, a skill added gets a row (quoted from the
 posting when the posting says it), and a skill removed stops being a requirement while its quote is kept. Those rows
-are marked `origin = USER`, and a later parse never replaces them.
+are marked `origin = USER`, and a later parse never replaces them. A list entry finds its row by exact text or,
+when the parser wrote a sentence for a short skill ("Strong Python experience" for "Python"), by being the only row
+at its old level that names it. A correction that matches no row, or several (changing "Python and Go" would also
+change Go), is saved in the document but applied to no row, and the Structured JD tab says so rather than letting
+you assume ranking and tailoring picked it up. The parser (`v2`) names each skill identically in the lists and in
+the requirements, so this is the exception rather than the rule.
 
 **Re-parse** never overwrites your corrections. For a corrected job it produces a candidate version and a
 field-by-field comparison — current value against new parser result — which you resolve with *Keep* or *Use new*.

@@ -601,6 +601,19 @@ describe('structured job description', () => {
     expect(ui.JD.draft).toBeNull();
   });
 
+  it('tells the user when a correction could not be applied to the requirements', async () => {
+    await open();
+    routes({ 'PUT /api/jobs/7/structured-description': () => ({ ...payload({ status: 'MANUALLY_CORRECTED' }), unmatched_corrections: ['Python'] }) });
+    ui.A['jd-edit']();
+    input('jd-required_skills', 'Go');
+    await ui.A['jd-save']({ dataset: { id: '7' } });
+    const notice = document.querySelector('[data-jd-unmatched]');
+    expect(notice.textContent).toContain('not applied to the requirements');
+    expect(notice.textContent).toContain('Python');
+    ui.A['jd-edit'](); ui.A['jd-cancel']();
+    expect(document.querySelector('[data-jd-unmatched]')).toBeNull();
+  });
+
   it('compares a re-parse of a corrected job and sends only the chosen values', async () => {
     let decisions;
     const candidate = { version: 'v1', changes: [{ id: 'chg_1', path: 'job_identity.seniority', current: 'Staff', proposed: 'Lead', corrected: true }] };
