@@ -40,11 +40,17 @@ def upsert_job(
     raw: dict | None = None,
     user_id: int | None = None,
 ) -> tuple[Job, bool]:
+    from app.services import (
+        job_description,  # local import: sources is imported while the app is starting up
+    )
+
     owner = user_id if user_id is not None else require_user_id(db)
     existing = db.scalar(select(Job).where(Job.user_id == owner, Job.source == source, Job.source_ref == source_ref))
     if existing:
         if description and len(description) > len(existing.description or ""):
             existing.description = description
+            # A fuller posting is new employer text: parse it again (app.services.job_description).
+            job_description.queue_parse(db, existing, reason="description_changed")
         if url:
             existing.url = url
         if raw:
@@ -63,6 +69,8 @@ def upsert_job(
         raw=raw or {},
     )
     db.add(job)
+    db.flush()
+    job_description.queue_parse(db, job)
     db.commit()
     db.refresh(job)
     return job, True
@@ -480,7 +488,7 @@ def refresh_apify_run(db: Session, search_run: SearchRun, reimport: bool = False
         search_run.item_count = import_stats["seen"]
         search_run.created_jobs = db.scalar(select(func.count(Job.id)).where(Job.search_run_id == search_run.id)) or 0
         if status != "SUCCEEDED":
-            search_run.error = str((run.get("statusMessage") or run.get("errorMessage") or status))[:2000]
+            search_run.error = str(run.get("statusMessage") or run.get("errorMessage") or status)[:2000]
         search_run.completed_at = search_run.completed_at or datetime.now(UTC).replace(tzinfo=None)
 
     db.commit()

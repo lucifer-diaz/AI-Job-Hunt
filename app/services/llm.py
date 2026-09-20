@@ -22,7 +22,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from app.services import llm_telemetry
-from app.services.ai_config import is_free_model, resolve as resolve_ai_config
+from app.services.ai_config import is_free_model
+from app.services.ai_config import resolve as resolve_ai_config
 from app.services.llm_telemetry import Attempt, LLMCall, Usage
 from app.settings import get_settings
 
@@ -73,7 +74,7 @@ def _extract_json(text: str) -> dict[str, Any]:
     try:
         value = json.loads(text)
     except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, re.S)
+        match = re.search(r"\{.*\}", text, re.DOTALL)
         if not match:
             raise LLMResponseError("Model did not return JSON")
         try:
@@ -88,7 +89,7 @@ def _extract_json(text: str) -> dict[str, Any]:
 # Prompt markers (app.prompts) → the stage whose model runs them.
 MARKER_TASKS = {"FIT_ANALYSIS": "rank", "TAILOR_RESUME": "tailor", "COVER_LETTER": "tailor", "REVIEW_RESUME": "review", "FOLLOW_UP": "followup",
                 "EXTRACT_EVIDENCE": "tailor", "AI_OPTIMIZATION": "advisor"}
-CONTEXT_OVERFLOW = re.compile(r"context[_ ]length|context window|maximum context|prompt is too long|too many tokens", re.I)
+CONTEXT_OVERFLOW = re.compile(r"context[_ ]length|context window|maximum context|prompt is too long|too many tokens", re.IGNORECASE)
 
 
 def _task_from_prompt(user: str) -> str:
@@ -385,7 +386,7 @@ class LLMClient:
     def _mock(self, task: str, user: str) -> dict[str, Any]:
         # Useful for local smoke tests without API spend.
         if task == "rank":
-            job_id = re.search(r"^JOB ID: (\d+)$", user, re.M)
+            job_id = re.search(r"^JOB ID: (\d+)$", user, re.MULTILINE)
             return {
                 "job_id": int(job_id.group(1)) if job_id else 0,
                 "overall_fit_score": 80,
@@ -419,6 +420,17 @@ class LLMClient:
         if task == "advisor":
             return {"summary": "Mock analysis of the supplied usage aggregates.", "recommendations": [],
                     "estimated_savings": "unknown"}
+        if "PARSE_JOB_DESCRIPTION" in user.split("\n", 1)[0]:
+            from types import SimpleNamespace
+
+            from app.services.job_description import deterministic_parse
+
+            facts = json.loads(re.search(r"^JOB POSTING:\n(.*)$", user, re.MULTILINE).group(1))
+            text = user.split("<untrusted_job_description>", 1)[-1].rsplit("</untrusted_job_description>", 1)[0]
+            job = SimpleNamespace(**{field: facts.get(field) for field in
+                                     ("title", "company", "location", "remote_type", "job_type", "seniority")},
+                                  source_board=None, source="mock")
+            return deterministic_parse(job, text.strip())
         if "COVER_LETTER" in user.split("\n", 1)[0]:
             company = re.search(r'^JOB:\n.*?"company": "([^"]*)"', user, re.MULTILINE | re.DOTALL)
             return {"cover_letter": f"Dear Hiring Team,\n\nI am applying for this role at "

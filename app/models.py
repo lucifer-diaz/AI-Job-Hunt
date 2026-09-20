@@ -27,6 +27,10 @@ def _in_check(column: str, enum: type) -> str:
     return f"{column} IN ({', '.join(repr(m.value) for m in enum)})"
 
 
+def _values(values: tuple[str, ...]) -> str:
+    return ", ".join(repr(v) for v in values)
+
+
 def _owner(table: str, unique: bool = False, required: bool = True):
     """The account that owns a row: every owned table carries it, indexed, and the row dies with the account.
 
@@ -67,6 +71,10 @@ class User(Base):
     application_events: Mapped[list[ApplicationEvent]] = relationship(back_populates="user", passive_deletes=True)
     transitions: Mapped[list[WorkflowTransition]] = relationship(back_populates="user", passive_deletes=True)
     resume_versions: Mapped[list[ResumeVersion]] = relationship(back_populates="user", passive_deletes=True)
+    job_requirements: Mapped[list[JobRequirementEvidence]] = relationship(back_populates="user", passive_deletes=True)
+    job_parse_tasks: Mapped[list[JobDescriptionParseTask]] = relationship(back_populates="user", passive_deletes=True)
+    job_structured_changes: Mapped[list[JobStructuredDataChange]] = relationship(back_populates="user",
+                                                                                 passive_deletes=True)
     ranking_tasks: Mapped[list[JobRankingTask]] = relationship(back_populates="user", passive_deletes=True)
     rankings: Mapped[list[JobRanking]] = relationship(back_populates="user", passive_deletes=True)
     optimization_tasks: Mapped[list[AIOptimizationTask]] = relationship(back_populates="user", passive_deletes=True)
@@ -308,6 +316,15 @@ class SearchProfile(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
 
 
+JD_STATUSES = ("RAW", "NORMALIZED", "PARSED", "NEEDS_REVIEW", "MANUALLY_CORRECTED")
+JD_PARSE_STATUSES = ("PENDING", "PROCESSING", "COMPLETED", "FAILED")
+ACTIVE_JD_PARSE_STATUSES = ("PENDING", "PROCESSING")
+REQUIREMENT_TYPES = ("SKILL", "EXPERIENCE", "RESPONSIBILITY", "LEADERSHIP", "EDUCATION", "LOCATION",
+                     "WORK_AUTHORIZATION", "VISA", "COMPENSATION", "DOMAIN", "SENIORITY", "OTHER")
+REQUIREMENT_LEVELS = ("REQUIRED", "PREFERRED", "INFORMATIONAL", "UNKNOWN")
+JOB_CHANGE_SOURCES = ("PARSER", "USER", "SYSTEM")
+
+
 class Job(Base):
     __tablename__ = "jobs"
     __table_args__ = (
@@ -315,6 +332,8 @@ class Job(Base):
         CheckConstraint(_in_check("state", WorkflowState), name="ck_jobs_state"),
         CheckConstraint(_in_check("previous_state", WorkflowState), name="ck_jobs_previous_state"),
         CheckConstraint(_in_check("error_category", ErrorCategory), name="ck_jobs_error_category"),
+        CheckConstraint(f"structured_description_status IN ({_values(JD_STATUSES)})",
+                        name="ck_jobs_structured_description_status"),
         CheckConstraint("attempt_count >= 0", name="ck_jobs_attempt_count"),
         CheckConstraint("(locked_at IS NULL AND locked_by IS NULL AND lock_token IS NULL AND lock_expires_at IS NULL)"
                         " OR (locked_at IS NOT NULL AND locked_by IS NOT NULL AND lock_token IS NOT NULL"
@@ -361,6 +380,17 @@ class Job(Base):
     locked_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
     lock_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
     lock_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Structured job description (app.services.job_description). `description` above stays the employer's raw text
+    # and is never rewritten; these hold the cleaned text and the machine-readable version built from it.
+    normalized_description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    structured_description: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    structured_description_version: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    structured_description_status: Mapped[str] = mapped_column(String(25), default="RAW", server_default="RAW")
+    structured_description_parsed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # The raw description the structured version was parsed from, and a re-parse waiting for the user's choices.
+    structured_description_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    structured_description_candidate: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+
     # Salary enrichment (app.services.compensation): posting salary plus the status of other sources.
     compensation: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     compensation_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -405,6 +435,10 @@ class Job(Base):
                                                                passive_deletes=True)
     rankings: Mapped[list[JobRanking]] = relationship(back_populates="job", cascade="all, delete-orphan",
                                                       passive_deletes=True, order_by="JobRanking.version")
+    requirements: Mapped[list[JobRequirementEvidence]] = relationship(back_populates="job", cascade="all, delete-orphan",
+                                                                      passive_deletes=True)
+    parse_tasks: Mapped[list[JobDescriptionParseTask]] = relationship(back_populates="job", cascade="all, delete-orphan",
+                                                                      passive_deletes=True)
     application: Mapped[Application | None] = relationship(back_populates="job", uselist=False, cascade="all, delete-orphan")
     transitions: Mapped[list[WorkflowTransition]] = relationship(back_populates="job", cascade="all, delete-orphan",
                                                                  passive_deletes=True,
@@ -422,6 +456,110 @@ class Job(Base):
     @validates("previous_state")
     def _guard_previous_state(self, _key: str, value: object) -> WorkflowState | None:
         return None if value is None else parse_state(value)
+
+
+class JobRequirementEvidence(Base):
+    """One requirement the posting states (or one signal the system derived), with the sentence it came from.
+
+    `is_explicit` rows quote the employer; `is_derived` rows are the system's inference and are never presented as
+    something the employer said.
+    """
+
+    __tablename__ = "job_requirement_evidence"
+    __table_args__ = (
+        CheckConstraint(f"requirement_type IN ({_values(REQUIREMENT_TYPES)})",
+                        name="ck_job_requirement_evidence_type"),
+        CheckConstraint(f"requirement_level IN ({_values(REQUIREMENT_LEVELS)})",
+                        name="ck_job_requirement_evidence_level"),
+        CheckConstraint("confidence >= 0 AND confidence <= 1", name="ck_job_requirement_evidence_confidence"),
+        CheckConstraint("origin IN ('PARSER', 'USER')", name="ck_job_requirement_evidence_origin"),
+        Index("ix_job_requirement_evidence_job_type", "job_id", "requirement_type"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("job_requirement_evidence")
+    job_id: Mapped[int] = mapped_column(
+        ForeignKey("jobs.id", ondelete="CASCADE", name="fk_job_requirement_evidence_job_id"), index=True)
+    item_id: Mapped[str] = mapped_column(String(60))  # stable within one parse, e.g. "req_001"
+    requirement_type: Mapped[str] = mapped_column(String(25))
+    normalized_value: Mapped[str] = mapped_column(String(300))
+    requirement_level: Mapped[str] = mapped_column(String(15), default="UNKNOWN")
+    source_text: Mapped[str] = mapped_column(Text, default="")
+    source_section: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    is_explicit: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_derived: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Who settled this row's level: the parser, or the user (a correction or a re-parse decision). A parser never
+    # replaces a USER row.
+    origin: Mapped[str] = mapped_column(String(10), default="PARSER", server_default="PARSER")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+    job: Mapped[Job] = relationship(back_populates="requirements")
+    user: Mapped[User] = relationship(back_populates="job_requirements")
+
+
+class JobStructuredDataChange(Base):
+    """Append-only history of how a job's structured description changed, and who changed it."""
+
+    __tablename__ = "job_structured_data_changes"
+    __table_args__ = (
+        CheckConstraint(f"change_source IN ({_values(JOB_CHANGE_SOURCES)})",
+                        name="ck_job_structured_data_changes_source"),
+        Index("ix_job_structured_data_changes_job_created", "job_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("job_structured_data_changes")
+    job_id: Mapped[int] = mapped_column(
+        ForeignKey("jobs.id", ondelete="CASCADE", name="fk_job_structured_data_changes_job_id"))
+    field_path: Mapped[str] = mapped_column(String(300))
+    old_value: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    new_value: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    change_source: Mapped[str] = mapped_column(String(10), default="USER")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+    job: Mapped[Job] = relationship()
+    user: Mapped[User] = relationship(back_populates="job_structured_changes")
+
+
+class JobDescriptionParseTask(Base):
+    """One queued parse of a job description, claimed by the scheduler like a ranking task.
+
+    A job has at most one PENDING or PROCESSING task at a time (uq_jd_parse_tasks_active_job), and a task carries
+    the hash of the description it was created for, so the same text is never queued twice.
+    """
+
+    __tablename__ = "job_description_parse_tasks"
+    __table_args__ = (
+        CheckConstraint(f"status IN ({_values(JD_PARSE_STATUSES)})", name="ck_jd_parse_tasks_status"),
+        CheckConstraint("attempt_count >= 0", name="ck_jd_parse_tasks_attempt_count"),
+        Index("uq_jd_parse_tasks_active_job", "job_id", unique=True,
+              postgresql_where=text(f"status IN ({_values(ACTIVE_JD_PARSE_STATUSES)})"),
+              sqlite_where=text(f"status IN ({_values(ACTIVE_JD_PARSE_STATUSES)})")),
+        Index("ix_jd_parse_tasks_claim", "status", "next_attempt_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("job_description_parse_tasks")
+    job_id: Mapped[int] = mapped_column(
+        ForeignKey("jobs.id", ondelete="CASCADE", name="fk_jd_parse_tasks_job_id"), index=True)
+    description_hash: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(20), default="PENDING")
+    reason: Mapped[str] = mapped_column(String(40), default="new")  # new | user_request | description_changed
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_category: Mapped[ErrorCategory | None] = mapped_column(_enum_type(ErrorCategory), nullable=True)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    locked_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    lock_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lock_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    job: Mapped[Job] = relationship(back_populates="parse_tasks")
+    user: Mapped[User] = relationship(back_populates="job_parse_tasks")
 
 
 class WorkflowTransition(Base):
@@ -652,10 +790,6 @@ ACTIVE_RANKING_TASK_STATUSES = ("PENDING", "PROCESSING")
 RANKING_DECISIONS = ("QUALIFIED", "ARCHIVED")
 
 
-def _values(values: tuple[str, ...]) -> str:
-    return ", ".join(repr(v) for v in values)
-
-
 class JobRanking(Base):
     """One versioned, append-only fit analysis of a job, with the exact inputs it was made from.
 
@@ -839,6 +973,10 @@ class LLMRequestLog(Base):
     cached: Mapped[bool] = mapped_column(Boolean, default=False)
     cache_read_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cache_write_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # The posting side of context selection (app.services.job_context): the raw description against what was sent.
+    raw_job_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    selected_job_context_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    job_context_reduction_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
     # Dynamic context selection (app.services.context_builder): what could have been sent versus what was.
     full_available_context_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     selected_context_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)

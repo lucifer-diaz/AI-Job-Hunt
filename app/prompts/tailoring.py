@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.prompts.common import (
+    JOB_REQUIREMENTS_RULE,
     JSON_ONLY_RULE,
     NO_INVENTION_RULE,
     UNTRUSTED_DATA_RULE,
@@ -12,6 +13,7 @@ from app.prompts.common import (
     context_value,
     instructions,
     job_facts,
+    job_sections,
     profile_facts,
     section,
     to_json,
@@ -19,7 +21,7 @@ from app.prompts.common import (
     user_message,
 )
 
-TAILOR_PROMPT_VERSION = "v3"
+TAILOR_PROMPT_VERSION = "v4"
 TAILOR_MARKER = "TAILOR_RESUME"
 # The fit-analysis fields tailoring uses, with their defaults; anything else stored with the analysis is left out.
 # resume_fit_score, resume_gaps and recommended_resume_focus come from the ranker and say what the resume under-sells.
@@ -38,6 +40,8 @@ TAILOR_SYSTEM = instructions(
     "those and VERIFIED EVIDENCE for factual claims (employers, titles, dates, metrics, skills, achievements). A "
     "bullet with \"type\": \"unverified\" appears only because CANDIDATE POLICY allows unverified facts. Never add "
     "a metric, employer, skill or date that is not in them. Roles without bullets keep their existing bullets.",
+    JOB_REQUIREMENTS_RULE + " Answer the REQUIRED requirements first, then the PREFERRED ones, and use "
+    "candidate_gaps to decide what the resume should bring forward. Never claim a gap is filled.",
     UNVERIFIED_FACTS_RULE,
     JSON_ONLY_RULE,
     """Fields:
@@ -78,7 +82,9 @@ def build_tailoring_prompt(candidate_profile: Any, resume: str = "", roles: list
         section("VERIFIED EVIDENCE", to_json(evidence or [], limit=32000)),
         policy,
         section("JOB", to_json(job_facts(job))),
-        untrusted("JOB DESCRIPTION", "untrusted_job_description", getattr(job, "description", ""), limit=26000),
+        *job_sections(context),
+        "" if context is not None and (context_value(context, "job_context", {}) or {}).get("structured")
+        else untrusted("JOB DESCRIPTION", "untrusted_job_description", getattr(job, "description", ""), limit=26000),
         section("FIT ANALYSIS", to_json(fit)),
     )
     return Prompt("tailoring", TAILOR_PROMPT_VERSION, TAILOR_MARKER, TAILOR_SYSTEM, user)

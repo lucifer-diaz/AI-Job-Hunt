@@ -51,8 +51,45 @@ def instructions(*parts: str) -> str:
 # ───────────── data sections ─────────────
 
 def to_json(value: Any, limit: int | None = None) -> str:
+    """JSON for a prompt section. With a `limit`, the value is trimmed until it fits and the result is still valid
+    JSON: the longest lists lose their last items first, then the longest strings are shortened. It is never cut
+    at an arbitrary character, which would hand the model broken JSON."""
     text = json.dumps(value, ensure_ascii=False, default=str)
-    return text[:limit] if limit else text
+    if not limit or len(text) <= limit:
+        return text
+    return json.dumps(_fit(json.loads(text), limit), ensure_ascii=False)
+
+
+def _containers(value: Any) -> list[Any]:
+    found, stack = [], [value]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            found.append(node)
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            found.append(node)
+            stack.extend(node)
+    return found
+
+
+def _fit(value: Any, limit: int) -> Any:
+    def size(node: Any) -> int:
+        return len(json.dumps(node, ensure_ascii=False))
+
+    while size(value) > limit:
+        lists = [node for node in _containers(value) if isinstance(node, list) and node]
+        if lists:
+            longest = max(lists, key=size)
+            del longest[-max(1, len(longest) // 10):]  # the tail goes first, as it is the least relevant
+            continue
+        strings = [(node, key) for node in _containers(value) if isinstance(node, dict)
+                   for key, item in node.items() if isinstance(item, str) and len(item) > 40]
+        if not strings:
+            return value if size(value) <= limit else ([] if isinstance(value, list) else {})
+        node, key = max(strings, key=lambda pair: len(pair[0][pair[1]]))
+        node[key] = node[key][: len(node[key]) // 2] + "..."
+    return value
 
 
 def section(label: str, body: str) -> str:
@@ -116,3 +153,26 @@ def resume_facts(context: Any) -> dict[str, Any]:
             "experience": experience_facts(context), "skills": context_value(context, "relevant_skills", []),
             "education": context_value(context, "education", []),
             "certifications": context_value(context, "certifications", [])}
+
+
+JOB_REQUIREMENTS_RULE = (
+    "JOB REQUIREMENTS is the posting parsed into structured requirements, each taken from the posting's own words. "
+    "level REQUIRED is what the employer asks for; PREFERRED is a plus and is never treated as required; "
+    "INFORMATIONAL describes the role or company and asks nothing of the candidate. Entries with \"derived\": true "
+    "are the application's inference, not employer statements. candidate_matches and candidate_gaps are computed by "
+    "the application from verified candidate facts: check them, and spend your attention on what they cannot settle."
+)
+
+
+def job_sections(context: Any, *, with_source: bool = False) -> list[str]:
+    """The posting for a prompt: structured requirements when it has been parsed, the raw advert when it has not."""
+    job = context_value(context, "job_context", {}) or {}
+    if not job.get("structured"):
+        return []
+    fields = ("identity", "role_summary", "required", "preferred", "responsibilities", "leadership_expectations",
+              "technical_domains", "education_requirements", "experience_requirements", "location_requirements",
+              "compensation", "hard_requirements", "candidate_matches", "candidate_gaps")
+    body = {key: job[key] for key in fields if job.get(key)}
+    if with_source and job.get("source_evidence"):
+        body["source_evidence"] = job["source_evidence"]
+    return [section("JOB REQUIREMENTS", to_json(body, limit=24000))]

@@ -27,11 +27,11 @@ from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from app.models import Application, Job, SearchRun, User
-from app.services import ai_advisor, monitoring, ranker
+from app.services import ai_advisor, job_description, monitoring, ranker
 from app.services import work_queue as wq
 from app.services.compensation import enrich_compensation
-from app.services.lifecycle import WorkflowState as S
 from app.services.hunter import run_due_profiles
+from app.services.lifecycle import WorkflowState as S
 from app.services.sources import refresh_apify_run
 from app.services.user_settings import ai_ready, apify_token
 from app.services.workflow import create_due_followups
@@ -201,6 +201,39 @@ async def ranking(ctx: JobContext) -> dict[str, Any]:
     return summary
 
 
+def _prepare_jd_parsing(ctx: JobContext) -> tuple[list[job_description.ParseClaim], dict[str, Any]] | str:
+    """Queue postings that were never parsed, recover crashed workers, then claim a bounded batch."""
+    with ctx.sessions() as db:
+        if not _is_postgres(db):
+            return "Job description parsing needs PostgreSQL (FOR UPDATE SKIP LOCKED)"
+        recovered = job_description.recover_expired(db)
+        queue = job_description.sweep(db)
+        claims = job_description.claim(db, worker_id=ctx.worker_id,
+                                       limit=max(1, get_settings().jd_parse_batch_size))
+    return claims, {"queue": queue, "recovered": recovered}
+
+
+async def jd_parsing(ctx: JobContext) -> dict[str, Any]:
+    """Parse a bounded batch of job descriptions into structured requirements, a few model calls at a time."""
+    if not get_settings().jd_parse_enabled:
+        return skipped("Job description parsing is off (JD_PARSE_ENABLED)")
+    prepared = await asyncio.to_thread(_prepare_jd_parsing, ctx)
+    if isinstance(prepared, str):
+        return skipped(prepared)
+    claims, details = prepared
+    semaphore = asyncio.Semaphore(max(1, get_settings().jd_parse_concurrency))
+
+    async def run(claim: job_description.ParseClaim) -> str:
+        async with semaphore:
+            return await asyncio.to_thread(job_description.process, ctx.sessions, claim)
+
+    outcomes = Counter(await asyncio.gather(*(run(claim) for claim in claims)))
+    summary = {"claimed": len(claims), **{name: outcomes.get(name, 0) for name in job_description.OUTCOMES}, **details}
+    if not claims and not details["queue"]["queued"]:
+        return skipped("No job descriptions waiting", **summary)
+    return summary
+
+
 # ───────────── enrichment, applications, follow-ups, inbox ─────────────
 
 def compensation(ctx: JobContext) -> dict[str, Any]:
@@ -263,7 +296,7 @@ def inbox(ctx: JobContext) -> dict[str, Any]:
 def analytics(ctx: JobContext) -> dict[str, Any]:
     """Snapshot of the whole system, kept as this job's last result (visible to the admin only)."""
     with ctx.sessions() as db:
-        count = lambda *where: db.scalar(select(func.count()).select_from(Job).where(*where)) or 0  # noqa: E731
+        count = lambda *where: db.scalar(select(func.count()).select_from(Job).where(*where)) or 0
         by_state = {str(state): n for state, n in db.execute(select(Job.state, func.count()).group_by(Job.state)).all()}
         by_status = dict(db.execute(select(Job.status, func.count()).group_by(Job.status)).all())
         by_stage = {stage or "applied": n for stage, n in db.execute(
@@ -316,6 +349,8 @@ JOBS: list[JobSpec] = [
             "Imports datasets of Apify runs that finished."),
     JobSpec("ranking", "Job ranking", "ranking_interval_minutes", ranking,
             "Filters and queues new jobs, then ranks a bounded batch of ranking tasks, a few at a time."),
+    JobSpec("jd_parsing", "Job description parsing", "jd_parse_interval_minutes", jd_parsing,
+            "Parses job descriptions into structured requirements, each tied to the sentence it came from."),
     JobSpec("compensation", "Salary enrichment", "compensation_interval_minutes", compensation,
             "Records the salary stated in each posting."),
     JobSpec("applications", "Application processing", "application_interval_minutes", applications,

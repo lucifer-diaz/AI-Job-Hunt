@@ -479,6 +479,17 @@ p.settings-help{margin:10px 0}
 .rd-history-row{padding:8px 0;border-bottom:1px solid var(--line2);min-width:0}
 @media (max-width:700px){.rd-compare-values{grid-template-columns:1fr}}
 
+/* Job detail -> Structured JD */
+.jd-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px 18px}
+.jd-row{border-bottom:1px dashed var(--line2);padding-bottom:8px;min-width:0;overflow-wrap:anywhere}
+.jd-req{border:1px solid var(--line2);border-radius:8px;padding:8px 10px}
+.jd-source summary{cursor:pointer;color:var(--muted)}
+.jd-source blockquote{margin:6px 0 0;padding-left:8px;border-left:2px solid var(--line);color:var(--ink2);overflow-wrap:anywhere}
+.jd-compare{border-top:1px solid var(--line2);padding:8px 0}
+.jd-compare-values{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.jd-history-row{padding:8px 0;border-bottom:1px solid var(--line2);min-width:0}
+@media (max-width:700px){.jd-compare-values{grid-template-columns:1fr}}
+
 /* Knowledge bank: focused libraries and inline editors. */
 .knowledge-workspace{max-width:1180px;margin:0 auto}
 .knowledge-nav{display:flex;gap:6px;border-bottom:1px solid var(--line);margin-bottom:28px}

@@ -1103,6 +1103,7 @@ function renderJobModal() {
   if (S.jobTab === 'description') tab = `<div class="desc" style="font-size:13.5px;line-height:1.7;padding:20px 22px">${paragraphs(j.description, [...j.matches, ...j.keywords], [...j.gaps, ...j.missing])}
       <div class="row gap12 wrap xs faint" style="margin-top:20px;padding-top:16px;border-top:1px solid var(--line2)"><span class="row gap6"><span style="width:9px;height:9px;border-radius:3px;background:#9fe0d2"></span>matched to your evidence</span><span class="row gap6"><span style="width:9px;height:9px;border-radius:3px;background:#ffd79a"></span>gap — needs a real answer</span><span>source: ${esc(j.board)}${j.search_run_id ? ` · pulled in run #${j.search_run_id}` : ''}</span></div></div>`;
   else if (S.jobTab === 'requirements') tab = `<div style="padding:20px 22px" class="col gap14">${fitSummary(j)}${j.fit_analysis.must_have_missing?.length ? `<div class="box bad"><div class="xs b mb4" style="color:var(--bad)">MUST-HAVES MISSING</div><div class="small">${esc(j.fit_analysis.must_have_missing.join(' · '))}</div></div>` : ''}<div><div class="caps mb8">KEYWORDS</div><div class="row wrap gap6">${j.keywords.map(k => pill(k, 'plain', 'lg')).join('') || '<span class="small muted">Rank this job to extract keywords.</span>'}</div></div></div>`;
+  else if (S.jobTab === 'structured') tab = renderJobStructured(j);
   else tab = `<div style="padding:20px 22px">${textareaF('jobnotes', j.id, j.notes, 'placeholder="Anything worth remembering about this role…" style="min-height:160px"')}${btn(label('jobnotes', 'Save notes', 'Saving…'), 'save-job-notes', { id: j.id }, 'primary sm mt10', isBusy('jobnotes'))}</div>`;
   return `<div class="overlay" data-act="overlay-close"><div class="modal" role="dialog" aria-label="Job detail">
     <div class="modal-head"><div class="row top-align gap16 wrap"><div class="avatar lg">${esc(initials(j.company))}</div>
@@ -1112,7 +1113,7 @@ function renderJobModal() {
         ${btn(j.resume_id ? 'Open packet' : 'Tailor resume', 'modal-tailor', { id: j.id }, 'primary')}${btn('Close', 'close-job')}</div></div>
       <div class="wizard">${j.wizard.map((w, i) => `<div class="${w.done ? 'done' : i === hereIdx ? 'here' : ''}"><div class="row gap6"><span class="m">${w.done ? '✓' : i + 1}</span><span class="small b" style="color:${w.done ? 'var(--ink)' : i === hereIdx ? 'var(--brand-ink)' : 'var(--faint)'}">${w.label}</span></div><div class="xs muted mt4">${esc(i === hereIdx && !w.done ? 'next step' : w.meta)}</div></div>`).join('')}</div></div>
     <div class="split gap16" style="padding:18px 24px 24px">
-      <section class="card flush" style="flex:1 1 420px;min-width:0"><div class="tabs under">${[['description', 'Description'], ['requirements', 'Requirements map'], ['notes', 'Notes']].map(([id, t]) => `<button class="${S.jobTab === id ? 'on' : ''}" data-act="job-tab" data-id="${id}">${t}</button>`).join('')}</div>${tab}</section>
+      <section class="card flush" style="flex:1 1 420px;min-width:0"><div class="tabs under">${[['description', 'Description'], ['structured', 'Structured JD'], ['requirements', 'Requirements map'], ['notes', 'Notes']].map(([id, t]) => `<button class="${S.jobTab === id ? 'on' : ''}" data-act="job-tab" data-id="${id}">${t}</button>`).join('')}</div>${tab}</section>
       <div class="col gap14" style="flex:1 1 280px;min-width:0">
         <section class="card pad18"><div class="row gap8 mb14">${pill('AI', 'brand')}<span class="card-title sm">Fit breakdown</span></div>
           ${j.fit == null ? `<div class="small muted mb12">Not ranked yet.</div>${btn(label('rank' + j.id, 'Rank this job', 'Queueing…'), 'rank-job', { id: j.id }, 'soft', isBusy('rank' + j.id))}` : `
@@ -1645,6 +1646,7 @@ const A = {
   ...KNOWLEDGE_ACTIONS,
   ...SETTINGS_ACTIONS,
   ...RESUME_DATA_ACTIONS,
+  ...JOB_DATA_ACTIONS,
   ...MONITORING_ACTIONS,
 };
 function tagFallback(form, key) {
@@ -1676,6 +1678,7 @@ document.addEventListener('input', e => {
   if (knowledgeFilterEvent(el)) return;
   if (el.dataset.authEntry || el.dataset.authNotes) { settingsAuthUpdate(); return; }
   if (el.dataset.rdPath) { resumeDataInput(el); return; }
+  if (el.dataset.jdPath) { jobDataInput(el); return; }
   if (el.dataset.form && el.dataset.field) {
     setF(el.dataset.form, el.dataset.field, el.type === 'checkbox' ? el.checked : el.value);
     if (el.dataset.live || el.type === 'radio') render();
@@ -1700,6 +1703,7 @@ document.addEventListener('change', e => {
   if (knowledgeFilterEvent(el)) return;
   if (el.dataset.authEntry) { settingsAuthUpdate(); return; }
   if (el.dataset.rdPath) { resumeDataInput(el); return; }
+  if (el.dataset.jdPath) { jobDataInput(el); return; }
   if (el.dataset.form && el.dataset.field && (el.tagName === 'SELECT' || el.type === 'checkbox' || el.type === 'radio')) {
     setF(el.dataset.form, el.dataset.field, el.type === 'checkbox' ? el.checked : el.value);
     if (el.type === 'radio') render();

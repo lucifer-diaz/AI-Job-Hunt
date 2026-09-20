@@ -34,7 +34,9 @@ ROW_COLUMNS = (LLMRequestLog.id, LLMRequestLog.created_at, LLMRequestLog.user_id
                LLMRequestLog.estimated_cost, LLMRequestLog.cost_source, LLMRequestLog.retry_count,
                LLMRequestLog.error_type, LLMRequestLog.structured_output_valid, LLMRequestLog.workflow_type,
                LLMRequestLog.workflow_entity_id, LLMRequestLog.cached, LLMRequestLog.full_available_context_tokens,
-               LLMRequestLog.selected_context_tokens, LLMRequestLog.context_reduction_percent)
+               LLMRequestLog.selected_context_tokens, LLMRequestLog.context_reduction_percent,
+               LLMRequestLog.raw_job_tokens, LLMRequestLog.selected_job_context_tokens,
+               LLMRequestLog.job_context_reduction_percent)
 
 
 def utcnow() -> datetime:
@@ -236,10 +238,17 @@ def context_selection(items: list[Any]) -> dict[str, Any]:
     def totals(group: list[Any]) -> dict[str, Any]:
         full = sum(r.full_available_context_tokens for r in group)
         sent = sum(r.selected_context_tokens for r in group)
+        posting = [r for r in group if r.selected_job_context_tokens is not None and r.raw_job_tokens]
+        raw_job = sum(r.raw_job_tokens for r in posting)
+        sent_job = sum(r.selected_job_context_tokens for r in posting)
         return {"requests": len(group), "full_available_context_tokens": full, "selected_context_tokens": sent,
                 "context_reduction_percent": round(100 * (full - sent) / full, 1) if full else None,
                 "avg_reduction_percent": _mean([r.context_reduction_percent for r in group
-                                                if r.context_reduction_percent is not None])}
+                                                if r.context_reduction_percent is not None]),
+                # The posting side: the whole job description against the requirements actually sent.
+                "job_requests": len(posting), "raw_job_tokens": raw_job,
+                "selected_job_context_tokens": sent_job,
+                "job_context_reduction_percent": round(100 * (raw_job - sent_job) / raw_job, 1) if raw_job else None}
 
     stages = sorted({r.stage for r in measured})
     return {**totals(measured), "by_stage": [{"stage": stage, **totals([r for r in measured if r.stage == stage])}
@@ -299,7 +308,9 @@ def request_row(r: Any) -> dict[str, Any]:
             "workflow_type": r.workflow_type, "workflow_entity_id": r.workflow_entity_id,
             "full_available_context_tokens": r.full_available_context_tokens,
             "selected_context_tokens": r.selected_context_tokens,
-            "context_reduction_percent": r.context_reduction_percent}
+            "context_reduction_percent": r.context_reduction_percent,
+            "raw_job_tokens": r.raw_job_tokens, "selected_job_context_tokens": r.selected_job_context_tokens,
+            "job_context_reduction_percent": r.job_context_reduction_percent}
 
 
 def list_requests(db: Session, f: MonitoringFilter, page: int = 1, per_page: int = 25) -> dict[str, Any]:

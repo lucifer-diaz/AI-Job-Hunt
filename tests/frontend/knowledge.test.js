@@ -3,7 +3,7 @@ import { resolve } from 'node:path';
 import { createContext, runInContext } from 'node:vm';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const scripts = ['settings', 'resume_data', 'monitoring', 'knowledge', 'app'].map(name => ({ source: readFileSync(`app/static/${name}.js`, 'utf8').split('/* ───────────── boot ───────────── */')[0], filename: resolve(`app/static/${name}.js`) }));
+const scripts = ['settings', 'resume_data', 'job_data', 'monitoring', 'knowledge', 'app'].map(name => ({ source: readFileSync(`app/static/${name}.js`, 'utf8').split('/* ───────────── boot ───────────── */')[0], filename: resolve(`app/static/${name}.js`) }));
 const names = ['S', 'D', 'A', 'render', 'readHash', 'setHash', 'knowledgeNavigate', 'knowledgeState', 'knowledgeFiltered', 'knowledgeOpen', 'knowledgeSave', 'loadKnowledge', 'knowledgeCancel', 'knowledgeCopy', 'setF'];
 let ui, context, fetchMock, writeText, confirm;
 const response = (data, status = 200) => ({ ok: status < 400, status, text: async () => JSON.stringify(data) });

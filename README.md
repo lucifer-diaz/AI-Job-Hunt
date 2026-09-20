@@ -358,6 +358,8 @@ Each prompt has:
 | `cover_letter.py` | `build_cover_letter_prompt` | `write_cover_letter`, called by `tailor_job` |
 | `review.py` | `build_review_prompt` | `review_resume` |
 | `followup.py` | `build_followup_prompt` | `draft_followup` |
+| `job_description_parser.py` | `build_job_description_parser_prompt` | the `jd_parsing` scheduler job (`app.services.job_description`) |
+| `job_description_parser.py` | `build_job_description_parser_prompt` | the `jd_parsing` scheduler job (`app.services.job_description`) |
 | `resume_parser.py` | `build_evidence_extraction_prompt`, `build_resume_parser_prompt` | evidence parsing; the optional AI re-parse in Settings → Resume Data (shown as a comparison, never applied automatically) |
 | `application.py` | `build_application_question_prompt` | not wired in yet |
 | `inbox.py` | `build_inbox_classification_prompt` | not wired in yet (inbox sync is a placeholder) |
@@ -1196,7 +1198,143 @@ columns to `llm_request_logs`. Existing uploads become resume versions (plus one
 structured data is parsed on first use and nothing is marked verified. Existing evidence keeps its verified flag.
 Because the ranking prompt is now `v3`, qualified jobs are re-ranked once when auto re-ranking is on.
 
-## 12. Recommended next upgrades
+## 12. Structured Job Descriptions
+
+The employer's posting is kept exactly as it arrived and is also parsed into machine-readable requirements, so AI
+workflows compare structured candidate facts with structured job facts instead of re-reading a long advert every time.
+
+```text
+ Apify / job source
+        │
+        ▼
+ Job.description ── the employer's text, never rewritten
+        │  normalize (HTML out, bullets kept, wording untouched)
+        ▼
+ Job.normalized_description
+        │  parse (scheduler task, model call; deterministic cues in tests and mock mode)
+        ▼
+ Job.structured_description  +  JobRequirementEvidence (one row per requirement, with its sentence)
+        │
+        ▼
+ Job context builders (app/services/job_context.py)
+        │
+        ├─► Ranker      identity, REQUIRED / PREFERRED requirements, experience, responsibilities, matches and gaps
+        ├─► Tailor      the critical requirements and the responsibilities to address
+        ├─► Reviewer    requirements with the employer's own words, to check coverage and claims
+        └─► Insights    domains and responsibilities, plus clearly labelled inferred preparation topics
+```
+
+### Why both are kept
+
+The raw description is the reference: it settles any argument about what the employer actually wrote, and it is what
+a task falls back to when parsing has not run or has failed. The structured description is what workflows read.
+Nothing is ever parsed *over* the raw text, and no requirement exists without the sentence it came from — the API
+can always answer "why is Python required?" with the employer's own line.
+
+### REQUIRED, PREFERRED, and what is neither
+
+| Level | Meaning | Example wording |
+|---|---|---|
+| `REQUIRED` | the posting asks for it | "Strong experience with Python is required" |
+| `PREFERRED` | it is a plus | "Familiarity with Kubernetes is a plus" |
+| `INFORMATIONAL` | it describes the role, team or company | "We are a fast-growing data company" |
+| `UNKNOWN` | the wording does not say | |
+
+A preferred skill is never promoted to required, and marketing copy never becomes a requirement. Ranking treats only
+`REQUIRED` items as things a candidate can fail on.
+
+### Explicit against derived
+
+`is_explicit` rows quote the employer. `is_derived` rows are the application's inference — likely interview domains,
+system-design topics, leadership and business topics — and they are stored separately, excluded from
+`GET /api/jobs/{id}/requirements` unless asked for, and always shown under a label saying they are inferred
+preparation topics, not something the employer said.
+
+### Corrections and re-parsing
+
+Settings are not involved: open a job and use its **Structured JD** tab. Every parsed value can be corrected with
+form fields (no raw JSON). A correction moves the job to `MANUALLY_CORRECTED` and is recorded in
+`job_structured_data_changes` with the field path, old and new value, and `change_source = USER`.
+
+Corrections to the required and preferred lists reach the requirement rows that ranking, tailoring and review
+read, value by value: a skill moved between the lists changes level, a skill added gets a row (quoted from the
+posting when the posting says it), and a skill removed stops being a requirement while its quote is kept. Those rows
+are marked `origin = USER`, and a later parse never replaces them. A list entry finds its row by exact text or,
+when the parser wrote a sentence for a short skill ("Strong Python experience" for "Python"), by being the only row
+at its old level that names it. A correction that matches no row, or several (changing "Python and Go" would also
+change Go), is saved in the document but applied to no row, and the Structured JD tab says so rather than letting
+you assume ranking and tailoring picked it up. The parser (`v2`) names each skill identically in the lists and in
+the requirements, so this is the exception rather than the rule.
+
+**Re-parse** never overwrites your corrections. For a corrected job it produces a candidate version and a
+field-by-field comparison — current value against new parser result — which you resolve with *Keep* or *Use new*.
+Only the values you accept change, requirement rows included. An uncorrected job is simply parsed again.
+
+### Parsing as a task
+
+A new posting (and any posting whose text grows) is queued as a `JobDescriptionParseTask`, and the scheduler's
+`jd_parsing` job claims a bounded batch with `FOR UPDATE SKIP LOCKED`, exactly like ranking. A job never has two
+active tasks, and the same text is never queued twice. Parsing failures retry with backoff and then stop at
+`FAILED`; the posting's status becomes `NEEDS_REVIEW` and the pipeline carries on with the raw description.
+
+Ranking waits for a parse while one is queued or running, and stops waiting once it completes or fails, so a
+posting that cannot be parsed never holds a job back. A posting whose text changes (Hunter merges a fuller copy, or
+an import updates it) is queued again, and until that parse lands every task reads the current raw text rather than
+requirements parsed from the old advert.
+
+A few safeguards keep the parse trustworthy:
+- the model sees only the posting and the job's title, company and location; salary, experience and seniority the
+  board reported are applied afterwards and marked `source = job_board`;
+- an "explicit" requirement whose quote is not actually in the posting is stored as a derived row with no quote,
+  and salary without a sentence from the posting is dropped;
+- the result is written against the job as it is after the model call, re-read under a lock (a row lock on
+  PostgreSQL, the writer lock on SQLite), so a correction saved meanwhile survives, and only while the worker still
+  holds the task's lease;
+- the other way round, a correction names the version it was edited from (`base_hash`, the `structured_hash` the
+  API returns): if a parse landed while the form was open, the save is refused with 409 and the tab reloads the new
+  values, instead of silently reverting the parse and recording its values as your corrections;
+- a missing AI key hands the task back without using an attempt, so the backlog resumes when the key is added. Re-ranking after a parse is off by default (`JD_RERANK_AFTER_PARSE=true` turns it
+on), so parsing a backlog does not start a round of model calls.
+
+### Candidate and job, side by side
+
+```text
+ Verified Structured Resume            Structured Job Description
+        +                                        +
+ Candidate Evidence                     Job Requirement Evidence
+        \                                      /
+         \____________ Fit Analysis __________/
+```
+
+`candidate_matches` and `candidate_gaps` are computed in Python from the candidate's verified skills, bullets and
+evidence, so the model spends its attention on the ambiguous comparisons instead of re-deriving that "Python"
+appears on both sides.
+
+### Monitoring
+
+Each call records the posting side of context selection next to the candidate side: `raw_job_tokens`,
+`selected_job_context_tokens` and `job_context_reduction_percent` in `llm_request_logs`. The Monitoring tab's
+context card shows both, for example *job description 4.2K → 1.5K (65.5%)*, overall and per stage.
+
+### Job description API
+
+| Route | Purpose |
+|---|---|
+| `GET /api/jobs/{id}/structured-description` | structured posting, requirement evidence, parse-task state |
+| `PUT /api/jobs/{id}/structured-description` | correct parsed values (typed fields, not raw JSON): `{structured_description, base_hash}`, 409 if the version changed |
+| `POST /api/jobs/{id}/structured-description/reparse` | parse again; a corrected job gets a comparison |
+| `POST /api/jobs/{id}/structured-description/reparse/resolve` | `{decisions: {change_id: keep \| use_new}}` |
+| `GET /api/jobs/{id}/requirements` | requirements with the employer's sentence; `include_derived=true` for signals |
+| `GET /api/jobs/{id}/structured-description/history` | who changed which field, and when |
+| `GET /api/jobs/{id}/interview-insights` | stated topics, plus inferred ones under their label |
+
+### Migration
+
+Migration `0015` adds the columns and tables and leaves every description untouched. Existing jobs stay readable and
+rankable throughout; the scheduler queues the backlog in batches (`JD_PARSE_ENQUEUE_BATCH_SIZE`), one task per job,
+and existing fit analyses are left alone.
+
+## 13. Recommended next upgrades
 
 - Apify webhook endpoint so completed runs are ingested without polling
 - Gmail integration for follow-up drafts and thread matching
@@ -1209,7 +1347,7 @@ Because the ranking prompt is now `v3`, qualified jobs are re-ranked once when a
 
 See [DEPLOY.md](DEPLOY.md) for hosting instructions.
 
-## 13. Google Gemini agent deployment
+## 14. Google Gemini agent deployment
 
 To tailor and review from Claude Desktop instead, see [10. Claude Desktop + MCP](#10-claude-desktop--mcp).
 
