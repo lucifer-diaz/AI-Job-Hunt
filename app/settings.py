@@ -75,6 +75,27 @@ class Settings(BaseSettings):
     # When a multi-board run fails, search its boards again with their dedicated actors (once).
     apify_auto_fallback: bool = True
     apify_request_timeout_seconds: int = 30
+
+    # Rate-limit backoff (app.services.backoff): after a provider says 429, its calls are held off for a while
+    # instead of being retried straight into another rejection. Each account can adjust this in Settings.
+    rate_limit_backoff_enabled: bool = True
+    rate_limit_base_seconds: int = 30
+    rate_limit_multiplier: float = 2.0
+    rate_limit_max_seconds: int = 900
+    # The longest a provider's own Retry-After is obeyed; beyond this the cap above applies instead.
+    rate_limit_retry_after_max_seconds: int = 3600
+
+    # External API monitoring (app.services.external_api). Every third-party call is recorded automatically;
+    # raw rows are rolled into daily totals once they pass the retention, and operational log lines are deleted.
+    external_api_telemetry_enabled: bool = True
+    external_api_log_retention_days: int = 90
+    system_log_retention_days: int = 30
+    # Off by design: bodies can hold a candidate's resume or an employer's posting. When it is on, extracts are
+    # still redacted and capped at external_api_payload_limit bytes.
+    external_api_debug_payloads: bool = False
+    external_api_payload_limit: int = 2000
+    # A call slower than this is logged as a warning in Monitoring → Logs, so slowdowns are visible without a query.
+    external_api_slow_call_ms: int = 10_000
     hunter_max_runs_per_search: int = 30
     apify_sync_batch_size: int = 25
 
@@ -103,6 +124,10 @@ class Settings(BaseSettings):
     cleanup_interval_minutes: int = 15
     # AI Optimization Advisor (app.services.ai_advisor): processes queued and scheduled analyses.
     ai_optimization_interval_minutes: int = 5
+    # A posting with no real description cannot be ranked honestly: the model would be scoring a job title.
+    # Postings shorter than this (and with no parsed structure) wait instead, and are ranked if a description
+    # arrives later. Several boards — Naukri and Bayt in particular — return listings without one.
+    ranking_min_description_chars: int = 200
     ranking_batch_size: int = 20
     ranking_concurrency: int = 5
     # Job Ranker (app.services.ranker)

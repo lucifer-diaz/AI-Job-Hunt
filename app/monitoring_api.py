@@ -15,9 +15,15 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.auth import CurrentUser, current_user, get_user_db
-from app.models import AIOptimizationReport, AIOptimizationTask
+from app.models import (
+    EXTERNAL_ERROR_TYPES,
+    SYSTEM_LOG_CATEGORIES,
+    SYSTEM_LOG_LEVELS,
+    AIOptimizationReport,
+    AIOptimizationTask,
+)
 from app.scheduler_hooks import run_soon
-from app.services import ai_advisor, monitoring
+from app.services import ai_advisor, external_monitoring, monitoring
 from app.services.user_settings import lock_settings_row, settings_for
 
 router = APIRouter(prefix="/api/monitoring")
@@ -114,6 +120,161 @@ def request_detail(request_id: int, all_accounts: bool = False, user: CurrentUse
     detail = monitoring.request_detail(db, request_id, None if all_accounts else user.id)
     if detail is None:
         raise HTTPException(404, "LLM request not found")
+    return detail
+
+
+# ───────────── external APIs ─────────────
+
+def external_filter(
+    user: CurrentUser = Depends(current_user),
+    range: str = Query("7d", pattern="^(today|7d|30d|90d)$"),  # noqa: A002  query parameter name
+    start: datetime | None = None,
+    end: datetime | None = None,
+    provider: str | None = Query(None, max_length=30),
+    service: str | None = Query(None, max_length=60),
+    operation: str | None = Query(None, max_length=60),
+    workflow: str | None = Query(None, max_length=60),
+    status: str | None = Query(None, pattern="^(SUCCEEDED|FAILED)$"),
+    error_only: bool = False,
+    error_type: str | None = Query(None, max_length=30),
+    http_status_code: int | None = Query(None, ge=100, le=599),
+    job_id: int | None = None,
+    application_id: int | None = None,
+    trace_id: str | None = Query(None, max_length=32),
+    all_accounts: bool = False,
+) -> external_monitoring.ExternalFilter:
+    if all_accounts and not user.is_admin:
+        raise HTTPException(403, "Only the admin can view every account's usage")
+    begin, finish = monitoring.time_range(range, start, end)
+    if finish < begin:
+        raise HTTPException(422, "end must be after start")
+    if error_type and error_type.upper() not in EXTERNAL_ERROR_TYPES:
+        raise HTTPException(422, f"Unknown failure type '{error_type}'")
+    return external_monitoring.ExternalFilter(
+        start=begin, end=finish, user_id=None if all_accounts else user.id,
+        provider=(provider or "").upper() or None, service=service, operation=operation, workflow=workflow,
+        status=status, error_only=error_only, error_type=(error_type or "").upper() or None,
+        http_status_code=http_status_code, job_id=job_id, application_id=application_id, trace_id=trace_id)
+
+
+ExtFilter = Depends(external_filter)
+
+
+@router.get("/external/dashboard")
+def external_dashboard(f: external_monitoring.ExternalFilter = ExtFilter, db: Session = Depends(get_user_db)):
+    """Everything the External APIs tab shows, in one call."""
+    return external_monitoring.dashboard(db, f)
+
+
+@router.get("/external/summary")
+def external_summary(f: external_monitoring.ExternalFilter = ExtFilter, db: Session = Depends(get_user_db)):
+    return {"filter": f.public(), **external_monitoring.summary(external_monitoring.rows(db, f))}
+
+
+@router.get("/external/providers")
+def external_providers(f: external_monitoring.ExternalFilter = ExtFilter, db: Session = Depends(get_user_db)):
+    """Per-provider health: success, failure, 429, 5xx, timeout and retry rates, with latency."""
+    items = external_monitoring.rows(db, f)
+    return {"filter": f.public(), "providers": external_monitoring.by_provider(items),
+            "operations": external_monitoring.by_operation(items)}
+
+
+@router.get("/external/filters")
+def external_filters(f: external_monitoring.ExternalFilter = ExtFilter, db: Session = Depends(get_user_db)):
+    """Everything that can be filtered for in this range — the choices, not the current selection."""
+    return {"filter": f.public(), **external_monitoring.facets(db, f),
+            "all_error_types": list(EXTERNAL_ERROR_TYPES)}
+
+
+@router.get("/external/latency")
+def external_latency(f: external_monitoring.ExternalFilter = ExtFilter, db: Session = Depends(get_user_db)):
+    return {"filter": f.public(), **external_monitoring.latency(external_monitoring.rows(db, f))}
+
+
+@router.get("/external/errors")
+def external_errors(f: external_monitoring.ExternalFilter = ExtFilter, db: Session = Depends(get_user_db)):
+    return {"filter": f.public(), **external_monitoring.errors(external_monitoring.rows(db, f)),
+            "error_types": list(EXTERNAL_ERROR_TYPES)}
+
+
+@router.get("/external/requests")
+def external_requests(f: external_monitoring.ExternalFilter = ExtFilter, page: int = Query(1, ge=1),
+                      per_page: int = Query(25, ge=1, le=100), db: Session = Depends(get_user_db)):
+    return {"filter": f.public(), **external_monitoring.list_requests(db, f, page, per_page)}
+
+
+@router.get("/external/requests/{request_id}")
+def external_request_detail(request_id: int, all_accounts: bool = False, user: CurrentUser = Depends(current_user),
+                            db: Session = Depends(get_user_db)):
+    if all_accounts and not user.is_admin:
+        raise HTTPException(403, "Only the admin can view every account's usage")
+    detail = external_monitoring.request_detail(db, request_id, None if all_accounts else user.id)
+    if detail is None:
+        raise HTTPException(404, "External API request not found")
+    return detail
+
+
+@router.get("/external/traces/{trace_id}")
+def external_trace(trace_id: str, all_accounts: bool = False, user: CurrentUser = Depends(current_user),
+                   db: Session = Depends(get_user_db)):
+    """Every call and event that shares one correlation ID, in order."""
+    if all_accounts and not user.is_admin:
+        raise HTTPException(403, "Only the admin can view every account's usage")
+    return external_monitoring.trace_detail(db, trace_id[:32], None if all_accounts else user.id)
+
+
+@router.get("/apify/summary")
+def apify_summary(f: external_monitoring.ExternalFilter = ExtFilter, db: Session = Depends(get_user_db)):
+    """Apify runs, what they found, and the usage and cost Apify itself reported."""
+    return {"filter": f.public(), **external_monitoring.apify_summary(db, f)}
+
+
+@router.get("/apify/runs")
+def apify_runs(f: external_monitoring.ExternalFilter = ExtFilter, page: int = Query(1, ge=1),
+               per_page: int = Query(25, ge=1, le=100), db: Session = Depends(get_user_db)):
+    from app.models import SavedSearch
+
+    runs = external_monitoring.apify_runs(db, f, limit=per_page * page + 1)
+    setups = {s.id: s.name for s in db.scalars(select(SavedSearch)).all()}
+    page_items = runs[(page - 1) * per_page: page * per_page]
+    return {"filter": f.public(), "items": [external_monitoring.run_card(r, setups) for r in page_items],
+            "page": page, "per_page": per_page, "has_more": len(runs) > page * per_page}
+
+
+@router.get("/logs")
+def logs(user: CurrentUser = Depends(current_user),
+         range: str = Query("7d", pattern="^(today|7d|30d|90d)$"),  # noqa: A002  query parameter name
+         start: datetime | None = None, end: datetime | None = None,
+         category: str | None = Query(None, max_length=20), level: str | None = Query(None, max_length=10),
+         provider: str | None = Query(None, max_length=30), workflow: str | None = Query(None, max_length=60),
+         trace_id: str | None = Query(None, max_length=32), search: str | None = Query(None, max_length=120),
+         page: int = Query(1, ge=1), per_page: int = Query(50, ge=1, le=200), all_accounts: bool = False,
+         db: Session = Depends(get_user_db)):
+    """Operational events, newest first. Paginated: log history is never returned in full."""
+    if all_accounts and not user.is_admin:
+        raise HTTPException(403, "Only the admin can view every account's logs")
+    if category and category not in SYSTEM_LOG_CATEGORIES:
+        raise HTTPException(422, f"Unknown log category '{category}'")
+    if level and level not in SYSTEM_LOG_LEVELS:
+        raise HTTPException(422, f"Unknown log level '{level}'")
+    begin, finish = monitoring.time_range(range, start, end)
+    return {"filter": {"range": range, "category": category, "level": level, "provider": provider,
+                       "workflow": workflow, "trace_id": trace_id, "search": search},
+            "levels": list(SYSTEM_LOG_LEVELS), "all_categories": list(SYSTEM_LOG_CATEGORIES),
+            **external_monitoring.logs(db, start=begin, end=finish, user_id=None if all_accounts else user.id,
+                                       category=category, level=level, provider=(provider or "").upper() or None,
+                                       workflow=workflow, trace_id=trace_id, search=search, page=page,
+                                       per_page=per_page)}
+
+
+@router.get("/logs/{log_id}")
+def log_detail(log_id: int, all_accounts: bool = False, user: CurrentUser = Depends(current_user),
+               db: Session = Depends(get_user_db)):
+    if all_accounts and not user.is_admin:
+        raise HTTPException(403, "Only the admin can view every account's logs")
+    detail = external_monitoring.log_detail(db, log_id, None if all_accounts else user.id)
+    if detail is None:
+        raise HTTPException(404, "Log entry not found")
     return detail
 
 

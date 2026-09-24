@@ -32,7 +32,7 @@ class FakeApify:
         self.runs[run_id]["_input"] = input_ or {"searchTerm": "Staff AI Engineer", "location": "Pune"}
         return run_id
 
-    def __call__(self, path, params=None, token=None):
+    def __call__(self, path, params=None, token=None, **telemetry):  # telemetry kwargs: operation, metadata
         assert token == "test-token", "Apify calls must use the account's own token"
         if path == "/actor-runs":
             return {"data": {"items": [dict(r) for r in reversed(list(self.runs.values()))]}}

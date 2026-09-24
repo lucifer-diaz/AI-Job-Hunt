@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 from app.services import llm_telemetry
 from app.services.ai_config import is_free_model
 from app.services.ai_config import resolve as resolve_ai_config
+from app.services.external_api import RateLimitedCooldown, external_operation
 from app.services.llm_telemetry import Attempt, LLMCall, Usage
 from app.settings import get_settings
 
@@ -193,6 +194,31 @@ class LLMClient:
         attempt = Attempt(provider=provider, requested_model=model, user_id=self.user_id, call=call or LLMCall(),
                           prompt_name=prompt_name, prompt_version=prompt_version, system=system, user=user)
         started = time.monotonic()
+        # A provider that just rate limited this account is left alone (app.services.backoff). The wait is
+        # reported as a rate limit, so the ranker and the workers retry it later exactly as they already do.
+        try:
+            return self._instrumented(system, user, task, model, config, attempt, prompt_name, prompt_version, started)
+        except RateLimitedCooldown as waiting:
+            raise LLMRateLimitError(str(waiting)) from waiting
+
+    def _instrumented(self, system: str, user: str, task: str, model: str, config: dict[str, Any], attempt: Attempt,
+                      prompt_name: str | None, prompt_version: str | None, started: float) -> LLMResult:
+        """The provider SDKs own their transport, so the generic external-call row is recorded here, at the one
+        boundary every provider passes through. LLMRequestLog then points at it (external_request_id), giving
+        the External APIs tab and the LLM tab two views of the same request instead of two records of it."""
+        provider = attempt.provider
+        with external_operation(provider.upper(), service="llm", operation="chat_completion",
+                                user_id=self.user_id, attempt=attempt.call.attempt,
+                                workflow_type=attempt.call.workflow_type,
+                                workflow_entity_id=attempt.call.entity_id,
+                                metadata={"model": model, "stage": llm_telemetry.STAGE_BY_PROMPT.get(prompt_name or "", "OTHER"),
+                                          "prompt_name": prompt_name, "prompt_version": prompt_version}) as external:
+            attempt.external_request_id = external.request_id
+            return self._run(system, user, task, model, config, attempt, external, started)
+
+    def _run(self, system: str, user: str, task: str, model: str, config: dict[str, Any], attempt: Attempt,
+             external: Any, started: float) -> LLMResult:
+        provider = attempt.provider
         failure: BaseException | None = None
         failure_type: str | None = None
         try:
@@ -214,6 +240,15 @@ class LLMClient:
                     attempt.structured_output_valid = False
             raise
         finally:
+            # Tokens and cost the provider reported travel to the generic row too, so a cost total can be taken
+            # from either table. `not_sent` requests (missing key, refused before the network) are marked as
+            # configuration failures rather than counted as provider calls.
+            external.note(answered_model=attempt.model, sent=attempt.sent,
+                          input_tokens=attempt.usage.input_tokens if attempt.usage else None,
+                          output_tokens=attempt.usage.output_tokens if attempt.usage else None)
+            if not attempt.sent and failure is not None:
+                external.http_status_code = None
+                external.metadata["not_sent"] = True
             llm_telemetry.record(attempt, latency_ms=int((time.monotonic() - started) * 1000), error=failure,
                                  error_type=failure_type)
 

@@ -27,9 +27,14 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import AIOptimizationReport, AIOptimizationTask, AppSetting
-from app.prompts.ai_optimization import (ADVISOR_STAGES, AI_OPTIMIZATION_PROMPT_VERSION, RECOMMENDATION_CATEGORIES,
-                                         RECOMMENDATION_PRIORITIES, build_ai_optimization_prompt)
-from app.services import monitoring
+from app.prompts.ai_optimization import (
+    ADVISOR_STAGES,
+    AI_OPTIMIZATION_PROMPT_VERSION,
+    RECOMMENDATION_CATEGORIES,
+    RECOMMENDATION_PRIORITIES,
+    build_ai_optimization_prompt,
+)
+from app.services import external_monitoring, monitoring
 from app.services.llm import LLMCall, LLMClient
 from app.services.user_settings import ai_ready
 
@@ -299,8 +304,94 @@ def detect_findings(aggregates: dict[str, Any]) -> list[dict[str, Any]]:
             f"{unpriced} requests used models without pricing in app/model_catalog.json.",
             "Add verified prices for those models to app/model_catalog.json.",
             "Complete cost visibility, so spend comparisons are accurate.", "unknown", "None."))
+    findings += detect_external_findings(aggregates.get("external") or {})
     order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
     return sorted(findings, key=lambda f: order[f["priority"]])
+
+
+# Rule thresholds for third-party APIs. Rates are shares of that provider's or actor's own calls.
+EXTERNAL_MIN_REQUESTS = 10
+EXTERNAL_FAILURE_RATE = 0.10
+EXTERNAL_RATE_LIMIT_RATE = 0.05
+EXTERNAL_RETRY_RATE = 0.15
+LATENCY_MULTIPLE = 2.5
+APIFY_MIN_RUNS = 5
+APIFY_FAILURE_RATE = 0.25
+APIFY_JOBS_PER_RUN = 1.0
+
+
+def detect_external_findings(external: dict[str, Any]) -> list[dict[str, Any]]:
+    """Patterns in third-party API telemetry that merit a recommendation. Pure and deterministic.
+
+    Every rule is a ratio over that provider's own calls, so a provider used twice cannot raise an alarm.
+    """
+    findings: list[dict[str, Any]] = []
+    providers = [p for p in external.get("providers", []) if p["requests"] >= EXTERNAL_MIN_REQUESTS]
+    for p in providers:
+        name = p["provider"]
+        if (p["failure_rate"] or 0) >= EXTERNAL_FAILURE_RATE:
+            findings.append(_finding(
+                "RELIABILITY", "HIGH" if (p["failure_rate"] or 0) >= 2 * EXTERNAL_FAILURE_RATE else "MEDIUM", "ALL",
+                f"{name} calls fail often.",
+                f"{p['failed']} of {p['requests']} {name} calls failed ({_pct(p['failure_rate'])}); "
+                f"{p['timeouts']} timed out, {p['server_errors']} returned 5xx.",
+                f"Check the {name} integration and its timeouts before adding more load.",
+                "Fewer lost searches and less repeated work.", "unknown",
+                "None: this is a diagnosis, not a change."))
+        if (p["rate_limit_rate"] or 0) >= EXTERNAL_RATE_LIMIT_RATE:
+            findings.append(_finding(
+                "RELIABILITY", "MEDIUM", "ALL", f"{name} is rate limiting this account.",
+                f"{p['rate_limited']} of {p['requests']} {name} calls were rate limited ({_pct(p['rate_limit_rate'])}).",
+                f"Slow the schedule that drives {name}, or spread its calls out.",
+                "Fewer rejected calls and less retry waste.", "unknown", "Work is discovered more slowly."))
+        if (p["retry_rate"] or 0) >= EXTERNAL_RETRY_RATE:
+            findings.append(_finding(
+                "COST", "MEDIUM", "ALL", f"Retries are a large share of {name} calls.",
+                f"{p['retries']} retries across {p['requests']} {name} calls ({_pct(p['retry_rate'])} were retries).",
+                f"Find why {name} calls are being repeated before increasing the retry limit.",
+                "Less duplicated work and lower spend.", "unknown", "None."))
+    # The same workflow going to two providers: one being markedly slower is worth knowing about.
+    by_operation = [o for o in external.get("operations", []) if o["requests"] >= EXTERNAL_MIN_REQUESTS
+                    and o["p95_latency_ms"]]
+    for operation in {o["operation"] for o in by_operation}:
+        peers = sorted((o for o in by_operation if o["operation"] == operation), key=lambda o: o["p95_latency_ms"])
+        if len(peers) > 1 and peers[-1]["p95_latency_ms"] >= LATENCY_MULTIPLE * peers[0]["p95_latency_ms"]:
+            slow, fast = peers[-1], peers[0]
+            findings.append(_finding(
+                "LATENCY", "MEDIUM", "ALL", f"{slow['provider']} is much slower at {operation}.",
+                f"p95 {slow['p95_latency_ms']:.0f}ms on {slow['provider']} against "
+                f"{fast['p95_latency_ms']:.0f}ms on {fast['provider']} for the same operation.",
+                f"Prefer {fast['provider']} for {operation} where both can do the work.",
+                "Shorter end-to-end runs.", "unknown", "The providers may not return the same quality of data."))
+    apify = external.get("apify") or {}
+    for actor in external.get("apify_by_actor", []):
+        runs = actor["runs"]
+        if runs >= APIFY_MIN_RUNS and actor["failed"] / runs >= APIFY_FAILURE_RATE:
+            findings.append(_finding(
+                "RELIABILITY", "HIGH", "ALL", f"Apify actor {actor['actor_id']} fails often.",
+                f"{actor['failed']} of {runs} runs of {actor['actor_id']} did not succeed.",
+                "Review that actor's inputs, or replace it with another actor for the same boards.",
+                "More searches that actually return jobs.", "unknown",
+                "A different actor may cover different boards."))
+        if runs >= APIFY_MIN_RUNS and actor["jobs_created"] / runs < APIFY_JOBS_PER_RUN:
+            findings.append(_finding(
+                "COST", "MEDIUM", "ALL", f"Apify actor {actor['actor_id']} rarely finds new jobs.",
+                f"{runs} runs produced {actor['jobs_created']} new jobs after deduplication"
+                + (f", using {actor['compute_units']} compute units" if actor["compute_units"] is not None else "")
+                + (f" and ${actor['reported_cost']}" if actor["reported_cost"] is not None else "") + ".",
+                "Run that actor less often, or narrow its roles and locations.",
+                "Less spend for the same discoveries.",
+                f"${actor['reported_cost']}" if actor["reported_cost"] is not None else "unknown",
+                "Fewer runs may delay finding new postings."))
+    if apify.get("runs", 0) >= APIFY_MIN_RUNS and apify.get("jobs_after_deduplication") is not None \
+            and apify["jobs_after_deduplication"] < apify["runs"] * APIFY_JOBS_PER_RUN:
+        findings.append(_finding(
+            "ARCHITECTURE", "MEDIUM", "ALL", "Searches run more often than they find new jobs.",
+            f"{apify['runs']} Apify runs produced {apify['jobs_after_deduplication']} jobs after deduplication "
+            f"from {apify['jobs_discovered']} found.",
+            "Lengthen the schedule on the saved searches that repeat the most.",
+            "The same discoveries for fewer runs.", "unknown", "New postings are noticed a little later."))
+    return findings
 
 
 # ───────────── LLM output ─────────────
@@ -413,15 +504,17 @@ def _owned(db: Session, claim: Claim) -> AIOptimizationTask | None:
 def analyse(db: Session, user_id: int, start: datetime, end: datetime) -> AIOptimizationReport:
     """Aggregate, detect findings and (when possible) ask the model to write recommendations. Does not commit."""
     aggregates = monitoring.advisor_aggregates(db, user_id, start, end)
+    # Third-party telemetry rides along in the same aggregates blob, so the report stores what it was shown.
+    aggregates["external"] = external_monitoring.advisor_aggregates(db, user_id, start, end)
     findings = detect_findings(aggregates)
-    if not aggregates["totals"]["requests"]:
+    if not aggregates["totals"]["requests"] and not aggregates["external"]["totals"]["requests"]:
         return build_report(user_id, start, end, aggregates, findings)
     has_settings = db.scalar(select(AppSetting.id).where(AppSetting.user_id == user_id)) is not None
     if not has_settings or not ai_ready(db, user_id)[0]:
         return build_report(user_id, start, end, aggregates, findings,
                             note="written from rule findings: no AI provider is available for this account")
     prompt = build_ai_optimization_prompt(aggregates, [{k: v for k, v in f.items() if k != "recommendation"}
-                                                       for f in findings])
+                                                       for f in findings], aggregates.get("external"))
     try:
         result = LLMClient.for_user(db, user_id).generate_prompt(
             prompt, LLMCall(workflow_type="system", validate=validate_report))

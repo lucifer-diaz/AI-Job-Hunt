@@ -1,0 +1,83 @@
+"""Production code must not open its own connection to a third party.
+
+Telemetry is a property of the HTTP client (app.services.external_api), so an integration that builds its own
+client is invisible to Monitoring no matter how carefully it is written. This test is the guard: it fails when a
+new unmanaged client appears in app/, and names the file so the fix is obvious.
+"""
+import ast
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+APP = ROOT / "app"
+# The infrastructure that is allowed to construct real clients, and why.
+APPROVED = {
+    "app/services/external_api.py": "the instrumentation layer itself",
+}
+# Constructors that open an unmanaged connection to a third party.
+BANNED_CALLS = {
+    ("httpx", "Client"), ("httpx", "AsyncClient"), ("httpx", "stream"), ("httpx", "get"), ("httpx", "post"),
+    ("httpx", "put"), ("httpx", "delete"), ("httpx", "patch"), ("httpx", "request"),
+    ("requests", "get"), ("requests", "post"), ("requests", "put"), ("requests", "delete"), ("requests", "patch"),
+    ("requests", "request"), ("requests", "Session"),
+    ("aiohttp", "ClientSession"), ("urllib", "urlopen"),
+}
+BANNED_IMPORTS = {"requests", "aiohttp", "urllib3"}
+
+
+def _module_attr(node: ast.AST) -> tuple[str, str] | None:
+    """`httpx.Client` → ("httpx", "Client"); anything else → None."""
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        return node.value.id, node.attr
+    return None
+
+
+def unmanaged_clients(source: str) -> list[str]:
+    found = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Call) and (pair := _module_attr(node.func)) in BANNED_CALLS:
+            found.append(f"{pair[0]}.{pair[1]}()")
+        elif isinstance(node, ast.Import):
+            found += [f"import {a.name}" for a in node.names if a.name.split(".")[0] in BANNED_IMPORTS]
+        elif isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] in BANNED_IMPORTS:
+            found.append(f"from {node.module} import …")
+    return found
+
+
+def test_production_code_uses_only_the_instrumented_client():
+    offenders = {}
+    for path in sorted(APP.rglob("*.py")):
+        relative = str(path.relative_to(ROOT))
+        if relative in APPROVED or "migrations" in path.parts:
+            continue
+        if hits := unmanaged_clients(path.read_text()):
+            offenders[relative] = hits
+    assert offenders == {}, (
+        "These modules talk to a third party without telemetry. Use app.services.external_api.external_client "
+        f"(or external_operation for an SDK) instead: {offenders}")
+
+
+def test_the_guard_catches_a_new_unmanaged_client():
+    """The detector has to actually detect; otherwise the test above passes for the wrong reason."""
+    assert unmanaged_clients("import httpx\nwith httpx.Client() as c: c.get('https://x.test')") == ["httpx.Client()"]
+    assert unmanaged_clients("import requests\nrequests.get('https://x.test')") == ["import requests", "requests.get()"]
+    assert unmanaged_clients("import aiohttp\naiohttp.ClientSession()") == ["import aiohttp", "aiohttp.ClientSession()"]
+    # What good code looks like: the shared client, and httpx used only for its types and errors.
+    assert unmanaged_clients("from app.services.external_api import external_client\n"
+                             "with external_client('APIFY') as c: c.get('https://api.apify.com')") == []
+    assert unmanaged_clients("import httpx\ntry: ...\nexcept httpx.HTTPError: ...") == []
+
+
+def test_only_the_instrumentation_layer_is_approved():
+    """The allowlist stays tiny on purpose: every entry is a place telemetry could be bypassed."""
+    assert set(APPROVED) == {"app/services/external_api.py"}
+    for relative in APPROVED:
+        assert (ROOT / relative).exists(), f"{relative} is allowlisted but does not exist"
+
+
+@pytest.mark.parametrize("module", ["app/services/sources.py", "app/services/llm.py", "app/workspace.py"])
+def test_every_migrated_integration_goes_through_the_layer(module):
+    """The integrations that existed before this layer did now use it."""
+    source = (ROOT / module).read_text()
+    assert "app.services.external_api" in source or "external_client" in source or "apify_client" in source

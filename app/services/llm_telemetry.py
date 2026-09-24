@@ -22,7 +22,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
-from app.services import model_catalog
+from app.services import model_catalog, redaction, tracing
 from app.settings import get_settings
 
 if TYPE_CHECKING:
@@ -56,14 +56,7 @@ SECTION_CONTRIBUTOR = {
 _SECTION_LINE = re.compile(
     r"^(?P<label>" + "|".join(re.escape(label) for label in sorted(SECTION_CONTRIBUTOR, key=len, reverse=True))
     + r")(?: \(untrusted data\))?:(?: |$)", re.M)
-_SECRETS = [
-    re.compile(r"sk-(?:or-v1-|ant-|proj-)?[A-Za-z0-9_\-]{8,}"),
-    re.compile(r"AIza[0-9A-Za-z_\-]{20,}"),
-    re.compile(r"apify_api_[A-Za-z0-9]{10,}"),
-    re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-]{8,}"),
-    re.compile(r"(?i)((?:x-)?api[_-]?key[\"']?\s*[:=]\s*[\"']?)[^\s\"',}]{6,}"),
-]
-MAX_ERROR_MESSAGE = 1000
+MAX_ERROR_MESSAGE = redaction.MAX_ERROR_MESSAGE
 DEBUG_TEXT_LIMIT = 200_000
 
 
@@ -77,12 +70,8 @@ def estimate_tokens(text: str | None) -> int:
 
 
 def redact(message: str | None) -> str | None:
-    if message is None:
-        return None
-    clean = message
-    for pattern in _SECRETS:
-        clean = pattern.sub(lambda m: (m.group(1) if m.groups() and m.group(1) else "") + "[redacted]", clean)
-    return clean[:MAX_ERROR_MESSAGE]
+    """Secrets out of an error message. One implementation for every kind of telemetry: app.services.redaction."""
+    return redaction.redact_text(message, MAX_ERROR_MESSAGE)
 
 
 def context_breakdown(system: str, user: str) -> dict[str, int]:
@@ -143,6 +132,8 @@ class Attempt:
     response_text: str | None = None
     sent: bool = False  # False when the request was refused before reaching the provider
     structured_output_valid: bool | None = None
+    # The generic external-call row for this same request (app.services.external_api), set by the LLM layer.
+    external_request_id: str | None = None
 
 
 _sessions: Callable[[], Session] | None = None
@@ -195,6 +186,7 @@ def build_entry(attempt: Attempt, *, latency_ms: int, error: BaseException | Non
     debug = settings.llm_prompt_debug
     return {
         "request_id": str(uuid.uuid4()), "user_id": attempt.user_id,
+        "external_request_id": attempt.external_request_id, "trace_id": tracing.current_trace_id(),
         "workflow_type": call.workflow_type, "workflow_entity_id": call.entity_id,
         "stage": STAGE_BY_PROMPT.get(attempt.prompt_name or "", "OTHER"),
         "provider": attempt.provider[:30], "requested_model": (attempt.requested_model or "")[:300] or None,

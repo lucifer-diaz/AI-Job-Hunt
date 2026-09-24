@@ -9,6 +9,11 @@ from app.settings import get_settings
 client = TestClient(app)
 
 
+# A posting long enough to rank: app.services.ranker holds back listings with nothing to read.
+POSTING = ("Lead Python platform teams building services on Kubernetes and AWS. You will own the roadmap for "
+           "our data platform, mentor five engineers, and work with product to ship reliably. We look for expe"
+           "rience with FastAPI, distributed systems and a track record of leading delivery.")
+
 @pytest.fixture(autouse=True)
 def mock_llm(monkeypatch):
     monkeypatch.setattr(get_settings(), "llm_provider", "mock")
@@ -18,7 +23,7 @@ def make_jobs(count, tag):
     ids = []
     for i in range(count):
         job = client.post("/api/jobs/from-url", json={"url": f"https://example.com/bulk/{tag}/{i}", "title": f"Engineer {i}",
-                                                      "company": f"Bulk Co {tag}", "description": "Python"}).json()["job"]
+                                                      "company": f"Bulk Co {tag}", "description": POSTING}).json()["job"]
         ids.append(job["id"])
     return ids
 

@@ -30,6 +30,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import SchedulerJob
+from app.services import system_log, tracing
 from app.services.scheduled_jobs import JOBS, JobContext, JobSpec
 from app.settings import get_settings
 
@@ -149,22 +150,38 @@ class Scheduler:
                          interval_minutes=self.interval(name))
         started = time.monotonic()
         result, error = None, None
-        try:
-            if asyncio.iscoroutinefunction(spec.run):
-                value = await spec.run(ctx)
-            else:
-                value = await asyncio.to_thread(spec.run, ctx)
-            result = _json_safe(value)
-            status = "skipped" if isinstance(result.get("skipped"), str) else "succeeded"
-        except Exception as exc:  # recorded on the job; other jobs and the loop carry on
-            log.exception("scheduled job %s failed", name)
-            status, error = "failed", f"{type(exc).__name__}: {exc}"[:4000]
-        duration_ms = int((time.monotonic() - started) * 1000)
+        # One correlation ID for the whole job: every external call it makes, in any account, is findable
+        # together afterwards (app.services.tracing). asyncio.to_thread copies the context, so worker threads
+        # inherit it.
+        with tracing.trace(name, workflow_type="system", inherit=False) as trace_ctx:
+            try:
+                if asyncio.iscoroutinefunction(spec.run):
+                    value = await spec.run(ctx)
+                else:
+                    value = await asyncio.to_thread(spec.run, ctx)
+                result = _json_safe(value)
+                status = "skipped" if isinstance(result.get("skipped"), str) else "succeeded"
+            except Exception as exc:  # recorded on the job; other jobs and the loop carry on
+                log.exception("scheduled job %s failed", name)
+                status, error = "failed", f"{type(exc).__name__}: {exc}"[:4000]
+            duration_ms = int((time.monotonic() - started) * 1000)
+            await asyncio.to_thread(self._log_run, name, trigger, status, error, result, duration_ms,
+                                    trace_ctx.trace_id)
         try:
             await asyncio.to_thread(self._release, name, owner, now, status, error, result, duration_ms)
         except Exception:  # the lease expires on its own if the database is unreachable
             log.exception("could not record the result of scheduled job %s", name)
         return RunOutcome(name, trigger, status, now, duration_ms, result, error)
+
+    @staticmethod
+    def _log_run(name: str, trigger: str, status: str, error: str | None, result: dict[str, Any] | None,
+                 duration_ms: int, trace_id: str) -> None:
+        """One Monitoring → Logs line per scheduled run, so a job's history reads next to the calls it made."""
+        system_log.log_event(
+            category="SCHEDULER", level="ERROR" if status == "failed" else "INFO",
+            message=f"{name} {status}" + (f": {error}" if error else ""),
+            operation=name, workflow=name, trace_id=trace_id, status=status, duration_ms=duration_ms,
+            details={"trigger": trigger, "result": result})
 
     def ensure_rows(self) -> None:
         with self.sessions() as db:
