@@ -192,6 +192,25 @@ def test_a_verified_saved_answer_answers_the_question(account):
     assert out["answer_source"] == f"knowledge_answer:{account['notice']}"
 
 
+def test_a_similar_question_never_borrows_another_questions_answer(account):
+    """Python and Java questions overlap 0.6 in content words; the Python answer must never answer Java."""
+    uid = account["user_id"]
+    python = "How many years of Python experience do you have?"
+    with session(uid) as db:
+        db.add(KnowledgeAnswer(question=python, question_key=question_key(python), answer="6", verified=True))
+        db.commit()
+    java = call(uid, "search_application_knowledge", question="How many years of Java experience do you have?")
+    assert java["status"] == "UNKNOWN" and java["answer"] is None and java["knowledge_answers"] == []
+    similar = java["similar_questions"][0]
+    assert similar["question"] == python and similar["answered"] is True and "answer" not in similar
+    reworded = call(uid, "search_application_knowledge", question="Years of Python experience?")
+    assert reworded["status"] == "ANSWERED" and reworded["answer"] == "6"  # only filler words differ
+    asked = call(uid, "request_human_answer", job_id=account["grab"], question="How many years of Java experience do you have?")
+    assert asked["status"] == "SAVED"
+    again = call(uid, "request_human_answer", job_id=account["grab"], question="What's your notice period?")
+    assert again["status"] == "ALREADY_ANSWERED" and again["question_id"] == account["notice"]
+
+
 def test_sensitive_answers_need_confirmation_and_are_not_returned(account):
     out = call(account["user_id"], "search_application_knowledge", question="What is your gender?")
     assert out["status"] == "NEEDS_CONFIRMATION" and out["answer"] is None
@@ -314,6 +333,29 @@ def test_a_blocker_hides_the_job_until_the_person_answers(account):
     done = call(uid, "record_application_result", job_id=grab, outcome="submitted")
     with session(uid) as db:
         assert done["status"] == "SUBMITTED" and db.get(Job, grab).application.apply_blocker is None
+
+
+def test_a_sensitive_question_keeps_its_blocker_open(account):
+    """A saved sensitive answer is confirmed per application, so it never clears a blocker by itself."""
+    uid, grab = account["user_id"], account["grab"]
+    asked = call(uid, "request_human_answer", job_id=grab, question="What is your gender?")
+    assert asked["status"] == "NEEDS_CONFIRMATION"
+    call(uid, "record_application_result", job_id=grab, outcome="blocked", blocker_reason="needs_human_answer",
+         question_ids=[asked["question_id"]])
+    assert [j["company"] for j in call(uid, "list_jobs_for_application")["jobs"]] == ["Stripe"]
+    blocked = call(uid, "list_jobs_for_application", include_blocked=True)["jobs"][0]
+    assert blocked["company"] == "Grab" and blocked["blocker"]["reason"] == "needs_human_answer"
+
+
+def test_a_job_without_an_application_url_is_not_ready(account):
+    uid = account["user_id"]
+    with session(uid) as db:
+        stripe = db.get(Job, account["stripe"])
+        stripe.url = ""
+        db.commit()
+    assert [j["company"] for j in call(uid, "list_jobs_for_application")["jobs"]] == ["Grab"]
+    refused = call(uid, "get_job_packet", job_id=account["stripe"])
+    assert refused["ok"] is False and "no application URL" in refused["error"]
 
 
 def test_blockers_are_validated(account):

@@ -17,15 +17,16 @@ from sqlalchemy.orm import Session
 from app.models import CandidateProfile, Evidence, Job, KnowledgeAnswer
 
 ANSWER_TYPES = ("text", "boolean", "choice", "number")
-# A saved question counts as the same question at this word overlap (Jaccard over content words).
-ANSWER_MATCH = 0.5
+# A saved question this close (Jaccard over content words) is shown as similar, never used as the answer:
+# "years of Python experience" and "years of Java experience" overlap 0.6 and mean different things.
+SIMILAR_MATCH = 0.5
 # Evidence is offered when it covers at least this share of the question's content words.
 EVIDENCE_MATCH = 1 / 3
 MAX_OPTIONS = 50
 # Words that carry no meaning in an application question, so they never make two questions look alike.
 STOPWORDS = frozenset("""
 a an and are as at be been being by can could describe detail details did do does done else enter explain for
-from give had has have how i if in into is it its list may me might must my of on or our please provide select
+from give had has have how i if in into is it its list many may me might much must my of on or our please provide select
 should so tell than that the their them then there these they this those to us was we were what when where which
 who whom why will with would you your yours
 """.split())
@@ -55,7 +56,17 @@ def _stem(word: str) -> str:
 
 def terms(text: str) -> set[str]:
     """Content words, lower-cased and lightly singularised: "Years of Kafka experience?" -> {years, kafka, ...}."""
-    return {_stem(w) for w in re.findall(r"[a-z0-9][a-z0-9+#-]*", (text or "").lower()) if w not in STOPWORDS}
+    words = re.findall(r"[a-z0-9][a-z0-9+#-]*", (text or "").lower())
+    # Single letters are contraction debris ("what's" -> what, s), not content.
+    return {_stem(w) for w in words if w not in STOPWORDS and (len(w) > 1 or w.isdigit())}
+
+
+def same_question(a: str, b: str) -> bool:
+    """The same question in other words only when nothing but filler differs: same key, or the same content words."""
+    if question_key(a) == question_key(b):
+        return True
+    ta, tb = terms(a), terms(b)
+    return bool(ta) and ta == tb
 
 
 def _overlap(a: set[str], b: set[str]) -> float:
@@ -74,26 +85,32 @@ def _answer_dict(row: KnowledgeAnswer, match: float) -> dict[str, Any]:
 def search(db: Session, question: str, limit: int = 5) -> dict[str, Any]:
     """Sourced candidates for one form question, and a status saying how far they go.
 
-    status: ANSWERED (a verified saved answer, or a contact detail from the profile), NEEDS_CONFIRMATION (a
-    sensitive saved answer: a person confirms it each time, so its text is not returned), PENDING_HUMAN (the
-    question is already waiting for a person), SUPPORTED (only facts to compose an answer from), UNKNOWN.
+    status: ANSWERED (a verified saved answer to this same question, or a contact detail from the profile),
+    NEEDS_CONFIRMATION (a sensitive saved answer to this or a similar question: a person confirms it each time, so
+    its text is not returned), PENDING_HUMAN (this question is already waiting for a person), SUPPORTED (only
+    facts to compose an answer from), UNKNOWN. Saved answers to merely similar questions never set the answer;
+    they are listed in similar_questions for reference.
     """
-    wanted, key = terms(question), question_key(question)
-    answered, sensitive, pending = [], [], []
+    wanted = terms(question)
+    answered, sensitive, pending, similar = [], [], [], []
     for row in db.scalars(select(KnowledgeAnswer).order_by(KnowledgeAnswer.id)).all():
-        match = 1.0 if row.question_key == key else _overlap(wanted, terms(row.question))
-        if match < ANSWER_MATCH:
+        same = same_question(question, row.question)
+        match = 1.0 if same else _overlap(wanted, terms(row.question))
+        if match < SIMILAR_MATCH:
             continue
         has_answer = bool((row.answer or "").strip())
         if row.verified and has_answer and row.sensitive:
+            # Withheld either way, so erring towards "ask the person" costs nothing.
             sensitive.append({"id": row.id, "question": row.question, "category": row.category,
                               "match": round(match, 2), "source": f"knowledge_answer:{row.id}"})
+        elif not same:
+            similar.append({"id": row.id, "question": row.question, "answered": row.verified and has_answer,
+                            "match": round(match, 2)})
         elif row.verified and has_answer:
             answered.append(_answer_dict(row, match))
         else:
-            pending.append({"id": row.id, "question": row.question, "answer_options": row.answer_options or [],
-                            "match": round(match, 2)})
-    answered.sort(key=lambda a: (-a["match"], a["id"]))
+            pending.append({"id": row.id, "question": row.question, "answer_options": row.answer_options or []})
+    similar.sort(key=lambda a: (-a["match"], a["id"]))
 
     facts = []
     profile = db.scalar(select(CandidateProfile))
@@ -129,7 +146,8 @@ def search(db: Session, question: str, limit: int = 5) -> dict[str, Any]:
     else:
         status, answer, source = "UNKNOWN", None, None
     return {"status": status, "answer": answer, "answer_source": source, "knowledge_answers": answered[:limit],
-            "sensitive_answers": sensitive[:limit], "pending_questions": pending[:limit], "profile_facts": facts,
+            "sensitive_answers": sensitive[:limit], "pending_questions": pending[:limit],
+            "similar_questions": similar[:limit], "profile_facts": facts,
             "evidence": evidence}
 
 
@@ -142,6 +160,16 @@ def _clean_options(options: Any) -> list[str]:
     if len(cleaned) > MAX_OPTIONS:
         raise ValueError(f"answer_options may list at most {MAX_OPTIONS} choices")
     return cleaned
+
+
+def find_same(db: Session, question: str) -> KnowledgeAnswer | None:
+    """The saved row for this question in any wording `same_question` accepts, preferring an answered one."""
+    exact = db.scalar(select(KnowledgeAnswer).where(KnowledgeAnswer.question_key == question_key(question)))
+    if exact is not None and exact.verified and (exact.answer or "").strip():
+        return exact
+    others = [r for r in db.scalars(select(KnowledgeAnswer).order_by(KnowledgeAnswer.id)).all()
+              if r is not exact and same_question(question, r.question)]
+    return next((r for r in others if r.verified and (r.answer or "").strip()), exact or next(iter(others), None))
 
 
 def request_answer(db: Session, job: Job, question: str, *, answer_options: Any = None, answer_type: str | None = None,
@@ -168,7 +196,7 @@ def request_answer(db: Session, job: Job, question: str, *, answer_options: Any 
              "note": (note or "").strip()[:1000] or None, "requested_by": requested_by, "requested_at": _now().isoformat()}
 
     key = question_key(question)
-    row = db.scalar(select(KnowledgeAnswer).where(KnowledgeAnswer.question_key == key))
+    row = find_same(db, question)
     if row is not None and row.verified and (row.answer or "").strip():
         if row.sensitive:
             return {"status": "NEEDS_CONFIRMATION", "question_id": row.id,
@@ -198,8 +226,13 @@ def request_answer(db: Session, job: Job, question: str, *, answer_options: Any 
 
 
 def answered(db: Session, question_ids: list[int]) -> bool:
-    """Whether a person has answered (and verified) every one of these saved questions."""
+    """Whether a person has answered (and verified) every one of these saved questions.
+
+    A sensitive answer never counts: the person confirms it for each application, and a saved value says nothing
+    about this one, so a blocker naming it stays open until the application is submitted.
+    """
     if not question_ids:
         return True
     rows = db.scalars(select(KnowledgeAnswer).where(KnowledgeAnswer.id.in_(question_ids))).all()
-    return len(rows) == len(set(question_ids)) and all(r.verified and (r.answer or "").strip() for r in rows)
+    return len(rows) == len(set(question_ids)) and all(
+        r.verified and not r.sensitive and (r.answer or "").strip() for r in rows)

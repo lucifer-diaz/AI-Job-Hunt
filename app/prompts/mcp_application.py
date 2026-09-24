@@ -16,9 +16,14 @@ APPLICATION_RULES = (
      "status is SUPPORTED, compose a short answer strictly from the returned evidence and profile_facts, and cite "
      "nothing else. Never guess work authorization, visa or sponsorship, salary, demographic, identity or legal "
      "answers."),
-    ("When status is UNKNOWN or PENDING_HUMAN and the question is required, or status is NEEDS_CONFIRMATION, do not "
-     "answer it: save it with request_human_answer (with the form's exact options), stop before submitting, and "
-     "record the blocker with record_application_result (blocker_reason needs_human_answer and the question_ids)."),
+    ("similar_questions are saved questions worded differently. They are for reference only: never reuse their "
+     "answers, because a question about another skill, place or date looks similar and means something else."),
+    ("When status is UNKNOWN or PENDING_HUMAN and the question is required, do not answer it: save it with "
+     "request_human_answer (with the form's exact options), stop before submitting, and record the blocker with "
+     "record_application_result (blocker_reason needs_human_answer and the question_ids)."),
+    ("When status is NEEDS_CONFIRMATION the answer is sensitive and the candidate confirms it for every application: "
+     "ask them in this conversation and use only what they confirm. If they are not here, record the "
+     "needs_human_answer blocker as above; it stays open until they confirm and the application is submitted."),
     "Optional questions you cannot answer from sourced data are left blank.",
     ("Submit only once. Call record_application_result with outcome submitted only after the portal confirms the "
      "submission, with its confirmation ID when one is shown. If anything stops you (CAPTCHA, a login or account, "

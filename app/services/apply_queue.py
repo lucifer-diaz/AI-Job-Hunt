@@ -1,7 +1,7 @@
 """Approved packets waiting to be submitted, and what happened when someone tried.
 
 A job is ready to apply to when its packet is approved, nothing was submitted for it yet, the approved resume's
-reviewer score is above the floor, no other posting of the same job was already applied to, and its last attempt
+reviewer score is above the floor, it has an application URL, no other posting of the same job was already applied to, and its last attempt
 did not stop at a blocker that is still open. Recording a submission goes through `workflow.mark_applied`, the
 same path the Apply screen uses, so a job is only ever applied to once.
 """
@@ -16,7 +16,7 @@ from typing import Any
 from sqlalchemy import desc, nulls_last, or_, select
 from sqlalchemy.orm import Session
 
-from app.models import Application, ApplicationEvent, Job, ResumeVariant
+from app.models import Application, ApplicationEvent, Job, ResumeVariant, User
 from app.services import knowledge
 from app.services.exports import DOCX_MEDIA_TYPE, markdown_to_docx, markdown_to_simple_pdf, packet_filename, packet_slug
 from app.services.workflow import get_profile, mark_applied
@@ -89,7 +89,7 @@ def ready_to_apply(db: Session, *, reviewer_score_above: float | None = None, in
     query = query.order_by(desc(ResumeVariant.reviewer_score), nulls_last(desc(Job.fit_score)), Job.id)
     out = []
     for job, application, resume in db.execute(query).all():
-        if applied_duplicate(db, job) is not None:
+        if not apply_url(job) or applied_duplicate(db, job) is not None:
             continue
         blocker = open_blocker(db, application)
         if blocker and not include_blocked:
@@ -114,6 +114,8 @@ def not_ready_reason(db: Session, job: Job, *, reviewer_score_above: float | Non
     duplicate = applied_duplicate(db, job)
     if duplicate is not None:
         return f"Already applied to the same posting as job {duplicate.id} ({duplicate.company})"
+    if not apply_url(job):
+        return "The job has no application URL; add the posting URL in Job Hunt OS first"
     return None
 
 
@@ -165,6 +167,12 @@ def record_submission(db: Session, job: Job, *, confirmation_id: str | None = No
 
 
 def lock_application(db: Session, job: Job) -> Application | None:
-    """Re-read the application under a row lock, so two agents cannot both record a submission."""
+    """Re-read the application under row locks, so two agents cannot both record a submission.
+
+    The account row is locked first: duplicate postings are different jobs, so a lock on this job's application
+    alone would let two sessions each pass the duplicate check before either commits. Submissions for one account
+    are therefore recorded one at a time (SQLite, which has no row locks, serialises writes anyway).
+    """
+    db.execute(select(User.id).where(User.id == job.user_id).with_for_update())
     return db.scalar(select(Application).where(Application.job_id == job.id).with_for_update()
                      .execution_options(populate_existing=True).limit(1))
