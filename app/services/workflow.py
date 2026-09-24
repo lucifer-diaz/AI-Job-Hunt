@@ -336,7 +336,8 @@ def approve_job(db: Session, job: Job, *, override: bool = False, note: str = ""
     return application
 
 
-def mark_applied(db: Session, job: Job) -> Application:
+def mark_applied(db: Session, job: Job, *, submitted_by: str = "you", submitted_via: str | None = None,
+                 confirmation_id: str | None = None) -> Application:
     application = job.application or approve_job(db, job)
     if application.status != "approved":
         raise ValueError("Application must be approved before marking applied")
@@ -345,9 +346,15 @@ def mark_applied(db: Session, job: Job) -> Application:
     application.stage = "applied"
     application.applied_at = applied_at
     application.followup_due_at = applied_at + timedelta(days=followup_days(db))
+    application.submitted_via = submitted_via
+    application.confirmation_id = confirmation_id or None
+    application.apply_blocker = None
     job.status = "applied"
+    detail = f"Submitted by {submitted_by} · {job.url or 'no posting URL'}"
     db.add(ApplicationEvent(application=application, kind="applied", title="Applied",
-                            detail=f"Submitted by you · {job.url or 'no posting URL'}", occurred_at=applied_at))
+                            detail=detail + (f" · confirmation {confirmation_id}" if confirmation_id else ""),
+                            occurred_at=applied_at,
+                            meta={"confirmation_id": confirmation_id} if confirmation_id else None))
     db.commit()
     db.refresh(application)
     return application

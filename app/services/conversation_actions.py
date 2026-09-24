@@ -15,7 +15,9 @@ from app.models import ConversationAction
 SOURCE_CLAUDE_DESKTOP = "CLAUDE_DESKTOP"
 # Scalar arguments kept as they are (filters and identifiers). Everything else is reduced to its size.
 KEPT_SCALARS = {"job_id", "job_ids", "minimum_fit_score", "posted_after", "location", "company", "limit",
-                "operation_id", "recommendation", "review_score", "confidence", "tailored_resume_version"}
+                "operation_id", "recommendation", "review_score", "confidence", "tailored_resume_version",
+                "reviewer_score_above", "include_blocked", "offset", "formats", "include_content", "outcome",
+                "blocker_reason", "question_ids", "answer_type", "category", "sensitive", "required"}
 
 
 def summarize_arguments(arguments: dict[str, Any]) -> dict[str, Any]:

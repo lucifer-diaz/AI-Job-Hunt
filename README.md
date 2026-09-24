@@ -1106,6 +1106,8 @@ Optional limits, in `.env`:
 ```env
 MCP_BULK_TAILOR_LIMIT=10
 MCP_BULK_REVIEW_LIMIT=20
+MCP_APPLICATION_PAGE_LIMIT=50     # most jobs one list_jobs_for_application page returns
+MCP_PACKET_DIR=./data/packets     # where get_job_packet writes resume files for upload
 ```
 
 Requests above these limits are rejected, not truncated.
@@ -1120,7 +1122,7 @@ In a new Claude Desktop chat, the tools menu should list **job-hunt-os**. Ask:
 Show me the available Job Hunt OS tools.
 ```
 
-You should see `list_jobs_for_tailoring`, `get_tailoring_context`, `save_tailored_resume`, `save_bulk_tailored_resumes`, `list_jobs_for_review`, `get_review_context`, `save_review`, `save_bulk_reviews` and `get_bulk_operation_status`, plus the prompts `tailor_jobs` and `review_applications`. Then ask:
+You should see `list_jobs_for_tailoring`, `get_tailoring_context`, `save_tailored_resume`, `save_bulk_tailored_resumes`, `list_jobs_for_review`, `get_review_context`, `save_review`, `save_bulk_reviews`, `get_bulk_operation_status`, `list_jobs_for_application`, `get_job_packet`, `search_application_knowledge`, `request_human_answer` and `record_application_result`, plus the prompts `tailor_jobs`, `review_applications` and `apply_to_jobs`. Then ask:
 
 ```text
 Show me the top 5 jobs waiting for tailoring.
@@ -1191,6 +1193,37 @@ The recommendation is advice. **Job Hunt OS decides the state:** it re-runs the 
 
 A review can never archive, approve by itself, or submit an application.
 
+### Application workflow
+
+Claude can fill in employers' application forms for approved packets (with a browser tool such as Claude in Chrome), while Job Hunt OS decides which jobs are ready, supplies the files and the answers, and records each submission once.
+
+```text
+Apply to my top 3 approved jobs.
+```
+
+```text
+Claude
+→ list_jobs_for_application         approved, not yet applied, approved resume reviewed above 60; best reviewed
+                                    first, with the apply URL; paged with offset / next_offset
+→ get_job_packet                    the approved resume version (not a newer draft), cover letter, screening
+                                    drafts, and the resume as PDF and DOCX files written to MCP_PACKET_DIR
+→ per form question:
+  search_application_knowledge      saved answers, verified evidence and profile facts, each with its source
+  request_human_answer              when nothing answers it: saved to the Knowledge bank with the job and the
+                                    form's options, for you to answer
+→ record_application_result         submitted (with the portal's confirmation ID) or blocked (with the reason)
+```
+
+| Tool | Returns / does |
+| --- | --- |
+| `list_jobs_for_application` | Approved jobs with no submission whose approved resume scored **above 60** in review (`reviewer_score_above` can raise the bar, never lower it). Jobs already applied to under another posting of the same job (same apply URL, posting URL or company/title/city) and jobs stopped at an open blocker are left out; `include_blocked=true` shows the latter. |
+| `get_job_packet` | The approved resume, cover letter and screening drafts, plus `files`: `pdf` and `docx` with `path`, `filename`, `size_bytes` and `sha256` (`include_content=true` also returns them base64-encoded). Refused for a job that is not approved, is already applied to, or is at or below the reviewer floor. |
+| `search_application_knowledge` | A `status` and the sources behind it. `ANSWERED`: a verified saved answer, or a contact detail from your profile. `SUPPORTED`: only facts (verified evidence, work authorization) to compose an answer from. `NEEDS_CONFIRMATION`: a saved answer marked sensitive, which you confirm each time, so its text is not returned. `PENDING_HUMAN`: already waiting for you. `UNKNOWN`: nothing supports an answer. Unverified evidence and unverified answers are never used. |
+| `request_human_answer` | Saves the question (once per distinct question) as an unanswered, unverified Knowledge bank entry with the form's options and the job that asked. The Knowledge bank shows *Asked by Company · Title — Options: …*. A question that already has a verified answer is not reopened. |
+| `record_application_result` | `submitted` marks the job applied (the same path as the Apply screen: follow-up date, tracker event, confirmation ID). A job already applied to is never recorded again: a repeat returns `ALREADY_APPLIED` and changes nothing, and a duplicate posting of a job already applied to is refused. `blocked` records `captcha`, `login_required`, `account_required`, `needs_human_answer`, `missing_document`, `posting_closed`, `form_error` or `other`; a `needs_human_answer` blocker clears itself once you have answered and verified its questions. |
+
+Job Hunt OS never submits anything itself, and these tools never create accounts, accept terms or change the approval. The `apply_to_jobs` prompt starts the workflow with the rules included.
+
 ### Recommended batch sizes
 
 ```text
@@ -1202,7 +1235,7 @@ Each job adds its description, evidence and output to the conversation. Larger b
 
 ### Useful Claude commands
 
-The tools cover jobs **waiting for tailoring** and **waiting for review**. The other commands below use what those tools return.
+The tools cover jobs **waiting for tailoring**, **waiting for review** and **approved for application**. The other commands below use what those tools return.
 
 - **Search:** `Show me the top 10 Singapore jobs ranked above 85.` (filters the tailoring queue by location and score)
 - **Tailor:** `Tailor the top 5 jobs waiting for tailoring.`
@@ -1212,7 +1245,7 @@ The tools cover jobs **waiting for tailoring** and **waiting for review**. The o
 - **Failed reviews:** `Show me applications rejected during review because of unsupported claims.` (uses `get_bulk_operation_status` decisions and reasons)
 - **Status:** `Show me the status of my latest bulk tailoring operation.`
 
-The built-in MCP prompts **tailor_jobs** and **review_applications** (in Claude Desktop's prompt/attachment menu) start either workflow with the rules included.
+The built-in MCP prompts **tailor_jobs**, **review_applications** and **apply_to_jobs** (in Claude Desktop's prompt/attachment menu) start each workflow with the rules included.
 
 ### Claude Desktop vs backend mode
 

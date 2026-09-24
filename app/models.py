@@ -258,6 +258,10 @@ class KnowledgeAnswer(Base):
     sensitive: Mapped[bool] = mapped_column(Boolean, default=False)
     source_job_id: Mapped[int | None] = mapped_column(ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True)
     use_count: Mapped[int] = mapped_column(Integer, default=0)
+    # A question an application form asked that nobody has answered yet (app.services.knowledge): the choices
+    # the form offered, and which job and form field asked it.
+    answer_options: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    request_context: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
 
@@ -765,6 +769,11 @@ class Application(Base):
     # reason the person gave. The score itself stays on the approved resume variant.
     approval_override: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
     approval_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Submission (app.services.apply_queue): the reference the portal showed, who submitted it, and why the last
+    # attempt stopped short of submitting ({reason, detail, question_ids, recorded_at}; cleared on submission).
+    confirmation_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    submitted_via: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    apply_blocker: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     # Post-submission tracker column: applied, acknowledged, screening, interviewing, ..., closed.
     stage: Mapped[str | None] = mapped_column(String(50), default="applied", nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
