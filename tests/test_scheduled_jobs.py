@@ -13,9 +13,10 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 import app.main as main
+from app import workspace
 from app.db import AppSession, SessionLocal
 from app.db_migrations import run_migrations
-from app.models import Job, SchedulerJob, SearchRun
+from app.models import Job, SavedSearch, SchedulerJob, SearchRun
 from app.services import scheduled_jobs as sj
 from app.services import work_queue as wq
 from app.services.compensation import extract_posting_salary, parse_salary_text
@@ -158,13 +159,14 @@ def test_compensation_enrichment_runs_once_per_job(sqlite_sessions):
         assert db.scalar(select(Job).where(Job.source_ref == "c")).compensation["status"] == "not_listed"
 
 
-def test_hunter_runs_each_accounts_search_with_its_own_token(sqlite_sessions, monkeypatch):
+def test_hunter_runs_each_accounts_due_setups_with_its_own_token(sqlite_sessions, monkeypatch):
     assert sj.hunter(ctx(sqlite_sessions)) == {"skipped": "No accounts yet"}
     searcher, _without_key = make_user(sqlite_sessions), make_user(sqlite_sessions)
     with sqlite_sessions() as db:
         set_user_keys(db, {"apify": "apify_api_searcher"}, user_id=searcher)
-    profile = {"roles": ["Engineer"], "schedule": "manual"}
-    monkeypatch.setattr(sj, "get_search_profile", lambda db: dict(profile))
+        db.add(SavedSearch(user_id=searcher, name="Engineering", settings={"roles": ["Engineer"]},
+                           schedule_kind="manual", weekdays=[], enabled=True))
+        db.commit()
     started = []
 
     def fake_run(db, sp):
@@ -174,17 +176,37 @@ def test_hunter_runs_each_accounts_search_with_its_own_token(sqlite_sessions, mo
         db.commit()
         return [run]
 
-    monkeypatch.setattr(sj, "run_search_profile", fake_run)
+    monkeypatch.setattr(workspace, "run_search_profile", fake_run)
     manual = sj.hunter(ctx(sqlite_sessions, trigger="schedule"))
-    assert manual["not_started"] == {"schedule is manual": 1, "no Apify key": 1} and started == []
+    assert manual["not_started"] == {"no search was due": 1, "no Apify key": 1} and started == []
 
-    profile["schedule"] = "daily"
+    with sqlite_sessions() as db:
+        db.query(SavedSearch).update({"schedule_kind": "daily", "next_run_at": utcnow() - timedelta(minutes=1)})
+        db.commit()
     out = sj.hunter(ctx(sqlite_sessions, trigger="schedule", interval=240))
     assert out["started"] == 1 and started == [(searcher, "apify_api_searcher")]
-    again = sj.hunter(ctx(sqlite_sessions, trigger="manual", interval=240))
-    assert again["skipped"] == "No account had a search due" and again["not_started"]["searched recently"] == 1
+    again = sj.hunter(ctx(sqlite_sessions, trigger="schedule", interval=240))
+    assert again["skipped"] == "No account had a search due"
     with sqlite_sessions() as db:
         assert db.scalar(select(SearchRun.user_id)) == searcher and len(started) == 1
+        setup = db.scalar(select(SavedSearch))
+        assert setup.last_run_at and setup.next_run_at > utcnow(), "a setup that ran is not due again until its next time"
+        assert db.scalar(select(SearchRun.saved_search_id)) == setup.id
+
+
+def test_a_manual_trigger_runs_every_scheduled_setup_at_once(sqlite_sessions, monkeypatch):
+    account = make_user(sqlite_sessions)
+    with sqlite_sessions() as db:
+        set_user_keys(db, {"apify": "apify_api_account"}, user_id=account)
+        db.add_all([SavedSearch(user_id=account, name="Daily", settings={"roles": ["Engineer"]}, weekdays=[],
+                                schedule_kind="daily", time_of_day="07:00", next_run_at=utcnow() + timedelta(hours=6)),
+                    SavedSearch(user_id=account, name="Only when I say", settings={"roles": ["Engineer"]}, weekdays=[],
+                                schedule_kind="manual")])
+        db.commit()
+    monkeypatch.setattr(workspace, "run_search_profile",
+                        lambda db, sp: [SearchRun(external_run_id=uuid.uuid4().hex, actor_id="a/b")])
+    out = sj.hunter(ctx(sqlite_sessions, trigger="manual", interval=240))
+    assert out["started"] == 1, "the manual setup stays manual; the scheduled one runs before its time"
 
 
 def test_apify_sync_imports_each_finished_run_once_with_the_owners_token(sqlite_sessions, monkeypatch):

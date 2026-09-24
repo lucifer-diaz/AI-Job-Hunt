@@ -4,15 +4,21 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import desc, select
 
 from app.db import SessionLocal
 from app.main import app
-from app.models import Job, SearchRun
+from app.models import Job, ResumeVariant, SearchRun
 from app.settings import get_settings
 from app.workspace import extract_job_posting
 
 client = TestClient(app)
 
+
+# A posting long enough to rank: app.services.ranker holds back listings with nothing to read.
+POSTING = ("Lead Python platform teams building services on Kubernetes and AWS. You will own the roadmap for "
+           "our data platform, mentor five engineers, and work with product to ship reliably. We look for expe"
+           "rience with FastAPI, distributed systems and a track record of leading delivery.")
 
 @pytest.fixture(autouse=True)
 def mock_llm(monkeypatch):
@@ -23,7 +29,7 @@ def make_job(title="Lead AI Engineer", company=None):
     tag = uuid.uuid4().hex[:8]
     response = client.post("/api/jobs/from-url", json={
         "url": f"https://example.com/jobs/{tag}", "title": title, "company": company or f"Acme {tag}",
-        "location": "Remote", "description": "Python FastAPI AWS and team leadership"})
+        "location": "Remote", "description": POSTING})
     assert response.status_code == 200, response.text
     return response.json()["job"]
 
@@ -211,7 +217,7 @@ def test_search_profile_save_run_and_detail(monkeypatch):
     db.add(run)
     db.commit()
     db.add(Job(source="apify:linkedin", source_ref=uuid.uuid4().hex, title="AI Engineer", company="Pulled Co",
-               search_run_id=run.id))
+               description=POSTING, search_run_id=run.id))
     db.commit()
     run_id = run.id
     db.close()
@@ -219,6 +225,28 @@ def test_search_profile_save_run_and_detail(monkeypatch):
     assert detail["counts"]["duplicates"] == 4 and detail["results"][0]["company"] == "Pulled Co"
     queued = client.post(f"/api/search/apify/runs/{run_id}/rank")
     assert queued.status_code == 202 and len(queued.json()["queued"]) == 1
+
+
+def test_the_tracker_can_open_the_packet_that_was_submitted():
+    """The tracker card names the submitted resume so the screen can open it; an applied packet is read-only."""
+    job = make_job(company=f"Epsilon {uuid.uuid4().hex[:6]}")
+    client.post(f"/api/jobs/{job['id']}/triage", json={"action": "shortlist"})
+    assert client.post(f"/api/jobs/{job['id']}/tailor").status_code == 200
+    with SessionLocal() as db:
+        variant = db.scalar(select(ResumeVariant).where(ResumeVariant.job_id == job["id"])
+                            .order_by(desc(ResumeVariant.version)))
+        variant.reviewer_score = 90
+        db.commit()
+        resume_id = variant.id
+    client.post(f"/api/jobs/{job['id']}/approve", json={})
+    client.post(f"/api/jobs/{job['id']}/applied", json={})
+
+    card = next(a for a in client.get("/api/tracker").json()["applications"] if a["job_id"] == job["id"])
+    assert card["resume_id"] == resume_id, "the tracker knows which packet was submitted"
+    assert "resume v" in card["docs"]
+
+    opened = client.get(f"/api/tailor/{job['id']}").json()
+    assert opened["resume"]["id"] == resume_id and opened["job"]["status"] == "applied"
 
 
 def test_tracker_stages_preferences_and_evidence_parsing():

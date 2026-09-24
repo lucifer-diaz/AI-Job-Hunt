@@ -5,8 +5,7 @@ from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import (JSON, Boolean, CheckConstraint, Date, DateTime, Enum, Float, ForeignKey, Index, Integer, Numeric,
-                        String, Text,
-                        UniqueConstraint, text)
+                        String, Text, UniqueConstraint, false, text, true)
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from app.db import Base
@@ -64,6 +63,8 @@ class User(Base):
     jobs: Mapped[list[Job]] = relationship(back_populates="user", passive_deletes=True)
     search_runs: Mapped[list[SearchRun]] = relationship(back_populates="user", passive_deletes=True)
     search_profiles: Mapped[list[SearchProfile]] = relationship(back_populates="user", passive_deletes=True)
+    saved_searches: Mapped[list[SavedSearch]] = relationship(back_populates="user", passive_deletes=True)
+    provider_cooldowns: Mapped[list[ProviderCooldown]] = relationship(back_populates="user", passive_deletes=True)
     applications: Mapped[list[Application]] = relationship(back_populates="user", passive_deletes=True)
     resume_variants: Mapped[list[ResumeVariant]] = relationship(back_populates="user", passive_deletes=True)
     tailor_tasks: Mapped[list[TailorTask]] = relationship(back_populates="user", passive_deletes=True)
@@ -316,6 +317,41 @@ class SearchProfile(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
 
 
+
+SCHEDULE_KINDS = ("manual", "interval", "daily", "weekly")
+
+
+class SavedSearch(Base):
+    """A named Discovery search setup: the whole search profile, plus its own schedule.
+
+    The settings blob is exactly what app.workspace.SearchProfileIn produces, so a setup stays in
+    step with the search form without a column per field.
+    """
+
+    __tablename__ = "saved_searches"
+    __table_args__ = (
+        UniqueConstraint("user_id", "name", name="uq_saved_searches_user_name"),
+        CheckConstraint(f"schedule_kind IN ({_values(SCHEDULE_KINDS)})", name="ck_saved_searches_schedule_kind"),
+        Index("ix_saved_searches_next_run_at", "next_run_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("saved_searches")
+    user: Mapped[User] = relationship(back_populates="saved_searches")
+    name: Mapped[str] = mapped_column(String(120))
+    settings: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    schedule_kind: Mapped[str] = mapped_column(String(20), default="manual", server_default="manual")
+    every_hours: Mapped[int] = mapped_column(Integer, default=24, server_default="24")
+    time_of_day: Mapped[str] = mapped_column(String(5), default="07:00", server_default="07:00")
+    weekdays: Mapped[list[int]] = mapped_column(JSON, default=list)
+    timezone: Mapped[str] = mapped_column(String(60), default="UTC", server_default="UTC")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+
 JD_STATUSES = ("RAW", "NORMALIZED", "PARSED", "NEEDS_REVIEW", "MANUALLY_CORRECTED")
 JD_PARSE_STATUSES = ("PENDING", "PROCESSING", "COMPLETED", "FAILED")
 ACTIVE_JD_PARSE_STATUSES = ("PENDING", "PROCESSING")
@@ -365,6 +401,11 @@ class Job(Base):
     status: Mapped[str] = mapped_column(String(50), default="discovered")
     search_run_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     triaged_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Why the candidate turned this job down (app.workspace REJECTION_REASONS). The reason is optional: a job
+    # can be rejected without one, and then only rejected_at is set.
+    rejection_reason: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    rejection_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    rejected_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     # Canonical workflow state (app.services.lifecycle). `status` above is the legacy dashboard status.
     state: Mapped[WorkflowState] = mapped_column(_enum_type(WorkflowState), default=WorkflowState.DISCOVERED,
@@ -643,6 +684,18 @@ class SearchRun(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     fallback_for_run_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
+    # The saved Discovery setup that started this run (app.services.saved_searches). Empty for the rest.
+    saved_search_id: Mapped[int | None] = mapped_column(
+        ForeignKey("saved_searches.id", ondelete="SET NULL", name="fk_search_runs_saved_search_id"),
+        nullable=True, index=True)
+
+    # What Apify itself reported about the run (app.services.sources). NULL whenever Apify did not report it:
+    # nothing here is guessed.
+    compute_units: Mapped[float | None] = mapped_column(Float, nullable=True)
+    usage_total_usd: Mapped[Decimal | None] = mapped_column(Numeric(14, 8), nullable=True)
+    memory_mb: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    dataset_item_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
 
 class ResumeVariant(Base):
     __tablename__ = "resume_variants"
@@ -708,6 +761,10 @@ class Application(Base):
     contacts: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
     notes: Mapped[str] = mapped_column(Text, default="")
     approved_resume_id: Mapped[int | None] = mapped_column(ForeignKey("resume_variants.id", ondelete="SET NULL"), nullable=True)
+    # Approved deliberately although the reviewer scored the packet below the account's minimum, with the
+    # reason the person gave. The score itself stays on the approved resume variant.
+    approval_override: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    approval_note: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Post-submission tracker column: applied, acknowledged, screening, interviewing, ..., closed.
     stage: Mapped[str | None] = mapped_column(String(50), default="applied", nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
@@ -942,6 +999,11 @@ class LLMRequestLog(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     request_id: Mapped[str] = mapped_column(String(36))
+    # The generic external-call row for the same provider request (external_api_request_logs.request_id), so the
+    # External APIs tab and this LLM-specific row are two views of one call. Plain id, not a foreign key: the two
+    # logs have their own retention and either may be pruned first.
+    external_request_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     user_id: Mapped[int | None] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE", name="fk_llm_request_logs_user_id"), nullable=True)
     workflow_type: Mapped[str | None] = mapped_column(String(30), nullable=True)  # job | application | profile | system | agent
@@ -1015,6 +1077,175 @@ class LLMUsageDaily(Base):
     latency_ms_sum: Mapped[int] = mapped_column(Integer, default=0)
     latency_ms_max: Mapped[int] = mapped_column(Integer, default=0)
     context_tokens_sum: Mapped[int] = mapped_column(Integer, default=0)
+
+
+EXTERNAL_STATUSES = ("SUCCEEDED", "FAILED")
+# Failure categories the instrumentation layer maps every exception and HTTP status onto.
+EXTERNAL_ERROR_TYPES = ("TIMEOUT", "CONNECTION", "DNS", "RATE_LIMIT", "CLIENT_ERROR", "SERVER_ERROR",
+                        "INVALID_RESPONSE", "RETRY_EXHAUSTED", "CONFIGURATION", "SDK_ERROR", "OTHER")
+# Providers seen so far. Deliberately NOT a database constraint: a new integration must not need a migration.
+KNOWN_EXTERNAL_PROVIDERS = ("APIFY", "OPENROUTER", "OPENAI", "ANTHROPIC", "GEMINI", "EMAIL", "SEARCH", "JOB_BOARD",
+                            "WEB", "OTHER")
+SYSTEM_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
+SYSTEM_LOG_CATEGORIES = ("EXTERNAL_API", "LLM", "SCHEDULER", "WORKFLOW", "APIFY", "APPLICATION", "EMAIL", "SYSTEM")
+
+
+class ExternalAPIRequestLog(Base):
+    """One call to a third-party service, recorded by the instrumentation layer (app.services.external_api).
+
+    Written automatically for everything that leaves the process through the shared HTTP client or a wrapped SDK
+    boundary; business services never write these rows themselves. Metadata only — no headers, no credentials and
+    no request or response bodies unless EXTERNAL_API_DEBUG_PAYLOADS is on, and even then redacted and capped.
+    Like llm_request_logs this table is not tenancy-filtered (a call may belong to no account); the monitoring
+    service always filters by user_id.
+    """
+
+    __tablename__ = "external_api_request_logs"
+    __table_args__ = (
+        CheckConstraint(f"status IN ({_values(EXTERNAL_STATUSES)})", name="ck_external_api_request_logs_status"),
+        CheckConstraint(f"error_type IS NULL OR error_type IN ({_values(EXTERNAL_ERROR_TYPES)})",
+                        name="ck_external_api_request_logs_error_type"),
+        UniqueConstraint("request_id", name="uq_external_api_request_logs_request_id"),
+        Index("ix_external_api_request_logs_user_created", "user_id", "created_at"),
+        Index("ix_external_api_request_logs_provider_created", "provider", "created_at"),
+        Index("ix_external_api_request_logs_operation_created", "service", "operation", "created_at"),
+        Index("ix_external_api_request_logs_status_created", "status", "created_at"),
+        Index("ix_external_api_request_logs_created_at", "created_at"),
+        Index("ix_external_api_request_logs_trace_id", "trace_id"),
+        Index("ix_external_api_request_logs_workflow", "workflow_type", "workflow_entity_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    request_id: Mapped[str] = mapped_column(String(36))
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE", name="fk_external_api_request_logs_user_id"), nullable=True)
+    provider: Mapped[str] = mapped_column(String(30), default="OTHER")  # APIFY, OPENROUTER, … open set
+    service: Mapped[str] = mapped_column(String(60), default="")  # the API within the provider
+    operation: Mapped[str] = mapped_column(String(60), default="")  # actor_run_start, chat_completion, …
+    workflow_type: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    workflow_entity_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    workflow: Mapped[str | None] = mapped_column(String(60), nullable=True)  # the trace's name: hunter, ranking, api…
+    job_id: Mapped[int | None] = mapped_column(
+        ForeignKey("jobs.id", ondelete="SET NULL", name="fk_external_api_request_logs_job_id"), nullable=True, index=True)
+    application_id: Mapped[int | None] = mapped_column(
+        ForeignKey("applications.id", ondelete="SET NULL", name="fk_external_api_request_logs_application_id"),
+        nullable=True, index=True)
+    http_method: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    endpoint_host: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    endpoint_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="SUCCEEDED")
+    http_status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    request_size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    response_size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    attempt: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    retry_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    rate_limit_remaining: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rate_limit_reset_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    error_type: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    estimated_cost: Mapped[Decimal | None] = mapped_column(Numeric(14, 8), nullable=True)
+    cost_currency: Mapped[str | None] = mapped_column(String(3), nullable=True)
+    cost_source: Mapped[str] = mapped_column(String(20), default="unknown")  # provider_reported | pricing_table | free | unknown
+    # Safe, provider-specific facts: actor and run ids, dataset counts, model names. Redacted before it is stored.
+    request_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+
+class ProviderCooldown(Base):
+    """How long one account must leave a provider alone after it said 429 (app.services.backoff).
+
+    One row per account and provider, written only when a provider rate limits and cleared on the next
+    success, so the common path never touches it.
+    """
+
+    __tablename__ = "provider_cooldowns"
+    __table_args__ = (
+        UniqueConstraint("user_id", "provider", name="uq_provider_cooldowns_user_provider"),
+        Index("ix_provider_cooldowns_until", "until"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("provider_cooldowns")
+    user: Mapped[User] = relationship(back_populates="provider_cooldowns")
+    provider: Mapped[str] = mapped_column(String(30))
+    until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Rate limits in a row: the exponent behind the delay. Reset to zero by the next successful call.
+    consecutive: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # Calls not made because the cooldown was still running — what the backoff saved.
+    calls_skipped: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    last_limited_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+
+class ExternalAPIUsageDaily(Base):
+    """Daily totals kept after raw rows pass EXTERNAL_API_LOG_RETENTION_DAYS."""
+
+    __tablename__ = "external_api_usage_daily"
+    __table_args__ = (
+        UniqueConstraint("user_id", "day", "provider", "service", "operation", name="uq_external_api_usage_daily_key"),
+        Index("ix_external_api_usage_daily_user_day", "user_id", "day"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE", name="fk_external_api_usage_daily_user_id"), nullable=True)
+    day: Mapped[date] = mapped_column(Date)
+    provider: Mapped[str] = mapped_column(String(30))
+    service: Mapped[str] = mapped_column(String(60), default="")
+    operation: Mapped[str] = mapped_column(String(60), default="")
+    requests: Mapped[int] = mapped_column(Integer, default=0)
+    failures: Mapped[int] = mapped_column(Integer, default=0)
+    retries: Mapped[int] = mapped_column(Integer, default=0)
+    rate_limited: Mapped[int] = mapped_column(Integer, default=0)
+    server_errors: Mapped[int] = mapped_column(Integer, default=0)
+    timeouts: Mapped[int] = mapped_column(Integer, default=0)
+    latency_ms_sum: Mapped[int] = mapped_column(Integer, default=0)
+    latency_ms_max: Mapped[int] = mapped_column(Integer, default=0)
+    request_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    response_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    estimated_cost: Mapped[Decimal | None] = mapped_column(Numeric(14, 8), nullable=True)
+    unpriced_requests: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class SystemLogEntry(Base):
+    """An operational event worth keeping: an external call that failed, a scheduler run, a workflow milestone.
+
+    This is the Monitoring → Logs table. Messages are redacted (app.services.redaction) before they are stored.
+    """
+
+    __tablename__ = "system_logs"
+    __table_args__ = (
+        CheckConstraint(f"level IN ({_values(SYSTEM_LOG_LEVELS)})", name="ck_system_logs_level"),
+        CheckConstraint(f"category IN ({_values(SYSTEM_LOG_CATEGORIES)})", name="ck_system_logs_category"),
+        Index("ix_system_logs_user_created", "user_id", "created_at"),
+        Index("ix_system_logs_category_created", "category", "created_at"),
+        Index("ix_system_logs_level_created", "level", "created_at"),
+        Index("ix_system_logs_created_at", "created_at"),
+        Index("ix_system_logs_trace_id", "trace_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    level: Mapped[str] = mapped_column(String(10), default="INFO")
+    category: Mapped[str] = mapped_column(String(20), default="SYSTEM")
+    provider: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    operation: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    workflow: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE", name="fk_system_logs_user_id"), nullable=True)
+    entity_type: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    entity_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    message: Mapped[str] = mapped_column(String(500), default="")
+    status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # The generic external-call row this event describes, when it has one.
+    external_request_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    details: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
 
 class AIOptimizationReport(Base):

@@ -311,7 +311,8 @@ def store_review(db: Session, resume: ResumeVariant, notes: dict) -> None:
     db.commit()
 
 
-def approve_job(db: Session, job: Job) -> Application:
+def approve_job(db: Session, job: Job, *, override: bool = False, note: str = "") -> Application:
+    """Approve the latest reviewed packet. `override` records that the reviewer minimum was waived for it."""
     latest = db.scalar(select(ResumeVariant).where(ResumeVariant.job_id == job.id)
                        .order_by(desc(ResumeVariant.version)).limit(1))
     if not latest or latest.reviewer_score is None:
@@ -323,7 +324,13 @@ def approve_job(db: Session, job: Job) -> Application:
     application.status = "approved"
     application.approved_at = datetime.now(UTC).replace(tzinfo=None)
     application.approved_resume_id = latest.id
+    application.approval_override = bool(override)
+    application.approval_note = (note or "").strip()[:2000] or None
     job.status = "approved"
+    if override:
+        # The tracker timeline should say the minimum was waived, and why, long after the decision.
+        db.add(ApplicationEvent(application=application, kind="approval", title="Approved below the reviewer minimum",
+                                detail=(note or "").strip()[:2000] or f"Reviewer scored {latest.reviewer_score:.0f}"))
     db.commit()
     db.refresh(application)
     return application

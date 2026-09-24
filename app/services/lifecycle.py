@@ -9,6 +9,7 @@ read it; nothing else may decide whether a state change is legal.
 Terminal states: OFFER, REJECTED, ARCHIVED, SKIPPED, FAILED. FAILED is terminal for automatic
 processing; an operator may requeue it, and only back to the state it failed in. An ARCHIVED job that was
 archived by ranking (from RANKED or QUALIFIED) may be reopened for re-ranking, and only to RANK_PENDING.
+A job SKIPPED before ranking for want of a description returns to NORMALIZED once it has one.
 """
 from __future__ import annotations
 
@@ -101,6 +102,10 @@ TERMINAL_STATES: frozenset[WorkflowState] = frozenset(s for s, targets in TRANSI
 FAILABLE_STATES: frozenset[WorkflowState] = frozenset(s for s, targets in TRANSITIONS.items() if S.FAILED in targets)
 # ARCHIVED stays terminal for automation; a job archived by ranking may be reopened, only for re-ranking.
 REOPENABLE_ARCHIVE_SOURCES: frozenset[WorkflowState] = frozenset({S.RANKED, S.QUALIFIED})
+# SKIPPED stays terminal too, with one exception: a posting skipped *before* ranking — because it arrived
+# without a usable description — is ranked after all once that description turns up (a fuller re-import, or
+# one pasted by hand). Nothing else about a skip is reversible.
+REOPENABLE_SKIP_SOURCES: frozenset[WorkflowState] = frozenset({S.NORMALIZED})
 
 
 class InvalidState(ValueError):
@@ -143,6 +148,8 @@ def can_transition(current: object, target: object, *, previous_state: object | 
         return previous_state is not None and parse_state(previous_state) == target and target in FAILABLE_STATES
     if current is S.ARCHIVED and target is S.RANK_PENDING:
         return previous_state is not None and parse_state(previous_state) in REOPENABLE_ARCHIVE_SOURCES
+    if current is S.SKIPPED and target is S.NORMALIZED:
+        return previous_state is not None and parse_state(previous_state) in REOPENABLE_SKIP_SOURCES
     return target in TRANSITIONS[current]
 
 

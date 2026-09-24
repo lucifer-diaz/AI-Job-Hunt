@@ -22,6 +22,11 @@ from tests.conftest import ensure_test_user
 
 PASSWORD = "correct horse battery"
 
+# A posting long enough to rank: app.services.ranker holds back listings with nothing to read.
+POSTING = ("Lead Python platform teams building services on Kubernetes and AWS. You will own the roadmap for "
+           "our data platform, mentor five engineers, and work with product to ship reliably. We look for expe"
+           "rience with FastAPI, distributed systems and a track record of leading delivery.")
+
 
 @pytest.fixture(autouse=True)
 def an_account_already_exists(anonymous):
@@ -137,7 +142,7 @@ def test_each_account_only_sees_and_changes_its_own_data():
     bob, _ = signed_up(new_email("bob"))
 
     posting = {"url": f"https://jobs.example/{uuid.uuid4().hex}", "title": "Staff Engineer", "company": "Acme",
-               "description": "Python services"}
+               "description": POSTING}
     job = alice.post("/api/jobs/from-url", json=posting).json()["job"]
     evidence_id = alice.post("/api/evidence", json={"claim": "Cut cloud costs by 30%", "company": "Acme"}).json()["id"]
     knowledge_id = alice.post("/api/knowledge", json={"question": "Notice period?", "answer": "30 days"}).json()["id"]
@@ -272,7 +277,7 @@ def test_ai_calls_use_the_signed_in_accounts_own_key(monkeypatch):
     assert parsed.status_code == 200 and captured["api_key"] == "sk-or-v1-alice-key"
 
     job = alice.post("/api/jobs/from-url", json={"url": f"https://jobs.example/{uuid.uuid4().hex}", "title": "ML Lead",
-                                                 "company": "Beta", "description": "Python"}).json()["job"]
+                                                 "company": "Beta", "description": POSTING}).json()["job"]
     queued = alice.post(f"/api/jobs/{job['id']}/rank")  # ranking is queued for the ranker, never run in the request
     assert queued.status_code == 202 and queued.json()["queued"] == [job["id"]] and queued.json()["blocked"] is None
 
@@ -283,7 +288,7 @@ def test_ai_calls_use_the_signed_in_accounts_own_key(monkeypatch):
     refused = bob.post("/api/profile/resume/parse-evidence")
     assert refused.status_code == 400 and "add your OpenRouter API key" in refused.json()["detail"]
     bob_job = bob.post("/api/jobs/from-url", json={"url": f"https://jobs.example/{uuid.uuid4().hex}", "title": "ML Lead",
-                                                   "company": "Beta", "description": "Python"}).json()["job"]
+                                                   "company": "Beta", "description": POSTING}).json()["job"]
     waiting = bob.post(f"/api/jobs/{bob_job['id']}/rank").json()
     assert waiting["queued"] == [bob_job["id"]] and waiting["blocked"] == "No OpenRouter API key saved in Settings"
     assert alice.post(f"/api/jobs/{bob_job['id']}/rank").status_code == 404  # another account's job

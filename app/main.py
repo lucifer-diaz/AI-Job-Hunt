@@ -37,6 +37,7 @@ from app.models import (
     KnowledgeAnswer,
     ResumeDocument,
     ResumeVariant,
+    SavedSearch,
     SchedulerJob,
     SearchRun,
 )
@@ -47,6 +48,7 @@ from app.schemas import (
     ApifySearchIn,
     ApiKeysIn,
     ApplicationUpdateIn,
+    ApproveIn,
     BulkTailorIn,
     EvidenceIn,
     KnowledgeIn,
@@ -60,7 +62,7 @@ from app.schemas import (
     TailorTasksIn,
 )
 from app.security import SecretsUnavailable
-from app.services import mcp_tokens, ranker, resume_verification, tailor_tasks
+from app.services import backoff, mcp_tokens, ranker, resume_verification, tailor_tasks, tracing
 from app.services.ai_config import PROVIDERS as AI_PROVIDERS
 from app.services.ai_config import STAGES as AI_STAGES
 from app.services.ai_config import env_defaults as ai_env_defaults
@@ -77,9 +79,12 @@ from app.services.sources import (
 )
 from app.services.user_settings import (
     EXECUTION_MODES,
+    PROCESSING_LIMITS,
     execution_mode_for,
     key_status,
     lock_settings_row,
+    processing_limits,
+    processing_maximums,
     set_user_keys,
     settings_for,
 )
@@ -93,6 +98,7 @@ from app.services.workflow import (
 )
 from app.settings import get_settings
 from app.tenancy import require_user_id
+from app.workspace import download_headers, packet_download_name
 from app.workspace import router as workspace_router
 
 run_migrations(engine)
@@ -160,7 +166,13 @@ async def require_sign_in(request: Request, call_next):
         if path.startswith("/api/"):
             return JSONResponse({"detail": "Sign in required"}, status_code=401)
         return RedirectResponse("/login", status_code=303)
-    return await call_next(request)
+    # One correlation ID per request, so every third-party call this request makes can be found together
+    # (app.services.tracing). Nothing downstream has to pass it around.
+    user = request.state.user
+    with tracing.trace("api", workflow_type="system", user_id=getattr(user, "id", None), inherit=False) as ctx:
+        response = await call_next(request)
+        response.headers["X-Trace-Id"] = ctx.trace_id
+        return response
 
 
 templates = Jinja2Templates(directory="app/templates")
@@ -268,6 +280,11 @@ def settings_get(db: Session = Depends(get_user_db)):
     return {"llm_provider": effective["llm_provider"], "model": effective["model"],
             "application_mode": value.application_mode, "min_review_score": value.min_review_score,
             "execution_mode": execution_mode_for(db),
+            # What this account runs at once, and the most the server will allow it to.
+            **processing_limits(db), "processing_maximums": processing_maximums(),
+            # How it backs off when a provider rate limits it, with the first few waits spelled out.
+            "rate_limits": backoff.policy_for(db, value.user_id).public(),
+            "ranking_interval_server_minutes": settings.ranking_interval_minutes,
             "configured": {**configured, "mock": True}, "keys": keys,
             "secret_storage": bool(settings.secret_key),
             # Raw saved values (blank = inherit) plus the server defaults, for the editor.
@@ -294,7 +311,22 @@ def settings_put(payload: SettingsIn, db: Session = Depends(get_user_db)):
     ai = {"llm_provider": provider, "model": payload.model.strip(),
           "stage_models": {k: v.strip()[:300] for k, v in payload.stage_models.items() if v.strip()},
           "require_free": payload.require_free}
-    value.preferences = {**(value.preferences or {}), "ai": ai, "execution_mode": execution_mode}
+    ceilings = processing_maximums()
+    limits = {**processing_limits(db),
+              **{name: min(asked, ceilings[name]) for name in PROCESSING_LIMITS
+                 if (asked := getattr(payload, name)) is not None}}
+    if payload.ranking_interval_minutes is not None:
+        limits["ranking_interval_minutes"] = payload.ranking_interval_minutes
+    # Anything the payload leaves out keeps what is saved; the policy itself clamps whatever is written.
+    saved_backoff = (value.preferences or {}).get("rate_limits") or {}
+    rate_limits = backoff.policy_from({**saved_backoff, **{
+        key: given for key, given in (("enabled", payload.rate_limit_backoff),
+                                      ("base_seconds", payload.rate_limit_base_seconds),
+                                      ("multiplier", payload.rate_limit_multiplier),
+                                      ("max_seconds", payload.rate_limit_max_seconds)) if given is not None}})
+    value.preferences = {**(value.preferences or {}), "ai": ai, "execution_mode": execution_mode,
+                         "processing": limits,
+                         "rate_limits": {k: v for k, v in rate_limits.public().items() if k != "ladder"}}
     effective = resolve_ai_config(settings, ai)
     value.llm_provider, value.model = effective["llm_provider"], effective["model"][:300]
     value.application_mode, value.min_review_score = payload.application_mode, payload.min_review_score
@@ -320,8 +352,13 @@ def settings_patch(payload: SettingsPatch, db: Session = Depends(get_user_db)):
     changes = payload.model_dump(exclude_unset=True)
     ai = dict((row.preferences or {}).get("ai") or {})
     stages = {**ai.get("stage_models", {}), **changes.pop("stage_models", {})}
+    saved = backoff.policy_for(db, row.user_id)
     current = {**ai, "stage_models": stages, "application_mode": row.application_mode,
-               "min_review_score": row.min_review_score, "execution_mode": execution_mode_for(db), **changes}
+               "min_review_score": row.min_review_score, "execution_mode": execution_mode_for(db),
+               **processing_limits(db),
+               "rate_limit_backoff": saved.enabled, "rate_limit_base_seconds": saved.base_seconds,
+               "rate_limit_multiplier": saved.multiplier, "rate_limit_max_seconds": saved.max_seconds,
+               **changes}
     return settings_put(SettingsIn(**current), db)
 
 
@@ -417,12 +454,14 @@ def apify_run_status(run_id: int, reimport: bool = False, db: Session = Depends(
 @app.get("/api/search/apify/runs")
 def apify_runs(db: Session = Depends(get_user_db)):
     runs = db.scalars(select(SearchRun).order_by(desc(SearchRun.id)).limit(50)).all()
+    names = dict(db.execute(select(SavedSearch.id, SavedSearch.name)).all())
     return [
         {
             "id": r.id, "external_run_id": r.external_run_id, "actor_id": r.actor_id,
             "status": r.status, "item_count": r.item_count, "created_jobs": r.created_jobs,
             "created_at": r.created_at.isoformat(), "completed_at": r.completed_at.isoformat() if r.completed_at else None,
-            "error": r.error,
+            "error": r.error, "saved_search_id": r.saved_search_id,
+            "saved_search_name": names.get(r.saved_search_id, ""),
         }
         for r in runs
     ]
@@ -571,11 +610,18 @@ def resume_pdf(job_id: int, db: Session = Depends(get_user_db)):
     if not resume:
         raise HTTPException(404, "No tailored resume for this job")
     data = markdown_to_simple_pdf(resume.markdown)
-    return Response(data, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="job-{job_id}-resume.pdf"'})
+    return Response(data, media_type="application/pdf",
+                    headers=download_headers(packet_download_name(db, job_id, "pdf")))
 
 
 @app.post("/api/jobs/{job_id}/approve")
-def approve(job_id: int, db: Session = Depends(get_user_db)):
+def approve(job_id: int, payload: ApproveIn | None = None, db: Session = Depends(get_user_db)):
+    """Approve a reviewed packet. A score below your minimum needs `override=true`, which is recorded.
+
+    The minimum can be waived for one packet; review itself cannot be skipped. A packet the reviewer never
+    scored has nothing to weigh up, so it is still refused.
+    """
+    payload = payload or ApproveIn()
     job = db.get(Job, job_id)
     if not job:
         raise HTTPException(404, "Job not found")
@@ -583,13 +629,21 @@ def approve(job_id: int, db: Session = Depends(get_user_db)):
         raise HTTPException(400, "Tailor and review a resume before approval")
     latest = max(job.resumes, key=lambda item: item.version)
     min_score = settings_for(db).min_review_score
-    if latest.reviewer_score is None or latest.reviewer_score < min_score:
-        raise HTTPException(400, f"Resume review score must be at least {min_score}")
+    if latest.reviewer_score is None:
+        raise HTTPException(400, "Review the tailored resume before approving it")
+    below = latest.reviewer_score < min_score
+    if below and not payload.override:
+        # Structured so the screen can offer the override instead of only reporting the refusal.
+        raise HTTPException(400, {"message": f"Resume review score must be at least {min_score}",
+                                  "reviewer_score": latest.reviewer_score, "min_review_score": min_score,
+                                  "can_override": True})
     try:
-        app_obj = approve_job(db, job)
+        app_obj = approve_job(db, job, override=below, note=payload.note)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    return {"application_id": app_obj.id, "status": app_obj.status, "apply_url": job.url}
+    return {"application_id": app_obj.id, "status": app_obj.status, "apply_url": job.url,
+            "approval_override": app_obj.approval_override, "reviewer_score": latest.reviewer_score,
+            "min_review_score": min_score}
 
 
 @app.post("/api/jobs/{job_id}/applied")

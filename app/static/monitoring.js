@@ -10,23 +10,56 @@ const MON_SERIES = { input: '#5b4ae8', output: '#eb6834' };
 const MON_FILTER_KEYS = ['provider', 'model', 'stage', 'prompt_version', 'status', 'job_id'];
 let monTimer = null;
 
+// Monitoring is one screen with six sections; each loads only what it shows (loadMonitoring).
+const MON_TABS = [['overview', 'Overview'], ['llm', 'LLM usage'], ['external', 'External APIs'],
+                  ['apify', 'Apify'], ['logs', 'Logs'], ['advisor', 'AI optimization']];
+const MON_CATEGORY_TONE = { EXTERNAL_API: 'brand', APIFY: 'brand', LLM: 'muted', SCHEDULER: 'muted',
+                            WORKFLOW: 'muted', APPLICATION: 'muted', EMAIL: 'muted', SYSTEM: 'muted' };
+const MON_LEVEL_TONE = { ERROR: 'bad', WARNING: 'warn', INFO: 'muted', DEBUG: 'muted' };
+// Every dimension the API calls table can be narrowed by, and how each is labelled on its chip.
+const MON_EXT_FILTERS = [['provider', 'Provider'], ['operation', 'Operation'], ['workflow', 'Workflow'],
+                         ['status', 'Status'], ['error_type', 'Failure'], ['http_status_code', 'HTTP']];
+const monExtFiltered = () => MON_EXT_FILTERS.some(([k]) => monState().ext[k]) || monState().ext.error_only;
+const MON_EXT_ERRORS = { TIMEOUT: 'Timeouts', RATE_LIMIT: 'Rate limits (429)', CLIENT_ERROR: 'Client errors (4xx)',
+                         SERVER_ERROR: 'Server errors (5xx)', CONNECTION: 'Connection failures', DNS: 'DNS failures',
+                         INVALID_RESPONSE: 'Invalid responses', RETRY_EXHAUSTED: 'Retries exhausted',
+                         CONFIGURATION: 'Configuration', SDK_ERROR: 'SDK errors', OTHER: 'Other' };
+
 function monState() {
-  if (!S.mon) S.mon = { range: '7d', provider: '', model: '', stage: '', prompt_version: '', status: '', job_id: '', all: false, page: 1, tables: new Set(), request: null };
+  if (!S.mon) S.mon = { tab: 'overview', range: '7d', provider: '', model: '', stage: '', prompt_version: '', status: '', job_id: '', all: false, page: 1, tables: new Set(), request: null,
+    ext: { provider: '', operation: '', workflow: '', status: '', error_type: '', http_status_code: '', error_only: false, page: 1, request: null },
+    logs: { category: '', level: '', provider: '', workflow: '', search: '', page: 1, entry: null } };
   return S.mon;
 }
 function monQuery(extra = {}) {
   const m = monState();
   return qs({ range: m.range, ...Object.fromEntries(MON_FILTER_KEYS.map(k => [k, m[k]])), all_accounts: m.all ? 'true' : '', ...extra });
 }
+function monExtQuery(extra = {}) {
+  const m = monState(), e = m.ext;
+  return qs({ range: m.range, ...Object.fromEntries(MON_EXT_FILTERS.map(([k]) => [k, e[k] ?? ''])),
+    error_only: e.error_only ? 'true' : '', all_accounts: m.all ? 'true' : '', ...extra });
+}
+function monLogQuery(extra = {}) {
+  const m = monState(), l = m.logs;
+  return qs({ range: m.range, category: l.category, level: l.level, provider: l.provider, search: l.search,
+    all_accounts: m.all ? 'true' : '', ...extra });
+}
 async function loadMonitoring() {
   const m = monState();
-  const [dash, reqs, rec] = await Promise.all([
-    api('/api/monitoring/dashboard?' + monQuery()),
-    api('/api/monitoring/requests?' + monQuery({ page: m.page, per_page: 20 })),
+  // Each section asks only for what it draws, so opening Logs does not aggregate every LLM request.
+  const wantsLlm = ['overview', 'llm', 'advisor'].includes(m.tab);
+  const wantsExternal = ['overview', 'external', 'apify'].includes(m.tab);
+  const [dash, reqs, rec, ext, extReqs, logs] = await Promise.all([
+    wantsLlm ? api('/api/monitoring/dashboard?' + monQuery()) : Promise.resolve(D.mon),
+    m.tab === 'llm' ? api('/api/monitoring/requests?' + monQuery({ page: m.page, per_page: 20 })) : Promise.resolve(D.monRequests),
     api('/api/monitoring/recommendations'),
+    wantsExternal ? api('/api/monitoring/external/dashboard?' + monExtQuery()) : Promise.resolve(D.monExt),
+    m.tab === 'external' ? api('/api/monitoring/external/requests?' + monExtQuery({ page: m.ext.page, per_page: 25 })) : Promise.resolve(D.monExtRequests),
+    m.tab === 'logs' ? api('/api/monitoring/logs?' + monLogQuery({ page: m.logs.page, per_page: 50 })) : Promise.resolve(D.monLogs),
   ]);
   const wasActive = D.monRec?.active;
-  Object.assign(D, { mon: dash, monRequests: reqs, monRec: rec });
+  Object.assign(D, { mon: dash, monRequests: reqs, monRec: rec, monExt: ext, monExtRequests: extReqs, monLogs: logs });
   if (wasActive && !rec.active) {
     const task = rec.tasks[0];
     toast(task?.status === 'FAILED' ? `AI usage analysis failed: ${task.error || 'unknown error'}` : 'AI usage analysis finished: recommendations updated', task?.status === 'FAILED');
@@ -98,6 +131,51 @@ function monTile(label, value, sub = '', tone = '') {
 
 /* ───────────── page ───────────── */
 function renderMonitoring() {
+  const m = monState();
+  const tabs = `<section class="card pad12"><div class="row between wrap gap10" style="align-items:center">
+    <div class="seg">${MON_TABS.map(([id, t]) => `<button class="${m.tab === id ? 'on' : ''}" data-act="mon-tab" data-id="${id}">${t}</button>`).join('')}</div>
+    <div class="seg">${MON_RANGES.map(([id, t]) => `<button class="${m.range === id ? 'on' : ''}" data-act="mon-range" data-id="${id}">${t}</button>`).join('')}</div></div></section>`;
+  const body = m.tab === 'llm' ? renderMonLlm() : m.tab === 'external' ? renderMonExternal()
+    : m.tab === 'apify' ? renderMonApify() : m.tab === 'logs' ? renderMonLogs()
+    : m.tab === 'advisor' ? renderAdvisor() : renderMonOverview();
+  return `<div class="stack">${tabs}${body}</div>`;
+}
+
+/* Overview: the few numbers that say whether the whole system is healthy, from both telemetry tables. */
+function renderMonOverview() {
+  const d = D.mon, e = D.monExt;
+  if (!d || !e) return loading();
+  const s = d.summary, x = e.summary, ap = e.apify;
+  const rangeLabel = MON_RANGES.find(([id]) => id === monState().range)?.[1].toLowerCase() || 'this range';
+  const tiles = `<section class="mon-tiles">
+    ${monTile(`External API calls · ${rangeLabel}`, x.requests.toLocaleString(), `${x.providers} provider${x.providers === 1 ? '' : 's'}`)}
+    ${monTile('Success rate', monPct(x.success_rate), `${x.failed} failed`, x.failed ? 'warn' : '')}
+    ${monTile('Average latency', monMs(x.avg_latency_ms), `p95 ${monMs(x.p95_latency_ms)}`)}
+    ${monTile('LLM requests', s.requests.toLocaleString(), `${monUSD(s.estimated_cost)} estimated`)}
+    ${monTile('Apify runs', (ap.runs || 0).toLocaleString(), `${ap.succeeded} succeeded · ${ap.failed} failed`)}
+    ${monTile('Jobs discovered', (ap.jobs_discovered || 0).toLocaleString(), `${ap.jobs_after_deduplication || 0} kept after deduplication`)}
+  </section>`;
+  const providers = e.providers.map(p => ({ ...p, _label: p.provider }));
+  const health = monCard('ov-providers', 'Provider health', 'Calls, failures and p95 latency for every third-party service',
+    monBars(providers, p => p.requests, p => `${p.requests.toLocaleString()} · ${monPct(p.failure_rate, 0)} failed`,
+      p => `${p.provider}: ${p.requests} calls · ${monPct(p.success_rate)} success · p95 ${monMs(p.p95_latency_ms)}`, { labelWidth: 120, valueWidth: 140 }),
+    monTable(['Provider', 'Calls', 'Failed', 'Success rate', 'p95 latency'], e.providers.map(p => [p.provider, p.requests, p.failed, monPct(p.success_rate), monMs(p.p95_latency_ms)])));
+  const stages = d.stages.map(v => ({ ...v, _label: monStage(v.stage) }));
+  const llm = monCard('ov-stages', 'LLM usage by stage', 'Requests per stage in this range',
+    monBars(stages, v => v.requests, v => v.requests.toLocaleString(), v => `${monStage(v.stage)}: ${v.requests} requests · ${monUSD(v.estimated_cost)}`),
+    monTable(['Stage', 'Requests', 'Estimated cost'], stages.map(v => [monStage(v.stage), v.requests, monUSD(v.estimated_cost)])));
+  return `${tiles}<div class="mon-grid">${health}${llm}</div>${renderMonRecentFailures(e)}`;
+}
+
+function renderMonRecentFailures(e) {
+  const rows = e.errors.by_type;
+  if (!rows.length) return `<section class="card pad16"><div class="card-title">No failed external calls</div><div class="card-sub">Every third-party call in this range succeeded.</div></section>`;
+  return `<section class="card pad16"><div class="card-title mb4">Failures by type</div>
+    <div class="card-sub mb12">${e.errors.failed} failed · ${monPct(e.errors.failure_rate)} of calls · <a href="#" data-act="mon-tab" data-id="external">see the calls</a></div>
+    <div class="row gap8 wrap">${rows.map(r => pill(`${MON_EXT_ERRORS[r.error_type] || r.error_type}: ${r.requests}`, 'bad')).join('')}</div></section>`;
+}
+
+function renderMonLlm() {
   const m = monState(), d = D.mon;
   if (!d) return loading();
   const s = d.summary, o = d.options;
@@ -107,7 +185,6 @@ function renderMonitoring() {
     .map(([k, all, opts]) => `<select class="select mon-select" data-act-change="mon-filter" data-key="${k}" aria-label="${attr(all)}">${[['', all], ...opts].map(([v, t]) => `<option value="${attr(v)}" ${String(m[k]) === v ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select>`).join('');
   const filtered = MON_FILTER_KEYS.some(k => m[k]) || m.all;
   const filters = `<section class="card pad16"><div class="row wrap gap8" style="align-items:center">
-    <div class="seg">${MON_RANGES.map(([id, t]) => `<button class="${m.range === id ? 'on' : ''}" data-act="mon-range" data-id="${id}">${t}</button>`).join('')}</div>
     ${selects}<input class="input mon-select" style="width:96px" inputmode="numeric" placeholder="Job id" value="${attr(m.job_id)}" data-act-change="mon-filter" data-key="job_id" aria-label="Job id">
     ${BOOT.user?.is_admin ? `<label class="row gap6 small"><input type="checkbox" data-act-change="mon-all" ${m.all ? 'checked' : ''}> All accounts</label>` : ''}
     ${filtered ? btn('Reset', 'mon-reset', {}, 'sm') : ''}<span class="grow"></span>${btn(label('monRefresh', 'Refresh', 'Refreshing…'), 'mon-refresh', {}, 'sm', isBusy('monRefresh'))}</div>
@@ -171,11 +248,11 @@ function renderMonitoring() {
     monBars(errs, x => x.requests, x => x.requests.toLocaleString(), x => `${x._label}: ${x.requests}`, { valueWidth: 44 }),
     monTable(['Failure type', 'Requests'], errs.map(x => [x._label, x.requests])));
 
-  return `<div class="stack">${filters}${tiles}
+  return `${filters}${tiles}
     <div class="mon-grid">${costChart}${tokenChart}</div>
     <div class="mon-grid">${stageChart}${modelChart}</div>
     <div class="mon-grid mon-grid-3">${latencyChart}${contextChart}${errorChart}</div>
-    ${renderAdvisor()}${renderMonRequests()}</div>`;
+    ${renderMonRequests()}`;
 }
 
 function renderMonRequests() {
@@ -192,6 +269,183 @@ function renderMonRequests() {
       <div class="row gap8 xs muted">${btn('‹ Prev', 'mon-page', { dir: -1 }, 'sm', r.page <= 1)}<span>Page ${r.page} of ${pages}</span>${btn('Next ›', 'mon-page', { dir: 1 }, 'sm', r.page >= pages)}</div></div>
     ${r.items.length ? `<div class="mon-table-wrap"><table class="mon-table"><thead><tr><th>Time</th><th>Stage</th><th>Model</th><th>Status</th><th>Tokens in / out</th><th>Context</th><th>Latency</th><th>Cost</th><th>Retry</th></tr></thead><tbody>${rows}</tbody></table></div>`
       : `<div style="padding:18px">${empty('No LLM requests', 'Requests appear here as ranking, tailoring, reviews and follow-ups call a model.')}</div>`}</section>`;
+}
+
+/* ───────────── External APIs ───────────── */
+function renderMonExternal() {
+  const m = monState(), e = D.monExt;
+  if (!e) return loading();
+  const s = e.summary, f = m.ext;
+  // Options come from the whole range (facets), never from the rows the current filter left behind — otherwise
+  // choosing one provider would drop every other provider from the list, with no way back but Reset.
+  const choices = e.facets || { providers: [], operations: [], workflows: [], error_types: [], status_codes: [] };
+  const opts = (key, all, values) => `<select class="select mon-select" data-act-change="mon-ext-filter" data-key="${key}" aria-label="${attr(all)}">${[['', all], ...values].map(([v, t]) => `<option value="${attr(v)}" ${String(f[key] ?? '') === String(v) ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select>`;
+  const filters = `<section class="card pad16"><div class="row wrap gap8" style="align-items:center">
+    ${opts('provider', 'All providers', choices.providers.map(p => [p, p]))}
+    ${opts('operation', 'All operations', choices.operations.map(o => [o, o]))}
+    ${opts('workflow', 'All workflows', choices.workflows.map(w => [w, w]))}
+    ${opts('status', 'All statuses', [['SUCCEEDED', 'Succeeded'], ['FAILED', 'Failed only']])}
+    ${opts('error_type', 'All failure types', choices.error_types.map(t => [t, MON_EXT_ERRORS[t] || t]))}
+    ${opts('http_status_code', 'All HTTP codes', choices.status_codes.map(code => [code, code]))}
+    <label class="row gap6 small"><input type="checkbox" data-act-change="mon-ext-errors" ${f.error_only ? 'checked' : ''}> Errors only</label>
+    ${BOOT.user?.is_admin ? `<label class="row gap6 small"><input type="checkbox" data-act-change="mon-all" ${m.all ? 'checked' : ''}> All accounts</label>` : ''}
+    ${monExtFiltered() ? btn('Reset', 'mon-ext-reset', {}, 'sm') : ''}
+    <span class="grow"></span>${btn(label('monRefresh', 'Refresh', 'Refreshing…'), 'mon-refresh', {}, 'sm', isBusy('monRefresh'))}</div>
+    ${monExtFiltered() ? `<div class="row gap6 wrap mt10">${MON_EXT_FILTERS.filter(([k]) => f[k]).map(([k, name]) => `<button type="button" class="btn sm soft" data-act="mon-ext-clear" data-key="${k}" title="Remove this filter">${esc(name)}: ${esc(k === 'error_type' ? (MON_EXT_ERRORS[f[k]] || f[k]) : f[k])} ×</button>`).join('')}${f.error_only ? `<button type="button" class="btn sm soft" data-act="mon-ext-clear" data-key="error_only">Errors only ×</button>` : ''}</div>` : ''}</section>`;
+
+  const rangeLabel = MON_RANGES.find(([id]) => id === m.range)?.[1].toLowerCase() || 'this range';
+  // A provider that rate limited this account is being left alone; say so, because its calls are being held.
+  const cooling = (e.cooldowns || []).length ? `<section class="card pad16"><div class="row gap10 wrap" style="align-items:center">
+    <span class="grow small"><b>Backing off</b> · ${e.cooldowns.map(c => `${esc(c.provider)} for ${monMs(c.seconds_left * 1000)}${c.calls_skipped ? ` (${c.calls_skipped} call${c.calls_skipped === 1 ? '' : 's'} held)` : ''}`).join(' · ')}</span>
+    <a class="small" href="#settings/workflow">Change the backoff</a></div>
+    <div class="xs muted mt6">Calls to these providers are not being made until the wait passes; queued work retries afterwards.</div></section>` : '';
+  const tiles = `<section class="mon-tiles">
+    ${monTile(m.range === 'today' ? 'External API calls today' : `External API calls · ${rangeLabel}`, s.requests.toLocaleString(), `${s.operations} operation${s.operations === 1 ? '' : 's'}`)}
+    ${monTile('Success rate', monPct(s.success_rate))}
+    ${monTile('Failed calls', s.failed.toLocaleString(), s.requests ? monPct(s.failure_rate) + ' of calls' : '', s.failed ? 'bad' : '')}
+    ${monTile('Average latency', monMs(s.avg_latency_ms))}
+    ${monTile('P95 latency', monMs(s.p95_latency_ms), `p99 ${monMs(s.p99_latency_ms)}`)}
+    ${monTile('Retries', s.retries.toLocaleString(), `${s.retried_requests} call${s.retried_requests === 1 ? '' : 's'} retried`)}
+    ${monTile('Rate limited', s.rate_limited.toLocaleString(), monPct(s.rate_limit_rate) + ' of calls', s.rate_limited ? 'warn' : '')}
+    ${monTile('Estimated cost', monUSD(s.estimated_cost), s.unpriced_requests ? `${s.unpriced_requests} call${s.unpriced_requests === 1 ? '' : 's'} with no reported cost` : 'all calls priced')}
+  </section>`;
+
+  const providers = e.providers.map(p => ({ ...p, _label: p.provider }));
+  const providerCard = monCard('ext-providers', 'By service', 'Calls per provider; hover for the reliability detail',
+    monBars(providers, p => p.requests, p => `${p.requests.toLocaleString()} · ${monPct(p.failure_rate, 0)} failed`,
+      p => `${p.provider}: ${p.requests} calls · ${monPct(p.success_rate)} success · ${p.rate_limited} rate limited · ${p.timeouts} timeouts · p95 ${monMs(p.p95_latency_ms)}`, { labelWidth: 120, valueWidth: 140 }),
+    monTable(['Provider', 'Calls', 'Success', 'Failed', '429', '5xx', 'Timeouts', 'Retries', 'Avg', 'p95', 'Cost'],
+      e.providers.map(p => [p.provider, p.requests, monPct(p.success_rate), p.failed, p.rate_limited, p.server_errors, p.timeouts, p.retries, monMs(p.avg_latency_ms), monMs(p.p95_latency_ms), monUSD(p.estimated_cost)])));
+
+  const ops = e.operations.slice(0, 12).map(o => ({ ...o, _label: `${o.provider} · ${o.operation || '—'}` }));
+  const opCard = monCard('ext-operations', 'By operation', 'Which calls happen most, and how reliable each one is',
+    monBars(ops, o => o.requests, o => `${o.requests.toLocaleString()} · ${monMs(o.p95_latency_ms)}`,
+      o => `${o.provider} ${o.operation}: ${o.requests} calls · ${monPct(o.success_rate)} success · p95 ${monMs(o.p95_latency_ms)}`, { labelWidth: 190, valueWidth: 130 }),
+    monTable(['Provider', 'Operation', 'Calls', 'Failed', 'Success rate', 'Avg', 'p95', 'Retries'],
+      e.operations.map(o => [o.provider, o.operation || '—', o.requests, o.failed, monPct(o.success_rate), monMs(o.avg_latency_ms), monMs(o.p95_latency_ms), o.retries])));
+
+  const errs = e.errors.by_type.map(x => ({ ...x, _label: MON_EXT_ERRORS[x.error_type] || x.error_type }));
+  const errorCard = monCard('ext-errors', 'Failures', `${e.errors.failed} failed · ${monPct(e.errors.failure_rate)} of calls`,
+    monBars(errs, x => x.requests, x => x.requests.toLocaleString(), x => `${x._label}: ${x.requests}`, { valueWidth: 44 }),
+    monTable(['Failure type', 'Calls', 'Share'], errs.map(x => [x._label, x.requests, monPct(x.share)])));
+
+  const days = e.timeseries.map(x => ({ ...x, day: x.at }));
+  const volumeCard = monCard('ext-volume', 'Calls over time', 'Calls per day (per hour for today), with failures',
+    monColumns(days, [{ key: 'requests', color: MON_SERIES.input, name: 'Calls' }], v => String(v),
+      x => `${fmtDateTime(x.at)} · ${x.requests} call${x.requests === 1 ? '' : 's'}${x.failed ? ` · ${x.failed} failed` : ''} · avg ${monMs(x.avg_latency_ms)}`),
+    monTable(['When', 'Calls', 'Failed', 'Avg latency'], days.map(x => [fmtDateTime(x.at), x.requests, x.failed, monMs(x.avg_latency_ms)])));
+
+  const workflows = e.workflows.map(w => ({ ...w, _label: w.workflow }));
+  const workflowCard = monCard('ext-workflows', 'By workflow', 'Which part of the system made the calls',
+    monBars(workflows, w => w.requests, w => `${w.requests.toLocaleString()} · ${monMs(w.p95_latency_ms)}`,
+      w => `${w.workflow}: ${w.requests} calls · ${monPct(w.success_rate)} success · p95 ${monMs(w.p95_latency_ms)}`, { labelWidth: 120, valueWidth: 130 }),
+    monTable(['Workflow', 'Calls', 'Failed', 'Success rate', 'p95 latency'], e.workflows.map(w => [w.workflow, w.requests, w.failed, monPct(w.success_rate), monMs(w.p95_latency_ms)])));
+
+  return `${filters}${cooling}${tiles}
+    <div class="mon-grid">${providerCard}${opCard}</div>
+    <div class="mon-grid mon-grid-3">${volumeCard}${workflowCard}${errorCard}</div>
+    ${renderMonExtRequests()}`;
+}
+
+function renderMonExtRequests() {
+  const r = D.monExtRequests; if (!r) return '';
+  // Any value in the table can be clicked to filter by it.
+  const pick = (key, value, text, extra = '') => value == null || value === '' ? esc(text ?? '—')
+    : `<a href="#" class="mon-pick ${extra}" data-act="mon-ext-pick" data-key="${key}" data-value="${attr(value)}" title="Show only ${attr(value)}">${esc(text ?? value)}</a>`;
+  const rows = r.items.map(x => `<tr class="click" data-act="mon-ext-request" data-id="${x.id}">
+    <td>${esc(fmtDateTime(x.created_at))}</td><td>${pick('provider', x.provider)}</td>
+    <td class="ellipsis" style="max-width:170px" title="${attr(x.operation || '')}">${pick('operation', x.operation)}</td>
+    <td>${pick('workflow', x.workflow)}</td>
+    <td>${x.status === 'FAILED'
+      ? pick('error_type', x.error_type, MON_EXT_ERRORS[x.error_type] || 'failed', 'bad-pick')
+        + (x.http_status_code ? ` ${pick('http_status_code', x.http_status_code)}` : '')
+      : pill(x.http_status_code || 'ok', 'good')}</td>
+    <td class="mono">${monMs(x.latency_ms)}</td><td class="mono">${x.retry_count}</td><td class="mono">${monUSD(x.estimated_cost)}</td></tr>`).join('');
+  const filtered = monExtFiltered();
+  return `<section class="card flush"><div class="row between wrap gap10" style="padding:14px 18px;border-bottom:1px solid var(--line2)">
+      <div><div class="card-title">API calls</div><div class="card-sub">${r.total.toLocaleString()} matching${filtered ? ' with these filters' : ''} · click any value to filter by it, or a row for its safe detail (no headers, credentials or bodies are stored)</div></div>
+      <div class="row gap8 xs muted">${btn('‹ Prev', 'mon-ext-page', { dir: -1 }, 'sm', r.page <= 1)}<span>Page ${r.page} of ${r.pages}</span>${btn('Next ›', 'mon-ext-page', { dir: 1 }, 'sm', r.page >= r.pages)}</div></div>
+    ${r.items.length ? `<div class="mon-table-wrap"><table class="mon-table"><thead><tr><th>Time</th><th>Provider</th><th>Operation</th><th>Workflow</th><th>Status</th><th>Latency</th><th>Retries</th><th>Cost</th></tr></thead><tbody>${rows}</tbody></table></div>`
+      : `<div style="padding:18px">${filtered
+        ? empty('No calls match these filters', 'Nothing in this range matches every filter at once. Clear one of them to widen the search.', btn('Reset filters', 'mon-ext-reset', {}, 'primary'))
+        : empty('No external API calls', 'Calls appear here as searches, job boards and models are contacted.')}</div>`}</section>`;
+}
+
+/* ───────────── Apify ───────────── */
+function renderMonApify() {
+  const e = D.monExt;
+  if (!e) return loading();
+  const a = e.apify;
+  const tiles = `<section class="mon-tiles">
+    ${monTile('Runs today', (a.runs_today || 0).toLocaleString(), `${a.runs_this_month || 0} this month`)}
+    ${monTile('Runs in range', (a.runs || 0).toLocaleString(), `${a.running} still running`)}
+    ${monTile('Successful runs', (a.succeeded || 0).toLocaleString(), a.success_rate == null ? 'no finished runs' : `${monPct(a.success_rate)} of finished runs`)}
+    ${monTile('Failed runs', (a.failed || 0).toLocaleString(), '', a.failed ? 'bad' : '')}
+    ${monTile('Compute units', a.compute_units == null ? '—' : String(a.compute_units), a.compute_units == null ? 'Apify reported none' : `${a.runs_with_reported_usage} run${a.runs_with_reported_usage === 1 ? '' : 's'} reported usage`)}
+    ${monTile('Dataset items', (a.dataset_items || 0).toLocaleString(), 'pulled from Apify')}
+    ${monTile('Jobs found', (a.jobs_discovered || 0).toLocaleString(), a.jobs_deduplicated ? `${a.jobs_deduplicated} duplicates` : '')}
+    ${monTile('After deduplication', (a.jobs_after_deduplication || 0).toLocaleString(), 'new jobs in the pipeline')}
+    ${monTile('Reported cost', a.reported_cost == null ? '—' : monUSD(a.reported_cost), a.reported_cost == null ? 'Apify reported no cost' : `${a.runs_with_reported_cost} run${a.runs_with_reported_cost === 1 ? '' : 's'} priced by Apify`)}
+    ${monTile('API calls', (a.api.requests || 0).toLocaleString(), `${monPct(a.api.success_rate)} success · p95 ${monMs(a.api.p95_latency_ms)}`)}
+  </section>`;
+  const group = (key, title, sub, labelKey) => {
+    const rows = (a[key] || []).slice(0, 12).map(x => ({ ...x, _label: String(x[labelKey] || '—') }));
+    return monCard(`apify-${key}`, title, sub,
+      monBars(rows, x => x.runs, x => `${x.runs} run${x.runs === 1 ? '' : 's'} · ${x.jobs_created} new`,
+        x => `${x._label}: ${x.runs} runs · ${x.jobs_discovered} found · ${x.jobs_created} new${x.compute_units == null ? '' : ` · ${x.compute_units} CU`}${x.reported_cost == null ? '' : ` · ${monUSD(x.reported_cost)}`}`, { labelWidth: 170, valueWidth: 140 }),
+      monTable([title.replace('By ', ''), 'Runs', 'Succeeded', 'Failed', 'Found', 'New', 'Compute', 'Cost'],
+        (a[key] || []).map(x => [x[labelKey] || '—', x.runs, x.succeeded, x.failed, x.jobs_discovered, x.jobs_created, x.compute_units ?? '—', x.reported_cost == null ? '—' : monUSD(x.reported_cost)])));
+  };
+  const sites = (a.by_site || []).map(x => ({ ...x, _label: x.site }));
+  const siteCard = monCard('apify-sites', 'By board', 'Jobs discovered per board in this range',
+    monBars(sites, x => x.jobs, x => x.jobs.toLocaleString(), x => `${x.site}: ${x.jobs} jobs`, { labelWidth: 120, valueWidth: 60 }),
+    monTable(['Board', 'Jobs'], sites.map(x => [x.site, x.jobs])));
+  const runs = a.recent_runs || [];
+  const runRows = runs.map(x => `<tr><td>${esc(fmtDateTime(x.created_at))}</td>
+    <td class="ellipsis" style="max-width:190px" title="${attr(x.actor_id)}"><span class="mono">${esc((x.actor_id || '').split('/').pop())}</span></td>
+    <td>${esc(x.saved_search || '—')}</td><td>${esc(x.location || '—')}</td>
+    <td>${x.status === 'SUCCEEDED' ? pill('succeeded', 'good') : x.finished_at ? pill(x.status.toLowerCase(), 'bad') : pill(x.status.toLowerCase(), 'warn')}</td>
+    <td class="mono">${x.jobs_discovered ?? '—'}</td><td class="mono">${x.jobs_deduplicated ?? '—'}</td><td class="mono">${x.jobs_created ?? '—'}</td>
+    <td class="mono">${x.compute_units ?? '—'}</td><td class="mono">${x.reported_cost == null ? '—' : monUSD(x.reported_cost)}</td>
+    <td class="mono">${x.duration_ms == null ? '—' : monMs(x.duration_ms)}</td></tr>`).join('');
+  const runTable = `<section class="card flush"><div style="padding:14px 18px;border-bottom:1px solid var(--line2)">
+      <div class="card-title">Recent runs</div><div class="card-sub">Compute units and cost are Apify's own figures; a dash means Apify reported none.</div></div>
+    ${runs.length ? `<div class="mon-table-wrap"><table class="mon-table"><thead><tr><th>Started</th><th>Actor</th><th>Saved search</th><th>Location</th><th>Status</th><th>Found</th><th>Duplicates</th><th>New</th><th>Compute</th><th>Cost</th><th>Duration</th></tr></thead><tbody>${runRows}</tbody></table></div>`
+      : `<div style="padding:18px">${empty('No Apify runs', 'Runs appear here once a saved search starts one.')}</div>`}</section>`;
+  return `${tiles}
+    <div class="mon-grid">${group('by_actor', 'By actor', 'Runs and what each actor found', 'actor_id')}${group('by_saved_search', 'By saved search', 'Which setup started the runs', 'saved_search')}</div>
+    <div class="mon-grid mon-grid-3">${group('by_location', 'By location', 'Runs per location searched', 'location')}${siteCard}${group('by_day', 'By day', 'Runs per day', 'day')}</div>
+    ${runTable}`;
+}
+
+/* ───────────── Logs ───────────── */
+function renderMonLogs() {
+  const m = monState(), l = D.monLogs;
+  if (!l) return loading();
+  const f = m.logs;
+  const opts = (key, all, values) => `<select class="select mon-select" data-act-change="mon-log-filter" data-key="${key}" aria-label="${attr(all)}">${[['', all], ...values].map(([v, t]) => `<option value="${attr(v)}" ${String(f[key]) === String(v) ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select>`;
+  const filters = `<section class="card pad16"><div class="row wrap gap8" style="align-items:center">
+    <input class="input mon-select" style="width:210px" placeholder="Search messages" value="${attr(f.search)}" data-act-change="mon-log-filter" data-key="search" aria-label="Search messages">
+    ${opts('category', 'All categories', (l.categories?.length ? l.categories : l.all_categories).map(c => [c, c.replace(/_/g, ' ').toLowerCase()]))}
+    ${opts('level', 'All levels', l.levels.map(v => [v, v.toLowerCase()]))}
+    ${opts('provider', 'All providers', (l.providers || []).map(v => [v, v]))}
+    ${opts('workflow', 'All workflows', (l.workflows || []).map(v => [v, v]))}
+    ${BOOT.user?.is_admin ? `<label class="row gap6 small"><input type="checkbox" data-act-change="mon-all" ${m.all ? 'checked' : ''}> All accounts</label>` : ''}
+    ${(f.category || f.level || f.provider || f.workflow || f.search) ? btn('Reset', 'mon-log-reset', {}, 'sm') : ''}
+    <span class="grow"></span>${btn(label('monRefresh', 'Refresh', 'Refreshing…'), 'mon-refresh', {}, 'sm', isBusy('monRefresh'))}</div></section>`;
+  const rows = l.items.map(x => `<tr class="click" data-act="mon-log" data-id="${x.id}">
+    <td>${esc(fmtDateTime(x.created_at))}</td><td>${pill(x.level.toLowerCase(), MON_LEVEL_TONE[x.level] || 'muted')}</td>
+    <td>${pill(x.category.replace(/_/g, ' ').toLowerCase(), MON_CATEGORY_TONE[x.category] || 'muted')}</td>
+    <td>${esc(x.provider || '—')}</td><td>${esc(x.workflow || '—')}</td>
+    <td class="mono xs ellipsis" style="max-width:90px" title="${attr(x.trace_id || '')}">${esc((x.trace_id || '—').slice(0, 8))}</td>
+    <td>${esc(x.entity_type ? `${x.entity_type} #${x.entity_id ?? ''}` : '—')}</td>
+    <td class="ellipsis" style="max-width:320px" title="${attr(x.message)}">${esc(x.message)}</td>
+    <td class="mono">${x.duration_ms == null ? '—' : monMs(x.duration_ms)}</td><td>${esc(x.status || '—')}</td></tr>`).join('');
+  return `${filters}<section class="card flush"><div class="row between wrap gap10" style="padding:14px 18px;border-bottom:1px solid var(--line2)">
+      <div><div class="card-title">Logs</div><div class="card-sub">${l.total.toLocaleString()} event${l.total === 1 ? '' : 's'} · failed and slow calls, scheduler runs and workflow milestones</div></div>
+      <div class="row gap8 xs muted">${btn('‹ Prev', 'mon-log-page', { dir: -1 }, 'sm', l.page <= 1)}<span>Page ${l.page} of ${l.pages}</span>${btn('Next ›', 'mon-log-page', { dir: 1 }, 'sm', l.page >= l.pages)}</div></div>
+    ${l.items.length ? `<div class="mon-table-wrap"><table class="mon-table"><thead><tr><th>Time</th><th>Level</th><th>Category</th><th>Provider</th><th>Workflow</th><th>Trace</th><th>Entity</th><th>Message</th><th>Duration</th><th>Status</th></tr></thead><tbody>${rows}</tbody></table></div>`
+      : `<div style="padding:18px">${empty('No log entries', 'Events appear here when an external call fails or crawls, and after each scheduled job.')}</div>`}</section>`;
 }
 
 const PRIORITY_TONE = { HIGH: 'bad', MEDIUM: 'warn', LOW: 'muted' };
@@ -245,6 +499,65 @@ function renderMonRequestModal() {
     <div class="card-foot row gap8" style="justify-content:flex-end">${x.entity?.job_id ? btn('Open job', 'mon-open-job', { id: x.entity.job_id }) : ''}${btn('Close', 'mon-close')}</div></div></div>`;
 }
 
+/* Detail views. Both show metadata only: no headers, credentials, cookies or bodies are ever stored. */
+function renderMonExtRequestModal() {
+  const x = D.monExtRequest;
+  if (!x || x.id !== monState().ext.request) return `<div class="overlay" data-act="mon-close"><div class="modal" style="padding:40px">${loading()}</div></div>`;
+  const row = (k, v) => `<div class="mon-kv"><span class="muted">${esc(k)}</span><span>${v}</span></div>`;
+  const meta = Object.entries(x.metadata || {}).filter(([, v]) => v !== null && v !== '');
+  return `<div class="overlay" data-act="mon-close"><div class="modal" role="dialog" aria-label="External API call detail" style="max-width:720px">
+    <div class="modal-head"><div class="row between gap10"><div><div style="font-size:19px;font-weight:600">${esc(x.provider)} · ${esc(x.operation || 'request')}</div>
+      <div class="muted small mt4">${esc(fmtDateTime(x.created_at))} · ${esc(x.request_id)}</div></div>
+      ${x.status === 'FAILED' ? pill(MON_EXT_ERRORS[x.error_type] || 'failed', 'bad') : pill('succeeded', 'good')}</div></div>
+    <div style="padding:18px 22px" class="col gap14">
+      <div class="mon-kv-grid">
+        ${row('Trace', x.trace_id ? `<a href="#" class="mono" data-act="mon-trace" data-id="${attr(x.trace_id)}">${esc(x.trace_id.slice(0, 12))}…</a>` : '—')}
+        ${row('Workflow', esc(x.workflow || '—'))}
+        ${row('Service', esc(x.service || '—'))}${row('Operation', esc(x.operation || '—'))}
+        ${row('Method', esc(x.http_method || '—'))}${row('Host', esc(x.endpoint_host || '—'))}
+        ${row('Path', esc(x.endpoint_path || '—'))}${row('HTTP status', x.http_status_code ?? '—')}
+        ${row('Latency', monMs(x.latency_ms))}${row('Attempt', `${x.attempt} (${x.retry_count} retr${x.retry_count === 1 ? 'y' : 'ies'})`)}
+        ${row('Request size', x.request_size_bytes == null ? '—' : `${x.request_size_bytes.toLocaleString()} bytes`)}
+        ${row('Response size', x.response_size_bytes == null ? '—' : `${x.response_size_bytes.toLocaleString()} bytes`)}
+        ${row('Rate limit left', x.rate_limit_remaining ?? '—')}${row('Rate limit resets', x.rate_limit_reset_at ? esc(fmtDateTime(x.rate_limit_reset_at)) : '—')}
+        ${row('Cost', x.estimated_cost == null ? '— <span class="faint">(not reported)</span>' : `${monUSD(x.estimated_cost)} <span class="faint">(${esc(x.cost_source.replace(/_/g, ' '))})</span>`)}
+        ${row('Job / application', x.entity ? esc(x.entity.label) : x.job_id ? `job #${x.job_id}` : '—')}
+      </div>
+      ${x.llm ? `<div class="box soft"><div class="caps-sm mb8">LLM request</div><div class="small">${esc(monStage(x.llm.stage))} · ${esc(x.llm.model || '')} · ${monTokens(x.llm.input_tokens)} in / ${monTokens(x.llm.output_tokens)} out · ${monUSD(x.llm.estimated_cost)}</div></div>` : ''}
+      ${meta.length ? `<div><div class="caps-sm mb8">Safe metadata</div><div class="mon-kv-grid">${meta.map(([k, v]) => row(k.replace(/_/g, ' '), esc(typeof v === 'object' ? JSON.stringify(v) : String(v)))).join('')}</div></div>` : ''}
+      ${x.error_message ? `<div class="box bad"><div class="xs b mb4" style="color:var(--bad)">ERROR</div><div class="small mono" style="white-space:pre-wrap;word-break:break-word">${esc(x.error_message)}</div></div>` : ''}
+      <div class="xs faint">Headers, credentials and bodies are never stored. Request and response sizes are recorded instead.</div>
+    </div>
+    <div class="card-foot row gap8" style="justify-content:flex-end">${btn('Close', 'mon-close')}</div></div></div>`;
+}
+
+function renderMonLogModal() {
+  const x = D.monLog;
+  if (!x || x.id !== monState().logs.entry) return `<div class="overlay" data-act="mon-close"><div class="modal" style="padding:40px">${loading()}</div></div>`;
+  const row = (k, v) => `<div class="mon-kv"><span class="muted">${esc(k)}</span><span>${v}</span></div>`;
+  const details = Object.entries(x.details || {}).filter(([, v]) => v !== null && v !== '');
+  const call = x.external_request;
+  return `<div class="overlay" data-act="mon-close"><div class="modal" role="dialog" aria-label="Log entry" style="max-width:720px">
+    <div class="modal-head"><div class="row between gap10"><div><div style="font-size:19px;font-weight:600">${esc(x.message)}</div>
+      <div class="muted small mt4">${esc(fmtDateTime(x.created_at))}</div></div>${pill(x.level.toLowerCase(), MON_LEVEL_TONE[x.level] || 'muted')}</div></div>
+    <div style="padding:18px 22px" class="col gap14">
+      <div class="mon-kv-grid">
+        ${row('Category', esc(x.category.replace(/_/g, ' ').toLowerCase()))}${row('Provider', esc(x.provider || '—'))}
+        ${row('Operation', esc(x.operation || '—'))}${row('Workflow', esc(x.workflow || '—'))}
+        ${row('Trace', x.trace_id ? `<span class="mono">${esc(x.trace_id)}</span>` : '—')}
+        ${row('Entity', esc(x.entity_type ? `${x.entity_type} #${x.entity_id ?? ''}` : '—'))}
+        ${row('Status', esc(x.status || '—'))}${row('Duration', x.duration_ms == null ? '—' : monMs(x.duration_ms))}
+      </div>
+      ${call ? `<div class="box soft"><div class="caps-sm mb8">The call it describes</div>
+        <div class="small">${esc(call.provider)} ${esc(call.http_method || '')} ${esc(call.endpoint_host || '')}${esc(call.endpoint_path || '')} · ${call.http_status_code ?? '—'} · ${monMs(call.latency_ms)}</div>
+        <div class="mt8">${btn('Open the call', 'mon-ext-request', { id: call.id }, 'sm')}</div></div>` : ''}
+      ${details.length ? `<div><div class="caps-sm mb8">Details</div><div class="mon-kv-grid">${details.map(([k, v]) => row(k.replace(/_/g, ' '), esc(typeof v === 'object' ? JSON.stringify(v) : String(v)))).join('')}</div></div>` : ''}
+      ${x.related?.length ? `<div><div class="caps-sm mb8">Same trace</div>${x.related.map(r => `<div class="row between gap10 small" style="padding:3px 0"><span class="ellipsis">${esc(r.message)}</span><span class="xs faint none">${esc(fmtDateTime(r.created_at))}</span></div>`).join('')}</div>` : ''}
+      <div class="xs faint">Messages and details are redacted before they are stored: no credentials, headers or payloads.</div>
+    </div>
+    <div class="card-foot row gap8" style="justify-content:flex-end">${btn('Close', 'mon-close')}</div></div></div>`;
+}
+
 const MONITORING_ACTIONS = {
   'mon-range': el => { Object.assign(monState(), { range: el.dataset.id, page: 1 }); load(); },
   'mon-filter': el => { monState()[el.dataset.key] = el.dataset.key === 'job_id' ? el.value.replace(/\D/g, '') : el.value; monState().page = 1; load(); },
@@ -259,7 +572,43 @@ const MONITORING_ACTIONS = {
     catch (e) { monState().request = null; toast(e.message, true); }
     render();
   },
-  'mon-close': (el, e) => { if (e && el.classList.contains('overlay') && e.target !== el) return; monState().request = null; render(); },
+  'mon-close': (el, e) => {
+    if (e && el.classList.contains('overlay') && e.target !== el) return;
+    const m = monState(); m.request = null; m.ext.request = null; m.logs.entry = null; render();
+  },
+  'mon-tab': (el, e) => { e?.preventDefault?.(); Object.assign(monState(), { tab: el.dataset.id }); load(); },
+  'mon-ext-filter': el => { monState().ext[el.dataset.key] = el.value; monState().ext.page = 1; load(); },
+  'mon-ext-errors': el => { Object.assign(monState().ext, { error_only: el.checked, page: 1 }); load(); },
+  'mon-ext-reset': () => { Object.assign(monState().ext, { provider: '', operation: '', workflow: '', status: '', error_type: '', http_status_code: '', error_only: false, page: 1 }); load(); },
+  'mon-ext-clear': el => { const e = monState().ext; e[el.dataset.key] = el.dataset.key === 'error_only' ? false : ''; e.page = 1; load(); },
+  // Clicking a value in the table filters by it, which is quicker than finding it in a list.
+  'mon-ext-pick': (el, ev) => { ev?.stopPropagation?.(); Object.assign(monState().ext, { [el.dataset.key]: el.dataset.value, page: 1 }); load(); },
+  'mon-ext-page': el => { const e = monState().ext; e.page = Math.max(1, e.page + Number(el.dataset.dir)); load(); },
+  'mon-ext-request': async el => {
+    const m = monState(); m.ext.request = Number(el.dataset.id); m.logs.entry = null; D.monExtRequest = null; render();
+    try { D.monExtRequest = await api(`/api/monitoring/external/requests/${el.dataset.id}?` + qs({ all_accounts: m.all ? 'true' : '' })); }
+    catch (err) { m.ext.request = null; toast(err.message, true); }
+    render();
+  },
+  'mon-trace': async (el, e) => {
+    e?.preventDefault?.();
+    const m = monState();
+    Object.assign(m.logs, { entry: null }); m.ext.request = null;
+    try {
+      const trace = await api(`/api/monitoring/external/traces/${el.dataset.id}?` + qs({ all_accounts: m.all ? 'true' : '' }));
+      toast(`Trace ${el.dataset.id.slice(0, 8)}: ${trace.calls.length} call${trace.calls.length === 1 ? '' : 's'} across ${trace.providers.join(', ') || 'no providers'} · ${monMs(trace.total_latency_ms)} total`);
+    } catch (err) { toast(err.message, true); }
+    render();
+  },
+  'mon-log-filter': el => { monState().logs[el.dataset.key] = el.value; monState().logs.page = 1; load(); },
+  'mon-log-reset': () => { Object.assign(monState().logs, { category: '', level: '', provider: '', workflow: '', search: '', page: 1 }); load(); },
+  'mon-log-page': el => { const l = monState().logs; l.page = Math.max(1, l.page + Number(el.dataset.dir)); load(); },
+  'mon-log': async el => {
+    const m = monState(); m.logs.entry = Number(el.dataset.id); D.monLog = null; render();
+    try { D.monLog = await api(`/api/monitoring/logs/${el.dataset.id}?` + qs({ all_accounts: m.all ? 'true' : '' })); }
+    catch (err) { m.logs.entry = null; toast(err.message, true); }
+    render();
+  },
   'mon-open-job': el => { monState().request = null; openJob(el.dataset.id); },
   'mon-analyze': () => busy('monAnalyze', async () => {
     await api('/api/monitoring/analyze', { method: 'POST', body: { range: monState().range === 'today' ? 'today' : monState().range } });

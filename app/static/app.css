@@ -120,6 +120,8 @@ button,input,select,textarea{font:inherit;color:inherit}
 .btn.primary{border-color:var(--brand);background:var(--brand);color:#fff}
 .btn.primary:hover{background:#4d3cd9;color:#fff}
 .btn.good{border-color:var(--good-btn);background:var(--good-btn);color:#fff}
+.btn.danger-solid{border-color:var(--bad);background:var(--bad);color:#fff}
+.btn.danger-solid:hover{background:#a82742;color:#fff}
 .btn.soft{border-color:var(--brand-line);background:#f6f5ff;color:var(--brand-ink)}
 .btn.danger{color:var(--bad)}
 .btn.ghost{border-color:transparent;background:transparent;color:var(--brand)}
@@ -438,6 +440,9 @@ p.settings-help{margin:10px 0}
 .mon-col-stack i:last-child{border-radius:4px 4px 0 0}
 .mon-col-x{position:absolute;bottom:-18px;font-size:10.5px;color:var(--faint);white-space:nowrap}
 .mon-cols-wrap{margin-bottom:20px}
+.mon-pick{color:inherit;text-decoration:none;border-bottom:1px dashed var(--line);cursor:pointer}
+.mon-pick:hover{color:var(--brand);border-bottom-color:var(--brand)}
+.mon-pick.bad-pick{color:var(--bad);border-bottom-color:var(--bad-line)}
 .mon-table-wrap{overflow:auto;max-height:420px}
 .mon-table{width:100%;border-collapse:collapse;font-size:12.5px}
 .mon-table th{position:sticky;top:0;background:#fafbfe;text-align:left;font-weight:600;color:var(--caps);font-size:11px;letter-spacing:.04em;padding:8px 10px;border-bottom:1px solid var(--line2);white-space:nowrap}

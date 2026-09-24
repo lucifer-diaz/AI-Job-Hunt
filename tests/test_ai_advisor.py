@@ -168,9 +168,13 @@ def test_the_advisor_sends_aggregates_not_individual_requests(user_id, monkeypat
     prompt, = fake.prompts
     assert prompt.name == "ai_optimization" and "PRIVATE RESUME TEXT" not in prompt.user
     assert len(prompt.user) < 20000  # 334 requests summarised in a small, bounded context
-    aggregates = json.loads(prompt.user.split("USAGE AGGREGATES:\n", 1)[1].split("\n\nRULE FINDINGS:", 1)[0])
+    aggregates = json.loads(prompt.user.split("USAGE AGGREGATES:\n", 1)[1]
+                            .split("\n\nEXTERNAL API AGGREGATES:", 1)[0])
     assert aggregates["totals"]["requests"] == 334 and len(aggregates["outliers"]["largest_context"]) <= 5
     assert "request_id" not in prompt.user
+    # Third-party telemetry travels with it, aggregated the same way (app.services.external_monitoring).
+    external = json.loads(prompt.user.split("EXTERNAL API AGGREGATES:\n", 1)[1].split("\n\nRULE FINDINGS:", 1)[0])
+    assert set(external) >= {"totals", "providers", "apify"} and "endpoint_path" not in prompt.user
 
 
 def test_rules_write_the_report_without_an_ai_key_or_when_the_answer_is_invalid(user_id, monkeypatch):
@@ -308,7 +312,7 @@ def test_running_an_analysis_changes_no_configuration(user_id, monkeypatch):
 
 def test_the_advisor_prompt_lives_in_app_prompts():
     prompt = build_ai_optimization_prompt({"totals": {"requests": 3}}, [{"category": "COST"}])
-    assert PROMPT_VERSIONS["ai_optimization"] == AI_OPTIMIZATION_PROMPT_VERSION == "v1"
+    assert PROMPT_VERSIONS["ai_optimization"] == AI_OPTIMIZATION_PROMPT_VERSION == "v2"
     assert prompt.user.startswith("AI_OPTIMIZATION") and prompt.name == "ai_optimization"
     assert "cannot and must never claim to change model configuration" in " ".join(prompt.system.split())
     for field in ("title", "category", "priority", "finding", "evidence", "recommended_change", "expected_benefit",

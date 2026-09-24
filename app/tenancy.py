@@ -25,11 +25,12 @@ from sqlalchemy.orm import Session, with_loader_criteria
 from app.models import (AIOptimizationReport, AIOptimizationTask, AppSetting, Application, ApplicationEvent, CandidateProfile,
                         ConversationAction, Evidence, FollowUp, Job, JobDescriptionParseTask, JobRanking, JobRankingTask,
                         JobRequirementEvidence, JobStructuredDataChange, KnowledgeAnswer, McpToken, Resume,
-                        ResumeDataChange, ResumeDocument, ResumeVariant, ResumeVersion, SearchProfile,
+                        ProviderCooldown, ResumeDataChange, ResumeDocument, ResumeVariant, ResumeVersion, SavedSearch,
+                        SearchProfile,
                         SearchRun, TailorTask, WorkflowTransition)
 
 OWNED_MODELS = (CandidateProfile, AppSetting, ResumeDocument, KnowledgeAnswer, Evidence, Job, SearchRun, SearchProfile,
-                Application, ResumeVariant, WorkflowTransition, ApplicationEvent, FollowUp, TailorTask, ResumeVersion,
+                SavedSearch, ProviderCooldown, Application, ResumeVariant, WorkflowTransition, ApplicationEvent, FollowUp, TailorTask, ResumeVersion,
                 JobRankingTask, JobRanking, AIOptimizationTask, AIOptimizationReport, ConversationAction, McpToken, Resume,
                 ResumeDataChange, JobRequirementEvidence, JobStructuredDataChange, JobDescriptionParseTask)
 # Rows that inherit their owner from a parent row: model -> (relationship, foreign key, parent model).

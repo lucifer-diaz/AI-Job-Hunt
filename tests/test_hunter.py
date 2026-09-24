@@ -24,6 +24,11 @@ from tests.conftest import ensure_test_user
 
 client = TestClient(app)
 TOKEN = "hunter-test-token"
+
+# A posting long enough to rank: app.services.ranker holds back listings with nothing to read.
+POSTING = ("Lead Python platform teams building services on Kubernetes and AWS. You will own the roadmap for "
+           "our data platform, mentor five engineers, and work with product to ship reliably. We look for expe"
+           "rience with FastAPI, distributed systems and a track record of leading delivery.")
 REFERENCE = datetime(2026, 9, 16, 12, 0)
 
 # Input properties each actor publishes in its input schema (read from the Apify API on 2026-09-16).
@@ -52,7 +57,7 @@ class FakeApify:
         self.started, self.runs, self.items, self.gets = [], {}, {}, []
         self.start_error = None  # callable(actor_input) -> Exception | None
 
-    def post(self, path, payload, token=None):
+    def post(self, path, payload, token=None, **telemetry):  # telemetry kwargs: operation, metadata
         assert token == TOKEN, "searches must use the account's own Apify token"
         error = self.start_error(payload) if self.start_error else None
         if error:
@@ -64,7 +69,7 @@ class FakeApify:
         self.items[f"ds{run_id}"] = []
         return {"data": dict(self.runs[run_id])}
 
-    def get(self, path, params=None, token=None):
+    def get(self, path, params=None, token=None, **telemetry):
         assert token == TOKEN
         self.gets.append(path)
         if path.startswith("/actor-runs/"):
@@ -139,7 +144,7 @@ def board_item(t, role="Engineering Manager", site="linkedin", **extra):
     item = {"id": f"li-{number}" if site == "linkedin" else f"in-{number}", "site": site,
             "title": f"Engineering Manager {t}", "company": f"Acme {t}", "location": "Singapore, Singapore",
             "job_url": f"https://www.{site}.com/jobs/view/{number}", "date_posted": "2026-09-14",
-            "matched_search_term": role, "scraped_at": "2026-09-16T08:03:00+00:00", "description": "Lead the team"}
+            "matched_search_term": role, "scraped_at": "2026-09-16T08:03:00+00:00", "description": POSTING}
     item.update(extra)
     return item
 
@@ -562,8 +567,8 @@ def test_search_profiles_are_saved_and_run_by_the_scheduler(apify, monkeypatch):
     assert updated.json()["locations"] == ["Singapore", "Dubai"]
     assert profile_id in [p["id"] for p in client.get("/api/hunter/profiles").json()["profiles"]]
 
-    # The scheduler starts due profiles; the Discovery screen's own saved search is not what is tested here.
-    monkeypatch.setattr(sj, "_saved_search", lambda ctx, db: "schedule is manual")
+    # The scheduler starts due profiles; the Discovery screen's own saved setups are not what is tested here.
+    monkeypatch.setattr(sj, "run_due_saved_searches", lambda db, owner, now, force=False: {"run_ids": [], "errors": []})
     now = datetime.now(UTC).replace(tzinfo=None)
     context = sj.JobContext(sessions=SessionLocal, trigger="schedule", now=now, worker_id="test", interval_minutes=240)
     result = sj.hunter(context)

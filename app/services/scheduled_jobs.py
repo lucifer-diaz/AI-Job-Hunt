@@ -19,15 +19,21 @@ import asyncio
 from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any
 
-from fastapi import HTTPException
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from app.models import Application, Job, SearchRun, User
-from app.services import ai_advisor, job_description, monitoring, ranker
+from app.services import (
+    ai_advisor,
+    external_monitoring,
+    job_description,
+    monitoring,
+    ranker,
+    system_log,
+)
 from app.services import work_queue as wq
 from app.services.compensation import enrich_compensation
 from app.services.hunter import run_due_profiles
@@ -36,7 +42,7 @@ from app.services.sources import refresh_apify_run
 from app.services.user_settings import ai_ready, apify_token
 from app.services.workflow import create_due_followups
 from app.settings import get_settings
-from app.workspace import get_search_profile, run_search_profile
+from app.workspace import run_due_saved_searches
 
 SessionFactory = Callable[[], Session]
 # Jobs not ranked yet: before the ranker's hard filters, waiting for it, or being ranked.
@@ -86,32 +92,20 @@ def _error(user_id: int, exc: Exception) -> dict[str, Any]:
 
 # ───────────── hunter / Apify ─────────────
 
-def _saved_search(ctx: JobContext, db: Session) -> list[int] | str:
-    """The Discovery screen's saved search profile (the older, single-profile one)."""
-    profile = get_search_profile(db)
-    if ctx.trigger != "manual" and profile.get("schedule") == "manual":
-        return "schedule is manual"
-    if not profile.get("roles"):
-        return "no roles in search profile"
-    latest = db.scalar(select(func.max(SearchRun.created_at)).where(SearchRun.adapter.is_(None)))
-    if latest and latest > ctx.now - timedelta(minutes=max(1, ctx.interval_minutes)):
-        return "searched recently"
-    try:
-        return [run.id for run in run_search_profile(db, profile)]
-    except HTTPException as exc:
-        raise ValueError(str(exc.detail)) from exc
-
-
 def _hunt_for_account(ctx: JobContext, db: Session) -> tuple[list[int] | str, list[dict[str, Any]]]:
-    """Start this account's due Hunter search profiles and its saved Discovery search."""
+    """Start this account's due saved Discovery searches and its due Hunter search profiles.
+
+    A manual trigger runs every scheduled setup at once, whatever their next run time says.
+    """
     if not apify_token(db):
         return "no Apify key", []
-    saved = _saved_search(ctx, db)
+    setups = run_due_saved_searches(db, db.info["user_id"], ctx.now, force=ctx.trigger == "manual")
     profiles = run_due_profiles(db, db.info["user_id"], ctx.now)
-    started = profiles["run_ids"] + (saved if isinstance(saved, list) else [])
-    if not started and isinstance(saved, str):
-        return saved, profiles["errors"]
-    return started, profiles["errors"]
+    started = setups["run_ids"] + profiles["run_ids"]
+    errors = setups["errors"] + profiles["errors"]
+    if not started and not errors:
+        return "no search was due", []
+    return started, errors
 
 
 def hunter(ctx: JobContext) -> dict[str, Any]:
@@ -176,7 +170,7 @@ def _prepare_ranking(ctx: JobContext) -> tuple[list[ranker.TaskClaim], dict[str,
         if not _is_postgres(db):
             return "Ranking workers need PostgreSQL (FOR UPDATE SKIP LOCKED)"
         queue = ranker.sweep(db)
-        ready, auto, waiting = ranker.accounts(db)
+        ready, auto, waiting = ranker.accounts(db, ctx.now)
         claims = ranker.claim(db, worker_id=ctx.worker_id, limit=max(1, get_settings().ranking_batch_size),
                               ready_accounts=ready, auto_rank_accounts=auto)
     return claims, {"queue": queue, "accounts_waiting": waiting}
@@ -313,12 +307,19 @@ def analytics(ctx: JobContext) -> dict[str, Any]:
 
 
 def cleanup(ctx: JobContext) -> dict[str, Any]:
-    """Recover work whose worker crashed, and apply LLM telemetry retention (roll up, then delete old rows)."""
+    """Recover work whose worker crashed, and apply telemetry retention (roll up, then delete old rows).
+
+    Three retentions, each with its own setting: LLM requests and external API calls are rolled into daily
+    totals that are kept for good, while operational log lines are simply deleted.
+    """
     with ctx.sessions() as db:
         telemetry = monitoring.prune(db, ctx.now)
+        external = external_monitoring.prune(db, ctx.now)
+        logs = system_log.prune(db, ctx.now)
+        retention = {"telemetry": telemetry, "external_api": external, "system_logs": logs}
         if not _is_postgres(db):
-            return skipped("Lease recovery needs PostgreSQL", telemetry=telemetry)
-        return {"recovered_leases": wq.recover_expired_leases(db), "telemetry": telemetry}
+            return skipped("Lease recovery needs PostgreSQL", **retention)
+        return {"recovered_leases": wq.recover_expired_leases(db), **retention}
 
 
 ADVISOR_BATCH = 5

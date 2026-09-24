@@ -18,7 +18,7 @@ const S = {
   kitJob: null, tailorJob: null, tailorTab: 'diff', editing: null,
   tailorMode: 'single', tailorChecked: new Set(), tailorRegenerate: false,
   pf: { tailor: pfDefaults('tailor'), approvals: pfDefaults('approvals') },
-  approvalJob: null, selApp: null, trackerView: 'board', runSel: null,
+  approvalJob: null, rejecting: null, overriding: null, selApp: null, trackerView: 'board', runSel: null, setupSel: null,
   scheduling: false, editingRecruiter: false, recruiterDraft: [], ivDraft: null, manualMissing: null,
   polling: null, busy: {}, forms: {}, apifyImport: false, importPick: new Set(), autoRefreshed: false,
 };
@@ -209,7 +209,7 @@ async function loadQueue() {
   const t = S.triage;
   D.queue = await api('/api/jobs/search?' + qs({ queue: true, per_page: 60, min_fit: t.min_fit || '', hide_agencies: t.hide_agencies, hide_reposts: t.hide_reposts, keywords: t.keywords.join(',') }));
   D.queueTotal = D.queue.total;
-  if (!D.searchProfile) D.searchProfile = await api('/api/search/profile');
+  if (!D.setups) D.setups = (await api('/api/search/setups')).setups;
   if (!D.runs) D.runs = await api('/api/search/apify/runs');
 }
 async function loadTable() {
@@ -219,7 +219,12 @@ async function loadTable() {
   D.selDetail = S.selJob ? await api(`/api/jobs/${S.selJob}`) : null;
 }
 async function loadSetup() {
-  [D.searchProfile, D.runs, D.actors] = await Promise.all([api('/api/search/profile'), api('/api/search/apify/runs'), api('/api/search/actors')]);
+  const [setups, runs, actors] = await Promise.all([api('/api/search/setups'), api('/api/search/apify/runs'), api('/api/search/actors')]);
+  [D.setups, D.runs, D.actors] = [setups.setups, runs, actors];
+  const sel = curSetup();
+  if (sel?.id !== S.setupSel) { S.setupSel = sel?.id ?? null; delete S.forms.sp; }
+  // The form below edits the selected setup's settings, so the rest of the screen needs no other source.
+  D.searchProfile = { profile: sel ? sel.settings : {}, board_yield: setups.board_yield, apify_configured: setups.apify_configured };
   schedulePreview();
   if (!D.runs.some(r => r.id === S.runSel)) S.runSel = (D.runs[0] || {}).id || null;
   D.runDetail = S.runSel ? await api(`/api/search/apify/runs/${S.runSel}/detail`) : null;
@@ -300,11 +305,11 @@ function renderSideFoot() {
   const account = BOOT.user ? `<div class="side-card"><div class="side-card-title ellipsis" title="${attr(BOOT.user.email)}">${esc(BOOT.user.email)}</div>
     <div class="side-card-body">${btn(label('logout', 'Sign out', 'Signing out…'), 'logout', {}, 'sm', isBusy('logout'))}</div></div>` : '';
   const s = D.summary; if (!s) return account;
-  const a = s.auto_search;
-  const on = a.schedule === 'daily';
+  const a = s.auto_search || {};  // a partial summary must never break the whole shell
+  const on = a.setups > 0;
   const last = a.last_run ? `Last run ${fmtDay(a.last_run)} · ${a.last_run_status.toLowerCase()}.` : 'No searches have run yet.';
   return `<div class="side-card"><div class="side-card-title"><span class="dot" style="background:${on ? '#4ade80' : '#6a7388'}"></span>Auto-search ${on ? 'on' : 'off'}</div>
-    <div class="side-card-body">${on ? `${a.roles} role${a.roles === 1 ? '' : 's'} × ${Math.max(1, a.locations)} location${a.locations === 1 ? '' : 's'} run on the scheduler with your Apify key.` : 'Searches run when you start them.'} ${esc(last)}</div></div>${account}`;
+    <div class="side-card-body">${on ? `${a.setups} scheduled setup${a.setups === 1 ? '' : 's'} · ${a.roles} role${a.roles === 1 ? '' : 's'} × ${Math.max(1, a.locations)} location${a.locations === 1 ? '' : 's'}${a.next_run ? `, next ${fmtDay(a.next_run)}` : ''}.` : 'Searches run when you start them.'} ${esc(last)}</div></div>${account}`;
 }
 function screenMeta() {
   const s = D.summary, c = s?.counts || {};
@@ -459,6 +464,18 @@ const until = iso => {
   return sec <= 0 ? 'now' : sec < 60 ? `in ${sec}s` : sec < 3600 ? `in ${Math.round(sec / 60)}m` : `in ${Math.round(sec / 3600)}h`;
 };
 const later = iso => !!iso && until(iso) !== 'now';
+// How long until a queued ranking starts, from what the server measured (never shown when nothing is measured).
+const rankEta = sec => sec == null ? '' : sec <= 5 ? 'starting next' : sec < 60 ? `~${sec}s` : sec < 3600 ? `~${Math.round(sec / 60)}m` : `~${Math.round(sec / 3600)}h`;
+const RANK_STAGE_COLOR = { ranking: '#5b4ae8', queued: '#8b93ad', waiting: '#c3c8da', retry: '#e0a136' };
+// One bar per job in the queue: where it is now, its place in line and when it should start.
+function rankProgress(t, total) {
+  if (t.percent == null) return '';
+  const place = t.queue_position ? `#${t.queue_position}${total ? ` of ${total}` : ''}` : '';
+  const eta = rankEta(t.eta_seconds);
+  const note = [place, t.stage_label, t.stage === 'ranking' && eta ? `${eta} left` : eta].filter(Boolean).join(' · ');
+  return `<div class="row base gap8 mt6"><span class="grow" style="max-width:220px">${bar(t.percent + '%', RANK_STAGE_COLOR[t.stage] || '#5b4ae8')}</span>
+    <span class="tiny mono faint none">${esc(note)}</span></div>`;
+}
 async function loadRanking() {
   const before = new Set((D.ranking?.active || []).map(t => t.id));
   D.ranking = await api('/api/ranking/tracker');
@@ -509,23 +526,28 @@ function renderRanking() {
   const tileGroup = (caption, items) => `<div class="grow" style="min-width:240px"><div class="caps-sm mb8">${esc(caption)}</div>
     <div style="display:grid;grid-template-columns:repeat(${items.length},minmax(0,1fr));gap:8px">${items.map(tile).join('')}</div></div>`;
   const tiles = tileGroup('Pipeline now', [['Filtering', c.filtering, 'hard filters', 'muted'], ['Queued', c.queued, 'next run', 'muted'],
-    ['Ranking', c.processing, 'model call', 'brand'], ['Retry / wait', c.retry_scheduled + c.waiting, 'backing off', 'warn']])
+    ['Ranking', c.processing, 'model call', 'brand'], ['Retry / wait', c.retry_scheduled + c.waiting, 'backing off', 'warn'],
+    ['No description', c.no_description ?? 0, 'not rankable', 'warn']])
     + tileGroup('Last 24 hours', [['Qualified', c.qualified, 'kept', 'good'], ['Archived', c.archived, 'by policy', 'muted'],
       ['Failed', c.failed, 'gave up', 'bad']]);
   const inFlight = r.active.length, { finished, total } = r.progress;
   const pct = total ? Math.round(100 * finished / total) : 100;
+  // Your own cadence when you set one (Settings → Workflow & cadence), otherwise the server's own sweep.
+  const cadence = r.interval_minutes ? `every ${r.interval_minutes} min · your cadence` : `every ${w.interval_minutes} min`;
+  const nextRun = r.next_run_at || w.next_run_at;
   const workerTxt = !w.enabled ? 'The ranking worker is turned off on this server'
-    : w.running ? 'A ranking run is in progress'
-    : w.next_run_at ? `Next ranking run ${until(w.next_run_at)} · every ${w.interval_minutes} min` : `Ranking runs every ${w.interval_minutes} min`;
+    : w.running && !r.next_run_at ? 'A ranking run is in progress'
+    : nextRun ? `Next ranking run ${until(nextRun)} · ${cadence}` : `Ranking runs ${cadence}`;
   const blocked = r.blocked ? `<div class="banner warn mb14"><span class="grow">Ranking is paused for your account: ${esc(r.blocked)}</span>${btn('Open settings', 'go', { screen: 'settings' }, 'sm')}</div>` : '';
   const autoOff = r.auto_rank ? '' : `<div class="banner mb14"><span class="grow">Auto-rank on import is off, so only the jobs you ask to rank are ranked.</span>${btn('Search setup', 'go', { screen: 'discovery', mode: 'setup' }, 'sm')}</div>`;
   const row = t => {
     const retry = t.status !== 'FAILED' ? '' : t.retried ? btn('Retried', 'ranking-retry', {}, 'sm', true)
       : btn(isBusy('rankRetry' + t.job_id) ? 'Queueing…' : 'Retry', 'ranking-retry', { job: t.job_id }, 'sm', isBusy('rankRetry' + t.job_id));
     const detail = rankTaskDetail(t), why = RANK_REASON[t.reason] || t.reason;
-    return `<div class="lrow ${t.status === 'PROCESSING' ? 'sel' : ''}" style="gap:12px">
+    return `<div class="lrow ${t.status === 'PROCESSING' ? 'sel' : ''}" style="gap:12px;align-items:flex-start">
       <div class="grow" style="min-width:0"><div class="small b ellipsis">${esc(t.title)} <span class="muted" style="font-weight:400">· ${esc(t.company)}</span></div>
-        <div class="xs ellipsis ${t.status === 'FAILED' ? '' : 'muted'}" style="${t.status === 'FAILED' ? 'color:var(--bad)' : ''}" title="${attr(detail)}">${esc(why)} · ${esc(detail)}</div></div>
+        <div class="xs ellipsis ${t.status === 'FAILED' ? '' : 'muted'}" style="${t.status === 'FAILED' ? 'color:var(--bad)' : ''}" title="${attr(detail)}">${esc(why)} · ${esc(detail)}</div>
+        ${rankProgress(t, r.in_flight)}</div>
       ${retry}${btn('Job', 'open-job', { id: t.job_id }, 'sm')}${rankTaskPill(t)}</div>`;
   };
   const section = (title, sub, items) => `<section class="card flush">
@@ -536,7 +558,8 @@ function renderRanking() {
     <section class="card">
       <div class="row wrap gap10 mb14"><div class="grow" style="min-width:220px"><div class="card-title">${inFlight || c.filtering ? 'Ranking in the background' : 'Ranking is idle'}</div>
         <div class="card-sub">${esc(workerTxt)}${w.enabled ? ' · runs on the server, safe to leave this page' : ''}</div>
-        <div class="row base gap8 mt8"><span class="grow">${bar(pct + '%', '#5b4ae8')}</span><span class="xs mono muted none">${finished}/${total} in the last day</span></div></div>
+        <div class="row base gap8 mt8"><span class="grow">${bar(pct + '%', '#5b4ae8')}</span><span class="xs mono muted none">${finished}/${total} in the last day</span></div>
+        <div class="xs muted mt6">Up to ${r.concurrency} ranking${r.concurrency === 1 ? '' : 's'} at a time${r.typical_seconds ? ` · about ${rankEta(r.typical_seconds).replace('~', '')} each` : ''} · <a href="#settings/workflow">change</a></div></div>
         ${btn(label('rankBatch', 'Queue unranked jobs', 'Queueing…'), 'rank-batch', {}, 'sm', isBusy('rankBatch'))}
         ${btn(label('rankRefresh', 'Refresh', 'Refreshing…'), 'ranking-refresh', {}, 'sm', isBusy('rankRefresh'))}</div>
       <div class="row wrap gap16" style="align-items:flex-start">${tiles}</div></section>
@@ -555,7 +578,7 @@ function renderTriage() {
   const job = q.items[0];
   const done = S.triagedThisSession;
   const total = q.total + done;
-  const sp = D.searchProfile?.profile;
+  const setups = D.setups || [];
   const side = `<div class="c-narrow col gap14">
     <section class="card pad16"><div class="card-title sm mb10">Up next</div><div class="col gap4">${q.items.slice(1, 6).map((u, i) => `<div class="row gap10" style="padding:9px;border-radius:9px;cursor:pointer;background:${i === 0 ? 'var(--softer)' : 'transparent'}" data-act="open-job" data-id="${u.id}"><span class="mono bb ${fitCls(u.fit)}" style="width:24px">${fitTxt(u.fit)}</span><div class="grow"><div class="small ellipsis" style="font-weight:500">${esc(u.title)}</div><div class="tiny muted ellipsis">${esc(u.company)}</div></div></div>`).join('') || '<div class="small muted">Nothing else in the queue.</div>'}</div></section>
     <section class="card pad16"><div class="card-title sm mb4">Filters for this batch</div><div class="small muted mb12">Narrowing re-ranks the queue instantly.</div>
@@ -564,8 +587,8 @@ function renderTriage() {
         <label class="check"><input type="checkbox" data-triage="hide_agencies" ${S.triage.hide_agencies ? 'checked' : ''}>Hide staffing agencies</label>
         <label class="check"><input type="checkbox" data-triage="hide_reposts" ${S.triage.hide_reposts ? 'checked' : ''}>Hide reposts I've seen</label>
         ${q.items.some(i => i.fit == null) ? btn(label('rankBatch', 'Rank every unranked job', 'Queueing…'), 'rank-batch', {}, 'soft block', isBusy('rankBatch')) : ''}</div></section>
-    <section class="card pad16"><div class="row between mb10"><div class="card-title sm">Saved search</div>${sp ? pill(sp.schedule === 'daily' ? 'daily' : 'manual', sp.schedule === 'daily' ? 'good' : 'muted') : ''}</div>
-      ${sp ? `<div class="box"><div class="small b">${esc(sp.roles.join(' · ') || 'No roles yet')}</div><div class="xs muted mt4">${esc(sp.locations.join(' · ') || 'Any location')} · ${sp.sites.length} board${sp.sites.length === 1 ? '' : 's'}${sp.auto_rank ? ' · auto-rank on' : ''}</div></div>` : ''}
+    <section class="card pad16"><div class="row between mb10"><div class="card-title sm">Saved searches</div>${setups.length ? pill(`${setups.length} setup${setups.length === 1 ? '' : 's'}`, 'muted') : ''}</div>
+      <div class="col gap6">${setups.map(x => `<div class="box" style="cursor:pointer" data-act="open-setup" data-id="${x.id}"><div class="row between gap8"><span class="small b ellipsis">${esc(x.name)}</span>${pill(x.schedule_label, x.schedule_kind !== 'manual' && x.enabled ? 'good' : 'muted')}</div><div class="xs muted mt4">${esc((x.settings.roles || []).join(' · ') || 'No roles yet')} · ${esc((x.settings.locations || []).join(' · ') || 'Any location')}</div></div>`).join('') || '<div class="small muted">No saved searches yet.</div>'}</div>
       <div class="col gap6 mt10">${(D.runs || []).slice(0, 3).map(r => `<div class="xs muted row gap8"><span class="dot" style="background:${r.status === 'SUCCEEDED' ? '#0f9c86' : r.completed_at ? '#c22f4e' : '#e0a136'}"></span>Run #${r.id} · ${r.created_jobs} new from ${r.item_count} · ${fmtDay(r.created_at)}</div>`).join('')}</div>
       <button class="btn block mt12" data-act="go" data-screen="discovery" data-mode="setup">Edit search setup</button></section></div>`;
   if (!job) {
@@ -646,7 +669,9 @@ function renderTable() {
 }
 function renderSetup() {
   const data = D.searchProfile; if (!data) return loading();
+  const setup = curSetup();
   const p = data.profile, F = 'sp';
+  const kind = setupField('schedule_kind', 'manual'), days = setupField('weekdays', []) || [];
   const roles = fv(F, 'roles', p.roles), sites = fv(F, 'sites', p.sites);
   const suggestions = (D.summary && D.profileRoles || []).filter(r => !roles.includes(r)).slice(0, 3);
   const actors = fv(F, 'actors', p.actors || []), customs = fv(F, 'custom_actors', p.custom_actors || []);
@@ -660,9 +685,12 @@ function renderSetup() {
   const boardName = { linkedin: 'LinkedIn', indeed: 'Indeed', glassdoor: 'Glassdoor', naukri: 'Naukri', bayt: 'Bayt', zip_recruiter: 'ZipRecruiter' };
   return `<div class="split">
   <section class="card flush c-main">
-    <div style="padding:18px 22px;border-bottom:1px solid var(--line2)"><div class="card-title" style="font-size:16px">Search profile</div><div class="card-sub">Save it once and let it run on a schedule — you triage, not configure.</div></div>
+    <div style="padding:18px 22px;border-bottom:1px solid var(--line2)"><div class="card-title" style="font-size:16px">Search setups</div><div class="card-sub">Save as many searches as you like — run one whenever you want, or let it run on its own schedule.</div>
+      <div class="row gap6 wrap mt12">${(D.setups || []).map(x => `<button type="button" class="btn sm ${x.id === setup?.id ? 'soft' : ''}" data-act="select-setup" data-id="${x.id}" title="${attr(x.schedule_label)}"><span class="dot" style="width:6px;height:6px;margin-right:6px;background:${x.schedule_kind !== 'manual' && x.enabled ? 'var(--good)' : 'var(--line)'}"></span>${esc(x.name)}</button>`).join('')}
+        ${btn(label('newSetup', '+ New setup', 'Creating…'), 'new-setup', {}, 'sm ghost', isBusy('newSetup'))}</div></div>
     ${data.apify_configured ? '' : `<div class="banner warn" style="margin:16px 22px 0">APIFY_API_TOKEN is not set on the server, so searches cannot start. You can still add jobs manually.</div>`}
     <div class="col gap18" style="padding:20px 22px">
+      <label class="field strong">Setup name${inputF(F, 'name', setup?.name || 'My search', 'maxlength="120" placeholder="e.g. Lead AI Engineer · remote"')}</label>
       <div><div class="small b mb8">Roles <span class="faint" style="font-weight:400">· up to 5</span></div>
         <div class="tagbox" data-tag-input="roles" data-act="focus-tag" data-target="sp-roles">${chips(F, 'roles', p.roles)}<input id="sp-roles" data-tag="roles" data-form="sp" data-max="5" autocomplete="off" placeholder="Type a role, then press Enter"></div>
         <div class="helper">Press Enter to add each role · Backspace removes the last one${suggestions.length ? ` · Suggested from your profile: ${suggestions.map(s => `<a href="#" data-act="suggest-role" data-role="${attr(s)}">${esc(s)}</a>`).join(' · ')}` : ''}</div></div>
@@ -689,14 +717,27 @@ function renderSetup() {
         <label class="field">Posted within${selectF(F, 'hours_old', p.hours_old, [[1, 'Past hour'], [24, 'Past 24 hours'], [72, 'Past 3 days'], [168, 'Past 7 days'], [720, 'Past 30 days'], [0, 'Any time']])}</label>
         <label class="field">Job type${selectF(F, 'job_type', p.job_type, [['', 'Any job type'], ['fulltime', 'Full-time'], ['parttime', 'Part-time'], ['contract', 'Contract'], ['internship', 'Internship'], ['temporary', 'Temporary']])}</label>
         <label class="field">Results per search${inputF(F, 'max_results', p.max_results, 'type="number" min="1" max="100"')}</label>
-        <label class="field">Run schedule${selectF(F, 'schedule', p.schedule, [['daily', 'Daily (cron)'], ['manual', 'Manual only']])}</label></div>
+        </div>
         <div class="mt12"><div class="xs muted mb4">Seniority <span class="faint">· Advanced LinkedIn and Remote Jobs Aggregator</span></div><div class="row gap6 wrap">${(D.actors?.seniority || []).map(s => `<button type="button" class="btn sm ${seniority.includes(s) ? 'soft' : ''}" data-act="toggle-list" data-key="seniority" data-value="${s}">${seniority.includes(s) ? '✓ ' : ''}${s}</button>`).join('')}</div></div>
         <div class="mt12"><div class="xs muted mb4">Exclude titles or keywords</div>${tagBox(F, 'exclude_keywords', p.exclude_keywords || [], 'e.g. intern, then Enter', 20)}</div>
         <div class="row gap16 wrap mt12">${checkF(F, 'is_remote', p.is_remote, 'Remote only')}${checkF(F, 'easy_apply', p.easy_apply, 'Easy Apply only')}${checkF(F, 'salary_only', p.salary_only, 'Salary listed only')}${checkF(F, 'visa_sponsorship', p.visa_sponsorship, 'Offers visa sponsorship')}${checkF(F, 'skip_agencies', p.skip_agencies, 'Skip agencies &amp; reposts')}${checkF(F, 'auto_rank', p.auto_rank, 'Auto-rank on import')}</div></div>
+      <div class="box soft" style="padding:14px"><div class="row between wrap gap8 mb8"><span class="small b">Schedule <span class="faint" style="font-weight:400">· this setup only</span></span>
+        ${kind === 'manual' ? '' : checkF(F, 'enabled', setup ? setup.enabled : true, 'Scheduled')}</div>
+        <div class="grid-auto"><label class="field">When${selectF(F, 'schedule_kind', kind, SCHEDULE_KINDS)}</label>
+          ${kind === 'interval' ? `<label class="field">Every N hours${inputF(F, 'every_hours', setupField('every_hours', 24), 'type="number" min="1" max="168"')}</label>` : ''}
+          ${kind === 'daily' || kind === 'weekly' ? `<label class="field">At${inputF(F, 'time_of_day', setupField('time_of_day', '07:00'), 'type="time"')}</label>
+            <label class="field">Time zone${inputF(F, 'timezone', setupField('timezone', localZone()), 'placeholder="Asia/Kolkata"')}</label>` : ''}</div>
+        ${kind === 'weekly' ? `<div class="mt12"><div class="xs muted mb4">Days</div><div class="row gap6 wrap">${DAY_NAMES.map((d, i) => `<button type="button" class="btn sm ${days.includes(i) ? 'soft' : ''}" data-act="toggle-day" data-day="${i}">${days.includes(i) ? '✓ ' : ''}${d}</button>`).join('')}</div></div>` : ''}
+        <div class="helper">${kind === 'manual' ? 'This setup only runs when you press Run now.'
+          : setup?.next_run_at && setup.schedule_kind === kind && setup.enabled ? `Next run ${fmtDateTime(setup.next_run_at)}${setup.last_run_at ? ` · last ran ${fmtDateTime(setup.last_run_at)}` : ''}`
+          : 'Save the setup to schedule it.'}</div></div>
     </div>
     <div class="card-foot row gap12 wrap">
-      ${btn(label('run', 'Run now &amp; triage', 'Starting…'), 'run-search', {}, 'primary lg', isBusy('run') || !!S.polling)}
-      ${btn(label('saveSp', 'Save profile', 'Saving…'), 'save-search', {}, 'lg', isBusy('saveSp'))}
+      ${btn(label('run', 'Run now &amp; triage', 'Starting…'), 'run-search', {}, 'primary lg', isBusy('run') || !!S.polling || !setup)}
+      ${btn(label('saveSp', 'Save', 'Saving…'), 'save-search', {}, 'lg', isBusy('saveSp'))}
+      ${btn(label('saveAsNew', 'Save as new', 'Saving…'), 'save-as-new', {}, '', isBusy('saveAsNew'))}
+      ${setup ? btn(label('dupSetup', 'Duplicate', 'Copying…'), 'duplicate-setup', {}, '', isBusy('dupSetup')) : ''}
+      ${setup && (D.setups || []).length > 1 ? btn(label('delSetup', 'Delete', 'Deleting…'), 'delete-setup', {}, 'ghost danger', isBusy('delSetup')) : ''}
       <span class="small muted grow">${!preview ? 'Planning runs…' : preview.error ? esc(preview.error)
         : `${preview.runs.length} run${preview.runs.length === 1 ? '' : 's'} across ${new Set(preview.runs.map(r => r.actor_id)).size} actor${new Set(preview.runs.map(r => r.actor_id)).size === 1 ? '' : 's'}`}</span>
       ${preview?.runs?.length ? btn(S.showInputs ? 'Hide inputs' : 'Show exact inputs', 'toggle-inputs', {}, 'sm ghost') : ''}</div>
@@ -708,7 +749,7 @@ function renderSetup() {
         <div class="row gap6">${D.runs.some(r => !r.completed_at) ? btn(label('refreshPending', `Refresh ${D.runs.filter(r => !r.completed_at).length} pending`, 'Checking…'), 'refresh-pending', {}, 'sm', isBusy('refreshPending') || !data.apify_configured) : ''}${btn(S.apifyImport ? 'Close import' : 'Import from Apify', 'toggle-apify-import', {}, 'sm soft', !data.apify_configured)}</div></div>
         <div class="card-sub">Pick a run to see exactly what it searched and everything it pulled.</div></div>
       ${S.apifyImport ? renderApifyImport() : ''}
-      ${D.runs.length ? D.runs.slice(0, 6).map(r => `<div class="lrow click ${r.id === S.runSel ? 'sel' : ''}" data-act="select-run" data-id="${r.id}" style="align-items:flex-start"><span class="dot" style="width:7px;height:7px;margin-top:6px;background:${r.status === 'SUCCEEDED' ? '#0f9c86' : r.completed_at ? '#c22f4e' : '#e0a136'}"></span><div class="grow"><div class="small b">Run #${r.id} · ${esc(r.status.toLowerCase())}</div><div class="xs muted mt4"><span class="mono">${esc((r.actor_id || '').split('/').pop())}</span> · ${r.created_jobs} new from ${r.item_count} results · ${fmtDateTime(r.created_at)}</div></div></div>`).join('') : `<div class="small muted" style="padding:16px">No runs yet.</div>`}
+      ${D.runs.length ? D.runs.slice(0, 6).map(r => `<div class="lrow click ${r.id === S.runSel ? 'sel' : ''}" data-act="select-run" data-id="${r.id}" style="align-items:flex-start"><span class="dot" style="width:7px;height:7px;margin-top:6px;background:${r.status === 'SUCCEEDED' ? '#0f9c86' : r.completed_at ? '#c22f4e' : '#e0a136'}"></span><div class="grow"><div class="row base gap6 wrap"><span class="small b">Run #${r.id} · ${esc(r.status.toLowerCase())}</span>${r.saved_search_name ? pill(r.saved_search_name, 'plain') : ''}</div><div class="xs muted mt4"><span class="mono">${esc((r.actor_id || '').split('/').pop())}</span> · ${r.created_jobs} new from ${r.item_count} results · ${fmtDateTime(r.created_at)}</div></div></div>`).join('') : `<div class="small muted" style="padding:16px">No runs yet.</div>`}
       ${run ? `<div style="padding:16px;background:#fbfbfe">
         <div class="row base between wrap gap8 mb12"><div class="base b">Run #${run.id}</div><div class="row gap6">${pill(run.status, run.status === 'SUCCEEDED' ? 'good' : run.completed ? 'bad' : 'warn')}${data.apify_configured ? btn(label('pull' + run.id, run.completed ? 'Pull again' : 'Check status &amp; pull', 'Checking…'), 'pull-run', { id: run.id, reimport: run.completed ? '1' : '' }, 'sm', isBusy('pull' + run.id)) : ''}</div></div>
         <div class="grid-auto w96 mb14">${[['pulled', 'Pulled', 'var(--ink)'], ['new', 'New', 'var(--good)'], ['duplicates', 'Duplicates', 'var(--muted)'], ['filtered', 'Filtered out', 'var(--warn)']].map(([k, l, c]) => `<div class="box" style="padding:9px 10px"><div class="mono bb" style="font-size:17px;color:${c}">${run.counts[k]}</div><div class="tiny muted">${l}</div></div>`).join('')}</div>
@@ -939,14 +980,20 @@ function renderApprovalsBody(list) {
   const a = D.approval;
   const waiting = list.filter(x => x.waiting).length;
   const queue = `<section class="card flush c-narrow"><div class="card-head card-title sm">Queue · ${waiting} waiting</div>
-    ${list.map(q => `<div class="lrow click ${q.id === S.approvalJob ? 'sel' : ''}" data-act="select-approval" data-id="${q.id}"><div class="grow"><div class="base b ellipsis">${esc(q.title)}</div><div class="xs muted">${esc(q.company)} · ${esc(q.age)}</div></div><span class="mono bb base" style="color:${q.status === 'approved' ? 'var(--faint)' : (q.reviewer_score || 0) >= 75 ? 'var(--good)' : (q.reviewer_score || 0) >= 65 ? 'var(--warn)' : 'var(--bad)'}">${fitTxt(q.reviewer_score)}</span></div>`).join('')}</section>`;
+    ${list.map(q => `<div class="lrow click ${q.id === S.approvalJob ? 'sel' : ''}" data-act="select-approval" data-id="${q.id}"><div class="grow"><div class="base b ellipsis">${esc(q.title)}</div><div class="xs muted">${esc(q.company)} · ${esc(q.age)}</div></div>${q.approval_override ? pill('waived', 'warn') : ''}<span class="mono bb base" style="color:${q.status === 'approved' ? 'var(--faint)' : (q.reviewer_score || 0) >= 75 ? 'var(--good)' : (q.reviewer_score || 0) >= 65 ? 'var(--warn)' : 'var(--bad)'}">${fitTxt(q.reviewer_score)}</span></div>`).join('')}</section>`;
   if (!a) return `<div class="split">${queue}<section class="card c-main">${loading()}</section></div>`;
   const r = a.resume, job = a.job;
   const approved = job.status === 'approved';
+  // A packet the reviewer scored below your minimum can still be approved — deliberately, and on the record.
+  const below = !!r && r.reviewer_score != null && r.reviewer_score < a.min_review_score;
+  const approveAct = below ? 'approve-override-open' : 'approve';
   return `<div class="split">${queue}
   <section class="card flush c-main">
     <div class="row between wrap gap12" style="padding:18px 22px;border-bottom:1px solid var(--line2)"><div><div style="font-size:17px;font-weight:600">${esc(job.title)} · ${esc(job.company)}</div><div class="small muted mt4">Fit ${fitTxt(job.fit)} · reviewer ${fitTxt(r?.reviewer_score)} · tailored ${esc(r?.generated || '')} · ${statusPill(job.status)}</div></div>
-      <div class="row gap8 wrap">${btn('Job details', 'open-job', { id: job.id })}${job.url ? `<a class="btn" href="${attr(job.url)}" target="_blank" rel="noopener">Open posting ↗</a>` : ''}${approved ? btn('Open apply kit', 'open-kit', { id: job.id }, 'good') : `${btn(label('revise', 'Needs revision', 'Sending back…'), 'revise', { id: job.id }, '', isBusy('revise'))}${btn(label('approve', 'Approve → apply kit', 'Approving…'), 'approve', { id: job.id }, 'good', isBusy('approve') || !r)}`}</div></div>
+      <div class="row gap8 wrap">${btn('Job details', 'open-job', { id: job.id })}${job.url ? `<a class="btn" href="${attr(job.url)}" target="_blank" rel="noopener">Open posting ↗</a>` : ''}${btn(label('reject', 'Reject', 'Rejecting…'), 'reject-open', { id: job.id }, 'ghost danger', isBusy('reject'))}${approved ? btn('Open apply kit', 'open-kit', { id: job.id }, 'good') : `${btn(label('revise', 'Needs revision', 'Sending back…'), 'revise', { id: job.id }, '', isBusy('revise'))}${btn(label('approve', below ? 'Approve anyway…' : 'Approve → apply kit', 'Approving…'), approveAct, { id: job.id }, 'good', isBusy('approve') || !r)}`}</div></div>
+    ${a.approval?.override ? `<div class="banner warn" style="margin:0 22px;display:block"><b>Approved below your reviewer minimum.</b>${a.approval.note ? ` ${esc(a.approval.note)}` : ''}</div>` : ''}
+    ${S.rejecting === job.id ? renderRejectPicker(job, a) : ''}
+    ${S.overriding === job.id ? renderApprovalOverride(job, a, r) : ''}
     ${r ? `<div style="padding:18px 22px;border-bottom:1px solid var(--line2)"><div class="base b mb12">Pre-submit checklist</div>
       <div class="grid-auto" style="grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px">${a.checklist.map(c => `<div class="check-item ${c.state}"><span class="mark">${c.state === 'ok' ? '✓' : '!'}</span><div><div class="small b lbl">${esc(c.label)}</div><div class="xs muted mt4">${esc(c.detail)}</div></div></div>`).join('')}</div></div>
     <div class="grid-auto" style="grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:0">
@@ -955,6 +1002,35 @@ function renderApprovalsBody(list) {
         <div class="col gap9">${a.answers.length ? a.answers.map(x => `<div class="box"><div class="small muted">${esc(x.question)}</div><div class="row gap8 mt4"><span class="small b grow">${esc(x.answer || 'Awaiting answer')}</span>${pill(x.sensitive ? 'confirm' : x.verified ? 'verified' : 'unverified', x.sensitive || !x.verified ? 'warn' : 'good')}</div></div>`).join('') : '<div class="small muted">No saved answers. Add them in the Knowledge bank.</div>'}</div>
         <textarea class="textarea mt12" id="approval-notes" data-act-blur="save-notes" data-id="${job.id}" placeholder="Notes for yourself — saved when you click away">${esc(fv('approvalNotes', job.id, a.notes))}</textarea></div></div>` : empty('No packet', 'This job has no tailored resume.')}
   </section></div>`;
+}
+// Approving a packet the reviewer scored below your minimum. The minimum can be waived for one packet; the
+// review itself cannot be skipped, so a packet nobody scored is not offered this.
+function renderApprovalOverride(job, a, r) {
+  const flagged = (a.checklist || []).filter(c => c.state !== 'ok');
+  return `<div style="padding:16px 22px;border-bottom:1px solid var(--line2);background:var(--warn-soft)">
+    <div class="row between wrap gap10 mb10"><div><div class="base b">Approve below your reviewer minimum?</div>
+      <div class="xs muted mt4">The reviewer scored this packet <b>${fitTxt(r.reviewer_score)}</b> against your minimum of <b>${a.min_review_score}</b>. Approving records that you waived it for this packet; your minimum does not change.</div></div>
+      <a href="#" class="small" data-act="approve-override-close">Cancel</a></div>
+    ${flagged.length ? `<div class="box mb10"><div class="caps-sm mb8">STILL FLAGGED</div>
+      <div class="col gap4">${flagged.map(c => `<div class="xs"><b>${esc(c.label)}</b> · ${esc(c.detail)}</div>`).join('')}</div></div>` : ''}
+    ${inputF('override', 'note', '', 'placeholder="Why this one is fine anyway (optional)" maxlength="2000"')}
+    <div class="row gap8 wrap mt10">${btn(label('approve', 'Approve anyway → apply kit', 'Approving…'), 'approve', { id: job.id, override: '1' }, 'good', isBusy('approve'))}
+      <a class="btn sm ghost" href="#settings/workflow">Change my minimum</a></div></div>`;
+}
+
+// Turning a job down. The reason is optional on purpose: one click is enough when you just want it gone,
+// and a reason is kept when you give one (it is shown wherever the job appears afterwards).
+function renderRejectPicker(job, a) {
+  const reasons = a.rejection_reasons || [];
+  const chosen = fv('reject', 'reason', '');
+  return `<div style="padding:16px 22px;border-bottom:1px solid var(--line2);background:var(--warn-soft)">
+    <div class="row between wrap gap10 mb10"><div><div class="base b">Reject this job?</div>
+      <div class="xs muted mt4">It leaves the approval queue and your pipeline. The tailored resume is kept, and nothing is sent to anyone.</div></div>
+      <a href="#" class="small" data-act="reject-close">Cancel</a></div>
+    <div class="row gap6 wrap mb10">${reasons.map(x => `<button type="button" class="btn sm ${chosen === x.id ? 'soft' : ''}" data-act="reject-reason" data-id="${attr(x.id)}">${chosen === x.id ? '✓ ' : ''}${esc(x.label)}</button>`).join('')}</div>
+    ${inputF('reject', 'notes', '', 'placeholder="Anything worth remembering (optional)" maxlength="2000"')}
+    <div class="row gap8 wrap mt10">${btn(label('reject', chosen ? 'Reject with this reason' : 'Reject without a reason', 'Rejecting…'), 'reject-confirm', { id: job.id }, 'danger-solid', isBusy('reject'))}
+      ${chosen ? btn('Clear reason', 'reject-reason', { id: '' }, 'sm ghost') : ''}</div></div>`;
 }
 function renderKit() {
   const k = D.kit; if (!k) return `<div class="overlay center" data-act="overlay-close"><div class="modal white" style="padding:40px">${loading()}</div></div>`;
@@ -1012,7 +1088,7 @@ function renderTracker() {
   </div>
   <section class="card">
     <div class="row top-align between wrap gap14 mb16"><div><div class="row gap9 wrap"><span class="card-title">${esc(sel.company)} · ${esc(sel.title)}</span>${pill(stageLabel, 'brand')}</div><div class="small muted mt4">${esc(sel.meta)}${sel.location ? ' · ' + esc(sel.location) : ''} · fit ${fitTxt(sel.fit)}</div></div>
-      <div class="row gap8 wrap">${btn('Open job', 'open-job', { id: sel.job_id }, 'sm')}${sel.url ? `<a class="btn sm" href="${attr(sel.url)}" target="_blank" rel="noopener">Open posting ↗</a>` : ''}</div></div>
+      <div class="row gap8 wrap">${btn('Open job', 'open-job', { id: sel.job_id }, 'sm')}${sel.resume_id ? btn('Open packet', 'go', { screen: 'tailor', job: sel.job_id }, 'sm') : ''}${sel.url ? `<a class="btn sm" href="${attr(sel.url)}" target="_blank" rel="noopener">Open posting ↗</a>` : ''}</div></div>
     <div class="row wrap gap10 mb16 movebar" style="background:#f8f9fd;border:1px solid #eaecf5;border-radius:12px;padding:12px 14px"><span class="caps none">MOVE TO</span>
       <div class="row wrap gap6 grow">${t.stages.map(st => btn(esc(st.label), 'move-stage', { app: sel.id, stage: st.id }, 'sm ' + (st.id === sel.stage ? 'primary' : ''))).join('')}</div><span class="xs muted none drag-hint">or drag the card between columns</span></div>
     <div class="split gap18">
@@ -1024,7 +1100,8 @@ function renderTracker() {
       <div style="flex:1 1 240px;min-width:0" class="col gap12">
         <div class="box brand" style="padding:13px"><div class="caps mb8">NEXT STEP</div><div class="base b">${esc(sel.next)}</div><div class="small muted mt4">${esc(sel.next_date)}</div></div>
         ${renderRecruiters(sel)}
-        <div class="box" style="padding:13px"><div class="caps mb8">SUBMITTED</div><div class="small ink2" style="line-height:1.5">${esc(sel.docs)}</div>${sel.notes ? `<div class="xs muted mt8 pretty">${esc(sel.notes)}</div>` : ''}</div>
+        <div class="box" style="padding:13px"><div class="caps mb8">SUBMITTED</div>
+          <div class="small ink2" style="line-height:1.5">${sel.resume_id ? `<a href="#" data-act="go" data-screen="tailor" data-job="${sel.job_id}">${esc(sel.docs)}</a>` : esc(sel.docs)}</div>${sel.notes ? `<div class="xs muted mt8 pretty">${esc(sel.notes)}</div>` : ''}</div>
         <div class="box" style="padding:13px;border-color:#e2ddff;background:var(--brand-softer)"><div class="row gap6 mb8">${pill('AI', 'brand')}<span class="xs b" style="color:var(--brand-ink)">Follow-up draft</span></div>
           <div class="small ink2 pretty" style="line-height:1.55;white-space:pre-wrap">${esc(sel.draft || 'No draft yet. Generate one — nothing is ever sent for you.')}</div>
           <div class="row gap8 mt10">${sel.draft ? btn('Review &amp; copy', 'copy-draft', { app: sel.id }, 'sm primary') : ''}${btn(label('nudge' + sel.id, sel.draft ? 'Regenerate' : 'Draft follow-up', 'Drafting…'), 'draft-nudge', { app: sel.id, stay: 1 }, 'sm' + (sel.draft ? '' : ' primary'), isBusy('nudge' + sel.id))}</div></div>
@@ -1094,6 +1171,10 @@ function renderScheduleForm(sel) {
 const KIND_DOT = { applied: '#5b4ae8', stage: '#0f9c86', note: '#c6cad8', call: '#0f9c86', email: '#a79bf0', referral: '#a79bf0', interview: '#e0a136' };
 
 /* ───────────── job modal + palette ───────────── */
+// A job you turned down says so wherever it turns up again, with the reason when you gave one.
+const rejectionBanner = j => !j.rejection ? ''
+  : `<div class="banner warn" style="margin:0 24px;display:block"><b>Rejected ${esc(j.rejection.on)}</b> · ${esc(j.rejection.label)}${j.rejection.note ? ` — ${esc(j.rejection.note)}` : ''}</div>`;
+
 function renderJobModal() {
   const j = D.jobModal;
   if (!j || j.id !== S.jobOpen) return `<div class="overlay" data-act="overlay-close"><div class="modal" style="padding:40px">${loading()}</div></div>`;
@@ -1112,6 +1193,7 @@ function renderJobModal() {
         ${j.url ? `<a class="btn" href="${attr(j.url)}" target="_blank" rel="noopener">Open posting ↗</a>` : ''}
         ${btn(j.resume_id ? 'Open packet' : 'Tailor resume', 'modal-tailor', { id: j.id }, 'primary')}${btn('Close', 'close-job')}</div></div>
       <div class="wizard">${j.wizard.map((w, i) => `<div class="${w.done ? 'done' : i === hereIdx ? 'here' : ''}"><div class="row gap6"><span class="m">${w.done ? '✓' : i + 1}</span><span class="small b" style="color:${w.done ? 'var(--ink)' : i === hereIdx ? 'var(--brand-ink)' : 'var(--faint)'}">${w.label}</span></div><div class="xs muted mt4">${esc(i === hereIdx && !w.done ? 'next step' : w.meta)}</div></div>`).join('')}</div></div>
+    ${rejectionBanner(j)}
     <div class="split gap16" style="padding:18px 24px 24px">
       <section class="card flush" style="flex:1 1 420px;min-width:0"><div class="tabs under">${[['description', 'Description'], ['structured', 'Structured JD'], ['requirements', 'Requirements map'], ['notes', 'Notes']].map(([id, t]) => `<button class="${S.jobTab === id ? 'on' : ''}" data-act="job-tab" data-id="${id}">${t}</button>`).join('')}</div>${tab}</section>
       <div class="col gap14" style="flex:1 1 280px;min-width:0">
@@ -1141,7 +1223,7 @@ function renderPalette() {
       <div class="caps-sm faint" style="padding:8px 18px">JUMP TO</div>
       ${item('O', 'Overview', 'pipeline health', 'palette-go', { screen: 'overview' })}${item('T', 'Today · run sheet', `${c.today ?? 0} actions`, 'palette-go', { screen: 'today', variant: 'run' })}${item('D', 'Discovery · triage queue', `${c.discovery ?? 0} new`, 'palette-go', { screen: 'discovery', mode: 'triage' })}${item('A', 'Approvals', `${c.approvals ?? 0} waiting`, 'palette-go', { screen: 'approvals' })}${item('R', 'Tracker', `${c.tracker ?? 0} live`, 'palette-go', { screen: 'tracker' })}
       <div class="caps-sm faint" style="padding:14px 18px 8px;border-top:1px solid var(--line3);margin-top:6px">ACTIONS</div>
-      ${item('N', 'Run the saved search now', 'search profile', 'palette-run')}${item('K', 'Open the apply kit for the latest approved packet', '', 'palette-kit')}${item('F', 'Work the follow-ups that are due', `${D.today?.followups?.length ?? ''}`, 'palette-go', { screen: 'today' })}${item('+', 'Add a job from a URL', 'manual', 'palette-go', { screen: 'discovery', mode: 'setup' })}
+      ${item('N', 'Run the saved search now', 'the setup you last opened', 'palette-run')}${item('K', 'Open the apply kit for the latest approved packet', '', 'palette-kit')}${item('F', 'Work the follow-ups that are due', `${D.today?.followups?.length ?? ''}`, 'palette-go', { screen: 'today' })}${item('+', 'Add a job from a URL', 'manual', 'palette-go', { screen: 'discovery', mode: 'setup' })}
     </div><div class="xs muted" style="padding:10px 18px;border-top:1px solid var(--line2);background:#fbfbfe">Search every job in the pipeline, jump between screens, or fire an action without leaving the keyboard.</div></div></div>`;
 }
 
@@ -1158,7 +1240,8 @@ function render() {
   if (D.summary?.profile) $('#brand-sub').textContent = [D.summary.profile.name, D.summary.profile.headline].filter(Boolean).join(' · ') || 'Set up your profile';
   $('#top').innerHTML = renderTop();
   $('#view').innerHTML = RENDER[S.screen]();
-  $('#overlays').innerHTML = (S.jobOpen ? renderJobModal() : '') + (S.kitJob ? renderKit() : '') + (S.paletteOpen ? renderPalette() : '') + (S.mon?.request ? renderMonRequestModal() : '');
+  $('#overlays').innerHTML = (S.jobOpen ? renderJobModal() : '') + (S.kitJob ? renderKit() : '') + (S.paletteOpen ? renderPalette() : '') + (S.mon?.request ? renderMonRequestModal() : '')
+    + (S.mon?.ext?.request ? renderMonExtRequestModal() : '') + (S.mon?.logs?.entry ? renderMonLogModal() : '');
   document.body.style.overflow = (S.jobOpen || S.kitJob || S.paletteOpen || S.mon?.request) ? 'hidden' : '';
   if (fid) {
     const el = document.getElementById(fid);
@@ -1282,13 +1365,65 @@ function toggleIn(key, value) {
   const i = list.indexOf(value); i >= 0 ? list.splice(i, 1) : list.push(value);
   setF('sp', key, list); render();
 }
-async function saveSearchProfile() {
-  const pending = document.getElementById('sp-roles')?.value.trim(); if (pending) addTags('sp', 'roles', pending, 5, D.searchProfile.profile.roles);
-  const pendingLoc = document.getElementById('sp-locations')?.value.trim(); if (pendingLoc) addTags('sp', 'locations', pendingLoc, 5, D.searchProfile.profile.locations);
-  const out = await api('/api/search/profile', { method: 'PUT', body: searchPayload() });
-  D.searchProfile.profile = out.profile; delete S.forms.sp;
-  S.triage.hide_agencies = out.profile.skip_agencies; S.triage.hide_reposts = out.profile.skip_agencies;
-  return out;
+/* ───────────── saved setups ───────────── */
+// Each setup is a whole search profile with a name and its own schedule. The selected one is what
+// every field above edits, so switching setups is just swapping D.searchProfile.profile.
+const curSetup = () => (D.setups || []).find(x => x.id === S.setupSel) || (D.setups || [])[0] || null;
+const localZone = () => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; } catch { return 'UTC'; } };
+const DAY_NAMES = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+const SCHEDULE_KINDS = [['manual', 'Manual only'], ['interval', 'Every N hours'], ['daily', 'Daily'], ['weekly', 'Weekly']];
+const setupField = (key, fallback) => fv('sp', key, curSetup()?.[key] ?? fallback);
+
+function useSetup(id) {
+  if (id === S.setupSel) return;
+  S.setupSel = id; delete S.forms.sp;
+  const sel = curSetup();
+  D.searchProfile.profile = sel ? sel.settings : {};
+  schedulePreview(); render();
+}
+function setupPayload() {
+  return {
+    name: String(setupField('name', 'My search') || '').trim(),
+    settings: searchPayload(),
+    schedule_kind: setupField('schedule_kind', 'manual'),
+    every_hours: Number(setupField('every_hours', 24)) || 24,
+    time_of_day: setupField('time_of_day', '07:00'),
+    weekdays: setupField('weekdays', []),
+    timezone: setupField('timezone', localZone()),
+    enabled: !!setupField('enabled', true),
+  };
+}
+// Text still sitting in a tag input counts as typed — save it rather than dropping it.
+function flushTagDrafts() {
+  for (const key of ['roles', 'locations']) {
+    const pending = document.getElementById(`sp-${key}`)?.value.trim();
+    if (pending) addTags('sp', key, pending, 5, D.searchProfile.profile[key]);
+  }
+}
+function adoptSetup(setup) {
+  D.setups = (D.setups || []).some(x => x.id === setup.id) ? D.setups.map(x => x.id === setup.id ? setup : x) : [...(D.setups || []), setup];
+  S.setupSel = setup.id; delete S.forms.sp;
+  D.searchProfile.profile = setup.settings;
+  S.triage.hide_agencies = setup.settings.skip_agencies; S.triage.hide_reposts = setup.settings.skip_agencies;
+  return setup;
+}
+async function saveSetup() {
+  const setup = curSetup();
+  if (!setup) return createSetup();
+  flushTagDrafts();
+  const out = await api(`/api/search/setups/${setup.id}`, { method: 'PUT', body: setupPayload() });
+  return adoptSetup(out.setup);
+}
+async function createSetup(body) {
+  if (!body) flushTagDrafts();
+  const out = await api('/api/search/setups', { method: 'POST', body: body || { ...setupPayload(), name: nextSetupName() } });
+  return adoptSetup(out.setup);
+}
+function nextSetupName(preferred) {
+  const taken = new Set((D.setups || []).map(x => x.name.toLowerCase()));
+  const base = String(preferred || setupField('name', 'My search') || 'My search').trim() || 'My search';
+  if (!taken.has(base.toLowerCase())) return base;
+  for (let n = 2; ; n++) if (!taken.has(`${base} ${n}`.toLowerCase())) return `${base} ${n}`;
 }
 async function refreshAfter(msg) { if (msg) toast(msg); await load(); }
 
@@ -1334,7 +1469,10 @@ const A = {
     const id = Number(el.dataset.id), j = D.jobModal;
     if (!j.resume_id && ['discovered', 'shortlisted', 'maybe', 'archived', 'dismissed'].includes(j.status)) await api(`/api/jobs/${id}/triage`, { method: 'POST', body: { action: 'shortlist' } }).catch(e => toast(e.message, true));
     S.jobOpen = null;
-    if (j.status === 'approved') go('approvals', { approvalJob: id });
+    // An applied job still has a packet, and the button says "Open packet" — so open it (read-only), rather
+    // than sending the reader back to the tracker they most likely came from.
+    if (j.resume_id) go('tailor', { tailorJob: id, tailorMode: 'single', tailorTab: 'diff' });
+    else if (j.status === 'approved') go('approvals', { approvalJob: id });
     else if (j.status === 'applied') go('tracker', { selApp: j.application_id });
     else go('tailor', { tailorJob: id });
   },
@@ -1456,11 +1594,41 @@ const A = {
     delete S.forms.ca; S.addActor = false; S.caFields = null;
     render(); toast('Actor added — save the profile to keep it');
   },
-  'save-search': () => busy('saveSp', saveSearchProfile, 'Search profile saved'),
+  'save-search': () => busy('saveSp', saveSetup, setup => `“${setup.name}” saved`),
+  'save-as-new': () => busy('saveAsNew', () => createSetup(), setup => `Saved as “${setup.name}”`),
+  'select-setup': el => useSetup(Number(el.dataset.id)),
+  'open-setup': el => { S.setupSel = Number(el.dataset.id); delete S.forms.sp; go('discovery', { discMode: 'setup' }); },
+  'new-setup': () => busy('newSetup', async () => {
+    // A new setup keeps the actors and filters on screen — only what makes it a different search starts empty.
+    const base = setupPayload();
+    return createSetup({ ...base, name: nextSetupName('New search'), schedule_kind: 'manual', enabled: true,
+                         settings: { ...base.settings, roles: [], locations: [] } });
+  }, setup => `“${setup.name}” created — name it and pick its roles`),
+  'duplicate-setup': () => busy('dupSetup', async () => {
+    const out = await api(`/api/search/setups/${curSetup().id}/duplicate`, { method: 'POST' });
+    return adoptSetup(out.setup);
+  }, setup => `Copied to “${setup.name}”`),
+  'delete-setup': () => {
+    const setup = curSetup();
+    if (!setup || !confirm(`Delete “${setup.name}”? Jobs it already found stay in your pipeline.`)) return;
+    busy('delSetup', async () => {
+      await api(`/api/search/setups/${setup.id}`, { method: 'DELETE' });
+      D.setups = (D.setups || []).filter(x => x.id !== setup.id);
+      S.setupSel = (D.setups[0] || {}).id ?? null; delete S.forms.sp;
+      D.searchProfile.profile = curSetup()?.settings || {};
+      await load();
+    }, `“${setup.name}” deleted`);
+  },
+  'toggle-day': el => {
+    const day = Number(el.dataset.day), days = [...(setupField('weekdays', []) || [])];
+    const i = days.indexOf(day); i >= 0 ? days.splice(i, 1) : days.push(day);
+    setF('sp', 'weekdays', days.sort((a, b) => a - b)); render();
+  },
   'run-search': () => busy('run', async () => {
-    if (!D.searchProfile) D.searchProfile = await api('/api/search/profile');
-    if (S.screen === 'discovery' && S.discMode === 'setup') await saveSearchProfile();
-    const out = await api('/api/search/profile/run', { method: 'POST' });
+    const setup = S.discMode === 'setup' ? await saveSetup() : curSetup();
+    if (!setup) throw new Error('Create a search setup first');
+    const out = await api(`/api/search/setups/${setup.id}/run`, { method: 'POST' });
+    adoptSetup(out.setup);
     const actorCount = new Set(out.runs.map(r => r.actor_id)).size;
     S.polling = { ids: out.runs.map(r => r.id), text: `Started ${out.runs.length} run${out.runs.length === 1 ? '' : 's'} on ${actorCount} actor${actorCount === 1 ? '' : 's'}. Waiting for results…` };
     setTimeout(pollRuns, 3000);
@@ -1572,10 +1740,26 @@ const A = {
   }, 'Cover letter saved'),
   // approvals
   'select-approval': async el => { S.approvalJob = Number(el.dataset.id); render(); D.approval = await api(`/api/approvals/${S.approvalJob}`).catch(() => null); render(); },
+  'approve-override-open': el => { S.overriding = Number(el.dataset.id); S.rejecting = null; delete S.forms.override; render(); },
+  'approve-override-close': (el, e) => { e?.preventDefault?.(); S.overriding = null; delete S.forms.override; render(); },
   approve: el => busy('approve', async () => {
-    const out = await api(`/api/jobs/${el.dataset.id}/approve`, { method: 'POST' });
+    const override = el.dataset.override === '1';
+    const out = await api(`/api/jobs/${el.dataset.id}/approve`, { method: 'POST',
+      body: { override, note: override ? fv('override', 'note', '') : '' } });
+    S.overriding = null; delete S.forms.override;
     await load(); openKit(el.dataset.id); return out;
-  }, 'Approved — here is your apply kit'),
+  }, out => out.approval_override ? 'Approved below your minimum — here is your apply kit' : 'Approved — here is your apply kit'),
+  'reject-open': el => { S.rejecting = Number(el.dataset.id); delete S.forms.reject; render(); },
+  'reject-close': (el, e) => { e?.preventDefault?.(); S.rejecting = null; delete S.forms.reject; render(); },
+  'reject-reason': el => { setF('reject', 'reason', el.dataset.id); render(); },
+  'reject-confirm': el => busy('reject', async () => {
+    const out = await api(`/api/jobs/${el.dataset.id}/reject`, { method: 'POST', body: {
+      reason: fv('reject', 'reason', ''), notes: fv('reject', 'notes', '') } });
+    S.rejecting = null; delete S.forms.reject;
+    S.approvalJob = null; D.approval = null;
+    await load();
+    return out;
+  }, out => `Rejected${out.rejection?.reason ? ` · ${out.rejection.label.toLowerCase()}` : ''}`),
   revise: el => busy('revise', async () => {
     await api(`/api/jobs/${el.dataset.id}/revision`, { method: 'POST', body: { notes: fv('approvalNotes', el.dataset.id, D.approval?.job?.id === Number(el.dataset.id) ? D.approval.notes || '' : '') } });
     await load();

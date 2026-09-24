@@ -13,9 +13,9 @@ let ui, fetchMock, context;
 function response(data, status = 200) { return { ok: status < 400, status, text: async () => JSON.stringify(data) }; }
 function data() {
   return { profile: { name: 'Alex Morgan', headline: 'Engineering leader', email: 'alex@example.com', phone: '123', location: 'Mumbai', linkedin_url: '', github_url: '', master_resume: 'My resume', target_roles: ['Lead'], preferred_locations: ['Mumbai, India'], work_authorization: 'Citizen', compensation_notes: 'INR 75 lakh', search_preferences: { total_experience: 0, notice_period: 0, primary_skills: ['Python'] } },
-    summary: { profile: { name: 'Alex Morgan', headline: 'Engineering leader' }, counts: {}, model: 'default-model', llm_provider: 'openai', application_mode: 'manual_approval', auto_search: { schedule: 'daily', roles: 1, locations: 1, last_run: null } },
+    summary: { profile: { name: 'Alex Morgan', headline: 'Engineering leader' }, counts: {}, model: 'default-model', llm_provider: 'openai', application_mode: 'manual_approval', auto_search: { schedule: 'daily', setups: 1, roles: 1, locations: 1, next_run: null, last_run: null } },
     resumes: [], prefs: { weekly_target: 10, followup_days: 7, warn_closing: false },
-    settings: { secret_storage: true, keys: Object.fromEntries(['openai', 'openrouter', 'anthropic', 'apify'].map(k => [k, { configured: k === 'openai', hint: k === 'openai' ? '…1234' : '' }])), configured: { openai: true, mock: true }, application_mode: 'manual_approval', min_review_score: 70,
+    settings: { secret_storage: true, ranking_concurrency: 5, tailoring_concurrency: 2, processing_maximums: { ranking_concurrency: 5, tailoring_concurrency: 2 }, rate_limits: { enabled: true, base_seconds: 30, multiplier: 2, max_seconds: 900, ladder: [30, 60, 120, 240, 480] }, keys: Object.fromEntries(['openai', 'openrouter', 'anthropic', 'apify'].map(k => [k, { configured: k === 'openai', hint: k === 'openai' ? '…1234' : '' }])), configured: { openai: true, mock: true }, application_mode: 'manual_approval', min_review_score: 70,
       ai: { saved: { llm_provider: '', model: '', require_free: null, stage_models: {} }, env: { llm_provider: 'openai', models: { openai: 'default-model' }, require_free: true, stage_models: {} } } } };
 }
 function section(id) { ui.S.settingsSection = id; ui.render(); }
@@ -288,10 +288,10 @@ describe('focused settings UI', () => {
   });
   it('refreshes auto-search counts after preference saves', async () => {
     section('preferences'); ui.setF('preferences', 'target_roles', ['Staff', 'Lead']);
-    const summary = { ...ui.D.summary, auto_search: { ...ui.D.summary.auto_search, roles: 2, locations: 3 } };
+    const summary = { ...ui.D.summary, auto_search: { ...ui.D.summary.auto_search, setups: 2, roles: 2, locations: 3 } };
     fetchMock.mockResolvedValueOnce(response({ ...ui.D.profile, target_roles: ['Staff', 'Lead'] })).mockResolvedValueOnce(response(summary));
     await ui.settingsSave('preferences');
-    expect(document.getElementById('side-foot').textContent).toContain('2 roles × 3 locations');
+    expect(document.getElementById('side-foot').textContent).toContain('2 scheduled setups · 2 roles × 3 locations');
   });
   it('refreshes the shell even if cadence fails after approval settings save', async () => {
     section('workflow'); ui.setF('workflow', 'application_mode', 'automatic'); ui.setF('workflow', 'followup_days', '14');

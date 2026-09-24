@@ -100,6 +100,17 @@ class SettingsIn(BaseModel):
     # backend: the configured model API tailors and reviews. claude_desktop: Claude Desktop does it over MCP.
     # Omitted keeps the saved mode.
     execution_mode: str | None = None
+    # How much work may run at once for this account. Bounded by the server's own ceilings, so the upper limit
+    # is validated against RANKING_CONCURRENCY / TAILOR_CONCURRENCY rather than a constant here.
+    ranking_concurrency: int | None = Field(default=None, ge=1, le=64)
+    tailoring_concurrency: int | None = Field(default=None, ge=1, le=64)
+    # 0 = rank whenever the server looks; higher spreads this account's ranking over a longer stretch.
+    ranking_interval_minutes: int | None = Field(default=None, ge=0, le=1440)
+    # How long to leave a provider alone after it answers 429 (app.services.backoff). Bounds mirror that module.
+    rate_limit_backoff: bool | None = None
+    rate_limit_base_seconds: int | None = Field(default=None, ge=1, le=600)
+    rate_limit_multiplier: float | None = Field(default=None, ge=1.0, le=10.0)
+    rate_limit_max_seconds: int | None = Field(default=None, ge=5, le=86_400)
 
 
 class ProfilePatch(ProfileIn):
@@ -118,6 +129,13 @@ class SettingsPatch(SettingsIn):
     """Omitted values remain saved; blank AI overrides restore inheritance."""
 
     model_config = ConfigDict(extra="forbid")
+
+
+class ApproveIn(BaseModel):
+    """Approving a packet. `override` waives the reviewer minimum for this packet only, and is recorded."""
+
+    override: bool = False
+    note: str = Field(default="", max_length=2000)
 
 
 class ApplicationUpdateIn(BaseModel):

@@ -5,6 +5,7 @@ searches, ranking, tailoring and follow-ups. There is no fallback to server-wide
 """
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Any, TypeVar
 
 from sqlalchemy import select, update
@@ -71,6 +72,53 @@ EXECUTION_MODES = ("backend", "claude_desktop")
 def execution_mode_for(db: Session, user_id: int | None = None) -> str:
     mode = (settings_for(db, user_id).preferences or {}).get("execution_mode")
     return mode if mode in EXECUTION_MODES else "backend"
+
+
+# How much work Job Hunt OS may do for one account at a time. The server sets the ceiling (RANKING_CONCURRENCY,
+# TAILOR_CONCURRENCY); an account may run at or below it, so one busy account cannot take the whole machine.
+PROCESSING_LIMITS = ("ranking_concurrency", "tailoring_concurrency")
+# How long an account waits between ranking runs of its own. 0 means "whenever the server looks", which is
+# every RANKING_INTERVAL_MINUTES; a larger number spreads the same work over a longer stretch.
+MAX_RANKING_INTERVAL_MINUTES = 1440
+
+
+def ranking_interval_minutes(db: Session, user_id: int | None = None) -> int:
+    saved = (settings_for(db, user_id).preferences or {}).get("processing") or {}
+    try:
+        return max(0, min(MAX_RANKING_INTERVAL_MINUTES, int(saved.get("ranking_interval_minutes", 0))))
+    except (TypeError, ValueError):
+        return 0
+
+
+def processing_maximums() -> dict[str, int]:
+    """The server's ceilings — the most an account is allowed to ask for."""
+    settings = get_settings()
+    return {"ranking_concurrency": max(1, settings.ranking_concurrency),
+            "tailoring_concurrency": max(1, settings.tailor_concurrency)}
+
+
+def _bounded(value: Any, ceiling: int) -> int:
+    try:
+        return max(1, min(int(value), ceiling))
+    except (TypeError, ValueError):
+        return ceiling
+
+
+def processing_limits(db: Session, user_id: int | None = None) -> dict[str, int]:
+    """How many ranking and tailoring tasks may run at once for this account, and how often ranking runs."""
+    saved = (settings_for(db, user_id).preferences or {}).get("processing") or {}
+    ceilings = processing_maximums()
+    return {**{name: _bounded(saved.get(name), ceilings[name]) for name in PROCESSING_LIMITS},
+            "ranking_interval_minutes": ranking_interval_minutes(db, user_id)}
+
+
+def limits_for(db: Session, user_ids: Iterable[int], name: str) -> dict[int, int]:
+    """One limit for several accounts at once, for the workers that serve every account in one pass."""
+    ceiling = processing_maximums()[name]
+    rows = db.execute(select(AppSetting.user_id, AppSetting.preferences)
+                      .where(AppSetting.user_id.in_(list(dict.fromkeys(user_ids))))).all()
+    saved = {user_id: ((preferences or {}).get("processing") or {}).get(name) for user_id, preferences in rows}
+    return {user_id: _bounded(saved.get(user_id), ceiling) for user_id in dict.fromkeys(user_ids)}
 
 
 def ai_overrides(db: Session, user_id: int | None = None) -> dict[str, Any]:

@@ -20,10 +20,11 @@ from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from app.models import Job, ResumeVariant, TailorTask
+from app.services import user_settings
 from app.services.user_settings import execution_mode_for, settings_for
 from app.services.workflow import (
     NEEDS_RETAILOR,
@@ -157,8 +158,12 @@ def claim_next(sessions: SessionFactory, worker_id: str, lease_seconds: int, now
                    .values(status="queued", stage="queued", locked_by=None, lock_expires_at=None)
                    .execution_options(synchronize_session=False))
         db.commit()
-        for task_id in db.scalars(select(TailorTask.id).where(TailorTask.status == "queued")
-                                  .order_by(TailorTask.id).limit(20)).all():
+        queued = db.execute(select(TailorTask.id, TailorTask.user_id).where(TailorTask.status == "queued")
+                            .order_by(TailorTask.id).limit(20)).all()
+        quota = _account_quota(db, {user_id for _, user_id in queued})
+        for task_id, user_id in queued:
+            if quota.get(user_id, 1) <= 0:
+                continue  # this account is already tailoring as many packets at once as it allows
             claimed = db.execute(update(TailorTask).where(TailorTask.id == task_id, TailorTask.status == "queued")
                                  .values(status="running", locked_by=worker_id, started_at=now,
                                          lock_expires_at=now + timedelta(seconds=lease_seconds),
@@ -168,6 +173,21 @@ def claim_next(sessions: SessionFactory, worker_id: str, lease_seconds: int, now
             if claimed.rowcount:
                 return task_id
     return None
+
+
+def _account_quota(db: Session, user_ids: set[int]) -> dict[int, int]:
+    """How many more packets each account may tailor at once: its own limit less what it already has running.
+
+    The count comes from the database, not from one worker's bookkeeping, so the limit holds across restarts
+    and across several workers.
+    """
+    if not user_ids:
+        return {}
+    limits = user_settings.limits_for(db, user_ids, "tailoring_concurrency")
+    running = dict(db.execute(select(TailorTask.user_id, func.count(TailorTask.id))
+                              .where(TailorTask.user_id.in_(user_ids), TailorTask.status == "running")
+                              .group_by(TailorTask.user_id)).all())
+    return {user_id: max(0, limits[user_id] - running.get(user_id, 0)) for user_id in user_ids}
 
 
 def _write(sessions: SessionFactory, task_id: int, worker_id: str, **values: Any) -> bool:

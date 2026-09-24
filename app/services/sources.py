@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import re
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 from urllib.parse import urlparse
 
@@ -12,6 +13,8 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models import Job, SearchRun
+from app.services import system_log, tracing
+from app.services.external_api import external_client
 from app.services.user_settings import apify_token
 from app.settings import get_settings
 from app.tenancy import require_user_id
@@ -51,6 +54,10 @@ def upsert_job(
             existing.description = description
             # A fuller posting is new employer text: parse it again (app.services.job_description).
             job_description.queue_parse(db, existing, reason="description_changed")
+            # A job held back for having no description can be ranked now that it has one.
+            from app.services.ranker import reopen_for_description
+
+            reopen_for_description(db, existing)
         if url:
             existing.url = url
         if raw:
@@ -78,7 +85,8 @@ def upsert_job(
 
 def import_lever(db: Session, site: str) -> dict[str, int]:
     url = f"https://api.lever.co/v0/postings/{site}?mode=json"
-    with httpx.Client(timeout=30, headers={"User-Agent": UA}) as client:
+    with external_client("JOB_BOARD", service="lever", operation="board_fetch", timeout=30,
+                         metadata={"board": site}) as client:
         resp = client.get(url)
         resp.raise_for_status()
         data = resp.json()
@@ -119,7 +127,8 @@ def import_lever(db: Session, site: str) -> dict[str, int]:
 
 def import_greenhouse(db: Session, board_token: str) -> dict[str, int]:
     url = f"https://boards-api.greenhouse.io/v1/boards/{board_token}/jobs?content=true"
-    with httpx.Client(timeout=30, headers={"User-Agent": UA}) as client:
+    with external_client("JOB_BOARD", service="greenhouse", operation="board_fetch", timeout=30,
+                         metadata={"board": board_token}) as client:
         resp = client.get(url)
         resp.raise_for_status()
         data = resp.json().get("jobs", [])
@@ -145,7 +154,8 @@ def fetch_job_page(url: str) -> str:
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"}:
         raise ValueError("Only http/https URLs are allowed")
-    with httpx.Client(timeout=25, follow_redirects=True, headers={"User-Agent": UA}) as client:
+    with external_client("WEB", service="job_posting", operation="page_fetch", timeout=25,
+                         follow_redirects=True) as client:
         resp = client.get(url)
         resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -297,6 +307,50 @@ def build_apify_input(payload: dict[str, Any]) -> dict[str, Any]:
     return actor_input
 
 
+APIFY_API = "https://api.apify.com/v2"
+# Every Apify read names the operation it is performing, so Monitoring can tell a dataset page fetch from a
+# status poll. Anything not named here is recorded under the path's first segment.
+APIFY_OPERATIONS = {"actor-runs": "actor_run_status", "datasets": "dataset_fetch", "acts": "actor_lookup",
+                    "key-value-stores": "key_value_fetch"}
+
+
+def _apify_operation(path: str) -> str:
+    return APIFY_OPERATIONS.get(path.strip("/").split("/")[0], "api_request")
+
+
+def apify_client(token: str, *, operation: str, user_id: int | None = None, metadata: dict[str, Any] | None = None,
+                 timeout: float | int = 30, json_body: bool = False):
+    """The instrumented HTTP client every Apify call uses. Telemetry comes with it; nothing else is needed."""
+    headers = {"Authorization": f"Bearer {token}"}
+    if json_body:
+        headers["Content-Type"] = "application/json"
+    return external_client("APIFY", service="apify_api", operation=operation, timeout=timeout, headers=headers,
+                           user_id=user_id, metadata=metadata or {})
+
+
+def apify_get(path: str, params: dict[str, Any] | None = None, token: str | None = None, *,
+              operation: str | None = None, metadata: dict[str, Any] | None = None) -> Any:
+    """GET an Apify API path with a user's token. All Apify reads go through here."""
+    if not token:
+        raise RuntimeError(MISSING_APIFY_TOKEN)
+    with apify_client(token, operation=operation or _apify_operation(path), metadata=metadata) as client:
+        resp = client.get(f"{APIFY_API}{path}", params=params)
+        resp.raise_for_status()
+        return resp.json()
+
+
+def apify_post(path: str, payload: dict[str, Any], token: str | None = None, *, operation: str | None = None,
+               metadata: dict[str, Any] | None = None) -> Any:
+    """POST to an Apify API path with a user's token. Starting actor runs goes through here."""
+    if not token:
+        raise RuntimeError(MISSING_APIFY_TOKEN)
+    with apify_client(token, operation=operation or "actor_run_start", metadata=metadata, json_body=True,
+                      timeout=get_settings().apify_request_timeout_seconds) as client:
+        resp = client.post(f"{APIFY_API}{path}", json=payload)
+        resp.raise_for_status()
+        return resp.json()
+
+
 def start_apify_search(db: Session, payload: dict[str, Any]) -> SearchRun:
     """Start an Actor run with the signed-in user's own Apify token."""
     settings = get_settings()
@@ -309,13 +363,9 @@ def start_apify_search(db: Session, payload: dict[str, Any]) -> SearchRun:
     # Search profiles pass an input already built for this actor's schema.
     actor_input = payload.get("actor_input") or build_apify_input(payload)
     api_actor_id = _apify_actor_api_id(actor_id)
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "User-Agent": UA,
-    }
-    with httpx.Client(timeout=30, headers=headers) as client:
-        resp = client.post(f"https://api.apify.com/v2/actors/{api_actor_id}/runs", json=actor_input)
+    with apify_client(token, operation="actor_run_start", user_id=owner, json_body=True,
+                      metadata={"actor_id": actor_id, "location": payload.get("location") or None}) as client:
+        resp = client.post(f"{APIFY_API}/actors/{api_actor_id}/runs", json=actor_input)
         resp.raise_for_status()
         run = (resp.json() or {}).get("data") or {}
 
@@ -338,29 +388,48 @@ def start_apify_search(db: Session, payload: dict[str, Any]) -> SearchRun:
     return search_run
 
 
-APIFY_API = "https://api.apify.com/v2"
+def _float(value: Any) -> float | None:
+    return None if value is None else float(value)
 
 
-def apify_get(path: str, params: dict[str, Any] | None = None, token: str | None = None) -> Any:
-    """GET an Apify API path with a user's token. All Apify reads go through here."""
-    if not token:
-        raise RuntimeError(MISSING_APIFY_TOKEN)
-    headers = {"Authorization": f"Bearer {token}", "User-Agent": UA}
-    with httpx.Client(timeout=30, headers=headers) as client:
-        resp = client.get(f"{APIFY_API}{path}", params=params)
-        resp.raise_for_status()
-        return resp.json()
+def _number(value: Any) -> float | None:
+    """A number Apify reported, or None. Never a guess: an unparsable value is simply unknown."""
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
-def apify_post(path: str, payload: dict[str, Any], token: str | None = None) -> Any:
-    """POST to an Apify API path with a user's token. Starting actor runs goes through here."""
-    if not token:
-        raise RuntimeError(MISSING_APIFY_TOKEN)
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "User-Agent": UA}
-    with httpx.Client(timeout=get_settings().apify_request_timeout_seconds, headers=headers) as client:
-        resp = client.post(f"{APIFY_API}{path}", json=payload)
-        resp.raise_for_status()
-        return resp.json()
+def apify_usage(run: dict[str, Any]) -> dict[str, Any]:
+    """The usage Apify reports for a run. Anything Apify did not return stays None — nothing is estimated."""
+    usage = run.get("usage") if isinstance(run.get("usage"), dict) else {}
+    options = run.get("options") if isinstance(run.get("options"), dict) else {}
+    stats = run.get("stats") if isinstance(run.get("stats"), dict) else {}
+    compute = _number(usage.get("ACTOR_COMPUTE_UNITS"))
+    if compute is None:
+        compute = _number(stats.get("computeUnits"))
+    return {"compute_units": compute,
+            "usage_total_usd": _number(run.get("usageTotalUsd")),
+            "memory_mb": _number(options.get("memoryMbytes")),
+            "usage_breakdown": {k: v for k, v in usage.items() if _number(v) is not None} or None}
+
+
+def apply_apify_usage(search_run: SearchRun, run: dict[str, Any]) -> None:
+    """Copy Apify's own usage figures onto the run, leaving anything it did not report untouched."""
+    reported = apify_usage(run)
+    if reported["compute_units"] is not None:
+        search_run.compute_units = reported["compute_units"]
+    if reported["usage_total_usd"] is not None:
+        search_run.usage_total_usd = Decimal(str(reported["usage_total_usd"]))
+    if reported["memory_mb"] is not None:
+        search_run.memory_mb = int(reported["memory_mb"])
+    stats = run.get("stats") if isinstance(run.get("stats"), dict) else {}
+    if reported["usage_breakdown"] or stats:
+        search_run.stats = {**(search_run.stats or {}),
+                            "apify_usage": reported["usage_breakdown"],
+                            "apify_run_stats": {k: v for k, v in stats.items() if isinstance(v, (int, float))} or None}
 
 
 def _apify_time(value: str | None) -> datetime | None:
@@ -376,7 +445,8 @@ def _actor_name(act_id: str, cache: dict[str, tuple[str, str]], token: str) -> t
     """Return (username/name, title) for an actor ID, falling back to the raw ID."""
     if act_id not in cache:
         try:
-            info = (apify_get(f"/acts/{act_id}", token=token) or {}).get("data") or {}
+            info = (apify_get(f"/acts/{act_id}", token=token, operation="actor_lookup",
+                              metadata={"actor_id": act_id}) or {}).get("data") or {}
             full = f"{info['username']}/{info['name']}" if info.get("username") and info.get("name") else act_id
             cache[act_id] = (full, info.get("title") or info.get("name") or full)
         except (httpx.HTTPError, TypeError, ValueError):
@@ -387,7 +457,8 @@ def _actor_name(act_id: str, cache: dict[str, tuple[str, str]], token: str) -> t
 def list_remote_runs(db: Session, limit: int = 20) -> list[dict[str, Any]]:
     """Recent runs in the user's Apify account, including ones started outside Job Hunt OS."""
     token = apify_token(db)
-    items = ((apify_get("/actor-runs", {"desc": 1, "limit": limit}, token=token) or {}).get("data") or {}).get("items") or []
+    items = ((apify_get("/actor-runs", {"desc": 1, "limit": limit}, token=token,
+                        operation="actor_run_list") or {}).get("data") or {}).get("items") or []
     ids = [str(item.get("id")) for item in items if item.get("id")]
     local = {r.external_run_id: r for r in db.scalars(select(SearchRun).where(SearchRun.external_run_id.in_(ids))).all()} if ids else {}
     names: dict[str, tuple[str, str]] = {}
@@ -398,7 +469,10 @@ def list_remote_runs(db: Session, limit: int = 20) -> list[dict[str, Any]]:
         count = None
         if item.get("defaultDatasetId") and item.get("status") in APIFY_TERMINAL_STATES:
             try:
-                count = ((apify_get(f"/datasets/{item['defaultDatasetId']}", token=token) or {}).get("data") or {}).get("itemCount")
+                count = ((apify_get(f"/datasets/{item['defaultDatasetId']}", token=token,
+                                    operation="dataset_info",
+                                    metadata={"dataset_id": item["defaultDatasetId"], "run_id": run_id})
+                          or {}).get("data") or {}).get("itemCount")
             except httpx.HTTPError:
                 count = None
         tracked = local.get(run_id)
@@ -419,14 +493,16 @@ def import_remote_run(db: Session, external_run_id: str, reimport: bool = False)
     token = apify_token(db, owner)
     search_run = db.scalar(select(SearchRun).where(SearchRun.user_id == owner, SearchRun.external_run_id == external_run_id))
     if not search_run:
-        run = (apify_get(f"/actor-runs/{external_run_id}", token=token) or {}).get("data") or {}
+        run = (apify_get(f"/actor-runs/{external_run_id}", token=token, operation="actor_run_status",
+                         metadata={"run_id": external_run_id}) or {}).get("data") or {}
         if not run:
             raise ValueError(f"Apify run {external_run_id} was not found")
         actor_id, _ = _actor_name(str(run.get("actId") or ""), {}, token)
         actor_input: dict[str, Any] = {}
         if run.get("defaultKeyValueStoreId"):
             try:
-                record = apify_get(f"/key-value-stores/{run['defaultKeyValueStoreId']}/records/INPUT", token=token)
+                record = apify_get(f"/key-value-stores/{run['defaultKeyValueStoreId']}/records/INPUT",
+                                   token=token, operation="run_input_fetch", metadata={"run_id": external_run_id})
                 actor_input = record if isinstance(record, dict) else {}
             except (httpx.HTTPError, ValueError):
                 actor_input = {}
@@ -445,7 +521,6 @@ def refresh_apify_run(db: Session, search_run: SearchRun, reimport: bool = False
 
     Uses the Apify token of the account that owns the run, so the scheduler can sync every account's runs.
     """
-    settings = get_settings()
     if search_run.provider != "apify":
         raise ValueError("Search run is not an Apify run")
     if search_run.adapter:  # a Hunter run: its actor's adapter normalizes and deduplicates the dataset
@@ -458,10 +533,20 @@ def refresh_apify_run(db: Session, search_run: SearchRun, reimport: bool = False
     if not token:
         raise RuntimeError("The account that started this search has no Apify API token")
 
-    run = (apify_get(f"/actor-runs/{search_run.external_run_id}", token=token) or {}).get("data") or {}
+    with tracing.trace("apify_sync", workflow_type="system", user_id=search_run.user_id):
+        return _refresh_apify_run(db, search_run, token, reimport=reimport)
+
+
+def _refresh_apify_run(db: Session, search_run: SearchRun, token: str, reimport: bool = False) -> dict[str, Any]:
+    settings = get_settings()
+    run_meta = {"run_id": search_run.external_run_id, "actor_id": search_run.actor_id,
+                "saved_search_id": search_run.saved_search_id, "search_profile_id": search_run.search_profile_id}
+    run = (apify_get(f"/actor-runs/{search_run.external_run_id}", token=token, operation="actor_run_status",
+                     metadata=run_meta) or {}).get("data") or {}
     status = str(run.get("status") or search_run.status)
     search_run.status = status
     search_run.dataset_id = str(run.get("defaultDatasetId") or search_run.dataset_id or "")
+    apply_apify_usage(search_run, run)
 
     import_stats = None
     finished = status in APIFY_TERMINAL_STATES
@@ -472,7 +557,9 @@ def refresh_apify_run(db: Session, search_run: SearchRun, reimport: bool = False
         if search_run.dataset_id:
             try:
                 payload = apify_get(f"/datasets/{search_run.dataset_id}/items",
-                                    {"format": "json", "clean": "true", "limit": settings.apify_dataset_limit}, token=token)
+                                    {"format": "json", "clean": "true", "limit": settings.apify_dataset_limit},
+                                    token=token, operation="dataset_fetch",
+                                    metadata={**run_meta, "dataset_id": search_run.dataset_id})
                 items = payload.get("items", []) if isinstance(payload, dict) else payload
             except httpx.HTTPError:
                 if status == "SUCCEEDED":
@@ -487,9 +574,19 @@ def refresh_apify_run(db: Session, search_run: SearchRun, reimport: bool = False
                                           user_id=search_run.user_id)
         search_run.item_count = import_stats["seen"]
         search_run.created_jobs = db.scalar(select(func.count(Job.id)).where(Job.search_run_id == search_run.id)) or 0
+        # What the run actually produced, for the Apify tab: found → normalized → kept after deduplication.
+        search_run.stats = {**(search_run.stats or {}), "import": import_stats}
         if status != "SUCCEEDED":
             search_run.error = str(run.get("statusMessage") or run.get("errorMessage") or status)[:2000]
         search_run.completed_at = search_run.completed_at or datetime.now(UTC).replace(tzinfo=None)
+        system_log.log_event(
+            category="APIFY", level="INFO" if status == "SUCCEEDED" else "WARNING",
+            message=f"Apify run {search_run.external_run_id} {status.lower()}: "
+                    f"{import_stats['seen']} found, {import_stats.get('created', 0)} new",
+            provider="APIFY", operation="dataset_import", status=status, user_id=search_run.user_id,
+            entity_type="search_run", entity_id=search_run.id,
+            details={"actor_id": search_run.actor_id, **import_stats,
+                     "compute_units": search_run.compute_units, "usage_total_usd": _float(search_run.usage_total_usd)})
 
     db.commit()
     db.refresh(search_run)

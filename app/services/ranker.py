@@ -55,7 +55,7 @@ from app.prompts.ranking import (
     posting_facts,
     ranking_profile_facts,
 )
-from app.services import job_description
+from app.services import backoff, job_description, user_settings
 from app.services.context_builder import build_ranking_context, latest_ranking_context_hash
 from app.services.lifecycle import ErrorCategory, InvalidTransition
 from app.services.lifecycle import WorkflowState as S
@@ -175,6 +175,32 @@ def normalization_problem(job: Job) -> str | None:
     return None
 
 
+NO_DESCRIPTION = "The posting has no job description yet"
+
+
+def description_text(job: Job) -> str:
+    """The posting's own words, whichever form of them the ranker would actually read."""
+    return ((job.normalized_description or job.description or "") or "").strip()
+
+
+def missing_description(job: Job, minimum: int | None = None) -> bool:
+    """True when there is not enough of a posting to rank honestly.
+
+    Some boards (Naukri and Bayt among them) list jobs with no description at all, or with a line or two of
+    boilerplate. Ranking those means scoring a job title, which produces a confident number about nothing —
+    so they are held back instead. A parsed structured description counts as a description: the parser only
+    produces one from real text.
+    """
+    if job.structured_description:
+        return False
+    floor = get_settings().ranking_min_description_chars if minimum is None else minimum
+    text = description_text(job)
+    if len(text) >= max(0, floor):
+        return False
+    # A "description" that only repeats the title and company says nothing the ranker does not already know.
+    return True
+
+
 def known_annual_salary(job: Job) -> tuple[float, str | None] | None:
     """The yearly salary the posting states, from the board's fields or salary enrichment. None when unknown."""
     high, currency, period = job.salary_max or job.salary_min, job.salary_currency, job.salary_interval
@@ -229,12 +255,26 @@ def prepare(db: Session, job: Job, policy: RankingPolicy, *, actor: str, now: da
             return problem
         transition(db, job, S.NORMALIZED, actor=actor, reason="Title and company present", now=now)
     if job.state is S.NORMALIZED:
+        if missing_description(job):
+            # Not a verdict on the job, just on what arrived: it goes back into the queue if a description does
+            # (app.services.sources.upsert_job, or a description added by hand).
+            transition(db, job, S.SKIPPED, actor=actor, reason=NO_DESCRIPTION, now=now)
+            return NO_DESCRIPTION
         reason = hard_filter_reason(job, policy)
         if reason:
             transition(db, job, S.SKIPPED, actor=actor, reason=reason, now=now)
             return reason
         transition(db, job, S.FILTERED, actor=actor, reason="Passed hard filters", now=now)
     return None
+
+
+def reopen_for_description(db: Session, job: Job, *, actor: str = "ranker", now: datetime | None = None) -> bool:
+    """Put a job skipped for want of a description back in the queue now that it has one. Does not commit."""
+    if job.state is not S.SKIPPED or job.previous_state is not S.NORMALIZED or missing_description(job):
+        return False
+    transition(db, job, S.NORMALIZED, actor=actor, now=now,
+               reason="A job description arrived, so it can be ranked after all")
+    return True
 
 
 # ───────────── queueing ─────────────
@@ -345,7 +385,7 @@ def auto_rank_on(db: Session, user_id: int) -> bool:
     return bool(search.get("auto_rank", True))
 
 
-def accounts(db: Session) -> tuple[list[int], list[int], dict[str, int]]:
+def accounts(db: Session, now: datetime | None = None) -> tuple[list[int], list[int], dict[str, int]]:
     """Accounts with waiting tasks: those that can be ranked, those with auto-ranking on, and why others wait."""
     owners = db.scalars(select(JobRankingTask.user_id).where(JobRankingTask.status == PENDING).distinct()).all()
     ready, auto, waiting = [], [], Counter()
@@ -354,12 +394,36 @@ def accounts(db: Session) -> tuple[list[int], list[int], dict[str, int]]:
         if problem:
             waiting[problem] += 1
             continue
+        if next_run_at(db, user_id, now=now) is not None:
+            waiting["Waiting for this account's next ranking run"] += 1
+            continue
         ready.append(user_id)
         if auto_rank_on(db, user_id):
             auto.append(user_id)
         else:
             waiting["Auto-ranking is off (only rankings you request run)"] += 1
     return ready, auto, dict(waiting)
+
+
+def last_ranking_start(db: Session, user_id: int) -> datetime | None:
+    """When this account last started ranking something."""
+    return db.scalar(select(func.max(JobRankingTask.started_at)).where(JobRankingTask.user_id == user_id))
+
+
+def next_run_at(db: Session, user_id: int, now: datetime | None = None) -> datetime | None:
+    """When this account may rank again, or None when it may rank now.
+
+    The server looks every RANKING_INTERVAL_MINUTES; an account can ask to be looked at less often than that
+    (Settings → Workflow & cadence), which spreads the same queue over a longer stretch.
+    """
+    minutes = user_settings.ranking_interval_minutes(db, user_id)
+    if minutes <= 0:
+        return None
+    started = last_ranking_start(db, user_id)
+    if started is None:
+        return None
+    due = started + timedelta(minutes=minutes)
+    return due if due > (now or utcnow()) else None
 
 
 def resume_snapshot(db: Session, profile: CandidateProfile, now: datetime | None = None) -> ResumeVersion:
@@ -535,6 +599,10 @@ def claim(db: Session, *, worker_id: str, limit: int, ready_accounts: Iterable[i
     Two workers never receive the same task: rows are locked with FOR UPDATE SKIP LOCKED inside the claim, and the
     lease written to the task keeps other workers away afterwards. User-requested (forced) tasks go first and run
     even when auto-ranking is off.
+
+    Each account also has its own concurrency limit (Settings → Workflow & cadence). Tasks past an account's
+    limit are left PENDING — untouched and first in line next run — so one account with hundreds of queued jobs
+    cannot take the whole batch.
     """
     _require_postgres(db)
     if limit < 1:
@@ -556,8 +624,11 @@ def claim(db: Session, *, worker_id: str, limit: int, ready_accounts: Iterable[i
         .with_for_update(skip_locked=True, of=JobRankingTask)
         .execution_options(populate_existing=True)
     ).all()
+    quota = _account_quota(db, {task.user_id for task in tasks}, now)
     claims = []
     for task in tasks:
+        if quota[task.user_id] <= 0:
+            continue  # this account is already running as many rankings at once as it allows
         job = _lock_job(db, task.job_id)
         if job is None:
             continue  # the job row is busy (e.g. an import is merging into it); try again next round
@@ -570,10 +641,24 @@ def claim(db: Session, *, worker_id: str, limit: int, ready_accounts: Iterable[i
         task.lock_token, task.lock_expires_at = uuid.uuid4().hex, now + lease
         task.attempt_count += 1
         task.last_attempt_at, task.started_at, task.next_attempt_at = now, now, None
+        quota[task.user_id] -= 1
         claims.append(TaskClaim(task.id, task.job_id, task.user_id, task.lock_token, task.locked_by, task.attempt_count,
                                 task.force, task.lock_expires_at))
     db.commit()
     return claims
+
+
+def _account_quota(db: Session, user_ids: set[int], now: datetime) -> dict[int, int]:
+    """How many more rankings each account may start: its own limit less what it already has running."""
+    if not user_ids:
+        return {}
+    limits = user_settings.limits_for(db, user_ids, "ranking_concurrency")
+    running = dict(db.execute(select(JobRankingTask.user_id, func.count(JobRankingTask.id))
+                              .where(JobRankingTask.user_id.in_(user_ids), JobRankingTask.status == PROCESSING,
+                                     or_(JobRankingTask.lock_expires_at.is_(None),
+                                         JobRankingTask.lock_expires_at > now))
+                              .group_by(JobRankingTask.user_id)).all())
+    return {user_id: max(0, limits[user_id] - running.get(user_id, 0)) for user_id in user_ids}
 
 
 def _owned(db: Session, claimed: TaskClaim) -> tuple[JobRankingTask, Job | None]:
@@ -603,6 +688,11 @@ def classify(exc: Exception) -> tuple[ErrorCategory, bool, bool]:
     return ErrorCategory.UNKNOWN, True, False
 
 
+def llm_provider_for(db: Session, user_id: int | None) -> str:
+    """The provider name this account's model calls are recorded under (app.services.external_api)."""
+    return (user_settings.ai_overrides(db, user_id).get("llm_provider") or get_settings().llm_provider or "").upper()
+
+
 def retry_delay(attempt: int) -> timedelta:
     settings = get_settings()
     seconds = settings.ranking_retry_base_seconds * 2 ** max(0, attempt - 1)
@@ -619,6 +709,11 @@ def _retry_or_fail(db: Session, task: JobRankingTask, job: Job | None, category:
         job.last_error, job.error_category = message, category
     if retryable and task.attempt_count < get_settings().ranking_max_attempts:
         task.status, task.next_attempt_at = PENDING, now + retry_delay(task.attempt_count)
+        if category is ErrorCategory.RATE_LIMITED:
+            # No point trying again before the provider will serve this account at all (app.services.backoff).
+            cooling = backoff.cooling_until(task.user_id, llm_provider_for(db, task.user_id), now=now)
+            if cooling is not None and cooling > task.next_attempt_at:
+                task.next_attempt_at = cooling
         if job is not None and job.state is S.RANKING:
             transition(db, job, S.RANK_PENDING, actor=actor, now=now,
                        reason=f"Attempt {task.attempt_count} failed ({category.value}); will retry: {message[:300]}")
@@ -1020,6 +1115,62 @@ TRACKER_WINDOW = timedelta(hours=24)
 TRACKER_LIMIT = 200
 
 
+def _typical_ranking_seconds(db: Session, user_id: int, since: datetime) -> int | None:
+    """How long a ranking has actually been taking for this account, from finished tasks. None until some have."""
+    durations = db.execute(
+        select(JobRankingTask.started_at, JobRankingTask.completed_at)
+        .where(JobRankingTask.user_id == user_id, JobRankingTask.status == COMPLETED,
+               JobRankingTask.completed_at >= since, JobRankingTask.started_at.is_not(None))
+        .order_by(JobRankingTask.completed_at.desc()).limit(50)).all()
+    seconds = sorted((completed - started).total_seconds() for started, completed in durations
+                     if completed >= started)
+    if not seconds:
+        return None
+    return max(1, round(seconds[len(seconds) // 2]))  # the median, so one stuck task does not skew the estimate
+
+
+# What a job waiting to be ranked has got through so far. Ranking itself is one model call, so the bar moves on
+# stages we can actually observe rather than on a guess at how far into the call it is.
+RANK_STAGES = {"waiting": ("Waiting its turn", 5), "queued": ("Queued", 25), "retry": ("Waiting to retry", 15),
+               "ranking": ("Ranking", 60), "done": ("Finished", 100)}
+RANKING_CEILING = 95  # a running ranking never shows as finished until it is
+
+
+def _with_progress(task: dict[str, Any], place: int, *, now: datetime, concurrency: int,
+                   typical_seconds: int | None) -> dict[str, Any]:
+    """Where this task is in the queue, how far along it is, and when it should start.
+
+    The estimate only exists once this account has finished some rankings: with nothing measured, `eta_seconds`
+    stays None rather than inventing a number.
+    """
+    running = task["status"] == PROCESSING
+    retrying = not running and task["next_attempt_at"] is not None and _parse(task["next_attempt_at"]) > now
+    stage = "ranking" if running else "retry" if retrying else "queued" if place < concurrency else "waiting"
+    label, percent = RANK_STAGES[stage]
+    elapsed = None
+    if running and task["started_at"]:
+        elapsed = max(0.0, (now - _parse(task["started_at"])).total_seconds())
+        if typical_seconds:
+            # Between the stage floor and the ceiling, in proportion to how long a ranking usually takes.
+            percent = min(RANKING_CEILING, round(percent + (RANKING_CEILING - percent) * min(1.0, elapsed / typical_seconds)))
+    eta = None
+    if running and typical_seconds:
+        eta = max(0, round(typical_seconds - (elapsed or 0)))
+    elif not running and not retrying and typical_seconds:
+        # With `concurrency` rankings at a time, the job in position p starts after p // concurrency waves,
+        # each taking about as long as this account's recent rankings did.
+        eta = round((place // max(1, concurrency)) * typical_seconds)
+    elif retrying:
+        eta = max(0, round((_parse(task["next_attempt_at"]) - now).total_seconds()))
+    return {**task, "queue_position": place + 1, "stage": stage, "stage_label": label,
+            "percent": percent, "elapsed_seconds": None if elapsed is None else round(elapsed),
+            "eta_seconds": eta}
+
+
+def _parse(value: str) -> datetime:
+    return datetime.fromisoformat(value)
+
+
 def tracker(db: Session, user_id: int, now: datetime | None = None) -> dict[str, Any]:
     """Where the account's ranking work stands: waiting, running, retrying and finished in the last day.
 
@@ -1040,6 +1191,13 @@ def tracker(db: Session, user_id: int, now: datetime | None = None) -> dict[str,
         "retry_scheduled": count(JobRankingTask.status == PENDING, not_due, JobRankingTask.attempt_count > 0),
         "waiting": count(JobRankingTask.status == PENDING, not_due, JobRankingTask.attempt_count == 0),
         "processing": count(JobRankingTask.status == PROCESSING),
+        # Postings held back for want of a description: skipped before ranking, with nothing to read. The
+        # parse timestamp is the test for structure — a JSON column holds 'null', not SQL NULL, when empty.
+        "no_description": db.scalar(select(func.count(Job.id)).where(
+            Job.user_id == user_id, Job.state == S.SKIPPED, Job.previous_state == S.NORMALIZED,
+            Job.structured_description_parsed_at.is_(None),
+            func.length(func.coalesce(func.nullif(Job.normalized_description, ""), Job.description, "")) <
+            get_settings().ranking_min_description_chars)) or 0,
         "completed": count(JobRankingTask.status == COMPLETED, JobRankingTask.completed_at >= since),
         "failed": count(JobRankingTask.status == FAILED, JobRankingTask.completed_at >= since),
         "skipped": count(JobRankingTask.status == SKIPPED, JobRankingTask.completed_at >= since),
@@ -1074,8 +1232,12 @@ def tracker(db: Session, user_id: int, now: datetime | None = None) -> dict[str,
         # Ranking now, then due in claim order (user requests first), then retries and waits by when they are due.
         return (task.status != PROCESSING, due_later, not task.force, task.next_attempt_at or task.created_at, task.id)
 
-    active = [row_dict(*row) for row in sorted((row for row in rows if row[0].status in ACTIVE_RANKING_TASK_STATUSES),
-                                               key=active_order)][:TRACKER_LIMIT]
+    limits = user_settings.processing_limits(db, user_id)
+    limit = limits["ranking_concurrency"]
+    typical = _typical_ranking_seconds(db, user_id, since)
+    active = [_with_progress(row_dict(*row), place, now=now, concurrency=limit, typical_seconds=typical)
+              for place, row in enumerate(sorted((row for row in rows if row[0].status in ACTIVE_RANKING_TASK_STATUSES),
+                                                 key=active_order))][:TRACKER_LIMIT]
     recent = [row_dict(*row) for row in rows if row[0].status not in ACTIVE_RANKING_TASK_STATUSES][:TRACKER_LIMIT]
     decisions = Counter(r["ranking"]["decision"] for r in recent if r["ranking"])
     in_flight = counts["queued"] + counts["retry_scheduled"] + counts["waiting"] + counts["processing"]
@@ -1086,6 +1248,11 @@ def tracker(db: Session, user_id: int, now: datetime | None = None) -> dict[str,
         "auto_rank": auto_rank_on(db, user_id),
         "counts": {**counts, "qualified": decisions.get("QUALIFIED", 0), "archived": decisions.get("ARCHIVED", 0)},
         "progress": {"finished": finished, "total": finished + in_flight},
+        "concurrency": limit,
+        "interval_minutes": limits["ranking_interval_minutes"],
+        "next_run_at": _iso(next_run_at(db, user_id, now=now)),
+        "typical_seconds": typical,
+        "in_flight": in_flight,
         "active": active,
         "recent": recent,
     }

@@ -22,7 +22,7 @@ from bs4 import BeautifulSoup
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, field_validator, model_validator
-from sqlalchemy import and_, desc, func, or_, select
+from sqlalchemy import and_, desc, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.auth import get_user_db
@@ -36,6 +36,7 @@ from app.models import (
     KnowledgeAnswer,
     ResumeDocument,
     ResumeVariant,
+    SavedSearch,
     SearchRun,
 )
 from app.prompts import build_evidence_extraction_prompt
@@ -69,10 +70,14 @@ from app.services.contacts import (
     to_utc,
     zone,
 )
+from app.services.external_api import external_client
+from app.services.lifecycle import WorkflowState as S
+from app.services.lifecycle import can_transition
 from app.services.llm import LLMCall, LLMClient
 from app.services.resume_format import flatten_links, unbold
+from app.services.saved_searches import SCHEDULE_KINDS, next_due, schedule_label, schedule_problems
 from app.services.sources import (
-    UA,
+    apify_client,
     import_remote_run,
     list_remote_runs,
     refresh_apify_run,
@@ -80,6 +85,7 @@ from app.services.sources import (
     upsert_job,
 )
 from app.services.user_settings import apify_token, lock_settings_row, settings_for
+from app.services.work_queue import transition
 from app.services.workflow import (
     AWAITING_TAILORING_STATUSES,
     NEEDS_RETAILOR,
@@ -189,6 +195,7 @@ def job_card(job: Job) -> dict:
         "snippet": (job.description or "")[:360], "agency": is_agency(job.company),
         "search_run_id": job.search_run_id, "application_id": app.id if app else None,
         "application_status": app.status if app else None, "stage": app.stage if app else None,
+        "rejection": rejection_card(job),
     }
 
 
@@ -218,11 +225,20 @@ def live_apps(db: Session) -> list[Application]:
     return db.scalars(select(Application).where(Application.applied_at.is_not(None))).all()
 
 
+def scheduled_searches(db: Session) -> dict:
+    """What the sidebar's auto-search card says: how many setups run on their own, and how wide they search."""
+    setups = db.scalars(select(SavedSearch).where(SavedSearch.enabled.is_(True),
+                                                  SavedSearch.schedule_kind != "manual")).all()
+    return {"schedule": "daily" if setups else "manual", "setups": len(setups),
+            "next_run": next(iter(sorted(s.next_run_at.isoformat() for s in setups if s.next_run_at)), None),
+            "roles": len({role for s in setups for role in (s.settings or {}).get("roles") or []}),
+            "locations": len({place for s in setups for place in (s.settings or {}).get("locations") or []})}
+
+
 @router.get("/api/workspace/summary")
 def summary(db: Session = Depends(get_user_db)):
     row = setting_row(db)
     profile = get_profile(db)
-    sp = search_prefs(db).get("search_profile") or {}
     apps = live_apps(db)
     live = [a for a in apps if (a.stage or "applied") not in INACTIVE_STAGES]
     tailor_count = db.scalar(select(func.count(Job.id)).where(Job.status.in_(AWAITING_TAILORING_STATUSES),
@@ -234,8 +250,7 @@ def summary(db: Session = Depends(get_user_db)):
                    "tailor": tailor_count, "approvals": len(approval_jobs(db)), "tracker": len(live)},
         "profile": {"name": profile.name, "headline": profile.headline},
         "llm_provider": row.llm_provider, "model": row.model, "application_mode": row.application_mode,
-        "auto_search": {"schedule": sp.get("schedule", "manual"), "roles": len(sp.get("roles") or []),
-                        "locations": len(sp.get("locations") or []),
+        "auto_search": {**scheduled_searches(db),
                         "last_run": last_run.created_at.isoformat() if last_run else None,
                         "last_run_status": last_run.status if last_run else None},
         "total_jobs": db.scalar(select(func.count(Job.id))) or 0,
@@ -628,7 +643,8 @@ def job_from_url(payload: JobUrlIn, db: Session = Depends(get_user_db)):
     if not (data["title"] and data["company"] and data["description"]):
         _safe_public_url(payload.url)
         try:
-            with httpx.Client(timeout=20, follow_redirects=True, headers={"User-Agent": UA}) as client:
+            with external_client("WEB", service="job_posting", operation="page_fetch", timeout=20,
+                                 follow_redirects=True) as client:
                 resp = client.get(payload.url)
                 resp.raise_for_status()
             extracted = extract_job_posting(resp.text)
@@ -750,9 +766,9 @@ def lookup_actor(payload: ActorLookupIn, db: Session = Depends(get_user_db)):
     if not token:
         raise HTTPException(400, "Add your Apify API token in Settings to look actors up")
     api_id = payload.id.replace("/", "~")
-    headers = {"Authorization": f"Bearer {token}", "User-Agent": UA}
     try:
-        with httpx.Client(timeout=20, headers=headers) as client:
+        with apify_client(token, operation="actor_lookup", timeout=20,
+                          metadata={"actor_id": payload.id}) as client:
             actor = client.get(f"https://api.apify.com/v2/acts/{api_id}")
             if actor.status_code == 404:
                 raise HTTPException(404, f"No Apify actor named '{payload.id}'")
@@ -783,16 +799,21 @@ def lookup_actor(payload: ActorLookupIn, db: Session = Depends(get_user_db)):
             "input_template": template}
 
 
-@router.get("/api/search/profile")
-def search_profile_get(db: Session = Depends(get_user_db)):
+def board_yield(db: Session) -> dict[str, int | None]:
+    """Jobs kept per 100 found, per board, over the last 30 days — the number under each board checkbox."""
     since = utcnow() - timedelta(days=30)
     jobs = db.scalars(select(Job).where(Job.discovered_at >= since, Job.source.like("apify:%"))).all()
-    stats = {}
+    stats: dict[str, int | None] = {}
     for site in BOARDS:
         mine = [j for j in jobs if j.source == f"apify:{site}"]
         kept = [j for j in mine if j.status not in ("discovered", "archived", "dismissed")]
         stats[site] = round(100 * len(kept) / len(mine)) if mine else None
-    return {"profile": get_search_profile(db), "board_yield": stats,
+    return stats
+
+
+@router.get("/api/search/profile")
+def search_profile_get(db: Session = Depends(get_user_db)):
+    return {"profile": get_search_profile(db), "board_yield": board_yield(db),
             "apify_configured": bool(apify_token(db)), "actor_id": get_settings().apify_actor_id}
 
 
@@ -841,6 +862,195 @@ def search_profile_run(db: Session = Depends(get_user_db)):
         raise HTTPException(400, str(exc)) from exc
     return {"runs": [{"id": r.id, "status": r.status, "actor_id": getattr(r, "actor_id", ""),
                       "location": (r.input_json or {}).get("location", "")} for r in runs], "warnings": warnings}
+
+
+# ───────────── saved search setups ─────────────
+
+DEFAULT_SETUP_NAME = "My search"
+MIGRATED_KEY = "search_profile_migrated"
+
+
+class SavedSearchIn(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    settings: SearchProfileIn
+    schedule_kind: str = "manual"
+    every_hours: int = Field(default=24, ge=1, le=168)
+    time_of_day: str = Field(default="07:00", max_length=5)
+    weekdays: list[int] = Field(default_factory=list, max_length=7)
+    timezone: str = Field(default="UTC", max_length=60)
+    enabled: bool = True
+
+    @field_validator("name")
+    @classmethod
+    def _trim_name(cls, value: str) -> str:
+        name = value.strip()
+        if not name:
+            raise ValueError("Give the setup a name")
+        return name
+
+
+def validate_saved_search(payload: SavedSearchIn) -> None:
+    validate_search_profile(payload.settings)
+    problems = schedule_problems(payload)
+    if problems:
+        raise HTTPException(422, "; ".join(problems))
+
+
+def saved_search_card(setup: SavedSearch) -> dict:
+    return {"id": setup.id, "name": setup.name, "settings": setup.settings,
+            "schedule_kind": setup.schedule_kind, "every_hours": setup.every_hours,
+            "time_of_day": setup.time_of_day, "weekdays": setup.weekdays or [], "timezone": setup.timezone,
+            "enabled": setup.enabled, "schedule_label": schedule_label(setup),
+            "last_run_at": setup.last_run_at.isoformat() if setup.last_run_at else None,
+            "next_run_at": setup.next_run_at.isoformat() if setup.next_run_at else None}
+
+
+def apply_saved_search(setup: SavedSearch, payload: SavedSearchIn) -> SavedSearch:
+    """Copy a validated payload onto a setup and work out when it next comes due."""
+    setup.name = payload.name
+    setup.settings = payload.settings.model_dump()
+    setup.schedule_kind = payload.schedule_kind
+    setup.every_hours = payload.every_hours
+    setup.time_of_day = payload.time_of_day
+    setup.weekdays = sorted({d for d in payload.weekdays if 0 <= d <= 6})
+    setup.timezone = payload.timezone
+    setup.enabled = payload.enabled
+    setup.next_run_at = next_due(setup, utcnow())
+    return setup
+
+
+def ensure_saved_searches(db: Session) -> list[SavedSearch]:
+    """This account's setups, moving its one older search profile into a setup the first time."""
+    setups = list(db.scalars(select(SavedSearch).order_by(SavedSearch.id)).all())
+    profile = get_profile(db)
+    prefs = dict(profile.search_preferences or {})
+    if setups or prefs.get(MIGRATED_KEY):
+        return setups
+    legacy = get_search_profile(db)
+    daily = legacy.get("schedule") == "daily"
+    setup = SavedSearch(name=DEFAULT_SETUP_NAME, settings=legacy, schedule_kind="daily" if daily else "manual",
+                        every_hours=24, time_of_day="07:00", weekdays=[], timezone="UTC", enabled=True)
+    setup.next_run_at = next_due(setup, utcnow())
+    db.add(setup)
+    prefs[MIGRATED_KEY] = True
+    profile.search_preferences = prefs
+    db.commit()
+    return [setup]
+
+
+def get_setup(db: Session, setup_id: int) -> SavedSearch:
+    setup = db.get(SavedSearch, setup_id)
+    if not setup:
+        raise HTTPException(404, "Saved search not found")
+    return setup
+
+
+def reject_duplicate_name(db: Session, name: str, keep: int | None = None) -> None:
+    clash = db.scalar(select(SavedSearch.id).where(func.lower(SavedSearch.name) == name.lower(),
+                                                   SavedSearch.id != (keep or -1)))
+    if clash:
+        raise HTTPException(409, f"You already have a setup named '{name}'")
+
+
+@router.get("/api/search/setups")
+def saved_searches_list(db: Session = Depends(get_user_db)):
+    setups = ensure_saved_searches(db)
+    return {"setups": [saved_search_card(s) for s in setups], "apify_configured": bool(apify_token(db)),
+            "board_yield": board_yield(db), "schedule_kinds": list(SCHEDULE_KINDS)}
+
+
+@router.post("/api/search/setups")
+def saved_search_create(payload: SavedSearchIn, db: Session = Depends(get_user_db)):
+    validate_saved_search(payload)
+    reject_duplicate_name(db, payload.name)
+    setup = apply_saved_search(SavedSearch(), payload)
+    db.add(setup)
+    db.commit()
+    return {"setup": saved_search_card(setup)}
+
+
+@router.put("/api/search/setups/{setup_id}")
+def saved_search_update(setup_id: int, payload: SavedSearchIn, db: Session = Depends(get_user_db)):
+    setup = get_setup(db, setup_id)
+    validate_saved_search(payload)
+    reject_duplicate_name(db, payload.name, keep=setup.id)
+    apply_saved_search(setup, payload)
+    db.commit()
+    return {"setup": saved_search_card(setup)}
+
+
+@router.delete("/api/search/setups/{setup_id}")
+def saved_search_delete(setup_id: int, db: Session = Depends(get_user_db)):
+    setup = get_setup(db, setup_id)
+    db.delete(setup)
+    db.commit()
+    return {"deleted": setup_id}
+
+
+@router.post("/api/search/setups/{setup_id}/duplicate")
+def saved_search_duplicate(setup_id: int, db: Session = Depends(get_user_db)):
+    setup = get_setup(db, setup_id)
+    taken = {name.lower() for name in db.scalars(select(SavedSearch.name)).all()}
+    name = next(candidate for candidate in (f"{setup.name[:110]} copy", *(f"{setup.name[:108]} copy {n}" for n in range(2, 50)))
+                if candidate.lower() not in taken)
+    copy = SavedSearch(name=name, settings=dict(setup.settings or {}), schedule_kind=setup.schedule_kind,
+                       every_hours=setup.every_hours, time_of_day=setup.time_of_day,
+                       weekdays=list(setup.weekdays or []), timezone=setup.timezone, enabled=setup.enabled)
+    copy.next_run_at = next_due(copy, utcnow())
+    db.add(copy)
+    db.commit()
+    return {"setup": saved_search_card(copy)}
+
+
+def start_saved_search(db: Session, setup: SavedSearch, now: datetime) -> list[SearchRun]:
+    """Start one setup's actor runs and tie them back to it, so the runs list can say where they came from."""
+    runs = run_search_profile(db, setup.settings or {})
+    for run in runs:
+        run.saved_search_id = setup.id
+    setup.last_run_at = now
+    db.commit()
+    return runs
+
+
+@router.post("/api/search/setups/{setup_id}/run")
+def saved_search_run(setup_id: int, db: Session = Depends(get_user_db)):
+    setup = get_setup(db, setup_id)
+    sp = setup.settings or {}
+    try:
+        runs = start_saved_search(db, setup, utcnow())
+        _, warnings = plan_runs(sp)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"runs": [{"id": r.id, "status": r.status, "actor_id": getattr(r, "actor_id", ""),
+                      "location": (r.input_json or {}).get("location", "")} for r in runs],
+            "warnings": warnings, "setup": saved_search_card(setup)}
+
+
+def run_due_saved_searches(db: Session, owner: int, now: datetime, force: bool = False) -> dict[str, list]:
+    """Start the account's enabled setups that are due. The guarded UPDATE makes each start happen once."""
+    ensure_saved_searches(db)
+    due = or_(SavedSearch.next_run_at.is_(None), SavedSearch.next_run_at <= now)
+    scheduled = SavedSearch.schedule_kind != "manual"
+    conditions = [SavedSearch.user_id == owner, SavedSearch.enabled.is_(True), scheduled]
+    setups = db.scalars(select(SavedSearch).where(*conditions, *([] if force else [due])).order_by(SavedSearch.id)).all()
+    run_ids, errors = [], []
+    for setup in setups:
+        following = next_due(setup, now) or now + timedelta(hours=24)
+        claimed = db.execute(update(SavedSearch).where(SavedSearch.id == setup.id, *conditions,
+                                                       *([] if force else [due]))
+                             .values(last_run_at=now, next_run_at=following)
+                             .execution_options(synchronize_session=False)).rowcount
+        db.commit()
+        if not claimed:
+            continue  # another instance started it
+        try:
+            run_ids += [run.id for run in start_saved_search(db, setup, now)]
+        except Exception as exc:  # one setup failing must not stop the others
+            db.rollback()
+            errors.append({"saved_search_id": setup.id, "error": f"{type(exc).__name__}: {exc}"[:300]})
+    return {"run_ids": run_ids, "errors": errors}
 
 
 @router.get("/api/search/apify/runs/{run_id}/detail")
@@ -1034,7 +1244,8 @@ def approvals(q: str = "", min_fit: int = 0, min_review: int = 0, board: str = "
         age = (f"approved {day_label(app.approved_at)}" if job.status == "approved" and app and app.approved_at
                else "sent back" if job.status in ("pending_approval", "rejected") else f"tailored {ago(resume.created_at) if resume else ''}")
         rows.append({**job_card(job), "reviewer_score": resume.reviewer_score if resume else None, "age": age,
-                     "waiting": job.status == "tailored"})
+                     "waiting": job.status == "tailored",
+                     "approval_override": bool(app.approval_override) if app else False})
     rows.sort(key=lambda r: (not r["waiting"], r["status"] == "approved"))
     return filter_packet_rows(rows, q=q, min_fit=min_fit, min_review=min_review, board=board, status=status, sort=sort,
                               status_filters=APPROVAL_STATUS_FILTERS, with_facets=with_facets)
@@ -1065,6 +1276,8 @@ def approval_detail(job_id: int, db: Session = Depends(get_user_db)):
         ]
     app = job.application
     return {**data, "checklist": checklist, "notes": app.notes if app else "", "application_id": app.id if app else None,
+            "approval": {"override": bool(app.approval_override), "note": app.approval_note or ""} if app else None,
+            "rejection_reasons": [{"id": key, "label": label} for key, label in REJECTION_REASONS.items()],
             "profile": {"name": profile.name, "headline": profile.headline, "location": profile.location},
             "answers": [{"id": a.id, "question": a.question, "answer": a.answer, "verified": a.verified,
                          "sensitive": a.sensitive, "category": a.category} for a in answers[:6]]}
@@ -1072,6 +1285,74 @@ def approval_detail(job_id: int, db: Session = Depends(get_user_db)):
 
 class NotesIn(BaseModel):
     notes: str = ""
+
+
+# Why a candidate turns a job down. The reason is optional: rejecting with none is one click, and the label is
+# only for the screen — nothing here changes how a job is ranked.
+REJECTION_REASONS = {
+    "compensation": "Pay too low",
+    "location": "Location or remote policy",
+    "seniority": "Wrong seniority",
+    "role_mismatch": "Role is not what I want",
+    "company": "Not interested in the company",
+    "tech_stack": "Technology or domain",
+    "no_longer_open": "Posting closed or filled",
+    "applied_elsewhere": "Already applied or in process",
+    "other": "Other",
+}
+# Rejecting is for jobs that have not been submitted. Once an application is out, the tracker records the
+# outcome instead (app.workspace tracker stages), so nothing here can rewrite that history.
+SUBMITTED_STATUSES = ("applied",)
+
+
+class RejectionIn(BaseModel):
+    reason: str = ""  # one of REJECTION_REASONS, or empty to reject without giving a reason
+    notes: str = Field(default="", max_length=2000)
+
+
+def rejection_card(job: Job) -> dict | None:
+    """What the queue and the tracker show about a rejection, or None when the job was not rejected."""
+    if job.rejected_at is None:
+        return None
+    return {"reason": job.rejection_reason,
+            "label": REJECTION_REASONS.get(job.rejection_reason or "", "No reason given"),
+            "note": job.rejection_note or "", "at": job.rejected_at.isoformat(),
+            "on": day_label(job.rejected_at)}
+
+
+@router.post("/api/jobs/{job_id}/reject")
+def reject_job(job_id: int, payload: RejectionIn, db: Session = Depends(get_user_db)):
+    """Turn a job down from the approval queue: it leaves the queue and the pipeline, with an optional reason.
+
+    This rejects the job, not the packet — use /revision to send a packet back for another tailoring pass. The
+    tailored resume is kept, so a restored job still has its work.
+    """
+    job = get_job(db, job_id)
+    reason = payload.reason.strip().lower()
+    if reason and reason not in REJECTION_REASONS:
+        raise HTTPException(422, f"Unknown rejection reason '{payload.reason}'")
+    if job.status in SUBMITTED_STATUSES:
+        raise HTTPException(409, "This application has already been submitted; record the outcome in the tracker")
+    job.rejection_reason, job.rejection_note = reason or None, payload.notes.strip() or None
+    job.rejected_at = job.triaged_at = utcnow()
+    job.status = "dismissed"
+    # The workflow state follows where the lifecycle allows it (app.services.lifecycle). A job whose state has
+    # not caught up with the legacy status is still rejected — the queue is what the user acted on.
+    if can_transition(job.state, S.SKIPPED, previous_state=job.previous_state):
+        transition(db, job, S.SKIPPED, actor="user",
+                   reason=f"Rejected: {REJECTION_REASONS.get(reason, 'no reason given')}")
+    application = job.application
+    if application is not None and application.applied_at is None:
+        application.status = "rejected"
+    db.commit()
+    db.refresh(job)
+    return {"ok": True, "job": job_card(job), "rejection": rejection_card(job)}
+
+
+@router.get("/api/rejection-reasons")
+def rejection_reasons():
+    """The reasons the approval screen offers, so the list lives in one place."""
+    return {"reasons": [{"id": key, "label": label} for key, label in REJECTION_REASONS.items()]}
 
 
 @router.post("/api/jobs/{job_id}/revision")
@@ -1100,6 +1381,44 @@ def save_notes(job_id: int, payload: NotesIn, db: Session = Depends(get_user_db)
     return {"ok": True}
 
 
+# What a downloaded packet file is called. The apply kit shows this name and the download headers use the same
+# one, so what lands in the Downloads folder is what the screen said it would be.
+MAX_SLUG = 80
+
+
+def packet_slug(name: str, company: str) -> str:
+    """`rohan-roy-straive` — the candidate and the employer, safe for a filename on any platform."""
+    slug = re.sub(r"[^a-z0-9]+", "-", f"{name or ''} {company or ''}".lower()).strip("-")[:MAX_SLUG].strip("-")
+    return slug or "resume"
+
+
+def packet_filename(slug: str, kind: str, version: int | None = None) -> str:
+    """The file name for one part of a packet: resume PDF and DOCX, or the cover letter."""
+    if kind == "cover_letter":
+        return f"cover-letter-{slug}.txt"
+    return f"{slug}-v{version or 1}.{kind}"
+
+
+def packet_names(db: Session, job: Job, resume: ResumeVariant | None) -> dict[str, str]:
+    """Every file name for this job's packet, from one definition."""
+    slug = packet_slug(get_profile(db).name, job.company)
+    version = resume.version if resume else 1
+    return {kind: packet_filename(slug, kind, version) for kind in ("pdf", "docx", "cover_letter")}
+
+
+def download_headers(filename: str) -> dict[str, str]:
+    return {"Content-Disposition": f'attachment; filename="{filename}"'}
+
+
+def packet_download_name(db: Session, job_id: int, kind: str) -> str:
+    """The name a download should carry, resolved the same way the apply kit resolves it."""
+    job = get_job(db, job_id)
+    application = job.application
+    resume = (db.get(ResumeVariant, application.approved_resume_id)
+              if application and application.approved_resume_id else None) or latest_resume(db, job.id)
+    return packet_names(db, job, resume)[kind]
+
+
 @router.get("/api/jobs/{job_id}/apply-kit")
 def apply_kit(job_id: int, db: Session = Depends(get_user_db)):
     job = get_job(db, job_id)
@@ -1107,16 +1426,15 @@ def apply_kit(job_id: int, db: Session = Depends(get_user_db)):
     if not app or app.status not in ("approved", "applied"):
         raise HTTPException(400, "Approve the packet before opening the apply kit")
     resume = db.get(ResumeVariant, app.approved_resume_id) if app.approved_resume_id else latest_resume(db, job.id)
-    profile = get_profile(db)
-    slug = re.sub(r"[^a-z0-9]+", "-", f"{profile.name or 'resume'} {job.company}".lower()).strip("-")
+    names = packet_names(db, job, resume)
     answers = [a for a in answers_for(db) if a.answer and a.verified][:8]
     return {
         "job": job_card(job), "status": app.status, "reviewer_score": resume.reviewer_score if resume else None,
         "followup_date": (utcnow() + timedelta(days=followup_days(db))).isoformat(),
         "files": [
-            {"kind": "PDF", "name": f"{slug}-v{resume.version}.pdf", "meta": "ATS-safe export", "href": f"/api/jobs/{job.id}/resume.pdf"},
-            {"kind": "DOCX", "name": f"{slug}-v{resume.version}.docx", "meta": "for portals that reject PDF", "href": f"/api/jobs/{job.id}/resume.docx"},
-            {"kind": "TXT", "name": f"cover-letter-{slug}.txt", "meta": f"{len(resume.cover_letter.split())} words · paste-ready", "href": f"/api/jobs/{job.id}/cover-letter.txt"},
+            {"kind": "PDF", "name": names["pdf"], "meta": "ATS-safe export", "href": f"/api/jobs/{job.id}/resume.pdf"},
+            {"kind": "DOCX", "name": names["docx"], "meta": "for portals that reject PDF", "href": f"/api/jobs/{job.id}/resume.docx"},
+            {"kind": "TXT", "name": names["cover_letter"], "meta": f"{len(resume.cover_letter.split())} words · paste-ready", "href": f"/api/jobs/{job.id}/cover-letter.txt"},
         ] if resume else [],
         "answers": [{"id": a.id, "question": a.question, "answer": a.answer, "sensitive": a.sensitive} for a in answers],
     }
@@ -1166,7 +1484,7 @@ def resume_docx(job_id: int, db: Session = Depends(get_user_db)):
     buffer = BytesIO()
     document.save(buffer)
     return Response(buffer.getvalue(), media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    headers={"Content-Disposition": f'attachment; filename="job-{job_id}-resume.docx"'})
+                    headers=download_headers(packet_download_name(db, job_id, "docx")))
 
 
 @router.get("/api/jobs/{job_id}/cover-letter.txt")
@@ -1175,7 +1493,7 @@ def cover_letter_txt(job_id: int, db: Session = Depends(get_user_db)):
     if not resume:
         raise HTTPException(404, "No tailored resume for this job")
     return Response(resume.cover_letter, media_type="text/plain; charset=utf-8",
-                    headers={"Content-Disposition": f'attachment; filename="job-{job_id}-cover-letter.txt"'})
+                    headers=download_headers(packet_download_name(db, job_id, "cover_letter")))
 
 
 # ───────────────────────────── tracker ─────────────────────────────
@@ -1215,6 +1533,8 @@ def app_payload(db: Session, app: Application) -> dict:
         "recruiter_name": app.recruiter_name, "recruiter_email": app.recruiter_email, "notes": app.notes,
         "recruiters": recruiters_of(app),
         "docs": " · ".join(filter(None, [f"resume v{resume.version}" if resume else "", "cover letter" if resume and resume.cover_letter else ""])) or "not recorded",
+        # The packet that was submitted, so the tracker can open it (read-only: an applied packet is locked).
+        "resume_id": resume.id if resume else None,
         "draft": draft.draft if draft else "", "draft_id": draft.id if draft else None,
         "next": next_step[0], "next_date": next_step[1],
         "timeline": [{"id": e.id, "kind": e.kind, "title": e.title, "detail": e.detail,

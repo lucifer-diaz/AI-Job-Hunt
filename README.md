@@ -17,12 +17,12 @@ The dashboard is a single-page workspace served from `app/static/app.js`; every 
 | Discovery · triage | One job at a time with fit reasons; keys `S` shortlist, `M` maybe, `X` skip, `⏎` shortlist & tailor | `GET /api/jobs/search?queue=true`, `POST /api/jobs/{id}/triage` |
 | Discovery · table | Filter, sort, paginate and bulk-shortlist the whole pipeline. The stage filter includes "Unranked" (`stage=unranked`: jobs without a fit score) | `GET /api/jobs/search`, `POST /api/jobs/bulk-triage` |
 | Discovery · ranking tracker | The asynchronous ranker's progress for your account: jobs being filtered, queued, ranking now, retrying or waiting (with the reason and when it retries), and rankings finished in the last 24 hours with fit, candidate and resume scores and the qualify/archive decision. Retry failed rankings, queue unranked jobs; refreshes itself while work is in flight | `GET /api/ranking/tracker`, `POST /api/jobs/{id}/rank`, `POST /api/jobs/rank-batch` |
-| Discovery · setup | Saved search profile (roles × locations × boards), run history with what each run searched and pulled, add a job from a URL | `GET/PUT /api/search/profile`, `POST /api/search/profile/run`, `GET /api/search/apify/runs/{id}/detail`, `POST /api/jobs/from-url` |
+| Discovery · setup | Saved search setups (named roles × locations × boards, each with its own schedule), run history with what each run searched and pulled, add a job from a URL | `GET/POST /api/search/setups`, `PUT/DELETE /api/search/setups/{id}`, `POST /api/search/setups/{id}/run`, `POST /api/search/setups/{id}/duplicate`, `GET /api/search/apify/runs/{id}/detail`, `POST /api/jobs/from-url` |
 | Tailor | Before → after edits with the evidence each one cites; edit, accept or revert; cover letter; keyword coverage; PDF/DOCX/TXT exports. "Skip tailoring" sends the master resume unchanged (still reviewed) for postings that need no tailoring. The "Bulk tailor" view tailors or skips tailoring for many queued jobs one at a time, with progress and stop | `GET /api/tailor/{job_id}`, `PATCH /api/resumes/{id}/edits/{n}`, `POST /api/jobs/{id}/tailor`, `POST /api/jobs/{id}/skip-tailoring`, `POST /api/jobs/bulk-tailor` |
-| Approvals | Pre-submit checklist, resume preview, reusable answers, notes; approve opens the apply kit | `GET /api/approvals/{job_id}`, `POST /api/jobs/{id}/revision` |
+| Approvals | Pre-submit checklist, resume preview, reusable answers, notes; approve opens the apply kit, send a packet back for another tailoring pass, or reject the job outright with an optional reason | `GET /api/approvals/{job_id}`, `POST /api/jobs/{id}/revision`, `POST /api/jobs/{id}/reject` |
 | Apply kit | Files to upload, answers to paste, link to the posting, confirm "mark applied" | `GET /api/jobs/{id}/apply-kit` |
 | Tracker | Kanban by post-submission stage (drag or "move to"), optional extra stages, timeline, recruiter, interview scheduling, AI follow-up draft | `GET /api/tracker`, `POST /api/applications/{id}/stage`, `POST /api/applications/{id}/events` |
-| Monitoring | Every LLM request: requests, tokens, estimated cost, latency (avg/p50/p95/p99), failures by type, retries, context utilisation, usage by stage and cost by model, with filters (range, provider, model, stage, prompt version, status, job), a request detail view and the AI Optimization Advisor | `GET /api/monitoring/dashboard`, `POST /api/monitoring/analyze`, `GET /api/monitoring/recommendations` |
+| Monitoring | Six sections — Overview, LLM usage, External APIs, Apify, Logs and AI optimization. Every LLM request and every third-party call: volume, success rate, latency (avg/p50/p95/p99), failures by type, retries, rate limits, tokens, context utilisation and cost, with filters, detail views, trace lookup and the AI Optimization Advisor | `GET /api/monitoring/dashboard`, `GET /api/monitoring/external/dashboard`, `GET /api/monitoring/apify/summary`, `GET /api/monitoring/logs`, `POST /api/monitoring/analyze` |
 | Knowledge bank | Searchable Answer library and Evidence bank, focused editors, verification filters, copy and removal | `/api/knowledge`, `/api/evidence` |
 | Settings & profile | Candidate details and chip fields, resume variants, re-parse resume into (unverified) evidence, provider/model, your own API keys (stored encrypted), approval mode, cadence | `/api/profile`, `/api/settings`, `PUT /api/settings/keys`, `/api/preferences` |
 | Sign-in | Create an account (email, password, confirm password), sign in, sign out | `/signup`, `/login`, `POST /api/auth/signup`, `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/auth/me` |
@@ -121,7 +121,7 @@ Anyone who can reach the site can create an account at `/signup` with an email a
   - Generate one with `python -c "import secrets; print(secrets.token_urlsafe(48))"`.
 - **The first account.** The first account ever created becomes the admin. It takes ownership of everything that existed before accounts were introduced, so an existing install carries on unchanged. Any `*_API_KEY` / `APIFY_API_TOKEN` values in `.env` are copied into that account, encrypted. After that, server `.env` keys are not used for anyone's work.
 - **Running the system your way.** Every account's own settings control what the scheduler does for it:
-  - its search schedule (manual or daily);
+  - the schedule on each of its saved search setups (manual, every N hours, daily or weekly at a local time);
   - the **Auto-rank on import** switch;
   - its AI provider and models;
   - its approval mode and follow-up cadence.
@@ -143,9 +143,36 @@ Save your Apify API token under **Settings → Your API keys** (create one in Ap
 APIFY_ACTOR_ID=openclawai/job-board-scraper
 ```
 
+### Saved search setups
+
+**Discovery → Search setup** holds as many named searches as you like — "Lead AI Engineer · remote" and
+"Staff SWE · Mumbai + SF" are separate setups, each with its own roles, locations, actors, boards and filters.
+Pick one from the row of setups at the top of the card to edit it, **Run now & triage** to start it immediately, or
+**Save as new** / **Duplicate** to branch off the one you are looking at.
+
+Each setup carries its own schedule, independent of the others:
+
+| When | What it means |
+| --- | --- |
+| Manual only | It runs when you press Run now, and never on its own |
+| Every N hours | It repeats N hours (1–168) after each run |
+| Daily | It runs at a time of day, in the time zone you pick |
+| Weekly | It runs at that time on the weekdays you tick |
+
+A setup stores its whole search as a `settings` blob plus `schedule_kind`, `every_hours`, `time_of_day`,
+`weekdays`, `timezone`, `enabled`, `last_run_at` and `next_run_at` (`saved_searches`). The scheduler's `hunter`
+job starts every enabled setup whose `next_run_at` has passed — a guarded UPDATE means two app instances cannot
+start the same one twice — and `apify_sync` imports each finished run. `search_runs.saved_search_id` records which
+setup started a run, so the run history says where each batch of jobs came from. Local times are converted with
+`zoneinfo`, so a daily 07:00 search stays at 07:00 across daylight-saving changes
+(`app/services/saved_searches.py`).
+
+The single search profile that accounts had before this becomes a setup named "My search" the first time the
+screen is opened, keeping its settings and its daily/manual schedule.
+
 ### Multiple actors
 
-Discovery → Search setup lets you tick one or more actors. One search profile is translated into each actor's own input schema (`app/services/actors.py`), and each actor gets the filters it supports:
+Discovery → Search setup lets you tick one or more actors. A setup's search is translated into each actor's own input schema (`app/services/actors.py`), and each actor gets the filters it supports:
 
 | Actor | Runs | Filters it receives |
 | --- | --- | --- |
@@ -459,7 +486,7 @@ whether a state change is legal.
 | FOLLOWUP_DUE | FOLLOWED_UP, INTERVIEW, REJECTED, OFFER, ARCHIVED |
 | FOLLOWED_UP | FOLLOWUP_DUE, INTERVIEW, REJECTED, OFFER, ARCHIVED |
 | INTERVIEW | OFFER, REJECTED, ARCHIVED |
-| OFFER, REJECTED, ARCHIVED, SKIPPED, FAILED | terminal |
+| OFFER, REJECTED, ARCHIVED, SKIPPED, FAILED | terminal (SKIPPED may return to NORMALIZED — see below) |
 
 - **No arbitrary states.** `jobs.state` accepts only these values. This is enforced three times:
   a strict parser, an ORM validator that also rejects illegal moves on direct assignment, and
@@ -467,6 +494,8 @@ whether a state change is legal.
 - **No shortcuts.** There is no path around NORMALIZED, FILTERED, RANK_PENDING, RANKING, RANKED, TAILORED or REVIEWED.
 - **Re-ranking.** A job archived by ranking (from RANKED or QUALIFIED) may be reopened, only to RANK_PENDING. A job
   archived for any other reason, for example after applying, cannot.
+- **A missing description is not a verdict.** A job SKIPPED from NORMALIZED — the skip used when a posting
+  arrives without a description — returns to NORMALIZED once it has one. Every other skip is final.
 - **FAILED only before submission.** Once a job is APPLIED it can never become FAILED, so a broken
   follow-up can't erase the fact that you applied.
 - **Requeue.** FAILED is terminal for automation. An operator can call `requeue_failed`, which only
@@ -548,16 +577,88 @@ FastAPI starts → scheduler loop (every SCHEDULER_TICK_SECONDS)
 
 | Job | Interval setting (minutes) | What it does |
 | --- | --- | --- |
-| `hunter` | `HUNTER_INTERVAL_MINUTES=240` | Starts the saved search profile's Apify runs when its schedule is not `manual`, and never twice within the interval |
+| `hunter` | `HUNTER_INTERVAL_MINUTES=240` | Starts the Apify runs of every saved search setup that is due ("Saved search setups" in section 2) and of every due Hunter search profile. A guarded UPDATE means two app instances cannot start the same one twice |
 | `apify_sync` | `APIFY_SYNC_INTERVAL_MINUTES=5` | Imports datasets of Apify runs that finished; each run is imported once |
-| `ranking` | `RANKING_INTERVAL_MINUTES=2` | The Job Ranker (section 8). A deterministic sweep hard-filters and queues new jobs, recovers crashed tasks and queues re-ranks; then it claims up to `RANKING_BATCH_SIZE` ranking tasks and runs at most `RANKING_CONCURRENCY` model calls at a time. Jobs move RANK_PENDING → RANKING → RANKED → QUALIFIED / ARCHIVED |
+| `ranking` | `RANKING_INTERVAL_MINUTES=2` | The Job Ranker (section 8). A deterministic sweep hard-filters and queues new jobs, recovers crashed tasks and queues re-ranks; then it claims up to `RANKING_BATCH_SIZE` ranking tasks and runs at most `RANKING_CONCURRENCY` model calls at a time — and no more than each account's own limit (see "Processing limits"). Jobs move RANK_PENDING → RANKING → RANKED → QUALIFIED / ARCHIVED |
 | `compensation` | `COMPENSATION_INTERVAL_MINUTES=5` | Records the salary stated in the original posting (structured actor fields or explicit salary text) in `jobs.compensation`. Glassdoor and PayScale are recorded as `not_configured` until those actors are integrated |
 | `applications` | `APPLICATION_INTERVAL_MINUTES=5` | Reports READY_TO_APPLY / APPLYING counts. Automatic submission is not enabled, so it always reports `skipped` |
 | `followups` | `FOLLOWUP_INTERVAL_MINUTES=60` | Drafts due follow-ups (never sends) |
 | `inbox` | `INBOX_INTERVAL_MINUTES=5` | Reserved for an email provider; reports `skipped` until one is configured |
 | `analytics` | `ANALYTICS_INTERVAL_MINUTES=60` | Stores a pipeline snapshot (jobs by state and status, pending work, failures) as its last result |
 | `ai_optimization` | `AI_OPTIMIZATION_INTERVAL_MINUTES=5` | Queues scheduled analyses (per account: off, daily or weekly) and processes waiting AI Optimization tasks into recommendation reports. Never changes configuration |
-| `cleanup` | `CLEANUP_INTERVAL_MINUTES=15` | Recovers jobs left leased by crashed workers: retries them or marks them FAILED. Rolls LLM telemetry older than `LLM_TELEMETRY_RETENTION_DAYS` into daily totals, then deletes it |
+| `cleanup` | `CLEANUP_INTERVAL_MINUTES=15` | Recovers jobs left leased by crashed workers: retries them or marks them FAILED. Applies the three telemetry retentions: rolls LLM requests and external API calls older than `LLM_TELEMETRY_RETENTION_DAYS` / `EXTERNAL_API_LOG_RETENTION_DAYS` into daily totals and deletes them, and deletes log lines older than `SYSTEM_LOG_RETENTION_DAYS` |
+
+### Postings with no description
+
+Some boards — Naukri and Bayt in particular — return listings with a title, a company and a link, and no
+description at all. Ranking one of those means asking a model to score a job title: it answers confidently
+about nothing, spends a call, and often fails outright.
+
+So a posting with less than `RANKING_MIN_DESCRIPTION_CHARS` (200) of text, and no parsed structured
+description, never reaches the queue. It is skipped before ranking with the reason *"The posting has no job
+description yet"*, and the ranking tracker counts those under **No description · not rankable**.
+
+It is a verdict on what arrived, not on the job, so it is reversible — the one skip that is. When a fuller
+description turns up (the board is searched again and returns more, or you paste one in), the job goes back to
+`NORMALIZED` and is ranked normally. A parsed structured description counts as a description: the parser only
+produces one from real text.
+
+### Rate-limit backoff
+
+When a provider answers **429**, calling it again straight away wastes quota and delays the work further — and
+with a queue of jobs behind it, one rate limit becomes a burst of them. So a 429 starts a cooldown for that
+account and that provider, and calls are held until it passes (`app/services/backoff.py`).
+
+```text
+call → 429 → cooldown starts for this account + provider
+every later call → refused locally, nothing is sent
+first normal answer → cooldown cleared, the ladder starts again
+```
+
+Each rate limit in a row waits longer. **Settings → Workflow & cadence → Rate limits** sets the shape per
+account: whether to back off at all, the first wait, what to multiply by, and the longest wait. The defaults
+give 30s → 1m → 2m → 4m … capped at 15 minutes. A provider's own `Retry-After` wins whenever it asks for
+longer (up to `RATE_LIMIT_RETRY_AFTER_MAX_SECONDS`), because it knows when it will serve again.
+
+```env
+RATE_LIMIT_BACKOFF_ENABLED=true
+RATE_LIMIT_BASE_SECONDS=30
+RATE_LIMIT_MULTIPLIER=2.0
+RATE_LIMIT_MAX_SECONDS=900
+RATE_LIMIT_RETRY_AFTER_MAX_SECONDS=3600
+```
+
+Cooldowns are per account **and** per provider, so Apify being throttled never holds up a model call, and one
+account's limit never affects another's. They live in `provider_cooldowns`, so they hold across restarts and
+across the web and scheduler processes.
+
+A held call is still real telemetry: it is recorded with `error_type=RATE_LIMIT`, no HTTP status and
+`skipped_by: cooldown` in its metadata, so Monitoring → External APIs shows what the backoff saved and banners
+which providers are currently waiting. Work that was held is not lost — a model call during a cooldown is
+reported as a rate limit, which the ranker and the workers already retry later, and a ranking retry is never
+scheduled before the cooldown ends.
+
+### Processing limits
+
+`RANKING_CONCURRENCY` (5) and `TAILOR_CONCURRENCY` (2) are the server's ceilings. Each account also chooses its
+own limits in **Settings → Workflow & cadence → Processing limits**: how many of its jobs may be ranked at once,
+and how many packets may be tailored at once. An account can only set a limit at or below the server ceiling, so
+one account with hundreds of queued jobs cannot take the whole machine.
+
+The same group sets **how often** ranking runs for an account: 0 (the default) means every time the server
+looks, which is `RANKING_INTERVAL_MINUTES`; a larger number spreads the same queue over a longer stretch —
+"up to 5 at a time, every 30 minutes". An account that is waiting for its next run says so in the ranking
+tracker rather than looking idle.
+
+Both limits are enforced where work is claimed, counting what is already running in the database rather than one
+worker's bookkeeping, so they hold across restarts and across several workers. A ranking task over the limit is
+left PENDING, untouched and first in line next run; a tailoring task over the limit stays queued. Nothing is
+dropped — the queue just moves at the pace you chose.
+
+The Discovery → Ranking tracker shows the effect: every waiting job has a progress bar, its place in the queue
+and, once the account has finished some rankings, an estimate of when it will start. The estimate comes from the
+median duration of that account's recent rankings; before anything has been measured it is left blank rather
+than guessed.
 
 Set an interval to `0` to disable that job, or `SCHEDULER_ENABLED=false` to disable the loop entirely. Jobs that need an LLM report `skipped` instead of using up attempts when the provider's key is missing. Ranking and cleanup need PostgreSQL and report `skipped` on SQLite.
 
@@ -676,7 +777,84 @@ The model is `RANK_MODEL` when set (any provider), otherwise the rank-stage mode
 
 ## 9. Monitoring and the AI Optimization Advisor
 
-### Telemetry
+### External API monitoring
+
+Every call Job Hunt OS makes to a third party — Apify, OpenRouter, OpenAI, Anthropic, Gemini, job boards, web
+pages and anything integrated later — is recorded automatically, because the HTTP client *is* the
+instrumentation.
+
+```text
+Job Hunt OS (any service)
+  → Instrumented integration layer          app/services/external_api.py
+      external_client(...)      HTTP APIs
+      external_operation(...)   vendor SDKs that own their transport
+      @track_external_call(...) whole integration methods
+  → External API
+  → Automatic telemetry: ExternalAPIRequestLog (+ a log line when it fails or crawls)
+  → Monitoring → External APIs · Apify · Logs
+```
+
+Nothing is opt-in. There is no `log_external_call(...)` to remember before a request, and a service that uses
+the shared client is measured the day it is written. `tests/test_external_api_guard.py` fails the build if an
+unmanaged `httpx.Client`, `requests` or `aiohttp` appears anywhere under `app/`.
+
+**Supported providers.** `APIFY`, `OPENROUTER`, `OPENAI`, `ANTHROPIC`, `GEMINI`, `JOB_BOARD` (Greenhouse,
+Lever), `WEB` (posting pages), plus `EMAIL`, `SEARCH` and anything else. The provider is a free string, so a
+new integration needs no migration and no enum change — see AGENTS.md for how to add one.
+
+`external_api_request_logs` stores, per call: provider, service and operation; workflow, trace ID, job and
+application; method, host and path; status and HTTP status code; start, end and latency; request and response
+sizes; attempt and retry count; rate-limit headers; a failure category (timeout, DNS, connection, 429, 4xx,
+5xx, invalid response, SDK error); reported cost; and a small dictionary of safe, provider-specific metadata.
+
+**Apify monitoring.** Apify calls are named per operation (`actor_run_start`, `actor_run_status`,
+`dataset_fetch`, `dataset_info`, `actor_run_list`, `actor_lookup`, `run_input_fetch`) and carry the actor,
+run, dataset and saved search they belong to. Each run also records what Apify itself reported — compute
+units, `usageTotalUsd`, memory — alongside what it produced: items found, normalized, deduplicated and kept.
+Usage Apify does not report stays NULL; it is never estimated.
+
+**Trace IDs.** A scheduler job or an HTTP request opens one correlation ID (`app/services/tracing.py`), and
+every call underneath it inherits it, so `job discovered → Apify dataset fetch → JD parse → ranking →
+compensation lookup` reads as one trace. Nested work narrows it (`trace("ranking", job_id=…)`) without
+changing the ID. `GET /api/monitoring/external/traces/{trace_id}` returns the calls, LLM requests and log
+events that share it. Responses also carry the request's ID in `X-Trace-Id`.
+
+**Cost tracking.** A row carries a cost only when the provider reported one; unknown stays NULL and the
+dashboard counts those calls as unpriced rather than free. LLM cost comes from the model catalog
+(section 9 → Cost). Apify's cost is read from the run itself, where Apify states it, and is reported
+separately from per-request costs so nothing is counted twice.
+
+**Security and redaction.** `app/services/redaction.py` runs inside the instrumentation layer, before anything
+is persisted, so no caller can forget it:
+- Authorization, proxy-authorization, cookie and API-key headers are replaced wholesale.
+- Secret query parameters and body fields (`token`, `api_key`, `password`, `email`, …) are replaced.
+- Secret-shaped strings (`sk-…`, `AIza…`, `apify_api_…`, `Bearer …`) are replaced anywhere they appear,
+  including inside error messages.
+- **Request and response bodies are not stored.** Sizes are recorded instead.
+
+**Debugging.** `EXTERNAL_API_DEBUG_PAYLOADS=true` stores short extracts of request and response bodies and the
+(redacted) header names. Extracts are still redacted and capped at `EXTERNAL_API_PAYLOAD_LIMIT` bytes. The
+default is off, and it should stay off in production: bodies can contain a candidate's resume.
+
+**Reliability.** Telemetry is best effort and isolated: every failure inside the layer is caught, so a
+monitoring outage can never turn a working API call into a failed one, and a failed call is still reported to
+its caller exactly as the provider answered.
+
+**Retention.** Raw call rows are kept for `EXTERNAL_API_LOG_RETENTION_DAYS` (90); the cleanup job then rolls
+them into `external_api_usage_daily` totals, which are kept. Log lines are kept for
+`SYSTEM_LOG_RETENTION_DAYS` (30) and then deleted.
+
+```env
+EXTERNAL_API_TELEMETRY_ENABLED=true
+EXTERNAL_API_LOG_RETENTION_DAYS=90
+SYSTEM_LOG_RETENTION_DAYS=30
+EXTERNAL_API_DEBUG_PAYLOADS=false
+EXTERNAL_API_PAYLOAD_LIMIT=2000
+EXTERNAL_API_SLOW_CALL_MS=10000
+```
+
+### LLM telemetry
+
 
 Every LLM request in the system is recorded once, in the shared LLM layer. Services contain no monitoring code:
 they pass an optional `LLMCall(workflow_type, entity_id, attempt, validate)` saying which job or application a
@@ -730,27 +908,59 @@ Prices and context windows live in one file, `app/model_catalog.json` (override 
 
 ### Monitoring tab and API
 
-The Monitoring tab shows:
-- **Metric tiles:** requests, tokens, estimated cost, average and P95 latency, failures, retry rate and average context.
-- **Charts:** cost and tokens over time, usage by stage, cost by model, latency percentiles, context-utilisation
-  buckets, and failures by type. Every chart has hover details and a table view.
-- **Requests:** a paginated request list with a detail view that shows metadata only.
+Monitoring has six sections, each loading only what it shows:
 
-Each account sees its own usage; the admin can switch to all accounts.
+- **Overview** — external call volume, success rate and latency next to LLM spend and Apify discovery.
+- **LLM usage** — metric tiles (requests, tokens, estimated cost, average and P95 latency, failures, retry
+  rate, average context) and charts: cost and tokens over time, usage by stage, cost by model, latency
+  percentiles, context-utilisation buckets and failures by type. Every chart has hover details and a table
+  view, and the paginated request list has a metadata-only detail view.
+- **External APIs** — calls, success rate, failed calls, average and P95 latency, retries, rate limits and
+  estimated cost; breakdowns by service, operation and workflow; failures by type; calls over time; and a
+  filterable, paginated table of individual calls (time, provider, operation, workflow, status, latency,
+  retries, cost) with a safe detail view.
+- **Apify** — runs today and this month, successful and failed runs, compute units, dataset items, jobs found
+  and jobs after deduplication, reported cost, and breakdowns by actor, saved search, location, board and day,
+  with a recent-runs table.
+- **Logs** — operational events (timestamp, level, category, provider, workflow, trace, entity, message,
+  duration, status), searchable and filterable, with a detail view that links to the call it describes and to
+  everything else in the same trace.
+- **AI optimization** — the Advisor's recommendations.
+
+Each account sees its own telemetry; the admin can switch to all accounts.
 
 ```http
-GET  /api/monitoring/dashboard         everything the tab shows
+GET  /api/monitoring/dashboard              everything the LLM section shows
 GET  /api/monitoring/summary | stages | models | costs | latency | context | errors
-GET  /api/monitoring/requests          paginated list
-GET  /api/monitoring/requests/{id}     one request (no prompt text unless debugging stored it)
-POST /api/monitoring/analyze           queue an AI Optimization analysis (202)
-GET  /api/monitoring/recommendations   latest report, tasks and the account's analysis schedule
-GET  /api/monitoring/reports/{id}      one report with the aggregates it was built from
-PUT  /api/monitoring/schedule          off | daily | weekly
+GET  /api/monitoring/requests               paginated LLM request list
+GET  /api/monitoring/requests/{id}          one LLM request (no prompt text unless debugging stored it)
+
+GET  /api/monitoring/external/dashboard     everything the External APIs section shows
+GET  /api/monitoring/external/summary       calls, success rate, latency percentiles, retries, cost
+GET  /api/monitoring/external/providers     per-provider health, and the same per operation
+GET  /api/monitoring/external/latency       average, p50, p95, p99 by provider, operation and workflow
+GET  /api/monitoring/external/errors        failures by type, status code and provider
+GET  /api/monitoring/external/requests      paginated call list
+GET  /api/monitoring/external/requests/{id} one call (metadata only; no headers, credentials or bodies)
+GET  /api/monitoring/external/traces/{id}   every call, LLM request and event sharing one correlation ID
+
+GET  /api/monitoring/apify/summary          runs, usage, discovery and cost, with breakdowns
+GET  /api/monitoring/apify/runs             paginated run list
+
+GET  /api/monitoring/logs                   paginated operational log
+GET  /api/monitoring/logs/{id}              one entry, with the call it describes and its trace
+
+POST /api/monitoring/analyze                queue an AI Optimization analysis (202)
+GET  /api/monitoring/recommendations        latest report, tasks and the account's analysis schedule
+GET  /api/monitoring/reports/{id}           one report with the aggregates it was built from
+PUT  /api/monitoring/schedule               off | daily | weekly
 ```
 
-Filters (query parameters): `range=today|7d|30d|90d` or `start`/`end`, `provider`, `model`, `stage`,
-`prompt_version`, `status`, `job_id`, and `all_accounts` (admin only).
+Filters (query parameters): `range=today|7d|30d|90d` or `start`/`end`, and `all_accounts` (admin only).
+The LLM endpoints also take `provider`, `model`, `stage`, `prompt_version`, `status` and `job_id`; the
+external endpoints take `provider`, `service`, `operation`, `workflow`, `status`, `error_only`, `job_id`,
+`application_id` and `trace_id`; the logs endpoint takes `category`, `level`, `provider`, `workflow`,
+`trace_id` and `search`. Every list is paginated — log history is never returned in full.
 
 ### AI Optimization Advisor
 
@@ -758,24 +968,67 @@ Filters (query parameters): `range=today|7d|30d|90d` or `start`/`end`, `provider
 Analyze AI usage (or a daily/weekly schedule) → AIOptimizationTask PENDING
 → scheduler job ai_optimization claims it (conditional UPDATE + lease)
 → deterministic aggregates (by stage and model: tokens, cost share, context contributors, p95 context,
-  latency, failure/retry/schema-failure rates, prompt versions, duplicate calls, a few metadata-only outliers)
+  latency, failure/retry/schema-failure rates, prompt versions, duplicate calls, a few metadata-only outliers;
+  and by provider, operation and workflow: calls, success/rate-limit/timeout/retry rates, latency percentiles,
+  reported cost, plus Apify runs, compute and discovery per actor and saved search)
 → deterministic rule findings (excessive context, stage cost share, paid vs free models per stage,
-  schema-failure gaps, retry waste, slow tails, input-heavy prompts, repeated calls, unpriced models)
+  schema-failure gaps, retry waste, slow tails, input-heavy prompts, repeated calls, unpriced models,
+  and from third-party telemetry: providers that fail or rate-limit often, retry-heavy providers, one
+  provider markedly slower than another at the same operation, Apify actors that fail or rarely find new
+  jobs, and searches running more often than they discover anything)
 → one validated LLM call writes prioritised recommendations with the account's own key
   (app/prompts/ai_optimization.py, AI_OPTIMIZATION_PROMPT_VERSION); with no usable key or an invalid
   answer the report is built from the rule findings
 → AIOptimizationReport (summary, findings by area, recommendations, estimated savings)
 ```
 
-Each recommendation has a title, category (COST, LATENCY, CONTEXT, MODEL, PROMPT, RELIABILITY or
-ARCHITECTURE), priority, finding, evidence, recommended change, expected benefit, estimated cost saving, risk and
-affected stage.
+Each recommendation has a title, category (COST, LATENCY, CONTEXT, MODEL, PROMPT, RELIABILITY, ARCHITECTURE
+or EXTERNAL_API), priority, finding, evidence, recommended change, expected benefit, estimated cost saving,
+risk and affected stage.
 
-**The advisor only recommends.** It can analyse, compare, recommend and estimate. It cannot change model
-configuration, prompts, candidate policy, thresholds or any other configuration, and it cannot deploy anything.
+**The advisor only recommends.** It can analyse, compare, recommend and estimate. It cannot disable a
+provider, change an actor, a scheduler interval, a model, a credential, prompts, candidate policy, thresholds
+or any other configuration, and it cannot deploy anything.
 Tests check this both ways: statically, that the module has no configuration writes, and at runtime, that settings,
 the profile, the catalog and the prompts are unchanged after an analysis. Every recommendation needs a person to
 implement it.
+
+### Approving below your reviewer minimum
+
+`min_review_score` (Settings → Workflow & cadence) is the score a tailored packet normally has to reach before
+it can be approved. You can waive it for a single packet: the Approve button becomes **Approve anyway…**, and
+the panel behind it shows the score against your minimum, lists the pre-submit checks that are still flagged,
+and takes an optional note.
+
+Waiving is deliberate and recorded. `POST /api/jobs/{id}/approve` refuses a low score unless the request says
+`override: true`, and the refusal carries the score, the minimum and `can_override` so the screen can offer
+the waiver rather than just report the block. An approval that used it stores `applications.approval_override`
+and `approval_note`, is marked *waived* in the approval queue, and writes an "Approved below the reviewer
+minimum" entry into the application's timeline.
+
+Two things it deliberately does not do: **it never changes your minimum** (waiving one packet leaves the
+setting alone), and **it cannot skip review** — a packet the reviewer never scored has nothing to weigh up, so
+it is still refused until it has been reviewed.
+
+### Rejecting a job
+
+Three decisions are open on every packet in **Approvals**:
+
+| Decision | What happens |
+| --- | --- |
+| **Approve → apply kit** | The packet is approved and the apply kit opens. Submitting stays your action. |
+| **Approve anyway** | The same, for a packet the reviewer scored below your minimum. It asks first, shows what is still flagged and takes an optional note. |
+| **Needs revision** | The *packet* goes back for another tailoring pass with your notes. The job stays in the pipeline. |
+| **Reject** | The *job* is turned down: it leaves the approval queue and the pipeline (state `SKIPPED`, status `dismissed`). |
+
+Rejecting asks for a reason — pay, location, seniority, role, company, technology, posting closed, already
+applied, or other — but never insists: one click rejects without one. The reason and an optional note are kept
+on the job (`jobs.rejection_reason`, `rejection_note`, `rejected_at`) and shown wherever that job appears
+afterwards, so you can see why something was turned down. Reasons are recorded only; they do not feed back
+into ranking.
+
+Rejecting is not deleting: the tailored resume is kept. A job whose application has already been submitted
+cannot be rejected — the tracker owns that outcome, and nothing may rewrite the fact that you applied.
 
 ## 10. Claude Desktop + MCP
 
