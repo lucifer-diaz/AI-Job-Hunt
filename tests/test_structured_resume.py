@@ -357,3 +357,11 @@ def test_resume_verification_works_without_structured_data_yet(user):
         db.commit()
     assert active(user)["structured"]["experience"][0]["company"] == "Zendrive"
 
+
+
+def test_education_keeps_university_and_grade():
+    data = sr.materialize({"education": [{"degree": "B.Tech", "institution": "Kalyani Government Engineering College",
+                                          "university": "MAKAUT", "grade": "8.2/10 CGPA", "end_date": "2014-06"}]})
+    edu, = data["education"]
+    assert (edu["university"], edu["grade"]) == ("MAKAUT", "8.2/10 CGPA")
+    assert "MAKAUT | 8.2/10 CGPA" in sr.render_text(data, statuses=("UNVERIFIED",))

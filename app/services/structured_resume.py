@@ -123,11 +123,15 @@ class EducationIn(_In):
     degree: str = Short
     field_of_study: str = Short
     institution: str = Short
+    # The degree-awarding university, when it differs from the institution (an affiliated college, say).
+    university: str = Short
     location: str = Short
     start_date: str | None = Field(default=None, max_length=10)
     end_date: str | None = Field(default=None, max_length=10)
     raw_start_date: str | None = Field(default=None, max_length=60)
     raw_end_date: str | None = Field(default=None, max_length=60)
+    # As written on the resume: "8.2/10 CGPA", "First Class", "3.7 GPA".
+    grade: str = Field(default="", max_length=60)
 
 
 class CertificationIn(_In):
@@ -746,7 +750,8 @@ def render_text(data: dict[str, Any], *, statuses: tuple[str, ...] = REVIEWED[:1
         lines += ["", " | ".join(filter(None, [role.get("job_title"), role.get("company"), role.get("location"), dates]))]
         lines += [f"- {b['text']}" for b in role.get("achievements", []) + role.get("responsibilities", []) if ok(b)]
     for label, section, fields in (("Projects", "projects", ("name", "description")),
-                                   ("Education", "education", ("degree", "field_of_study", "institution", "end_date")),
+                                   ("Education", "education", ("degree", "field_of_study", "institution", "university",
+                                                                  "grade", "end_date")),
                                    ("Certifications", "certifications", ("name", "issuer", "issue_date")),
                                    ("Awards", "awards", ("title", "issuer", "date")),
                                    ("Languages", "languages", ("name", "proficiency"))):

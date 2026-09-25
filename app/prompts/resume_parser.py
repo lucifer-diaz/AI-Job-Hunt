@@ -19,7 +19,7 @@ from app.prompts.common import (
     user_message,
 )
 
-RESUME_PARSER_PROMPT_VERSION = "v3"
+RESUME_PARSER_PROMPT_VERSION = "v4"
 RESUME_PARSER_MARKER = "PARSE_RESUME"
 EVIDENCE_EXTRACTION_PROMPT_VERSION = "v1"
 EVIDENCE_EXTRACTION_MARKER = "EXTRACT_EVIDENCE"
@@ -37,8 +37,8 @@ STRUCTURED_RESUME_TEMPLATE: dict[str, Any] = {
         "raw_bullets": [],
     }],
     "projects": [{"name": None, "description": None, "url": None, "technologies": [], "skills": [], "achievements": []}],
-    "education": [{"degree": None, "field_of_study": None, "institution": None, "location": None,
-                   "start_date": None, "end_date": None, "raw_start_date": None, "raw_end_date": None}],
+    "education": [{"degree": None, "field_of_study": None, "institution": None, "university": None,
+                   "location": None, "grade": None, "start_date": None, "end_date": None, "raw_start_date": None, "raw_end_date": None}],
     "certifications": [{"name": None, "issuer": None, "issue_date": None, "expiration_date": None,
                         "credential_id": None, "url": None}],
     "awards": [{"title": None, "issuer": None, "date": None, "description": None}],
@@ -82,6 +82,12 @@ Experience
 - Keep the original bullets in raw_bullets, then place each one, unchanged, in responsibilities or
   achievements. A bullet belongs in achievements when it shows measurable impact, scope, improvement,
   delivery, scale, leadership or a business outcome.
+
+Education
+- institution is the school or college attended. university is the degree-awarding university only when the
+  resume names one separately (an affiliated college); otherwise null.
+- grade is the GPA, CGPA, percentage or class exactly as written (8.2/10 CGPA, 3.7 GPA, First Class); null
+  when the resume gives none.
 
 Skills
 - Extract only skills explicitly present in the resume. Never infer skills from job titles alone.
