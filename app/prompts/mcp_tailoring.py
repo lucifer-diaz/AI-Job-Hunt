@@ -51,7 +51,9 @@ MCP_SERVER_INSTRUCTIONS = instructions(
     "Job Hunt OS supplies compact context, validates what you save and decides every workflow state.",
     "Tailoring: list_jobs_for_tailoring → get_tailoring_context → save_bulk_tailored_resumes. "
     "Review: list_jobs_for_review → get_review_context → save_bulk_reviews. "
-    "get_bulk_operation_status shows what a batch saved.",
+    "get_bulk_operation_status shows what a batch saved. "
+    "Applying: list_jobs_for_application → get_job_packet → search_application_knowledge per form question "
+    "(request_human_answer for what it cannot answer) → record_application_result once per job.",
     "Batches are limited (see the error message when a batch is too large). A rejected item comes back with "
     "validation errors: fix only that item and save it again. Never invent facts to get past validation.",
 )

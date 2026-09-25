@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from io import BytesIO
 
 from reportlab.lib.pagesizes import A4
@@ -131,3 +132,57 @@ def markdown_to_simple_pdf(markdown: str) -> bytes:
     c.save()
     buffer.seek(0)
     return buffer.read()
+
+
+DOCX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+
+def markdown_to_docx(markdown: str) -> bytes:
+    """The same resume Markdown as a Word document, for portals that reject PDF."""
+    from docx import Document
+
+    document = Document()
+
+    def write(paragraph, text: str) -> None:
+        """Markdown emphasis becomes real bold runs instead of literal ** markers."""
+        for index, part in enumerate(text.split("**")):
+            if part:
+                paragraph.add_run(part).bold = index % 2 == 1
+
+    for line in (markdown or "").split("## Source Resume")[0].splitlines():
+        line = flatten_links(line)
+        if line.startswith("# "):
+            document.add_heading(unbold(line[2:]), level=0)
+        elif line.startswith("### "):
+            parts = [p.strip() for p in unbold(line[4:]).split("|")]
+            paragraph = document.add_paragraph()
+            paragraph.add_run(parts[0]).bold = True
+            if len(parts) > 1:
+                paragraph.add_run("  |  " + "  |  ".join(parts[1:]))
+        elif line.startswith("## "):
+            document.add_heading(unbold(line[3:]), level=1)
+        elif line.startswith("- "):
+            write(document.add_paragraph(style="List Bullet"), line[2:])
+        elif line.strip():
+            write(document.add_paragraph(), line)
+    buffer = BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
+
+
+# What a downloaded packet file is called. The apply kit shows this name and the download headers use the same
+# one, so what lands in the Downloads folder is what the screen said it would be.
+MAX_SLUG = 80
+
+
+def packet_slug(name: str, company: str) -> str:
+    """`rohan-roy-straive` — the candidate and the employer, safe for a filename on any platform."""
+    slug = re.sub(r"[^a-z0-9]+", "-", f"{name or ''} {company or ''}".lower()).strip("-")[:MAX_SLUG].strip("-")
+    return slug or "resume"
+
+
+def packet_filename(slug: str, kind: str, version: int | None = None) -> str:
+    """The file name for one part of a packet: resume PDF and DOCX, or the cover letter."""
+    if kind == "cover_letter":
+        return f"cover-letter-{slug}.txt"
+    return f"{slug}-v{version or 1}.{kind}"

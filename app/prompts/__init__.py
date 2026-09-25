@@ -22,6 +22,7 @@ from app.prompts.job_description_parser import (
                                        JOB_DESCRIPTION_PARSER_PROMPT_VERSION,
                                        build_job_description_parser_prompt,
 )
+from app.prompts.mcp_application import MCP_APPLICATION_PROMPT_VERSION
 from app.prompts.mcp_review import MCP_REVIEW_PROMPT_VERSION
 from app.prompts.mcp_tailoring import MCP_TAILORING_PROMPT_VERSION
 from app.prompts.ranking import RANKING_PROMPT_VERSION, build_ranking_prompt
@@ -49,6 +50,7 @@ PROMPT_VERSIONS = {
     "ai_optimization": AI_OPTIMIZATION_PROMPT_VERSION,
     "mcp_tailoring": MCP_TAILORING_PROMPT_VERSION,
     "mcp_review": MCP_REVIEW_PROMPT_VERSION,
+    "mcp_application": MCP_APPLICATION_PROMPT_VERSION,
 }
 
 __all__ = [

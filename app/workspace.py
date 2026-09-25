@@ -12,7 +12,6 @@ import re
 import socket
 from collections import Counter, defaultdict
 from datetime import UTC, datetime, timedelta
-from io import BytesIO
 from pathlib import Path
 from statistics import median
 from urllib.parse import urlparse
@@ -70,11 +69,12 @@ from app.services.contacts import (
     to_utc,
     zone,
 )
+from app.services.exports import DOCX_MEDIA_TYPE, markdown_to_docx, packet_filename, packet_slug
 from app.services.external_api import external_client
+from app.services.knowledge import question_key
 from app.services.lifecycle import WorkflowState as S
 from app.services.lifecycle import can_transition
 from app.services.llm import LLMCall, LLMClient
-from app.services.resume_format import flatten_links, unbold
 from app.services.saved_searches import SCHEDULE_KINDS, next_due, schedule_label, schedule_problems
 from app.services.sources import (
     apify_client,
@@ -1381,24 +1381,6 @@ def save_notes(job_id: int, payload: NotesIn, db: Session = Depends(get_user_db)
     return {"ok": True}
 
 
-# What a downloaded packet file is called. The apply kit shows this name and the download headers use the same
-# one, so what lands in the Downloads folder is what the screen said it would be.
-MAX_SLUG = 80
-
-
-def packet_slug(name: str, company: str) -> str:
-    """`rohan-roy-straive` — the candidate and the employer, safe for a filename on any platform."""
-    slug = re.sub(r"[^a-z0-9]+", "-", f"{name or ''} {company or ''}".lower()).strip("-")[:MAX_SLUG].strip("-")
-    return slug or "resume"
-
-
-def packet_filename(slug: str, kind: str, version: int | None = None) -> str:
-    """The file name for one part of a packet: resume PDF and DOCX, or the cover letter."""
-    if kind == "cover_letter":
-        return f"cover-letter-{slug}.txt"
-    return f"{slug}-v{version or 1}.{kind}"
-
-
 def packet_names(db: Session, job: Job, resume: ResumeVariant | None) -> dict[str, str]:
     """Every file name for this job's packet, from one definition."""
     slug = packet_slug(get_profile(db).name, job.company)
@@ -1455,35 +1437,7 @@ def resume_docx(job_id: int, db: Session = Depends(get_user_db)):
     resume = latest_resume(db, job_id)
     if not resume:
         raise HTTPException(404, "No tailored resume for this job")
-    from docx import Document
-
-    document = Document()
-
-    def write(paragraph, text: str) -> None:
-        """Markdown emphasis becomes real bold runs instead of literal ** markers."""
-        for index, part in enumerate(text.split("**")):
-            if part:
-                paragraph.add_run(part).bold = index % 2 == 1
-
-    for line in resume.markdown.split("## Source Resume")[0].splitlines():
-        line = flatten_links(line)
-        if line.startswith("# "):
-            document.add_heading(unbold(line[2:]), level=0)
-        elif line.startswith("### "):
-            parts = [p.strip() for p in unbold(line[4:]).split("|")]
-            paragraph = document.add_paragraph()
-            paragraph.add_run(parts[0]).bold = True
-            if len(parts) > 1:
-                paragraph.add_run("  |  " + "  |  ".join(parts[1:]))
-        elif line.startswith("## "):
-            document.add_heading(unbold(line[3:]), level=1)
-        elif line.startswith("- "):
-            write(document.add_paragraph(style="List Bullet"), line[2:])
-        elif line.strip():
-            write(document.add_paragraph(), line)
-    buffer = BytesIO()
-    document.save(buffer)
-    return Response(buffer.getvalue(), media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    return Response(markdown_to_docx(resume.markdown), media_type=DOCX_MEDIA_TYPE,
                     headers=download_headers(packet_download_name(db, job_id, "docx")))
 
 
@@ -1865,7 +1819,7 @@ def knowledge_put(item_id: int, payload: KnowledgeUpdateIn, db: Session = Depend
     item = db.get(KnowledgeAnswer, item_id)
     if not item:
         raise HTTPException(404, "Knowledge answer not found")
-    key = hashlib.sha256(re.sub(r"[^a-z0-9]+", " ", payload.question.lower()).strip().encode()).hexdigest()
+    key = question_key(payload.question)
     clash = db.scalar(select(KnowledgeAnswer).where(KnowledgeAnswer.question_key == key, KnowledgeAnswer.id != item.id))
     if clash:
         raise HTTPException(409, "Another saved answer already covers this question")

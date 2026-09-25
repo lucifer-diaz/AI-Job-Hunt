@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import re
 import secrets
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -69,6 +68,7 @@ from app.services.ai_config import env_defaults as ai_env_defaults
 from app.services.ai_config import resolve as resolve_ai_config
 from app.services.contacts import recruiters_of, set_primary_recruiter
 from app.services.exports import markdown_to_simple_pdf
+from app.services.knowledge import question_key
 from app.services.structured_resume import clean_raw_text
 from app.services.sources import (
     import_greenhouse,
@@ -176,11 +176,6 @@ async def require_sign_in(request: Request, call_next):
 
 
 templates = Jinja2Templates(directory="app/templates")
-
-
-def question_key(question: str) -> str:
-    normalized = re.sub(r"[^a-z0-9]+", " ", question.lower()).strip()
-    return hashlib.sha256(normalized.encode()).hexdigest()
 
 
 def job_dict(j: Job) -> dict:
@@ -839,7 +834,16 @@ def knowledge_get(db: Session = Depends(get_user_db)):
     rows = db.scalars(select(KnowledgeAnswer).order_by(desc(KnowledgeAnswer.updated_at))).all()
     return [{"id": q.id, "question": q.question, "answer": q.answer, "category": q.category,
              "answer_type": q.answer_type, "verified": q.verified, "sensitive": q.sensitive,
-             "source_job_id": q.source_job_id, "use_count": q.use_count} for q in rows]
+             "source_job_id": q.source_job_id, "use_count": q.use_count, "answer_options": q.answer_options or [],
+             "asked_by": _asked_by(q.request_context)} for q in rows]
+
+
+def _asked_by(context: dict | None) -> dict | None:
+    """Which job's application form asked a question saved for you to answer."""
+    if not context:
+        return None
+    return {key: context.get(key) for key in ("job_id", "company", "title", "field_label", "required", "note",
+                                              "requested_at")}
 
 
 @app.post("/api/knowledge")

@@ -46,9 +46,16 @@ function knowledgeToolbar(section) {
 function knowledgeBadges(row) {
   return `${pill(row.verified ? 'Verified' : 'Needs review', row.verified ? 'good' : 'warn')}${row.sensitive ? pill('Sensitive · confirm each time', 'bad') : ''}`;
 }
+function knowledgeAsked(row) {
+  // A question an application form asked while applying: which job, and the choices the form offered.
+  const asked = row.asked_by, options = row.answer_options || [];
+  if (!asked && !options.length) return '';
+  const job = asked ? `Asked by ${esc([asked.company, asked.title].filter(Boolean).join(' · ') || `job ${asked.job_id}`)}${asked.required ? ' · required' : ''}` : '';
+  return `<p class="xs muted">${[job, options.length ? `Options: ${options.map(esc).join(' / ')}` : ''].filter(Boolean).join(' — ')}</p>`;
+}
 function knowledgeAnswer(row) {
   return `<article class="knowledge-item" aria-labelledby="knowledge-title-${row.id}"><div class="knowledge-item-body"><div class="row gap6 wrap mb8">${knowledgeBadges(row)}${pill(knowledgeLabel(row.category))}</div>
-    <h3 id="knowledge-title-${row.id}">${esc(row.question)}</h3><p class="knowledge-answer">${esc(row.answer || 'Awaiting answer')}</p><span class="xs muted">Used ${row.use_count || 0} times</span></div>
+    <h3 id="knowledge-title-${row.id}">${esc(row.question)}</h3>${knowledgeAsked(row)}<p class="knowledge-answer">${esc(row.answer || 'Awaiting answer')}</p><span class="xs muted">Used ${row.use_count || 0} times</span></div>
     <div class="knowledge-actions">${btn('Copy', 'kn-copy', { id: row.id }, 'sm', !row.answer || isBusy('knowledge'))}${btn('Edit', 'kn-edit', { id: row.id }, 'sm', isBusy('knowledge'))}${btn('Delete', 'kn-delete', { id: row.id }, 'sm ghost danger', isBusy('knowledge'))}</div></article>`;
 }
 function knowledgeEvidence(row) {

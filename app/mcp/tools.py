@@ -1,7 +1,8 @@
 """The Job Hunt OS operations Claude Desktop may call. Each handler takes a session that belongs to one account.
 
 Handlers only read and write through the application services. They take IDs, filters and structured results,
-never SQL, file paths, shell input or settings, and they never return API keys or environment values.
+never SQL, file paths, shell input or settings, and they never return API keys or environment values. The only
+paths they return are the packet files get_job_packet writes under MCP_PACKET_DIR.
 """
 from __future__ import annotations
 
@@ -14,11 +15,12 @@ from sqlalchemy import desc, nulls_last, select
 from sqlalchemy.orm import Session
 
 from app.models import ConversationAction, Evidence, Job, JobRanking, ResumeVariant
+from app.prompts.mcp_application import APPLICATION_RULES, MCP_APPLICATION_PROMPT_VERSION
 from app.prompts.common import profile_facts
 from app.prompts.mcp_review import MCP_REVIEW_PROMPT_VERSION, REVIEW_RULES
 from app.prompts.mcp_tailoring import MCP_TAILORING_PROMPT_VERSION, TAILORING_RULES
 from app.prompts.tailoring import FIT_ANALYSIS_DEFAULTS
-from app.services import conversation_actions
+from app.services import apply_queue, conversation_actions, knowledge
 from app.services.ranker import policy_for, relevant_evidence
 from app.services.resume_format import parse_resume
 from app.services.review_results import ReviewIn, apply_review, latest_variant
@@ -372,3 +374,132 @@ def get_bulk_operation_status(db: Session, operation_id: str | None = None) -> d
     return {"ok": True, "operation_id": row.operation_id, "tool_name": row.tool_name,
             "created_at": _iso(row.created_at), "result_status": row.result_status,
             "saved": summary.get("saved"), "rejected": summary.get("rejected"), "items": current}
+
+
+# ───────────── applying ─────────────
+
+def application_page_limit() -> int:
+    return get_settings().mcp_application_page_limit
+
+
+def _threshold(reviewer_score_above: float | None) -> float:
+    try:
+        return apply_queue.check_threshold(reviewer_score_above)
+    except (TypeError, ValueError) as exc:
+        raise ToolError(str(exc)) from exc
+
+
+def _job(db: Session, job_id: Any) -> Job:
+    if not isinstance(job_id, int) or isinstance(job_id, bool):
+        raise ToolError("job_id must be an integer")
+    job = db.get(Job, job_id)
+    if job is None:
+        raise ToolError(f"Job {job_id} not found")
+    return job
+
+
+def _blocker_out(blocker: dict[str, Any] | None) -> dict[str, Any] | None:
+    return None if not blocker else {k: blocker.get(k) for k in ("reason", "detail", "question_ids", "recorded_at")}
+
+
+def list_jobs_for_application(db: Session, reviewer_score_above: float | None = None, company: str | None = None,
+                              include_blocked: bool = False, offset: int = 0, limit: int = 20) -> dict[str, Any]:
+    limit = _check_limit(limit, application_page_limit(), "MCP_APPLICATION_PAGE_LIMIT")
+    if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+        raise ToolError("offset must be a non-negative integer")
+    threshold = _threshold(reviewer_score_above)
+    ready = apply_queue.ready_to_apply(db, reviewer_score_above=threshold, include_blocked=bool(include_blocked),
+                                       company=company)
+    page = ready[offset:offset + limit]
+    jobs = [{"job_id": r["job"].id, "title": r["job"].title, "company": r["job"].company,
+             "location": r["job"].location, "apply_url": apply_queue.apply_url(r["job"]),
+             "posting_url": r["job"].url or r["job"].source_url or None,
+             "reviewer_score": r["resume"].reviewer_score, "fit_score": r["job"].fit_score,
+             "resume_version": r["resume"].version, "approved_at": _iso(r["application"].approved_at),
+             "blocker": _blocker_out(r["blocker"])} for r in page]
+    next_offset = offset + len(page) if offset + len(page) < len(ready) else None
+    return {"ok": True, "reviewer_score_above": threshold, "total": len(ready), "offset": offset,
+            "count": len(jobs), "next_offset": next_offset, "jobs": jobs}
+
+
+def get_job_packet(db: Session, job_id: int, formats: list[str] | None = None,
+                   include_content: bool = False) -> dict[str, Any]:
+    job = _job(db, job_id)
+    formats = list(dict.fromkeys(formats or apply_queue.FILE_FORMATS))
+    unknown = [f for f in formats if f not in apply_queue.FILE_FORMATS]
+    if unknown:
+        raise ToolError(f"formats must be chosen from {', '.join(apply_queue.FILE_FORMATS)}")
+    reason = apply_queue.not_ready_reason(db, job)
+    if reason:
+        raise ToolError(f"Job {job.id} is not ready to apply to: {reason}")
+    application = job.application
+    resume = apply_queue.approved_resume(db, application)
+    content = resume.content or {}
+    return {"ok": True, "prompt_version": MCP_APPLICATION_PROMPT_VERSION, "rules": list(APPLICATION_RULES),
+            "job_id": job.id, "title": job.title, "company": job.company, "location": job.location,
+            "apply_url": apply_queue.apply_url(job),
+            "resume": {"resume_id": resume.id, "version": resume.version, "reviewer_score": resume.reviewer_score,
+                       "approved_at": _iso(application.approved_at), "markdown": resume.markdown,
+                       "summary": content.get("summary", "")},
+            "cover_letter": resume.cover_letter or "",
+            "screening_answer_drafts": content.get("screening_answer_drafts") or {},
+            "files": apply_queue.packet_files(db, job, resume, formats, include_content=bool(include_content)),
+            "blocker": _blocker_out(apply_queue.open_blocker(db, application))}
+
+
+def search_application_knowledge(db: Session, question: str, limit: int = 5) -> dict[str, Any]:
+    if not isinstance(question, str) or len(question.strip()) < 2:
+        raise ToolError("question must be the form question's text")
+    limit = _check_limit(limit, 20, "at most 20 sources")
+    return {"ok": True, "question": question.strip()[:2000], **knowledge.search(db, question[:2000], limit)}
+
+
+def request_human_answer(db: Session, job_id: int, question: str, answer_options: list[str] | None = None,
+                         answer_type: str | None = None, category: str = "general", sensitive: bool = False,
+                         required: bool | None = None, field_label: str | None = None,
+                         note: str | None = None) -> dict[str, Any]:
+    job = _job(db, job_id)
+    try:
+        saved = knowledge.request_answer(db, job, question, answer_options=answer_options, answer_type=answer_type,
+                                         category=category, sensitive=sensitive, required=required,
+                                         field_label=field_label, note=note)
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+    return {"ok": True, "job_id": job.id, **saved}
+
+
+def record_application_result(db: Session, job_id: int, outcome: str, confirmation_id: str | None = None,
+                              blocker_reason: str | None = None, detail: str | None = None,
+                              question_ids: list[int] | None = None) -> dict[str, Any]:
+    job = _job(db, job_id)
+    if outcome not in ("submitted", "blocked"):
+        raise ToolError("outcome must be submitted or blocked")
+    if question_ids is not None and not (isinstance(question_ids, list)
+                                         and all(isinstance(i, int) and not isinstance(i, bool) for i in question_ids)):
+        raise ToolError("question_ids must be a list of integers")
+    application = apply_queue.lock_application(db, job)
+    if application is not None and application.status == "applied":
+        # Idempotent: a second report of the same submission changes nothing.
+        return {"ok": True, "status": "ALREADY_APPLIED", "job_id": job.id, "job_status": job.status,
+                "applied_at": _iso(application.applied_at), "confirmation_id": application.confirmation_id,
+                "submitted_via": application.submitted_via}
+    if application is None or application.status != "approved" or job.status != "approved":
+        raise ToolError(f"Job {job.id} is {job.status}, not approved for application")
+    if outcome == "blocked":
+        try:
+            blocker = apply_queue.record_blocker(db, job, blocker_reason or "", detail=detail or "",
+                                                 question_ids=question_ids)
+        except ValueError as exc:
+            raise ToolError(str(exc)) from exc
+        return {"ok": True, "status": "BLOCKED", "job_id": job.id, "job_status": job.status,
+                "blocker": _blocker_out(blocker)}
+    duplicate = apply_queue.applied_duplicate(db, job)
+    if duplicate is not None:
+        db.rollback()
+        return {"ok": False, "status": "DUPLICATE_APPLICATION", "job_id": job.id, "duplicate_of_job_id": duplicate.id,
+                "error": f"Already applied to the same posting as job {duplicate.id} ({duplicate.company}); "
+                         "not recorded"}
+    application = apply_queue.record_submission(db, job, confirmation_id=confirmation_id)
+    return {"ok": True, "status": "SUBMITTED", "job_id": job.id, "job_status": job.status,
+            "applied_at": _iso(application.applied_at), "confirmation_id": application.confirmation_id,
+            "followup_due_at": _iso(application.followup_due_at)}

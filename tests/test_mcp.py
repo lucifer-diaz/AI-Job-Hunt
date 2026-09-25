@@ -124,7 +124,7 @@ def test_server_exposes_only_the_approved_tools_and_prompts(account):
     names = {tool.name for tool in asyncio.run(server.list_tools())}
     assert names == set(TOOL_NAMES)
     assert not any(word in name for name in names for word in ("sql", "file", "shell", "env", "key", "setting"))
-    assert {p.name for p in asyncio.run(server.list_prompts())} == {"tailor_jobs", "review_applications"}
+    assert {p.name for p in asyncio.run(server.list_prompts())} == {"tailor_jobs", "review_applications", "apply_to_jobs"}
     content = asyncio.run(server.call_tool("list_jobs_for_tailoring", {"minimum_fit_score": 85}))
     assert "Grab" in str(content)
 

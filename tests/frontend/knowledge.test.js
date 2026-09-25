@@ -10,7 +10,8 @@ const response = (data, status = 200) => ({ ok: status < 400, status, text: asyn
 const answers = () => [
   { id: 1, question: 'What is your notice period?', answer: '30 days', category: 'notice_period', answer_type: 'text', verified: true, sensitive: false, use_count: 4 },
   { id: 2, question: 'What compensation do you expect?', answer: 'Discuss with recruiter', category: 'compensation', answer_type: 'text', verified: true, sensitive: true, use_count: 2 },
-  { id: 3, question: 'Are you willing to relocate?', answer: '', category: 'relocation', answer_type: 'boolean', verified: false, sensitive: false, use_count: 0 },
+  { id: 3, question: 'Are you willing to relocate?', answer: '', category: 'relocation', answer_type: 'boolean', verified: false, sensitive: false, use_count: 0,
+    answer_options: ['Yes', 'No'], asked_by: { job_id: 9, company: 'Globex', title: 'Staff Engineer', required: true } },
 ];
 const evidence = () => [
   { id: 4, claim: 'Reduced cloud spend by 35%', company: 'Acme', role: 'Platform engineer', skills: ['AWS', 'Python'], verified: false },
@@ -42,6 +43,10 @@ beforeEach(() => {
 });
 
 describe('Knowledge bank workspace', () => {
+  it('shows which application asked a waiting question and the choices its form offered', () => {
+    expect(text()).toContain('Asked by Globex · Staff Engineer · required — Options: Yes / No');
+    expect(text()).not.toContain('Asked by Acme');
+  });
   it('defaults legacy and invalid links to answers and supports evidence deep links', () => {
     for (const hash of ['#knowledge', '#knowledge/unknown', '#knowledge/answers']) {
       history.replaceState(null, '', hash); ui.readHash(); expect(ui.S.knowledgeSection).toBe('answers');
