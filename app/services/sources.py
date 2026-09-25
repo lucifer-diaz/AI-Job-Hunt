@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -232,16 +233,23 @@ def dedupe_key(title: str, company: str, location: str = "") -> str:
 
 
 def import_apify_items(db: Session, items: list[dict[str, Any]], search_run_id: int | None = None,
-                       default_site: str = "unknown", user_id: int | None = None) -> dict[str, int]:
+                       default_site: str = "unknown", user_id: int | None = None,
+                       adapt: Callable[[dict[str, Any]], dict[str, Any]] | None = None) -> dict[str, int]:
+    """Import dataset items. `adapt` is the actor's own item mapping (app.services.actors.item_normalizer);
+    the job keeps the item exactly as the actor returned it in `raw`."""
     owner = user_id if user_id is not None else require_user_id(db)
     created = normalized = skipped = duplicates = 0
     known = {dedupe_key(t, c, loc) for t, c, loc in
              db.execute(select(Job.title, Job.company, Job.location).where(Job.user_id == owner)).all()}
     for item in items:
-        job_data = normalize_apify_job(item, default_site)
+        if not isinstance(item, dict):
+            skipped += 1
+            continue
+        job_data = normalize_apify_job(adapt(item) if adapt else item, default_site)
         if not job_data:
             skipped += 1
             continue
+        job_data["raw"] = item
         normalized += 1
         key = dedupe_key(job_data["title"], job_data["company"], job_data["location"])
         same_listing = db.scalar(select(Job.id).where(Job.user_id == owner, Job.source == job_data["source"],
@@ -567,11 +575,11 @@ def _refresh_apify_run(db: Session, search_run: SearchRun, token: str, reimport:
                 items = []  # failed runs may have no dataset; keep the error below
         if not isinstance(items, list):
             items = []
-        from app.services.actors import default_site_for
+        from app.services.actors import default_site_for, item_normalizer
 
         # Failed, aborted and timed-out runs still import whatever they collected.
         import_stats = import_apify_items(db, items, search_run.id, default_site_for(search_run.actor_id),
-                                          user_id=search_run.user_id)
+                                          user_id=search_run.user_id, adapt=item_normalizer(search_run.actor_id))
         search_run.item_count = import_stats["seen"]
         search_run.created_jobs = db.scalar(select(func.count(Job.id)).where(Job.search_run_id == search_run.id)) or 0
         # What the run actually produced, for the Apify tab: found → normalized → kept after deduplication.

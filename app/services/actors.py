@@ -9,6 +9,10 @@ filters exist, so each spec owns its input builder and its fan-out rule:
     role           one run per role, all locations in that run
     once           a single run covering every role and location
 
+Each spec may also own a `normalize` step that maps its dataset items onto the common job fields
+(title, company, location, url, description, id, site) before app.services.sources imports them, for
+actors whose items do not use the usual field names.
+
 User-added actors describe their input with a JSON template using {{placeholders}}.
 """
 from __future__ import annotations
@@ -26,6 +30,10 @@ OPENCLAW_BOARDS = ["linkedin", "indeed", "glassdoor", "naukri", "bayt", "zip_rec
 REMOTE_PLATFORMS = ["arbeitnow", "jobicy", "himalayas", "remoteok", "remotive", "workingnomads"]
 SENIORITY_LEVELS = ["entry", "mid", "senior", "lead", "manager", "director", "executive"]
 FAN_OUTS = ("role_location", "location", "role", "once")
+# How the picker groups actors, in display order.
+ACTOR_GROUPS = ("Job boards", "LinkedIn", "Remote boards", "Startups", "Your actors")
+HN_MONTH_RE = re.compile(r"^(current|\d{4}-(0[1-9]|1[0-2]))$")
+YC_BATCH_RE = re.compile(r"^[WSFX]\d{2}$", re.IGNORECASE)
 PLACEHOLDERS = ("role", "roles", "location", "locations", "max_results", "hours_old", "days_old",
                 "is_remote", "job_type", "sites", "country")
 REMOTE_WORDS = {"remote", "anywhere", "worldwide", "global"}
@@ -48,11 +56,14 @@ class ActorSpec:
     location_hint: str = ""
     custom: bool = False
     extra: dict = field(default_factory=dict)
+    group: str = "Job boards"
+    # Maps one dataset item onto the common job fields; None when the item already uses them.
+    normalize: Callable[[dict], dict] | None = None
 
     def public(self) -> dict:
         return {"id": self.id, "name": self.name, "summary": self.summary, "cost": self.cost,
                 "fan_out": self.fan_out, "supports": self.supports, "location_hint": self.location_hint,
-                "custom": self.custom, **self.extra}
+                "custom": self.custom, "group": self.group, **self.extra}
 
 
 def _days(hours: int | None) -> int:
@@ -181,6 +192,215 @@ def build_remoteok(sp: dict, roles: list[str], locations: list[str]) -> tuple[di
             "results_wanted": int(sp.get("max_results") or 20), "proxyConfiguration": {"useApifyProxy": False}}, warnings
 
 
+# ───────────── shared helpers for the startup boards ─────────────
+def _places(locations: list[str]) -> list[str]:
+    return [loc for loc in locations if not is_remote_location(loc)]
+
+
+def _remote_only(sp: dict, locations: list[str]) -> bool:
+    """Remote only when asked for, or when every location given is a remote one."""
+    return bool(sp.get("is_remote")) or bool(locations and not _places(locations))
+
+
+def _batches(sp: dict) -> list[str]:
+    return [b.strip().upper() for b in sp.get("yc_batches") or [] if YC_BATCH_RE.match(b.strip())]
+
+
+def _facts(pairs: list[tuple[str, Any]]) -> str:
+    """Listing facts (salary, equity, visa) as text lines, so ranking sees them next to the description."""
+    lines = []
+    for label, value in pairs:
+        if isinstance(value, list):
+            value = ", ".join(str(v.get("name") if isinstance(v, dict) else v) for v in value if v)
+        if value not in (None, "", [], {}) and not isinstance(value, bool):
+            lines.append(f"{label}: {value}")
+    return "\n".join(lines)
+
+
+def _join(description: Any, facts: str) -> str:
+    text = str(description or "").strip()
+    return "\n\n".join(part for part in (text, facts) if part)
+
+
+def _pick(item: dict, *keys: str) -> Any:
+    for key in keys:
+        if item.get(key) not in (None, "", [], {}):
+            return item[key]
+    return None
+
+
+# ───────────── antishock/workatastartup-jobs-scraper ─────────────
+# The actor filters by role family, not by title: each search role is mapped onto its family, and the
+# ranker judges the titles that come back.
+WAAS_FAMILIES = [
+    (re.compile(r"design|\bux\b|\bui\b", re.IGNORECASE), "design"),
+    (re.compile(r"sales|account exec|business develop|\bbdr\b|\bsdr\b", re.IGNORECASE), "sales"),
+    (re.compile(r"market|growth|content|brand|seo", re.IGNORECASE), "marketing"),
+    (re.compile(r"operat|\bops\b|finance|recruit|people|\bhr\b|chief of staff", re.IGNORECASE), "ops"),
+    (re.compile(r"engineer|developer|scientist|machine learning|\bml\b|\bai\b|data|devops|\bsre\b|architect|"
+                r"programmer|\bcto\b|technical", re.IGNORECASE), "eng"),
+]
+
+
+def waas_family(role: str) -> str | None:
+    return next((family for pattern, family in WAAS_FAMILIES if pattern.search(role)), None)
+
+
+def build_waas(sp: dict, roles: list[str], locations: list[str]) -> tuple[dict, list[str]]:
+    warnings: list[str] = []
+    families = list(dict.fromkeys(f for f in (waas_family(r) for r in roles) if f))
+    unmatched = [r for r in roles if not waas_family(r)]
+    if unmatched:
+        warnings.append(f"Work at a Startup: no role family matches {', '.join(unmatched)}, so every role family is searched.")
+        families = []
+    if _places(locations):
+        warnings.append("Work at a Startup cannot filter by city: listings from every location come back.")
+    data: dict[str, Any] = {"roles": families, "remote": _remote_only(sp, locations),
+                            "maxResults": int(sp.get("max_results") or 20),
+                            "includeCompanyDetails": bool(sp.get("startup_details", True))}
+    if _batches(sp):
+        data["ycBatches"] = _batches(sp)
+    return data, warnings
+
+
+def normalize_waas(item: dict) -> dict:
+    location = _pick(item, "location") or ("Remote" if item.get("remote") is True else "")
+    return {"id": _pick(item, "jobId", "id"), "site": "workatastartup",
+            "title": _pick(item, "jobTitle", "title"), "company": _pick(item, "companyName", "company"),
+            "location": location, "url": _pick(item, "jobUrl", "url", "companyUrl"),
+            "description": _join(_pick(item, "description", "jobDescription", "descriptionText"), _facts([
+                ("Salary", item.get("salary")), ("Equity", item.get("equity")),
+                ("Experience", item.get("minExperience")), ("Job type", item.get("jobType")),
+                ("Remote", item.get("remote") if isinstance(item.get("remote"), str) else None),
+                ("Visa sponsorship", "yes" if item.get("sponsorsVisa") is True else None),
+                ("YC batch", item.get("ycBatch")), ("Team size", item.get("teamSize")),
+                ("Funding", item.get("funding")), ("Company", item.get("companyDescription")),
+                ("Tags", item.get("tags"))])),
+            "posted_at": item.get("postedAt")}
+
+
+# ───────────── automation-lab/ycombinator-jobs-scraper ─────────────
+YC_TYPES = {"fulltime": "Full-time", "internship": "Internship"}
+
+
+def build_yc(sp: dict, roles: list[str], locations: list[str]) -> tuple[dict, list[str]]:
+    warnings: list[str] = []
+    per = int(sp.get("max_results") or 20)
+    details = bool(sp.get("startup_details", True))
+    data: dict[str, Any] = {"query": roles[0], "maxItems": per, "remoteOnly": _remote_only(sp, locations),
+                            "includeIncomplete": False, "includeDetails": details}
+    if details:
+        data["maxDetailRequests"] = per
+    if sp.get("job_type") in YC_TYPES:
+        data["jobType"] = YC_TYPES[sp["job_type"]]
+    elif sp.get("job_type"):
+        warnings.append("Y Combinator Jobs: only full-time and internship job types can be filtered; any type is searched.")
+    batches = _batches(sp)
+    if batches:
+        data["companyBatch"] = batches[0]
+        if len(batches) > 1:
+            warnings.append(f"Y Combinator Jobs: filters by one batch only, so {batches[0]} is used.")
+    if _places(locations):
+        warnings.append("Y Combinator Jobs cannot filter by city: listings from every location come back.")
+    return data, warnings
+
+
+def normalize_yc(item: dict) -> dict:
+    location = _pick(item, "location") or ("Remote" if item.get("isRemote") is True else "")
+    return {"id": item.get("id"), "site": "ycombinator",
+            "title": item.get("title"), "company": _pick(item, "companyName", "companySlug"),
+            "location": location, "url": _pick(item, "url", "applyUrl"),
+            "description": _join(_pick(item, "descriptionText", "descriptionHtml"), _facts([
+                ("Salary", item.get("salaryRange")), ("Equity", item.get("equityRange")),
+                ("Experience", item.get("minExperience")), ("Job type", item.get("type")),
+                ("Visa", item.get("visa")), ("Skills", item.get("skills")),
+                ("YC batch", item.get("companyBatch")), ("Company", item.get("companyOneLiner")),
+                ("Industry", item.get("industry")), ("Team size", item.get("companySize"))])),
+            "posted_at": item.get("createdAt")}
+
+
+# ───────────── parseforge/hn-whoishiring-scraper ─────────────
+def build_hn(sp: dict, roles: list[str], locations: list[str]) -> tuple[dict, list[str]]:
+    warnings: list[str] = []
+    month = str(sp.get("hn_month") or "current").strip().lower()
+    if not HN_MONTH_RE.match(month):
+        warnings.append("HN Who's Hiring: the thread month must be 'current' or YYYY-MM; the current thread is used.")
+        month = "current"
+    data: dict[str, Any] = {"keyword": roles[0], "month": month, "maxItems": int(sp.get("max_results") or 20),
+                            "remoteOnly": _remote_only(sp, locations)}
+    if int(sp.get("min_salary") or 0) > 0:
+        data["minSalary"] = int(sp["min_salary"])
+    if _places(locations):
+        warnings.append("HN Who's Hiring cannot filter by city: postings from every location come back.")
+    return data, warnings
+
+
+def normalize_hn(item: dict) -> dict:
+    location = _pick(item, "location") or ("Remote" if item.get("remote") is True else "")
+    return {"id": _pick(item, "hnCommentId", "commentId", "id"), "site": "hackernews",
+            "title": _pick(item, "role", "title", "position"), "company": _pick(item, "company", "companyName"),
+            "location": location, "url": _pick(item, "applyUrl", "url", "hnCommentUrl"),
+            "description": _join(_pick(item, "description", "text", "descriptionText", "body", "fullText"), _facts([
+                ("Salary", item.get("salaryRaw")), ("Job type", item.get("employmentType")),
+                ("Stack", item.get("stackText")), ("Visa sponsorship", "yes" if item.get("visa") is True else None),
+                ("Posted in", item.get("threadMonth") and f"HN Who's Hiring {item['threadMonth']}")])),
+            "posted_at": _pick(item, "postedAt", "createdAt")}
+
+
+# ───────────── blackfalcondata/wellfound-scraper ─────────────
+WELLFOUND_TYPES = {"fulltime": "fulltime", "parttime": "parttime", "contract": "contract", "internship": "internship"}
+# Wellfound filters by a minimum experience band, so the lowest seniority chosen sets it.
+WELLFOUND_LEVELS = [("entry", "entry"), ("mid", "mid"), ("senior", "senior"), ("lead", "senior"),
+                    ("manager", "senior"), ("director", "staff"), ("executive", "staff")]
+
+
+def wellfound_slug(location: str) -> str:
+    """'New York, NY' -> 'new-york': Wellfound's location slugs are the city alone."""
+    return re.sub(r"[^a-z0-9]+", "-", location.split(",")[0].lower()).strip("-")
+
+
+def build_wellfound(sp: dict, roles: list[str], locations: list[str]) -> tuple[dict, list[str]]:
+    places = _places(locations)
+    data: dict[str, Any] = {"query": roles[0], "maxResults": int(sp.get("max_results") or 20),
+                            "remote": _remote_only(sp, locations), "descriptionFormat": "text"}
+    if places:
+        data["location"] = list(dict.fromkeys(wellfound_slug(p) for p in places))
+    if sp.get("job_type") in WELLFOUND_TYPES:
+        data["jobType"] = WELLFOUND_TYPES[sp["job_type"]]
+    chosen = set(sp.get("seniority") or [])
+    level = next((band for name, band in WELLFOUND_LEVELS if name in chosen), None)
+    if level:
+        data["experienceLevel"] = level
+    if int(sp.get("min_salary") or 0) > 0:
+        data["salaryMin"] = int(sp["min_salary"])
+    if sp.get("visa_sponsorship"):
+        data["visaSponsorship"] = True
+    if sp.get("hours_old"):
+        data["maxAgeMinutes"] = int(sp["hours_old"]) * 60
+    if sp.get("exclude_keywords"):
+        data["excludeKeywords"] = {"keywords": list(sp["exclude_keywords"]), "matchTitle": True,
+                                   "matchDescription": False, "matchSkills": False}
+    if sp.get("skip_agencies", True):
+        data["skipReposts"] = True
+    return data, []
+
+
+def normalize_wellfound(item: dict) -> dict:
+    places = item.get("locationNames") or []
+    location = ", ".join(places) if isinstance(places, list) else str(places or "")
+    if item.get("remote") is True:
+        location = f"Remote · {location}" if location else "Remote"
+    return {"id": _pick(item, "id", "slug"), "site": "wellfound",
+            "title": _pick(item, "title", "primaryRoleTitle"), "company": _pick(item, "companyName", "companySlug"),
+            "location": location, "url": _pick(item, "portalUrl", "detailUrl"),
+            "description": _join(_pick(item, "description", "descriptionMarkdown", "descriptionHtml"), _facts([
+                ("Compensation", item.get("compensation")), ("Job type", item.get("jobType")),
+                ("Experience", item.get("yearsExperienceMin") and f"{item['yearsExperienceMin']}+ years"),
+                ("Skills", item.get("skills")), ("Company", item.get("companyTagline")),
+                ("Company size", item.get("companySizeLabel")), ("Stage", item.get("companyStage"))])),
+            "posted_at": item.get("postedAt")}
+
+
 BUILTIN: dict[str, ActorSpec] = {spec.id: spec for spec in [
     ActorSpec("openclawai/job-board-scraper", "Multi Job Board",
               "LinkedIn, Indeed, Glassdoor, Naukri, Bayt and ZipRecruiter in one run.", "$0.005 per job",
@@ -191,16 +411,38 @@ BUILTIN: dict[str, ActorSpec] = {spec.id: spec for spec in [
               "Indexed LinkedIn jobs with AI-enriched seniority, work arrangement, salary and visa data.",
               "$0.005 per job (less on paid tiers)", "once", "linkedin",
               ["location", "remote", "job_type", "hours", "easy_apply", "seniority", "salary_only",
-               "visa_sponsorship", "exclude_keywords", "skip_agencies"], build_fantastic,
+               "visa_sponsorship", "exclude_keywords", "skip_agencies"], build_fantastic, group="LinkedIn",
               location_hint="Locations must be 'City, State/Region, Country', e.g. 'Bengaluru, Karnataka, India'."),
     ActorSpec("benthepythondev/remote-jobs-aggregator", "Remote Jobs Aggregator",
               "Arbeitnow, Jobicy, Himalayas, RemoteOK, Remotive and Working Nomads, deduplicated.",
               "$0.015 per job", "role", "remote",
               ["remote_platforms", "location", "job_type", "hours", "seniority", "salary_only", "exclude_keywords"],
-              build_remote_aggregator, extra={"platforms": REMOTE_PLATFORMS}),
+              build_remote_aggregator, group="Remote boards", extra={"platforms": REMOTE_PLATFORMS}),
     ActorSpec("shahidirfan/Remoteok-Job-Scraper", "RemoteOK",
               "RemoteOK listings from the main feed or a category page.", "$0.001 per job + $0.005 per run",
-              "role", "remoteok", ["remoteok_url"], build_remoteok),
+              "role", "remoteok", ["remoteok_url"], build_remoteok, group="Remote boards"),
+    ActorSpec("antishock/workatastartup-jobs-scraper", "Work at a Startup",
+              "YC's own hiring board: roles at YC companies with salary, equity, batch and funding.",
+              "$0.004 per job + $0.002 per run", "once", "workatastartup",
+              ["remote", "yc_batches", "startup_details"], build_waas, group="Startups", normalize=normalize_waas,
+              location_hint="Work at a Startup searches by role family (engineering, design, sales, marketing, ops) "
+                            "and cannot filter by city."),
+    ActorSpec("automation-lab/ycombinator-jobs-scraper", "Y Combinator Jobs",
+              "The public ycombinator.com/jobs board, with salary, equity, visa and founders.",
+              "$0.006 per run + under $0.0001 per job", "role", "ycombinator",
+              ["remote", "job_type", "yc_batches", "startup_details"], build_yc, group="Startups",
+              normalize=normalize_yc),
+    ActorSpec("parseforge/hn-whoishiring-scraper", "HN Who's Hiring",
+              "Every posting in a monthly Hacker News 'Who is hiring?' thread, with parsed salary.",
+              "$0.02 per job", "role", "hackernews", ["remote", "hn_month", "min_salary"], build_hn,
+              group="Startups", normalize=normalize_hn),
+    ActorSpec("blackfalcondata/wellfound-scraper", "Wellfound",
+              "Startup jobs from Wellfound (AngelList Talent) with salary and equity ranges.",
+              "$0.003 per job + $0.005 per run", "role", "wellfound",
+              ["location", "remote", "job_type", "hours", "seniority", "min_salary", "visa_sponsorship",
+               "exclude_keywords", "skip_agencies"], build_wellfound, group="Startups",
+              normalize=normalize_wellfound,
+              location_hint="Wellfound matches the city name only: 'New York, NY' searches new-york."),
 ]}
 
 
@@ -244,7 +486,7 @@ def custom_spec(entry: dict) -> ActorSpec:
 
     return ActorSpec(entry["id"], entry.get("name") or entry["id"], "Added by you", "see the actor's pricing",
                      entry.get("fan_out") or "role_location", entry["id"].split("/")[-1], [], build, custom=True,
-                     extra={"input_template": template})
+                     group="Your actors", extra={"input_template": template})
 
 
 def catalog(sp: dict | None = None) -> dict[str, ActorSpec]:
@@ -294,6 +536,12 @@ def default_site_for(actor_id: str, sp: dict | None = None) -> str:
     return spec.source if spec else actor_id.split("/")[-1].lower()
 
 
+def item_normalizer(actor_id: str) -> Callable[[dict], dict] | None:
+    """The actor's own dataset-item mapping, when it has one. Only built-in actors do."""
+    spec = BUILTIN.get(actor_id)
+    return spec.normalize if spec else None
+
+
 LABELS = {
     "searchTerm": "Role", "searchTerms": "Roles", "titleSearch": "Roles", "searchKeywords": "Keywords", "keyword": "Keyword",
     "location": "Location", "locationSearch": "Locations", "locationKeywords": "Locations",
@@ -306,14 +554,22 @@ LABELS = {
     "seniorityFilter": "Seniority", "seniorityLevels": "Seniority", "removeAgency": "Skip agencies",
     "hasSalary": "Salary listed", "salaryOnly": "Salary listed", "linkedinFetchDescription": "Full LinkedIn descriptions",
     "enforceAnnualSalary": "Annual salary", "titleExclusionSearch": "Exclude", "excludeKeywords": "Exclude",
+    "roles": "Role families", "remote": "Remote only", "ycBatches": "YC batches", "companyBatch": "YC batch",
+    "includeCompanyDetails": "Company details", "includeDetails": "Full descriptions", "query": "Keywords",
+    "maxItems": "Limit", "remoteOnly": "Remote only", "month": "Thread month", "minSalary": "Min salary",
+    "salaryMin": "Min salary", "experienceLevel": "Experience", "visaSponsorship": "Visa sponsorship",
+    "maxAgeMinutes": "Posted ≤ minutes", "skipReposts": "Skip reposts", "maxDetailRequests": "Detail pages",
 }
 
 
 def describe_input(data: dict) -> list[list[str]]:
     rows = []
     for key, value in (data or {}).items():
-        if key in ("proxyConfiguration", "descriptionFormat", "descriptionType") or value in (None, "", [], {}, False, 0):
+        if key in ("proxyConfiguration", "descriptionFormat", "descriptionType", "includeIncomplete") \
+                or value in (None, "", [], {}, False, 0):
             continue
+        if isinstance(value, dict) and "keywords" in value:
+            value = value["keywords"]
         shown = " · ".join(map(str, value)) if isinstance(value, list) else "yes" if value is True else str(value)
         rows.append([LABELS.get(key, key), shown[:300]])
     return rows

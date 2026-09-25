@@ -1,4 +1,5 @@
 import uuid
+from typing import ClassVar
 
 import pytest
 from fastapi.testclient import TestClient
@@ -23,9 +24,12 @@ class FakeApify:
         self.runs = {}
         self.items = {}
 
-    def add_run(self, status="SUCCEEDED", items=None, input_=None):
+    ACTORS: ClassVar[dict[str, tuple[str, str, str]]] = {"ACT1": ("openclawai", "job-board-scraper", "Multi Job Board"),
+              "ACT2": ("blackfalcondata", "wellfound-scraper", "Wellfound")}
+
+    def add_run(self, status="SUCCEEDED", items=None, input_=None, act="ACT1"):
         run_id = uuid.uuid4().hex[:17]
-        self.runs[run_id] = {"id": run_id, "actId": "ACT1", "status": status, "startedAt": "2026-09-14T10:00:00.000Z",
+        self.runs[run_id] = {"id": run_id, "actId": act, "status": status, "startedAt": "2026-09-14T10:00:00.000Z",
                              "finishedAt": "2026-09-14T10:02:00.000Z", "defaultDatasetId": f"DS{run_id}",
                              "defaultKeyValueStoreId": f"KV{run_id}", "meta": {"origin": "WEB"}}
         self.items[f"DS{run_id}"] = items or []
@@ -38,8 +42,9 @@ class FakeApify:
             return {"data": {"items": [dict(r) for r in reversed(list(self.runs.values()))]}}
         if path.startswith("/actor-runs/"):
             return {"data": dict(self.runs[path.rsplit("/", 1)[1]])}
-        if path == "/acts/ACT1":
-            return {"data": {"username": "openclawai", "name": "job-board-scraper", "title": "Multi Job Board"}}
+        if path.startswith("/acts/") and path.split("/")[2] in self.ACTORS:
+            username, name, title = self.ACTORS[path.split("/")[2]]
+            return {"data": {"username": username, "name": name, "title": title}}
         if path.startswith("/datasets/") and path.endswith("/items"):
             return self.items[path.split("/")[2]]
         if path.startswith("/datasets/"):
@@ -128,3 +133,17 @@ def test_sync_requires_the_accounts_own_token():
     set_apify_key("")
     assert client.get("/api/search/apify/remote-runs").status_code == 400
     assert client.post("/api/search/apify/runs/refresh-pending").status_code == 400
+
+
+def test_a_startup_actor_run_is_imported_with_its_own_field_names(apify):
+    wellfound = {"id": f"wf-{apify.tag}", "title": "Founding AI Engineer", "companyName": apify.company,
+                 "locationNames": ["San Francisco"], "remote": True, "portalUrl": f"https://wellfound.com/jobs/{apify.tag}",
+                 "description": "Ship the agent platform.", "compensation": "$180k – $220k • 0.5%"}
+    run_id = apify.add_run(items=[wellfound, {"title": "no company"}], act="ACT2",
+                           input_={"query": "AI Engineer", "maxResults": 20})
+    result = client.post("/api/search/apify/import", json={"external_run_ids": [run_id]}).json()["results"][0]
+    assert result["ok"] and result["import"]["created"] == 1 and result["import"]["skipped"] == 1
+    detail = client.get(f"/api/search/apify/runs/{result['id']}/detail").json()
+    job = detail["results"][0]
+    assert (job["title"], job["company"]) == ("Founding AI Engineer", apify.company)
+    assert ["Keywords", "AI Engineer"] in detail["context"]
