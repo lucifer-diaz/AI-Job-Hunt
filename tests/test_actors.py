@@ -165,6 +165,12 @@ def test_startup_items_normalize_to_jobs_with_listing_facts():
     assert (waas["source"], waas["source_ref"], waas["title"], waas["company"]) == (
         "apify:workatastartup", "workatastartup:77", "Backend Engineer", "Acme")
     assert "Salary: $150K - $190K" in waas["description"] and "Visa sponsorship: yes" in waas["description"]
+    remote_sf = normalize_apify_job(item_normalizer(STARTUP[0])({
+        "jobId": 78, "jobTitle": "ML Engineer", "companyName": "Acme", "location": "San Francisco", "remote": True,
+        "postedAt": "2026-09-20T10:00:00Z"}))
+    assert remote_sf["location"] == "Remote · San Francisco"  # a remote role that names a city stays remote
+    assert remote_sf["posted_at"].isoformat() == "2026-09-20T10:00:00" and remote_sf["posted_date_raw"] == "2026-09-20T10:00:00Z"
+    assert waas["posted_at"] is None  # no date given: unknown, never guessed
 
     yc = normalize_apify_job(item_normalizer(STARTUP[1])({
         "id": 93174, "title": "Forward Deployed Engineer", "companyName": "Confido", "location": "", "isRemote": True,

@@ -222,6 +222,14 @@ def _join(description: Any, facts: str) -> str:
     return "\n\n".join(part for part in (text, facts) if part)
 
 
+def _where(location: Any, remote: Any) -> str:
+    """The listing's location, marked remote when the listing says so (a remote role may still name a city)."""
+    text = ", ".join(map(str, location)) if isinstance(location, list) else str(location or "").strip()
+    if remote is not True or "remote" in text.lower():
+        return text
+    return f"Remote · {text}" if text else "Remote"
+
+
 def _pick(item: dict, *keys: str) -> Any:
     for key in keys:
         if item.get(key) not in (None, "", [], {}):
@@ -264,10 +272,9 @@ def build_waas(sp: dict, roles: list[str], locations: list[str]) -> tuple[dict, 
 
 
 def normalize_waas(item: dict) -> dict:
-    location = _pick(item, "location") or ("Remote" if item.get("remote") is True else "")
     return {"id": _pick(item, "jobId", "id"), "site": "workatastartup",
             "title": _pick(item, "jobTitle", "title"), "company": _pick(item, "companyName", "company"),
-            "location": location, "url": _pick(item, "jobUrl", "url", "companyUrl"),
+            "location": _where(item.get("location"), item.get("remote")), "url": _pick(item, "jobUrl", "url", "companyUrl"),
             "description": _join(_pick(item, "description", "jobDescription", "descriptionText"), _facts([
                 ("Salary", item.get("salary")), ("Equity", item.get("equity")),
                 ("Experience", item.get("minExperience")), ("Job type", item.get("jobType")),
@@ -306,10 +313,9 @@ def build_yc(sp: dict, roles: list[str], locations: list[str]) -> tuple[dict, li
 
 
 def normalize_yc(item: dict) -> dict:
-    location = _pick(item, "location") or ("Remote" if item.get("isRemote") is True else "")
     return {"id": item.get("id"), "site": "ycombinator",
             "title": item.get("title"), "company": _pick(item, "companyName", "companySlug"),
-            "location": location, "url": _pick(item, "url", "applyUrl"),
+            "location": _where(item.get("location"), item.get("isRemote")), "url": _pick(item, "url", "applyUrl"),
             "description": _join(_pick(item, "descriptionText", "descriptionHtml"), _facts([
                 ("Salary", item.get("salaryRange")), ("Equity", item.get("equityRange")),
                 ("Experience", item.get("minExperience")), ("Job type", item.get("type")),
@@ -336,10 +342,9 @@ def build_hn(sp: dict, roles: list[str], locations: list[str]) -> tuple[dict, li
 
 
 def normalize_hn(item: dict) -> dict:
-    location = _pick(item, "location") or ("Remote" if item.get("remote") is True else "")
     return {"id": _pick(item, "hnCommentId", "commentId", "id"), "site": "hackernews",
             "title": _pick(item, "role", "title", "position"), "company": _pick(item, "company", "companyName"),
-            "location": location, "url": _pick(item, "applyUrl", "url", "hnCommentUrl"),
+            "location": _where(item.get("location"), item.get("remote")), "url": _pick(item, "applyUrl", "url", "hnCommentUrl"),
             "description": _join(_pick(item, "description", "text", "descriptionText", "body", "fullText"), _facts([
                 ("Salary", item.get("salaryRaw")), ("Job type", item.get("employmentType")),
                 ("Stack", item.get("stackText")), ("Visa sponsorship", "yes" if item.get("visa") is True else None),
@@ -386,13 +391,9 @@ def build_wellfound(sp: dict, roles: list[str], locations: list[str]) -> tuple[d
 
 
 def normalize_wellfound(item: dict) -> dict:
-    places = item.get("locationNames") or []
-    location = ", ".join(places) if isinstance(places, list) else str(places or "")
-    if item.get("remote") is True:
-        location = f"Remote · {location}" if location else "Remote"
     return {"id": _pick(item, "id", "slug"), "site": "wellfound",
             "title": _pick(item, "title", "primaryRoleTitle"), "company": _pick(item, "companyName", "companySlug"),
-            "location": location, "url": _pick(item, "portalUrl", "detailUrl"),
+            "location": _where(item.get("locationNames"), item.get("remote")), "url": _pick(item, "portalUrl", "detailUrl"),
             "description": _join(_pick(item, "description", "descriptionMarkdown", "descriptionHtml"), _facts([
                 ("Compensation", item.get("compensation")), ("Job type", item.get("jobType")),
                 ("Experience", item.get("yearsExperienceMin") and f"{item['yearsExperienceMin']}+ years"),

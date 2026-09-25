@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.models import Job, SearchRun
 from app.services import system_log, tracing
+from app.services.apify_adapters import parse_posted_date
 from app.services.external_api import external_client
 from app.services.user_settings import apify_token
 from app.settings import get_settings
@@ -43,6 +44,8 @@ def upsert_job(
     description: str = "",
     raw: dict | None = None,
     user_id: int | None = None,
+    posted_at: datetime | None = None,
+    posted_date_raw: str | None = None,
 ) -> tuple[Job, bool]:
     from app.services import (
         job_description,  # local import: sources is imported while the app is starting up
@@ -63,6 +66,8 @@ def upsert_job(
             existing.url = url
         if raw:
             existing.raw = raw
+        if existing.posted_at is None and posted_at is not None:
+            existing.posted_at, existing.posted_date_raw = posted_at, posted_date_raw
         db.commit()
         return existing, False
     job = Job(
@@ -75,6 +80,8 @@ def upsert_job(
         url=url or "",
         description=description or "",
         raw=raw or {},
+        posted_at=posted_at,
+        posted_date_raw=posted_date_raw,
     )
     db.add(job)
     db.flush()
@@ -214,7 +221,11 @@ def normalize_apify_job(item: dict[str, Any], default_site: str = "unknown") -> 
     else:
         source_ref = f"{site}:{_source_ref(f'{company}|{title}|{location}') }"
 
+    # Only actor item mappings (app.services.actors) supply `posted_at`; the date is parsed, never guessed.
+    posted = parse_posted_date(item.get("posted_at"), None)
     return {
+        "posted_at": posted.at,
+        "posted_date_raw": posted.raw,
         "source": f"apify:{site}",
         "source_ref": source_ref,
         "title": title,
@@ -547,6 +558,13 @@ def refresh_apify_run(db: Session, search_run: SearchRun, reimport: bool = False
 
 def _refresh_apify_run(db: Session, search_run: SearchRun, token: str, reimport: bool = False) -> dict[str, Any]:
     settings = get_settings()
+    if search_run.actor_id and "/" not in search_run.actor_id:
+        # An imported run whose actor name could not be looked up keeps Apify's opaque ID. Its items are only
+        # imported once the name is known: the wrong item mapping would store jobs that a later pull cannot fix.
+        search_run.actor_id, _ = _actor_name(search_run.actor_id, {}, token)
+        if "/" not in search_run.actor_id:
+            db.commit()
+            raise RuntimeError("Could not look up this run's actor on Apify; its results will be imported on the next try")
     run_meta = {"run_id": search_run.external_run_id, "actor_id": search_run.actor_id,
                 "saved_search_id": search_run.saved_search_id, "search_profile_id": search_run.search_profile_id}
     run = (apify_get(f"/actor-runs/{search_run.external_run_id}", token=token, operation="actor_run_status",
