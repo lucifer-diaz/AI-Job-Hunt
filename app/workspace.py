@@ -42,13 +42,16 @@ from app.prompts import build_evidence_extraction_prompt
 from app.scheduler_hooks import run_soon
 from app.services import ranker, resume_verification
 from app.services.actors import (
+    ACTOR_GROUPS,
     BUILTIN,
     DEFAULT_ACTORS,
     FAN_OUTS,
+    HN_MONTH_RE,
     MAX_RUNS,
     PLACEHOLDERS,
     REMOTE_PLATFORMS,
     SENIORITY_LEVELS,
+    YC_BATCH_RE,
     describe_input,
     plan_runs,
 )
@@ -693,6 +696,11 @@ class SearchProfileIn(BaseModel):
     exclude_keywords: list[str] = Field(default_factory=list, max_length=20)
     linkedin_company_ids: list[str] = Field(default_factory=list, max_length=20)
     skip_agencies: bool = True
+    # Startup boards: Work at a Startup, Y Combinator Jobs, HN Who's Hiring and Wellfound.
+    yc_batches: list[str] = Field(default_factory=list, max_length=10)
+    hn_month: str = Field(default="current", max_length=10)
+    min_salary: int = Field(default=0, ge=0, le=10_000_000)
+    startup_details: bool = True
     auto_rank: bool = True
     schedule: str = "manual"
 
@@ -721,6 +729,11 @@ def validate_search_profile(payload: SearchProfileIn) -> None:
         problems.append("Unknown remote job boards")
     if set(payload.seniority) - set(SENIORITY_LEVELS):
         problems.append("Unknown seniority level")
+    bad_batches = [b for b in payload.yc_batches if not YC_BATCH_RE.match(b.strip())]
+    if bad_batches:
+        problems.append(f"YC batches look like W24 or S21, not {', '.join(bad_batches)}")
+    if not HN_MONTH_RE.match(payload.hn_month.strip().lower()):
+        problems.append("HN thread month must be 'current' or YYYY-MM")
     for entry in payload.custom_actors:
         if entry.fan_out not in FAN_OUTS:
             problems.append(f"{entry.id}: unknown fan-out '{entry.fan_out}'")
@@ -741,7 +754,7 @@ def validate_search_profile(payload: SearchProfileIn) -> None:
 def search_actors(db: Session = Depends(get_user_db)):
     sp = get_search_profile(db)
     return {"actors": [spec.public() for spec in actor_catalog(sp).values()], "placeholders": list(PLACEHOLDERS),
-            "fan_outs": list(FAN_OUTS), "boards": BOARDS, "remote_platforms": REMOTE_PLATFORMS,
+            "fan_outs": list(FAN_OUTS), "groups": list(ACTOR_GROUPS), "boards": BOARDS, "remote_platforms": REMOTE_PLATFORMS,
             "seniority": SENIORITY_LEVELS, "max_runs": MAX_RUNS}
 
 

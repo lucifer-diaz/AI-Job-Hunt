@@ -1,12 +1,14 @@
 import uuid
+from typing import ClassVar
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from app.db import SessionLocal
 from app.main import app
-from app.models import SearchRun
+from app.models import Job, SearchRun
 from app.services.sources import dedupe_key, import_apify_items
 from app.services.user_settings import set_user_keys
 from tests.conftest import ensure_test_user
@@ -22,10 +24,14 @@ class FakeApify:
         self.company = f"Sync Co {tag}"
         self.runs = {}
         self.items = {}
+        self.lookups_fail = False
 
-    def add_run(self, status="SUCCEEDED", items=None, input_=None):
+    ACTORS: ClassVar[dict[str, tuple[str, str, str]]] = {"ACT1": ("openclawai", "job-board-scraper", "Multi Job Board"),
+              "ACT2": ("blackfalcondata", "wellfound-scraper", "Wellfound")}
+
+    def add_run(self, status="SUCCEEDED", items=None, input_=None, act="ACT1"):
         run_id = uuid.uuid4().hex[:17]
-        self.runs[run_id] = {"id": run_id, "actId": "ACT1", "status": status, "startedAt": "2026-09-14T10:00:00.000Z",
+        self.runs[run_id] = {"id": run_id, "actId": act, "status": status, "startedAt": "2026-09-14T10:00:00.000Z",
                              "finishedAt": "2026-09-14T10:02:00.000Z", "defaultDatasetId": f"DS{run_id}",
                              "defaultKeyValueStoreId": f"KV{run_id}", "meta": {"origin": "WEB"}}
         self.items[f"DS{run_id}"] = items or []
@@ -38,8 +44,11 @@ class FakeApify:
             return {"data": {"items": [dict(r) for r in reversed(list(self.runs.values()))]}}
         if path.startswith("/actor-runs/"):
             return {"data": dict(self.runs[path.rsplit("/", 1)[1]])}
-        if path == "/acts/ACT1":
-            return {"data": {"username": "openclawai", "name": "job-board-scraper", "title": "Multi Job Board"}}
+        if path.startswith("/acts/") and self.lookups_fail:
+            raise httpx.ConnectError("Apify unreachable")
+        if path.startswith("/acts/") and path.split("/")[2] in self.ACTORS:
+            username, name, title = self.ACTORS[path.split("/")[2]]
+            return {"data": {"username": username, "name": name, "title": title}}
         if path.startswith("/datasets/") and path.endswith("/items"):
             return self.items[path.split("/")[2]]
         if path.startswith("/datasets/"):
@@ -128,3 +137,41 @@ def test_sync_requires_the_accounts_own_token():
     set_apify_key("")
     assert client.get("/api/search/apify/remote-runs").status_code == 400
     assert client.post("/api/search/apify/runs/refresh-pending").status_code == 400
+
+
+def test_a_startup_actor_run_is_imported_with_its_own_field_names(apify):
+    wellfound = {"id": f"wf-{apify.tag}", "title": "Founding AI Engineer", "companyName": apify.company,
+                 "locationNames": ["San Francisco"], "remote": True, "portalUrl": f"https://wellfound.com/jobs/{apify.tag}",
+                 "description": "Ship the agent platform.", "compensation": "$180k – $220k • 0.5%"}
+    run_id = apify.add_run(items=[wellfound, {"title": "no company"}], act="ACT2",
+                           input_={"query": "AI Engineer", "maxResults": 20})
+    result = client.post("/api/search/apify/import", json={"external_run_ids": [run_id]}).json()["results"][0]
+    assert result["ok"] and result["import"]["created"] == 1 and result["import"]["skipped"] == 1
+    detail = client.get(f"/api/search/apify/runs/{result['id']}/detail").json()
+    job = detail["results"][0]
+    assert (job["title"], job["company"]) == ("Founding AI Engineer", apify.company)
+    assert ["Keywords", "AI Engineer"] in detail["context"]
+
+
+def test_posting_dates_are_kept_and_an_unresolved_actor_is_looked_up_again(apify):
+    wellfound = {"id": f"wf2-{apify.tag}", "title": "Staff Data Engineer", "companyName": apify.company,
+                 "locationNames": ["Berlin"], "portalUrl": f"https://wellfound.com/jobs/2{apify.tag}",
+                 "description": "Pipelines.", "postedAt": "2026-09-18"}
+    run_id = apify.add_run(items=[wellfound], act="ACT2")
+    apify.lookups_fail = True  # the actor's name cannot be resolved when the run is first imported
+    first = client.post("/api/search/apify/import", json={"external_run_ids": [run_id]}).json()["results"][0]
+    assert not first["ok"] and "look up" in first["error"]
+    with SessionLocal() as db:
+        run = db.scalar(select(SearchRun).where(SearchRun.external_run_id == run_id))
+        # Nothing is imported under a guessed mapping; the run waits for the next try.
+        assert run.actor_id == "ACT2" and run.completed_at is None
+        assert db.scalar(select(Job).where(Job.company == apify.company)) is None
+
+    apify.lookups_fail = False
+    second = client.post("/api/search/apify/import", json={"external_run_ids": [run_id]}).json()["results"][0]
+    assert second["ok"] and second["import"]["created"] == 1
+    with SessionLocal() as db:
+        assert db.get(SearchRun, second["id"]).actor_id == "blackfalcondata/wellfound-scraper"
+        job = db.scalar(select(Job).where(Job.company == apify.company, Job.title == "Staff Data Engineer"))
+        assert job.posted_at is not None and job.posted_at.date().isoformat() == "2026-09-18"
+        assert job.location == "Berlin"

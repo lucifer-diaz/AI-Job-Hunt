@@ -181,6 +181,19 @@ Discovery → Search setup lets you tick one or more actors. A setup's search is
 | `fantastic-jobs/advanced-linkedin-job-search-api` (Advanced LinkedIn) | one for everything | `titleSearch`, `locationSearch` (needs `City, State, Country`), `timeRange`, `limit`, `aiWorkArrangementFilter`, `aiEmploymentTypeFilter`, `seniorityFilter`, `directApply`, `hasSalary`, `aiVisaSponsorshipFilter`, `removeAgency`, `titleExclusionSearch` |
 | `benthepythondev/remote-jobs-aggregator` | one per role | `searchKeywords`, `platforms`, `maxJobsPerPlatform`, `postedWithinDays`, `locationKeywords`, `jobTypes`, `seniorityLevels`, `salaryOnly`, `excludeKeywords` |
 | `shahidirfan/Remoteok-Job-Scraper` | one per role | `startUrl`, `keyword`, `results_wanted` |
+| `antishock/workatastartup-jobs-scraper` (Work at a Startup) | one for everything | `roles` (role families: each search role is mapped to `eng`, `design`, `sales`, `marketing` or `ops`), `remote`, `ycBatches`, `maxResults`, `includeCompanyDetails` |
+| `automation-lab/ycombinator-jobs-scraper` (Y Combinator Jobs) | one per role | `query`, `maxItems`, `remoteOnly`, `jobType` (full-time or internship), `companyBatch` (the first YC batch), `includeDetails`, `maxDetailRequests` |
+| `parseforge/hn-whoishiring-scraper` (HN Who's Hiring) | one per role | `keyword`, `month` (`current` or `YYYY-MM`), `maxItems`, `remoteOnly`, `minSalary` |
+| `blackfalcondata/wellfound-scraper` (Wellfound) | one per role | `query`, `location` (city slugs), `remote`, `jobType`, `experienceLevel` (from the lowest seniority chosen), `salaryMin`, `visaSponsorship`, `maxAgeMinutes`, `excludeKeywords`, `skipReposts`, `maxResults` |
+
+The four startup boards have their own settings on the setup (YC batches, HN thread month, minimum salary,
+and whether to fetch full descriptions), and none of them except Wellfound can filter by city. Their dataset items use
+their own field names, so each has an item mapping in `actors.py` (`normalize` on its spec) that turns an item into
+title, company, location, URL and description before import; salary, equity, visa and batch facts from the listing
+are appended to the description so ranking can see them. The raw item is kept on the job unchanged.
+
+The picker groups actors (job boards, LinkedIn, remote boards, startups, your own), lists the settings each one reads,
+and marks every filter with the selected actors that use it, so a filter nobody reads is visible as such.
 
 Conflicting filters are reported before a run starts (for example, Multi Job Board drops `hoursOld` when Easy Apply is on). "Show exact inputs" displays the JSON each run will send, and one profile may start at most 30 runs.
 

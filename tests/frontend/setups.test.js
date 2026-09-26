@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 // The production script, minus the automatic network boot at the bottom.
 const appSource = readFileSync('app/static/app.js', 'utf8').split('/* ───────────── boot ───────────── */')[0];
-const names = ['S', 'D', 'A', 'setF', 'render', 'curSetup', 'setupPayload', 'nextSetupName', 'useSetup', 'adoptSetup'];
+const names = ['S', 'D', 'A', 'setF', 'render', 'curSetup', 'setupPayload', 'searchPayload', 'nextSetupName', 'useSetup', 'adoptSetup'];
 let ui, context, fetchMock;
 
 function response(data, status = 200) { return { ok: status < 400, status, text: async () => JSON.stringify(data) }; }
@@ -128,5 +128,50 @@ describe('saved search setups', () => {
     await ui.A['run-search']();
     expect(calls).toEqual(['PUT /api/search/setups/1', 'POST /api/search/setups/1/run']);
     expect(ui.S.polling.ids).toEqual([9]);
+  });
+});
+
+describe('actor picker', () => {
+  const catalog = [
+    { id: 'openclawai/job-board-scraper', name: 'Multi Job Board', summary: 'Many boards', cost: '$0.005 per job', fan_out: 'location', group: 'Job boards', supports: ['boards', 'hours', 'job_type', 'remote'], custom: false },
+    { id: 'blackfalcondata/wellfound-scraper', name: 'Wellfound', summary: 'Startup jobs', cost: '$0.003 per job', fan_out: 'role', group: 'Startups', supports: ['hours', 'seniority', 'min_salary', 'remote'], custom: false },
+    { id: 'parseforge/hn-whoishiring-scraper', name: "HN Who's Hiring", summary: 'HN thread', cost: '$0.02 per job', fan_out: 'role', group: 'Startups', supports: ['remote', 'hn_month', 'min_salary'], custom: false },
+  ];
+  beforeEach(() => {
+    ui.D.actors = { actors: catalog, groups: ['Job boards', 'LinkedIn', 'Startups', 'Your actors'], remote_platforms: [], seniority: ['entry', 'senior'] };
+  });
+
+  it('groups actors under labelled fieldsets and counts the selection', () => {
+    ui.setF('sp', 'actors', ['blackfalcondata/wellfound-scraper']);
+    ui.render();
+    const legends = [...document.querySelectorAll('.actor-group legend')].map(l => l.textContent.trim());
+    expect(legends).toEqual(['JOB BOARDS', 'STARTUPS · 1 selected']);
+    const box = document.getElementById('actor-blackfalcondata-wellfound-scraper');
+    expect(box.checked).toBe(true);
+    expect(document.getElementById(box.getAttribute('aria-describedby')).textContent).toContain('Startup jobs');
+    expect(document.getElementById('actors-heading').textContent).toContain('1 selected');
+  });
+
+  it('shows startup settings only for the startup actors picked, and says which actor reads each filter', () => {
+    ui.setF('sp', 'actors', ['openclawai/job-board-scraper']);
+    ui.render();
+    expect(document.querySelector('.actor-settings')).toBeNull();
+    expect(document.getElementById('use-seniority').textContent).toBe('Not used by the selected actors');
+
+    ui.setF('sp', 'actors', ['openclawai/job-board-scraper', 'parseforge/hn-whoishiring-scraper']);
+    ui.render();
+    expect(document.getElementById('sp-hn_month').value).toBe('current');
+    expect(document.getElementById('sp-min_salary')).not.toBeNull();
+    expect(document.getElementById('sp-yc_batches')).toBeNull();  // only Work at a Startup and YC Jobs read batches
+    expect(document.getElementById('use-hours').textContent).toBe('Used by Multi Job Board');
+    expect(document.getElementById('use-min_salary').textContent).toBe("Used by HN Who's Hiring");
+  });
+
+  it('sends the startup settings with the search', () => {
+    ui.setF('sp', 'yc_batches', ['W24']);
+    ui.setF('sp', 'hn_month', ' 2026-08 ');
+    ui.setF('sp', 'min_salary', '150000');
+    const body = ui.searchPayload();
+    expect([body.yc_batches, body.hn_month, body.min_salary, body.startup_details]).toEqual([['W24'], '2026-08', 150000, true]);
   });
 });

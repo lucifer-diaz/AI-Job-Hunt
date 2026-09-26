@@ -1,10 +1,9 @@
-"""LLM structured output telemetry and generation provenance
+"""LLM structured output telemetry: schema enforcement, validation failure reason, context builder version
 
 Every LLM request now records how the worker's output contract (app.prompts.contracts) was enforced, why an answer
 failed it (including POSSIBLE_CROSS_WORKER_OUTPUT: valid JSON in another worker's shape), and the version of the
-context builder that prepared its input. Rankings record the AI configuration version they ran under, and follow-up
-drafts record what produced them (prompt version, provider, model, config version). Existing rows keep NULL
-(unknown): nothing is backfilled or guessed, and no stored result is rewritten.
+context builder that prepared its input. Existing rows keep NULL (unknown): nothing is backfilled or guessed.
+Generation provenance on rankings and follow-ups is migration 0024: this revision is left as installs applied it.
 
 Revision ID: 0023
 Revises: 0022
@@ -27,17 +26,9 @@ def upgrade() -> None:
     with op.batch_alter_table("llm_request_logs") as batch:
         for name, length in COLUMNS:
             batch.add_column(sa.Column(name, sa.String(length), nullable=True))
-    with op.batch_alter_table("job_rankings") as batch:
-        batch.add_column(sa.Column("config_version", sa.Integer(), nullable=True))
-    with op.batch_alter_table("followups") as batch:
-        batch.add_column(sa.Column("generation", sa.JSON(), nullable=True))
 
 
 def downgrade() -> None:
-    with op.batch_alter_table("followups") as batch:
-        batch.drop_column("generation")
-    with op.batch_alter_table("job_rankings") as batch:
-        batch.drop_column("config_version")
     with op.batch_alter_table("llm_request_logs") as batch:
         for name, _length in reversed(COLUMNS):
             batch.drop_column(name)

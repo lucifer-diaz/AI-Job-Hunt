@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -14,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.models import Job, SearchRun
 from app.services import system_log, tracing
+from app.services.apify_adapters import parse_posted_date
 from app.services.external_api import external_client
 from app.services.user_settings import apify_token
 from app.settings import get_settings
@@ -42,6 +44,8 @@ def upsert_job(
     description: str = "",
     raw: dict | None = None,
     user_id: int | None = None,
+    posted_at: datetime | None = None,
+    posted_date_raw: str | None = None,
 ) -> tuple[Job, bool]:
     from app.services import (
         job_description,  # local import: sources is imported while the app is starting up
@@ -62,6 +66,8 @@ def upsert_job(
             existing.url = url
         if raw:
             existing.raw = raw
+        if existing.posted_at is None and posted_at is not None:
+            existing.posted_at, existing.posted_date_raw = posted_at, posted_date_raw
         db.commit()
         return existing, False
     job = Job(
@@ -74,6 +80,8 @@ def upsert_job(
         url=url or "",
         description=description or "",
         raw=raw or {},
+        posted_at=posted_at,
+        posted_date_raw=posted_date_raw,
     )
     db.add(job)
     db.flush()
@@ -213,7 +221,11 @@ def normalize_apify_job(item: dict[str, Any], default_site: str = "unknown") -> 
     else:
         source_ref = f"{site}:{_source_ref(f'{company}|{title}|{location}') }"
 
+    # Only actor item mappings (app.services.actors) supply `posted_at`; the date is parsed, never guessed.
+    posted = parse_posted_date(item.get("posted_at"), None)
     return {
+        "posted_at": posted.at,
+        "posted_date_raw": posted.raw,
         "source": f"apify:{site}",
         "source_ref": source_ref,
         "title": title,
@@ -232,16 +244,23 @@ def dedupe_key(title: str, company: str, location: str = "") -> str:
 
 
 def import_apify_items(db: Session, items: list[dict[str, Any]], search_run_id: int | None = None,
-                       default_site: str = "unknown", user_id: int | None = None) -> dict[str, int]:
+                       default_site: str = "unknown", user_id: int | None = None,
+                       adapt: Callable[[dict[str, Any]], dict[str, Any]] | None = None) -> dict[str, int]:
+    """Import dataset items. `adapt` is the actor's own item mapping (app.services.actors.item_normalizer);
+    the job keeps the item exactly as the actor returned it in `raw`."""
     owner = user_id if user_id is not None else require_user_id(db)
     created = normalized = skipped = duplicates = 0
     known = {dedupe_key(t, c, loc) for t, c, loc in
              db.execute(select(Job.title, Job.company, Job.location).where(Job.user_id == owner)).all()}
     for item in items:
-        job_data = normalize_apify_job(item, default_site)
+        if not isinstance(item, dict):
+            skipped += 1
+            continue
+        job_data = normalize_apify_job(adapt(item) if adapt else item, default_site)
         if not job_data:
             skipped += 1
             continue
+        job_data["raw"] = item
         normalized += 1
         key = dedupe_key(job_data["title"], job_data["company"], job_data["location"])
         same_listing = db.scalar(select(Job.id).where(Job.user_id == owner, Job.source == job_data["source"],
@@ -539,6 +558,13 @@ def refresh_apify_run(db: Session, search_run: SearchRun, reimport: bool = False
 
 def _refresh_apify_run(db: Session, search_run: SearchRun, token: str, reimport: bool = False) -> dict[str, Any]:
     settings = get_settings()
+    if search_run.actor_id and "/" not in search_run.actor_id:
+        # An imported run whose actor name could not be looked up keeps Apify's opaque ID. Its items are only
+        # imported once the name is known: the wrong item mapping would store jobs that a later pull cannot fix.
+        search_run.actor_id, _ = _actor_name(search_run.actor_id, {}, token)
+        if "/" not in search_run.actor_id:
+            db.commit()
+            raise RuntimeError("Could not look up this run's actor on Apify; its results will be imported on the next try")
     run_meta = {"run_id": search_run.external_run_id, "actor_id": search_run.actor_id,
                 "saved_search_id": search_run.saved_search_id, "search_profile_id": search_run.search_profile_id}
     run = (apify_get(f"/actor-runs/{search_run.external_run_id}", token=token, operation="actor_run_status",
@@ -567,11 +593,11 @@ def _refresh_apify_run(db: Session, search_run: SearchRun, token: str, reimport:
                 items = []  # failed runs may have no dataset; keep the error below
         if not isinstance(items, list):
             items = []
-        from app.services.actors import default_site_for
+        from app.services.actors import default_site_for, item_normalizer
 
         # Failed, aborted and timed-out runs still import whatever they collected.
         import_stats = import_apify_items(db, items, search_run.id, default_site_for(search_run.actor_id),
-                                          user_id=search_run.user_id)
+                                          user_id=search_run.user_id, adapt=item_normalizer(search_run.actor_id))
         search_run.item_count = import_stats["seen"]
         search_run.created_jobs = db.scalar(select(func.count(Job.id)).where(Job.search_run_id == search_run.id)) or 0
         # What the run actually produced, for the Apify tab: found → normalized → kept after deduplication.

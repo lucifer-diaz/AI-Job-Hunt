@@ -347,6 +347,7 @@ def test_resume_parser_prompt_asks_for_the_structured_schema_only():
     # The resume is not copied back: no cleaned raw_text, no raw_bullets (the application derives both).
     assert "raw_text" not in prompt.system and "raw_bullets" not in prompt.system
     assert set(prompt.output_schema.model_fields) == {"structured_resume"}
+    assert {"university", "grade"} <= set(schema["education"][0]) and "degree-awarding university" in prompt.system
     for rule in ("YYYY-MM", "word for word", "Postgres -> PostgreSQL", "Ka[ka -> Kafka", "Never invent", "visa"):
         assert rule in prompt.system, rule
 

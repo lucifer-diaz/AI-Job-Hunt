@@ -2,7 +2,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.services.actors import plan_runs
+from app.services.actors import item_normalizer, plan_runs, waas_family
 from app.services.sources import build_apify_input, normalize_apify_job
 
 client = TestClient(app)
@@ -13,6 +13,10 @@ BASE = {"roles": ["Lead AI Engineer", "Engineering Manager"], "locations": ["New
         "easy_apply": False, "fetch_description": True, "enforce_annual_salary": True,
         "residential_proxy": False, "salary_only": True, "exclude_keywords": ["intern"],
         "remote_platforms": ["remotive", "himalayas"], "skip_agencies": True}
+
+
+STARTUP = ["antishock/workatastartup-jobs-scraper", "automation-lab/ycombinator-jobs-scraper",
+           "parseforge/hn-whoishiring-scraper", "blackfalcondata/wellfound-scraper"]
 
 
 def inputs_for(actor, **overrides):
@@ -102,4 +106,101 @@ def test_profile_api_validates_and_previews():
         "actors": ["openclawai/job-board-scraper", "shahidirfan/Remoteok-Job-Scraper"]}).json()
     assert [r["actor_id"] for r in preview["runs"]] == ["openclawai/job-board-scraper", "shahidirfan/Remoteok-Job-Scraper"]
     catalog = client.get("/api/search/actors").json()
-    assert len([a for a in catalog["actors"] if not a["custom"]]) == 4
+    assert len([a for a in catalog["actors"] if not a["custom"]]) == 8
+    assert "Startups" in catalog["groups"]
+    assert {a["group"] for a in catalog["actors"] if a["id"] in STARTUP} == {"Startups"}
+
+
+def test_work_at_a_startup_searches_role_families_once():
+    runs, warnings = inputs_for("antishock/workatastartup-jobs-scraper", roles=["Lead AI Engineer", "Product Designer"],
+                                yc_batches=["w24", "S23", "bogus"], is_remote=True)
+    assert len(runs) == 1
+    assert runs[0]["input"] == {"roles": ["eng", "design"], "remote": True, "maxResults": 25,
+                                "includeCompanyDetails": True, "ycBatches": ["W24", "S23"]}
+    assert any("cannot filter by city" in w for w in warnings)
+    # A role with no family searches every family rather than silently dropping it.
+    runs, warnings = inputs_for("antishock/workatastartup-jobs-scraper", roles=["Chief Vibes Officer"], locations=["Remote"])
+    assert runs[0]["input"]["roles"] == [] and runs[0]["input"]["remote"] is True
+    assert any("no role family matches" in w for w in warnings)
+    assert waas_family("Staff ML Engineer") == "eng" and waas_family("Head of Growth") == "marketing"
+
+
+def test_y_combinator_jobs_runs_per_role_with_schema_names():
+    runs, warnings = inputs_for("automation-lab/ycombinator-jobs-scraper", yc_batches=["W24", "S23"], startup_details=False)
+    assert [r["input"]["query"] for r in runs] == BASE["roles"]
+    data = runs[0]["input"]
+    assert data == {"query": "Lead AI Engineer", "maxItems": 25, "remoteOnly": False, "includeIncomplete": False,
+                    "includeDetails": False, "jobType": "Full-time", "companyBatch": "W24"}
+    assert any("one batch only" in w for w in warnings)
+    _, warnings = inputs_for("automation-lab/ycombinator-jobs-scraper", job_type="contract", locations=["Remote"])
+    assert any("full-time and internship" in w for w in warnings)
+
+
+def test_hn_whos_hiring_month_salary_and_remote():
+    runs, _ = inputs_for("parseforge/hn-whoishiring-scraper", locations=["Remote"], hn_month="2026-08", min_salary=150000)
+    assert runs[0]["input"] == {"keyword": "Lead AI Engineer", "month": "2026-08", "maxItems": 25,
+                                "remoteOnly": True, "minSalary": 150000}
+    runs, warnings = inputs_for("parseforge/hn-whoishiring-scraper", hn_month="August")
+    assert runs[0]["input"]["month"] == "current" and any("YYYY-MM" in w for w in warnings)
+
+
+def test_wellfound_maps_every_supported_filter():
+    runs, warnings = inputs_for("blackfalcondata/wellfound-scraper", min_salary=120000, visa_sponsorship=True)
+    assert len(runs) == 2 and not warnings
+    data = runs[0]["input"]
+    assert data["query"] == "Lead AI Engineer" and data["location"] == ["new-york"] and data["remote"] is False
+    assert data["jobType"] == "fulltime" and data["experienceLevel"] == "senior"  # the lowest seniority chosen
+    assert data["salaryMin"] == 120000 and data["visaSponsorship"] is True and data["maxAgeMinutes"] == 72 * 60
+    assert data["excludeKeywords"]["keywords"] == ["intern"] and data["skipReposts"] is True
+    remote, _ = inputs_for("blackfalcondata/wellfound-scraper", locations=["Remote"], seniority=[])
+    assert remote[0]["input"]["remote"] is True and "location" not in remote[0]["input"]
+    assert "experienceLevel" not in remote[0]["input"]
+
+
+def test_startup_items_normalize_to_jobs_with_listing_facts():
+    waas = normalize_apify_job(item_normalizer(STARTUP[0])({
+        "jobId": 77, "jobTitle": "Backend Engineer", "companyName": "Acme", "location": "San Francisco",
+        "jobUrl": "https://www.workatastartup.com/jobs/77", "salary": "$150K - $190K", "equity": "0.2% - 0.5%",
+        "ycBatch": "W24", "sponsorsVisa": True}), "workatastartup")
+    assert (waas["source"], waas["source_ref"], waas["title"], waas["company"]) == (
+        "apify:workatastartup", "workatastartup:77", "Backend Engineer", "Acme")
+    assert "Salary: $150K - $190K" in waas["description"] and "Visa sponsorship: yes" in waas["description"]
+    remote_sf = normalize_apify_job(item_normalizer(STARTUP[0])({
+        "jobId": 78, "jobTitle": "ML Engineer", "companyName": "Acme", "location": "San Francisco", "remote": True,
+        "postedAt": "2026-09-20T10:00:00Z"}))
+    assert remote_sf["location"] == "Remote · San Francisco"  # a remote role that names a city stays remote
+    assert remote_sf["posted_at"].isoformat() == "2026-09-20T10:00:00" and remote_sf["posted_date_raw"] == "2026-09-20T10:00:00Z"
+    assert waas["posted_at"] is None  # no date given: unknown, never guessed
+
+    yc = normalize_apify_job(item_normalizer(STARTUP[1])({
+        "id": 93174, "title": "Forward Deployed Engineer", "companyName": "Confido", "location": "", "isRemote": True,
+        "url": "https://www.ycombinator.com/companies/confido/jobs/X", "descriptionText": "Build integrations.",
+        "source": "ycombinator.com", "role": "eng"}))
+    # The item's own `source` and `role` fields do not leak into the board or the title.
+    assert yc["source"] == "apify:ycombinator" and yc["title"] == "Forward Deployed Engineer"
+    assert yc["location"] == "Remote" and yc["description"].startswith("Build integrations.")
+
+    hn = normalize_apify_job(item_normalizer(STARTUP[2])({
+        "company": "Tiny Co", "role": "Senior Rust Engineer", "location": "Berlin", "remote": True,
+        "salaryRaw": "€90k", "stackText": "Rust, Postgres", "hnCommentUrl": "https://news.ycombinator.com/item?id=1",
+        "description": "We build databases."}))
+    assert hn["title"] == "Senior Rust Engineer" and hn["url"] == "https://news.ycombinator.com/item?id=1"
+    assert hn["source_ref"].startswith("hackernews:") and "Stack: Rust, Postgres" in hn["description"]
+
+    wf = normalize_apify_job(item_normalizer(STARTUP[3])({
+        "id": "4716549", "title": "Senior Software Engineer", "companyName": "Hourglass",
+        "locationNames": ["New York City", "San Francisco Bay Area"], "remote": False,
+        "portalUrl": "https://wellfound.com/jobs/4716549", "description": "Fintech.", "compensation": "$175k – $225k"}))
+    assert wf["location"] == "New York City, San Francisco Bay Area" and wf["source_ref"] == "wellfound:4716549"
+    assert "Compensation: $175k – $225k" in wf["description"]
+    assert item_normalizer("openclawai/job-board-scraper") is None and item_normalizer("someone/else") is None
+
+
+def test_profile_api_validates_startup_settings():
+    bad = client.post("/api/search/profile/preview", json={
+        "roles": ["AI Engineer"], "actors": STARTUP, "yc_batches": ["2024"], "hn_month": "May"}).json()
+    assert "YC batches" in bad["detail"] and "HN thread month" in bad["detail"]
+    ok = client.post("/api/search/profile/preview", json={
+        "roles": ["AI Engineer"], "locations": ["Remote"], "actors": STARTUP, "yc_batches": ["W24"],
+        "hn_month": "2026-09", "min_salary": 100000}).json()
+    assert [r["actor_id"] for r in ok["runs"]] == STARTUP

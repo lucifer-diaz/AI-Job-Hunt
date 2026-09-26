@@ -20,9 +20,10 @@ from app.prompts.common import (
 )
 from app.prompts.contracts import EvidenceExtractionResult, ResumeParserOutput, describe_fields
 
-# v4: structured JSON only. The cleaned raw_text copy and raw_bullets were never read (the application keeps the
-# uploaded text and derives raw_bullets itself), so the model no longer writes the resume two or three times.
-RESUME_PARSER_PROMPT_VERSION = "v4"
+# v5: v4 (main: university and grade on education entries) merged with the trimmed parser: structured JSON
+# only. The cleaned raw_text copy and raw_bullets were never read (the application keeps the uploaded text
+# and derives raw_bullets itself), so the model no longer writes the resume two or three times.
+RESUME_PARSER_PROMPT_VERSION = "v5"
 RESUME_PARSER_MARKER = "PARSE_RESUME"
 # v2: typed output contract; a claim keeps the employer and role it sits under in the resume, never another one.
 EVIDENCE_EXTRACTION_PROMPT_VERSION = "v2"
@@ -40,8 +41,8 @@ STRUCTURED_RESUME_TEMPLATE: dict[str, Any] = {
         "responsibilities": [], "achievements": [], "technologies": [], "skills": [],
     }],
     "projects": [{"name": None, "description": None, "url": None, "technologies": [], "skills": [], "achievements": []}],
-    "education": [{"degree": None, "field_of_study": None, "institution": None, "location": None,
-                   "start_date": None, "end_date": None, "raw_start_date": None, "raw_end_date": None}],
+    "education": [{"degree": None, "field_of_study": None, "institution": None, "university": None,
+                   "location": None, "grade": None, "start_date": None, "end_date": None, "raw_start_date": None, "raw_end_date": None}],
     "certifications": [{"name": None, "issuer": None, "issue_date": None, "expiration_date": None,
                         "credential_id": None, "url": None}],
     "awards": [{"title": None, "issuer": None, "date": None, "description": None}],
@@ -69,6 +70,9 @@ Skills: only skills the resume names; never infer them from a job title. Normali
   Kubernetes, Postgres -> PostgreSQL, GCP -> Google Cloud Platform); keep canonical names such as AWS, FastAPI,
   LangGraph, OpenAI API, MCP and RAG. Use the resume's own category heading. A role's skills and technologies are
   only those named in that role.
+Education: institution is the school or college attended; university is the degree-awarding university only when
+  the resume names one separately (an affiliated college), otherwise null. grade is the GPA, CGPA, percentage or
+  class exactly as written (8.2/10 CGPA, First Class), or null.
 Cleanup: drop duplicate bullets caused by PDF extraction, and fix only obvious character corruption
   (quali[ication -> qualification, Ka[ka -> Kafka, Educa7on -> Education).""",
     JSON_ONLY_RULE,
