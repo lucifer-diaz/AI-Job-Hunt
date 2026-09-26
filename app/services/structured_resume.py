@@ -16,12 +16,13 @@ from __future__ import annotations
 
 import hashlib
 import re
+import types
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
-from typing import Any
+from typing import Any, Union, get_args, get_origin
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
 
 from app.services.resume_format import BULLET_RE, parse_resume, to_plain
 
@@ -52,6 +53,17 @@ Short = Field(default="", max_length=300)
 
 class _In(BaseModel):
     model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def _null_is_default(cls, value: Any, info: ValidationInfo) -> Any:
+        """The parser prompt asks for null when a value is missing; a field that cannot hold None takes its
+        default ("" / [] / False) instead of failing the whole parse."""
+        if value is not None or info.field_name is None:
+            return value
+        field = cls.model_fields[info.field_name]
+        optional = get_origin(field.annotation) in (Union, types.UnionType) and type(None) in get_args(field.annotation)
+        return value if optional else field.get_default(call_default_factory=True)
 
 
 class MetricIn(_In):
@@ -123,11 +135,15 @@ class EducationIn(_In):
     degree: str = Short
     field_of_study: str = Short
     institution: str = Short
+    # The degree-awarding university, when it differs from the institution (an affiliated college, say).
+    university: str = Short
     location: str = Short
     start_date: str | None = Field(default=None, max_length=10)
     end_date: str | None = Field(default=None, max_length=10)
     raw_start_date: str | None = Field(default=None, max_length=60)
     raw_end_date: str | None = Field(default=None, max_length=60)
+    # As written on the resume: "8.2/10 CGPA", "First Class", "3.7 GPA".
+    grade: str = Field(default="", max_length=60)
 
 
 class CertificationIn(_In):
@@ -746,7 +762,8 @@ def render_text(data: dict[str, Any], *, statuses: tuple[str, ...] = REVIEWED[:1
         lines += ["", " | ".join(filter(None, [role.get("job_title"), role.get("company"), role.get("location"), dates]))]
         lines += [f"- {b['text']}" for b in role.get("achievements", []) + role.get("responsibilities", []) if ok(b)]
     for label, section, fields in (("Projects", "projects", ("name", "description")),
-                                   ("Education", "education", ("degree", "field_of_study", "institution", "end_date")),
+                                   ("Education", "education", ("degree", "field_of_study", "institution", "university",
+                                                                  "grade", "end_date")),
                                    ("Certifications", "certifications", ("name", "issuer", "issue_date")),
                                    ("Awards", "awards", ("title", "issuer", "date")),
                                    ("Languages", "languages", ("name", "proficiency"))):

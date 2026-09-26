@@ -272,7 +272,7 @@ def _base(db: Session, profile: CandidateProfile, job: Job, task: str, allowed: 
     experience, unverified = _select_experience(data or {}, terms, allowed)
     candidate, unverified_summary = _candidate(profile, data or {}, allowed)
     relevant, every = select_evidence(db, profile.user_id, terms, evidence_limit)
-    education_fields = ("degree", "field_of_study", "institution", "end_date", "raw_end_date")
+    education_fields = ("degree", "field_of_study", "institution", "university", "grade", "end_date", "raw_end_date")
     context = TaskContext(
         task=task, candidate=candidate,
         resume={"id": resume.id, "version": resume.version, "verification_status": resume.verification_status}

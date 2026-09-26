@@ -144,7 +144,7 @@ def test_resume_parser_prompt_asks_for_raw_text_and_the_structured_schema():
     from app.prompts.resume_parser import STRUCTURED_RESUME_TEMPLATE
 
     prompt = all_prompts()["resume_parser"]
-    assert prompt.version == "v3"
+    assert prompt.version == "v4"
     assert '{"raw_text": "...", "structured_resume": {...}}' in prompt.system
     schema = json.loads(prompt.system.split("or an empty list.\n", 1)[1].split("\n\nPARSING RULES", 1)[0])
     assert schema == STRUCTURED_RESUME_TEMPLATE

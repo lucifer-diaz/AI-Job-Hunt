@@ -675,9 +675,10 @@ function renderSetup() {
   const roles = fv(F, 'roles', p.roles), sites = fv(F, 'sites', p.sites);
   const suggestions = (D.summary && D.profileRoles || []).filter(r => !roles.includes(r)).slice(0, 3);
   const actors = fv(F, 'actors', p.actors || []), customs = fv(F, 'custom_actors', p.custom_actors || []);
-  const catalogList = [...(D.actors?.actors || []).filter(a => !a.custom),
-    ...customs.map(c => ({ ...c, name: c.name || c.id, summary: 'Added by you', cost: "see the actor's pricing", custom: true }))];
+  const catalogList = [...(D.actors?.actors || []).filter(a => !a.custom).map(a => ({ ...a, group: a.group || 'Job boards' })),
+    ...customs.map(c => ({ ...c, name: c.name || c.id, summary: 'Added by you', cost: "see the actor's pricing", custom: true, group: 'Your actors' }))];
   const on = id => actors.includes(id);
+  const startup = Object.fromEntries(Object.entries(STARTUP_ACTORS).map(([k, id]) => [k, on(id)]));
   const platforms = fv(F, 'remote_platforms', p.remote_platforms || []), seniority = fv(F, 'seniority', p.seniority || []);
   const hint = catalogList.filter(a => on(a.id) && a.location_hint).map(a => a.location_hint).join(' ');
   const preview = D.spPreview;
@@ -697,10 +698,10 @@ function renderSetup() {
       <div><div class="small b mb8">Locations <span class="faint" style="font-weight:400">· up to 5, one search each</span></div>
         <div class="tagbox" data-tag-input="locations" data-act="focus-tag" data-target="sp-locations">${chips(F, 'locations', p.locations)}<input id="sp-locations" data-tag="locations" data-form="sp" data-max="5" data-split="newline" autocomplete="off" placeholder="Type a city or Remote, then press Enter"></div>
         <div class="helper">Press Enter to add each location — commas stay part of it (New York, NY) · leave empty to search anywhere</div></div>
-      <div><div class="row base between mb8"><span class="small b">Apify actors <span class="faint" style="font-weight:400">· pick one or more</span></span><a href="#" class="xs" data-act="toggle-add-actor">${S.addActor ? 'Close' : '+ Add your own actor'}</a></div>
-        <div class="grid-auto" style="grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:8px">${catalogList.map(a => `<label class="board-opt ${on(a.id) ? 'on' : ''}" style="align-items:flex-start"><input type="checkbox" data-act="toggle-actor" data-actor="${attr(a.id)}" ${on(a.id) ? 'checked' : ''} style="margin-top:3px"><span class="grow" style="min-width:0"><span class="small b" style="display:block">${esc(a.name)}</span><span class="xs muted" style="display:block">${esc(a.summary)}</span><span class="tiny faint" style="display:block;margin-top:4px"><span class="mono">${esc(a.id)}</span> · ${esc(a.cost)} · ${esc(FANOUT[a.fan_out] || a.fan_out)}</span></span>${a.custom ? `<button type="button" class="btn ghost sm danger none" data-act="remove-actor" data-actor="${attr(a.id)}">Remove</button>` : ''}</label>`).join('') || '<span class="small muted">Loading actors…</span>'}</div>
-        ${hint ? `<div class="helper" style="color:var(--warn)">${esc(hint)}</div>` : ''}
-        ${S.addActor ? addActorForm() : ''}</div>
+      <section aria-labelledby="actors-heading"><div class="row base between mb8"><h3 class="small b" id="actors-heading" style="margin:0">Apify actors <span class="faint" style="font-weight:400" aria-live="polite">· ${actors.length ? `${actors.length} selected` : 'pick one or more'}</span></h3><button type="button" class="textbtn xs" data-act="toggle-add-actor" aria-expanded="${S.addActor ? 'true' : 'false'}">${S.addActor ? 'Close' : '+ Add your own actor'}</button></div>
+        <div class="col gap14">${catalogList.length ? actorPicker(catalogList, on) : '<span class="small muted">Loading actors…</span>'}</div>
+        ${hint ? `<div class="helper" role="note" style="color:var(--warn)">${esc(hint)}</div>` : ''}
+        ${S.addActor ? addActorForm() : ''}</section>
       ${on('openclawai/job-board-scraper') ? `<div class="box soft" style="padding:14px"><div class="small b mb8">Multi Job Board settings</div>
         <div class="grid-auto w140">${Object.keys(boardName).map(b => `<label class="board-opt ${sites.includes(b) ? 'on' : ''}"><input type="checkbox" data-act="toggle-site" data-site="${b}" ${sites.includes(b) ? 'checked' : ''}><span class="grow">${boardName[b]}</span><span class="tiny mono faint" title="kept per 100 found, last 30 days">${data.board_yield[b] ?? '—'}</span></label>`).join('')}</div>
         <div class="helper">Numbers show jobs kept per 100 found over the last 30 days.</div>
@@ -713,14 +714,23 @@ function renderSetup() {
         <div class="grid-auto w140">${(D.actors?.remote_platforms || []).map(pl => `<label class="board-opt ${platforms.includes(pl) ? 'on' : ''}"><input type="checkbox" data-act="toggle-list" data-key="remote_platforms" data-value="${pl}" ${platforms.includes(pl) ? 'checked' : ''}><span class="grow">${pl}</span></label>`).join('')}</div></div>` : ''}
       ${on('shahidirfan/Remoteok-Job-Scraper') ? `<div class="box soft" style="padding:14px"><label class="field strong">RemoteOK start page${inputF(F, 'remoteok_url', p.remoteok_url, 'placeholder="https://remoteok.com/remote-dev-jobs"')}</label>
         <div class="helper">Use a category page such as https://remoteok.com/remote-dev-jobs to narrow results before the keyword filter.</div></div>` : ''}
-      <div><div class="small b mb8">Filters <span class="faint" style="font-weight:400">· each actor receives the filters it supports</span></div><div class="grid-auto">
-        <label class="field">Posted within${selectF(F, 'hours_old', p.hours_old, [[1, 'Past hour'], [24, 'Past 24 hours'], [72, 'Past 3 days'], [168, 'Past 7 days'], [720, 'Past 30 days'], [0, 'Any time']])}</label>
-        <label class="field">Job type${selectF(F, 'job_type', p.job_type, [['', 'Any job type'], ['fulltime', 'Full-time'], ['parttime', 'Part-time'], ['contract', 'Contract'], ['internship', 'Internship'], ['temporary', 'Temporary']])}</label>
-        <label class="field">Results per search${inputF(F, 'max_results', p.max_results, 'type="number" min="1" max="100"')}</label>
+      ${Object.values(startup).some(Boolean) ? `<fieldset class="box soft actor-settings"><legend class="small b">Startup board settings</legend>
+        ${startup.waas || startup.yc ? `<div class="mt8"><label class="xs muted mb4" for="sp-yc_batches" style="display:block">YC batches <span class="faint">· optional, e.g. W24 or S23${startup.yc ? ' · Y Combinator Jobs uses the first one' : ''}</span></label>${tagBox(F, 'yc_batches', p.yc_batches || [], 'e.g. W24, then Enter', 10)}</div>` : ''}
+        ${startup.hn || startup.wellfound ? `<div class="grid-auto mt12">
+          ${startup.hn ? `<label class="field">HN thread month${inputF(F, 'hn_month', p.hn_month || 'current', 'placeholder="current or 2026-09" pattern="current|\\d{4}-(0[1-9]|1[0-2])" aria-describedby="hn-month-help"')}<span class="helper" id="hn-month-help">"current" is the latest Who is hiring? thread.</span></label>` : ''}
+          <label class="field">Minimum salary (USD / year)${inputF(F, 'min_salary', p.min_salary || 0, 'type="number" min="0" step="5000" inputmode="numeric" aria-describedby="use-min_salary"')}${filterNote(catalogList, on, 'min_salary')}</label></div>` : ''}
+        ${startup.waas || startup.yc ? `<div class="row gap16 wrap mt12">${checkF(F, 'startup_details', p.startup_details ?? true, 'Fetch full descriptions &amp; company details', 'aria-describedby="startup-details-help"')}</div>
+          <div class="helper" id="startup-details-help">Needed for ranking; turning it off is faster and cheaper but most jobs arrive without a description.</div>` : ''}
+        ${startup.hn ? '<div class="helper">HN Who\'s Hiring costs $0.02 per job — keep “Results per search” low.</div>' : ''}</fieldset>` : ''}
+      <section aria-labelledby="filters-heading"><h3 class="small b mb8" id="filters-heading" style="margin-top:0">Filters <span class="faint" style="font-weight:400">· each actor receives the filters it supports</span></h3><div class="grid-auto">
+        <label class="field">Posted within${selectF(F, 'hours_old', p.hours_old, [[1, 'Past hour'], [24, 'Past 24 hours'], [72, 'Past 3 days'], [168, 'Past 7 days'], [720, 'Past 30 days'], [0, 'Any time']], 'aria-describedby="use-hours"')}${filterNote(catalogList, on, 'hours')}</label>
+        <label class="field">Job type${selectF(F, 'job_type', p.job_type, [['', 'Any job type'], ['fulltime', 'Full-time'], ['parttime', 'Part-time'], ['contract', 'Contract'], ['internship', 'Internship'], ['temporary', 'Temporary']], 'aria-describedby="use-job_type"')}${filterNote(catalogList, on, 'job_type')}</label>
+        <label class="field">Results per search${inputF(F, 'max_results', p.max_results, 'type="number" min="1" max="100" aria-describedby="max-results-help"')}<span class="helper" id="max-results-help">Used by every actor, for each run it starts.</span></label>
         </div>
-        <div class="mt12"><div class="xs muted mb4">Seniority <span class="faint">· Advanced LinkedIn and Remote Jobs Aggregator</span></div><div class="row gap6 wrap">${(D.actors?.seniority || []).map(s => `<button type="button" class="btn sm ${seniority.includes(s) ? 'soft' : ''}" data-act="toggle-list" data-key="seniority" data-value="${s}">${seniority.includes(s) ? '✓ ' : ''}${s}</button>`).join('')}</div></div>
-        <div class="mt12"><div class="xs muted mb4">Exclude titles or keywords</div>${tagBox(F, 'exclude_keywords', p.exclude_keywords || [], 'e.g. intern, then Enter', 20)}</div>
-        <div class="row gap16 wrap mt12">${checkF(F, 'is_remote', p.is_remote, 'Remote only')}${checkF(F, 'easy_apply', p.easy_apply, 'Easy Apply only')}${checkF(F, 'salary_only', p.salary_only, 'Salary listed only')}${checkF(F, 'visa_sponsorship', p.visa_sponsorship, 'Offers visa sponsorship')}${checkF(F, 'skip_agencies', p.skip_agencies, 'Skip agencies &amp; reposts')}${checkF(F, 'auto_rank', p.auto_rank, 'Auto-rank on import')}</div></div>
+        <div class="mt12" role="group" aria-labelledby="seniority-label" aria-describedby="use-seniority"><div class="xs muted mb4" id="seniority-label">Seniority</div><div class="row gap6 wrap">${(D.actors?.seniority || []).map(s => `<button type="button" class="btn sm ${seniority.includes(s) ? 'soft' : ''}" data-act="toggle-list" data-key="seniority" data-value="${s}" aria-pressed="${seniority.includes(s) ? 'true' : 'false'}">${seniority.includes(s) ? '✓ ' : ''}${s}</button>`).join('')}</div>${filterNote(catalogList, on, 'seniority')}</div>
+        <div class="mt12"><label class="xs muted mb4" for="sp-exclude_keywords" style="display:block">Exclude titles or keywords</label>${tagBox(F, 'exclude_keywords', p.exclude_keywords || [], 'e.g. intern, then Enter', 20)}${filterNote(catalogList, on, 'exclude_keywords')}</div>
+        <div class="row gap16 wrap mt12">${usedCheck(catalogList, on, 'remote', 'is_remote', p.is_remote, 'Remote only')}${usedCheck(catalogList, on, 'easy_apply', 'easy_apply', p.easy_apply, 'Easy Apply only')}${usedCheck(catalogList, on, 'salary_only', 'salary_only', p.salary_only, 'Salary listed only')}${usedCheck(catalogList, on, 'visa_sponsorship', 'visa_sponsorship', p.visa_sponsorship, 'Offers visa sponsorship')}${usedCheck(catalogList, on, 'skip_agencies', 'skip_agencies', p.skip_agencies, 'Skip agencies &amp; reposts')}${checkF(F, 'auto_rank', p.auto_rank, 'Auto-rank on import')}</div>
+        <div class="helper">“Not used” means none of the actors you picked reads that setting.</div></section>
       <div class="box soft" style="padding:14px"><div class="row between wrap gap8 mb8"><span class="small b">Schedule <span class="faint" style="font-weight:400">· this setup only</span></span>
         ${kind === 'manual' ? '' : checkF(F, 'enabled', setup ? setup.enabled : true, 'Scheduled')}</div>
         <div class="grid-auto"><label class="field">When${selectF(F, 'schedule_kind', kind, SCHEDULE_KINDS)}</label>
@@ -1323,6 +1333,48 @@ async function pollRuns() {
   } catch (e) { toast(`Could not refresh search status: ${e.message}`, true); S.polling = null; render(); }
 }
 const FANOUT = { role_location: 'one run per role × location', location: 'one run per location', role: 'one run per role', once: 'one run for everything' };
+// What each `supports` key of an actor means on screen, so a card can say which of the settings it reads.
+const ACTOR_USES = { boards: 'Boards', location: 'Location', distance: 'Radius', country: 'Country', remote: 'Remote only', job_type: 'Job type', hours: 'Posted within', easy_apply: 'Easy Apply', fetch_description: 'Full descriptions', annual_salary: 'Annual salary', linkedin_company_ids: 'Company IDs', seniority: 'Seniority', salary_only: 'Salary listed', visa_sponsorship: 'Visa sponsorship', exclude_keywords: 'Exclude', skip_agencies: 'Skip agencies', remote_platforms: 'Boards', remoteok_url: 'Start page', yc_batches: 'YC batches', startup_details: 'Company details', hn_month: 'Thread month', min_salary: 'Min salary' };
+const STARTUP_ACTORS = { waas: 'antishock/workatastartup-jobs-scraper', yc: 'automation-lab/ycombinator-jobs-scraper', hn: 'parseforge/hn-whoishiring-scraper', wellfound: 'blackfalcondata/wellfound-scraper' };
+// A user-added actor reads whichever filters its input template names.
+const TEMPLATE_USES = { hours_old: 'hours', days_old: 'hours', is_remote: 'remote', job_type: 'job_type', location: 'location', locations: 'location', sites: 'boards', country: 'country' };
+function actorUses(a) {
+  if (!a.custom) return a.supports || [];
+  const text = JSON.stringify(a.input_template || {});
+  return [...new Set(Object.entries(TEMPLATE_USES).filter(([k]) => text.includes(`{{${k}}}`)).map(([, v]) => v))];
+}
+const domId = value => String(value).replace(/[^\w-]/g, '-');
+function actorCard(a, on) {
+  const id = `actor-${domId(a.id)}`, uses = [...new Set(actorUses(a).map(u => ACTOR_USES[u]).filter(Boolean))];
+  return `<label class="board-opt actor-opt ${on ? 'on' : ''}" for="${id}"><input type="checkbox" id="${id}" data-act="toggle-actor" data-actor="${attr(a.id)}" aria-describedby="${id}-about" ${on ? 'checked' : ''}>
+    <span class="grow" style="min-width:0"><span class="small b" style="display:block">${esc(a.name)}</span>
+      <span class="xs muted" style="display:block" id="${id}-about">${esc(a.summary)} <span class="sr-only">Cost ${esc(a.cost)}, ${esc(FANOUT[a.fan_out] || a.fan_out)}.</span></span>
+      <span class="tiny faint" style="display:block;margin-top:4px" aria-hidden="true"><span class="mono">${esc(a.id)}</span> · ${esc(a.cost)} · ${esc(FANOUT[a.fan_out] || a.fan_out)}</span>
+      ${uses.length ? `<span class="actor-uses" aria-label="Settings it uses: ${attr(uses.join(', '))}">${uses.map(u => `<span>${esc(u)}</span>`).join('')}</span>` : ''}</span>
+    ${a.custom ? `<button type="button" class="btn ghost sm danger none" data-act="remove-actor" data-actor="${attr(a.id)}" aria-label="Remove ${attr(a.name)}">Remove</button>` : ''}</label>`;
+}
+function actorPicker(list, on) {
+  const groups = [...new Set([...(D.actors?.groups || []), ...list.map(a => a.group)])];
+  return groups.map(g => {
+    const items = list.filter(a => a.group === g); if (!items.length) return '';
+    const count = items.filter(a => on(a.id)).length;
+    return `<fieldset class="actor-group"><legend><span class="caps">${esc(g.toUpperCase())}</span>${count ? `<span class="tiny faint"> · ${count} selected</span>` : ''}</legend>
+      <div class="grid-auto" style="grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:8px">${items.map(a => actorCard(a, on(a.id))).join('')}</div></fieldset>`;
+  }).join('');
+}
+// Which selected actors read a setting, shown beside it so a filter nobody uses is obvious.
+function usedBy(list, on, key) {
+  const names = list.filter(a => on(a.id) && actorUses(a).includes(key)).map(a => a.name);
+  return names.length ? `Used by ${names.join(', ')}` : 'Not used by the selected actors';
+}
+function filterNote(list, on, key) {
+  const names = list.filter(a => on(a.id) && actorUses(a).includes(key));
+  return `<span class="helper filter-note ${names.length ? '' : 'unused'}" id="use-${key}">${esc(usedBy(list, on, key))}</span>`;
+}
+function usedCheck(list, on, key, field, value, text) {
+  const used = list.some(a => on(a.id) && actorUses(a).includes(key));
+  return `<span class="${used ? '' : 'filter-unused'}" title="${attr(usedBy(list, on, key))}">${checkF('sp', field, value, text + (used ? '' : ' <span class="tiny">(not used)</span>'))}</span>`;
+}
 const COUNTRIES = ['usa', 'uk', 'canada', 'australia', 'india', 'singapore', 'uae', 'germany', 'france', 'netherlands', 'ireland', 'spain', 'italy', 'japan', 'brazil', 'mexico', 'south africa', 'new zealand'];
 const DEFAULT_TEMPLATE = JSON.stringify({ searchTerm: '{{role}}', location: '{{location}}', maxItems: '{{max_results}}' }, null, 2);
 function addActorForm() {
@@ -1348,6 +1400,8 @@ function searchPayload() {
     residential_proxy: !!v('residential_proxy', true), salary_only: !!v('salary_only', false), visa_sponsorship: !!v('visa_sponsorship', false),
     exclude_keywords: v('exclude_keywords', []), linkedin_company_ids: v('linkedin_company_ids', []),
     skip_agencies: !!v('skip_agencies', true), auto_rank: !!v('auto_rank', true), schedule: v('schedule', 'manual'),
+    yc_batches: v('yc_batches', []), hn_month: String(v('hn_month', 'current') || 'current').trim(),
+    min_salary: Math.max(0, Number(v('min_salary', 0)) || 0), startup_details: !!v('startup_details', true),
   };
 }
 let previewTimer;

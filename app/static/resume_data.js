@@ -14,7 +14,7 @@ const RD_FIELDS = {
   skills: [['name', 'Skill'], ['category', 'Category']],
   experience: [['job_title', 'Job title'], ['company', 'Company'], ['location', 'Location'], ['employment_type', 'Employment type'], ['start_date', 'Start (YYYY-MM)', 'month'], ['end_date', 'End (YYYY-MM)', 'month'], ['is_current', 'Current role', 'bool'], ['technologies', 'Technologies', 'list']],
   projects: [['name', 'Name'], ['url', 'URL'], ['description', 'Description', 'textarea'], ['technologies', 'Technologies', 'list']],
-  education: [['degree', 'Degree'], ['field_of_study', 'Field of study'], ['institution', 'Institution'], ['location', 'Location'], ['start_date', 'Start (YYYY-MM)', 'month'], ['end_date', 'End (YYYY-MM)', 'month']],
+  education: [['degree', 'Degree'], ['field_of_study', 'Field of study'], ['institution', 'Institution'], ['university', 'University'], ['location', 'Location'], ['start_date', 'Start (YYYY-MM)', 'month'], ['end_date', 'End (YYYY-MM)', 'month'], ['grade', 'Grade (GPA / %)']],
   certifications: [['name', 'Name'], ['issuer', 'Issuer'], ['issue_date', 'Issued'], ['expiration_date', 'Expires'], ['credential_id', 'Credential ID'], ['url', 'URL']],
   awards: [['title', 'Title'], ['issuer', 'Issuer'], ['date', 'Date'], ['description', 'Description', 'textarea']],
   languages: [['name', 'Language'], ['proficiency', 'Proficiency']],
@@ -109,7 +109,7 @@ function rdTitle(section, item) {
   return item.name || item.title || item.text || '';
 }
 function rdViewItem(section, item) {
-  const meta = [section === 'experience' || section === 'education' ? rdDates(item) : '', item.location, item.issuer, item.issue_date || item.date,
+  const meta = [section === 'experience' || section === 'education' ? rdDates(item) : '', item.university, item.location, item.grade, item.issuer, item.issue_date || item.date,
     (item.technologies || []).join(', '), item.description].filter(Boolean);
   const bullets = (RD_BULLETS[section] || []).map(([key, label]) => (item[key] || []).length ? `<div class="rd-bullets"><div class="caps-sm">${label}</div>${item[key].map(b => `<div class="rd-bullet" data-rd-item="${attr(b.id)}">${rdBadge(b)}<span class="grow">${esc(b.text)}</span>${rdItemActions(b)}</div>`).join('')}</div>` : '').join('');
   return `<article class="rd-item" data-rd-item="${attr(item.id)}"><div class="rd-item-head">${rdBadge(item)}<div class="grow"><strong>${esc(rdTitle(section, item) || 'Untitled')}</strong>${meta.length ? `<p>${esc(meta.join(' · '))}</p>` : ''}</div>${rdItemActions(item)}</div>${bullets}</article>`;
