@@ -24,6 +24,7 @@ from app.auth import PASSWORD_MIN_LENGTH, CurrentUser, current_user, get_user_db
 from app.auth import router as auth_router
 from app.db import engine
 from app.db_migrations import run_migrations
+from app.ai_models_api import router as ai_models_router
 from app.hunter_api import router as hunter_router
 from app.monitoring_api import router as monitoring_router
 from app.job_description_api import router as job_description_router
@@ -63,6 +64,7 @@ from app.schemas import (
 from app.security import SecretsUnavailable
 from app.services import backoff, mcp_tokens, ranker, resume_verification, tailor_tasks, tracing
 from app.services.ai_config import PROVIDERS as AI_PROVIDERS
+from app.services.ai_model_config import gateway_settings
 from app.services.ai_config import STAGES as AI_STAGES
 from app.services.ai_config import env_defaults as ai_env_defaults
 from app.services.ai_config import resolve as resolve_ai_config
@@ -140,6 +142,7 @@ app.include_router(hunter_router)
 app.include_router(monitoring_router)
 app.include_router(resume_router)
 app.include_router(job_description_router)
+app.include_router(ai_models_router)
 
 # Reachable without signing in. Cron and admin routes are protected by their own secrets.
 PUBLIC_PATHS = {"/health", "/login", "/signup", "/api/auth/login", "/api/auth/signup", "/api/auth/logout"}
@@ -189,7 +192,7 @@ def job_dict(j: Job) -> dict:
 def _asset_version() -> str:
     # Cache-bust static assets whenever they change, not only on version bumps.
     static = Path(__file__).parent / "static"
-    return f"{app.version}-{max(int((static / name).stat().st_mtime) for name in ('app.js', 'app.css', 'settings.js', 'knowledge.js'))}"
+    return f"{app.version}-{max(int((static / name).stat().st_mtime) for name in ('app.js', 'app.css', 'settings.js', 'knowledge.js', 'ai_models.js', 'monitoring.js'))}"
 
 
 @app.get("/health")
@@ -280,7 +283,8 @@ def settings_get(db: Session = Depends(get_user_db)):
             # How it backs off when a provider rate limits it, with the first few waits spelled out.
             "rate_limits": backoff.policy_for(db, value.user_id).public(),
             "ranking_interval_server_minutes": settings.ranking_interval_minutes,
-            "configured": {**configured, "mock": True}, "keys": keys,
+            "configured": {**configured, "mock": True, "litellm": bool(gateway_settings(db, value.user_id)[0])},
+            "keys": keys,
             "secret_storage": bool(settings.secret_key),
             # Raw saved values (blank = inherit) plus the server defaults, for the editor.
             "ai": {"saved": {"llm_provider": overrides.get("llm_provider") or "", "model": overrides.get("model") or "",

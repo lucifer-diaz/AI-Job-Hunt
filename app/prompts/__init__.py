@@ -1,8 +1,9 @@
 """Every production LLM prompt lives in this package.
 
-Each prompt module has a builder that returns a provider-independent `Prompt` (trusted instructions in
-`system`, dynamic data in `user`) and a version constant that services store with the result where the
-data model allows. Services must not define long prompts inline.
+Each prompt module has a builder that returns a provider-independent `Prompt` (trusted instructions in `system`,
+dynamic data in `user`, the worker's output contract in `output_schema`) and a version constant that services store
+with the result. Services must not define prompts inline. Output contracts live in app.prompts.contracts;
+OUTPUT_CONTRACTS maps each machine-facing prompt to its contract. Conventions: docs/prompts.md.
 """
 from app.prompts.agents import AGENT_PROMPT_VERSION
 from app.prompts.ai_optimization import AI_OPTIMIZATION_PROMPT_VERSION, build_ai_optimization_prompt
@@ -11,6 +12,19 @@ from app.prompts.application import (
                                        build_application_question_prompt,
 )
 from app.prompts.common import Prompt
+from app.prompts.contracts import (
+                                       ApplicationAnswerResult,
+                                       CoverLetterResult,
+                                       EvidenceExtractionResult,
+                                       FollowUpResult,
+                                       InboxClassificationResult,
+                                       JobDescriptionParserOutput,
+                                       OptimizationReport,
+                                       RankingResult,
+                                       ResumeParserOutput,
+                                       ReviewResult,
+                                       TailoringResult,
+)
 from app.prompts.cover_letter import COVER_LETTER_PROMPT_VERSION, build_cover_letter_prompt
 from app.prompts.followup import FOLLOWUP_PROMPT_VERSION, build_followup_prompt
 from app.prompts.inbox import (
@@ -25,6 +39,11 @@ from app.prompts.job_description_parser import (
 from app.prompts.mcp_application import MCP_APPLICATION_PROMPT_VERSION
 from app.prompts.mcp_review import MCP_REVIEW_PROMPT_VERSION
 from app.prompts.mcp_tailoring import MCP_TAILORING_PROMPT_VERSION
+from app.prompts.model_tests import (
+                                       MODEL_TEST_PROMPT_VERSION,
+                                       build_model_health_prompt,
+                                       build_worker_test_prompt,
+)
 from app.prompts.ranking import RANKING_PROMPT_VERSION, build_ranking_prompt
 from app.prompts.resume_parser import (
                                        EVIDENCE_EXTRACTION_PROMPT_VERSION,
@@ -51,11 +70,36 @@ PROMPT_VERSIONS = {
     "mcp_tailoring": MCP_TAILORING_PROMPT_VERSION,
     "mcp_review": MCP_REVIEW_PROMPT_VERSION,
     "mcp_application": MCP_APPLICATION_PROMPT_VERSION,
+    "model_health": MODEL_TEST_PROMPT_VERSION,
+    "worker_test": MODEL_TEST_PROMPT_VERSION,
 }
 
+# Prompt name → the output contract its answers must satisfy (app.services.llm checks every answer against it).
+OUTPUT_CONTRACTS = {
+    "ranking": RankingResult,
+    "tailoring": TailoringResult,
+    "review": ReviewResult,
+    "cover_letter": CoverLetterResult,
+    "followup": FollowUpResult,
+    "resume_parser": ResumeParserOutput,
+    "job_description_parser": JobDescriptionParserOutput,
+    "evidence_extraction": EvidenceExtractionResult,
+    "application_question": ApplicationAnswerResult,
+    "inbox": InboxClassificationResult,
+    "ai_optimization": OptimizationReport,
+}
+# Worker prompt names reserved in app.services.ai_workers with no production prompt yet (nothing calls them).
+RESERVED_PROMPTS = ("company_insights", "interview_insights")
+# Conversation instructions (Claude Desktop over MCP, the ADK agents): not model calls the backend makes. Their saved
+# results are validated by the backend (app.services.tailoring_results, review_results, job_hunt_agent.tools).
+CONVERSATION_PROMPTS = ("agents", "mcp_tailoring", "mcp_review", "mcp_application")
+
 __all__ = [
+                                       "CONVERSATION_PROMPTS",
                                        "INBOX_CATEGORIES",
+                                       "OUTPUT_CONTRACTS",
                                        "PROMPT_VERSIONS",
+                                       "RESERVED_PROMPTS",
                                        "Prompt",
                                        "build_ai_optimization_prompt",
                                        "build_application_question_prompt",
@@ -64,8 +108,10 @@ __all__ = [
                                        "build_followup_prompt",
                                        "build_inbox_classification_prompt",
                                        "build_job_description_parser_prompt",
+                                       "build_model_health_prompt",
                                        "build_ranking_prompt",
                                        "build_resume_parser_prompt",
                                        "build_review_prompt",
                                        "build_tailoring_prompt",
+                                       "build_worker_test_prompt",
 ]

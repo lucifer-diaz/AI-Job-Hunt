@@ -21,17 +21,15 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import ValidationError
 from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import AIOptimizationReport, AIOptimizationTask, AppSetting
+from app.prompts import contracts
 from app.prompts.ai_optimization import (
-    ADVISOR_STAGES,
     AI_OPTIMIZATION_PROMPT_VERSION,
-    RECOMMENDATION_CATEGORIES,
-    RECOMMENDATION_PRIORITIES,
     build_ai_optimization_prompt,
 )
 from app.services import external_monitoring, monitoring
@@ -305,8 +303,82 @@ def detect_findings(aggregates: dict[str, Any]) -> list[dict[str, Any]]:
             "Add verified prices for those models to app/model_catalog.json.",
             "Complete cost visibility, so spend comparisons are accurate.", "unknown", "None."))
     findings += detect_external_findings(aggregates.get("external") or {})
+    findings += detect_routing_findings(aggregates.get("routing") or {})
     order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
     return sorted(findings, key=lambda f: order[f["priority"]])
+
+
+# Rule thresholds for model routing (LiteLLM gateway mode). Rates are shares of that worker's own requests.
+ROUTING_MIN_REQUESTS = 10
+ESCALATION_HIGH = 0.5
+ESCALATION_KEEP = 0.1
+INFERENCE_SHARE = 0.3
+ROUTING_SCHEMA_FAILURE = 0.1
+ROUTING_FALLBACK_RATE = 0.1
+
+
+def detect_routing_findings(routing: dict[str, Any]) -> list[dict[str, Any]]:
+    """Recommendations about which model each worker should use, from routing telemetry. Pure and deterministic.
+
+    Advice only: a finding may say "assign PRIMARY_REASONING directly", but nothing here (or anywhere in the
+    advisor) changes a worker's model, a tier, the auto router or any other configuration.
+    """
+    from app.services.ai_workers import MONITORING_STAGE
+    from app.services.ai_workers import label as worker_label
+
+    findings: list[dict[str, Any]] = []
+    for w in routing.get("workers") or []:
+        if w["requests"] < ROUTING_MIN_REQUESTS:
+            continue
+        name, stage = worker_label(w["worker_type"]), MONITORING_STAGE.get(w["worker_type"], "OTHER")
+        configured = ", ".join(w.get("configured") or []) or "its configured model"
+        escalation = w.get("escalation_rate")
+        if escalation is not None and escalation >= ESCALATION_HIGH:
+            findings.append(_finding(
+                "MODEL", "HIGH" if escalation >= 0.6 else "MEDIUM", stage,
+                f"{_pct(escalation)} of {name} requests escalate from {configured}.",
+                f"{w['escalations']} escalations over {w['requests']} {name} requests.",
+                f"Assign {name} its escalation model (or PRIMARY_REASONING) directly in Settings → AI Models.",
+                "One request instead of two for most calls: lower latency and less inference time.",
+                "unknown", "Low: the escalation model already answers these requests today."))
+        elif escalation is not None and escalation <= ESCALATION_KEEP and (w.get("schema_failure_rate") or 0) \
+                <= SCHEMA_FAILURE_GAP and (w.get("failure_rate") or 0) <= FAILURE_RATE:
+            findings.append(_finding(
+                "MODEL", "LOW", stage,
+                f"{_pct(1 - escalation)} of {name} requests succeed on {configured} without escalation.",
+                f"Escalation rate {_pct(escalation)}, schema failure rate {_pct(w.get('schema_failure_rate'))} "
+                f"over {w['requests']} requests.",
+                f"Keep the current {name} configuration.", "Stable quality at the current cost.", "none",
+                "None."))
+        share = w.get("inference_share")
+        if share is not None and share >= INFERENCE_SHARE:
+            findings.append(_finding(
+                "ARCHITECTURE", "MEDIUM", stage, f"{name} uses {_pct(share)} of all inference time.",
+                f"{name}: {w['requests']} requests, p95 latency {w.get('p95_latency_ms')} ms.",
+                f"Consider a faster model (e.g. PRIMARY_REASONING) for {name}'s first pass, with a quality-escalation "
+                "policy (low confidence or schema failure) sending only uncertain cases to the larger model.",
+                "Less local compute and lower latency for the common case.", "unknown",
+                "Medium: measure answer quality before and after; keep the larger model for uncertain cases."))
+        fallback = w.get("fallback_rate")
+        if fallback is not None and fallback >= ROUTING_FALLBACK_RATE:
+            findings.append(_finding(
+                "RELIABILITY", "MEDIUM", stage,
+                f"{_pct(fallback)} of {name} requests were answered by the fallback model.",
+                f"LiteLLM reported a fallback on {_pct(fallback)} of {name} requests.",
+                f"Check the health of {name}'s primary model (Settings → AI Models → Test) before changing it.",
+                "Predictable quality: the configured model answers, not its fallback.", "unknown", "Low."))
+    for x in routing.get("worker_models") or []:
+        rate = x.get("schema_failure_rate")
+        if x["requests"] >= ROUTING_MIN_REQUESTS and rate is not None and rate >= ROUTING_SCHEMA_FAILURE:
+            name = worker_label(x["worker_type"])
+            findings.append(_finding(
+                "RELIABILITY", "HIGH" if rate >= 2 * ROUTING_SCHEMA_FAILURE else "MEDIUM",
+                MONITORING_STAGE.get(x["worker_type"], "OTHER"),
+                f"{x['model']} returns invalid structured output for {name} {_pct(rate)} of the time.",
+                f"{_pct(rate)} schema failures over {x['requests']} {name} requests on {x['model']}.",
+                f"Add a SCHEMA_FAILURE escalation for {name}, or assign it a model that returns JSON reliably.",
+                "Fewer failed and retried requests.", "unknown", "Low."))
+    return findings
 
 
 # Rule thresholds for third-party APIs. Rates are shares of that provider's or actor's own calls.
@@ -396,53 +468,13 @@ def detect_external_findings(external: dict[str, Any]) -> list[dict[str, Any]]:
 
 # ───────────── LLM output ─────────────
 
-class Recommendation(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    title: str = Field(min_length=1, max_length=300)
-    category: str
-    priority: str
-    finding: str
-    evidence: str
-    recommended_change: str
-    expected_benefit: str
-    estimated_cost_saving: str
-    risk: str
-    affected_stage: str
-
-    @field_validator("category", "priority", "affected_stage", mode="before")
-    @classmethod
-    def _upper(cls, value: Any) -> Any:
-        return value.strip().upper().replace(" ", "_").replace("-", "_") if isinstance(value, str) else value
-
-    @field_validator("category")
-    @classmethod
-    def _category(cls, value: str) -> str:
-        if value not in RECOMMENDATION_CATEGORIES:
-            raise ValueError(f"must be one of {', '.join(RECOMMENDATION_CATEGORIES)}")
-        return value
-
-    @field_validator("priority")
-    @classmethod
-    def _priority(cls, value: str) -> str:
-        if value not in RECOMMENDATION_PRIORITIES:
-            raise ValueError(f"must be one of {', '.join(RECOMMENDATION_PRIORITIES)}")
-        return value
-
-    @field_validator("affected_stage")
-    @classmethod
-    def _stage(cls, value: str) -> str:
-        if value not in ADVISOR_STAGES:
-            raise ValueError(f"must be one of {', '.join(ADVISOR_STAGES)}")
-        return value
-
-
-class AdvisorOutput(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    summary: str = Field(min_length=1)
-    estimated_savings: str = "unknown"
-    recommendations: list[Recommendation] = Field(default_factory=list, max_length=MAX_RECOMMENDATIONS)
+# The advisor's output contract lives with its prompt (app.prompts.contracts): one definition for the JSON Schema the
+# LLM layer sends and for the validation here.
+Recommendation = contracts.Recommendation
+AdvisorOutput = contracts.OptimizationReport
+ADVISOR_STAGES = contracts.ADVISOR_STAGES
+RECOMMENDATION_CATEGORIES = contracts.RECOMMENDATION_CATEGORIES
+RECOMMENDATION_PRIORITIES = contracts.RECOMMENDATION_PRIORITIES
 
 
 class AdvisorOutputError(ValueError):

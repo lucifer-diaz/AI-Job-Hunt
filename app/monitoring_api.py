@@ -42,6 +42,7 @@ def monitoring_filter(
     workflow_type: str | None = Query(None, max_length=30),
     job_id: int | None = None,
     entity_id: int | None = None,
+    worker_type: str | None = Query(None, max_length=40),
     all_accounts: bool = False,
 ) -> monitoring.MonitoringFilter:
     if all_accounts and not user.is_admin:
@@ -53,7 +54,8 @@ def monitoring_filter(
         workflow_type, entity_id = "job", job_id
     return monitoring.MonitoringFilter(start=begin, end=finish, user_id=None if all_accounts else user.id,
                                        provider=provider, model=model, stage=stage, prompt_version=prompt_version,
-                                       status=status, workflow_type=workflow_type, entity_id=entity_id)
+                                       status=status, workflow_type=workflow_type, entity_id=entity_id,
+                                       worker_type=worker_type)
 
 
 Filter = Depends(monitoring_filter)

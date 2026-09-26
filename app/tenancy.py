@@ -22,7 +22,9 @@ from typing import Any
 from sqlalchemy import event
 from sqlalchemy.orm import Session, with_loader_criteria
 
-from app.models import (AIOptimizationReport, AIOptimizationTask, AppSetting, Application, ApplicationEvent, CandidateProfile,
+from app.models import (AIConfigAuditEntry, AIConfigVersion, AIModel, AIOptimizationReport, AIOptimizationTask,
+                        AIRoutingConfig, AppSetting, Application, ApplicationEvent, CandidateProfile, LiteLLMConnection,
+                        ModelTier, WorkerModelConfig,
                         ConversationAction, Evidence, FollowUp, Job, JobDescriptionParseTask, JobRanking, JobRankingTask,
                         JobRequirementEvidence, JobStructuredDataChange, KnowledgeAnswer, McpToken, Resume,
                         ProviderCooldown, ResumeDataChange, ResumeDocument, ResumeVariant, ResumeVersion, SavedSearch,
@@ -32,7 +34,9 @@ from app.models import (AIOptimizationReport, AIOptimizationTask, AppSetting, Ap
 OWNED_MODELS = (CandidateProfile, AppSetting, ResumeDocument, KnowledgeAnswer, Evidence, Job, SearchRun, SearchProfile,
                 SavedSearch, ProviderCooldown, Application, ResumeVariant, WorkflowTransition, ApplicationEvent, FollowUp, TailorTask, ResumeVersion,
                 JobRankingTask, JobRanking, AIOptimizationTask, AIOptimizationReport, ConversationAction, McpToken, Resume,
-                ResumeDataChange, JobRequirementEvidence, JobStructuredDataChange, JobDescriptionParseTask)
+                ResumeDataChange, JobRequirementEvidence, JobStructuredDataChange, JobDescriptionParseTask,
+                LiteLLMConnection, AIModel, ModelTier, WorkerModelConfig, AIRoutingConfig, AIConfigVersion,
+                AIConfigAuditEntry)
 # Rows that inherit their owner from a parent row: model -> (relationship, foreign key, parent model).
 INHERITED_OWNER = {
     Application: ("job", "job_id", Job),

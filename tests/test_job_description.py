@@ -466,7 +466,11 @@ def test_prompts_get_requirements_instead_of_the_whole_advert(user):
     # Both sides of context selection travel with the call.
     assert set(ranking.call_stats()) == {"full_available_context_tokens", "selected_context_tokens",
                                          "context_reduction_percent", "raw_job_tokens",
-                                         "selected_job_context_tokens", "job_context_reduction_percent"}
+                                         "selected_job_context_tokens", "job_context_reduction_percent",
+                                         "context_builder_version"}
+    # Match analysis is the Ranker's: only its context computes candidate matches, the Tailor's does not.
+    assert not tailoring_context.job_context.get("candidate_matches")
+    assert "term_overlap" in prompts["ranking"].user and "term_overlap" not in prompts["tailoring"].user
 
 
 def test_an_unparsed_posting_still_sends_the_description(user):

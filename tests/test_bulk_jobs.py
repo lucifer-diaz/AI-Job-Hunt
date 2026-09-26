@@ -60,6 +60,8 @@ def test_bulk_rank_queues_tasks_and_never_ranks_in_the_request():
 def test_bulk_delete_protects_submitted_jobs_and_cascades():
     ids = make_jobs(3, uuid.uuid4().hex[:8])
     tailored, applied, plain = ids
+    # Tailoring needs resume content to present: an empty resume is refused before any model call.
+    assert client.put("/api/profile", json={"master_resume": "Built Python FastAPI services at 10k rps"}).status_code == 200
     for job_id in (tailored, applied):
         client.post(f"/api/jobs/{job_id}/triage", json={"action": "shortlist"})
         assert client.post(f"/api/jobs/{job_id}/tailor").status_code == 200

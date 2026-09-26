@@ -8,7 +8,11 @@ Rules:
 * Provider-reported usage is preferred; otherwise tokens are estimated locally and marked `estimated`.
   Metrics that cannot be reported or estimated stay NULL.
 * Context size is always estimated from the prompt text, split by the labelled sections app.prompts builds.
-* No prompt or response text is stored unless LLM_PROMPT_DEBUG is on. Error messages are redacted.
+* No prompt or response text is stored unless LLM_PROMPT_DEBUG is on, and then only after central redaction
+  (app.services.redaction), like error messages.
+* Structured output is recorded per request: how the contract was enforced (`schema_enforcement`), whether the answer
+  passed it, and why not (`validation_failure_reason`: INVALID_JSON, WRONG_OUTPUT_SCHEMA,
+  POSSIBLE_CROSS_WORKER_OUTPUT or SEMANTIC_VALIDATION).
 """
 from __future__ import annotations
 
@@ -36,6 +40,8 @@ STAGE_BY_PROMPT = {
     "evidence_extraction": "RESUME_PARSER", "application_question": "APPLICATION", "followup": "FOLLOW_UP",
     "inbox": "INBOX", "company_insights": "COMPANY_INSIGHTS", "job_description_parser": "OTHER", "ai_optimization": "ADVISOR",
 }
+VALIDATION_FAILURE_REASONS = ("INVALID_JSON", "WRONG_OUTPUT_SCHEMA", "POSSIBLE_CROSS_WORKER_OUTPUT",
+                              "SEMANTIC_VALIDATION")
 CONTRIBUTORS = ("system_prompt", "candidate_profile", "resume", "evidence", "job_description", "conversation",
                 "research", "other")
 # Section labels written by app.prompts.common.section/untrusted → the context contributor they belong to.
@@ -44,7 +50,10 @@ SECTION_CONTRIBUTOR = {
     "ACTIVE RESUME": "resume", "RESUME": "resume", "MASTER RESUME": "resume", "MASTER RESUME ROLES": "resume",
     "RESUME TEXT": "resume", "TAILORED RESUME": "resume", "RELEVANT EXPERIENCE": "resume", "RELEVANT SKILLS": "resume",
     "VERIFIED RESUME FACTS": "resume", "UNVERIFIED RESUME FACTS": "resume", "REJECTED RESUME FACTS": "resume",
-    "VERIFIED EVIDENCE": "evidence", "KNOWN ANSWERS": "candidate_profile",
+    "VERIFIED EVIDENCE": "evidence", "KNOWN ANSWERS": "candidate_profile", "CANDIDATE": "candidate_profile",
+    "SOURCE RESUME": "resume", "RELEVANT EVIDENCE": "evidence", "TAILORED CLAIMS": "resume",
+    "FIT ANALYSIS (completed by the Ranker; read-only)": "job_description", "QUESTION": "conversation",
+    "ANSWER OPTIONS": "conversation", "SCHEMA CORRECTION": "other",
     "JOB ID": "job_description", "JOB": "job_description", "JOB POSTING": "job_description",
     "JOB REQUIREMENTS": "job_description", "POSTING SECTIONS": "job_description",
     "JOB DESCRIPTION": "job_description", "FIT ANALYSIS": "job_description",
@@ -99,6 +108,17 @@ class LLMCall:
     structured_output_retry_count: int = 0
     # Set by services that build task-specific context (app.services.context_builder.ContextStats.as_dict()).
     context_stats: dict[str, Any] | None = None
+    # LiteLLM gateway mode (app.services.model_resolution). The worker is normally read from the prompt's name;
+    # `worker_type` names it explicitly (configuration tests), `resolved` runs an unapplied configuration (worker
+    # tests), and `escalate` asks for the worker's escalation model when its policy allows MANUAL escalation.
+    worker_type: str | None = None
+    resolved: Any = None
+    escalate: bool = False
+    # Set by the LLM layer: the prompt's output contract, schema corrections used, and whether escalation is off
+    # (a correction retry is never escalated again).
+    contract: Any = None
+    schema_corrections: int = 0
+    no_escalation: bool = False
 
 
 @dataclass
@@ -134,6 +154,22 @@ class Attempt:
     structured_output_valid: bool | None = None
     # The generic external-call row for this same request (app.services.external_api), set by the LLM layer.
     external_request_id: str | None = None
+    # Model routing, filled in gateway mode (app.services.model_resolution): see LLMRequestLog.
+    worker_type: str | None = None
+    model_mode: str | None = None
+    configured_model: str | None = None
+    config_version: int | None = None
+    litellm_call_id: str | None = None
+    model_group: str | None = None
+    routing_tier: str | None = None
+    routing_cause: str | None = None
+    fallback_used: bool | None = None
+    escalated: bool = False
+    escalation_reason: str | None = None
+    confidence: float | None = None
+    context_window: int | None = None  # known from the model registry when the catalog has no entry
+    schema_enforcement: str | None = None  # native_schema | json_mode | prompt_only | none
+    validation_failure_reason: str | None = None
 
 
 _sessions: Callable[[], Session] | None = None
@@ -165,7 +201,7 @@ def build_entry(attempt: Attempt, *, latency_ms: int, error: BaseException | Non
     context_tokens = usage.input_tokens if usage and usage.input_tokens is not None else sum(breakdown.values())
     model = attempt.model or attempt.requested_model
     window = model_catalog.context_window(attempt.provider, attempt.requested_model, attempt.started_at) \
-        or model_catalog.context_window(attempt.provider, model, attempt.started_at)
+        or model_catalog.context_window(attempt.provider, model, attempt.started_at) or attempt.context_window
     if not attempt.sent:
         cost = model_catalog.CostEstimate(Decimal(0), "not_sent")
     else:
@@ -205,8 +241,13 @@ def build_entry(attempt: Attempt, *, latency_ms: int, error: BaseException | Non
         "cache_read_tokens": usage.cache_read_tokens if usage else None,
         "cache_write_tokens": usage.cache_write_tokens if usage else None,
         **_context_selection(call.context_stats),
-        "debug_prompt": f"{attempt.system}\n\n{attempt.user}"[:DEBUG_TEXT_LIMIT] if debug else None,
-        "debug_response": (attempt.response_text or "")[:DEBUG_TEXT_LIMIT] if debug and attempt.response_text else None,
+        **_routing(attempt),
+        "schema_enforcement": attempt.schema_enforcement,
+        "validation_failure_reason": attempt.validation_failure_reason,
+        "context_builder_version": ((call.context_stats or {}).get("context_builder_version") or None),
+        "debug_prompt": redaction.redact_text(f"{attempt.system}\n\n{attempt.user}", DEBUG_TEXT_LIMIT) if debug else None,
+        "debug_response": redaction.redact_text(attempt.response_text, DEBUG_TEXT_LIMIT)
+        if debug and attempt.response_text else None,
         "created_at": attempt.started_at, "completed_at": completed_at or utcnow(),
     }
 
@@ -216,6 +257,16 @@ def _context_selection(stats: dict[str, Any] | None) -> dict[str, Any]:
     return {key: stats.get(key) for key in ("full_available_context_tokens", "selected_context_tokens",
                                             "context_reduction_percent", "raw_job_tokens",
                                             "selected_job_context_tokens", "job_context_reduction_percent")}
+
+
+def _routing(attempt: Attempt) -> dict[str, Any]:
+    return {"worker_type": attempt.worker_type, "model_mode": attempt.model_mode,
+            "configured_model": (attempt.configured_model or "")[:200] or None,
+            "config_version": attempt.config_version, "litellm_call_id": (attempt.litellm_call_id or "")[:64] or None,
+            "model_group": (attempt.model_group or "")[:200] or None, "routing_tier": attempt.routing_tier,
+            "routing_cause": (attempt.routing_cause or "")[:60] or None, "fallback_used": attempt.fallback_used,
+            "escalated": attempt.escalated, "escalation_reason": attempt.escalation_reason,
+            "confidence": attempt.confidence}
 
 
 STRUCTURED_OUTPUT_ERRORS = ("SCHEMA_VALIDATION", "INVALID_JSON")

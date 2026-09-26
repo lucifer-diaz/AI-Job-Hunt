@@ -539,3 +539,23 @@ p.settings-help{margin:10px 0}
   .knowledge-editor{padding:18px 16px}.knowledge-field-grid{grid-template-columns:1fr;gap:0}
   .knowledge-summary{gap:12px 18px}.knowledge-notice{align-items:flex-start;flex-direction:column}
 }
+
+/* Settings → AI Models (app/static/ai_models.js) */
+.aim-bar{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:var(--softer);margin-bottom:12px}
+.aim-tabs{padding:0;margin-bottom:14px}
+.aim-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}
+.aim-card{border:1px solid var(--line);border-radius:12px;padding:12px 14px;background:#fff}
+.aim-card p{margin:6px 0}
+.aim-wide .mon-table td{white-space:normal;vertical-align:top}
+.aim-cap{font-size:11px;padding:2px 6px;border-radius:6px;background:var(--soft);color:var(--muted)}
+.aim-cap.yes{background:var(--good-soft);color:var(--good)}
+.aim-cap.no{background:var(--bad-soft);color:var(--bad)}
+.aim-inline{margin:0;min-width:120px;padding:4px 8px}
+.aim-test{margin-top:6px;max-width:420px}
+.aim-drawer,.aim-preview{border:1px solid var(--brand-line);border-radius:14px;background:#fff;padding:16px 18px;margin-top:16px;box-shadow:0 10px 30px rgba(17,21,39,.08)}
+.aim-drawer h3,.aim-preview h3{margin:0;font-size:16px}
+.aim-changes{list-style:none;padding:0;margin:8px 0;display:flex;flex-direction:column;gap:8px}
+.aim-diff{font-size:12px;color:var(--ink2);word-break:break-word}
+.aim-checks{list-style:none;padding:0;margin:10px 0 0;display:flex;flex-direction:column;gap:4px}
+.aim-add{margin:10px 0}
+@media (min-width:1100px){.aim-drawer{position:sticky;bottom:16px}}

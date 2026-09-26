@@ -82,6 +82,15 @@ class User(Base):
     optimization_reports: Mapped[list[AIOptimizationReport]] = relationship(back_populates="user", passive_deletes=True)
     conversation_actions: Mapped[list[ConversationAction]] = relationship(back_populates="user", passive_deletes=True)
     mcp_tokens: Mapped[list[McpToken]] = relationship(back_populates="user", passive_deletes=True)
+    litellm_connection: Mapped[LiteLLMConnection | None] = relationship(back_populates="user", uselist=False,
+                                                                         passive_deletes=True)
+    ai_models: Mapped[list[AIModel]] = relationship(back_populates="user", passive_deletes=True)
+    model_tiers: Mapped[list[ModelTier]] = relationship(back_populates="user", passive_deletes=True)
+    worker_model_configs: Mapped[list[WorkerModelConfig]] = relationship(back_populates="user", passive_deletes=True)
+    ai_routing_config: Mapped[AIRoutingConfig | None] = relationship(back_populates="user", uselist=False,
+                                                                      passive_deletes=True)
+    ai_config_versions: Mapped[list[AIConfigVersion]] = relationship(back_populates="user", passive_deletes=True)
+    ai_config_audit: Mapped[list[AIConfigAuditEntry]] = relationship(back_populates="user", passive_deletes=True)
 
 
 class UserSession(Base):
@@ -815,6 +824,8 @@ class FollowUp(Base):
     draft: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(30), default="draft")
     sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # What produced the draft: prompt version, provider, model, AI config version. NULL on drafts made before it existed.
+    generation: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
     application: Mapped[Application] = relationship(back_populates="followups")
@@ -919,6 +930,7 @@ class JobRanking(Base):
     provider: Mapped[str] = mapped_column(String(30))
     model: Mapped[str] = mapped_column(String(300))
     prompt_version: Mapped[str] = mapped_column(String(20))
+    config_version: Mapped[int | None] = mapped_column(Integer, nullable=True)  # the AI configuration it ran under
     raw_output: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
@@ -1003,6 +1015,7 @@ class LLMRequestLog(Base):
         Index("ix_llm_request_logs_stage_created", "stage", "created_at"),
         Index("ix_llm_request_logs_model_created", "model", "created_at"),
         Index("ix_llm_request_logs_created_at", "created_at"),
+        Index("ix_llm_request_logs_worker_created", "worker_type", "created_at"),
         UniqueConstraint("request_id", name="uq_llm_request_logs_request_id"),
     )
 
@@ -1054,6 +1067,30 @@ class LLMRequestLog(Base):
     context_reduction_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
     debug_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
     debug_response: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Model routing (app.services.model_resolution): which worker asked, what it was configured to use, and what
+    # actually answered. NULL on requests made before AI model configuration existed, and on direct-provider mode
+    # for the routing columns that only a gateway reports.
+    worker_type: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    model_mode: Mapped[str | None] = mapped_column(String(20), nullable=True)  # FIXED | TIER | AUTO_ROUTER
+    configured_model: Mapped[str | None] = mapped_column(String(200), nullable=True)  # the logical assignment
+    config_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # What LiteLLM reported: its call id, the model group (alias) that answered, and the auto router's decision.
+    litellm_call_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    model_group: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    routing_tier: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    routing_cause: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    # Infrastructure fallback (LiteLLM answered from another model group) and quality escalation (Job Hunt OS asked
+    # a stronger model because the first answer was not good enough) are separate facts on purpose.
+    fallback_used: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    escalated: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    escalation_reason: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Structured output (app.prompts.contracts): how the worker's contract was enforced (native_schema, json_mode,
+    # prompt_only, none), why an answer failed it (INVALID_JSON, WRONG_OUTPUT_SCHEMA, POSSIBLE_CROSS_WORKER_OUTPUT,
+    # SEMANTIC_VALIDATION), and which context builder version prepared the input. NULL on older rows.
+    schema_enforcement: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    validation_failure_reason: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    context_builder_version: Mapped[str | None] = mapped_column(String(20), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
@@ -1093,8 +1130,8 @@ EXTERNAL_STATUSES = ("SUCCEEDED", "FAILED")
 EXTERNAL_ERROR_TYPES = ("TIMEOUT", "CONNECTION", "DNS", "RATE_LIMIT", "CLIENT_ERROR", "SERVER_ERROR",
                         "INVALID_RESPONSE", "RETRY_EXHAUSTED", "CONFIGURATION", "SDK_ERROR", "OTHER")
 # Providers seen so far. Deliberately NOT a database constraint: a new integration must not need a migration.
-KNOWN_EXTERNAL_PROVIDERS = ("APIFY", "OPENROUTER", "OPENAI", "ANTHROPIC", "GEMINI", "EMAIL", "SEARCH", "JOB_BOARD",
-                            "WEB", "OTHER")
+KNOWN_EXTERNAL_PROVIDERS = ("APIFY", "OPENROUTER", "OPENAI", "ANTHROPIC", "GEMINI", "LITELLM", "OLLAMA", "EMAIL",
+                            "SEARCH", "JOB_BOARD", "WEB", "OTHER")
 SYSTEM_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 SYSTEM_LOG_CATEGORIES = ("EXTERNAL_API", "LLM", "SCHEDULER", "WORKFLOW", "APIFY", "APPLICATION", "EMAIL", "SYSTEM")
 
@@ -1368,6 +1405,246 @@ class McpToken(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     user: Mapped[User] = relationship(back_populates="mcp_tokens")
+
+
+# ───────────── AI model configuration (Settings → AI Models) ─────────────
+# PostgreSQL is the source of truth for what an account wants its AI workers to use. The editable rows below are
+# the *desired* (draft) configuration; an Apply validates them, pushes the parts that live inside LiteLLM, and
+# freezes the result as an AIConfigVersion. Workers only ever read the latest version (the *active* one).
+
+AI_MODEL_TYPES = ("FAST", "BALANCED", "REASONING", "DEEP_REASONING", "EMBEDDING", "AUTO_ROUTER", "CUSTOM")
+WORKER_MODEL_MODES = ("FIXED", "TIER", "AUTO_ROUTER")
+REASONING_EFFORTS = ("low", "medium", "high")
+LITELLM_CONNECTION_STATUSES = ("UNKNOWN", "CONNECTED", "DISCONNECTED", "AUTH_FAILED", "UNAVAILABLE")
+LITELLM_SYNC_MODES = ("disabled", "admin_api", "config_file")
+AI_SYNC_STATUSES = ("SYNCED", "PENDING", "APPLYING", "OUT_OF_SYNC", "FAILED")
+AI_CONFIG_SOURCES = ("USER", "SYSTEM", "MIGRATION")
+AUTO_ROUTER_CLASSIFIERS = ("DISABLED", "HEURISTIC", "HEURISTIC_V2", "LLM", "CUSTOM")
+MODEL_HEALTH_STATUSES = ("UNKNOWN", "HEALTHY", "UNHEALTHY")
+AI_AUDIT_RESULTS = ("SUCCEEDED", "FAILED", "REJECTED")
+
+
+class LiteLLMConnection(Base):
+    """How one account reaches its LiteLLM proxy, and the synchronization state of its AI configuration.
+
+    The API key is encrypted with SECRET_KEY (app.security) and never returned by the API. `draft_revision`
+    increases on every edit to the desired configuration, so an Apply can tell that what it previewed is still
+    what it is about to deploy.
+    """
+
+    __tablename__ = "litellm_connections"
+    __table_args__ = (
+        CheckConstraint(f"status IN ({_values(LITELLM_CONNECTION_STATUSES)})", name="ck_litellm_connections_status"),
+        CheckConstraint(f"sync_status IN ({_values(AI_SYNC_STATUSES)})", name="ck_litellm_connections_sync_status"),
+        CheckConstraint(f"sync_mode IN ({_values(LITELLM_SYNC_MODES)})", name="ck_litellm_connections_sync_mode"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("litellm_connections", unique=True)
+    base_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    api_key_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sync_mode: Mapped[str] = mapped_column(String(20), default="disabled")
+    status: Mapped[str] = mapped_column(String(20), default="UNKNOWN")
+    litellm_version: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_discovery_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    sync_status: Mapped[str] = mapped_column(String(20), default="SYNCED")
+    last_sync_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_sync_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    applying_since: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    draft_revision: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+    user: Mapped[User] = relationship(back_populates="litellm_connection")
+
+
+class AIModel(Base):
+    """One model an account can assign to workers: a LiteLLM model name (alias) and what is known about it.
+
+    Discovered facts (provider, underlying model, context window, capabilities, health) come from LiteLLM and,
+    for Ollama deployments, from Ollama itself. A fact nobody reported stays NULL: unknown, never guessed.
+    `overrides` holds what the user asserted instead. A `managed` model is one Job Hunt OS deploys into LiteLLM
+    itself from `deployment_params` (for example a local Ollama model); other models are only referenced.
+    """
+
+    __tablename__ = "ai_models"
+    __table_args__ = (
+        UniqueConstraint("user_id", "litellm_model_name", name="uq_ai_models_user_name"),
+        CheckConstraint(f"model_type IN ({_values(AI_MODEL_TYPES)})", name="ck_ai_models_model_type"),
+        CheckConstraint(f"health_status IN ({_values(MODEL_HEALTH_STATUSES)})", name="ck_ai_models_health_status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("ai_models")
+    display_name: Mapped[str] = mapped_column(String(200), default="")
+    litellm_model_name: Mapped[str] = mapped_column(String(200))
+    provider: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    underlying_model: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    model_type: Mapped[str] = mapped_column(String(20), default="CUSTOM")
+    supports_structured_output: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    supports_tools: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    supports_reasoning: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    supports_vision: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # The context the deployment actually runs with (Ollama num_ctx when set) and the model's own maximum.
+    context_window: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_context_window: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    overrides: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    managed: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Managed models only: the LiteLLM deployment (litellm_params) Job Hunt OS deploys. Never a literal secret —
+    # credentials must be LiteLLM `os.environ/NAME` references, which validation enforces.
+    deployment_params: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    present_in_litellm: Mapped[bool] = mapped_column(Boolean, default=False)
+    source: Mapped[str] = mapped_column(String(20), default="DISCOVERED")  # DISCOVERED | USER | SEED
+    health_status: Mapped[str] = mapped_column(String(20), default="UNKNOWN")
+    health_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    health_latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    health_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    user: Mapped[User] = relationship(back_populates="ai_models")
+
+
+class ModelTier(Base):
+    """A logical tier (FAST, PRIMARY_REASONING, …) that workers can point at instead of naming a model."""
+
+    __tablename__ = "model_tiers"
+    __table_args__ = (UniqueConstraint("user_id", "name", name="uq_model_tiers_user_name"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("model_tiers")
+    name: Mapped[str] = mapped_column(String(60))
+    description: Mapped[str] = mapped_column(String(300), default="")
+    litellm_model_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+    user: Mapped[User] = relationship(back_populates="model_tiers")
+
+
+class WorkerModelConfig(Base):
+    """Which model one AI worker uses and how it calls it. Blank generation settings mean "the model's default".
+
+    `escalation` is the worker's quality-escalation policy (app.services.model_resolution), deliberately separate
+    from `fallback_model`, which is LiteLLM's infrastructure fallback for timeouts, rate limits and outages.
+    """
+
+    __tablename__ = "worker_model_configs"
+    __table_args__ = (
+        UniqueConstraint("user_id", "worker_type", name="uq_worker_model_configs_user_worker"),
+        CheckConstraint(f"model_mode IN ({_values(WORKER_MODEL_MODES)})", name="ck_worker_model_configs_model_mode"),
+        CheckConstraint(f"reasoning_effort IN ({_values(REASONING_EFFORTS)})",
+                        name="ck_worker_model_configs_reasoning_effort"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("worker_model_configs")
+    worker_type: Mapped[str] = mapped_column(String(40))
+    model_mode: Mapped[str] = mapped_column(String(20), default="TIER")
+    primary_model: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    tier_name: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    fallback_model: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    temperature: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    context_window: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reasoning_effort: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    timeout_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    retry_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_concurrency: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    use_structured_output: Mapped[bool] = mapped_column(Boolean, default=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    escalation: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+    user: Mapped[User] = relationship(back_populates="worker_model_configs")
+
+
+class AIRoutingConfig(Base):
+    """The account's LiteLLM auto router: the classifier LiteLLM runs and the model behind each complexity tier."""
+
+    __tablename__ = "ai_routing_configs"
+    __table_args__ = (
+        CheckConstraint(f"classifier IN ({_values(AUTO_ROUTER_CLASSIFIERS)})", name="ck_ai_routing_configs_classifier"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("ai_routing_configs", unique=True)
+    auto_router_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    auto_router_model_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # True: Job Hunt OS deploys the router into LiteLLM from the settings below. False: it uses a router someone
+    # already defined in LiteLLM under that name, and only routes workers to it.
+    manage_auto_router: Mapped[bool] = mapped_column(Boolean, default=True)
+    classifier: Mapped[str] = mapped_column(String(20), default="HEURISTIC")
+    classifier_model: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    classifier_plugin: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    tier_models: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)  # SIMPLE/MEDIUM/COMPLEX/REASONING
+    default_model: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # Send Job Hunt OS request metadata (worker, workflow, retry number, …) with every LiteLLM request.
+    send_metadata: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+    user: Mapped[User] = relationship(back_populates="ai_routing_config")
+
+
+class AIConfigVersion(Base):
+    """An applied AI configuration, frozen. Never updated: a rollback creates a new version from an old snapshot.
+
+    The snapshot holds no secrets (no API keys, no credential values); app.services.ai_model_config redacts it.
+    """
+
+    __tablename__ = "ai_config_versions"
+    __table_args__ = (
+        UniqueConstraint("user_id", "version_number", name="uq_ai_config_versions_user_version"),
+        CheckConstraint(f"source IN ({_values(AI_CONFIG_SOURCES)})", name="ck_ai_config_versions_source"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("ai_config_versions")
+    version_number: Mapped[int] = mapped_column(Integer)
+    configuration_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    changed_by: Mapped[str] = mapped_column(String(320), default="")
+    source: Mapped[str] = mapped_column(String(20), default="USER")
+    change_summary: Mapped[str] = mapped_column(Text, default="")
+    changes: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    sync_result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    restored_from_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+    user: Mapped[User] = relationship(back_populates="ai_config_versions")
+
+
+class AIConfigAuditEntry(Base):
+    """Every attempt to change the AI configuration or its LiteLLM state, including the ones that failed."""
+
+    __tablename__ = "ai_config_audit"
+    __table_args__ = (
+        CheckConstraint(f"source IN ({_values(AI_CONFIG_SOURCES)})", name="ck_ai_config_audit_source"),
+        CheckConstraint(f"result IN ({_values(AI_AUDIT_RESULTS)})", name="ck_ai_config_audit_result"),
+        Index("ix_ai_config_audit_user_created", "user_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("ai_config_audit")
+    action: Mapped[str] = mapped_column(String(30))  # SEED | APPLY | ROLLBACK | VERIFY | DISCOVER | CONNECTION
+    source: Mapped[str] = mapped_column(String(20), default="USER")
+    actor: Mapped[str] = mapped_column(String(320), default="")
+    result: Mapped[str] = mapped_column(String(20), default="SUCCEEDED")
+    version_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    changes: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    sync_result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+    user: Mapped[User] = relationship(back_populates="ai_config_audit")
 
 
 # Registers the per-user isolation hooks on every session; needs the models above.

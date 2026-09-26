@@ -154,6 +154,12 @@ def set_user_keys(db: Session, updates: dict[str, str | None], user_id: int | No
 def ai_ready(db: Session, user_id: int) -> tuple[bool, str]:
     """Whether this account's chosen AI provider can be called, so workers never burn attempts on a missing key."""
     provider = resolve_ai_config(get_settings(), ai_overrides(db, user_id))["llm_provider"]
+    if provider == "litellm":
+        from app.services.ai_model_config import gateway_settings
+
+        if gateway_settings(db, user_id)[0]:
+            return True, ""
+        return False, "No LiteLLM base URL saved in Settings → AI Models"
     if provider == "mock" or user_keys(db, user_id).get(provider):
         return True, ""
     return False, f"No {KEY_LABELS.get(provider, provider)} API key saved in Settings"

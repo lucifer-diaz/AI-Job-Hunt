@@ -5,12 +5,21 @@ backend makes. Job Hunt OS still validates every saved result (app.services.tail
 """
 from __future__ import annotations
 
-from app.prompts.common import NO_INVENTION_RULE, UNTRUSTED_DATA_RULE, instructions
+from app.prompts.common import (
+    GAPS_STAY_GAPS_RULE,
+    NO_INVENTION_RULE,
+    UNTRUSTED_DATA_RULE,
+    instructions,
+)
 
-MCP_TAILORING_PROMPT_VERSION = "v1"
+# v2: tailoring is told it is not ranking, and that the fit analysis's gaps stay gaps.
+MCP_TAILORING_PROMPT_VERSION = "v2"
 
 TAILORING_RULES = (
+    ("You are tailoring, not ranking: fit_analysis was computed by Job Hunt OS's Ranker. Use its strong matches, "
+     "resume gaps and recommended focus to choose emphasis; never rescore it or decide whether to apply."),
     NO_INVENTION_RULE,
+    GAPS_STAY_GAPS_RULE,
     "Use only candidate_profile, active_resume and relevant_evidence from get_tailoring_context.",
     "Never change employers, job titles or employment dates; they are kept from the master resume automatically.",
     "Never state visa, sponsorship, citizenship or work-authorization facts beyond candidate_profile.work_authorization.",

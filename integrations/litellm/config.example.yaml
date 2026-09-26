@@ -1,0 +1,41 @@
+# Example LiteLLM proxy config for Job Hunt OS with local Ollama models. These model choices are an example,
+# not a requirement: Job Hunt OS discovers whatever LiteLLM serves, and every worker's model is chosen in
+# Settings → AI Models.
+#
+# Start:  STORE_MODEL_IN_DB=True LITELLM_MASTER_KEY=sk-... DATABASE_URL=postgresql://... litellm --config config.yaml
+#   STORE_MODEL_IN_DB=True lets Job Hunt OS apply managed models and the auto router at runtime (admin_api mode).
+#   Without it, use config_file mode (the include below) and restart LiteLLM after each Apply.
+
+include:
+  - jobhunt_models.yaml   # written only by Job Hunt OS in config_file mode (LITELLM_MANAGED_CONFIG_PATH)
+
+model_list:
+  - model_name: local-fast          # FAST tier, e.g. Llama 3.2 3B
+    litellm_params:
+      model: ollama_chat/llama3.2:3b
+      api_base: http://localhost:11434
+      num_ctx: 8192
+      keep_alive: "15m"
+
+  - model_name: local-reasoning     # PRIMARY_REASONING tier, e.g. GPT-OSS 20B
+    litellm_params:
+      model: ollama_chat/gpt-oss:20b
+      api_base: http://localhost:11434
+      num_ctx: 24576
+      keep_alive: "15m"
+
+  - model_name: local-deep          # DEEP_REVIEW tier, e.g. Qwen 2.5 32B (a different family for review)
+    litellm_params:
+      model: ollama_chat/qwen2.5:32b
+      api_base: http://localhost:11434
+      num_ctx: 24576
+      keep_alive: "2m"
+
+router_settings:
+  routing_strategy: simple-shuffle
+  num_retries: 1
+  timeout: 300
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL

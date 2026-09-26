@@ -3,6 +3,7 @@
 Telemetry is captured once in the shared LLM layer, so these tests drive LLMClient with fake provider SDKs and read
 back the llm_request_logs rows it wrote. They run on the default test database (SQLite or TEST_DATABASE_URL).
 """
+from dataclasses import replace
 import json
 import sys
 import uuid
@@ -98,8 +99,9 @@ def openai_usage(prompt, completion, cached=None, cost=None):
 
 def test_openai_usage_latency_model_and_cost_are_recorded(user_id, fake_openai):
     fake_openai.reply = {"model": "gpt-5.6-luna-2026-09-01", "usage": openai_usage(1200, 300, cached=200)}
+    # Usage recording is the subject here, not the ranking contract: the fake answers {"ok": true}.
     result = client_for(user_id, "openai", {"openai": "sk-test"}, model="gpt-5.6-luna").generate_prompt(
-        ranking_prompt(), LLMCall(workflow_type="job", entity_id=7))
+        replace(ranking_prompt(), output_schema=None), LLMCall(workflow_type="job", entity_id=7))
     assert result.data == {"ok": True}
     log, = logs_for(user_id)
     assert (log.provider, log.requested_model, log.model) == ("openai", "gpt-5.6-luna", "gpt-5.6-luna-2026-09-01")

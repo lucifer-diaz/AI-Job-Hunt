@@ -8,7 +8,9 @@ from __future__ import annotations
 
 from typing import Any
 
-PROVIDERS = ("openrouter", "openai", "anthropic", "gemini", "mock")
+# `litellm` is gateway mode: models come from Settings → AI Models per worker (app.services.model_resolution),
+# so the stage models below only apply to the direct providers.
+PROVIDERS = ("litellm", "openrouter", "openai", "anthropic", "gemini", "mock")
 STAGES = (("rank", "Rank"), ("tailor", "Tailor"), ("review", "Review"), ("followup", "Follow-up"))
 
 
@@ -29,7 +31,8 @@ def env_defaults(settings: Any) -> dict[str, Any]:
     stages = {stage: _clean(getattr(settings, f"openrouter_model_{stage}", None)) for stage, _ in STAGES}
     return {
         "llm_provider": provider,
-        "models": {name: _clean(getattr(settings, f"{name}_model", "")) for name in PROVIDERS if name != "mock"},
+        "models": {name: _clean(getattr(settings, "litellm_default_model" if name == "litellm" else f"{name}_model", ""))
+                   for name in PROVIDERS if name != "mock"},
         # OPENROUTER_MODEL_<STAGE> overrides only apply to OpenRouter.
         "stage_models": stages,
         # Provider-independent stage overrides (RANK_MODEL), used with any provider.

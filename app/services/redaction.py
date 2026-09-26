@@ -6,6 +6,11 @@ before they reach the database or the log file.
 
 Nothing that could be a credential is ever stored: header values are replaced wholesale for known credential
 headers, and secret-shaped strings are replaced anywhere they appear in free text.
+
+Field names are matched by shape as well as by list (`is_secret_field`): user_api_key, user_api_key_hash,
+openai_api_key, database_url or x-custom-api-key are all credentials, while token *counts* such as input_tokens or
+max_tokens are not. Every writer of telemetry, logs, debug text and Monitoring payloads goes through this module:
+external_api (request logs), llm_telemetry (LLM logs and LLM_PROMPT_DEBUG text), system_log and litellm_client.
 """
 from __future__ import annotations
 
@@ -26,9 +31,23 @@ SECRET_FIELDS = frozenset({
     "token", "access_token", "refresh_token", "id_token", "api_key", "apikey", "key", "secret",
     "client_secret", "password", "passwd", "pwd", "authorization", "auth", "session", "sig", "signature",
     "code", "email", "phone",
+    # LiteLLM and provider credentials as they appear in configuration (app.services.ai_model_config).
+    "master_key", "litellm_master_key", "litellm_api_key", "api_key_enc", "aws_secret_access_key",
+    "aws_session_token", "vertex_credentials", "azure_ad_token", "salt_key", "litellm_salt_key",
 })
+# Field names that are credentials by shape: a credential word as a whole segment of the name (split on _ - .).
+SECRET_FIELD_RE = re.compile(
+    r"(?i)(?:^|[_\-.])(?:api[_\-]?key|secret|password|passwd|passphrase|authorization|cookie|credentials?|"
+    r"private[_\-]?key|(?:access|refresh|id|auth|session|bearer|csrf)[_\-]?token|token|database[_\-]?url|"
+    r"db[_\-]?url|dsn|connection[_\-]?string|master[_\-]?key|salt[_\-]?key)(?:$|[_\-.])")
+_SECRET_NAME = (r"[a-z0-9_\-]*(?:api[_\-]?key|secret|password|passwd|authorization|cookie|credential|database[_\-]?url|"
+                r"access[_\-]?token|refresh[_\-]?token|auth[_\-]?token|session[_\-]?token|private[_\-]?key)[a-z0-9_\-]*")
 # Secret-shaped strings, redacted wherever they appear in free text (error messages, URLs, payload extracts).
 SECRET_PATTERNS = [
+    # A password inside a connection string or URL: scheme://user:PASSWORD@host
+    re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^:/\s@]+:)[^@\s/]+(?=@)"),
+    re.compile(r"eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}"),  # JWTs
+    re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|xox[abprs]-[A-Za-z0-9\-]{10,}|AKIA[0-9A-Z]{16})\b"),
     re.compile(r"sk-(?:or-v1-|ant-|proj-)?[A-Za-z0-9_\-]{8,}"),
     re.compile(r"AIza[0-9A-Za-z_\-]{20,}"),
     re.compile(r"apify_api_[A-Za-z0-9]{10,}"),
@@ -36,6 +55,9 @@ SECRET_PATTERNS = [
     re.compile(r"(?i)((?:x-)?api[_-]?key[\"']?\s*[:=]\s*[\"']?)[^\s\"',}]{6,}"),
     re.compile(r"(?i)((?:access_|refresh_|id_)?token[\"']?\s*[:=]\s*[\"']?)[^\s\"',}]{8,}"),
     re.compile(r"(?i)(password[\"']?\s*[:=]\s*[\"']?)[^\s\"',}]+"),
+    # Last, so the specific shapes above (a bearer token) are replaced whole first: any other credential-named
+    # field in JSON or key=value text ("user_api_key": "…", database_url=…, x-foo-secret: …).
+    re.compile(r"(?i)([\"']?" + _SECRET_NAME + r"[\"']?\s*[:=]\s*[\"']?)(?=[^\s\"',}]*[A-Za-z0-9])[^\s\"',}]{4,}"),
 ]
 MAX_ERROR_MESSAGE = 1000
 
@@ -50,22 +72,37 @@ def redact_text(value: str | None, limit: int = MAX_ERROR_MESSAGE) -> str | None
     return clean[:limit]
 
 
+def is_secret_field(name: Any) -> bool:
+    """Whether a header, query or JSON field name holds a credential (by list or by shape)."""
+    key = str(name).lower()
+    return key in SECRET_FIELDS or key in SECRET_HEADERS or bool(SECRET_FIELD_RE.search(key))
+
+
+def _secret_entry(name: Any, value: Any) -> bool:
+    """A listed credential name is always redacted. A name matched only by its shape (no_token, retry_token_count)
+    is redacted when its value could hold a credential: a count or a flag cannot."""
+    key = str(name).lower()
+    if key in SECRET_FIELDS or key in SECRET_HEADERS:
+        return True
+    return bool(SECRET_FIELD_RE.search(key)) and not isinstance(value, (bool, int, float, type(None)))
+
+
 def redact_headers(headers: Any) -> dict[str, str]:
     """Header names with safe values: credential headers keep only their name."""
     items = headers.items() if hasattr(headers, "items") else (headers or [])
-    return {str(name): REDACTED if str(name).lower() in SECRET_HEADERS else (redact_text(str(value), 200) or "")
+    return {str(name): REDACTED if is_secret_field(name) else (redact_text(str(value), 200) or "")
             for name, value in items}
 
 
 def redact_params(params: Any) -> dict[str, str]:
     pairs = params.items() if hasattr(params, "items") else (params or [])
-    return {str(k): REDACTED if str(k).lower() in SECRET_FIELDS else (redact_text(str(v), 200) or "") for k, v in pairs}
+    return {str(k): REDACTED if is_secret_field(k) else (redact_text(str(v), 200) or "") for k, v in pairs}
 
 
 def redact_url(url: str) -> str:
-    """The URL without any secret query values — what is safe to show in a log line."""
+    """The URL without any secret query values or embedded password — what is safe to show in a log line."""
     parts = urlsplit(str(url))
-    query = urlencode([(k, REDACTED if k.lower() in SECRET_FIELDS else v) for k, v in parse_qsl(parts.query, keep_blank_values=True)])
+    query = urlencode([(k, REDACTED if is_secret_field(k) else v) for k, v in parse_qsl(parts.query, keep_blank_values=True)])
     return redact_text(urlunsplit((parts.scheme, parts.netloc, parts.path, query, "")), 2000) or ""
 
 
@@ -74,7 +111,7 @@ def redact_value(value: Any, depth: int = 0) -> Any:
     if depth > 6:
         return REDACTED
     if isinstance(value, dict):
-        return {str(k): REDACTED if str(k).lower() in SECRET_FIELDS else redact_value(v, depth + 1)
+        return {str(k): REDACTED if _secret_entry(k, v) else redact_value(v, depth + 1)
                 for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [redact_value(v, depth + 1) for v in value[:50]]

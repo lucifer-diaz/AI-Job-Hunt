@@ -51,7 +51,7 @@ call before a request, because a developer can forget one; the client *is* the t
 
 3. `provider` is a free string, upper-cased. Adding one needs no migration and no enum change. Use an existing
    name when the call belongs to an existing service (`APIFY`, `OPENROUTER`, `OPENAI`, `ANTHROPIC`, `GEMINI`,
-   `EMAIL`, `SEARCH`, `JOB_BOARD`, `WEB`).
+   `LITELLM`, `OLLAMA`, `EMAIL`, `SEARCH`, `JOB_BOARD`, `WEB`).
 
 4. `tests/test_external_api_guard.py` fails the build when an unmanaged `httpx.Client`, `requests` or
    `aiohttp` appears anywhere under `app/`. Only `app/services/external_api.py` is allowlisted. Tests may use
@@ -70,6 +70,43 @@ call before a request, because a developer can forget one; the client *is* the t
 * **Telemetry must not change an outcome.** Every failure inside `external_api` and `system_log` is caught and
   logged. If the monitoring database is unreachable, the API call still succeeds.
 
+## LLM calls and model configuration
+
+These rules keep the model a worker uses a matter of configuration, never of code:
+
+* **All production LLM calls use the centralized LLM gateway abstraction**: `LLMClient.generate_prompt(prompt,
+  LLMCall(...))` in `app/services/llm.py`. Never call a provider SDK, LiteLLM or Ollama from a service.
+* **Workers must not hard-code provider model names.** No `model="gpt-oss:20b"` anywhere in a worker. A worker is
+  identified by its prompt's name (`app/services/ai_workers.py`), and the LLM layer resolves its model.
+* **Worker model selection comes from `WorkerModelConfig`**, read at request time through
+  `model_resolution.get(user_id, "RANKER")`, which returns the model and generation settings of the account's
+  *active* `AIConfigVersion` (cached for `AI_CONFIG_CACHE_SECONDS`, cleared on Apply).
+* **When LiteLLM gateway mode is enabled (provider `litellm`), workers must not bypass LiteLLM.** Every request goes
+  to the proxy; there is no direct-provider shortcut in that mode.
+* **Model configuration changes go through the AI configuration service** (`app/services/ai_model_config.py`):
+  edit the draft → preview → validate → apply → version. Do not write `WorkerModelConfig`, `ModelTier`,
+  `AIRoutingConfig` or `AIModel` rows anywhere else, and never mutate an `AIConfigVersion`; roll back by applying an
+  old snapshot as a new version.
+* **Prompts remain under `app/prompts/`.** Prompts say *what* a model is asked to do; worker configuration decides
+  *which* model, its generation settings and routing. Never put model selection in a prompt, or a prompt in the
+  configuration.
+* **Adding a worker**: add a `Worker` to `app/services/ai_workers.py` with the prompt names it sends, whether it
+  requires structured output, its minimum context and its default assignment. Nothing else needs to change; its
+  config row is seeded, and it appears in Settings and Monitoring.
+* **Routing policy is central.** Quality escalation (`escalation_reason`), request metadata and parameter filtering
+  (`request_params`) live in `app/services/model_resolution.py`. A worker never decides to retry on a bigger model.
+  Infrastructure fallback (the worker's `fallback_model`, sent to LiteLLM) and quality escalation stay separate.
+* **Unsupported parameters are never sent blindly**: a parameter goes out only when the model is not known to lack
+  it; reasoning effort needs a model known to reason. Unknown capability stays unknown (NULL), never guessed.
+* **Job Hunt OS never destroys LiteLLM configuration it does not own.** `LiteLLMConfigManager` creates and removes
+  only deployments marked `jobhunt_managed` with this install's owner tag, and in `config_file` mode writes only
+  `LITELLM_MANAGED_CONFIG_PATH`. Do not add code that edits LiteLLM's own config file or `router_settings`.
+* **LiteLLM changes are atomic where possible**: validate first, apply, verify, and undo everything on failure so the
+  previous version stays active. Do not use a LiteLLM admin endpoint the installed version does not have; check its
+  `/openapi.json` first.
+* **No secret in configuration**: a managed deployment's credentials are `os.environ/NAME` references; the LiteLLM
+  key is encrypted like the provider keys and never returned, logged or snapshotted.
+
 ## Traces
 
 `app/services/tracing.py` holds an ambient correlation ID. Scheduler jobs and HTTP requests open one; nested
@@ -82,17 +119,42 @@ a new integration inherits it. Annotate what becomes known mid-flight with `trac
 and workflow milestones. It is for events a person would want to see, not a debug stream — ordinary successful
 calls are already one row each in the request table.
 
-## Prompts
+## Prompts and LLM workers
 
-LLM prompts live in `app/prompts/` and nowhere else (`tests/test_prompts.py` enforces it). Bump the prompt's
-version when its behaviour materially changes.
+Checklist and examples: `docs/prompts.md`. The rules a change must keep:
+
+* **All reusable production prompts live under `app/prompts/`** — including retry and correction wording.
+  `tests/test_prompts.py` fails the build on an inline prompt elsewhere. Prompt modules import no provider SDK.
+* **Each LLM worker has a single responsibility.** The Ranker produces the FitAnalysis; the Tailor only presents
+  verified experience and never scores, reranks, reclassifies requirements or fills gaps; the Reviewer checks and
+  recommends, never rewrites. Say in the prompt what the worker is *not*.
+* **Never pass an empty output template belonging to an upstream worker into a downstream prompt.** Missing upstream
+  data raises `ContextError` (`RANKING_REQUIRED`, `TAILOR_CONTEXT_INCOMPLETE`, `REVIEW_CONTEXT_INCOMPLETE`, ...)
+  before any model call.
+* **Machine-facing workers use typed output schemas** (`app/prompts/contracts.py`, `Prompt.output_schema`). Valid JSON
+  is not enough: contracts forbid unknown fields, do not share field names across workers, and the gateway diagnoses
+  another worker's shape as `POSSIBLE_CROSS_WORKER_OUTPUT`. Services use `result.validated`, never the raw dict.
+* **External text is untrusted data**: job descriptions, emails, uploaded resumes, form questions, web text and another
+  model's output under review go through `untrusted()`; instructions inside them are never followed.
+* **Generated factual claims are evidence-backed**: each unit carries `evidence_ids`, and
+  `app.services.tailoring_results` drops units whose evidence does not support them. A requirement without evidence
+  stays missing.
+* **Context builders remove irrelevant and disallowed information before prompt construction**: task projections,
+  no search/scraper settings, unverified and rejected facts filtered by CandidatePolicy, provenance conflicts held
+  back (`app.services.evidence_provenance`, which only diagnoses and never edits candidate history).
+* **Workflow state transitions are deterministic Python.** A model may recommend (PASS / RETAILOR / SKIP, QUALIFY /
+  ARCHIVE); code decides and moves the job.
+* **Secrets are centrally redacted before logging** (`app/services/redaction.py`): telemetry, debug text, system logs
+  and Monitoring payloads. Never add a logging path that bypasses it.
+* Bump a prompt's `*_PROMPT_VERSION` when its behaviour materially changes; outputs store prompt version, provider,
+  model and config version. Add a golden fixture (`tests/fixtures/prompt_golden/`) for a new worker.
 
 ## Telemetry tables and retention
 
 | Table | Written by | Retention |
 | --- | --- | --- |
 | `external_api_request_logs` | `app/services/external_api.py` | `EXTERNAL_API_LOG_RETENTION_DAYS` (90), rolled into `external_api_usage_daily` |
-| `llm_request_logs` | `app/services/llm_telemetry.py` | `LLM_TELEMETRY_RETENTION_DAYS` (90), rolled into `llm_usage_daily` |
+| `llm_request_logs` | `app/services/llm_telemetry.py` (routing columns: worker, requested and actual model, tier, fallback, escalation; structured output: schema enforcement, validation failure reason, context builder version) | `LLM_TELEMETRY_RETENTION_DAYS` (90), rolled into `llm_usage_daily` |
 | `system_logs` | `app/services/system_log.py` | `SYSTEM_LOG_RETENTION_DAYS` (30), deleted |
 
 An LLM call writes one row in each of the first two: the generic row is the provider call, the LLM row is the
@@ -102,13 +164,16 @@ twice by wrapping it again at a call site.
 ## The AI Optimization Advisor recommends, never acts
 
 `app/services/ai_advisor.py` may analyse, compare and recommend. It must never disable a provider, change an
-actor, a scheduler interval, a model or any credential or configuration. Keep new rules deterministic and
+actor, a scheduler interval, a model, a worker's model assignment, a tier, the auto router, or any credential or
+configuration. Keep new rules deterministic and
 grounded in the aggregates; add advisor instructions to `app/prompts/ai_optimization.py`, not to a service.
 
 ## Tenancy
 
 Every user-owned table carries `user_id` and is registered in `app/tenancy.py::OWNED_MODELS`, which filters
-every ORM query by the session's account. The two telemetry tables are deliberately not in that list — a call
+every ORM query by the session's account. The AI model configuration tables (`litellm_connections`, `ai_models`, `model_tiers`, `worker_model_configs`,
+`ai_routing_configs`, `ai_config_versions`, `ai_config_audit`) are owned and in that list. The two telemetry tables
+are deliberately not in that list — a call
 can belong to no account — so `app/services/monitoring.py` and `app/services/external_monitoring.py` filter by
 `user_id` explicitly in every query.
 

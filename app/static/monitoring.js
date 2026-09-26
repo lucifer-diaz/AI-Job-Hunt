@@ -7,7 +7,9 @@ const MON_STAGES = { RANKER: 'Ranker', TAILOR: 'Tailor', REVIEWER: 'Reviewer', R
 const MON_ERRORS = { TIMEOUT: 'Timeouts', RATE_LIMIT: 'Rate limits', INVALID_JSON: 'Invalid JSON', SCHEMA_VALIDATION: 'Schema validation', PROVIDER_ERROR: 'Provider errors', CONTEXT_OVERFLOW: 'Context overflow', CONFIGURATION: 'Configuration', OTHER: 'Other' };
 const MON_RANGES = [['today', 'Today'], ['7d', '7 days'], ['30d', '30 days']];
 const MON_SERIES = { input: '#5b4ae8', output: '#eb6834' };
-const MON_FILTER_KEYS = ['provider', 'model', 'stage', 'prompt_version', 'status', 'job_id'];
+const MON_FILTER_KEYS = ['provider', 'model', 'stage', 'prompt_version', 'status', 'job_id', 'worker_type'];
+// Worker labels as Settings → AI Models names them; unknown workers fall back to their type.
+const monWorker = w => w ? w.replace(/_/g, ' ').toLowerCase().replace(/^./, c => c.toUpperCase()) : '—';
 let monTimer = null;
 
 // Monitoring is one screen with six sections; each loads only what it shows (loadMonitoring).
@@ -25,8 +27,18 @@ const MON_EXT_ERRORS = { TIMEOUT: 'Timeouts', RATE_LIMIT: 'Rate limits (429)', C
                          INVALID_RESPONSE: 'Invalid responses', RETRY_EXHAUSTED: 'Retries exhausted',
                          CONFIGURATION: 'Configuration', SDK_ERROR: 'SDK errors', OTHER: 'Other' };
 
+// How a request's output contract was enforced, and why an answer failed it (app.prompts.contracts).
+const MON_SCHEMA_ENFORCEMENT = {
+  native_schema: 'JSON Schema enforced by the provider', json_mode: 'JSON mode; contract checked by Job Hunt OS',
+  prompt_only: 'contract in the prompt; checked by Job Hunt OS', none: 'no contract',
+};
+function monSchemaReason(reason) {
+  return ({ POSSIBLE_CROSS_WORKER_OUTPUT: "another worker's output shape", WRONG_OUTPUT_SCHEMA: 'wrong output schema',
+    INVALID_JSON: 'not JSON', SEMANTIC_VALIDATION: 'failed the service checks' })[reason] || reason;
+}
+
 function monState() {
-  if (!S.mon) S.mon = { tab: 'overview', range: '7d', provider: '', model: '', stage: '', prompt_version: '', status: '', job_id: '', all: false, page: 1, tables: new Set(), request: null,
+  if (!S.mon) S.mon = { tab: 'overview', range: '7d', provider: '', model: '', stage: '', prompt_version: '', status: '', job_id: '', worker_type: '', all: false, page: 1, tables: new Set(), request: null,
     ext: { provider: '', operation: '', workflow: '', status: '', error_type: '', http_status_code: '', error_only: false, page: 1, request: null },
     logs: { category: '', level: '', provider: '', workflow: '', search: '', page: 1, entry: null } };
   return S.mon;
@@ -181,7 +193,8 @@ function renderMonLlm() {
   const s = d.summary, o = d.options;
   const selects = [['provider', 'All providers', o.providers.map(v => [v, v])], ['model', 'All models', o.models.map(v => [v, v])],
     ['stage', 'All stages', o.stages.map(v => [v, monStage(v)])], ['prompt_version', 'All prompt versions', o.prompt_versions.map(v => [v, v])],
-    ['status', 'All statuses', [['SUCCEEDED', 'Succeeded'], ['FAILED', 'Failed only']]]]
+    ['status', 'All statuses', [['SUCCEEDED', 'Succeeded'], ['FAILED', 'Failed only']]],
+    ...((o.worker_types || []).length ? [['worker_type', 'All workers', o.worker_types.map(v => [v, monWorker(v)])]] : [])]
     .map(([k, all, opts]) => `<select class="select mon-select" data-act-change="mon-filter" data-key="${k}" aria-label="${attr(all)}">${[['', all], ...opts].map(([v, t]) => `<option value="${attr(v)}" ${String(m[k]) === v ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select>`).join('');
   const filtered = MON_FILTER_KEYS.some(k => m[k]) || m.all;
   const filters = `<section class="card pad16"><div class="row wrap gap8" style="align-items:center">
@@ -252,14 +265,32 @@ function renderMonLlm() {
     <div class="mon-grid">${costChart}${tokenChart}</div>
     <div class="mon-grid">${stageChart}${modelChart}</div>
     <div class="mon-grid mon-grid-3">${latencyChart}${contextChart}${errorChart}</div>
+    ${renderMonRouting(d.routing)}
     ${renderMonRequests()}`;
+}
+
+// Model routing through the LiteLLM gateway: which worker used which model, the auto router's tiers, quality
+// escalation and infrastructure fallback — kept apart, because they answer different questions.
+function renderMonRouting(r) {
+  if (!r || !r.requests) return '';
+  const workers = r.workers.map(x => ({ ...x, _label: monWorker(x.worker_type) }));
+  const tiers = r.auto_router.requests ? `<div class="xs muted mt8">Auto Router tiers (${r.auto_router.requests} requests): ${r.auto_router.tiers.map(t => `${esc(t.tier)} ${monPct(t.share, 0)}`).join(' · ')}</div>` : '';
+  const escalations = r.escalations.length ? `<div class="xs muted mt8">Escalations: ${r.escalations.map(e => `${esc(monWorker(e.worker_type))} ${e.requests}× (${esc(e.reason)})`).join(' · ')}</div>` : '';
+  const notes = [r.slowest_model && `Slowest model (p95): ${r.slowest_model}`, r.most_schema_failures && `Most schema failures: ${r.most_schema_failures}`].filter(Boolean);
+  return `<div class="mon-grid">${monCard('routing', 'Model routing', 'Inference time by worker (wall-clock latency) · escalation and fallback are counted separately',
+    monBars(workers, x => x.inference_ms, x => monPct(x.inference_share, 0), x => `${monWorker(x.worker_type)} · ${x.requests} requests · models ${x.models.map(m => m[0]).join(', ') || '—'} · escalated ${monPct(x.escalation_rate)} · fallback ${monPct(x.fallback_rate)} · p95 ${monMs(x.p95_latency_ms)}`, { labelWidth: 150, valueWidth: 52 })
+      + tiers + escalations + (notes.length ? `<div class="xs muted mt8">${esc(notes.join(' · '))}</div>` : ''),
+    monTable(['Worker', 'Requests', 'Configured', 'Actual model', 'Escalated', 'Fallback', 'Schema failures', 'p95', 'Inference share'], workers.map(x => [monWorker(x.worker_type), x.requests, x.configured.map(m => m[0]).join(', ') || '—', x.models.map(m => m[0]).join(', ') || '—', monPct(x.escalation_rate), monPct(x.fallback_rate), monPct(x.schema_failure_rate), monMs(x.p95_latency_ms), monPct(x.inference_share)])))}
+    ${monCard('routing-models', 'Models behind the workers', 'Per model: schema failures, latency and share of inference time',
+      monBars(r.models.map(x => ({ ...x, _label: x.model })), x => x.inference_ms, x => monPct(x.inference_share, 0), x => `${x.model} · ${x.requests} requests · schema failures ${monPct(x.schema_failure_rate)} · p95 ${monMs(x.p95_latency_ms)}`, { labelWidth: 170, valueWidth: 52 }),
+      monTable(['Model', 'Requests', 'Schema failures', 'Failure rate', 'p95', 'Avg confidence', 'Inference share'], r.models.map(x => [x.model, x.requests, monPct(x.schema_failure_rate), monPct(x.failure_rate), monMs(x.p95_latency_ms), x.avg_confidence ?? '—', monPct(x.inference_share)])))}</div>`;
 }
 
 function renderMonRequests() {
   const r = D.monRequests; if (!r) return '';
   const pages = Math.max(1, Math.ceil(r.total / r.per_page));
   const rows = r.items.map(x => `<tr class="click" data-act="mon-request" data-id="${x.id}">
-    <td>${esc(fmtDateTime(x.created_at))}</td><td>${esc(monStage(x.stage))}</td><td class="ellipsis" style="max-width:200px" title="${attr(x.model || '')}">${esc(x.model || '—')}</td>
+    <td>${esc(fmtDateTime(x.created_at))}</td><td>${esc(x.worker_type ? monWorker(x.worker_type) : monStage(x.stage))}${x.escalated ? ` ${pill('escalated', 'warn')}` : ''}${x.fallback_used ? ` ${pill('fallback', 'warn')}` : ''}</td><td class="ellipsis" style="max-width:200px" title="${attr(x.model || '')}">${esc(x.model || '—')}</td>
     <td>${x.status === 'FAILED' ? pill(MON_ERRORS[x.error_type] || 'failed', 'bad') : pill('ok', 'good')}</td>
     <td class="mono">${monTokens(x.input_tokens)} / ${monTokens(x.output_tokens)}${x.usage_source === 'estimated' ? ' <span class="faint" title="Estimated locally">~</span>' : ''}</td>
     <td class="mono">${x.context_utilization_percent == null ? '—' : x.context_utilization_percent.toFixed(1) + '%'}</td>
@@ -267,7 +298,7 @@ function renderMonRequests() {
   return `<section class="card flush"><div class="row between wrap gap10" style="padding:14px 18px;border-bottom:1px solid var(--line2)">
       <div><div class="card-title">LLM requests</div><div class="card-sub">${r.total.toLocaleString()} matching · click a request for details (no prompt or resume text is shown)</div></div>
       <div class="row gap8 xs muted">${btn('‹ Prev', 'mon-page', { dir: -1 }, 'sm', r.page <= 1)}<span>Page ${r.page} of ${pages}</span>${btn('Next ›', 'mon-page', { dir: 1 }, 'sm', r.page >= pages)}</div></div>
-    ${r.items.length ? `<div class="mon-table-wrap"><table class="mon-table"><thead><tr><th>Time</th><th>Stage</th><th>Model</th><th>Status</th><th>Tokens in / out</th><th>Context</th><th>Latency</th><th>Cost</th><th>Retry</th></tr></thead><tbody>${rows}</tbody></table></div>`
+    ${r.items.length ? `<div class="mon-table-wrap"><table class="mon-table"><thead><tr><th>Time</th><th>Worker / stage</th><th>Model</th><th>Status</th><th>Tokens in / out</th><th>Context</th><th>Latency</th><th>Cost</th><th>Retry</th></tr></thead><tbody>${rows}</tbody></table></div>`
       : `<div style="padding:18px">${empty('No LLM requests', 'Requests appear here as ranking, tailoring, reviews and follow-ups call a model.')}</div>`}</section>`;
 }
 
@@ -490,7 +521,14 @@ function renderMonRequestModal() {
         ${row('Context utilisation', x.context_utilization_percent == null ? `${monTokens(x.context_tokens)} tokens · window unknown` : `${(x.context_tokens || 0).toLocaleString()} / ${(x.context_window_size || 0).toLocaleString()} tokens · ${x.context_utilization_percent.toFixed(1)}%`)}
         ${row('Cached tokens', x.cache_read_tokens == null ? '—' : `${monTokens(x.cache_read_tokens)} read${x.cache_write_tokens ? ` · ${monTokens(x.cache_write_tokens)} written` : ''}`)}
         ${row('Latency', monMs(x.latency_ms))}${row('Estimated cost', `${monUSD(x.estimated_cost)} <span class="faint">(${esc(x.cost_source.replace(/_/g, ' '))}${x.pricing_effective_from ? `, prices from ${esc(x.pricing_effective_from)}` : ''})</span>`)}
-        ${row('Retry count', x.retry_count)}${row('Structured output', x.structured_output_valid == null ? 'not checked' : x.structured_output_valid ? 'valid' : `invalid${x.structured_output_retry_count ? ` · ${x.structured_output_retry_count} earlier failure${x.structured_output_retry_count === 1 ? '' : 's'}` : ''}`)}
+        ${x.worker_type ? `${row('Worker', esc(monWorker(x.worker_type)))}${row('Configured', `${esc(x.configured_model || '—')} <span class="faint">(${esc((x.model_mode || '').replace('_', ' ').toLowerCase() || 'mode unknown')}${x.config_version ? `, config v${x.config_version}` : ''})</span>`)}
+        ${row('Requested model', esc(x.requested_model || '—'))}${row('Model group that answered', esc(x.model_group || '—'))}
+        ${row('Routing tier', esc(x.routing_tier || '—') + (x.routing_cause ? ` <span class="faint">(${esc(x.routing_cause)})</span>` : ''))}${row('Fallback', x.fallback_used == null ? 'not reported' : x.fallback_used ? 'LiteLLM used the fallback model' : 'no')}
+        ${row('Escalation', x.escalated ? `escalated (${esc(x.escalation_reason || '')})` : 'no')}${row('Confidence', x.confidence == null ? '—' : String(x.confidence))}
+        ${row('LiteLLM call id', `<span class="mono">${esc(x.litellm_call_id || '—')}</span>`)}${row('External API request', `<span class="mono">${esc(x.external_request_id || '—')}</span>`)}
+        ${row('Trace', `<span class="mono">${esc(x.trace_id || '—')}</span>`)}` : ''}
+        ${row('Retry count', x.retry_count)}${row('Structured output', x.structured_output_valid == null ? 'not checked' : x.structured_output_valid ? 'valid' : `invalid${x.validation_failure_reason ? ` (${esc(monSchemaReason(x.validation_failure_reason))})` : ''}${x.structured_output_retry_count ? ` · ${x.structured_output_retry_count} earlier failure${x.structured_output_retry_count === 1 ? '' : 's'}` : ''}`)}
+        ${row('Schema enforcement', esc(MON_SCHEMA_ENFORCEMENT[x.schema_enforcement] || x.schema_enforcement || 'not recorded'))}${row('Context builder', esc(x.context_builder_version || '—'))}
       </div>
       ${breakdown.length ? `<div><div class="caps-sm mb8">Estimated context by source</div>${monBars(breakdown, b => b.v, b => `${monTokens(b.v)} tokens`, b => `${b._label}: ${b.v.toLocaleString()} estimated tokens`, { labelWidth: 130, valueWidth: 96 })}</div>` : ''}
       ${x.error_message ? `<div class="box bad"><div class="xs b mb4" style="color:var(--bad)">ERROR</div><div class="small mono" style="white-space:pre-wrap;word-break:break-word">${esc(x.error_message)}</div></div>` : ''}

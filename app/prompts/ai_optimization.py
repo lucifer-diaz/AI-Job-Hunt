@@ -8,15 +8,19 @@ from __future__ import annotations
 from typing import Any
 
 from app.prompts.common import JSON_ONLY_RULE, Prompt, instructions, section, to_json, user_message
+from app.prompts.contracts import (
+    ADVISOR_STAGES,
+    RECOMMENDATION_CATEGORIES,
+    RECOMMENDATION_PRIORITIES,
+    OptimizationReport,
+)
 
 # v2 adds third-party API telemetry (app.services.external_monitoring) alongside the LLM aggregates.
-AI_OPTIMIZATION_PROMPT_VERSION = "v2"
+# v3 adds model-routing aggregates (worker → model, auto-router tiers, escalation, fallback, inference share).
+AI_OPTIMIZATION_PROMPT_VERSION = "v3"
 AI_OPTIMIZATION_MARKER = "AI_OPTIMIZATION"
-RECOMMENDATION_CATEGORIES = ("COST", "LATENCY", "CONTEXT", "MODEL", "PROMPT", "RELIABILITY", "ARCHITECTURE",
-                            "EXTERNAL_API")
-RECOMMENDATION_PRIORITIES = ("HIGH", "MEDIUM", "LOW")
-ADVISOR_STAGES = ("RANKER", "TAILOR", "REVIEWER", "RESUME_PARSER", "APPLICATION", "FOLLOW_UP", "INBOX",
-                  "COMPANY_INSIGHTS", "ADVISOR", "OTHER", "ALL")
+__all__ = ["ADVISOR_STAGES", "AI_OPTIMIZATION_PROMPT_VERSION", "RECOMMENDATION_CATEGORIES",
+           "RECOMMENDATION_PRIORITIES", "build_ai_optimization_prompt"]
 
 AI_OPTIMIZATION_SYSTEM = instructions(
     "You are an AI cost and reliability advisor for Job Hunt OS, an application that calls LLMs to rank jobs, "
@@ -41,6 +45,15 @@ the same workflow; an Apify actor whose runs often fail; searches that run far m
 jobs (compare runs and jobs_after_deduplication); and actors that consume reported compute or cost while
 returning little. Apify compute and cost are only present when Apify reported them, and null means unknown, not
 zero or free.""",
+    """USAGE AGGREGATES.routing covers requests made through the LiteLLM gateway: per worker (Ranker, Reviewer,
+Inbox, …) the models it was configured with and the models that actually answered, its escalation rate (a second,
+stronger model was asked because the first answer was low-confidence, ambiguous or failed its schema), its
+fallback rate (LiteLLM answered from the fallback model after a timeout, rate limit or outage), its share of total
+inference time, and how often the auto router chose each tier. Recommend, for example, assigning a stronger tier
+directly when most requests escalate anyway, keeping a configuration that succeeds without escalation, or a cheaper
+first pass with escalation for a worker that dominates inference time. Name tiers and workers exactly as they
+appear in the data. These are recommendations for a person to apply in Settings → AI Models; never claim to have
+changed a worker's model, a tier or the auto router.""",
     JSON_ONLY_RULE,
     f"""Fields:
   summary (string: three to five sentences),
@@ -68,4 +81,4 @@ def build_ai_optimization_prompt(aggregates: dict[str, Any], findings: list[dict
         section("RULE FINDINGS", to_json(findings, limit=12000)),
     )
     return Prompt("ai_optimization", AI_OPTIMIZATION_PROMPT_VERSION, AI_OPTIMIZATION_MARKER, AI_OPTIMIZATION_SYSTEM,
-                  user)
+                  user, OptimizationReport)

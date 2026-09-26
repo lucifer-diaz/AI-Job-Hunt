@@ -1772,6 +1772,17 @@ class EvidencePatchIn(BaseModel):
     verified: bool
 
 
+@router.get("/api/evidence/diagnostics")
+def evidence_diagnostics(db: Session = Depends(get_user_db)):
+    """Evidence whose employer or role disagrees with the resume item it came from. Read-only: nothing is corrected
+    here, and ERROR-level items are left out of tailoring until the candidate fixes them."""
+    from app.services.evidence_provenance import diagnose
+
+    issues = [issue.as_dict() for issue in diagnose(db, get_profile(db).user_id)]
+    return {"issues": issues, "held_back_from_generation": sorted({i["evidence_id"] for i in issues
+                                                                    if i["severity"] == "ERROR"})}
+
+
 @router.patch("/api/evidence/{evidence_id}")
 def evidence_patch(evidence_id: int, payload: EvidencePatchIn, db: Session = Depends(get_user_db)):
     item = db.get(Evidence, evidence_id)

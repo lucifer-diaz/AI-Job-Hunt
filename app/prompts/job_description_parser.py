@@ -20,6 +20,7 @@ from app.prompts.common import (
     untrusted,
     user_message,
 )
+from app.prompts.contracts import JobDescriptionParserOutput
 
 JOB_DESCRIPTION_PARSER_PROMPT_VERSION = "v2"
 JOB_DESCRIPTION_PARSER_MARKER = "PARSE_JOB_DESCRIPTION"
@@ -125,4 +126,4 @@ def build_job_description_parser_prompt(job: Any, description: str, sections: li
         untrusted("JOB DESCRIPTION", "untrusted_job_description", description, limit=40000),
     )
     return Prompt("job_description_parser", JOB_DESCRIPTION_PARSER_PROMPT_VERSION, JOB_DESCRIPTION_PARSER_MARKER,
-                  JOB_DESCRIPTION_PARSER_SYSTEM, user)
+                  JOB_DESCRIPTION_PARSER_SYSTEM, user, JobDescriptionParserOutput)

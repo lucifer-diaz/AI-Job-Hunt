@@ -4,7 +4,8 @@ import { createContext, runInContext } from 'node:vm';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const appSource = readFileSync('app/static/app.js', 'utf8').split('/* ───────────── boot ───────────── */')[0];
-const names = ['S', 'D', 'A', 'render', 'monState', 'MON_TABS', 'renderMonExternal', 'renderMonApify', 'renderMonLogs'];
+const names = ['S', 'D', 'A', 'render', 'monState', 'MON_TABS', 'renderMonExternal', 'renderMonApify', 'renderMonLogs',
+  'renderMonRequestModal'];
 let ui, context, fetchMock;
 
 const response = (data, status = 200) => ({ ok: status < 400, status, text: async () => JSON.stringify(data) });
@@ -190,5 +191,22 @@ describe('Monitoring · external APIs', () => {
     ui.A['mon-log-page']({ dataset: { dir: '-1' } });
     ui.A['mon-log-page']({ dataset: { dir: '-1' } });
     expect(ui.monState().logs.page).toBe(1);
+  });
+});
+
+describe('Monitoring · LLM request structured output', () => {
+  it('shows how the contract was enforced and why an answer failed it', () => {
+    const request = { id: 41, request_id: 'r-41', created_at: '2026-09-25T10:00:00', stage: 'TAILOR', status: 'FAILED',
+      error_type: 'SCHEMA_VALIDATION', structured_output_valid: false, structured_output_retry_count: 0,
+      validation_failure_reason: 'POSSIBLE_CROSS_WORKER_OUTPUT', schema_enforcement: 'json_mode',
+      context_builder_version: 'v2', provider: 'litellm', model: 'm', retry_count: 0, context_breakdown: {},
+      cost_source: 'unknown', usage_source: 'provider_reported', latency_ms: 900, estimated_cost: null };
+    ui.D.monRequest = request;
+    ui.monState().request = 41;
+    const html = ui.renderMonRequestModal();
+    expect(html).toMatch(/invalid \(another worker(&#39;|&#x27;|')s output shape\)/);
+    expect(html).toContain('JSON mode; contract checked by Job Hunt OS');
+    expect(html).toContain('Context builder');
+    expect(html).toContain('v2');
   });
 });

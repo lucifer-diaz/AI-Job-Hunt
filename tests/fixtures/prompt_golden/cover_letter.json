@@ -1,0 +1,18 @@
+{
+  "worker": "TAILOR", "prompt": "cover_letter",
+  "input": {"context": {
+    "candidate": {"name": "Sam Rivera", "headline": "Senior Backend Engineer", "location": "Austin, TX", "work_authorization": "US citizen",
+                  "search_preferences": {"search_profile": {"hours_old": 72}}},
+    "relevant_experience": [{"job_title": "Senior Engineer", "company": "Acme", "dates": "2020 - Present", "verified": true,
+                             "bullets": [{"id": "ach_1", "text": "Reduced production incidents by 45% across Kafka pipelines"},
+                                         {"id": "ach_2", "text": "Moved nightly archives to AWS S3"}]}],
+    "relevant_skills": ["Python", "Kafka", "AWS"],
+    "knowledge": [{"question": "Notice period?", "answer": "Two weeks", "category": "availability"}],
+    "fit_analysis": {"strong_matches": ["Python"], "recommended_resume_focus": ["Lead with the incident reduction"]}}},
+  "must_include": ["first person", "Sincerely", "250-300 words", "stays a gap", "<untrusted_job_description>", "Reduced production incidents by 45%"],
+  "must_exclude": ["hours_old", "Rohan", "candidate_fit_score"],
+  "valid_output": {"cover_letter": "Dear Hiring Team,\n\nI am applying for the Staff Platform Engineer role at Northwind.\n\nAt Acme I reduced production incidents by 45% across Kafka pipelines.\n\nI would bring the same focus to your platform.\n\nSincerely,\nSam Rivera", "selected_evidence_ids": [6]},
+  "prohibited_claims": ["PHP", "Java", "Kubernetes", "deployment ownership", "Sam Rivera is"],
+  "invalid_outputs": [
+    {"name": "tailor patch instead of a letter", "output": {"summary": {"text": "x", "evidence_ids": []}, "role_updates": []}, "reason": "POSSIBLE_CROSS_WORKER_OUTPUT"}]
+}

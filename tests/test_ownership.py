@@ -53,6 +53,7 @@ def test_a_user_reaches_their_data_through_relationships():
 
 def test_tailoring_through_the_api_owns_every_row_it_creates():
     tag = uuid.uuid4().hex[:8]
+    assert client.put("/api/profile", json={"master_resume": "Built Python FastAPI services at 10k rps"}).status_code == 200
     job = client.post("/api/jobs/from-url", json={"url": f"https://example.com/own/{tag}", "title": "Staff Engineer",
                                                   "company": f"Own Co {tag}", "description": "Python"}).json()["job"]
     client.post(f"/api/jobs/{job['id']}/triage", json={"action": "shortlist"})

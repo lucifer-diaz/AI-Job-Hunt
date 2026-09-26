@@ -15,7 +15,8 @@ class Settings(BaseSettings):
     # Secure cookie flag. Unset = on when the request arrives over HTTPS.
     session_cookie_secure: bool | None = None
 
-    # LLM provider: openai | anthropic | openrouter | mock
+    # LLM provider: litellm | openai | anthropic | openrouter | gemini | mock. `litellm` is gateway mode: every
+    # worker's model comes from Settings → AI Models and every request goes through the LiteLLM proxy.
     llm_provider: str = "openrouter"
     upload_dir: str = "./data/resumes"
     max_resume_upload_mb: int = 8
@@ -38,6 +39,11 @@ class Settings(BaseSettings):
     openrouter_model_rank: str | None = None
     # Provider-independent model for the rank stage (any provider). A model saved in Settings still wins.
     rank_model: str | None = None
+    # The same for the other stages. In LiteLLM gateway mode they seed the matching workers' model assignments
+    # the first time an account's AI model configuration is created (app.services.ai_model_config).
+    tailor_model: str | None = None
+    review_model: str | None = None
+    followup_model: str | None = None
     openrouter_model_tailor: str | None = None
     openrouter_model_review: str | None = None
     openrouter_model_followup: str | None = None
@@ -49,6 +55,38 @@ class Settings(BaseSettings):
     # Every provider call: request timeout and SDK-level retries (the workers retry on their own too).
     llm_request_timeout_seconds: int = 120
     llm_max_retries: int = 1
+
+    # LiteLLM gateway (Settings → AI Models). These are bootstrap values: an account's saved connection wins.
+    # LITELLM_API_KEY is copied (encrypted) into the FIRST account only, like the provider keys above.
+    litellm_base_url: str | None = None
+    litellm_api_key: str | None = None
+    # Used when a worker has no usable assignment yet (for example a tier nobody has mapped to a model).
+    litellm_default_model: str | None = None
+    # Seed values for the default tiers, as LiteLLM model names (aliases), e.g. tier-1-fast. Blank = unmapped.
+    litellm_tier_fast: str | None = None
+    litellm_tier_primary: str | None = None
+    litellm_tier_deep: str | None = None
+    litellm_auto_router_model: str | None = None
+    # How Job Hunt OS applies the parts of its configuration that live inside LiteLLM (managed deployments and
+    # the auto router): admin_api (needs STORE_MODEL_IN_DB=True on the proxy), config_file, or disabled.
+    litellm_sync_mode: str = "disabled"
+    # config_file mode: the one file Job Hunt OS owns. The proxy's own config must `include:` it; Job Hunt OS
+    # never edits that main config. Operator-level on purpose: a user cannot point the app at another path.
+    litellm_managed_config_path: str | None = None
+    # Optional: the main proxy config, read (never written) to check that it includes the managed file.
+    litellm_config_path: str | None = None
+    # Optional command that restarts the proxy after the managed file changes (split like a shell, not run by
+    # one). Without it a file change waits for a manual restart and shows as PENDING until verified.
+    litellm_restart_command: str | None = None
+    litellm_restart_wait_seconds: int = 60
+    # The local Ollama server whose models the "Add local Ollama model" form lists. Operator-level: the app only
+    # ever fetches this URL, never one a user types in.
+    ollama_base_url: str = "http://localhost:11434"
+    # Management calls (discovery, sync, verification); inference uses llm_request_timeout_seconds.
+    litellm_admin_timeout_seconds: int = 15
+    # How long a worker's resolved model configuration is cached in-process. Every applied change clears the
+    # cache at once in this process; other processes pick it up within this many seconds.
+    ai_config_cache_seconds: int = 30
 
     # LLM monitoring (app.services.llm_telemetry). Telemetry stores metadata and token counts, never prompt text,
     # unless LLM_PROMPT_DEBUG is on. Raw request rows older than the retention are rolled up into daily totals.
@@ -124,6 +162,8 @@ class Settings(BaseSettings):
     cleanup_interval_minutes: int = 15
     # AI Optimization Advisor (app.services.ai_advisor): processes queued and scheduled analyses.
     ai_optimization_interval_minutes: int = 5
+    # Imports the auto router's decisions (tier and cause) from LiteLLM's spend logs into Monitoring.
+    litellm_telemetry_interval_minutes: int = 10
     # A posting with no real description cannot be ranked honestly: the model would be scoring a job title.
     # Postings shorter than this (and with no parsed structure) wait instead, and are ranked if a description
     # arrives later. Several boards — Naukri and Bayt in particular — return listings without one.

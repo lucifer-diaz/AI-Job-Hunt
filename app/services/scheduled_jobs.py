@@ -322,6 +322,16 @@ def cleanup(ctx: JobContext) -> dict[str, Any]:
         return {"recovered_leases": wq.recover_expired_leases(db), **retention}
 
 
+def litellm_telemetry(ctx: JobContext) -> dict[str, Any]:
+    """Fill in the auto router's tier and cause from LiteLLM's spend logs (best effort, bounded)."""
+    from app.services.litellm_routing_import import import_routing
+
+    result = import_routing(ctx.sessions, ctx.now)
+    if not result["accounts"]:
+        return skipped("No auto-router requests waiting for LiteLLM routing details", **result)
+    return result
+
+
 ADVISOR_BATCH = 5
 
 
@@ -364,6 +374,8 @@ JOBS: list[JobSpec] = [
             "Stores a pipeline snapshot."),
     JobSpec("ai_optimization", "AI optimization advisor", "ai_optimization_interval_minutes", ai_optimization,
             "Analyses LLM usage and writes recommendations; never changes configuration."),
+    JobSpec("litellm_telemetry", "LiteLLM routing import", "litellm_telemetry_interval_minutes", litellm_telemetry,
+            "Adds the auto router's tier and cause from LiteLLM's spend logs to Monitoring."),
     JobSpec("cleanup", "Cleanup", "cleanup_interval_minutes", cleanup,
             "Recovers jobs left locked by crashed workers and applies LLM telemetry retention."),
 ]

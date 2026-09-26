@@ -1,4 +1,10 @@
-"""Provider-independent LLM layer: one call shape for OpenRouter, OpenAI, Anthropic, Gemini and the no-cost mock.
+"""Provider-independent LLM layer: one call shape for the LiteLLM gateway, OpenRouter, OpenAI, Anthropic, Gemini
+and the no-cost mock.
+
+LiteLLM gateway mode (LLM_PROVIDER / Settings provider `litellm`) is the preferred mode: every request goes to the
+LiteLLM proxy, and the worker's model and generation settings come from Settings → AI Models
+(app.services.model_resolution) rather than from any name in code. In that mode nothing here calls Ollama, OpenAI,
+Anthropic, OpenRouter or Gemini directly. The direct-provider modes remain for installs without a gateway.
 
 Every request goes through `LLMClient._generate`, which records telemetry (app.services.llm_telemetry): tokens,
 context size, latency, estimated cost, errors and structured-output validity. Services never add monitoring code;
@@ -11,19 +17,35 @@ Failures are typed so workers can decide what to do without reading error text:
 * LLMTimeoutError / LLMRateLimitError: the provider was slow or throttled; worth retrying later.
 * LLMContextOverflowError: the prompt does not fit the model's context window.
 * LLMResponseError: the model answered, but not with a JSON object.
+* LLMSchemaError: the model answered with JSON that does not match the worker's output contract (app.prompts.contracts),
+  including JSON in another worker's shape (POSSIBLE_CROSS_WORKER_OUTPUT).
 * LLMError: any other provider failure (outage, 5xx, connection error).
+
+Structured output, for every provider:
+
+    model answer → JSON object → the prompt's output contract (unknown fields rejected) → the service's own validator
+    → LLMResult.validated
+
+A contract failure is retried once with a short schema correction appended to the same request (unless the gateway
+already escalated it to a stronger model); a second failure reaches the caller. Missing fields are never inferred.
+How the contract was enforced is recorded per request (`schema_enforcement`): native_schema (a JSON Schema the provider
+enforces), json_mode (JSON only, the contract checked here), prompt_only, or none.
 """
 from __future__ import annotations
 
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
-from app.services import llm_telemetry
+from pydantic import ValidationError
+
+from app.services import llm_telemetry, model_resolution, tracing
 from app.services.ai_config import is_free_model
 from app.services.ai_config import resolve as resolve_ai_config
+from app.services.ai_workers import label as worker_label
+from app.services.ai_workers import worker_for_prompt
 from app.services.external_api import RateLimitedCooldown, external_operation
 from app.services.llm_telemetry import Attempt, LLMCall, Usage
 from app.settings import get_settings
@@ -34,7 +56,7 @@ if TYPE_CHECKING:
     from app.prompts.common import Prompt
 
 __all__ = ["LLMCall", "LLMClient", "LLMConfigError", "LLMContextOverflowError", "LLMError", "LLMRateLimitError",
-           "LLMResponseError", "LLMResult", "LLMTimeoutError"]
+           "LLMResponseError", "LLMResult", "LLMSchemaError", "LLMTimeoutError"]
 
 
 class LLMError(RuntimeError):
@@ -59,6 +81,42 @@ class LLMContextOverflowError(LLMError):
 
 class LLMResponseError(LLMError):
     """The provider answered, but the answer is not a usable JSON object."""
+    reason = "INVALID_JSON"
+
+
+class LLMSchemaError(LLMResponseError):
+    """Valid JSON that does not match the worker's output contract. `reason` is WRONG_OUTPUT_SCHEMA, or
+    POSSIBLE_CROSS_WORKER_OUTPUT when its fields belong to another worker (`looks_like` names which)."""
+
+    def __init__(self, contract: str, reason: str, problems: list[str], looks_like: str | None = None):
+        self.contract, self.reason, self.problems, self.looks_like = contract, reason, problems, looks_like
+        detail = f" (looks like {looks_like} output)" if looks_like else ""
+        super().__init__(f"{reason}: the answer does not match {contract}{detail}: " + "; ".join(problems))
+
+
+# One schema-correction retry per request; a second contract failure is final.
+MAX_SCHEMA_CORRECTIONS = 1
+
+
+def check_contract(contract: Any, data: dict[str, Any]) -> Any:
+    """The answer as the contract's model. Escalation signals are routing hints, not part of any result."""
+    from app.prompts.contracts import SIGNAL_FIELDS, diagnose
+
+    try:
+        return contract.model_validate({k: v for k, v in data.items() if k not in SIGNAL_FIELDS})
+    except ValidationError as exc:
+        reason, looks_like = diagnose(contract, data)
+        problems = [f"{'.'.join(str(p) for p in error['loc']) or 'result'}: {error['msg']}"
+                    for error in exc.errors()[:6]]
+        raise LLMSchemaError(contract.__name__, reason, problems, looks_like) from exc
+
+
+def correction_note(contract: Any, error: LLMResponseError) -> str:
+    """Appended to the user message for the one retry (wording in app.prompts.common.schema_correction)."""
+    from app.prompts.common import schema_correction
+
+    return schema_correction(getattr(contract, "__name__", "the requested"),
+                             getattr(error, "problems", None) or [str(error)[:300]])
 
 
 @dataclass(frozen=True)
@@ -68,6 +126,8 @@ class LLMResult:
     model: str  # the model that answered when the provider reports it, otherwise the one requested
     usage: Usage | None = None
     validated: Any = None  # what LLMCall.validate returned, when a validator was given
+    # Gateway mode: what was asked for and what answered (worker, model group, tier, fallback, escalation).
+    routing: dict[str, Any] | None = None
 
 
 def _extract_json(text: str) -> dict[str, Any]:
@@ -87,6 +147,9 @@ def _extract_json(text: str) -> dict[str, Any]:
     return value
 
 
+# Stage (from a prompt marker) → the worker whose configuration a prompt without a known name runs under.
+STAGE_WORKERS = {"rank": "RANKER", "tailor": "TAILOR", "review": "REVIEWER", "followup": "FOLLOWUP",
+                 "advisor": "AI_OPTIMIZATION"}
 # Prompt markers (app.prompts) → the stage whose model runs them.
 MARKER_TASKS = {"FIT_ANALYSIS": "rank", "TAILOR_RESUME": "tailor", "COVER_LETTER": "tailor", "REVIEW_RESUME": "review", "FOLLOW_UP": "followup",
                 "EXTRACT_EVIDENCE": "tailor", "AI_OPTIMIZATION": "advisor"}
@@ -124,7 +187,7 @@ def _provider_error(provider: str, model: str, exc: Exception) -> LLMError:
 
 def error_type(exc: BaseException, *, validation: bool = False) -> str:
     """The Monitoring tab's failure category for an exception raised while generating."""
-    if validation:
+    if validation or (isinstance(exc, LLMSchemaError) and exc.reason != "INVALID_JSON"):
         return "SCHEMA_VALIDATION"
     return ("CONFIGURATION" if isinstance(exc, LLMConfigError) else "TIMEOUT" if isinstance(exc, (LLMTimeoutError, TimeoutError))
             else "RATE_LIMIT" if isinstance(exc, LLMRateLimitError)
@@ -142,23 +205,67 @@ def _answered_model(response: Any, requested: str) -> str:
     return answered if isinstance(answered, str) and answered else requested
 
 
+def _answered_model_name(body: Any) -> str | None:
+    value = body.get("model") if isinstance(body, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
+def _dict_usage(usage: Any, reported_cost: float | None) -> Usage | None:
+    """Token usage from an OpenAI-shaped JSON answer; the cost is what the gateway itself reported, if anything."""
+    if not isinstance(usage, dict) or _int(usage.get("prompt_tokens")) is None:
+        return None
+    prompt = _int(usage["prompt_tokens"])
+    cached = _int((usage.get("prompt_tokens_details") or {}).get("cached_tokens"))
+    return Usage(input_tokens=prompt, output_tokens=_int(usage.get("completion_tokens")), cache_read_tokens=cached,
+                 uncached_input_tokens=prompt - (cached or 0), reported_cost=reported_cost)
+
+
+def _gateway_error(model: str, exc: Exception) -> LLMError:
+    """A LiteLLM failure as the typed error workers already understand."""
+    from app.services.litellm_client import LiteLLMAuthError, LiteLLMRejected, LiteLLMUnsupported
+
+    detail = f"LiteLLM request failed for model={model}: {exc}"
+    status = getattr(exc, "http_status", None)
+    text = str(exc)
+    if isinstance(exc, LiteLLMAuthError):
+        return LLMConfigError(f"LiteLLM refused the API key saved in Settings → AI Models: {text}")
+    if status == 429:
+        return LLMRateLimitError(detail)
+    if status in (408, 504) or "did not answer in time" in text or "Timeout" in text:
+        return LLMTimeoutError(detail)
+    if status == 413 or CONTEXT_OVERFLOW.search(text):
+        return LLMContextOverflowError(detail)
+    if isinstance(exc, LiteLLMUnsupported) or (isinstance(exc, LiteLLMRejected) and re.search(
+            r"invalid model|model not found|no deployments|not allowed to access model", text, re.IGNORECASE)):
+        return LLMConfigError(detail)
+    return LLMError(detail)
+
+
 class LLMClient:
     """Calls the AI provider chosen in a user's settings, with that user's own API key."""
 
     def __init__(self, overrides: dict[str, Any] | None = None, keys: dict[str, str | None] | None = None,
-                 user_id: int | None = None):
+                 user_id: int | None = None, gateway: tuple[str | None, str | None] | None = None):
         self.settings = get_settings()
         self.overrides = overrides or {}
         self.keys = keys or {}
         self.user_id = user_id
+        # (LiteLLM base URL, API key) for gateway mode; None outside it.
+        self.gateway = gateway
 
     @classmethod
     def for_user(cls, db: Session, user_id: int | None = None) -> LLMClient:
         """A client for the user the session belongs to (or an explicit user)."""
         from app.services.user_settings import ai_overrides, user_keys
 
-        return cls(overrides=ai_overrides(db, user_id), keys=user_keys(db, user_id),
-                   user_id=user_id if user_id is not None else db.info.get("user_id"))
+        owner = user_id if user_id is not None else db.info.get("user_id")
+        overrides = ai_overrides(db, user_id)
+        gateway = None
+        if resolve_ai_config(get_settings(), overrides)["llm_provider"] == "litellm" and owner is not None:
+            from app.services.ai_model_config import gateway_settings
+
+            gateway = gateway_settings(db, owner)
+        return cls(overrides=overrides, keys=user_keys(db, user_id), user_id=owner, gateway=gateway)
 
     def _config(self) -> dict[str, Any]:
         return resolve_ai_config(self.settings, self.overrides)
@@ -174,9 +281,24 @@ class LLMClient:
         return self.generate_prompt(prompt, call).data
 
     def generate_prompt(self, prompt: Prompt, call: LLMCall | None = None) -> LLMResult:
-        """Run a prompt built in app.prompts. The stage comes from the prompt's marker, never from its data."""
-        return self._generate(prompt.system, prompt.user, MARKER_TASKS.get(prompt.marker, "default"),
-                              prompt_name=prompt.name, prompt_version=prompt.version, call=call)
+        """Run a prompt built in app.prompts. The stage comes from the prompt's marker, never from its data.
+
+        The answer is checked against the prompt's output contract before the call's own validator sees it. A
+        contract failure gets one retry with a schema correction; the retry is never escalated a second time."""
+        call = call or LLMCall()
+        task = MARKER_TASKS.get(prompt.marker, "default")
+        call.contract = prompt.output_schema
+        try:
+            return self._generate(prompt.system, prompt.user, task, prompt_name=prompt.name,
+                                  prompt_version=prompt.version, call=call)
+        except LLMResponseError as exc:
+            if (prompt.output_schema is None or getattr(exc, "_jobhunt_escalated", False)
+                    or call.schema_corrections >= MAX_SCHEMA_CORRECTIONS):
+                raise
+            retry = replace(call, schema_corrections=call.schema_corrections + 1, no_escalation=True,
+                            structured_output_retry_count=call.structured_output_retry_count + 1)
+            return self._generate(prompt.system, prompt.user + correction_note(prompt.output_schema, exc), task,
+                                  prompt_name=prompt.name, prompt_version=prompt.version, call=retry)
 
     def generate_json(self, system: str, user: str) -> dict[str, Any]:
         return self._generate(system, user, _task_from_prompt(user)).data
@@ -184,12 +306,19 @@ class LLMClient:
     def model_for(self, task: str) -> tuple[str, str]:
         """The provider and model a stage would use."""
         config = self._config()
+        if config["llm_provider"] == "litellm":
+            return "litellm", model_resolution.get(self.user_id, STAGE_WORKERS.get(task)).model or ""
         return config["llm_provider"], config["stage_models"].get(task) or config["model"]
 
     def _generate(self, system: str, user: str, task: str, *, prompt_name: str | None = None,
                   prompt_version: str | None = None, call: LLMCall | None = None) -> LLMResult:
         config = self._config()
         provider = config["llm_provider"]
+        if provider == "litellm":
+            try:
+                return self._gateway(system, user, task, prompt_name, prompt_version, call or LLMCall())
+            except RateLimitedCooldown as waiting:
+                raise LLMRateLimitError(str(waiting)) from waiting
         model = config["stage_models"].get(task) or config["model"]
         attempt = Attempt(provider=provider, requested_model=model, user_id=self.user_id, call=call or LLMCall(),
                           prompt_name=prompt_name, prompt_version=prompt_version, system=system, user=user)
@@ -216,6 +345,31 @@ class LLMClient:
             attempt.external_request_id = external.request_id
             return self._run(system, user, task, model, config, attempt, external, started)
 
+    @staticmethod
+    def _validated(result: LLMResult, attempt: Attempt) -> LLMResult:
+        """Contract first, then the service's validator. Records the outcome on the attempt; raises on failure."""
+        call = attempt.call
+        if call.contract is None and call.validate is None:
+            return result
+        validated: Any = None
+        try:
+            if call.contract is not None:
+                validated = check_contract(call.contract, result.data)
+            if call.validate is not None:
+                validated = call.validate(result.data)
+        except LLMSchemaError as exc:
+            attempt.structured_output_valid, attempt.validation_failure_reason = False, exc.reason
+            raise
+        except Exception as exc:
+            attempt.structured_output_valid, attempt.validation_failure_reason = False, "SEMANTIC_VALIDATION"
+            try:
+                exc._jobhunt_validation = True  # lets _gateway tell a schema failure from other errors
+            except AttributeError:
+                pass
+            raise
+        attempt.structured_output_valid = True
+        return replace(result, validated=validated)
+
     def _run(self, system: str, user: str, task: str, model: str, config: dict[str, Any], attempt: Attempt,
              external: Any, started: float) -> LLMResult:
         provider = attempt.provider
@@ -223,21 +377,13 @@ class LLMClient:
         failure_type: str | None = None
         try:
             result = self._dispatch(provider, system, user, task, model, config, attempt)
-            if attempt.call.validate is not None:
-                try:
-                    validated = attempt.call.validate(result.data)
-                except Exception as exc:
-                    attempt.structured_output_valid = False
-                    failure, failure_type = exc, error_type(exc, validation=True)
-                    raise
-                attempt.structured_output_valid = True
-                result = LLMResult(result.data, result.provider, result.model, result.usage, validated)
-            return result
+            return self._validated(result, attempt)
         except Exception as exc:
-            if failure is None:
-                failure, failure_type = exc, error_type(exc)
-                if isinstance(exc, LLMResponseError):
-                    attempt.structured_output_valid = False
+            failure = exc
+            failure_type = error_type(exc, validation=attempt.validation_failure_reason == "SEMANTIC_VALIDATION")
+            if isinstance(exc, LLMResponseError):
+                attempt.structured_output_valid = False
+                attempt.validation_failure_reason = attempt.validation_failure_reason or exc.reason
             raise
         finally:
             # Tokens and cost the provider reported travel to the generic row too, so a cost total can be taken
@@ -254,6 +400,10 @@ class LLMClient:
 
     def _dispatch(self, provider: str, system: str, user: str, task: str, model: str, config: dict[str, Any],
                   attempt: Attempt) -> LLMResult:
+        # Direct providers get JSON mode, not a JSON Schema: support varies by model there, and the contract is
+        # always checked here. Anthropic has no JSON mode; the contract rides in the prompt only.
+        attempt.schema_enforcement = ("none" if attempt.call.contract is None and provider == "mock"
+                                      else "prompt_only" if provider in ("anthropic", "mock") else "json_mode")
         if provider == "mock":
             attempt.sent, attempt.model = True, "mock"
             data = self._mock(task, user)
@@ -269,6 +419,147 @@ class LLMClient:
             return self._openrouter(system, user, task=task, model=model, require_free=config["require_free"],
                                     attempt=attempt)
         raise LLMConfigError(f"Unsupported LLM_PROVIDER={provider}")
+
+    # ───────────── LiteLLM gateway mode ─────────────
+
+    def _gateway(self, system: str, user: str, task: str, prompt_name: str | None, prompt_version: str | None,
+                 call: LLMCall) -> LLMResult:
+        """One logical request: the worker's model, then — only when its escalation policy says so — one
+        escalated request to a stronger model. Each is recorded as its own telemetry row."""
+        worker_type = call.worker_type or worker_for_prompt(prompt_name) or STAGE_WORKERS.get(task)
+        resolved = call.resolved or model_resolution.get(self.user_id, worker_type)
+        try:
+            first = self._gateway_attempt(system, user, resolved.model, resolved, call, prompt_name, prompt_version)
+        except Exception as exc:
+            schema_failed = isinstance(exc, LLMResponseError) or getattr(exc, "_jobhunt_validation", False)
+            reason = (model_resolution.escalation_reason(resolved, schema_failed=schema_failed)
+                      if schema_failed and not call.no_escalation else None)
+            if reason is None:
+                raise
+            try:
+                return self._gateway_attempt(system, user, resolved.escalation.model, resolved, call, prompt_name,
+                                             prompt_version, escalation=reason)
+            except Exception as escalated:
+                try:
+                    escalated._jobhunt_escalated = True  # a stronger model already had its try: no correction retry
+                except AttributeError:
+                    pass
+                raise
+        reason = (None if call.no_escalation
+                  else model_resolution.escalation_reason(resolved, data=first.data, manual=call.escalate))
+        if reason is None:
+            return first
+        return self._gateway_attempt(system, user, resolved.escalation.model, resolved, call, prompt_name,
+                                     prompt_version, escalation=reason,
+                                     previous_confidence=model_resolution.confidence_of(first.data))
+
+    def _gateway_attempt(self, system: str, user: str, model: str | None, resolved: Any, call: LLMCall,
+                         prompt_name: str | None, prompt_version: str | None, *, escalation: str | None = None,
+                         previous_confidence: float | None = None) -> LLMResult:
+        attempt = Attempt(provider="litellm", requested_model=model, user_id=self.user_id, call=call,
+                          prompt_name=prompt_name, prompt_version=prompt_version, system=system, user=user,
+                          worker_type=resolved.worker_type, model_mode=resolved.mode,
+                          configured_model=resolved.configured, config_version=resolved.config_version,
+                          escalated=escalation is not None, escalation_reason=escalation,
+                          context_window=resolved.context_limit(model))
+        started = time.monotonic()
+        failure: BaseException | None = None
+        failure_type: str | None = None
+        try:
+            result = self._litellm_request(system, user, model, resolved, attempt, call, escalation,
+                                           previous_confidence)
+            if call.contract is None and call.validate is None:
+                if attempt.structured_output_valid is None and resolved.structured_output_required:
+                    attempt.structured_output_valid = True  # parsed as a JSON object; no finer schema was given
+                return result
+            return self._validated(result, attempt)
+        except Exception as exc:
+            failure = exc
+            failure_type = error_type(exc, validation=attempt.validation_failure_reason == "SEMANTIC_VALIDATION")
+            if isinstance(exc, LLMResponseError):
+                attempt.structured_output_valid = False
+                attempt.validation_failure_reason = attempt.validation_failure_reason or exc.reason
+            raise
+        finally:
+            llm_telemetry.record(attempt, latency_ms=int((time.monotonic() - started) * 1000), error=failure,
+                                 error_type=failure_type)
+
+    def _litellm_request(self, system: str, user: str, model: str | None, resolved: Any, attempt: Attempt,
+                         call: LLMCall, escalation: str | None, previous_confidence: float | None) -> LLMResult:
+        from app.services.litellm_client import LiteLLMAPI, LiteLLMError
+
+        base, key = self.gateway or (None, None)
+        if not base:
+            raise LLMConfigError("LiteLLM gateway mode is on but no LiteLLM base URL is configured: add it in "
+                                 "Settings → AI Models → LiteLLM")
+        if not resolved.enabled:
+            raise LLMConfigError(f"{worker_label(resolved.worker_type)} is disabled in Settings → AI Models")
+        if not model:
+            raise LLMConfigError(f"{worker_label(resolved.worker_type)} has no model: "
+                                 f"{resolved.note or 'nothing is assigned'} (Settings → AI Models)")
+        budget = resolved.context_window
+        estimated = llm_telemetry.estimate_tokens(system) + llm_telemetry.estimate_tokens(user)
+        if budget and estimated > budget:
+            raise LLMContextOverflowError(f"The {worker_label(resolved.worker_type)} request needs about {estimated} "
+                                          f"tokens but its context window is set to {budget}")
+        params, withheld = model_resolution.request_params(resolved, model, call.contract)
+        attempt.schema_enforcement = model_resolution.schema_enforcement(params)
+        timeout = resolved.timeout_seconds or self._timeout()
+        retries = resolved.retry_count if resolved.retry_count is not None else self._retries()
+        body: dict[str, Any] = {
+            "model": model,
+            "messages": [{"role": "system", "content": system + "\nReturn only valid JSON. No markdown fences."},
+                         {"role": "user", "content": user}],
+            **params, "timeout": timeout, "num_retries": retries,
+        }
+        # Infrastructure fallback is LiteLLM's (a client-side fallback on this request). An escalated request has
+        # already been judged; it gets no silent fallback to a weaker model.
+        if resolved.fallback_model and escalation is None:
+            body["fallbacks"] = [resolved.fallback_model]
+        if resolved.send_metadata:
+            body["metadata"] = model_resolution.request_metadata(
+                resolved, workflow_type=call.workflow_type, entity_id=call.entity_id, attempt=call.attempt,
+                trace_id=tracing.current_trace_id(), previous_confidence=previous_confidence, escalation=escalation)
+        http_timeout = min(3600, timeout * (retries + 1) * (2 if "fallbacks" in body else 1) + 15)
+        external = {"model": model, "stage": llm_telemetry.STAGE_BY_PROMPT.get(attempt.prompt_name or "", "OTHER"),
+                    "worker_type": resolved.worker_type, "prompt_name": attempt.prompt_name,
+                    "prompt_version": attempt.prompt_version, "params_withheld": withheld or None,
+                    "escalation": escalation}
+        with model_resolution.concurrency_slot(resolved, self.user_id, timeout) as free:
+            if not free:
+                raise LLMRateLimitError(f"{worker_label(resolved.worker_type)} already has {resolved.max_concurrency} "
+                                        "requests in flight (max concurrency)")
+            with LiteLLMAPI(base, key, user_id=self.user_id, service="llm", timeout=http_timeout) as api:
+                attempt.sent = True
+                try:
+                    chat = api.chat(body, metadata={k: v for k, v in external.items() if v is not None})
+                except RateLimitedCooldown:
+                    attempt.sent = False
+                    raise
+                except LiteLLMError as exc:
+                    attempt.external_request_id = api.client.last_request_id
+                    raise _gateway_error(model, exc) from exc
+        attempt.external_request_id = chat.request_id
+        facts = chat.litellm
+        choice = (chat.body.get("choices") or [{}])[0] if isinstance(chat.body, dict) else {}
+        attempt.response_text = ((choice or {}).get("message") or {}).get("content") or "{}"
+        attempt.model = facts.get("model_name") or _answered_model_name(chat.body) or model
+        attempt.litellm_call_id = facts.get("call_id")
+        attempt.model_group = facts.get("model_group")
+        if facts.get("attempted_fallbacks") is not None:
+            attempt.fallback_used = facts["attempted_fallbacks"] > 0
+        attempt.routing_tier = model_resolution.routing_tier(resolved, model, attempt.model_group, attempt.model)
+        attempt.usage = _dict_usage(chat.body.get("usage") if isinstance(chat.body, dict) else None,
+                                    facts.get("response_cost"))
+        data = _extract_json(attempt.response_text)
+        attempt.confidence = model_resolution.confidence_of(data)
+        routing = {"worker_type": resolved.worker_type, "mode": resolved.mode, "configured": resolved.configured,
+                   "requested_model": model, "model_group": attempt.model_group, "underlying_model": attempt.model,
+                   "routing_tier": attempt.routing_tier, "fallback_used": attempt.fallback_used,
+                   "escalated": escalation is not None, "escalation_reason": escalation,
+                   "litellm_call_id": attempt.litellm_call_id, "latency_ms": chat.latency_ms,
+                   "config_version": resolved.config_version, "params_withheld": withheld}
+        return LLMResult(data, "litellm", attempt.model, attempt.usage, routing=routing)
 
     @staticmethod
     def _openai_usage(response: Any) -> Usage | None:
@@ -444,12 +735,9 @@ class LLMClient:
                 "reasoning_summary": "Good overall fit based on the supplied profile.",
             }
         if task == "review":
-            return {
-                "score": 86,
-                "reject_reasons": [],
-                "strengths": ["Relevant evidence", "Clear outcomes"],
-                "improvements": ["Keep bullets concise"],
-            }
+            return {"review_score": 86, "confidence": 0.9, "recommendation": "PASS", "unsupported_claims": [],
+                    "overstated_claims": [], "unaddressed_requirements": [], "risks": ["Keep bullets concise"],
+                    "strengths": ["Relevant evidence", "Clear outcomes"], "summary": "Mock review."}
         if task == "followup":
             return {"draft": "Hi, I wanted to follow up on my application and reiterate my interest in the role. Best regards."}
         if task == "advisor":
@@ -479,16 +767,26 @@ class LLMClient:
             from app.services.structured_resume import parse_deterministic
 
             text = user.split("<untrusted_resume>", 1)[-1].rsplit("</untrusted_resume>", 1)[0].strip()
-            return {"raw_text": text, "structured_resume": parse_deterministic(text)}
+            return {"structured_resume": parse_deterministic(text)}
         if "EXTRACT_EVIDENCE" in user.split("\n", 1)[0]:
             lines = [line.strip(" -•*\t") for line in user.split("MASTER RESUME:", 1)[-1].splitlines()]
             claims = [line for line in lines if len(line) > 25 and re.search(r"\d", line)][:12]
             return {"claims": [{"claim": c, "company": "", "role": "", "skills": []} for c in claims]}
-        return {
-            "summary": "Tailored engineering leader with production AI and backend experience.",
-            "skills": ["Python", "FastAPI", "AWS", "Kubernetes"],
-            "experience": [{"role_index": 0, "bullets": ["Built and operated production backend and AI systems."]}],
-            "experience_bullets": ["Built and operated production backend and AI systems."],
-            "selected_evidence_ids": [],
-            "cover_letter": "I am excited to apply because the role aligns with my production engineering and AI experience.",
-        }
+        if "TAILOR_RESUME" in user.split("\n", 1)[0]:
+            return self._mock_tailoring(user)
+        return {"summary": "Mock answer."}
+
+    @staticmethod
+    def _mock_tailoring(user: str) -> dict[str, Any]:
+        """A TailoringResult patch made only of the prompt's own SOURCE RESUME: skills reordered, and the lead
+        bullet of each role kept with its evidence ids."""
+        found = re.search(r"^SOURCE RESUME:\n(.*)$", user, re.MULTILINE)
+        source = json.loads(found.group(1)) if found else {}
+        updates = [{"role_index": role["role_index"], "bullets": role["bullets"][:1]}
+                   for role in source.get("roles") or [] if role.get("bullets")][:3]
+        highlights = [] if source.get("roles") else (source.get("highlights") or [])[:3]
+        skills = list(reversed(source.get("skills") or []))
+        cited = sorted({i for unit in [*highlights, *(b for u in updates for b in u["bullets"])]
+                        for i in unit.get("evidence_ids") or []})
+        return {"summary": None, "skills_order": skills, "role_updates": updates, "highlights": highlights,
+                "selected_evidence_ids": cited}

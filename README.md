@@ -54,6 +54,7 @@ Auto-submit is intentionally not offered: approved packets always become an appl
 - Simple PDF export
 - Email and password accounts: each account has its own jobs, resumes, settings, schedule and encrypted API keys
 - Prompt-injection hardening for untrusted job descriptions
+- **LiteLLM gateway**: per-worker model assignments, tiers, auto router, preview/apply, version history and rollback (Settings → AI Models)
 - OpenAI, Anthropic, Gemini, **OpenRouter**, or no-cost mock provider
 - LLM monitoring (tokens, context size, latency, estimated cost, failures) and a recommend-only AI Optimization Advisor
 - Claude Desktop + MCP: bulk tailoring and review with your Claude subscription, validated by the backend
@@ -272,6 +273,10 @@ Use smaller `maxResults` values while testing. Apify Actor pricing is Actor-spec
 
 ## 3. LLM configuration
 
+The preferred setup is the **LiteLLM gateway** (section 3a): every worker's model is chosen in Settings → AI Models
+and every request goes through a LiteLLM proxy. This section covers the direct providers, used when the gateway is
+off.
+
 API keys are saved per account under **Settings → Your API keys**. The `*_API_KEY` values below only seed the first account at sign-up; the other variables set server-wide defaults (provider, models, free-only guard) that each account can override in Settings.
 
 ### Default: OpenRouter free models
@@ -368,35 +373,358 @@ LLM_PROVIDER=mock
 
 The SDK/client libraries do not remove model inference cost. The model layer is isolated so providers can be switched without changing the workflow.
 
-### LLM prompts
+### LLM Prompt Architecture
 
-All production prompts live under `app/prompts/`. Backend services must not define long LLM prompts inline.
+Every model call follows one path, and no model output reaches the database directly:
 
-Each prompt has:
-- a dedicated builder (`build_ranking_prompt`, `build_tailoring_prompt`, `build_review_prompt`, ...) that returns a provider-independent `Prompt`;
-- a version identifier (`RANKING_PROMPT_VERSION = "v1"`, ...), stored with the result where the data model has room (`jobs.fit_analysis`, `resume_variants.content` and `reviewer_notes`);
-- structured input: trusted instructions in the system message, data in labelled sections of the user message, with job descriptions, resumes and emails wrapped in `<untrusted_...>` tags;
-- a structured JSON output whose fields are listed in the instructions.
+```
+Structured data (verified resume, Evidence Bank, parsed job, completed FitAnalysis)
+→ context builder      app/services/context_builder.py   task-specific, policy-filtered, validated
+→ prompt               app/prompts/                       versioned, one responsibility, typed contract
+→ LLM gateway          app/services/llm.py → LiteLLM      JSON Schema where the model supports it
+→ structured output    app/prompts/contracts.py           unknown fields rejected, cross-worker output diagnosed
+→ validation           evidence per claim, CandidatePolicy, deterministic checks
+→ persistence          with prompt version, provider, model, config version
+→ workflow             state changes made by Python, never by a model
+```
 
-| Module | Builders | Used by |
+**One responsibility per worker.** The **Ranker** compares the candidate with the job and produces the FitAnalysis:
+candidate fit (all verified facts) and resume fit (the resume as written), and a MATCH / PARTIAL_MATCH / MISSING /
+UNKNOWN assessment per requirement. The **Tailor** receives that *completed* FitAnalysis as read-only input and only
+changes how the source resume presents verified experience: it never scores, reranks, reclassifies requirements or
+fills a gap. Its answer is a patch (summary, skill order, rewritten bullets per role, each claim with its evidence ids)
+that a deterministic renderer applies to the source resume, so roles, employers, titles and dates cannot change. The
+**Reviewer** checks the already-tailored claims against the evidence they cite, CandidatePolicy and the job, and
+recommends PASS / RETAILOR / SKIP; it never rewrites. Parsers extract; they never improve or infer.
+
+**Fail early.** Without a completed FitAnalysis the Tailor is not called (`RANKING_REQUIRED`); a FitAnalysis of another
+job (`FIT_ANALYSIS_MISMATCH`), an empty or inconsistent context (`TAILOR_CONTEXT_INCOMPLETE`, `TAILOR_CONTEXT_INVALID`)
+or nothing to review (`REVIEW_CONTEXT_INCOMPLETE`) fail the same way, before a prompt exists. An empty template for
+another worker's output is never sent. Ranking needs PostgreSQL, so an SQLite install cannot tailor (backend or Claude
+Desktop); **Skip tailoring** still sends the master resume unchanged.
+
+**Evidence rules.** Context builders drop unverified and rejected facts unless CandidatePolicy allows them, so the model
+never has to reason about verification status. Every generated factual unit carries its own `evidence_ids`; each is
+checked (the evidence exists, is verified, belongs to the account, sits at the same employer, was offered in the
+context), and numbers and named technologies must appear in what it cites or in the resume. A unit that fails is
+dropped and the source text stays; a requirement no evidence supports stays missing. Evidence whose employer or role
+disagrees with the resume item it came from is flagged (`GET /api/evidence/diagnostics`) and held back from generation,
+never silently corrected.
+
+**Structured output.** Each machine-facing worker has a contract (`RankingResult`, `TailoringResult`, `ReviewResult`,
+`CoverLetterResult`, `FollowUpResult`, `ApplicationAnswerResult`, `InboxClassificationResult`, `ResumeParserOutput`,
+`JobDescriptionParserOutput`, `EvidenceExtractionResult`, `OptimizationReport`). Contracts do not overlap and forbid
+unknown fields: a Tailor answer carrying `candidate_fit_score` fails as `POSSIBLE_CROSS_WORKER_OUTPUT`. The gateway
+sends the contract as a JSON Schema to models known to support it (JSON mode when unknown), validates every answer,
+retries once with a short schema correction, then fails. Monitoring records the enforcement mode, the failure reason and
+the context builder version per request.
+
+**Versioning and context size.** Every prompt has a `*_PROMPT_VERSION`, bumped on a material change and stored with
+its output. Contexts are projections: the Tailor gets the candidate's name and headline, one canonical copy of the
+source resume, the relevant evidence, the requirements and the FitAnalysis — never search or scraper settings, the
+raw resume, or the policy. Requests record available versus selected context tokens.
+
+Conventions for adding or changing a prompt: [docs/prompts.md](docs/prompts.md). Golden fixtures per worker live in
+`tests/fixtures/prompt_golden/`; `scripts/evaluate_prompts.py` runs them against real models to compare models or
+prompt versions, and `scripts/audit_sensitive_logs.py` checks stored logs for credential-shaped values.
+
+| Module | Builder | Contract | Used by |
+|---|---|---|---|
+| `ranking.py` | `build_ranking_prompt` | `RankingResult` | the Job Ranker (`app.services.ranker`) |
+| `tailoring.py` | `build_tailoring_prompt` | `TailoringResult` | `tailor_job` |
+| `cover_letter.py` | `build_cover_letter_prompt` | `CoverLetterResult` | `write_cover_letter`, called by `tailor_job` |
+| `review.py` | `build_review_prompt` | `ReviewResult` | `review_resume` |
+| `followup.py` | `build_followup_prompt` | `FollowUpResult` | `draft_followup` |
+| `job_description_parser.py` | `build_job_description_parser_prompt` | `JobDescriptionParserOutput` | the `jd_parsing` scheduler job |
+| `resume_parser.py` | `build_resume_parser_prompt`, `build_evidence_extraction_prompt` | `ResumeParserOutput`, `EvidenceExtractionResult` | AI re-parse (a comparison, never applied automatically); evidence parsing |
+| `application.py` | `build_application_question_prompt` | `ApplicationAnswerResult` | not wired in yet |
+| `inbox.py` | `build_inbox_classification_prompt` | `InboxClassificationResult` | not wired in yet (inbox sync is a placeholder) |
+| `ai_optimization.py` | `build_ai_optimization_prompt` | `OptimizationReport` | the AI Optimization Advisor (advice only) |
+| `model_tests.py` | `build_model_health_prompt`, `build_worker_test_prompt` | per fixture | Settings → AI Models tests (fictional data) |
+| `agents.py`, `mcp_*.py` | instructions and rules | validated on save | the ADK agents; Claude Desktop over MCP |
+
+Company Insights and Interview Insights are reserved worker names with no prompt yet.
+
+## 3a. LiteLLM & AI Model Configuration
+
+LiteLLM gateway mode is the preferred way to run Job Hunt OS. Job Hunt OS becomes the control plane for which model
+each AI worker uses, and a [LiteLLM proxy](https://docs.litellm.ai/) is the one inference gateway:
+
+```
+Job Hunt OS worker (Ranker, Tailor, Reviewer, …)
+  → LLM layer (app/services/llm.py) — resolves the worker's model from Settings → AI Models
+  → LiteLLM proxy (/v1/chat/completions)
+  → Ollama (local) / OpenRouter / OpenAI / Anthropic / any provider LiteLLM supports
+```
+
+In gateway mode no worker calls Ollama, OpenAI, Anthropic, OpenRouter or Gemini directly, and no worker names a
+provider model in code: workers point at a **model**, a **tier** or the **auto router**, and the LiteLLM model name
+(alias) that answers is resolved at request time. The direct providers in section 3 remain available when the
+gateway is off.
+
+PostgreSQL holds the configuration you edit (models, tiers, worker assignments, routing, generation settings and
+LiteLLM sync state). `.env` supplies the bootstrap values and secrets.
+
+### LiteLLM setup
+
+Run a LiteLLM proxy (1.102+). An example config with three local Ollama models is in
+`integrations/litellm/config.example.yaml`:
+
+```bash
+STORE_MODEL_IN_DB=True LITELLM_MASTER_KEY=sk-... DATABASE_URL=postgresql://.../litellm \
+  litellm --config config.yaml
+```
+
+- **Base URL**: where the proxy listens (default `http://localhost:4000`).
+- **Master key**: LiteLLM's `LITELLM_MASTER_KEY` (or a virtual key allowed to use the models). Job Hunt OS stores it
+  encrypted with `SECRET_KEY`, never returns it and redacts it from logs, Monitoring, audit history and snapshots.
+- **Database**: LiteLLM's own PostgreSQL database (`DATABASE_URL` for the proxy). It is needed for
+  `STORE_MODEL_IN_DB=True`, which is what lets Job Hunt OS change managed models at runtime.
+
+Then in Job Hunt OS, either set the bootstrap values:
+
+```env
+LLM_PROVIDER=litellm
+LITELLM_BASE_URL=http://localhost:4000
+LITELLM_API_KEY=sk-...            # copied (encrypted) into the first account only, like the provider keys
+LITELLM_SYNC_MODE=admin_api       # admin_api | config_file | disabled
+```
+
+or open **Settings → AI Models → LiteLLM**, enter the base URL and key, and use **Test Connection**. The test checks
+that LiteLLM is reachable, that the key is accepted, that model discovery works, and measures latency. It reports
+**Connected**, **Disconnected**, **Authentication failed** or **LiteLLM unavailable**, and makes no model call.
+**Use LiteLLM gateway** on the Overview tab switches the account's workers to the gateway (and back).
+
+### Adding models
+
+Job Hunt OS never hard-codes a model list: **Models → Sync models from LiteLLM** reads LiteLLM's `/v1/models` and
+`/model/info` (plus Ollama's `/api/tags` for local models) and fills the model registry. For each model it records
+the underlying provider and model, the context window LiteLLM runs it with (`num_ctx`) and the model's maximum,
+capabilities (structured output, tools, reasoning, vision) and health. A value neither LiteLLM nor Ollama reports is
+shown as **unknown**, never guessed.
+
+There are two ways to add a model:
+
+- Define it in LiteLLM yourself (its config or its UI), then sync. Job Hunt OS references it and never changes it.
+- **Add local Ollama model** (Models tab): choose a model from the server's Ollama (`OLLAMA_BASE_URL`), give it a
+  LiteLLM name, a context size and keep-alive. Job Hunt OS then *manages* that deployment and creates it in LiteLLM
+  on the next Apply. A managed model can use a credential only as an `os.environ/NAME` reference; a literal
+  secret is refused.
+
+**Test** on a model sends one tiny request (a few dozen tokens) and records success, latency, the model that
+actually answered, and whether it returned the JSON it was asked for.
+
+### Worker model selection
+
+**Workers** lists every AI worker: Resume Parser, JD Parser, Ranker, Resume Matcher, Tailor, Reviewer, Application
+Answer, Inbox Classifier, Follow-Up, Company Insights, Interview Insights, AI Optimization, Job Normalization and
+Evidence Extraction. Selecting one opens its settings:
+
+| Setting | What it does |
+|---|---|
+| Model mode / model / tier | See *Model modes* below |
+| Fallback model | Infrastructure fallback: LiteLLM uses it on timeouts, rate limits and outages (sent with each request) |
+| Temperature, max output tokens | Sent only when set; otherwise the model's defaults |
+| Context window | The worker's context budget; a prompt estimated above it is refused before it is sent |
+| Reasoning effort | Offered, and sent, only for a model known to support reasoning |
+| Timeout, retries | LiteLLM's per-request timeout and retries |
+| Maximum concurrency | Requests of this worker in flight at once (per process) |
+| Structured output | JSON mode; workers marked **Structured Output Required** parse typed JSON |
+| Quality escalation | See *Quality escalation* below |
+
+Only options the selected model supports are shown, and unsupported parameters are never sent blindly: reasoning
+effort is withheld from a model not known to reason, JSON mode from a model known not to support it, and
+`drop_params` lets LiteLLM drop anything else a provider cannot take. Validation warns when a model may not meet a
+worker's needs (for example a small context window for the Reviewer, or unknown structured-output support) and
+blocks only what would be incorrect (a model known not to return structured output for a worker that requires it,
+a context larger than the model runs with, reasoning effort on a model without it).
+
+Suggested defaults, seeded once and then yours to edit:
+
+| Worker | Default |
+|---|---|
+| Inbox Classifier, Job Normalization | Auto Router (FAST tier while the router is off) |
+| Follow-Up | Auto Router (FAST) |
+| Company Insights, Interview Insights | Auto Router (PRIMARY_REASONING) |
+| Resume Parser, JD Parser, Ranker, Resume Matcher, Tailor, Application Answer, Evidence Extraction | Tier PRIMARY_REASONING |
+| Reviewer, AI Optimization | Tier DEEP_REVIEW |
+
+For an independent review, give the Reviewer a different model family than the Tailor (for example GPT-OSS for
+tailoring and Qwen for review). Validation points it out when both use the same model; it is not required.
+
+### Model modes
+
+- **FIXED** — the worker always uses one model (a LiteLLM model name).
+- **TIER** — the worker uses its tier (FAST, PRIMARY_REASONING, DEEP_REVIEW, or any tier you add on the Routing
+  tab). Change the model behind a tier and every worker on it follows.
+- **AUTO_ROUTER** — the worker's requests go to the LiteLLM auto router, which picks a model per request. While the
+  router is off, the worker uses its tier instead.
+
+### Auto Router
+
+LiteLLM 1.102's complexity router classifies each request into **SIMPLE**, **MEDIUM**, **COMPLEX** or
+**REASONING** and routes it to the model mapped to that tier. On the Routing tab choose the classifier
+(**Disabled**, **Heuristic**, **Heuristic v2**, **LLM classifier** or **Custom Job Hunt classifier**) and map each
+tier to a model, for example SIMPLE → local-fast, MEDIUM and COMPLEX → local-reasoning, REASONING → local-deep. None
+of this mapping is hard-coded.
+
+When "Job Hunt OS deploys this router" is on, the router is a managed deployment
+(`model: auto_router/complexity_router`) and LiteLLM validates its config before it is created. Otherwise the
+router must already exist in LiteLLM under that name, and Job Hunt OS only routes workers to it.
+
+Every gateway request carries metadata — the worker, workflow, job or application id, retry number, whether
+structured output is required, the confidence the worker needs, and on an escalated request the previous answer's
+confidence. `integrations/litellm/jobhunt_classifier.py` is a custom classifier that routes on that metadata: put
+it on the LiteLLM proxy's `PYTHONPATH` and choose **Custom Job Hunt classifier** with the plugin
+`jobhunt_classifier.router`.
+
+### Quality escalation and fallback
+
+These are kept separate on purpose:
+
+- **Infrastructure fallback** — timeouts, 429s, a provider down. LiteLLM retries the request on the worker's
+  fallback model. Monitoring marks the request *fallback*.
+- **Quality escalation** — the answer arrived but is not good enough: confidence below the threshold, structured
+  output failed validation, the model flagged ambiguity or an uncertain fatal requirement, or escalation was asked
+  for explicitly. Job Hunt OS asks the worker's escalation model (a model or a tier) once, and records both
+  requests; the escalated one is marked *escalated* with its reason. An escalated request gets no silent fallback
+  to a weaker model.
+
+Escalation policies are stored per worker with the rest of the configuration, and the decision is made in one place
+(`app/services/model_resolution.py`), not in individual workers.
+
+### Apply changes
+
+Edits change the *desired* configuration only. Nothing reaches a worker until it is applied:
+
+```
+edit → Preview changes → validate → Apply → LiteLLM sync (only if needed) → verification
+```
+
+**Preview changes** lists every change, including each worker whose effective model changes ("Reviewer:
+local-reasoning → local-deep", "Ranker context: 16K → 24K"), the validation errors and warnings, and what will
+change inside LiteLLM. Validation checks that models exist and are enabled, capabilities fit the worker,
+contexts and token limits are within known limits, temperatures are valid, fallbacks do not point at themselves or
+loop through LiteLLM's own fallbacks, tiers exist and are mapped, secrets are references and required settings are
+present, and (for the auto router) that LiteLLM accepts the router config.
+
+**Apply** is one logical operation. Worker assignments, generation settings, fallbacks and escalation are sent with
+each request, so they need no LiteLLM change and no restart: the next request uses them. Only managed models and a
+managed auto router live inside LiteLLM, and they are synchronized according to the sync mode:
+
+| Sync mode | How | Restart |
 |---|---|---|
-| `ranking.py` | `build_ranking_prompt` | the Job Ranker (`app.services.ranker`) |
-| `tailoring.py` | `build_tailoring_prompt` | `tailor_job` |
-| `cover_letter.py` | `build_cover_letter_prompt` | `write_cover_letter`, called by `tailor_job` |
-| `review.py` | `build_review_prompt` | `review_resume` |
-| `followup.py` | `build_followup_prompt` | `draft_followup` |
-| `job_description_parser.py` | `build_job_description_parser_prompt` | the `jd_parsing` scheduler job (`app.services.job_description`) |
-| `job_description_parser.py` | `build_job_description_parser_prompt` | the `jd_parsing` scheduler job (`app.services.job_description`) |
-| `resume_parser.py` | `build_evidence_extraction_prompt`, `build_resume_parser_prompt` | evidence parsing; the optional AI re-parse in Settings → Resume Data (shown as a comparison, never applied automatically) |
-| `application.py` | `build_application_question_prompt` | not wired in yet |
-| `inbox.py` | `build_inbox_classification_prompt` | not wired in yet (inbox sync is a placeholder) |
-| `agents.py` | ADK agent instructions | `job_hunt_agent` |
+| `admin_api` | LiteLLM's `/model/new` and `/model/delete` (needs `STORE_MODEL_IN_DB=True` on the proxy). A replaced deployment is created before the old one is removed. On any failure every operation already made is undone, in reverse. | No |
+| `config_file` | Job Hunt OS renders the one file it owns (`LITELLM_MANAGED_CONFIG_PATH`), validates it, keeps a backup and replaces it atomically. Your LiteLLM config must `include:` it once; Job Hunt OS never edits that config (`LITELLM_CONFIG_PATH`, if set, is only read to check the include). With `LITELLM_RESTART_COMMAND` it restarts LiteLLM and verifies, restoring the previous file and restarting again if verification fails. | Yes |
+| `disabled` | Nothing inside LiteLLM is changed; changes that would need it are refused with an explanation. | — |
 
-When you change a prompt's wording or output fields, bump its version.
+Job Hunt OS manages only deployments it created (marked `jobhunt_managed` in their `model_info`, with an owner
+tag). Deployments defined elsewhere, `router_settings` (including LiteLLM's own fallbacks), keys, callbacks and
+general settings are never touched, and a managed name that collides with one of them is refused rather than
+shadowing it.
 
-Ranking, tailoring, review and follow-up builders take a `context=` built by `app/services/context_builder.py`
-(see "Resume Data & Verification"). Selecting that context is application logic, so there is no
-`context_selection` prompt.
+If LiteLLM rejects the change or verification fails, LiteLLM is put back as it was and the previous version stays
+active. Every attempt — applied, rejected or failed — is in the audit trail with who made it, the previous and new
+values, and the sync result.
+
+**Sync status** is one of **SYNCED**, **PENDING** (unapplied edits, or a managed file waiting for a LiteLLM
+restart), **APPLYING**, **OUT_OF_SYNC** (LiteLLM no longer serves what the active version expects) or **FAILED**,
+with the last sync time and error. **Check runtime** on the Overview tab shows, per worker, the desired model, the
+active model and whether LiteLLM serves it; **Verify** records the result.
+
+Two Applies for one account cannot run at once, and an Apply refuses a draft edited after it was previewed; edits
+carry the revision they were based on and are refused (409) when someone else changed the draft first.
+
+### Rollback
+
+Every successful Apply creates a new, immutable configuration version (v1 is the one seeded from your existing
+settings). **Advanced → Version history** lists them; **Roll back** applies an old version's snapshot as a *new*
+version (v14 → restore v12 creates v15), through the same validation and sync. History is never rewritten. If the
+rollback cannot be applied, your current edits are kept.
+
+### Monitoring
+
+Every gateway request records, next to its tokens, latency and cost: the worker, the configured assignment (model,
+tier or AUTO_ROUTER), the mode, the configuration version, the model requested, the model group and the underlying
+model that actually answered (from LiteLLM's `x-litellm-*` response headers), the auto router tier, whether LiteLLM
+used the fallback, whether Job Hunt OS escalated and why, the answer's confidence and its structured-output
+validity. The LiteLLM call id, the external API request id, the Job Hunt request id and the trace id are all on the
+same row, so a request can be followed across both systems. The `litellm_telemetry` scheduler job fills in the
+auto router's decision (tier and cause) from LiteLLM's spend logs when LiteLLM keeps them.
+
+**Monitoring → LLM usage** has a worker filter and a **Model routing** panel: inference time by worker and model,
+escalation and fallback rates, schema failures by model, the slowest model and how often the auto router chose
+each tier. The AI Optimization Advisor receives the same aggregates and may recommend, for example, assigning a
+worker a stronger tier directly when most of its requests escalate, or a cheaper first pass for a worker that uses a
+large share of inference time. It never changes the configuration.
+
+### Local model example
+
+A setup that runs everything on one machine with Ollama. These are **examples, not requirements**; any models
+LiteLLM serves can fill these tiers:
+
+| Tier | LiteLLM model name | Example model |
+|---|---|---|
+| FAST | `local-fast` | Llama 3.2 3B (`ollama_chat/llama3.2:3b`, `num_ctx` 8192) |
+| PRIMARY_REASONING | `local-reasoning` | GPT-OSS 20B (`ollama_chat/gpt-oss:20b`, `num_ctx` 24576) |
+| DEEP_REVIEW | `local-deep` | Qwen 2.5 32B (`ollama_chat/qwen2.5:32b`, `num_ctx` 24576, `keep_alive` 2m) |
+
+```env
+LLM_PROVIDER=litellm
+LITELLM_BASE_URL=http://localhost:4000
+LITELLM_TIER_FAST=local-fast
+LITELLM_TIER_PRIMARY=local-reasoning
+LITELLM_TIER_DEEP=local-deep
+```
+
+### Migration from `.env` model settings
+
+The first time an account's AI configuration is read, it is created from what the account already uses. In gateway
+mode, stage models saved in Settings and `RANK_MODEL`, `TAILOR_MODEL`, `REVIEW_MODEL` and `FOLLOWUP_MODEL` become
+the matching workers' FIXED assignments. `LITELLM_TIER_*` and `LITELLM_AUTO_ROUTER_MODEL` seed the tiers and the
+router. The result is version 1 (source MIGRATION), with every imported value listed in its summary. Nothing is
+discarded: the saved stage models and `OPENROUTER_MODEL_*` values keep driving the direct-provider modes, and the
+environment values remain the fallback (`LITELLM_DEFAULT_MODEL` answers for a worker whose tier is not mapped yet).
+
+### Configuration caching
+
+Workers read the active version through an in-process cache (`AI_CONFIG_CACHE_SECONDS`, 30 by default). An Apply
+clears it in the process that applied it immediately; other processes see the new version within that many seconds.
+
+### What still needs a LiteLLM restart
+
+- `config_file` sync: LiteLLM reads its config only at startup (1.102 has no file watcher or reload endpoint), so a
+  managed-model or router change is live after the restart (automatic with `LITELLM_RESTART_COMMAND`).
+- Turning on `STORE_MODEL_IN_DB=True`, once, to allow `admin_api` sync.
+- Keep-alive and context size of models defined in LiteLLM's own config (not managed by Job Hunt OS): those are
+  deployment settings LiteLLM does not let a client override per request.
+
+Worker assignments, tiers, generation settings, fallbacks, escalation and the choice of router never need a restart.
+
+### AI model settings API
+
+| Route | Purpose |
+|---|---|
+| `GET /api/settings/ai` | Everything the AI Models page shows: connection (no key), draft, active version, workers, models, tiers, routing, pending changes |
+| `PUT /api/settings/ai/connection` | Base URL, API key (write-only), sync mode |
+| `POST /api/settings/ai/test-connection` | Reachability, authentication, discovery, latency |
+| `PUT /api/settings/ai/gateway` | Turn LiteLLM gateway mode on or off |
+| `GET /api/settings/ai/models`, `POST /api/settings/ai/models/sync` | The registry; discover from LiteLLM |
+| `POST /api/settings/ai/models`, `PUT/DELETE /api/settings/ai/models/{model}` | Add a managed local model; edit a model; stop managing it |
+| `POST /api/settings/ai/models/{model}/test` | Tiny health test |
+| `GET /api/settings/ai/ollama` | Models on the server's Ollama, for the add form |
+| `GET /api/settings/ai/workers`, `PUT /api/settings/ai/workers/{worker_type}` | Worker assignments |
+| `POST /api/settings/ai/workers/{worker_type}/test` | Run the worker's fixture task (draft or active configuration) |
+| `GET /api/settings/ai/tiers`, `PUT/DELETE /api/settings/ai/tiers/{name}` | Tiers |
+| `GET/PUT /api/settings/ai/routing` | The auto router |
+| `POST /api/settings/ai/preview`, `POST /api/settings/ai/apply` | Preview; apply (with the previewed `revision` and `base_version`) |
+| `POST /api/settings/ai/verify`, `GET /api/settings/ai/runtime` | Compare with LiteLLM; desired vs active vs served |
+| `GET /api/settings/ai/versions`, `GET /api/settings/ai/versions/{id}`, `POST /api/settings/ai/versions/{id}/restore` | History and rollback |
+| `GET /api/settings/ai/audit` | The audit trail |
+
+Draft edits accept `revision` and answer 409 when it is stale. Errors: 404 unknown worker/model/version,
+409 conflict or apply in progress, 422 invalid configuration (the body lists every validation error), 502 LiteLLM
+rejected the change (the body has the sync result, including whether it was rolled back).
 
 ## 4. API endpoints
 

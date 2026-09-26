@@ -1,3 +1,12 @@
+"""Tailoring, review, approval and follow-up workflows.
+
+Every model call here follows one path, and no model output reaches the database directly:
+
+    context builder (app.services.context_builder) → prompt (app.prompts) → LLM gateway (app.services.llm)
+    → output contract → evidence and policy validation → persistence → a state change made here, in Python
+
+Models recommend (a review's PASS / RETAILOR / SKIP); this module and app.services.review_results decide.
+"""
 from __future__ import annotations
 
 import re
@@ -24,13 +33,13 @@ from app.prompts import (
 )
 from app.services.contacts import recruiters_of
 from app.services.context_builder import (
-    TaskContext,
+    ContextError,
     build_cover_letter_context,
     build_followup_context,
     build_review_context,
     build_tailoring_context,
 )
-from app.services.llm import LLMCall, LLMClient
+from app.services.llm import LLMCall, LLMClient, LLMResult
 from app.services.resume_format import (
     ParsedResume,
     parse_resume,
@@ -63,49 +72,63 @@ def _no_progress(_stage: str) -> None:
     return None
 
 
+def generation_provenance(prompt_version: str, result: LLMResult) -> dict:
+    """What produced a stored output: prompt version, provider, the model that answered and the AI config version."""
+    routing = result.routing or {}
+    return {"prompt_version": prompt_version, "provider": result.provider, "model": result.model,
+            "config_version": routing.get("config_version"), "escalated": bool(routing.get("escalated"))}
+
+
 def tailor_job(db: Session, job: Job, progress: Progress = _no_progress) -> ResumeVariant:
-    """Tailor from verified facts. Ranking never runs here: it is the asynchronous ranker's job (app.services.ranker),
-    and its latest fit analysis, when there is one, tells tailoring what the resume under-sells."""
+    """Tailor from verified facts and the Ranker's completed fit analysis. Ranking never runs here: it is the
+    asynchronous ranker's job (app.services.ranker). Without a completed analysis the context builder raises
+    ContextError(RANKING_REQUIRED) and no model is called."""
+    from app.services.tailoring_results import apply_tailoring_patch
+
     profile = get_profile(db)
-    # Verified facts relevant to this job only; raises UnverifiedResumeError when there are none to tailor from.
+    # Verified facts relevant to this job only; raises UnverifiedResumeError / ContextError before any model call.
     context = build_tailoring_context(db, profile, job)
     progress("tailoring")
     llm = LLMClient.for_user(db)
-    prompt = build_tailoring_prompt(candidate_profile=profile, job=job, fit_analysis=job.fit_analysis,
-                                    fit_score=job.fit_score, context=context)
-    content = {**llm.generate_prompt_json(prompt, LLMCall(workflow_type="job", entity_id=job.id,
-                                                          context_stats=context.call_stats())),
-               "prompt_version": prompt.version}
-    content = trusted_content(content, context)
-    content["cover_letter"] = write_cover_letter(db, profile, job, llm)
+    prompt = build_tailoring_prompt(candidate_profile=profile, job=job, context=context)
+    result = llm.generate_prompt(prompt, LLMCall(workflow_type="job", entity_id=job.id,
+                                                 context_stats=context.call_stats()))
+    allowed = context.evidence_ids | {i for role in context.source_resume.get("roles") or []
+                                      for bullet in role["bullets"] for i in bullet["evidence_ids"]}
+    content = apply_tailoring_patch(db, profile, job, result.validated, allowed_evidence=allowed)
+    content.update(generation_provenance(prompt.version, result))
+    content["context"] = {**context.resume, **context.stats.as_dict(), "evidence_ids": sorted(context.evidence_ids),
+                          "context_builder_version": context.call_stats()["context_builder_version"],
+                          "excluded_evidence": context.excluded_evidence,
+                          "fit_analysis": {"ranking_id": context.fit_analysis.get("ranking_id"),
+                                           "ranking_version": context.fit_analysis.get("ranking_version")},
+                          "allow_unverified_resume_facts": context.policy.get("allow_unverified_resume_facts", False)}
+    content["cover_letter"], content["cover_letter_generation"] = write_cover_letter(db, profile, job, llm)
     resume = persist_tailored_resume(db, job, content)
     progress("reviewing")
     review_resume(db, resume)
     return resume
 
 
-def write_cover_letter(db: Session, profile: CandidateProfile, job: Job, llm: LLMClient) -> str:
+def write_cover_letter(db: Session, profile: CandidateProfile, job: Job, llm: LLMClient) -> tuple[str, dict]:
     """A letter in the candidate's own voice, from its own prompt and context (app.prompts.cover_letter): the
     posting and its company facts, the verified proof points that fit it, and the answers the posting raises."""
     context = build_cover_letter_context(db, profile, job)
     prompt = build_cover_letter_prompt(context, recruiters=recruiters_of(job.application) if job.application else [])
-    result = llm.generate_prompt_json(prompt, LLMCall(workflow_type="job", entity_id=job.id,
-                                                      context_stats=context.call_stats()))
-    return to_plain(str(result.get("cover_letter") or "")).strip()
+    result = llm.generate_prompt(prompt, LLMCall(workflow_type="job", entity_id=job.id,
+                                                 context_stats=context.call_stats()))
+    from app.services.tailoring_results import TailoredResumeIn, validate_tailored_resume, verified_evidence
 
-
-def trusted_content(content: dict, context: TaskContext) -> dict:
-    """Keep only what the tailoring context supports: rewrites for roles it supplied bullets for, and evidence ids
-    it supplied. Records which resume version and how much context the packet was generated from."""
-    usable_roles = {role["role_index"] for role in context.roles if role["bullets"]}
-    experience = [item for item in content.get("experience") or []
-                  if isinstance(item, dict) and item.get("role_index") in usable_roles]
-    cited = [i for i in content.get("selected_evidence_ids") or [] if isinstance(i, int)]
-    return {**content, "experience": experience,
-            "selected_evidence_ids": [i for i in cited if i in context.evidence_ids],
-            "discarded_evidence_ids": [i for i in cited if i not in context.evidence_ids],
-            "context": {**context.resume, **context.stats.as_dict(), "evidence_ids": sorted(context.evidence_ids),
-                        "allow_unverified_resume_facts": context.policy.get("allow_unverified_resume_facts", False)}}
+    letter = to_plain(result.validated.cover_letter).strip()
+    # The same deterministic checks as a letter saved over MCP (invented numbers, names nothing supports, work
+    # authorization the profile does not state). A letter is one unit a person approves before it is sent, so its
+    # issues are recorded with it for that review rather than silently cutting sentences out of it.
+    issues = [issue for issue in validate_tailored_resume(db, profile, job, TailoredResumeIn.model_construct(
+        job_id=job.id, summary="", skills_order=[], experience_sections=[], resume_bullets=[], cover_letter=letter,
+        screening_answer_drafts={})) if issue["location"] == "cover_letter"]
+    known = verified_evidence(db, job)
+    return letter, {**generation_provenance(prompt.version, result), "validation_issues": issues,
+                    "evidence_ids": [i for i in result.validated.selected_evidence_ids if i in known]}
 
 
 def persist_tailored_resume(db: Session, job: Job, content: dict, *, markdown: str | None = None) -> ResumeVariant:
@@ -219,7 +242,12 @@ def resume_edits(db: Session, resume: ResumeVariant) -> list[dict]:
     selected = set(content.get("selected_evidence_ids") or [])
     claims = {e.id: e for e in evidence}
 
+    cited_by_text = {item["text"]: item.get("evidence_ids") or [] for item in content.get("bullet_evidence") or []}
+
     def cite(text: str) -> str:
+        own = [claims[i] for i in cited_by_text.get(text, []) if i in claims]
+        if own:  # the bullet recorded its own evidence: show that, not a best guess
+            return f"{own[0].company or 'verified'} · {own[0].claim[:80]}"
         pool = [claims[i] for i in selected if i in claims] or list(claims.values())
         match, score = _best_match(text, [f"{e.claim} {' '.join(e.skills or [])}" for e in pool])
         if score < 0.15:
@@ -289,19 +317,32 @@ def update_resume_edit(db: Session, resume: ResumeVariant, index: int, status: s
     db.commit()
 
 
+def tailored_claims(content: dict) -> list[dict]:
+    """The tailored units with the evidence each cites, for the Reviewer to check one by one."""
+    claims = [{"section": "summary", "text": content["summary"], "evidence_ids": content.get("summary_evidence_ids", [])}
+              ] if content.get("summary") else []
+    return claims + [{"section": "experience" if item.get("role_index") is not None else "highlights",
+                      "text": item["text"], "evidence_ids": item.get("evidence_ids") or []}
+                     for item in content.get("bullet_evidence") or []]
+
+
 def review_resume(db: Session, resume: ResumeVariant) -> dict:
-    llm = LLMClient.for_user(db)
-    job = db.get(Job, resume.job_id)
-    profile = get_profile(db)
-    context = build_review_context(db, profile, job)  # verified structured truth to check the text against
-    prompt = build_review_prompt(candidate_profile=profile, job=job, tailored_resume=resume.markdown, context=context)
+    """The Reviewer checks an already-tailored version. It recommends; it never rewrites the resume or moves the job."""
     from app.services.review_results import normalize_backend_review
 
-    result = normalize_backend_review({**llm.generate_prompt_json(prompt, LLMCall(workflow_type="job", entity_id=resume.job_id,
-                                                                                  context_stats=context.call_stats())),
-                                       "prompt_version": prompt.version})
-    store_review(db, resume, result)
-    return result
+    job = db.get(Job, resume.job_id)
+    if job is None or not (resume.markdown or "").strip():
+        raise ContextError("REVIEW_CONTEXT_INCOMPLETE", "there is no tailored resume text to review")
+    llm = LLMClient.for_user(db)
+    profile = get_profile(db)
+    context = build_review_context(db, profile, job)  # verified structured truth to check the text against
+    prompt = build_review_prompt(candidate_profile=profile, job=job, tailored_resume=resume.markdown, context=context,
+                                 tailored_claims=tailored_claims(resume.content or {}))
+    result = llm.generate_prompt(prompt, LLMCall(workflow_type="job", entity_id=resume.job_id,
+                                                 context_stats=context.call_stats()))
+    notes = {**normalize_backend_review(result.validated.model_dump()), **generation_provenance(prompt.version, result)}
+    store_review(db, resume, notes)
+    return notes
 
 
 def store_review(db: Session, resume: ResumeVariant, notes: dict) -> None:
@@ -393,14 +434,15 @@ def draft_followup(db: Session, app: Application, commit: bool = True) -> Follow
         candidate_profile=profile, job=job, context=context,
         application={"status": app.status, "applied_at": app.applied_at.isoformat() if app.applied_at else ""},
         recruiters=recruiters_of(app), previous_followups=[text for text in sent if text])
-    result = llm.generate_prompt_json(prompt, LLMCall(workflow_type="application", entity_id=app.id,
-                                                      context_stats=context.call_stats()))
+    result = llm.generate_prompt(prompt, LLMCall(workflow_type="application", entity_id=app.id,
+                                                 context_stats=context.call_stats()))
     fu = db.scalar(select(FollowUp).where(FollowUp.application_id == app.id, FollowUp.status == "draft")
                    .order_by(desc(FollowUp.id)).limit(1))
     if not fu:
         fu = FollowUp(application_id=app.id, due_at=app.followup_due_at or now, channel="email", status="draft")
         db.add(fu)
-    fu.draft = result.get("draft", "")
+    fu.draft = result.validated.draft
+    fu.generation = {**generation_provenance(prompt.version, result), "evidence_ids": result.validated.evidence_ids}
     if commit:
         db.commit()
         db.refresh(fu)

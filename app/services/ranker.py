@@ -30,9 +30,9 @@ from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Any
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import ValidationError
 from sqlalchemy import and_, desc, exists, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -48,8 +48,8 @@ from app.models import (
     ResumeDocument,
     ResumeVersion,
 )
+from app.prompts.contracts import RankingResult
 from app.prompts.ranking import (
-    QUALIFICATION_RECOMMENDATIONS,
     RANKING_PROMPT_VERSION,
     build_ranking_prompt,
     posting_facts,
@@ -483,45 +483,11 @@ def relevant_evidence(db: Session, user_id: int, job: Job, limit: int) -> list[d
 
 # ───────────── structured output and qualification ─────────────
 
-Score = Annotated[float, Field(ge=0, le=100)]
-
-
-class RankingOutput(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    job_id: int
-    overall_fit_score: Score
-    confidence: float = Field(ge=0, le=1)
-    candidate_fit_score: Score
-    resume_fit_score: Score
-    seniority_match_score: Score
-    skills_match_score: Score
-    leadership_match_score: Score
-    domain_match_score: Score
-    location_match_score: Score
-    strong_matches: list[str] = Field(default_factory=list)
-    partial_matches: list[str] = Field(default_factory=list)
-    missing_requirements: list[str] = Field(default_factory=list)
-    fatal_gaps: list[str] = Field(default_factory=list)
-    resume_gaps: list[str] = Field(default_factory=list)
-    relevant_evidence_ids: list[int] = Field(default_factory=list)
-    recommended_resume_focus: list[str] = Field(default_factory=list)
-    qualification_recommendation: str
-    reasoning_summary: str
-
-    @field_validator("qualification_recommendation", mode="before")
-    @classmethod
-    def _recommendation(cls, value: Any) -> Any:
-        clean = value.strip().upper() if isinstance(value, str) else value
-        if clean not in QUALIFICATION_RECOMMENDATIONS:
-            raise ValueError(f"must be one of {', '.join(QUALIFICATION_RECOMMENDATIONS)}")
-        return clean
-
-    @field_validator("strong_matches", "partial_matches", "missing_requirements", "fatal_gaps", "resume_gaps",
-                     "recommended_resume_focus")
-    @classmethod
-    def _clean_list(cls, values: list[str]) -> list[str]:
-        return [value.strip() for value in values if value.strip()]
+# The Ranker's output contract lives with its prompt (app.prompts.contracts.RankingResult): the same model is sent to
+# capable providers as a JSON Schema, checked by the LLM layer, and validated again here for this job.
+RankingOutput = RankingResult
+# Output fields that are not columns of JobRanking; they are kept in raw_output and in the job's fit analysis.
+NON_COLUMN_FIELDS = {"job_id", "requirement_assessments"}
 
 
 def validate_output(data: Any, job_id: int, verified_ids: set[int]) -> tuple[RankingOutput, list[int]]:
@@ -824,8 +790,10 @@ def legacy_fit_analysis(ranking: JobRanking, decision: Decision) -> dict[str, An
         "relevant_evidence_ids": ranking.relevant_evidence_ids,
         "recommended_resume_focus": ranking.recommended_resume_focus,
         "qualification_recommendation": ranking.qualification_recommendation,
+        "requirement_assessments": (ranking.raw_output or {}).get("requirement_assessments") or [],
         "decision": decision.state.value, "decision_reasons": decision.reasons,
         "ranking_id": ranking.id, "ranking_version": ranking.version, "prompt_version": ranking.prompt_version,
+        "provider": ranking.provider, "model": ranking.model,
     }
 
 
@@ -848,10 +816,10 @@ def _complete(db: Session, claimed: TaskClaim, inputs: RankingInputs, now: datet
             candidate_profile_id=inputs.profile_id, resume_id=inputs.resume_id, resume_version=inputs.resume_version,
             resume_content_hash=inputs.resume_content_hash, profile_hash=inputs.profile_hash,
             evidence_hash=inputs.evidence_hash, job_hash=inputs.job_hash,
-            **output.model_dump(exclude={"job_id"}), discarded_evidence_ids=discarded or [],
+            **output.model_dump(exclude=NON_COLUMN_FIELDS), discarded_evidence_ids=discarded or [],
             decision=decision.state.value, decision_reasons=decision.reasons, policy=inputs.policy.public(),
             provider=llm.provider[:30], model=llm.model[:300], prompt_version=RANKING_PROMPT_VERSION,
-            raw_output=llm.data, created_at=now)
+            config_version=(llm.routing or {}).get("config_version"), raw_output=llm.data, created_at=now)
         db.add(ranking)
         try:
             db.flush()

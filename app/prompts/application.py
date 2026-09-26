@@ -1,6 +1,8 @@
 """Application questions: interpret an unusual form question and answer it only from known candidate data.
 
-Not called by the app yet: answers are currently saved by hand in the Knowledge bank.
+Not called by the app yet: Claude Desktop answers form questions over MCP from app.services.knowledge, and the
+backend saves answers by hand in the Knowledge bank. The prompt is kept ready and tested so the worker can be
+switched on without re-deriving its rules. Output contract: app.prompts.contracts.ApplicationAnswerResult.
 """
 from __future__ import annotations
 
@@ -11,50 +13,50 @@ from app.prompts.common import (
     NO_INVENTION_RULE,
     UNTRUSTED_DATA_RULE,
     Prompt,
+    context_value,
     instructions,
-    profile_facts,
+    resume_facts,
     section,
     to_json,
     untrusted,
     user_message,
 )
+from app.prompts.contracts import APPLICATION_DECISIONS, ApplicationAnswerResult, describe_fields
 
-APPLICATION_QUESTION_PROMPT_VERSION = "v1"
+# v2: answers from a prepared context (verified facts and verified knowledge answers, not the raw resume), a
+# NEEDS_INPUT decision for questions only the candidate can answer, and a typed output contract.
+APPLICATION_QUESTION_PROMPT_VERSION = "v2"
 APPLICATION_QUESTION_MARKER = "APPLICATION_QUESTION"
-APPLICATION_DECISIONS = ("ANSWER", "UNKNOWN", "SKIP_APPLICATION")
+__all__ = ["APPLICATION_DECISIONS", "APPLICATION_QUESTION_PROMPT_VERSION", "build_application_question_prompt"]
 
 APPLICATION_QUESTION_SYSTEM = instructions(
-    "You interpret a question from a job application form and answer it for the candidate.",
-    UNTRUSTED_DATA_RULE,
-    NO_INVENTION_RULE + " Answer only from CANDIDATE PROFILE, CANDIDATE POLICY, RESUME and VERIFIED EVIDENCE. "
-    "Never guess. Never invent work authorization, visa or sponsorship status, salary or compensation, years of "
-    "experience, identity, demographic or contact data.",
-    """Decide:
-  ANSWER when the supplied data answers the question directly,
-  UNKNOWN when it does not,
-  SKIP_APPLICATION when the question is required, cannot be answered from the data, or the true answer
-    conflicts with CANDIDATE POLICY.""",
+    "You interpret one question from a job application form and answer it for the candidate, or say why you cannot.",
+    UNTRUSTED_DATA_RULE + " The question and its options come from the employer's form.",
+    NO_INVENTION_RULE + " Answer only from CANDIDATE PROFILE, KNOWN ANSWERS, VERIFIED RESUME FACTS and VERIFIED "
+    "EVIDENCE, and cite evidence ids for factual answers. Never guess work authorization, visa or sponsorship, salary, "
+    "years of experience, identity, demographic, legal or contact answers.",
+    """decision:
+  ANSWER            the supplied data answers the question directly,
+  NEEDS_INPUT       only the candidate can answer it (a preference, a sensitive or legal answer, a missing fact),
+  UNKNOWN           an optional question the data does not answer,
+  SKIP_APPLICATION  the truthful answer conflicts with CANDIDATE POLICY.""",
     JSON_ONLY_RULE,
-    f"""Fields:
-  decision (one of {", ".join(APPLICATION_DECISIONS)}),
-  answer (string or null; null unless decision is ANSWER),
-  sources (array of strings: which of profile, policy, resume, evidence the answer came from),
-  evidence_ids (array of ints),
-  reason (string).""",
+    describe_fields(ApplicationAnswerResult),
 )
 
 
-def build_application_question_prompt(question: str, candidate_profile: Any, candidate_policy: dict[str, Any] | None,
-                                      resume: str, evidence: list[dict[str, Any]],
-                                      options: list[str] | None = None) -> Prompt:
+def build_application_question_prompt(question: str, context: Any, options: list[str] | None = None) -> Prompt:
+    """Build from an application answer context (app.services.context_builder.build_application_answer_context)."""
+    knowledge = context_value(context, "knowledge", [])
     user = user_message(
         APPLICATION_QUESTION_MARKER,
         untrusted("QUESTION", "untrusted_question", question, limit=2000),
         untrusted("ANSWER OPTIONS", "untrusted_options", to_json(options)) if options else "",
-        section("CANDIDATE PROFILE", to_json(profile_facts(candidate_profile, include_name=True))),
-        section("CANDIDATE POLICY", to_json(candidate_policy or {})),
-        untrusted("RESUME", "untrusted_resume", resume, limit=22000),
-        section("VERIFIED EVIDENCE", to_json(evidence, limit=32000)),
+        section("CANDIDATE PROFILE", to_json(context_value(context, "candidate", {}) or {})),
+        section("CANDIDATE POLICY", to_json(context_value(context, "policy", {}) or {})),
+        section("KNOWN ANSWERS", to_json(knowledge)) if knowledge else "",
+        untrusted("VERIFIED RESUME FACTS", "untrusted_resume_facts", to_json(resume_facts(context), limit=16000)),
+        section("VERIFIED EVIDENCE", to_json(context_value(context, "relevant_evidence", []), limit=16000)),
     )
     return Prompt("application_question", APPLICATION_QUESTION_PROMPT_VERSION, APPLICATION_QUESTION_MARKER,
-                  APPLICATION_QUESTION_SYSTEM, user)
+                  APPLICATION_QUESTION_SYSTEM, user, ApplicationAnswerResult)
