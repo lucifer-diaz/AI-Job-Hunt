@@ -24,7 +24,7 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from app.models import Job, ResumeVariant, TailorTask
-from app.services import user_settings
+from app.services import context_builder, user_settings
 from app.services.user_settings import execution_mode_for, settings_for
 from app.services.workflow import (
     NEEDS_RETAILOR,
@@ -104,6 +104,8 @@ def enqueue(db: Session, ids: list[int], mode: str = "tailor", regenerate: bool 
                   else "not in the Tailor queue" if job.status not in SKIP_TAILORING_STATUSES
                   else "already has a packet" if job_id in has_packet and not regenerate
                   and job.status != NEEDS_RETAILOR
+                  # The Tailor works from the Ranker's analysis; skipping tailoring needs none.
+                  else context_builder.RANKING_REQUIRED_REASON if mode == "tailor" and not context_builder.is_ranked(job)
                   else None)
         if reason:
             skipped.append({"id": job_id, "reason": reason})

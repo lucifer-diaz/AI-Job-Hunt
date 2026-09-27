@@ -7,7 +7,9 @@ const MON_STAGES = { RANKER: 'Ranker', TAILOR: 'Tailor', REVIEWER: 'Reviewer', R
 const MON_ERRORS = { TIMEOUT: 'Timeouts', RATE_LIMIT: 'Rate limits', INVALID_JSON: 'Invalid JSON', SCHEMA_VALIDATION: 'Schema validation', PROVIDER_ERROR: 'Provider errors', CONTEXT_OVERFLOW: 'Context overflow', CONFIGURATION: 'Configuration', OTHER: 'Other' };
 const MON_RANGES = [['today', 'Today'], ['7d', '7 days'], ['30d', '30 days']];
 const MON_SERIES = { input: '#5b4ae8', output: '#eb6834' };
-const MON_FILTER_KEYS = ['provider', 'model', 'stage', 'prompt_version', 'status', 'job_id'];
+const MON_FILTER_KEYS = ['provider', 'model', 'stage', 'prompt_version', 'status', 'job_id', 'worker_type'];
+// Worker labels as Settings → AI Models names them; unknown workers fall back to their type.
+const monWorker = w => w ? w.replace(/_/g, ' ').toLowerCase().replace(/^./, c => c.toUpperCase()) : '—';
 let monTimer = null;
 
 // Monitoring is one screen with six sections; each loads only what it shows (loadMonitoring).
@@ -25,10 +27,20 @@ const MON_EXT_ERRORS = { TIMEOUT: 'Timeouts', RATE_LIMIT: 'Rate limits (429)', C
                          INVALID_RESPONSE: 'Invalid responses', RETRY_EXHAUSTED: 'Retries exhausted',
                          CONFIGURATION: 'Configuration', SDK_ERROR: 'SDK errors', OTHER: 'Other' };
 
+// How a request's output contract was enforced, and why an answer failed it (app.prompts.contracts).
+const MON_SCHEMA_ENFORCEMENT = {
+  native_schema: 'JSON Schema enforced by the provider', json_mode: 'JSON mode; contract checked by Job Hunt OS',
+  prompt_only: 'contract in the prompt; checked by Job Hunt OS', none: 'no contract',
+};
+function monSchemaReason(reason) {
+  return ({ POSSIBLE_CROSS_WORKER_OUTPUT: "another worker's output shape", WRONG_OUTPUT_SCHEMA: 'wrong output schema',
+    INVALID_JSON: 'not JSON', SEMANTIC_VALIDATION: 'failed the service checks' })[reason] || reason;
+}
+
 function monState() {
-  if (!S.mon) S.mon = { tab: 'overview', range: '7d', provider: '', model: '', stage: '', prompt_version: '', status: '', job_id: '', all: false, page: 1, tables: new Set(), request: null,
+  if (!S.mon) S.mon = { tab: 'overview', range: '7d', provider: '', model: '', stage: '', prompt_version: '', status: '', job_id: '', worker_type: '', all: false, page: 1, tables: new Set(), request: null,
     ext: { provider: '', operation: '', workflow: '', status: '', error_type: '', http_status_code: '', error_only: false, page: 1, request: null },
-    logs: { category: '', level: '', provider: '', workflow: '', search: '', page: 1, entry: null } };
+    logs: { category: '', level: '', provider: '', workflow: '', search: '', trace_id: '', page: 1, entry: null } };
   return S.mon;
 }
 function monQuery(extra = {}) {
@@ -42,7 +54,7 @@ function monExtQuery(extra = {}) {
 }
 function monLogQuery(extra = {}) {
   const m = monState(), l = m.logs;
-  return qs({ range: m.range, category: l.category, level: l.level, provider: l.provider, search: l.search,
+  return qs({ range: m.range, category: l.category, level: l.level, provider: l.provider, search: l.search, trace_id: l.trace_id,
     all_accounts: m.all ? 'true' : '', ...extra });
 }
 async function loadMonitoring() {
@@ -50,16 +62,17 @@ async function loadMonitoring() {
   // Each section asks only for what it draws, so opening Logs does not aggregate every LLM request.
   const wantsLlm = ['overview', 'llm', 'advisor'].includes(m.tab);
   const wantsExternal = ['overview', 'external', 'apify'].includes(m.tab);
-  const [dash, reqs, rec, ext, extReqs, logs] = await Promise.all([
+  const [dash, reqs, capture, rec, ext, extReqs, logs] = await Promise.all([
     wantsLlm ? api('/api/monitoring/dashboard?' + monQuery()) : Promise.resolve(D.mon),
     m.tab === 'llm' ? api('/api/monitoring/requests?' + monQuery({ page: m.page, per_page: 20 })) : Promise.resolve(D.monRequests),
+    ['llm', 'logs'].includes(m.tab) ? api('/api/monitoring/capture').catch(() => D.monCapture) : Promise.resolve(D.monCapture),
     api('/api/monitoring/recommendations'),
     wantsExternal ? api('/api/monitoring/external/dashboard?' + monExtQuery()) : Promise.resolve(D.monExt),
     m.tab === 'external' ? api('/api/monitoring/external/requests?' + monExtQuery({ page: m.ext.page, per_page: 25 })) : Promise.resolve(D.monExtRequests),
     m.tab === 'logs' ? api('/api/monitoring/logs?' + monLogQuery({ page: m.logs.page, per_page: 50 })) : Promise.resolve(D.monLogs),
   ]);
   const wasActive = D.monRec?.active;
-  Object.assign(D, { mon: dash, monRequests: reqs, monRec: rec, monExt: ext, monExtRequests: extReqs, monLogs: logs });
+  Object.assign(D, { mon: dash, monRequests: reqs, monCapture: capture, monRec: rec, monExt: ext, monExtRequests: extReqs, monLogs: logs });
   if (wasActive && !rec.active) {
     const task = rec.tasks[0];
     toast(task?.status === 'FAILED' ? `AI usage analysis failed: ${task.error || 'unknown error'}` : 'AI usage analysis finished: recommendations updated', task?.status === 'FAILED');
@@ -181,7 +194,8 @@ function renderMonLlm() {
   const s = d.summary, o = d.options;
   const selects = [['provider', 'All providers', o.providers.map(v => [v, v])], ['model', 'All models', o.models.map(v => [v, v])],
     ['stage', 'All stages', o.stages.map(v => [v, monStage(v)])], ['prompt_version', 'All prompt versions', o.prompt_versions.map(v => [v, v])],
-    ['status', 'All statuses', [['SUCCEEDED', 'Succeeded'], ['FAILED', 'Failed only']]]]
+    ['status', 'All statuses', [['SUCCEEDED', 'Succeeded'], ['FAILED', 'Failed only']]],
+    ...((o.worker_types || []).length ? [['worker_type', 'All workers', o.worker_types.map(v => [v, monWorker(v)])]] : [])]
     .map(([k, all, opts]) => `<select class="select mon-select" data-act-change="mon-filter" data-key="${k}" aria-label="${attr(all)}">${[['', all], ...opts].map(([v, t]) => `<option value="${attr(v)}" ${String(m[k]) === v ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select>`).join('');
   const filtered = MON_FILTER_KEYS.some(k => m[k]) || m.all;
   const filters = `<section class="card pad16"><div class="row wrap gap8" style="align-items:center">
@@ -252,22 +266,40 @@ function renderMonLlm() {
     <div class="mon-grid">${costChart}${tokenChart}</div>
     <div class="mon-grid">${stageChart}${modelChart}</div>
     <div class="mon-grid mon-grid-3">${latencyChart}${contextChart}${errorChart}</div>
+    ${renderMonRouting(d.routing)}
     ${renderMonRequests()}`;
+}
+
+// Model routing through the LiteLLM gateway: which worker used which model, the auto router's tiers, quality
+// escalation and infrastructure fallback — kept apart, because they answer different questions.
+function renderMonRouting(r) {
+  if (!r || !r.requests) return '';
+  const workers = r.workers.map(x => ({ ...x, _label: monWorker(x.worker_type) }));
+  const tiers = r.auto_router.requests ? `<div class="xs muted mt8">Auto Router tiers (${r.auto_router.requests} requests): ${r.auto_router.tiers.map(t => `${esc(t.tier)} ${monPct(t.share, 0)}`).join(' · ')}</div>` : '';
+  const escalations = r.escalations.length ? `<div class="xs muted mt8">Escalations: ${r.escalations.map(e => `${esc(monWorker(e.worker_type))} ${e.requests}× (${esc(e.reason)})`).join(' · ')}</div>` : '';
+  const notes = [r.slowest_model && `Slowest model (p95): ${r.slowest_model}`, r.most_schema_failures && `Most schema failures: ${r.most_schema_failures}`].filter(Boolean);
+  return `<div class="mon-grid">${monCard('routing', 'Model routing', 'Inference time by worker (wall-clock latency) · escalation and fallback are counted separately',
+    monBars(workers, x => x.inference_ms, x => monPct(x.inference_share, 0), x => `${monWorker(x.worker_type)} · ${x.requests} requests · models ${x.models.map(m => m[0]).join(', ') || '—'} · escalated ${monPct(x.escalation_rate)} · fallback ${monPct(x.fallback_rate)} · p95 ${monMs(x.p95_latency_ms)}`, { labelWidth: 150, valueWidth: 52 })
+      + tiers + escalations + (notes.length ? `<div class="xs muted mt8">${esc(notes.join(' · '))}</div>` : ''),
+    monTable(['Worker', 'Requests', 'Configured', 'Actual model', 'Escalated', 'Fallback', 'Schema failures', 'p95', 'Inference share'], workers.map(x => [monWorker(x.worker_type), x.requests, x.configured.map(m => m[0]).join(', ') || '—', x.models.map(m => m[0]).join(', ') || '—', monPct(x.escalation_rate), monPct(x.fallback_rate), monPct(x.schema_failure_rate), monMs(x.p95_latency_ms), monPct(x.inference_share)])))}
+    ${monCard('routing-models', 'Models behind the workers', 'Per model: schema failures, latency and share of inference time',
+      monBars(r.models.map(x => ({ ...x, _label: x.model })), x => x.inference_ms, x => monPct(x.inference_share, 0), x => `${x.model} · ${x.requests} requests · schema failures ${monPct(x.schema_failure_rate)} · p95 ${monMs(x.p95_latency_ms)}`, { labelWidth: 170, valueWidth: 52 }),
+      monTable(['Model', 'Requests', 'Schema failures', 'Failure rate', 'p95', 'Avg confidence', 'Inference share'], r.models.map(x => [x.model, x.requests, monPct(x.schema_failure_rate), monPct(x.failure_rate), monMs(x.p95_latency_ms), x.avg_confidence ?? '—', monPct(x.inference_share)])))}</div>`;
 }
 
 function renderMonRequests() {
   const r = D.monRequests; if (!r) return '';
   const pages = Math.max(1, Math.ceil(r.total / r.per_page));
   const rows = r.items.map(x => `<tr class="click" data-act="mon-request" data-id="${x.id}">
-    <td>${esc(fmtDateTime(x.created_at))}</td><td>${esc(monStage(x.stage))}</td><td class="ellipsis" style="max-width:200px" title="${attr(x.model || '')}">${esc(x.model || '—')}</td>
+    <td>${esc(fmtDateTime(x.created_at))}</td><td>${esc(x.worker_type ? monWorker(x.worker_type) : monStage(x.stage))}${x.escalated ? ` ${pill('escalated', 'warn')}` : ''}${x.fallback_used ? ` ${pill('fallback', 'warn')}` : ''}</td><td class="ellipsis" style="max-width:200px" title="${attr(x.model || '')}">${esc(x.model || '—')}</td>
     <td>${x.status === 'FAILED' ? pill(MON_ERRORS[x.error_type] || 'failed', 'bad') : pill('ok', 'good')}</td>
     <td class="mono">${monTokens(x.input_tokens)} / ${monTokens(x.output_tokens)}${x.usage_source === 'estimated' ? ' <span class="faint" title="Estimated locally">~</span>' : ''}</td>
     <td class="mono">${x.context_utilization_percent == null ? '—' : x.context_utilization_percent.toFixed(1) + '%'}</td>
     <td class="mono">${monMs(x.latency_ms)}</td><td class="mono">${monUSD(x.estimated_cost)}</td><td class="mono">${x.retry_count}</td></tr>`).join('');
   return `<section class="card flush"><div class="row between wrap gap10" style="padding:14px 18px;border-bottom:1px solid var(--line2)">
-      <div><div class="card-title">LLM requests</div><div class="card-sub">${r.total.toLocaleString()} matching · click a request for details (no prompt or resume text is shown)</div></div>
+      <div><div class="card-title">LLM requests</div><div class="card-sub">${r.total.toLocaleString()} matching · click a request for its details${D.monCapture?.enabled || D.monCapture?.server_wide ? ', full prompt and response' : ''} and its logs</div>${monCaptureSwitch()}</div>
       <div class="row gap8 xs muted">${btn('‹ Prev', 'mon-page', { dir: -1 }, 'sm', r.page <= 1)}<span>Page ${r.page} of ${pages}</span>${btn('Next ›', 'mon-page', { dir: 1 }, 'sm', r.page >= pages)}</div></div>
-    ${r.items.length ? `<div class="mon-table-wrap"><table class="mon-table"><thead><tr><th>Time</th><th>Stage</th><th>Model</th><th>Status</th><th>Tokens in / out</th><th>Context</th><th>Latency</th><th>Cost</th><th>Retry</th></tr></thead><tbody>${rows}</tbody></table></div>`
+    ${r.items.length ? `<div class="mon-table-wrap" data-scroll-key="mon-llm"><table class="mon-table"><thead><tr><th>Time</th><th>Worker / stage</th><th>Model</th><th>Status</th><th>Tokens in / out</th><th>Context</th><th>Latency</th><th>Cost</th><th>Retry</th></tr></thead><tbody>${rows}</tbody></table></div>`
       : `<div style="padding:18px">${empty('No LLM requests', 'Requests appear here as ranking, tailoring, reviews and follow-ups call a model.')}</div>`}</section>`;
 }
 
@@ -365,7 +397,7 @@ function renderMonExtRequests() {
   return `<section class="card flush"><div class="row between wrap gap10" style="padding:14px 18px;border-bottom:1px solid var(--line2)">
       <div><div class="card-title">API calls</div><div class="card-sub">${r.total.toLocaleString()} matching${filtered ? ' with these filters' : ''} · click any value to filter by it, or a row for its safe detail (no headers, credentials or bodies are stored)</div></div>
       <div class="row gap8 xs muted">${btn('‹ Prev', 'mon-ext-page', { dir: -1 }, 'sm', r.page <= 1)}<span>Page ${r.page} of ${r.pages}</span>${btn('Next ›', 'mon-ext-page', { dir: 1 }, 'sm', r.page >= r.pages)}</div></div>
-    ${r.items.length ? `<div class="mon-table-wrap"><table class="mon-table"><thead><tr><th>Time</th><th>Provider</th><th>Operation</th><th>Workflow</th><th>Status</th><th>Latency</th><th>Retries</th><th>Cost</th></tr></thead><tbody>${rows}</tbody></table></div>`
+    ${r.items.length ? `<div class="mon-table-wrap" data-scroll-key="mon-external"><table class="mon-table"><thead><tr><th>Time</th><th>Provider</th><th>Operation</th><th>Workflow</th><th>Status</th><th>Latency</th><th>Retries</th><th>Cost</th></tr></thead><tbody>${rows}</tbody></table></div>`
       : `<div style="padding:18px">${filtered
         ? empty('No calls match these filters', 'Nothing in this range matches every filter at once. Clear one of them to widen the search.', btn('Reset filters', 'mon-ext-reset', {}, 'primary'))
         : empty('No external API calls', 'Calls appear here as searches, job boards and models are contacted.')}</div>`}</section>`;
@@ -410,7 +442,7 @@ function renderMonApify() {
     <td class="mono">${x.duration_ms == null ? '—' : monMs(x.duration_ms)}</td></tr>`).join('');
   const runTable = `<section class="card flush"><div style="padding:14px 18px;border-bottom:1px solid var(--line2)">
       <div class="card-title">Recent runs</div><div class="card-sub">Compute units and cost are Apify's own figures; a dash means Apify reported none.</div></div>
-    ${runs.length ? `<div class="mon-table-wrap"><table class="mon-table"><thead><tr><th>Started</th><th>Actor</th><th>Saved search</th><th>Location</th><th>Status</th><th>Found</th><th>Duplicates</th><th>New</th><th>Compute</th><th>Cost</th><th>Duration</th></tr></thead><tbody>${runRows}</tbody></table></div>`
+    ${runs.length ? `<div class="mon-table-wrap" data-scroll-key="mon-apify"><table class="mon-table"><thead><tr><th>Started</th><th>Actor</th><th>Saved search</th><th>Location</th><th>Status</th><th>Found</th><th>Duplicates</th><th>New</th><th>Compute</th><th>Cost</th><th>Duration</th></tr></thead><tbody>${runRows}</tbody></table></div>`
       : `<div style="padding:18px">${empty('No Apify runs', 'Runs appear here once a saved search starts one.')}</div>`}</section>`;
   return `${tiles}
     <div class="mon-grid">${group('by_actor', 'By actor', 'Runs and what each actor found', 'actor_id')}${group('by_saved_search', 'By saved search', 'Which setup started the runs', 'saved_search')}</div>
@@ -425,6 +457,7 @@ function renderMonLogs() {
   const f = m.logs;
   const opts = (key, all, values) => `<select class="select mon-select" data-act-change="mon-log-filter" data-key="${key}" aria-label="${attr(all)}">${[['', all], ...values].map(([v, t]) => `<option value="${attr(v)}" ${String(f[key]) === String(v) ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select>`;
   const filters = `<section class="card pad16"><div class="row wrap gap8" style="align-items:center">
+    ${f.trace_id ? `<span class="pill brand lg"><span class="pt">Trace ${esc(f.trace_id.slice(0, 12))}</span></span>${btn('Show all logs', 'mon-log-clear-trace', {}, 'sm')}` : ''}
     <input class="input mon-select" style="width:210px" placeholder="Search messages" value="${attr(f.search)}" data-act-change="mon-log-filter" data-key="search" aria-label="Search messages">
     ${opts('category', 'All categories', (l.categories?.length ? l.categories : l.all_categories).map(c => [c, c.replace(/_/g, ' ').toLowerCase()]))}
     ${opts('level', 'All levels', l.levels.map(v => [v, v.toLowerCase()]))}
@@ -442,9 +475,9 @@ function renderMonLogs() {
     <td class="ellipsis" style="max-width:320px" title="${attr(x.message)}">${esc(x.message)}</td>
     <td class="mono">${x.duration_ms == null ? '—' : monMs(x.duration_ms)}</td><td>${esc(x.status || '—')}</td></tr>`).join('');
   return `${filters}<section class="card flush"><div class="row between wrap gap10" style="padding:14px 18px;border-bottom:1px solid var(--line2)">
-      <div><div class="card-title">Logs</div><div class="card-sub">${l.total.toLocaleString()} event${l.total === 1 ? '' : 's'} · failed and slow calls, scheduler runs and workflow milestones</div></div>
+      <div><div class="card-title">Logs</div><div class="card-sub">${l.total.toLocaleString()} event${l.total === 1 ? '' : 's'} · every LLM call, failed and slow API calls, scheduler runs and workflow milestones · open an LLM line for its prompt and response</div>${monCaptureSwitch()}</div>
       <div class="row gap8 xs muted">${btn('‹ Prev', 'mon-log-page', { dir: -1 }, 'sm', l.page <= 1)}<span>Page ${l.page} of ${l.pages}</span>${btn('Next ›', 'mon-log-page', { dir: 1 }, 'sm', l.page >= l.pages)}</div></div>
-    ${l.items.length ? `<div class="mon-table-wrap"><table class="mon-table"><thead><tr><th>Time</th><th>Level</th><th>Category</th><th>Provider</th><th>Workflow</th><th>Trace</th><th>Entity</th><th>Message</th><th>Duration</th><th>Status</th></tr></thead><tbody>${rows}</tbody></table></div>`
+    ${l.items.length ? `<div class="mon-table-wrap" data-scroll-key="mon-logs"><table class="mon-table"><thead><tr><th>Time</th><th>Level</th><th>Category</th><th>Provider</th><th>Workflow</th><th>Trace</th><th>Entity</th><th>Message</th><th>Duration</th><th>Status</th></tr></thead><tbody>${rows}</tbody></table></div>`
       : `<div style="padding:18px">${empty('No log entries', 'Events appear here when an external call fails or crawls, and after each scheduled job.')}</div>`}</section>`;
 }
 
@@ -472,6 +505,25 @@ function renderAdvisor() {
     ${body || '<div class="small muted mt12">No recommendations: nothing in this period needs attention.</div>'}</section>`;
 }
 
+// Full prompt and response capture: off unless the account (or LLM_PROMPT_DEBUG on the server) turns it on.
+function monCaptureSwitch() {
+  const c = D.monCapture; if (!c) return '';
+  if (c.server_wide) return '<div class="xs muted mt6">Full prompts and responses are captured for every account (LLM_PROMPT_DEBUG is on).</div>';
+  return `<label class="check xs mt6" title="Stores the full prompt and response of each new request, redacted, for ${c.retention_days} days. They include your resume and job text."><input type="checkbox" data-act-change="mon-capture" data-on="${c.enabled ? '' : '1'}" ${c.enabled ? 'checked' : ''} ${isBusy('monCapture') ? 'disabled' : ''}>Capture full prompts and responses${c.enabled ? ` · kept ${c.retention_days} days` : ''}</label>`;
+}
+function monPayloads(x) {
+  if (!x.debug) {
+    const c = D.monCapture;
+    return `<div class="box soft"><div class="caps-sm mb4">INPUT AND OUTPUT</div><div class="small muted">The prompt and response were not captured for this request; only metadata and token counts were kept.</div>
+      ${c && !c.enabled && !c.server_wide ? `<div class="mt8">${btn('Capture them for new requests', 'mon-capture', { on: 1 }, 'sm')}</div>` : ''}</div>`;
+  }
+  const block = (title, text, open) => `<details ${open ? 'open' : ''}><summary class="small b row between"><span>${title} <span class="faint" style="font-weight:400">· ${(text || '').length.toLocaleString()} characters</span></span></summary>
+    <div class="row mt6" style="justify-content:flex-end">${btn('Copy', 'mon-copy', {}, 'sm')}</div><pre class="mon-debug">${esc(text || '(empty)')}</pre></details>`;
+  return `<div class="col gap10"><div class="caps-sm">INPUT AND OUTPUT <span class="faint" style="font-weight:400">· redacted: keys and tokens are masked</span></div>
+    ${block('Input · the full prompt sent (system, then user message)', x.debug.prompt, x.status === 'FAILED')}
+    ${block('Output · the model’s response as received', x.debug.response || (x.status === 'FAILED' ? 'No response was received.' : ''), true)}</div>`;
+}
+
 function renderMonRequestModal() {
   const x = D.monRequest;
   if (!x || x.id !== monState().request) return `<div class="overlay" data-act="mon-close"><div class="modal" style="padding:40px">${loading()}</div></div>`;
@@ -490,11 +542,20 @@ function renderMonRequestModal() {
         ${row('Context utilisation', x.context_utilization_percent == null ? `${monTokens(x.context_tokens)} tokens · window unknown` : `${(x.context_tokens || 0).toLocaleString()} / ${(x.context_window_size || 0).toLocaleString()} tokens · ${x.context_utilization_percent.toFixed(1)}%`)}
         ${row('Cached tokens', x.cache_read_tokens == null ? '—' : `${monTokens(x.cache_read_tokens)} read${x.cache_write_tokens ? ` · ${monTokens(x.cache_write_tokens)} written` : ''}`)}
         ${row('Latency', monMs(x.latency_ms))}${row('Estimated cost', `${monUSD(x.estimated_cost)} <span class="faint">(${esc(x.cost_source.replace(/_/g, ' '))}${x.pricing_effective_from ? `, prices from ${esc(x.pricing_effective_from)}` : ''})</span>`)}
-        ${row('Retry count', x.retry_count)}${row('Structured output', x.structured_output_valid == null ? 'not checked' : x.structured_output_valid ? 'valid' : `invalid${x.structured_output_retry_count ? ` · ${x.structured_output_retry_count} earlier failure${x.structured_output_retry_count === 1 ? '' : 's'}` : ''}`)}
+        ${x.worker_type ? `${row('Worker', esc(monWorker(x.worker_type)))}${row('Configured', `${esc(x.configured_model || '—')} <span class="faint">(${esc((x.model_mode || '').replace('_', ' ').toLowerCase() || 'mode unknown')}${x.config_version ? `, config v${x.config_version}` : ''})</span>`)}
+        ${row('Requested model', esc(x.requested_model || '—'))}${row('Model group that answered', esc(x.model_group || '—'))}
+        ${row('Routing tier', esc(x.routing_tier || '—') + (x.routing_cause ? ` <span class="faint">(${esc(x.routing_cause)})</span>` : ''))}${row('Fallback', x.fallback_used == null ? 'not reported' : x.fallback_used ? 'LiteLLM used the fallback model' : 'no')}
+        ${row('Escalation', x.escalated ? `escalated (${esc(x.escalation_reason || '')})` : 'no')}${row('Confidence', x.confidence == null ? '—' : String(x.confidence))}
+        ${row('LiteLLM call id', `<span class="mono">${esc(x.litellm_call_id || '—')}</span>`)}${row('External API request', `<span class="mono">${esc(x.external_request_id || '—')}</span>`)}
+        ${row('Trace', `<span class="mono">${esc(x.trace_id || '—')}</span>`)}` : ''}
+        ${row('Retry count', x.retry_count)}${row('Structured output', x.structured_output_valid == null ? 'not checked' : x.structured_output_valid ? 'valid' : `invalid${x.validation_failure_reason ? ` (${esc(monSchemaReason(x.validation_failure_reason))})` : ''}${x.structured_output_retry_count ? ` · ${x.structured_output_retry_count} earlier failure${x.structured_output_retry_count === 1 ? '' : 's'}` : ''}`)}
+        ${row('Schema enforcement', esc(MON_SCHEMA_ENFORCEMENT[x.schema_enforcement] || x.schema_enforcement || 'not recorded'))}${row('Context builder', esc(x.context_builder_version || '—'))}
       </div>
       ${breakdown.length ? `<div><div class="caps-sm mb8">Estimated context by source</div>${monBars(breakdown, b => b.v, b => `${monTokens(b.v)} tokens`, b => `${b._label}: ${b.v.toLocaleString()} estimated tokens`, { labelWidth: 130, valueWidth: 96 })}</div>` : ''}
       ${x.error_message ? `<div class="box bad"><div class="xs b mb4" style="color:var(--bad)">ERROR</div><div class="small mono" style="white-space:pre-wrap;word-break:break-word">${esc(x.error_message)}</div></div>` : ''}
-      ${x.debug ? `<details><summary class="small b">Prompt debugging (stored because LLM_PROMPT_DEBUG is on)</summary><pre class="mon-debug">${esc(x.debug.prompt || '')}</pre><pre class="mon-debug">${esc(x.debug.response || '')}</pre></details>` : '<div class="xs faint">Prompt and response text are not stored. Only metadata and token counts are kept.</div>'}
+      ${x.trace_id ? `<div class="box soft row between wrap gap10"><div><div class="caps-sm">LOGS</div><div class="small mt4">${x.trace_log_count ? `${x.trace_log_count} log line${x.trace_log_count === 1 ? '' : 's'} written by the same run (trace <span class="mono">${esc(x.trace_id.slice(0, 12))}</span>)` : 'No log lines were written by this run'}</div></div>
+        ${x.trace_log_count ? btn('View logs', 'mon-logs-trace', { id: x.trace_id }, 'sm') : ''}</div>` : ''}
+      ${monPayloads(x)}
     </div>
     <div class="card-foot row gap8" style="justify-content:flex-end">${x.entity?.job_id ? btn('Open job', 'mon-open-job', { id: x.entity.job_id }) : ''}${btn('Close', 'mon-close')}</div></div></div>`;
 }
@@ -551,9 +612,12 @@ function renderMonLogModal() {
       ${call ? `<div class="box soft"><div class="caps-sm mb8">The call it describes</div>
         <div class="small">${esc(call.provider)} ${esc(call.http_method || '')} ${esc(call.endpoint_host || '')}${esc(call.endpoint_path || '')} · ${call.http_status_code ?? '—'} · ${monMs(call.latency_ms)}</div>
         <div class="mt8">${btn('Open the call', 'mon-ext-request', { id: call.id }, 'sm')}</div></div>` : ''}
+      ${x.llm_requests?.length ? `<div class="box soft"><div class="caps-sm mb8">LLM request${x.llm_requests.length === 1 ? '' : 's'} behind this line</div>
+        ${x.llm_requests.map(q => `<div class="row between gap10 small" style="padding:3px 0"><span class="ellipsis">${esc(monStage(q.stage))} · ${esc(q.model || '—')} · ${esc(q.status.toLowerCase())}${q.captured ? ' · prompt and response captured' : ''}</span>${btn('Open request', 'mon-log-request', { id: q.id }, 'sm')}</div>`).join('')}</div>` : ''}
+      ${x.llm_requests?.length === 1 ? monPayloads({ status: x.llm_requests[0].status, debug: x.llm_requests[0].payload }) : ''}
       ${details.length ? `<div><div class="caps-sm mb8">Details</div><div class="mon-kv-grid">${details.map(([k, v]) => row(k.replace(/_/g, ' '), esc(typeof v === 'object' ? JSON.stringify(v) : String(v)))).join('')}</div></div>` : ''}
       ${x.related?.length ? `<div><div class="caps-sm mb8">Same trace</div>${x.related.map(r => `<div class="row between gap10 small" style="padding:3px 0"><span class="ellipsis">${esc(r.message)}</span><span class="xs faint none">${esc(fmtDateTime(r.created_at))}</span></div>`).join('')}</div>` : ''}
-      <div class="xs faint">Messages and details are redacted before they are stored: no credentials, headers or payloads.</div>
+      <div class="xs faint">Messages and details are redacted before they are stored: no credentials or headers. Prompts and responses are kept only while capture is on.</div>
     </div>
     <div class="card-foot row gap8" style="justify-content:flex-end">${btn('Close', 'mon-close')}</div></div></div>`;
 }
@@ -601,7 +665,7 @@ const MONITORING_ACTIONS = {
     render();
   },
   'mon-log-filter': el => { monState().logs[el.dataset.key] = el.value; monState().logs.page = 1; load(); },
-  'mon-log-reset': () => { Object.assign(monState().logs, { category: '', level: '', provider: '', workflow: '', search: '', page: 1 }); load(); },
+  'mon-log-reset': () => { Object.assign(monState().logs, { category: '', level: '', provider: '', workflow: '', search: '', trace_id: '', page: 1 }); load(); },
   'mon-log-page': el => { const l = monState().logs; l.page = Math.max(1, l.page + Number(el.dataset.dir)); load(); },
   'mon-log': async el => {
     const m = monState(); m.logs.entry = Number(el.dataset.id); D.monLog = null; render();
@@ -610,6 +674,20 @@ const MONITORING_ACTIONS = {
     render();
   },
   'mon-open-job': el => { monState().request = null; openJob(el.dataset.id); },
+  // From an LLM request to the log lines its run wrote, and back.
+  'mon-logs-trace': el => {
+    const m = monState();
+    m.request = null; D.monRequest = null;
+    Object.assign(m.logs, { category: '', level: '', provider: '', workflow: '', search: '', trace_id: el.dataset.id, page: 1, entry: null });
+    m.tab = 'logs'; load();
+  },
+  'mon-log-clear-trace': () => { Object.assign(monState().logs, { trace_id: '', page: 1 }); load(); },
+  'mon-log-request': el => { monState().logs.entry = null; MONITORING_ACTIONS['mon-request'](el); },
+  'mon-capture': el => busy('monCapture', async () => {
+    D.monCapture = await api('/api/monitoring/capture', { method: 'PUT', body: { enabled: !!el.dataset.on } });
+    return D.monCapture;
+  }, c => c.enabled ? 'New LLM requests keep their full prompt and response' : 'Capture off: new requests keep metadata only'),
+  'mon-copy': el => copyText(el.closest('details')?.querySelector('pre')?.textContent || ''),
   'mon-analyze': () => busy('monAnalyze', async () => {
     await api('/api/monitoring/analyze', { method: 'POST', body: { range: monState().range === 'today' ? 'today' : monState().range } });
     await loadMonitoring();

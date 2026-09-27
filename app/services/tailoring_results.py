@@ -1,13 +1,18 @@
-"""Tailored resumes produced outside the backend workers (Claude Desktop over MCP): schema and deterministic checks.
+"""Tailored resumes: schema and deterministic checks for every tailoring path, and the patch renderer.
 
-Claude writes the resume; this module decides whether it may be stored. Every check is deterministic:
+A model writes the tailored content — Claude Desktop over MCP, or the backend Tailor worker, whose answer is a
+TailoringResult patch (app.prompts.contracts). This module decides whether it may be stored. Every check is
+deterministic, and the same checks run for both paths:
 
 * UNKNOWN_EVIDENCE        an evidence ID that is not a verified Evidence row of this account
 * EVIDENCE_ROLE_MISMATCH  a role's bullet cites evidence recorded for a different employer
 * UNCITED_CLAIM           a bullet with no evidence ID that is not a close restatement of a master resume bullet
 * INVENTED_METRIC         a number that appears in neither the cited evidence nor the master resume
-* UNSUPPORTED_TERM        a technology, employer or other name in the summary, cover letter or a screening answer
-                          that appears nowhere in the master resume, the profile or verified evidence
+* UNSUPPORTED_TERM        a technology, employer or other name in a bullet, the summary, cover letter or a screening
+                          answer that appears nowhere in the master resume, the profile or verified evidence
+                          (a job requirement the candidate lacks stays missing: it cannot enter as a named term)
+* EVIDENCE_NOT_IN_CONTEXT (backend Tailor) evidence the tailoring context did not supply, e.g. evidence held back for
+                          a provenance conflict
 * INVENTED_SKILL          a skill found nowhere in the master resume, the profile skills or verified evidence
 * UNKNOWN_ROLE            a role_index the master resume does not have (titles, employers and dates are never taken
                           from the input, so they cannot be changed)
@@ -163,6 +168,14 @@ def validate_tailored_resume(db: Session, profile: CandidateProfile, job: Job, d
         issues.append(_issue("LAYOUT", "experience_sections",
                              "The master resume has no parsed roles: use resume_bullets instead"))
 
+    prefs = profile.search_preferences or {}
+    evidence_text = " ".join(f"{e.company} {e.role} {e.claim} {e.context} {' '.join(e.skills or [])} "
+                             f"{' '.join(e.tags or [])}" for e in evidence.values())
+    # Everything the candidate can be said to have done: the resume, their own profile, and verified evidence.
+    supported = _words(" ".join([master_text, evidence_text, profile.headline or "", profile.work_authorization or "",
+                                 *(str(s) for s in prefs.get("primary_skills") or []),
+                                 *(str(s) for s in prefs.get("secondary_skills") or [])]))
+
     def check_bullet(bullet: BulletIn, location: str, candidates: list[str], employer: str) -> None:
         unknown = [i for i in bullet.evidence_ids if i not in evidence]
         if unknown:
@@ -185,6 +198,10 @@ def validate_tailored_resume(db: Session, profile: CandidateProfile, job: Job, d
         if invented:
             issues.append(_issue("INVENTED_METRIC", location,
                                  f"Numbers {invented} are not in the cited evidence or the master resume"))
+        unsupported = sorted(term for term in _named_terms(bullet.text) if term not in supported)
+        if unsupported:
+            issues.append(_issue("UNSUPPORTED_TERM", location,
+                                 f"{unsupported} appear nowhere in the master resume, your profile or verified evidence"))
 
     for s_index, section in enumerate(data.experience_sections):
         if section.role_index >= len(parsed.roles):
@@ -200,18 +217,12 @@ def validate_tailored_resume(db: Session, profile: CandidateProfile, job: Job, d
     for b_index, bullet in enumerate(data.resume_bullets):
         check_bullet(bullet, f"resume_bullets.{b_index}", all_master_lines, "")
 
-    prefs = profile.search_preferences or {}
-    evidence_text = " ".join(f"{e.company} {e.role} {e.claim} {e.context} {' '.join(e.skills or [])} "
-                             f"{' '.join(e.tags or [])}" for e in evidence.values())
-    # Everything the candidate can be said to have done: the resume, their own profile, and verified evidence.
-    supported = _words(" ".join([master_text, evidence_text, profile.headline or "", profile.work_authorization or "",
-                                 *(str(s) for s in prefs.get("primary_skills") or []),
-                                 *(str(s) for s in prefs.get("secondary_skills") or [])]))
     for skill in data.skills_order:
         words = _skill_words(skill)
         if not words or not set(words) <= supported:
-            issues.append(_issue("INVENTED_SKILL", "skills_order",
-                                 f"'{skill}' is not in the master resume, profile skills or verified evidence"))
+            issues.append({**_issue("INVENTED_SKILL", "skills_order",
+                                    f"'{skill}' is not in the master resume, profile skills or verified evidence"),
+                           "value": skill})
 
     # The summary, cover letter and screening answers are read as fact too, so their numbers and the names
     # they drop must come from the same places a bullet's do. Naming this job and yourself is always fine.
@@ -295,3 +306,79 @@ def from_variant_content(job_id: int, content: dict[str, Any]) -> tuple[Tailored
         cover_letter=str(content.get("cover_letter") or ""),
         screening_answer_drafts=dict(content.get("screening_answer_drafts") or {}))
     return data, legacy
+
+
+# ───────────── the backend Tailor's patch ─────────────
+
+class TailoringRejected(ValueError):
+    """Every unit the Tailor generated failed evidence or policy validation: nothing is stored."""
+
+    def __init__(self, issues: list[dict[str, str]]):
+        self.issues = issues
+        summary = "; ".join(f"{i['code']} at {i['location']}" for i in issues[:4])
+        super().__init__(f"TAILOR_OUTPUT_UNSUPPORTED: no generated claim passed evidence validation ({summary})")
+
+
+def _unit_of(location: str) -> tuple[str, ...]:
+    """The patch unit an issue location names: ('summary',), ('role', 2), ('bullet', 2, 0), ('highlight', 1) ..."""
+    parts = location.split(".")
+    if parts[0] == "experience_sections" and len(parts) >= 4 and parts[2] == "bullets":
+        return ("bullet", int(parts[1]), int(parts[3]))
+    if parts[0] == "experience_sections" and len(parts) >= 2 and parts[1].isdigit():
+        return ("role", int(parts[1]))
+    if parts[0] == "resume_bullets" and len(parts) >= 2 and parts[1].isdigit():
+        return ("highlight", int(parts[1]))
+    return (parts[0],)
+
+
+def apply_tailoring_patch(db: Session, profile: CandidateProfile, job: Job, patch: Any, *,
+                          allowed_evidence: set[int]) -> dict[str, Any]:
+    """Source resume + TailoringResult patch → the stored tailored content, deterministically.
+
+    The patch is checked unit by unit (validate_tailored_resume, plus the evidence the context supplied). A unit
+    with an issue is dropped and the source text stays in its place: nothing is repaired by guessing, and the
+    dropped units and their reasons are kept with the content. Titles, employers and dates come from the master
+    resume at render time, so a patch cannot change them. Raises TailoringRejected when no unit survives."""
+    sections = [ExperienceSectionIn.model_construct(role_index=u.role_index, bullets=[
+        BulletIn.model_construct(text=b.text, evidence_ids=list(b.evidence_ids)) for b in u.bullets])
+        for u in patch.role_updates]
+    highlights = [BulletIn.model_construct(text=h.text, evidence_ids=list(h.evidence_ids)) for h in patch.highlights]
+    summary = patch.summary.text if patch.summary else ""
+    data = TailoredResumeIn.model_construct(job_id=job.id, summary=summary, skills_order=list(patch.skills_order),
+                                            experience_sections=sections, resume_bullets=highlights, cover_letter="",
+                                            screening_answer_drafts={})
+    issues = [i for i in validate_tailored_resume(db, profile, job, data) if i["code"] != "EMPTY"]
+    # Evidence the tailoring context did not offer (for example evidence held back for a provenance conflict).
+    for s_index, section in enumerate(sections):
+        for b_index, bullet in enumerate(section.bullets):
+            outside = sorted(set(bullet.evidence_ids) - allowed_evidence)
+            if outside:
+                issues.append(_issue("EVIDENCE_NOT_IN_CONTEXT", f"experience_sections.{s_index}.bullets.{b_index}",
+                                     f"Evidence {outside} was not part of this job's tailoring context"))
+    if patch.summary and set(patch.summary.evidence_ids) - allowed_evidence:
+        issues.append(_issue("EVIDENCE_NOT_IN_CONTEXT", "summary", "The summary cites evidence outside the context"))
+
+    dropped = {_unit_of(i["location"]) for i in issues}
+    bad_skills = {i.get("value") for i in issues if i["code"] == "INVENTED_SKILL"}
+    kept_sections = []
+    for s_index, section in enumerate(sections):
+        if ("role", s_index) in dropped or ("experience_sections",) in dropped:
+            continue
+        bullets = [b for b_index, b in enumerate(section.bullets) if ("bullet", s_index, b_index) not in dropped]
+        if bullets:
+            kept_sections.append(ExperienceSectionIn.model_construct(role_index=section.role_index, bullets=bullets))
+    kept_highlights = [] if ("resume_bullets",) in dropped else [
+        h for index, h in enumerate(highlights) if ("highlight", index) not in dropped]
+    kept_summary = "" if ("summary",) in dropped else summary
+    kept_skills = [skill for skill in data.skills_order if skill not in bad_skills]
+    if not (kept_sections or kept_highlights or kept_summary or kept_skills):
+        raise TailoringRejected(issues)
+    kept = TailoredResumeIn.model_construct(job_id=job.id, summary=kept_summary, skills_order=kept_skills,
+                                            experience_sections=kept_sections, resume_bullets=kept_highlights,
+                                            cover_letter="", screening_answer_drafts={})
+    content = to_variant_content(kept, source="backend")
+    if kept_summary and patch.summary:
+        content["summary_evidence_ids"] = list(patch.summary.evidence_ids)
+        content["selected_evidence_ids"] = sorted(set(content["selected_evidence_ids"]) | set(patch.summary.evidence_ids))
+    content["validation"] = {"issues": issues[:30], "dropped_units": len(dropped)}
+    return content

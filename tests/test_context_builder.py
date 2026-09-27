@@ -211,7 +211,11 @@ def test_tailoring_context_holds_verified_relevant_facts_and_fit_analysis(user):
     assert [r["role_index"] for r in context.roles] == [0] and context.roles[0]["bullets"] == bullets(context)
     prompt = build_tailoring_prompt(candidate_profile=profile_for_user(user), job=job(user, job_id), context=context)
     assert "team of 8" not in prompt.user and "React dashboards" not in prompt.user
-    assert "VERIFIED RESUME FACTS (untrusted data):" in prompt.user and "Reliability impact" in prompt.user
+    assert "SOURCE RESUME:" in prompt.user and "Reliability impact" in prompt.user
+    source = context.source_resume["roles"][0]["bullets"]
+    assert [b["text"] for b in source] == bullets(context)
+    assert all(isinstance(b.get("id"), int) for b in source), "a verified bullet carries one id: its evidence row"
+    assert set(source[0]) == {"id", "text"}
 
     review = build(user, cb.build_review_context, job_id)
     assert {f["text"] for f in review.rejected_facts} == {rejected["text"]}
@@ -246,15 +250,19 @@ def test_final_application_content_uses_only_verified_facts(user, monkeypatch):
     assert "Reduced production incidents" in seen["tailoring"]
 
 
-def test_tailoring_drops_evidence_ids_and_role_rewrites_the_context_did_not_supply():
-    context = cb.TaskContext(task="tailoring", candidate={}, resume={"id": 1},
-                             relevant_evidence=[{"id": 7}], roles=[{"role_index": 0, "bullets": ["x"]},
-                                                                  {"role_index": 1, "bullets": []}])
-    from app.services.workflow import trusted_content
-    out = trusted_content({"experience": [{"role_index": 0, "bullets": ["a"]}, {"role_index": 1, "bullets": ["b"]}],
-                           "selected_evidence_ids": [7, 99]}, context)
-    assert [e["role_index"] for e in out["experience"]] == [0]
-    assert out["selected_evidence_ids"] == [7] and out["discarded_evidence_ids"] == [99]
+def test_the_tailoring_context_is_checked_before_a_prompt_exists():
+    context = cb.TaskContext(task="tailoring", candidate={}, resume={"id": 1}, relevant_evidence=[{"id": 7}],
+                             roles=[{"role_index": 0, "bullets": ["x"]}, {"role_index": 0, "bullets": ["y"]}])
+    with pytest.raises(cb.ContextError, match="TAILOR_CONTEXT_INVALID"):
+        cb.validate_tailoring_context(context, master_role_count=2)  # two roles mapped onto one
+    context.roles = [{"role_index": 3, "bullets": ["x"]}]
+    with pytest.raises(cb.ContextError, match="TAILOR_CONTEXT_INVALID"):
+        cb.validate_tailoring_context(context, master_role_count=2)  # a role the master resume does not have
+    context.roles, context.relevant_evidence = [{"role_index": 0, "bullets": ["x"]}], [{"id": 7}, {"id": 7}]
+    with pytest.raises(cb.ContextError, match="TAILOR_CONTEXT_INVALID"):
+        cb.validate_tailoring_context(context, master_role_count=2)
+    with pytest.raises(cb.ContextError, match="TAILOR_CONTEXT_INCOMPLETE"):
+        cb.validate_tailoring_context(cb.TaskContext(task="tailoring", candidate={}, resume={}), master_role_count=0)
 
 
 def test_prompts_are_loaded_from_the_prompts_package():

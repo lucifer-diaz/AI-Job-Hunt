@@ -15,6 +15,7 @@ Two separations are kept everywhere:
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -162,6 +163,27 @@ def candidate_match(requirements: list[dict[str, Any]], candidate: Any) -> tuple
     return matches, gaps
 
 
+# Paragraphs that ask nothing of the candidate and appear in most postings: equal-opportunity statements,
+# accommodation notices and "learn more about us" links.
+BOILERPLATE = re.compile(
+    r"equal[- ]opportunity employer|equal employment opportunity|reasonable accommodation|regardless of (?:age|race|"
+    r"color|gender|religion)|protected (?:veteran|by applicable law)|to learn more,? about|check out more about|"
+    r"e-verify", re.IGNORECASE)
+
+
+def compact_posting(text: str) -> str:
+    """The posting as a model should read it: exact repeated paragraphs and legal boilerplate removed. Everything
+    the employer asks for, and what they say about the role and company, stays word for word."""
+    kept, seen = [], set()
+    for paragraph in re.split(r"\n\s*\n", text or ""):
+        key = re.sub(r"[^a-z0-9]+", " ", paragraph.lower()).strip()
+        if not key or key in seen or BOILERPLATE.search(paragraph):
+            continue
+        seen.add(key)
+        kept.append(paragraph.strip())
+    return "\n\n".join(kept)
+
+
 def _relevant(values: list[str], terms: set[str], limit: int) -> list[str]:
     scored = sorted(values, key=lambda value: -len(_tokens(value) & terms))
     return scored[:limit] if limit else scored
@@ -181,7 +203,7 @@ def _base(db: Session, job: Job, task: str) -> JobContext:
         # Not parsed, parsing failed, or the posting changed since: the task gets the posting as it is now.
         from app.services.job_description import normalize_description
 
-        context.raw_description = normalize_description(job.description or "")
+        context.raw_description = compact_posting(normalize_description(job.description or ""))
         context.identity = {"title": job.title, "company": job.company, "location": job.location}
         return context
     context.identity = {k: v for k, v in (data.get("job_identity") or {}).items() if v}

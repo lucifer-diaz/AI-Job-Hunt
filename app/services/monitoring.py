@@ -19,7 +19,8 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models import LLM_ERROR_TYPES, LLM_STAGES, Application, Job, LLMRequestLog
-from app.services.llm_telemetry import CONTRIBUTORS
+from app.services import redaction
+from app.services.llm_telemetry import CONTRIBUTORS, DEBUG_TEXT_LIMIT
 
 RANGES = {"today": 0, "7d": 7, "30d": 30, "90d": 90}
 MAX_ROWS = 50_000
@@ -36,7 +37,12 @@ ROW_COLUMNS = (LLMRequestLog.id, LLMRequestLog.created_at, LLMRequestLog.user_id
                LLMRequestLog.workflow_entity_id, LLMRequestLog.cached, LLMRequestLog.full_available_context_tokens,
                LLMRequestLog.selected_context_tokens, LLMRequestLog.context_reduction_percent,
                LLMRequestLog.raw_job_tokens, LLMRequestLog.selected_job_context_tokens,
-               LLMRequestLog.job_context_reduction_percent)
+               LLMRequestLog.job_context_reduction_percent, LLMRequestLog.requested_model, LLMRequestLog.worker_type,
+               LLMRequestLog.model_mode, LLMRequestLog.configured_model, LLMRequestLog.model_group,
+               LLMRequestLog.routing_tier, LLMRequestLog.routing_cause, LLMRequestLog.fallback_used,
+               LLMRequestLog.escalated, LLMRequestLog.escalation_reason, LLMRequestLog.confidence,
+               LLMRequestLog.config_version, LLMRequestLog.litellm_call_id, LLMRequestLog.schema_enforcement,
+               LLMRequestLog.validation_failure_reason, LLMRequestLog.context_builder_version)
 
 
 def utcnow() -> datetime:
@@ -55,12 +61,13 @@ class MonitoringFilter:
     status: str | None = None
     workflow_type: str | None = None
     entity_id: int | None = None
+    worker_type: str | None = None
 
     def public(self) -> dict[str, Any]:
         return {"start": self.start.isoformat(), "end": self.end.isoformat(), "all_accounts": self.user_id is None,
                 "provider": self.provider, "model": self.model, "stage": self.stage,
                 "prompt_version": self.prompt_version, "status": self.status, "workflow_type": self.workflow_type,
-                "entity_id": self.entity_id}
+                "entity_id": self.entity_id, "worker_type": self.worker_type}
 
 
 def time_range(name: str | None = None, start: datetime | None = None, end: datetime | None = None,
@@ -101,7 +108,7 @@ def rows(db: Session, f: MonitoringFilter) -> list[Any]:
     for column, value in ((LLMRequestLog.provider, f.provider), (LLMRequestLog.model, f.model),
                           (LLMRequestLog.stage, f.stage), (LLMRequestLog.prompt_version, f.prompt_version),
                           (LLMRequestLog.status, f.status), (LLMRequestLog.workflow_type, f.workflow_type),
-                          (LLMRequestLog.workflow_entity_id, f.entity_id)):
+                          (LLMRequestLog.workflow_entity_id, f.entity_id), (LLMRequestLog.worker_type, f.worker_type)):
         if value not in (None, ""):
             query = query.where(column == value)
     return db.execute(query.order_by(LLMRequestLog.created_at.desc()).limit(MAX_ROWS)).all()
@@ -131,6 +138,11 @@ def summary(items: list[Any]) -> dict[str, Any]:
         "retry_rate": _rate(sum((r.retry_count or 0) > 0 for r in items), requests),
         "structured_output_failures": sum(r.structured_output_valid is False for r in items),
         "structured_output_failure_rate": _rate(sum(r.structured_output_valid is False for r in items), len(checked)),
+        # Why answers failed their worker's contract; POSSIBLE_CROSS_WORKER_OUTPUT is a worker doing another's job.
+        "validation_failure_reasons": dict(Counter(r.validation_failure_reason for r in items
+                                                   if r.validation_failure_reason)),
+        "cross_worker_outputs": sum(r.validation_failure_reason == "POSSIBLE_CROSS_WORKER_OUTPUT" for r in items),
+        "schema_enforcement": dict(Counter(r.schema_enforcement for r in items if r.schema_enforcement)),
         "avg_context_tokens": _mean(contexts), "p95_context_tokens": percentile(contexts, 95),
         "avg_context_utilization_percent": _mean(utilization),
         "cached_requests": sum(bool(r.cached) for r in items),
@@ -263,21 +275,85 @@ def errors(items: list[Any]) -> dict[str, Any]:
                          for s in by_stage(items) if s["failed"]]}
 
 
+# ───────────── model routing (LiteLLM gateway mode) ─────────────
+
+def _share(part: float, whole: float) -> float | None:
+    return round(part / whole, 4) if whole else None
+
+
+def routing(items: list[Any]) -> dict[str, Any]:
+    """How requests were routed: per worker and model, the auto router's tiers, escalation and fallback.
+
+    Answers: how often AUTO chooses each tier; how often a worker escalates and why; which model has the most
+    schema failures; which is slowest; how much inference time each worker and model consumes (wall-clock latency
+    is the measure available for local models). Only requests made in gateway mode carry a worker type.
+    """
+    routed = [r for r in items if r.worker_type]
+    total_time = sum(r.latency_ms or 0 for r in routed)
+
+    def block(group: list[Any]) -> dict[str, Any]:
+        latencies = [r.latency_ms for r in group if r.latency_ms is not None]
+        checked = [r for r in group if r.structured_output_valid is not None]
+        first = [r for r in group if not r.escalated]
+        confidences = [r.confidence for r in group if r.confidence is not None]
+        return {"requests": len(group), "failure_rate": _rate(sum(r.status == "FAILED" for r in group), len(group)),
+                "schema_failure_rate": _rate(sum(r.structured_output_valid is False for r in group), len(checked)),
+                "escalations": sum(bool(r.escalated) for r in group),
+                "escalation_rate": _rate(sum(bool(r.escalated) for r in group), len(first)),
+                "fallbacks": sum(r.fallback_used is True for r in group),
+                "fallback_rate": _rate(sum(r.fallback_used is True for r in group),
+                                       sum(r.fallback_used is not None for r in group)),
+                "avg_latency_ms": _mean(latencies), "p95_latency_ms": percentile(latencies, 95),
+                "inference_ms": sum(latencies), "inference_share": _share(sum(latencies), total_time),
+                "avg_confidence": round(sum(confidences) / len(confidences), 3) if confidences else None,
+                "input_tokens": sum(r.input_tokens or 0 for r in group),
+                "output_tokens": sum(r.output_tokens or 0 for r in group)}
+
+    by_worker: dict[str, list[Any]] = defaultdict(list)
+    by_model: dict[str, list[Any]] = defaultdict(list)
+    by_pair: dict[tuple[str, str], list[Any]] = defaultdict(list)
+    for r in routed:
+        by_worker[r.worker_type].append(r)
+        by_model[r.model or r.requested_model or "unknown"].append(r)
+        by_pair[(r.worker_type, r.model or r.requested_model or "unknown")].append(r)
+    auto = [r for r in routed if r.model_mode == "AUTO_ROUTER" and r.configured_model == "AUTO_ROUTER"]
+    tiers = Counter(r.routing_tier or "UNKNOWN" for r in auto)
+    reasons = Counter((r.worker_type, r.escalation_reason) for r in routed if r.escalated)
+    workers = sorted(({"worker_type": w, **block(g),
+                       "configured": Counter(r.configured_model for r in g if r.configured_model).most_common(3),
+                       "models": Counter(r.model for r in g if r.model).most_common(3)} for w, g in by_worker.items()),
+                     key=lambda x: -x["requests"])
+    models = sorted(({"model": m, **block(g)} for m, g in by_model.items()), key=lambda x: -x["requests"])
+    return {
+        "requests": len(routed), "inference_ms": total_time,
+        "workers": workers, "models": models,
+        "worker_models": [{"worker_type": w, "model": m, **block(g)} for (w, m), g in sorted(by_pair.items())],
+        "auto_router": {"requests": len(auto), "tiers": [{"tier": t, "requests": n, "share": _share(n, len(auto))}
+                                                         for t, n in tiers.most_common()]},
+        "escalations": [{"worker_type": w, "reason": reason, "requests": n} for (w, reason), n in reasons.most_common()],
+        "slowest_model": max(models, key=lambda m: m["p95_latency_ms"] or 0)["model"] if models else None,
+        "most_schema_failures": max(models, key=lambda m: m["schema_failure_rate"] or 0)["model"]
+        if any(m["schema_failure_rate"] for m in models) else None,
+    }
+
+
 def options(db: Session, f: MonitoringFilter) -> dict[str, list[str]]:
     """Values the filter selects can offer, from the whole range regardless of the other filters."""
     base = replace(f, provider=None, model=None, stage=None, prompt_version=None, status=None, workflow_type=None,
-                   entity_id=None)
+                   entity_id=None, worker_type=None)
     items = rows(db, base)
     return {"providers": sorted({r.provider for r in items}), "models": sorted({r.model for r in items if r.model}),
             "stages": list(LLM_STAGES), "prompt_versions": sorted({r.prompt_version for r in items if r.prompt_version}),
-            "statuses": ["SUCCEEDED", "FAILED"]}
+            "statuses": ["SUCCEEDED", "FAILED"],
+            "worker_types": sorted({r.worker_type for r in items if r.worker_type})}
 
 
 def dashboard(db: Session, f: MonitoringFilter) -> dict[str, Any]:
     items = rows(db, f)
     return {"filter": f.public(), "truncated": len(items) >= MAX_ROWS, "summary": summary(items),
             "stages": by_stage(items), "models": by_model(items), "timeseries": timeseries(items, f),
-            "latency": latency(items), "context": context(items), "errors": errors(items), "options": options(db, f)}
+            "latency": latency(items), "context": context(items), "errors": errors(items), "routing": routing(items),
+            "options": options(db, f)}
 
 
 # ───────────── individual requests ─────────────
@@ -310,7 +386,16 @@ def request_row(r: Any) -> dict[str, Any]:
             "selected_context_tokens": r.selected_context_tokens,
             "context_reduction_percent": r.context_reduction_percent,
             "raw_job_tokens": r.raw_job_tokens, "selected_job_context_tokens": r.selected_job_context_tokens,
-            "job_context_reduction_percent": r.job_context_reduction_percent}
+            "job_context_reduction_percent": r.job_context_reduction_percent,
+            # Model routing: the worker, what it was configured to use, what it asked for and what answered.
+            "worker_type": r.worker_type, "model_mode": r.model_mode, "configured_model": r.configured_model,
+            "requested_model": r.requested_model, "model_group": r.model_group, "routing_tier": r.routing_tier,
+            "routing_cause": r.routing_cause, "fallback_used": r.fallback_used, "escalated": bool(r.escalated),
+            "escalation_reason": r.escalation_reason, "confidence": r.confidence, "config_version": r.config_version,
+            "litellm_call_id": r.litellm_call_id,
+            # Structured output: how the contract was enforced and why an answer failed it.
+            "schema_enforcement": r.schema_enforcement, "validation_failure_reason": r.validation_failure_reason,
+            "context_builder_version": r.context_builder_version}
 
 
 def list_requests(db: Session, f: MonitoringFilter, page: int = 1, per_page: int = 25) -> dict[str, Any]:
@@ -326,15 +411,32 @@ def request_detail(db: Session, request_id: int, user_id: int | None) -> dict[st
     log = db.get(LLMRequestLog, request_id)
     if log is None or (user_id is not None and log.user_id != user_id):
         return None
-    return {**request_row(log), "request_id": log.request_id, "requested_model": log.requested_model,
-            "prompt_name": log.prompt_name, "context_breakdown": log.context_breakdown,
+    return {**request_row(log), "request_id": log.request_id, "external_request_id": log.external_request_id,
+            "trace_id": log.trace_id, "prompt_name": log.prompt_name, "context_breakdown": log.context_breakdown,
             "cached": log.cached, "cache_read_tokens": log.cache_read_tokens, "cache_write_tokens": log.cache_write_tokens,
             "pricing_effective_from": log.pricing_effective_from.isoformat() if log.pricing_effective_from else None,
             "structured_output_retry_count": log.structured_output_retry_count, "error_message": log.error_message,
             "completed_at": log.completed_at.isoformat() if log.completed_at else None,
             "entity": _entity(db, log.workflow_type, log.workflow_entity_id),
-            "debug": ({"prompt": log.debug_prompt, "response": log.debug_response}
+            "trace_log_count": _trace_log_count(db, log.trace_id, user_id),
+            # Redacted again on the way out: rows stored before debug text was redacted at write time are cleaned too.
+            "debug": ({"prompt": redaction.redact_text(log.debug_prompt, DEBUG_TEXT_LIMIT),
+                       "response": redaction.redact_text(log.debug_response, DEBUG_TEXT_LIMIT)}
                       if log.debug_prompt or log.debug_response else None)}
+
+
+def _trace_log_count(db: Session, trace_id: str | None, user_id: int | None) -> int:
+    """Monitoring → Logs lines written under the same trace as a request (its link to the logs)."""
+    from sqlalchemy import func
+
+    from app.models import SystemLogEntry
+
+    if not trace_id:
+        return 0
+    query = select(func.count(SystemLogEntry.id)).where(SystemLogEntry.trace_id == trace_id)
+    if user_id is not None:
+        query = query.where(SystemLogEntry.user_id == user_id)
+    return db.scalar(query) or 0
 
 
 # ───────────── advisor input ─────────────
@@ -387,6 +489,8 @@ def advisor_aggregates(db: Session, user_id: int, start: datetime, end: datetime
         "errors": [e for e in errors(items)["by_type"] if e["requests"]],
         "context_buckets": context(items)["buckets"],
         "duplicate_successful_calls": [{"stage": stage, "extra_calls": n} for stage, n in duplicates.items()],
+        # Gateway mode only: per-worker routing, escalation and inference-time aggregates (see routing()).
+        "routing": _advisor_routing(routing(items)),
         "outliers": {
             "largest_context": [outlier(r) for r in sorted((r for r in items if r.estimated_context_tokens),
                                                            key=lambda r: -r.estimated_context_tokens)[:OUTLIERS]],
@@ -394,6 +498,18 @@ def advisor_aggregates(db: Session, user_id: int, start: datetime, end: datetime
                                                           key=lambda r: -r.estimated_cost)[:OUTLIERS]],
         },
     }
+
+
+def _advisor_routing(data: dict[str, Any]) -> dict[str, Any]:
+    keep = ("requests", "failure_rate", "schema_failure_rate", "escalations", "escalation_rate", "fallback_rate",
+            "avg_latency_ms", "p95_latency_ms", "inference_share", "avg_confidence")
+    return {"requests": data["requests"],
+            "workers": [{"worker_type": w["worker_type"], **{k: w[k] for k in keep},
+                         "configured": [name for name, _ in w["configured"]], "models": [n for n, _ in w["models"]]}
+                        for w in data["workers"]],
+            "worker_models": [{"worker_type": x["worker_type"], "model": x["model"], **{k: x[k] for k in keep}}
+                              for x in data["worker_models"]],
+            "auto_router_tiers": data["auto_router"]["tiers"], "escalations": data["escalations"]}
 
 
 def request_count(db: Session, user_id: int, start: datetime, end: datetime) -> int:
@@ -416,14 +532,25 @@ def prune(db: Session, now: datetime | None = None, retention_days: int | None =
     from app.models import LLMUsageDaily
     from app.settings import get_settings
 
+    from sqlalchemy import update
+
+    debug_days = get_settings().llm_prompt_debug_retention_days
+    cleared = 0
+    if debug_days > 0:  # full prompt and response text goes first; the metadata row stays
+        cleared = db.execute(update(LLMRequestLog)
+                             .where(LLMRequestLog.created_at < (now or utcnow()) - timedelta(days=debug_days),
+                                    (LLMRequestLog.debug_prompt.is_not(None)) | (LLMRequestLog.debug_response.is_not(None)))
+                             .values(debug_prompt=None, debug_response=None)
+                             .execution_options(synchronize_session=False)).rowcount or 0
+        db.commit()
     days = retention_days if retention_days is not None else get_settings().llm_telemetry_retention_days
     if days <= 0:
-        return {"rolled_up": 0, "deleted": 0}
+        return {"rolled_up": 0, "deleted": 0, "debug_text_cleared": cleared}
     cutoff = (now or utcnow()) - timedelta(days=days)
     old = db.execute(select(*ROW_COLUMNS).where(LLMRequestLog.created_at < cutoff)
                      .order_by(LLMRequestLog.id).limit(PRUNE_BATCH)).all()
     if not old:
-        return {"rolled_up": 0, "deleted": 0}
+        return {"rolled_up": 0, "deleted": 0, "debug_text_cleared": cleared}
     groups: dict[tuple, list[Any]] = defaultdict(list)
     for r in old:
         groups[(r.user_id, r.created_at.date(), r.stage, r.provider, r.model or "", r.prompt_version or "")].append(r)
@@ -454,4 +581,4 @@ def prune(db: Session, now: datetime | None = None, retention_days: int | None =
     deleted = db.execute(delete(LLMRequestLog).where(LLMRequestLog.id.in_([r.id for r in old]))
                          .execution_options(synchronize_session=False)).rowcount or 0
     db.commit()
-    return {"rolled_up": len(groups), "deleted": deleted}
+    return {"rolled_up": len(groups), "deleted": deleted, "debug_text_cleared": cleared}

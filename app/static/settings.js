@@ -7,7 +7,7 @@ const SETTINGS_SECTIONS = [
   ['resume-data', 'Resume Data', 'Review and verify the facts AI may use', '04'],
   ['account', 'Account & security', 'Manage access to your workspace', '05'],
   ['api-keys', 'API keys', 'Connect your own providers', '06'],
-  ['ai', 'AI models', 'Choose how your assistant works', '07'],
+  ['ai', 'AI models', 'LiteLLM, models, tiers and which model each worker uses', '07'],
   ['workflow', 'Workflow & cadence', 'Set a pace that works for you', '08'],
 ];
 const SETTINGS_FORMS = ['profile', 'preferences', 'resumes', 'resume-data', 'account', 'keys', 'ai', 'workflow'];
@@ -282,6 +282,7 @@ async function settingsSave(form) {
     if (form === 'preferences') authorizationDraft = null;
     if (form === 'resumes') { D.resumes = await api('/api/profile/resumes'); D.resumeData = undefined; }
     if (['profile', 'preferences', 'ai'].includes(form)) await refreshSettingsSummary(form);
+    if (form === 'ai' && typeof aimLoad === 'function') await aimLoad();  // the Route card shows the direct model
   }, form === 'account' ? 'Password updated. Other sessions are signed out.' : 'Changes saved');
 }
 async function saveWorkflowSettings() {

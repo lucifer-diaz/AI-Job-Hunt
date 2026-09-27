@@ -154,13 +154,24 @@ def set_user_keys(db: Session, updates: dict[str, str | None], user_id: int | No
 def ai_ready(db: Session, user_id: int) -> tuple[bool, str]:
     """Whether this account's chosen AI provider can be called, so workers never burn attempts on a missing key."""
     provider = resolve_ai_config(get_settings(), ai_overrides(db, user_id))["llm_provider"]
+    if provider == "litellm":
+        from app.services.ai_model_config import gateway_settings
+
+        if gateway_settings(db, user_id)[0]:
+            return True, ""
+        return False, "No LiteLLM base URL saved in Settings → AI Models"
     if provider == "mock" or user_keys(db, user_id).get(provider):
         return True, ""
     return False, f"No {KEY_LABELS.get(provider, provider)} API key saved in Settings"
 
 
 # CandidatePolicy: how AI workflows may use resume facts the user has not verified.
+# Where AI workflows take the candidate's resume from (CandidatePolicy.resume_source):
+#   structured   the facts in Settings → Resume Data. Verified corrections win, headings included.
+#   master_text  the master resume text as written: its role headings and bullets, used as-is.
+RESUME_SOURCES = ("structured", "master_text")
 CANDIDATE_POLICY_DEFAULTS = {
+    "resume_source": "structured",
     # Tailoring, review, follow-ups and application answers: verified facts only unless this is on.
     "allow_unverified_resume_facts": False,
     # Ranking may read unverified parsed facts as clearly marked, lower-confidence context.
@@ -168,6 +179,10 @@ CANDIDATE_POLICY_DEFAULTS = {
 }
 
 
-def candidate_policy(db: Session, user_id: int | None = None) -> dict[str, bool]:
+def candidate_policy(db: Session, user_id: int | None = None) -> dict[str, Any]:
     stored = (settings_for(db, user_id).preferences or {}).get("candidate_policy") or {}
-    return {key: bool(stored.get(key, default)) for key, default in CANDIDATE_POLICY_DEFAULTS.items()}
+    policy: dict[str, Any] = {key: bool(stored.get(key, default)) for key, default in CANDIDATE_POLICY_DEFAULTS.items()
+                              if isinstance(default, bool)}
+    source = stored.get("resume_source")
+    policy["resume_source"] = source if source in RESUME_SOURCES else CANDIDATE_POLICY_DEFAULTS["resume_source"]
+    return policy

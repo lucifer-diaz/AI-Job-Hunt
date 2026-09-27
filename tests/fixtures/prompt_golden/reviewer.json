@@ -1,0 +1,15 @@
+{
+  "worker": "REVIEWER", "prompt": "review",
+  "input": {"tailored_resume": "# Sam Rivera\n- Cut production incidents by 45% across Kafka pipelines\n- Owned AWS deployments with Kubernetes",
+            "tailored_claims": [{"text": "Cut production incidents by 45% across Kafka pipelines", "evidence_ids": [6]},
+                                {"text": "Owned AWS deployments with Kubernetes", "evidence_ids": [24]}]},
+  "must_include": ["never assume a claim is true", "<untrusted_tailored_claims>", "Owned AWS deployments"],
+  "must_exclude": ["hours_old", "candidate_fit_score"],
+  "valid_output": {"review_score": 55, "confidence": 0.85, "recommendation": "RETAILOR",
+                   "unsupported_claims": ["Kubernetes use"], "overstated_claims": ["Owned AWS deployments (evidence shows S3 archives)"],
+                   "unaddressed_requirements": ["PHP", "Java"], "risks": [], "strengths": ["Quantified incident reduction"],
+                   "summary": "One overstated AWS claim."},
+  "invalid_outputs": [
+    {"name": "ranker-shaped", "output": {"candidate_fit_score": 70, "resume_fit_score": 60, "strong_matches": ["Python"]}, "reason": "POSSIBLE_CROSS_WORKER_OUTPUT"},
+    {"name": "old vocabulary", "output": {"review_score": 70, "confidence": 0.8, "recommendation": "approve"}, "reason": "WRONG_OUTPUT_SCHEMA"}]
+}

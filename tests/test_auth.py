@@ -147,7 +147,8 @@ def test_each_account_only_sees_and_changes_its_own_data():
     evidence_id = alice.post("/api/evidence", json={"claim": "Cut cloud costs by 30%", "company": "Acme"}).json()["id"]
     knowledge_id = alice.post("/api/knowledge", json={"question": "Notice period?", "answer": "30 days"}).json()["id"]
     assert alice.put("/api/profile", json={"name": "Alice", "master_resume": "Built Python services at 10k rps"}).status_code == 200
-    assert alice.post("/api/profile/resume", files={"file": ("cv.txt", io.BytesIO(b"Alice's resume"), "text/plain")}).status_code == 200
+    assert alice.post("/api/profile/resume", files={"file": ("cv.txt", io.BytesIO(
+        b"Alice's resume\nBuilt Python services at 10k rps for payments"), "text/plain")}).status_code == 200
     assert alice.post(f"/api/jobs/{job['id']}/triage", json={"action": "shortlist"}).status_code == 200
     resume_id = alice.post(f"/api/jobs/{job['id']}/tailor").json()["resume_id"]
     assert alice.post(f"/api/jobs/{job['id']}/approve").status_code == 200
@@ -178,10 +179,10 @@ def test_each_account_only_sees_and_changes_its_own_data():
     assert bob.post("/api/knowledge", json={"question": "Notice period?", "answer": "60 days"}).status_code == 200
 
     # Alice's data is intact.
-    assert alice.get("/api/jobs/search").json()["total"] == 1
+    assert alice.get("/api/jobs/search", params={"include_applied": True}).json()["total"] == 1
     assert [k["answer"] for k in alice.get("/api/knowledge").json()] == ["30 days"]
     assert alice.get(f"/api/jobs/{job['id']}").status_code == 200
-    assert alice.get("/api/profile/resume").content == b"Alice's resume"
+    assert alice.get("/api/profile/resume").content == b"Alice's resume\nBuilt Python services at 10k rps for payments"
 
 
 def test_the_first_account_is_the_admin_and_gets_the_servers_keys(tmp_path, monkeypatch):

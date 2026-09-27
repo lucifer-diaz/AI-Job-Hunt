@@ -92,7 +92,14 @@ def test_pdf_export_renders_headings_and_roles_cleanly():
     assert "■" not in text
 
 
-def test_tailoring_keeps_structure_and_revert_restores_master_bullet():
+def test_tailoring_keeps_structure_and_revert_restores_master_bullet(monkeypatch):
+    from app.services.llm import LLMClient
+
+    # The Tailor answers with a patch: one Flow AI bullet rewritten. The renderer keeps every other role and header.
+    rewrite = "Built production AI agents for Flow AI, adopted by 100+ brands"
+    monkeypatch.setattr(LLMClient, "_mock_tailoring", staticmethod(lambda user: {
+        "summary": None, "skills_order": [], "highlights": [], "selected_evidence_ids": [],
+        "role_updates": [{"role_index": 0, "bullets": [{"text": rewrite, "evidence_ids": []}]}]}))
     assert client.put("/api/profile", json={"name": "Rohan Roy", "headline": "AI Engineering Leader",
                                             "master_resume": MASTER}).status_code == 200
     tag = uuid.uuid4().hex[:8]
@@ -106,12 +113,12 @@ def test_tailoring_keeps_structure_and_revert_restores_master_bullet():
     for header in ("### AI Consultant | Flow AI", "### Software Development Engineer 3 | Zendrive (India)",
                    "## Projects", "### B.Tech, Computer Science"):
         assert header in markdown
-    assert "- Built and operated production backend and AI systems." in markdown
+    assert f"- {rewrite}" in markdown
     bullet = next(e for e in resume["edits"] if e["section"].startswith("EXPERIENCE"))
     assert bullet["section"] == "EXPERIENCE · AI Consultant · Flow AI"
     reverted = client.patch(f"/api/resumes/{resume['id']}/edits/{bullet['index']}", json={"status": "reverted"}).json()
     restored = reverted["resume"]["markdown"]
-    assert "Built and operated production backend" not in restored
+    assert rewrite not in restored
     assert "- Built production AI agents adopted by 100+ brands" in restored  # master bullets come back
     docx = client.get(f"/api/jobs/{job['id']}/resume.docx")
     pdf = client.get(f"/api/jobs/{job['id']}/resume.pdf")

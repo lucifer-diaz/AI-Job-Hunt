@@ -13,3 +13,21 @@ def test_health_and_dashboard():
     r = client.get('/')
     assert r.status_code == 200
     assert 'Job Hunt OS' in r.text
+
+
+def test_the_asset_version_changes_when_any_script_changes():
+    """Regression: resume_data.js was missing from a hand-kept list, so its changes never reached browsers."""
+    import os
+    from pathlib import Path
+
+    import app.main as main
+
+    static = Path(main.__file__).parent / "static"
+    before = main._asset_version()
+    target = static / "resume_data.js"
+    stat = target.stat()
+    try:
+        os.utime(target, (stat.st_atime, stat.st_mtime + 10_000))
+        assert main._asset_version() != before
+    finally:
+        os.utime(target, (stat.st_atime, stat.st_mtime))

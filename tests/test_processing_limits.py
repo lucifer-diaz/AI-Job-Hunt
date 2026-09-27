@@ -177,8 +177,9 @@ def test_a_cadence_holds_an_account_back_until_it_is_due(owner, ready_account):
                completed=now - timedelta(minutes=4))
     with SessionLocal() as db:
         assert ranker.next_run_at(db, owner, now) is not None, "five minutes into a thirty minute cadence"
-        ready, _, waiting = ranker.accounts(db, now)
-        assert owner not in ready
+        ready, auto, waiting = ranker.accounts(db, now)
+        assert owner not in auto, "automatic ranking waits for the cadence"
+        assert owner in ready, "a ranking the user asks for does not"
         assert "Waiting for this account's next ranking run" in waiting
 
     with SessionLocal() as db:  # once the wait has passed
@@ -186,8 +187,29 @@ def test_a_cadence_holds_an_account_back_until_it_is_due(owner, ready_account):
             {"started_at": now - timedelta(minutes=45)})
         db.commit()
         assert ranker.next_run_at(db, owner, now) is None
-        ready, _, _ = ranker.accounts(db, now)
-        assert owner in ready
+        ready, auto, _ = ranker.accounts(db, now)
+        assert owner in ready and owner in auto
+
+
+def test_a_ranking_you_ask_for_neither_waits_for_the_cadence_nor_resets_it(owner, ready_account):
+    """Regression: a job ranked by hand sat "queued" for up to the whole cadence (two hours), and once it ran it
+    pushed the next automatic run back by another cadence."""
+    set_limits(ranking_interval_minutes=120)
+    now = utcnow()
+    queue_jobs(owner, 1)  # the job waiting to be ranked
+    queue_jobs(owner, 1, status="COMPLETED", started=now - timedelta(minutes=30),
+               completed=now - timedelta(minutes=29))  # an automatic run half an hour ago
+    with SessionLocal() as db:
+        ready, auto, _ = ranker.accounts(db, now)
+        assert owner in ready and owner not in auto, "requested rankings may run; automatic ones wait"
+        automatic_due = ranker.next_run_at(db, owner, now)
+        db.query(JobRankingTask).update({"force": True, "started_at": now - timedelta(minutes=1)})
+        db.add(JobRankingTask(user_id=owner, job_id=db.scalar(select(Job.id).where(Job.user_id == owner)),
+                              status="COMPLETED", reason="new", attempt_count=1, force=False,
+                              started_at=now - timedelta(minutes=30), completed_at=now - timedelta(minutes=29),
+                              created_at=now - timedelta(minutes=31)))
+        db.commit()
+        assert ranker.next_run_at(db, owner, now) == automatic_due, "the hand-started ranking did not move it"
 
 
 def test_no_cadence_means_every_server_pass(owner, ready_account):
@@ -274,3 +296,17 @@ def test_the_tracker_endpoint_carries_the_progress_to_the_screen(owner):
     out = client.get("/api/ranking/tracker").json()
     assert out["concurrency"] >= 1 and "in_flight" in out
     assert {"queue_position", "stage", "percent", "eta_seconds"} <= set(out["active"][0])
+
+
+def test_the_tracker_times_automatic_rankings_from_the_next_automatic_run(owner, ready_account):
+    set_limits(ranking_interval_minutes=120)
+    now = utcnow()
+    queue_jobs(owner, 1, status="COMPLETED", started=now - timedelta(minutes=30), completed=now - timedelta(minutes=29))
+    automatic, requested = queue_jobs(owner, 2)
+    with SessionLocal() as db:
+        db.query(JobRankingTask).filter(JobRankingTask.job_id == requested).update({"force": True})
+        db.commit()
+        rows = {t["job_id"]: t for t in ranker.tracker(db, owner, now)["active"]}
+    assert rows[automatic]["stage_label"] == "Next automatic run"
+    assert 89 * 60 <= rows[automatic]["eta_seconds"] <= 91 * 60 + 600, "about 90 minutes away, not 'starting next'"
+    assert rows[requested]["stage_label"] != "Next automatic run", "a requested ranking does not wait for it"

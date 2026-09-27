@@ -1,0 +1,12 @@
+{
+  "worker": "FOLLOWUP", "prompt": "followup",
+  "input": {"resume": "Reduced production incidents by 45% across Kafka pipelines",
+            "application": {"status": "applied", "applied_at": "2026-09-10"},
+            "recruiters": [{"name": "Priya", "email": "", "phone": ""}]},
+  "must_include": ["never state a fact that is not provided", "Priya"],
+  "must_exclude": ["hours_old", "JOB DESCRIPTION", "candidate_fit_score"],
+  "valid_output": {"draft": "Hi Priya, I wanted to follow up on my application for the Staff Platform Engineer role.", "evidence_ids": []},
+  "prohibited_claims": ["interview", "PHP", "Java"],
+  "invalid_outputs": [
+    {"name": "reviewer-shaped", "output": {"review_score": 90, "recommendation": "PASS"}, "reason": "POSSIBLE_CROSS_WORKER_OUTPUT"}]
+}

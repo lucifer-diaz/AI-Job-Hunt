@@ -225,6 +225,24 @@ def test_apify_usage_comes_from_what_apify_reported(owner):
     assert [a["actor_id"] for a in out["by_actor"]] == ["openclawai/job-board-scraper"]
 
 
+def test_runs_of_multi_location_actors_group_by_their_locations(owner):
+    """Regression: an actor whose input takes a list of locations crashed the summary (and with it the AI
+    Optimization Advisor) with "unhashable type: 'list'"."""
+    search_run(owner, input_json={"location": ["Bengaluru", "Singapore"]}, completed_at=utcnow())
+    search_run(owner, input_json={"location": "Bengaluru"}, completed_at=utcnow())
+    search_run(owner, input_json={"location": {"city": "Pune", "country": "India"}}, completed_at=utcnow())
+    search_run(owner, input_json={}, location="Remote", completed_at=utcnow())
+
+    out = client.get("/api/monitoring/apify/summary").json()
+    assert {row["location"]: row["runs"] for row in out["by_location"]} == {
+        "Bengaluru, Singapore": 1, "Bengaluru": 1, "Pune, India": 1, "Remote": 1}
+    assert {card["location"] for card in out["recent_runs"]} >= {"Bengaluru, Singapore", "Pune, India"}
+    with SessionLocal() as db:
+        now = utcnow()
+        aggregates = external_monitoring.advisor_aggregates(db, owner, now - timedelta(days=1), now + timedelta(days=1))
+    assert aggregates is not None
+
+
 def test_apify_usage_that_was_not_reported_stays_unknown(owner):
     search_run(owner, item_count=10, created_jobs=1, completed_at=utcnow())
     out = client.get("/api/monitoring/apify/summary").json()

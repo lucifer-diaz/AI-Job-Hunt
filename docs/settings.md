@@ -12,6 +12,12 @@ Profile, preference, AI, and workflow saves refresh the workspace summary so the
 
 The UI saves changed fields only. Pending chip input is committed before saving, including locations with commas. Valid numeric zero values count toward completeness. Uploading or selecting a primary resume warns before replacing unsaved master text. Deleting the only uploaded resume preserves master text and any draft; confirmed drafts are cleared only when the backend promotes a replacement. Parsing evidence requires saved text. Advanced AI overrides and master text are collapsible.
 
+`app/static/ai_models.js` owns the AI models section (LiteLLM connection, model registry, tiers, worker
+assignments, auto router, preview/apply, version history; see the README's "LiteLLM & AI Model Configuration"). It
+loads after `settings.js`, registers its renderer and actions in settings' tables, and talks only to
+`/api/settings/ai`. Its edits are saved to the draft configuration immediately and reach workers only through
+Preview → Apply; the direct-provider editor above lives under its Advanced tab.
+
 `app/static/resume_data.js` owns the Resume Data section (structured resume review, editing and verification; see
 the README's "Resume Data & Verification"). It loads after `settings.js`. Its section edit draft counts as the
 `resume-data` form, so leaving Settings, switching tabs or cancelling warns before discarding it.

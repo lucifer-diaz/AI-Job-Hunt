@@ -27,8 +27,13 @@ def owner():
 
 @pytest.fixture(autouse=True)
 def clean(owner):
+    from app.models import WorkflowTransition
+
     with SessionLocal() as db:
-        db.execute(delete(Job).where(Job.user_id == owner, Job.source.in_(("apify:naukri", "apify:bayt", "manual"))))
+        ids = select(Job.id).where(Job.user_id == owner, Job.source.in_(("apify:naukri", "apify:bayt", "manual")))
+        # SQLite does not enforce the cascade: without this a reused job id inherits another job's history.
+        db.execute(delete(WorkflowTransition).where(WorkflowTransition.job_id.in_(ids)))
+        db.execute(delete(Job).where(Job.id.in_(ids)))
         db.commit()
     yield
 
@@ -164,3 +169,18 @@ def test_the_tracker_counts_what_is_waiting_on_a_description(owner):
     with SessionLocal() as db:
         counts = ranker.tracker(db, owner)["counts"]
     assert counts["no_description"] == 3
+
+
+# ───────────── re-ranking is held back too ─────────────
+
+def test_a_ranked_job_without_a_description_is_not_re_ranked(owner):
+    """prepare() only guards a first ranking; a re-rank request must not score a title either."""
+    job_id = make_job(owner, "", state=S.RANKED)
+    with SessionLocal() as db:
+        job = db.get(Job, job_id)
+        why = ranker.queue_job(db, job, policy=RankingPolicy(minimum_fit_score=70, minimum_confidence=0.6),
+                               actor="test", reason="user_request", force=True)
+        db.commit()
+        db.refresh(job)
+        assert why == ranker.NO_DESCRIPTION
+        assert job.state is S.RANKED, "the job keeps its state; nothing was queued"

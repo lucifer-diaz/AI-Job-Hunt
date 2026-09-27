@@ -24,7 +24,8 @@ dependencies = [
   "alembic>=1.13,<2",
   "cryptography>=42,<51",
   "tzdata>=2024.1",
-  "mcp>=1.12,<2"
+  "mcp>=1.12,<2",
+  "pyyaml>=6.0,<7"
 ]
 
 [project.optional-dependencies]
@@ -33,7 +34,10 @@ dev = ["pytest>=8.4,<9", "pytest-asyncio>=1.1,<2", "ruff>=0.12,<1", "pytest-cov>
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
-markers = ["strict_resume_policy: run with the production CandidatePolicy (verified resume facts only)"]
+markers = [
+    "strict_resume_policy: run with the production CandidatePolicy (verified resume facts only)",
+    "strict_ranking: tailoring requires a real completed FitAnalysis (no test stand-in)",
+]
 
 [tool.ruff]
 line-length = 100

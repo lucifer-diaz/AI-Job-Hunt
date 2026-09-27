@@ -64,13 +64,26 @@ class ReviewDecision:
 
 
 def normalize_backend_review(result: dict[str, Any]) -> dict[str, Any]:
-    """Give a backend model review the shared field names, keeping everything it returned."""
+    """A backend ReviewResult (app.prompts.contracts) as stored notes, with the field names the Tailor screen reads.
+
+    reject_reasons and improvements are derived from the review's own lists; nothing is inferred beyond them. Older
+    stored reviews (approve / revise / reject) are mapped onto PASS / RETAILOR / SKIP."""
     score = result.get("review_score", result.get("score", 0))
     recommendation = str(result.get("recommendation") or "").strip()
     shared = BACKEND_RECOMMENDATIONS.get(recommendation.lower(), recommendation.upper())
     if shared not in RECOMMENDATIONS:
         shared = "RETAILOR" if result.get("reject_reasons") or result.get("unsupported_claims") else "PASS"
-    return {**result, "score": score, "review_score": score, "recommendation": shared, "source": "backend"}
+    reject = result.get("reject_reasons")
+    if reject is None:
+        reject = [*(result.get("unsupported_claims") or []), *(result.get("overstated_claims") or [])]
+    missing = result.get("missing_requirements")
+    if missing is None:
+        missing = result.get("unaddressed_requirements") or []
+    improvements = result.get("improvements")
+    if improvements is None:
+        improvements = [*missing, *(result.get("risks") or [])]
+    return {**result, "score": score, "review_score": score, "recommendation": shared, "reject_reasons": reject,
+            "missing_requirements": missing, "improvements": improvements, "source": "backend"}
 
 
 def latest_variant(db: Session, job_id: int) -> ResumeVariant | None:

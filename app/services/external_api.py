@@ -274,6 +274,9 @@ def _log_notable(entry: dict[str, Any]) -> None:
     slow = (entry["latency_ms"] or 0) >= max(1, get_settings().external_api_slow_call_ms)
     if not failed and not slow:
         return
+    if entry.get("service") == "llm" and get_settings().llm_telemetry_enabled:
+        # A model call (app.services.llm): llm_telemetry.log_call writes its line, with the model and request row.
+        return
     what = f"{entry['provider']} {entry['operation'] or entry['endpoint_path'] or ''}".strip()
     system_log.log_event(
         level="ERROR" if failed else "WARNING",

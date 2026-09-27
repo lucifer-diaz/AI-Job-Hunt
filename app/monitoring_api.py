@@ -42,6 +42,7 @@ def monitoring_filter(
     workflow_type: str | None = Query(None, max_length=30),
     job_id: int | None = None,
     entity_id: int | None = None,
+    worker_type: str | None = Query(None, max_length=40),
     all_accounts: bool = False,
 ) -> monitoring.MonitoringFilter:
     if all_accounts and not user.is_admin:
@@ -53,7 +54,8 @@ def monitoring_filter(
         workflow_type, entity_id = "job", job_id
     return monitoring.MonitoringFilter(start=begin, end=finish, user_id=None if all_accounts else user.id,
                                        provider=provider, model=model, stage=stage, prompt_version=prompt_version,
-                                       status=status, workflow_type=workflow_type, entity_id=entity_id)
+                                       status=status, workflow_type=workflow_type, entity_id=entity_id,
+                                       worker_type=worker_type)
 
 
 Filter = Depends(monitoring_filter)
@@ -265,6 +267,40 @@ def logs(user: CurrentUser = Depends(current_user),
                                        category=category, level=level, provider=(provider or "").upper() or None,
                                        workflow=workflow, trace_id=trace_id, search=search, page=page,
                                        per_page=per_page)}
+
+
+class CaptureIn(BaseModel):
+    enabled: bool
+
+
+def _capture_state(db: Session, user_id: int) -> dict[str, Any]:
+    from app.services.llm_telemetry import CAPTURE_PREFERENCE
+    from app.settings import get_settings
+
+    saved = bool(((settings_for(db, user_id).preferences or {}).get("monitoring") or {}).get(CAPTURE_PREFERENCE))
+    return {"enabled": saved, "server_wide": get_settings().llm_prompt_debug,
+            "retention_days": get_settings().llm_prompt_debug_retention_days}
+
+
+@router.get("/capture")
+def capture_get(user: CurrentUser = Depends(current_user), db: Session = Depends(get_user_db)):
+    """Whether this account's LLM requests keep their full prompt and response (off unless turned on)."""
+    return _capture_state(db, user.id)
+
+
+@router.put("/capture")
+def capture_put(payload: CaptureIn, user: CurrentUser = Depends(current_user), db: Session = Depends(get_user_db)):
+    """Turn full prompt and response capture on or off for this account. Captured text is redacted and cleared
+    after llm_prompt_debug_retention_days; turning capture off does not erase what was already captured."""
+    from app.services.llm_telemetry import CAPTURE_PREFERENCE, forget_capture_setting
+
+    row = lock_settings_row(db, settings_for(db, user.id))
+    preferences = dict(row.preferences or {})
+    row.preferences = {**preferences, "monitoring": {**(preferences.get("monitoring") or {}),
+                                                     CAPTURE_PREFERENCE: payload.enabled}}
+    db.commit()
+    forget_capture_setting(user.id)
+    return _capture_state(db, user.id)
 
 
 @router.get("/logs/{log_id}")

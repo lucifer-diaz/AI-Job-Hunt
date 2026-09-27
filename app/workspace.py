@@ -74,10 +74,12 @@ from app.services.contacts import (
 )
 from app.services.exports import DOCX_MEDIA_TYPE, markdown_to_docx, packet_filename, packet_slug
 from app.services.external_api import external_client
+from app.services.external_monitoring import run_location
 from app.services.knowledge import question_key
 from app.services.lifecycle import WorkflowState as S
 from app.services.lifecycle import can_transition
 from app.services.llm import LLMCall, LLMClient
+from app.services.locations import location_facets, location_key
 from app.services.saved_searches import SCHEDULE_KINDS, next_due, schedule_label, schedule_problems
 from app.services.sources import (
     apify_client,
@@ -191,11 +193,17 @@ def job_card(job: Job) -> dict:
         "id": job.id, "title": job.title, "company": job.company, "location": job.location, "url": job.url,
         "source": job.source, "board": board_label(job.source),
         "fit": None if job.fit_score is None else round(job.fit_score),
+        # "posted" is when *we* found the job (kept for older screens); the employer's own date is posted_at, and
+        # stays null when the board did not give one (posted_date_raw keeps whatever text it did give).
         "status": job.status, "discovered_at": job.discovered_at.isoformat(), "posted": ago(job.discovered_at),
+        "posted_at": job.posted_at.isoformat() if job.posted_at else None,
+        "posted_ago": ago(job.posted_at) if job.posted_at else None, "posted_raw": job.posted_date_raw or None,
         "matches": analysis.get("strong_matches") or [], "gaps": analysis.get("gaps") or [],
         "missing": analysis.get("must_have_missing") or [], "keywords": analysis.get("keywords") or [],
         "summary": analysis.get("summary") or "", "strategy": analysis.get("application_strategy") or "",
         "snippet": (job.description or "")[:360], "agency": is_agency(job.company),
+        # Ranking waits for a real posting (app.services.ranker.missing_description); the UI asks for one.
+        "needs_description": ranker.missing_description(job),
         "search_run_id": job.search_run_id, "application_id": app.id if app else None,
         "application_status": app.status if app else None, "stage": app.stage if app else None,
         "rejection": rejection_card(job),
@@ -432,19 +440,42 @@ def _dedupe_key(job: Job) -> str:
     return re.sub(r"[^a-z0-9]+", " ", f"{job.company}|{job.title}".lower()).strip()
 
 
+# Discovery's date filter: how far back "found" (discovered_at) or "posted" (the employer's date) may be.
+DATE_WINDOWS = {"24h": timedelta(hours=24), "3d": timedelta(days=3), "7d": timedelta(days=7),
+                "15d": timedelta(days=15), "30d": timedelta(days=30)}
+
+
 @router.get("/api/jobs/search")
-def jobs_search(q: str = "", min_fit: int = 0, board: str = "all", stage: str = "all", sort: str = "fit",
+def jobs_search(q: str = "", min_fit: int = 0, board: str = "all", location: str = "all", stage: str = "all",
+                description: str = "all", sort: str = "fit", within: str = "", date_field: str = "found",
+                include_applied: bool = False,
                 page: int = Query(1, ge=1), per_page: int = Query(25, ge=1, le=200), queue: bool = False,
                 hide_agencies: bool = False, hide_reposts: bool = False, keywords: str = "",
                 ids_only: bool = False, db: Session = Depends(get_user_db)):
+    from app.services import job_description  # local import, as app.services.sources does
+
+    if description not in ("all", "") and description not in job_description.DESCRIPTION_STATES:
+        raise HTTPException(422, f"Unknown description filter: {description}")
+    if within and within not in DATE_WINDOWS:
+        raise HTTPException(422, f"Unknown date window: {within}")
+    if date_field not in ("found", "posted"):
+        raise HTTPException(422, "date_field must be found or posted")
+    cutoff = utcnow() - DATE_WINDOWS[within] if within else None
+    # Jobs you already applied to stay out of Discovery unless you ask for them (the Applied stage, or the box).
+    show_applied = include_applied or stage in SUBMITTED_STATUSES
+    applied_ids = set() if show_applied else set(db.scalars(
+        select(Application.job_id).where(Application.applied_at.is_not(None))).all())
     query = triage_query(db) if queue else select(Job)
     jobs = db.scalars(query.order_by(Job.id)).all()
+    parse_status = job_description.latest_parse_statuses(db)
+    described = {job.id: job_description.description_state(job, parse_status.get(job.id)) for job in jobs}
     excluded = excluded_companies(db)
     total_all = len(jobs)
     needle = q.lower().strip()
     words = [w.strip().lower() for w in keywords.split(",") if w.strip()]
     seen: set[str] = set()
     rows = []
+    applied_hidden = 0
     for job in jobs:
         key = _dedupe_key(job)
         repost = key in seen
@@ -455,6 +486,18 @@ def jobs_search(q: str = "", min_fit: int = 0, board: str = "all", stage: str = 
             continue
         if board != "all" and board_label(job.source) != board:
             continue
+        if location not in ("all", "") and location_key(job.location) != location:
+            continue
+        if description not in ("all", "") and described[job.id] != description:
+            continue
+        if not show_applied and (job.status in SUBMITTED_STATUSES or job.id in applied_ids):
+            applied_hidden += 1
+            continue
+        if cutoff is not None:
+            # A posting date the board never gave is unknown, so it cannot be "within" any window.
+            when = job.discovered_at if date_field == "found" else job.posted_at
+            if when is None or when < cutoff:
+                continue
         if stage == "unranked":  # not a status: any job without a fit score yet
             if job.fit_score is not None:
                 continue
@@ -472,18 +515,28 @@ def jobs_search(q: str = "", min_fit: int = 0, board: str = "all", stage: str = 
         rows.append(job)
     if sort == "new":
         rows.sort(key=lambda j: j.discovered_at, reverse=True)
+    elif sort == "posted":  # newest posting first; jobs without a posting date last
+        rows.sort(key=lambda j: (j.posted_at is None, -(j.posted_at.timestamp() if j.posted_at else 0), -j.id))
     elif sort == "company":
         rows.sort(key=lambda j: j.company.lower())
     else:
         rows.sort(key=lambda j: (j.fit_score is None, -(j.fit_score or 0), -j.id))
     total = len(rows)
     if ids_only:  # "select all matching" across every page
-        return {"ids": [j.id for j in rows[:5000]], "total": total}
+        chosen = rows[:5000]
+        return {"ids": [j.id for j in chosen], "total": total,
+                "ranked_ids": [j.id for j in chosen if j.fit_score is not None]}
     pages = max(1, -(-total // per_page))
     page = min(page, pages)
     boards = sorted({board_label(j.source) for j in jobs})
-    return {"items": [job_card(j) for j in rows[(page - 1) * per_page: page * per_page]], "total": total,
-            "total_all": total_all, "page": page, "pages": pages, "per_page": per_page, "boards": boards}
+    counts = Counter(described.values())
+    return {"items": [{**job_card(j), "description_state": described[j.id]}
+                      for j in rows[(page - 1) * per_page: page * per_page]], "total": total,
+            "description_states": [[key, name, counts.get(key, 0)]
+                                   for key, name in job_description.DESCRIPTION_STATES.items()],
+            "total_all": total_all, "applied_hidden": applied_hidden,
+            "page": page, "pages": pages, "per_page": per_page, "boards": boards,
+            "locations": location_facets([j.location for j in jobs])}
 
 
 class TriageIn(BaseModel):
@@ -580,7 +633,11 @@ def job_detail(job_id: int, db: Session = Depends(get_user_db)):
         words = {w for w in re.findall(r"[a-z0-9]{3,}", str(gap).lower())}
         partial = next((e for e in evidence if words & set(re.findall(r"[a-z0-9]{3,}", f"{e.claim} {' '.join(e.skills or [])}".lower()))), None)
         gap_notes.append({"gap": str(gap), "partial": f"{partial.company or 'Evidence'}: {partial.claim}" if partial else ""})
+    from app.services import job_description  # local import, as app.services.sources does
+
+    parse_status = job_description.latest_parse_statuses(db, [job.id]).get(job.id)
     return {**job_card(job), "description": job.description, "fit_analysis": job.fit_analysis or {},
+            "description_state": job_description.description_state(job, parse_status),
             "rank_pct": rank, "wizard": [{"label": l, "done": d, "meta": m} for l, d, m in steps],
             "gap_notes": gap_notes, "notes": app.notes if app else "",
             "resume_id": resume.id if resume else None}
@@ -609,6 +666,8 @@ def _safe_public_url(url: str) -> None:
 
 
 def extract_job_posting(html: str) -> dict:
+    """Title, company, location and description from a posting page. `description_source` says where the text came
+    from: "posting" is the page's own JobPosting data, "page_text" is every visible word on it (menus included)."""
     soup = BeautifulSoup(html, "html.parser")
     found: dict = {}
     for script in soup.find_all("script", type="application/ld+json"):
@@ -631,11 +690,25 @@ def extract_job_posting(html: str) -> dict:
     found.setdefault("title", "")
     found["title"] = found["title"] or meta("og:title") or (soup.title.string.strip() if soup.title and soup.title.string else "")
     found["company"] = found.get("company") or meta("og:site_name")
+    found["description_source"] = "posting" if found.get("description") else "page_text"
     if not found.get("description"):
         for tag in soup(["script", "style", "nav", "footer", "header"]):
             tag.decompose()
-        found["description"] = soup.get_text("\n", strip=True)[:30000]
+        found["description"] = soup.get_text("\n", strip=True)[:MAX_DESCRIPTION_CHARS]
     return found
+
+
+MAX_DESCRIPTION_CHARS = 30000
+
+
+def fetch_job_posting(url: str, *, operation: str = "page_fetch") -> dict:
+    """Fetch a public posting page and extract it. Raises HTTPException (422) for an unusable URL."""
+    _safe_public_url(url)
+    with external_client("WEB", service="job_posting", operation=operation, timeout=20,
+                         follow_redirects=True) as client:
+        resp = client.get(url)
+        resp.raise_for_status()
+    return extract_job_posting(resp.text)
 
 
 @router.post("/api/jobs/from-url")
@@ -644,13 +717,8 @@ def job_from_url(payload: JobUrlIn, db: Session = Depends(get_user_db)):
             "description": payload.description}
     fetch_error = ""
     if not (data["title"] and data["company"] and data["description"]):
-        _safe_public_url(payload.url)
         try:
-            with external_client("WEB", service="job_posting", operation="page_fetch", timeout=20,
-                                 follow_redirects=True) as client:
-                resp = client.get(payload.url)
-                resp.raise_for_status()
-            extracted = extract_job_posting(resp.text)
+            extracted = fetch_job_posting(payload.url)
             data = {k: data[k] or extracted.get(k, "") for k in data}
         except httpx.HTTPError as exc:
             fetch_error = f"Could not fetch the posting ({exc.__class__.__name__})"
@@ -660,8 +728,60 @@ def job_from_url(payload: JobUrlIn, db: Session = Depends(get_user_db)):
                                   "missing": missing, "extracted": data})
     ref = hashlib.sha256(payload.url.encode()).hexdigest()[:40]
     job, created = upsert_job(db, source="manual", source_ref=ref, title=data["title"], company=data["company"],
-                              location=data["location"], url=payload.url, description=data["description"] or data["title"])
+                              location=data["location"], url=payload.url, description=data["description"])
     return {"created": created, "job": job_card(job)}
+
+
+@router.post("/api/jobs/{job_id}/description/fetch")
+def fetch_job_description(job_id: int, db: Session = Depends(get_user_db)):
+    """Read the description from the job's posting URL. Nothing is saved: the text comes back as a draft the user
+    checks (a page without JobPosting data yields every word on it, menus and cookie notices included)."""
+    job = get_job(db, job_id)
+    if not (job.url or "").strip():
+        raise HTTPException(422, "This job has no posting URL to read from — paste the description instead")
+    try:
+        found = fetch_job_posting(job.url, operation="description_fetch")
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(422, f"The posting page answered {exc.response.status_code} — many boards block "
+                                 "automated reads, so paste the description instead") from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(422, f"Could not fetch the posting ({exc.__class__.__name__}) — paste the description "
+                                 "instead") from exc
+    text = (found.get("description") or "").strip()
+    if len(text) < get_settings().ranking_min_description_chars:
+        raise HTTPException(422, "The posting page has no readable description (it is probably built in the "
+                                 "browser) — open the posting and paste the description instead")
+    return {"description": text, "source": found["description_source"]}
+
+
+class JobDescriptionIn(BaseModel):
+    description: str = Field(max_length=MAX_DESCRIPTION_CHARS)
+
+
+@router.put("/api/jobs/{job_id}/description")
+def save_job_description(job_id: int, payload: JobDescriptionIn, request: Request, background: BackgroundTasks,
+                         db: Session = Depends(get_user_db)):
+    """Set the posting text by hand (typed, pasted or fetched), then parse and rank it."""
+    from app.services import job_description  # local import, as app.services.sources does
+
+    job = job_description.lock_job(db, job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+    text = payload.description.strip()
+    floor = get_settings().ranking_min_description_chars
+    if len(text) < floor:
+        raise HTTPException(422, f"That is too short to rank against — paste the full description (at least {floor} "
+                                 "characters)")
+    job.description = text
+    job_description.normalize_job(db, job)
+    job_description.queue_parse(db, job, reason="description_changed")
+    ranker.reopen_for_description(db, job, actor=f"user:{db.info['user_id']}")
+    # A job ranked without a description (or with a different one) is ranked again against the new text.
+    why = ranker.queue_job(db, job, policy=ranker.policy_for(db, job.user_id), actor=f"user:{db.info['user_id']}",
+                           reason="description_changed", force=True)
+    db.commit()
+    run_soon(background, request.app, "ranking")
+    return {"job": job_card(job), "ranking_queued": why is None, "ranking_skipped": why}
 
 
 class CustomActorIn(BaseModel):
@@ -874,7 +994,7 @@ def search_profile_run(db: Session = Depends(get_user_db)):
     except Exception as exc:
         raise HTTPException(400, str(exc)) from exc
     return {"runs": [{"id": r.id, "status": r.status, "actor_id": getattr(r, "actor_id", ""),
-                      "location": (r.input_json or {}).get("location", "")} for r in runs], "warnings": warnings}
+                      "location": run_location(r)} for r in runs], "warnings": warnings}
 
 
 # ───────────── saved search setups ─────────────
@@ -1037,7 +1157,7 @@ def saved_search_run(setup_id: int, db: Session = Depends(get_user_db)):
     except Exception as exc:
         raise HTTPException(400, str(exc)) from exc
     return {"runs": [{"id": r.id, "status": r.status, "actor_id": getattr(r, "actor_id", ""),
-                      "location": (r.input_json or {}).get("location", "")} for r in runs],
+                      "location": run_location(r)} for r in runs],
             "warnings": warnings, "setup": saved_search_card(setup)}
 
 
@@ -1130,10 +1250,11 @@ PACKET_SORTS = {
 
 
 def filter_packet_rows(rows: list[dict], *, q: str, min_fit: int, min_review: int, board: str, status: str,
-                       sort: str, status_filters: dict, with_facets: bool):
+                       sort: str, status_filters: dict, with_facets: bool, location: str = "all"):
     """Filter and sort Tailor or Approvals rows. The unfiltered order is kept for sort="" (the screen's default).
 
-    Returns the plain list unless `with_facets`, which adds totals and the boards present before filtering.
+    Returns the plain list unless `with_facets`, which adds totals and the boards and locations present before
+    filtering.
     """
     if status not in ("all", "") and status not in status_filters:
         raise HTTPException(422, f"Unknown status filter: {status}")
@@ -1145,17 +1266,19 @@ def filter_packet_rows(rows: list[dict], *, q: str, min_fit: int, min_review: in
            and (not min_fit or (r["fit"] or 0) >= min_fit)
            and (not min_review or (r["reviewer_score"] or 0) >= min_review)
            and (board in ("all", "") or r["board"] == board)
+           and (location in ("all", "") or location_key(r["location"]) == location)
            and (status in ("all", "") or status_filters[status](r))]
     if sort in PACKET_SORTS:
         out.sort(key=PACKET_SORTS[sort], reverse=sort == "new")
     if not with_facets:
         return out
-    return {"items": out, "total": len(out), "total_all": len(rows), "boards": sorted({r["board"] for r in rows})}
+    return {"items": out, "total": len(out), "total_all": len(rows), "boards": sorted({r["board"] for r in rows}),
+            "locations": location_facets([r["location"] for r in rows])}
 
 
 @router.get("/api/tailor/queue")
-def tailor_queue(q: str = "", min_fit: int = 0, min_review: int = 0, board: str = "all", status: str = "all",
-                 sort: str = "fit", with_facets: bool = False, db: Session = Depends(get_user_db)):
+def tailor_queue(q: str = "", min_fit: int = 0, min_review: int = 0, board: str = "all", location: str = "all",
+                 status: str = "all", sort: str = "fit", with_facets: bool = False, db: Session = Depends(get_user_db)):
     # AI-ranked jobs only reach Tailor once you have confirmed the shortlist in triage.
     jobs = db.scalars(select(Job).where(or_(and_(Job.status.in_(AWAITING_TAILORING_STATUSES),
                                                  Job.triaged_at.is_not(None)),
@@ -1181,7 +1304,8 @@ def tailor_queue(q: str = "", min_fit: int = 0, min_review: int = 0, board: str 
                      "review_decision": (resume.reviewer_notes or {}).get("decision") if resume else None,
                      "review_reasons": ((resume.reviewer_notes or {}).get("decision_reasons") or [])[:3] if resume else []})
     return filter_packet_rows(rows, q=q, min_fit=min_fit, min_review=min_review, board=board, status=status, sort=sort,
-                              status_filters=TAILOR_STATUS_FILTERS, with_facets=with_facets)
+                              status_filters=TAILOR_STATUS_FILTERS, with_facets=with_facets,
+                              location=location)
 
 
 def packet(db: Session, job: Job) -> dict:
@@ -1246,8 +1370,8 @@ def answers_for(db: Session) -> list[KnowledgeAnswer]:
 
 
 @router.get("/api/approvals")
-def approvals(q: str = "", min_fit: int = 0, min_review: int = 0, board: str = "all", status: str = "all",
-              sort: str = "default", with_facets: bool = False, db: Session = Depends(get_user_db)):
+def approvals(q: str = "", min_fit: int = 0, min_review: int = 0, board: str = "all", location: str = "all",
+              status: str = "all", sort: str = "default", with_facets: bool = False, db: Session = Depends(get_user_db)):
     jobs = db.scalars(select(Job).where(Job.status.in_(("tailored", "pending_approval", "approved", "rejected")))
                       .order_by(desc(Job.id))).all()
     rows = []
@@ -1261,7 +1385,8 @@ def approvals(q: str = "", min_fit: int = 0, min_review: int = 0, board: str = "
                      "approval_override": bool(app.approval_override) if app else False})
     rows.sort(key=lambda r: (not r["waiting"], r["status"] == "approved"))
     return filter_packet_rows(rows, q=q, min_fit=min_fit, min_review=min_review, board=board, status=status, sort=sort,
-                              status_filters=APPROVAL_STATUS_FILTERS, with_facets=with_facets)
+                              status_filters=APPROVAL_STATUS_FILTERS, with_facets=with_facets,
+                              location=location)
 
 
 @router.get("/api/approvals/{job_id}")
@@ -1783,6 +1908,17 @@ def parse_evidence(db: Session = Depends(get_user_db)):
 
 class EvidencePatchIn(BaseModel):
     verified: bool
+
+
+@router.get("/api/evidence/diagnostics")
+def evidence_diagnostics(db: Session = Depends(get_user_db)):
+    """Evidence whose employer or role disagrees with the resume item it came from. Read-only: nothing is corrected
+    here, and ERROR-level items are left out of tailoring until the candidate fixes them."""
+    from app.services.evidence_provenance import diagnose
+
+    issues = [issue.as_dict() for issue in diagnose(db, get_profile(db).user_id)]
+    return {"issues": issues, "held_back_from_generation": sorted({i["evidence_id"] for i in issues
+                                                                    if i["severity"] == "ERROR"})}
 
 
 @router.patch("/api/evidence/{evidence_id}")

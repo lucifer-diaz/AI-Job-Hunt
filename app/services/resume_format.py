@@ -285,8 +285,10 @@ def order_skills(lines: list[str], top_skills: list[str]) -> list[str]:
 
 def render_resume(parsed: ParsedResume, *, name: str = "", headline: str = "", summary: str | None = None,
                   top_skills: list[str] | None = None, role_bullets: dict[int, list[str]] | None = None,
-                  highlights: list[str] | None = None) -> str:
-    role_bullets = role_bullets or {}
+                  highlights: list[str] | None = None, role_headings: dict[int, dict[str, str]] | None = None) -> str:
+    """`role_headings` replaces a role's title and employer (the user's verified corrections); its location and
+    dates stay as the master resume wrote them."""
+    role_bullets, role_headings = role_bullets or {}, role_headings or {}
     out = [f"# {parsed.name or name or 'Candidate'}"]
     out.extend(parsed.header_lines or ([headline] if headline else []))
     sections = list(parsed.sections)
@@ -306,7 +308,10 @@ def render_resume(parsed: ParsedResume, *, name: str = "", headline: str = "", s
             out.extend(section.lines)
             for index, role in enumerate(section.roles):
                 bullets = [b for b in role_bullets.get(index, []) if b and b.strip()] or role.bullets
-                out += ["", f"### {role.full_header}", *[f"- {to_plain(b).strip()}" for b in bullets]]
+                fix = role_headings.get(index)
+                header = (" | ".join(p for p in (fix["title"], fix["company"], role.location, role.dates) if p)
+                          if fix else role.full_header)
+                out += ["", f"### {header}", *[f"- {to_plain(b).strip()}" for b in bullets]]
             continue
         out.extend(section.lines)
     return "\n".join(out).strip() + "\n"

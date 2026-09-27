@@ -15,12 +15,13 @@ from sqlalchemy import desc, nulls_last, select
 from sqlalchemy.orm import Session
 
 from app.models import ConversationAction, Evidence, Job, JobRanking, ResumeVariant
+from app.prompts.common import prompt_profile
 from app.prompts.mcp_application import APPLICATION_RULES, MCP_APPLICATION_PROMPT_VERSION
-from app.prompts.common import profile_facts
 from app.prompts.mcp_review import MCP_REVIEW_PROMPT_VERSION, REVIEW_RULES
 from app.prompts.mcp_tailoring import MCP_TAILORING_PROMPT_VERSION, TAILORING_RULES
-from app.prompts.tailoring import FIT_ANALYSIS_DEFAULTS
+from app.prompts.tailoring import fit_analysis_input
 from app.services import apply_queue, conversation_actions, knowledge
+from app.services.context_builder import ContextError
 from app.services.ranker import policy_for, relevant_evidence
 from app.services.resume_format import parse_resume
 from app.services.review_results import ReviewIn, apply_review, latest_variant
@@ -94,9 +95,12 @@ def _latest_ranking(db: Session, job_id: int) -> JobRanking | None:
     return db.scalar(select(JobRanking).where(JobRanking.job_id == job_id).order_by(desc(JobRanking.version)).limit(1))
 
 
-def _fit_analysis(job: Job) -> dict[str, Any]:
-    analysis = job.fit_analysis or {}
-    return {"score": job.fit_score, **{key: analysis.get(key, default) for key, default in FIT_ANALYSIS_DEFAULTS.items()}}
+def _fit_analysis(db: Session, job: Job) -> dict[str, Any]:
+    """The Ranker's completed analysis as the tailoring component reads it: present fields only, no scores, never
+    an empty template. Raises ContextError(RANKING_REQUIRED) when the job has no completed analysis."""
+    from app.services.context_builder import completed_fit_analysis
+
+    return fit_analysis_input(completed_fit_analysis(db, job))
 
 
 def _evidence_dict(item: Evidence) -> dict[str, Any]:
@@ -116,7 +120,7 @@ def _evidence_for(db: Session, job: Job, cited: list[int]) -> list[dict[str, Any
 
 def _profile_payload(db: Session) -> tuple[Any, dict[str, Any]]:
     profile = get_profile(db)
-    return profile, profile_facts(profile, include_name=True)
+    return profile, prompt_profile(profile, include_name=True)  # facts about the person, not search settings
 
 
 def _require_resume(profile: Any) -> None:
@@ -172,10 +176,15 @@ def get_tailoring_context(db: Session, job_ids: list[int]) -> dict[str, Any]:
             continue
         ranking = _latest_ranking(db, job.id)
         analysis = job.fit_analysis or {}
+        try:
+            fit = _fit_analysis(db, job)
+        except ContextError as exc:  # the Tailor never works without the Ranker's analysis
+            jobs.append({"job_id": job_id, "error": str(exc)})
+            continue
         jobs.append({
             "job_id": job.id, "company": job.company, "role": job.title, "location": job.location,
             "job_description": (job.description or "")[:DESCRIPTION_LIMIT],
-            "fit_analysis": _fit_analysis(job),
+            "fit_analysis": fit,
             "relevant_evidence": _evidence_for(db, job, ranking.relevant_evidence_ids if ranking else []),
             "recommended_resume_focus": (ranking.recommended_resume_focus if ranking
                                          else analysis.get("recommended_resume_focus") or []),
@@ -296,7 +305,6 @@ def get_review_context(db: Session, job_ids: list[int]) -> dict[str, Any]:
         jobs.append({
             "job_id": job.id, "company": job.company, "role": job.title, "location": job.location,
             "job_description": (job.description or "")[:DESCRIPTION_LIMIT],
-            "fit_analysis": _fit_analysis(job),
             "verified_evidence": _evidence_for(db, job, content.get("selected_evidence_ids") or []),
             "tailored_resume": {"version": variant.version, "markdown": variant.markdown,
                                 "summary": content.get("summary", ""), "skills": content.get("skills") or [],

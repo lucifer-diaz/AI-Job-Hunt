@@ -1,0 +1,26 @@
+{
+  "worker": "TAILOR", "prompt": "tailoring",
+  "input": {"context": {
+    "source_resume": {"summary": "Backend engineer running data platforms", "skills": ["Python", "Kafka", "AWS"],
+      "roles": [{"role_index": 0, "title": "Senior Engineer", "company": "Acme", "dates": "2020 - Present",
+                 "bullets": [{"text": "Reduced production incidents by 45% across Kafka pipelines", "evidence_ids": [6]},
+                             {"text": "Moved nightly archives to AWS S3", "evidence_ids": [24]}]}]},
+    "fit_analysis": {"candidate_fit_score": 60, "resume_fit_score": 55, "strong_matches": ["Python"],
+                     "partial_matches": ["AWS; supported: S3; not shown: deployment ownership"],
+                     "missing_requirements": ["PHP", "Java"], "fatal_gaps": [], "resume_gaps": [],
+                     "recommended_resume_focus": ["Lead with the incident reduction"]},
+    "job_context": {}}},
+  "must_include": ["You are not the Ranker", "gaps_to_preserve", "Reduced production incidents by 45%"],
+  "must_exclude": ["candidate_fit_score", "resume_fit_score", "hours_old", "work_authorization", "CANDIDATE POLICY"],
+  "valid_output": {
+    "summary": {"text": "Backend engineer who cut production incidents by 45% on Kafka pipelines", "evidence_ids": [6]},
+    "skills_order": ["Python", "AWS", "Kafka"],
+    "role_updates": [{"role_index": 0, "bullets": [
+      {"text": "Cut production incidents by 45% across Kafka pipelines", "evidence_ids": [6]},
+      {"text": "Moved nightly archives to AWS S3", "evidence_ids": [24]}]}],
+    "selected_evidence_ids": [6, 24]},
+  "prohibited_claims": ["PHP", "Java", "Kubernetes", "deployment ownership", "owned AWS deployments"],
+  "invalid_outputs": [
+    {"name": "current Tailor failure: Ranker output", "output": {"score": 85, "candidate_fit_score": 85, "resume_fit_score": 80, "strong_matches": [], "gaps": []}, "reason": "POSSIBLE_CROSS_WORKER_OUTPUT"},
+    {"name": "whole resume instead of a patch", "output": {"resume": "# Sam Rivera ..."}, "reason": "WRONG_OUTPUT_SCHEMA"}]
+}
