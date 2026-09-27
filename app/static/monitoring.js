@@ -12,9 +12,9 @@ const MON_FILTER_KEYS = ['provider', 'model', 'stage', 'prompt_version', 'status
 const monWorker = w => w ? w.replace(/_/g, ' ').toLowerCase().replace(/^./, c => c.toUpperCase()) : '—';
 let monTimer = null;
 
-// Monitoring is one screen with six sections; each loads only what it shows (loadMonitoring).
+// Monitoring is one screen with seven sections; each loads only what it shows (loadMonitoring).
 const MON_TABS = [['overview', 'Overview'], ['llm', 'LLM usage'], ['external', 'External APIs'],
-                  ['apify', 'Apify'], ['logs', 'Logs'], ['advisor', 'AI optimization']];
+                  ['apify', 'Apify'], ['jd_recovery', 'JD recovery'], ['logs', 'Logs'], ['advisor', 'AI optimization']];
 const MON_CATEGORY_TONE = { EXTERNAL_API: 'brand', APIFY: 'brand', LLM: 'muted', SCHEDULER: 'muted',
                             WORKFLOW: 'muted', APPLICATION: 'muted', EMAIL: 'muted', SYSTEM: 'muted' };
 const MON_LEVEL_TONE = { ERROR: 'bad', WARNING: 'warn', INFO: 'muted', DEBUG: 'muted' };
@@ -62,7 +62,7 @@ async function loadMonitoring() {
   // Each section asks only for what it draws, so opening Logs does not aggregate every LLM request.
   const wantsLlm = ['overview', 'llm', 'advisor'].includes(m.tab);
   const wantsExternal = ['overview', 'external', 'apify'].includes(m.tab);
-  const [dash, reqs, capture, rec, ext, extReqs, logs] = await Promise.all([
+  const [dash, reqs, capture, rec, ext, extReqs, logs, jdr] = await Promise.all([
     wantsLlm ? api('/api/monitoring/dashboard?' + monQuery()) : Promise.resolve(D.mon),
     m.tab === 'llm' ? api('/api/monitoring/requests?' + monQuery({ page: m.page, per_page: 20 })) : Promise.resolve(D.monRequests),
     ['llm', 'logs'].includes(m.tab) ? api('/api/monitoring/capture').catch(() => D.monCapture) : Promise.resolve(D.monCapture),
@@ -70,9 +70,10 @@ async function loadMonitoring() {
     wantsExternal ? api('/api/monitoring/external/dashboard?' + monExtQuery()) : Promise.resolve(D.monExt),
     m.tab === 'external' ? api('/api/monitoring/external/requests?' + monExtQuery({ page: m.ext.page, per_page: 25 })) : Promise.resolve(D.monExtRequests),
     m.tab === 'logs' ? api('/api/monitoring/logs?' + monLogQuery({ page: m.logs.page, per_page: 50 })) : Promise.resolve(D.monLogs),
+    m.tab === 'jd_recovery' ? api('/api/monitoring/jd-recovery?' + monQuery()) : Promise.resolve(D.monJdr),
   ]);
   const wasActive = D.monRec?.active;
-  Object.assign(D, { mon: dash, monRequests: reqs, monCapture: capture, monRec: rec, monExt: ext, monExtRequests: extReqs, monLogs: logs });
+  Object.assign(D, { mon: dash, monRequests: reqs, monCapture: capture, monRec: rec, monExt: ext, monExtRequests: extReqs, monLogs: logs, monJdr: jdr });
   if (wasActive && !rec.active) {
     const task = rec.tasks[0];
     toast(task?.status === 'FAILED' ? `AI usage analysis failed: ${task.error || 'unknown error'}` : 'AI usage analysis finished: recommendations updated', task?.status === 'FAILED');
@@ -149,7 +150,7 @@ function renderMonitoring() {
     <div class="seg">${MON_TABS.map(([id, t]) => `<button class="${m.tab === id ? 'on' : ''}" data-act="mon-tab" data-id="${id}">${t}</button>`).join('')}</div>
     <div class="seg">${MON_RANGES.map(([id, t]) => `<button class="${m.range === id ? 'on' : ''}" data-act="mon-range" data-id="${id}">${t}</button>`).join('')}</div></div></section>`;
   const body = m.tab === 'llm' ? renderMonLlm() : m.tab === 'external' ? renderMonExternal()
-    : m.tab === 'apify' ? renderMonApify() : m.tab === 'logs' ? renderMonLogs()
+    : m.tab === 'apify' ? renderMonApify() : m.tab === 'jd_recovery' ? renderMonJdRecovery() : m.tab === 'logs' ? renderMonLogs()
     : m.tab === 'advisor' ? renderAdvisor() : renderMonOverview();
   return `<div class="stack">${tabs}${body}</div>`;
 }
@@ -404,6 +405,38 @@ function renderMonExtRequests() {
 }
 
 /* ───────────── Apify ───────────── */
+/* JD recovery: how often a missing job description was read back from its posting, and by which route. */
+const JDR_STATUS_TONE = { AVAILABLE: 'good', UNAVAILABLE: 'bad', UNKNOWN: 'muted' };
+function renderMonJdRecovery() {
+  const data = D.monJdr;
+  if (!data) return loading();
+  const x = data.metrics, diag = data.diagnostics;
+  const tiles = `<section class="mon-tiles">
+    ${monTile('Missing descriptions', (x.missing_descriptions || 0).toLocaleString(), 'jobs whose description is unusable now')}
+    ${monTile('Recovery tasks', (x.tasks_created || 0).toLocaleString(), x.active ? `${x.active} queued or running` : 'in range')}
+    ${monTile('Success rate', monPct(x.success_rate), `${x.recovered || 0} recovered`, x.success_rate != null && x.success_rate < 0.5 ? 'warn' : '')}
+    ${monTile('HTTP only', monPct(x.http_only_success_rate), 'recovered without a browser')}
+    ${monTile('Browser fallback', monPct(x.playwright_fallback_rate), x.playwright_success_rate == null ? 'never needed' : `${monPct(x.playwright_success_rate)} of those recovered`)}
+    ${monTile('Model fallback', monPct(x.llm_fallback_rate), x.llm_success_rate == null ? 'never needed' : `${monPct(x.llm_success_rate)} of those recovered`)}
+    ${monTile('Average latency', monMs(x.average_latency_ms), 'per recovery')}
+    ${monTile('Average length', x.average_recovered_length == null ? '—' : `${x.average_recovered_length.toLocaleString()} chars`, 'of recovered descriptions')}
+    ${monTile('Blocked', (x.blocked || 0).toLocaleString(), 'login walls and anti-bot checks — never bypassed', x.blocked ? 'warn' : '')}
+    ${monTile('Failed', (x.failed || 0).toLocaleString(), '', x.failed ? 'bad' : '')}
+    ${monTile('Postings removed', (x.jobs_removed || 0).toLocaleString(), 'closed or gone')}
+    ${monTile('Parsed · ranked after', `${x.subsequently_parsed || 0} · ${x.subsequently_ranked || 0}`, 'recovered jobs that went on')}
+  </section>`;
+  const status = (name, d) => `<div class="row gap8 wrap" style="align-items:center"><span class="small b" style="width:150px">${esc(name)}</span>${pill(d.status, JDR_STATUS_TONE[d.status] || 'muted')}${d.reason ? `<span class="xs muted">${esc(d.reason)}</span>` : ''}</div>`;
+  const pw = diag.playwright || {};
+  const capabilities = `<section class="card mon-card"><div class="card-title mb12">What recovery can use</div><div class="col gap8">
+    ${status('HTTP extraction', diag.http)}${status('Browser (Playwright)', pw)}${status('Model extraction', diag.llm)}
+    <div class="xs faint mt4">Automatic recovery ${diag.enabled ? 'on' : 'off (JD_FETCH_ENABLED=false) — manual recovery still works'} · browser ${esc(pw.browser || 'chromium')}${pw.headless === false ? ' (headed, for debugging)' : ''}${pw.running ? ' · running' : ''} · batch ${diag.settings.batch_size}, ${diag.settings.max_concurrency} at a time, ${diag.settings.max_attempts} attempts</div></div></section>`;
+  const results = Object.entries(x.by_result || {});
+  const outcomes = monCard('jdr-results', 'Outcomes', 'How finished recoveries ended',
+    results.length ? monBars(results.map(([code, n]) => ({ _label: code, n })), r => r.n, r => String(r.n), r => r._label, { labelWidth: 170 }) : '<div class="small muted">No finished recoveries in this range.</div>',
+    monTable(['Result', 'Tasks'], results.map(([code, n]) => [code, n])));
+  return `${tiles}<div class="mon-grid">${capabilities}${outcomes}</div>`;
+}
+
 function renderMonApify() {
   const e = D.monExt;
   if (!e) return loading();

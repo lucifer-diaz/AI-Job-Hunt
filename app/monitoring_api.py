@@ -243,6 +243,16 @@ def apify_runs(f: external_monitoring.ExternalFilter = ExtFilter, page: int = Qu
             "page": page, "per_page": per_page, "has_more": len(runs) > page * per_page}
 
 
+@router.get("/jd-recovery")
+def jd_recovery_metrics(f: monitoring.MonitoringFilter = Filter, db: Session = Depends(get_user_db)) -> dict[str, Any]:
+    """Job description recovery: success and fallback rates, blocked and failed pages, and what recovered jobs did
+    next (parsed, ranked), plus what recovery can use right now."""
+    from app.services import jd_recovery
+
+    return {"filters": f.public(), "metrics": jd_recovery.metrics(db, f.user_id, f.start, f.end),
+            "diagnostics": jd_recovery.diagnostics(db, db.info.get("user_id"))}
+
+
 @router.get("/logs")
 def logs(user: CurrentUser = Depends(current_user),
          range: str = Query("7d", pattern="^(today|7d|30d|90d)$"),  # noqa: A002  query parameter name

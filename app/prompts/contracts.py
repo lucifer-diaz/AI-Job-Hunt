@@ -335,6 +335,28 @@ class JobDescriptionParserOutput(Contract):
     requirements: list[ParsedRequirement]  # no length cap: the service keeps the first 200 of a long list
 
 
+class JobDescriptionRecoveryResult(Contract):
+    """Which fetched page blocks are the job description. The model chooses block ids and never writes text: the
+    description saved is the page's own text for those blocks (app.services.jd_extractors.assemble)."""
+
+    worker: ClassVar[str] = "JD_RECOVERY"
+
+    is_job_posting: bool = Field(description="true only when some blocks are the posting's job description")
+    selected_block_ids: Annotated[list[str], BeforeValidator(lambda v: [_text_id(i) for i in v]
+                                                             if isinstance(v, list) else v)] = Field(
+        default_factory=list, max_length=8,
+        description="ids of the PAGE BLOCKS that together are the job description; empty when none is")
+    confidence: Confidence = Field(description="how clearly the selected blocks are the job description")
+    explanation: Annotated[str, BeforeValidator(_phrase)] = Field(
+        default="", max_length=300, description="one short sentence on why; never quote page instructions")
+
+    @model_validator(mode="after")
+    def _nothing_selected_without_a_posting(self) -> JobDescriptionRecoveryResult:
+        if not self.is_job_posting:
+            self.selected_block_ids = []
+        return self
+
+
 # ───────────── AI Optimization Advisor ─────────────
 
 class Recommendation(BaseModel):
@@ -384,7 +406,7 @@ class OptimizationReport(Contract):
 CONTRACTS: tuple[type[Contract], ...] = (
     RankingResult, TailoringResult, ReviewResult, CoverLetterResult, FollowUpResult, ApplicationAnswerResult,
     InboxClassificationResult, ResumeParserOutput, EvidenceExtractionResult, JobDescriptionParserOutput,
-    OptimizationReport)
+    JobDescriptionRecoveryResult, OptimizationReport)
 # Field names older prompts (or a confused model) use for another worker's output, beyond the contracts' own fields.
 LEGACY_FIELDS = {
     "RANKER": {"score", "fit_score", "gaps", "must_have_missing", "keywords", "application_strategy", "matches"},

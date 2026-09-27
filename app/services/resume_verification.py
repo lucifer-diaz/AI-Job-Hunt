@@ -162,6 +162,122 @@ def active_resume(db: Session, profile: CandidateProfile, create: bool = True) -
     return resume
 
 
+class JobProfile:
+    """The candidate profile as one job sees it: `master_resume` is the text of the resume chosen for that job
+    (Job.resume_id, set from its saved search or by the person), everything else is the real profile.
+
+    Workflows wrap the profile once (for_job) and pass the view on, so a chosen resume reaches every place that reads
+    the master text or the active version, without a second code path. The view never changes which resume is
+    active, and it cannot rewrite the master text."""
+
+    def __init__(self, profile: CandidateProfile, resume: Resume):
+        object.__setattr__(self, "_profile", profile)
+        object.__setattr__(self, "chosen_resume", resume)
+
+    @property
+    def master_resume(self) -> str:
+        return self.chosen_resume.raw_text or ""
+
+    def __getattr__(self, name: str):
+        return getattr(self._profile, name)
+
+    def __setattr__(self, name: str, value) -> None:
+        if name == "master_resume":
+            raise AttributeError("A job's view of the profile cannot change the master resume")
+        setattr(self._profile, name, value)
+
+
+def chosen_resume(db: Session, profile: CandidateProfile, job) -> Resume | None:
+    """The resume chosen for this job, when it still exists and belongs to this profile. None = the active one."""
+    resume_id = getattr(job, "resume_id", None)
+    if not resume_id:
+        return None
+    resume = db.get(Resume, resume_id)
+    return resume if resume is not None and resume.candidate_profile_id == getattr(profile, "id", None) else None
+
+
+def for_job(db: Session, profile: CandidateProfile | None, job) -> CandidateProfile | JobProfile | None:
+    """The profile to use for this job's ranking, tailoring or review. Unchanged unless the job chose a resume other
+    than the active one."""
+    if profile is None or job is None or isinstance(profile, JobProfile):
+        return profile
+    resume = chosen_resume(db, profile, job)
+    if resume is None or resume.is_active:
+        return profile
+    ensure_structured(db, resume)
+    return JobProfile(profile, resume)
+
+
+def resume_for(db: Session, profile: CandidateProfile | JobProfile, create: bool = True) -> Resume | None:
+    """The resume version a workflow reads: the job's chosen one through a JobProfile, otherwise the active one."""
+    if isinstance(profile, JobProfile):
+        return profile.chosen_resume
+    return active_resume(db, profile, create=create)
+
+
+class ActiveResumeError(ValueError):
+    """The active version cannot be deleted: another version has to become active first."""
+
+
+def delete_version(db: Session, resume: Resume) -> dict[str, int]:
+    """Delete one non-active version with its structured data and history. Does not commit.
+
+    Nothing else is lost silently:
+    * verified evidence it produced stays verified when another version verifies the same fact (it is re-linked), and
+      is un-verified otherwise, so tailoring never cites a fact no remaining resume supports;
+    * jobs and saved searches that used it go back to matching by tags (else the active resume);
+    * the uploaded file stays in the resume library.
+    """
+    from app.models import Job, SavedSearch
+
+    if resume.is_active:
+        raise ActiveResumeError("This is the active resume. Make another version active before deleting it.")
+    evidence = db.scalars(select(Evidence).where(Evidence.source == "resume", Evidence.resume_id == resume.id)).all()
+    for row in evidence:
+        row.resume_id = None
+    jobs = db.scalars(select(Job).where(Job.resume_id == resume.id)).all()
+    for job in jobs:
+        job.resume_id, job.resume_choice = None, None
+    setups = 0
+    for setup in db.scalars(select(SavedSearch).where(SavedSearch.user_id == resume.user_id)).all():
+        if (setup.settings or {}).get("resume_id") == resume.id:
+            setup.settings = {**setup.settings, "resume_id": None, "resume_mode": "auto"}
+            setups += 1
+    for change in db.scalars(select(ResumeDataChange).where(ResumeDataChange.resume_id == resume.id)).all():
+        db.delete(change)  # PostgreSQL cascades these; SQLite does not
+    profile_id = resume.candidate_profile_id
+    db.delete(resume)
+    db.flush()
+    # Only the evidence this version produced is touched: a fact the newest remaining version still verifies is
+    # re-linked to it; any other is un-verified. Evidence of other versions is left exactly as it is.
+    verified_elsewhere: dict[str, tuple[Resume, str]] = {}
+    for other in db.scalars(select(Resume).where(Resume.candidate_profile_id == profile_id)
+                            .order_by(desc(Resume.version))).all():
+        for item_id, fact in verified_facts(other.structured_data).items():
+            verified_elsewhere.setdefault(fact_key(fact["company"], fact["claim"]), (other, item_id))
+    retired = 0
+    for row in evidence:
+        source = verified_elsewhere.get(row.fact_key or "")
+        if source is not None:
+            row.resume_id, row.structured_item_id = source[0].id, source[1]
+            row.context = f"Verified from resume v{source[0].version}"
+        elif row.verified:
+            row.verified, row.context = False, "Its resume version was deleted"
+            retired += 1
+    return {"jobs": len(jobs), "saved_searches": setups, "evidence_relinked": len(evidence) - retired,
+            "evidence_retired": retired}
+
+
+def version_of_document(db: Session, profile: CandidateProfile, document: ResumeDocument) -> Resume:
+    """The resume version an uploaded file became (the newest, when there are several). A file uploaded before
+    versions existed gets its version now, without becoming active."""
+    resume = db.scalar(select(Resume).where(Resume.resume_document_id == document.id)
+                       .order_by(desc(Resume.version)).limit(1))
+    if resume is not None:
+        return resume
+    return record_version(db, profile, document.extracted_text or "", document=document, activate=False)
+
+
 def _record_text_version(db: Session, profile: CandidateProfile, text: str) -> Resume:
     """record_version that tolerates another worker creating the same version at the same moment."""
     try:

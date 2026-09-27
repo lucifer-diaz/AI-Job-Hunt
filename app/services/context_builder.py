@@ -396,7 +396,7 @@ def _base(db: Session, profile: CandidateProfile, job: Job, task: str, allowed: 
           evidence_limit: int) -> tuple[TaskContext, dict[str, Any], list[dict[str, Any]], Resume | None]:
     from app.services.evidence_provenance import excluded_ids
 
-    resume = rv.active_resume(db, profile)
+    resume = rv.resume_for(db, profile)
     data = resume.structured_data if resume is not None else {}
     terms = job_terms(job)
     policy = candidate_policy(db, profile.user_id)
@@ -777,7 +777,7 @@ def role_headings(db: Session, profile: CandidateProfile, parsed: Any | None = N
     """
     if candidate_policy(db, profile.user_id)["resume_source"] != "structured":
         return {}
-    resume = rv.active_resume(db, profile, create=False)
+    resume = rv.resume_for(db, profile, create=False)
     data = (resume.structured_data if resume is not None else None) or {}
     parsed = parsed or parse_resume(profile.master_resume or "")
     experience = data.get("experience") or []

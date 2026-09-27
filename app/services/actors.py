@@ -402,12 +402,83 @@ def normalize_wellfound(item: dict) -> dict:
             "posted_at": item.get("postedAt")}
 
 
+# ───────────── crawlerbros/naukri-scraper ─────────────
+# The Multi Job Board actor returns Naukri listings without their descriptions; this actor returns them with one.
+NAUKRI_AGES = (1, 3, 7, 15, 30)
+NAUKRI_TYPES = {"fulltime": "full-time", "parttime": "part-time", "internship": "internship", "contract": "contractual"}
+# Naukri's own city slugs where they differ from the usual name.
+NAUKRI_CITIES = {"bengaluru": "bangalore", "gurugram": "gurgaon", "delhi": "delhi-ncr", "new-delhi": "delhi-ncr",
+                 "ncr": "delhi-ncr", "bombay": "mumbai", "madras": "chennai", "calcutta": "kolkata"}
+NAUKRI_BASE = "https://www.naukri.com"
+NAUKRI_ACTOR = "crawlerbros/naukri-scraper"
+
+
+def naukri_city(location: str) -> str:
+    """'Bengaluru, Karnataka, India' -> 'bangalore'."""
+    slug = re.sub(r"[^a-z0-9]+", "-", location.split(",")[0].lower()).strip("-")
+    return NAUKRI_CITIES.get(slug, slug)
+
+
+def build_naukri(sp: dict, roles: list[str], locations: list[str]) -> tuple[dict, list[str]]:
+    warnings: list[str] = []
+    places = _places(locations)
+    data: dict[str, Any] = {"keyword": roles[0], "maxItems": int(sp.get("max_results") or 20), "sortBy": "date"}
+    if places:
+        from app.services.apify_adapters import (
+            resolve_country,  # local import: the Hunter adapters' country list
+        )
+
+        data["location"] = naukri_city(places[0])
+        country = resolve_country("", places[0])
+        if country is not None and country.iso != "IN":
+            warnings.append(f"Naukri lists jobs in India: '{places[0]}' may return nothing.")
+    if _remote_only(sp, locations):
+        data["workMode"] = "remote"
+    if sp.get("hours_old"):
+        days = math.ceil(int(sp["hours_old"]) / 24)
+        age = next((d for d in NAUKRI_AGES if days <= d), None)
+        if age is None:
+            warnings.append("Naukri: 'Posted within' is at most 30 days, so older postings are not searched.")
+            age = NAUKRI_AGES[-1]
+        data["jobAge"] = str(age)
+    if sp.get("job_type") in NAUKRI_TYPES:
+        data["jobType"] = NAUKRI_TYPES[sp["job_type"]]
+    return data, warnings
+
+
+def normalize_naukri(item: dict) -> dict:
+    from app.services.job_description import (
+        normalize_description,  # keeps paragraphs and bullets, inline tags flat
+    )
+
+    url = _pick(item, "url", "jdURL", "jobUrl") or ""
+    description = _pick(item, "description", "jobDescription", "descriptionText")
+    description = normalize_description(description) if isinstance(description, str) else description
+    if isinstance(url, str) and url.startswith("/"):
+        url = NAUKRI_BASE + url
+    return {"id": _pick(item, "id", "jobId"), "site": "naukri",
+            "title": _pick(item, "title", "jobTitle"), "company": _pick(item, "companyName", "company"),
+            "location": _pick(item, "location", "placeholders"), "url": url,
+            "description": _join(description, _facts([
+                ("Experience", _pick(item, "experience", "experienceText")), ("Salary", item.get("salary")),
+                ("Skills", _pick(item, "skills", "tagsAndSkills")), ("Work mode", item.get("workMode"))])),
+            "posted_at": _pick(item, "postedDate", "datePosted", "createdDate", "footerPlaceholderLabel")}
+
+
 BUILTIN: dict[str, ActorSpec] = {spec.id: spec for spec in [
     ActorSpec("openclawai/job-board-scraper", "Multi Job Board",
-              "LinkedIn, Indeed, Glassdoor, Naukri, Bayt and ZipRecruiter in one run.", "$0.005 per job",
+              "LinkedIn, Indeed, Glassdoor, Naukri, Bayt and ZipRecruiter in one run. Full descriptions come back for "
+              "LinkedIn (with 'Fetch full LinkedIn descriptions') and Indeed; Naukri, ZipRecruiter and Bayt listings "
+              "arrive without them.", "$0.005 per job",
               "location", "unknown",
               ["boards", "location", "distance", "country", "remote", "job_type", "hours", "easy_apply",
                "fetch_description", "annual_salary", "proxy", "linkedin_company_ids"], build_openclaw),
+    ActorSpec("crawlerbros/naukri-scraper", "Naukri",
+              "Naukri.com jobs with their descriptions (the Multi Job Board actor returns Naukri without them). One "
+              "run per role × city.", "Free actor · Apify usage only", "role_location", "naukri",
+              ["location", "remote", "job_type", "hours"], build_naukri, normalize=normalize_naukri,
+              location_hint="Naukri searches Indian cities: 'Bengaluru, India' searches bangalore; leave the "
+                            "location empty to search all of India."),
     ActorSpec("fantastic-jobs/advanced-linkedin-job-search-api", "Advanced LinkedIn",
               "Indexed LinkedIn jobs with AI-enriched seniority, work arrangement, salary and visa data.",
               "$0.005 per job (less on paid tiers)", "once", "linkedin",
@@ -529,6 +600,11 @@ def plan_runs(sp: dict) -> tuple[list[dict], list[str]]:
                          "location": ", ".join(group_locations), "roles": group_roles})
     if len(runs) > MAX_RUNS:
         raise ValueError(f"This profile would start {len(runs)} runs; the limit is {MAX_RUNS}. Remove roles, locations or actors.")
+    boards = set(sp.get("sites") or [])
+    if "openclawai/job-board-scraper" in selected and "naukri" in boards:
+        warnings.append("Multi Job Board returns Naukri listings without descriptions"
+                        + (": untick Naukri there — the Naukri actor already searches it, with descriptions."
+                           if NAUKRI_ACTOR in selected else ". Add the Naukri actor for Naukri jobs with descriptions."))
     return runs, list(dict.fromkeys(warnings))
 
 

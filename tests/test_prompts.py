@@ -22,6 +22,7 @@ from app.prompts import (
     build_followup_prompt,
     build_inbox_classification_prompt,
     build_job_description_parser_prompt,
+    build_job_description_recovery_prompt,
     build_ranking_prompt,
     build_resume_parser_prompt,
     build_review_prompt,
@@ -102,6 +103,9 @@ def all_prompts() -> dict[str, Prompt]:
         "resume_parser": build_resume_parser_prompt(resume),
         "evidence_extraction": build_evidence_extraction_prompt(resume),
         "job_description_parser": build_job_description_parser_prompt(job, job.description),
+        "job_description_recovery": build_job_description_recovery_prompt(
+            job, [{"id": "b1", "text": job.description}, {"id": "b2", "text": "Home · Jobs · Sign in"}],
+            page_title="Lead AI Engineer - Globex"),
         "application_question": build_application_question_prompt("Do you require visa sponsorship?", answer_context),
         "inbox": build_inbox_classification_prompt("hr@globex.com", "Interview", f"Hi Asha. {EMAIL_INJECTION}"),
         "ai_optimization": build_ai_optimization_prompt({"totals": {"requests": 3}}, []),

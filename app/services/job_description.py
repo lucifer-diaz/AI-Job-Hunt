@@ -32,10 +32,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import (
+    ACTIVE_JD_FETCH_STATUSES,
     ACTIVE_JD_PARSE_STATUSES,
     REQUIREMENT_LEVELS,
     REQUIREMENT_TYPES,
     Job,
+    JobDescriptionFetchTask,
     JobDescriptionParseTask,
     JobRequirementEvidence,
     JobStructuredDataChange,
@@ -705,10 +707,14 @@ def sweep(db: Session, limit: int | None = None) -> dict[str, int]:
     """
     limit = limit or get_settings().jd_parse_enqueue_batch_size
     active = select(JobDescriptionParseTask.job_id).where(JobDescriptionParseTask.status.in_(ACTIVE_JD_PARSE_STATUSES))
+    # A stub being recovered from the posting (app.services.jd_recovery) is parsed once the real text arrives.
+    recovering = select(JobDescriptionFetchTask.job_id).where(
+        JobDescriptionFetchTask.status.in_(ACTIVE_JD_FETCH_STATUSES))
     candidates = db.scalars(
         select(Job)
         .where(Job.description.is_not(None), Job.description != "",
-               Job.structured_description_status.in_((RAW, NORMALIZED)), Job.id.not_in(active))
+               Job.structured_description_status.in_((RAW, NORMALIZED)), Job.id.not_in(active),
+               Job.id.not_in(recovering), Job.domain_match.is_distinct_from("NOT_MATCHING"))
         .order_by(Job.id).limit(max(1, limit))).all()
     queued = 0
     for job in candidates:

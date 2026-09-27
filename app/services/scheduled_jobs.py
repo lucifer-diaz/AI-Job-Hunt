@@ -29,6 +29,7 @@ from app.models import Application, Job, SearchRun, User
 from app.services import (
     ai_advisor,
     external_monitoring,
+    jd_recovery,
     job_description,
     monitoring,
     ranker,
@@ -236,6 +237,62 @@ async def jd_parsing(ctx: JobContext) -> dict[str, Any]:
     return summary
 
 
+def _prepare_jd_recovery(ctx: JobContext) -> tuple[list[jd_recovery.FetchClaim], dict[str, Any]]:
+    """Recover crashed workers, assess never-assessed descriptions (queueing recovery), then claim a bounded batch.
+
+    Claiming is a guarded UPDATE (plus SKIP LOCKED on PostgreSQL), so it is safe on SQLite local installs too."""
+    with ctx.sessions() as db:
+        expired = jd_recovery.recover_expired(db, ctx.now)
+        queue = jd_recovery.sweep(db, now=ctx.now)
+        claims = jd_recovery.claim(db, worker_id=ctx.worker_id, limit=max(1, get_settings().jd_fetch_batch_size),
+                                   now=ctx.now)
+    # "recovered" is an outcome (a description recovered); leases taken back from crashed workers are counted apart.
+    return claims, {"queue": queue, "expired_leases": expired}
+
+
+async def jd_recovery_job(ctx: JobContext) -> dict[str, Any]:
+    """Recover a bounded batch of missing job descriptions from their posting URLs, a few at a time.
+
+    HTTP first; the shared browser only for pages HTTP could not read, and never more pages at once than
+    PLAYWRIGHT_MAX_CONCURRENCY. One task failing never affects another task, or any other scheduled job."""
+    from app.infrastructure.browser import get_browser_service
+
+    claims, details = await asyncio.to_thread(_prepare_jd_recovery, ctx)
+    browser = get_browser_service()
+    semaphore = asyncio.Semaphore(max(1, get_settings().jd_fetch_max_concurrency))
+
+    async def run(claim: jd_recovery.FetchClaim) -> str:
+        async with semaphore:
+            try:
+                return await jd_recovery.process(ctx.sessions, claim, browser=browser)
+            except Exception:  # noqa: BLE001  the lease expires and the task is retried (recover_expired)
+                return "lost"
+
+    try:
+        outcomes = Counter(await asyncio.gather(*(run(claim) for claim in claims)))
+    finally:
+        await browser.release_idle()
+    summary = {"claimed": len(claims), **{name: outcomes.get(name, 0) for name in jd_recovery.OUTCOMES}, **details}
+    if not claims and not details["queue"]["queued"] and not details["expired_leases"]:
+        return skipped("No job descriptions waiting for recovery", **summary)
+    return summary
+
+
+async def listing_check(ctx: JobContext) -> dict[str, Any]:
+    """Re-read a bounded batch of postings over plain HTTP and delete the ones that no longer exist.
+
+    Never the browser or a model, and only a removed or closed page deletes: blocked pages, timeouts and server
+    errors change nothing (app.services.job_removal)."""
+    from app.services import job_removal
+
+    if not get_settings().auto_delete_removed_jobs:
+        return skipped("Removed postings are kept (AUTO_DELETE_REMOVED_JOBS=false)")
+    summary = await job_removal.check_listings(ctx.sessions, ctx.now)
+    if not summary["checked"]:
+        return skipped("No postings due for a check", **summary)
+    return summary
+
+
 # ───────────── enrichment, applications, follow-ups, inbox ─────────────
 
 def compensation(ctx: JobContext) -> dict[str, Any]:
@@ -370,6 +427,10 @@ JOBS: list[JobSpec] = [
             "Filters and queues new jobs, then ranks a bounded batch of ranking tasks, a few at a time."),
     JobSpec("jd_parsing", "Job description parsing", "jd_parse_interval_minutes", jd_parsing,
             "Parses job descriptions into structured requirements, each tied to the sentence it came from."),
+    JobSpec("jd_recovery", "Job description recovery", "jd_recovery_interval_minutes", jd_recovery_job,
+            "Reads missing job descriptions from their posting URLs: HTTP first, the browser only when needed."),
+    JobSpec("listing_check", "Removed posting check", "listing_check_interval_minutes", listing_check,
+            "Re-reads postings over HTTP and deletes the ones that no longer exist (applied jobs are kept)."),
     JobSpec("compensation", "Salary enrichment", "compensation_interval_minutes", compensation,
             "Records the salary stated in each posting."),
     JobSpec("applications", "Application processing", "application_interval_minutes", applications,

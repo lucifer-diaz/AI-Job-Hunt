@@ -33,6 +33,7 @@ from app.prompts import (
     build_review_prompt,
     build_tailoring_prompt,
 )
+from app.services import resume_verification as rv
 from app.services.contacts import recruiters_of
 from app.services.context_builder import (
     ContextError,
@@ -89,7 +90,7 @@ def tailor_job(db: Session, job: Job, progress: Progress = _no_progress) -> Resu
     ContextError(RANKING_REQUIRED) and no model is called."""
     from app.services.tailoring_results import apply_tailoring_patch
 
-    profile = get_profile(db)
+    profile = rv.for_job(db, get_profile(db), job)  # the job's chosen resume, else the active one
     # Verified facts relevant to this job only; raises UnverifiedResumeError / ContextError before any model call.
     context = build_tailoring_context(db, profile, job)
     progress("tailoring")
@@ -147,7 +148,8 @@ def persist_tailored_resume(db: Session, job: Job, content: dict, *, markdown: s
     version = (db.scalar(select(ResumeVariant.version).where(ResumeVariant.job_id == job.id)
                          .order_by(desc(ResumeVariant.version)).limit(1)) or 0) + 1
     resume = ResumeVariant(job_id=job.id, version=version, content=content,
-                           markdown=build_resume_markdown(get_profile(db), content) if markdown is None else markdown,
+                           markdown=build_resume_markdown(rv.for_job(db, get_profile(db), job), content)
+                           if markdown is None else markdown,
                            cover_letter=content.get("cover_letter", "") or "")
     db.add(resume)
     job.status = "tailored"
@@ -167,7 +169,7 @@ AWAITING_TAILORING_STATUSES = ("shortlisted", NEEDS_RETAILOR)
 
 def skip_tailoring(db: Session, job: Job, progress: Progress = _no_progress) -> ResumeVariant:
     """Use the master resume unchanged for a job that needs no tailoring. No AI edits; the reviewer still scores it."""
-    profile = get_profile(db)
+    profile = rv.for_job(db, get_profile(db), job)
     if not (profile.master_resume or "").strip():
         raise ValueError("Add a master resume in Settings before skipping tailoring")
     markdown = render_resume(parse_resume(profile.master_resume), name=profile.name, headline=profile.headline)
@@ -246,7 +248,7 @@ def resume_edits(db: Session, resume: ResumeVariant) -> list[dict]:
     content = resume.content or {}
     if content.get("untailored"):
         return []  # the master resume is used as-is: nothing was rewritten
-    profile = get_profile(db)
+    profile = rv.for_job(db, get_profile(db), db.get(Job, resume.job_id))
     state = content.get("edit_state") or {}
     evidence = db.scalars(select(Evidence).where(Evidence.verified.is_(True))).all()
     selected = set(content.get("selected_evidence_ids") or [])
@@ -341,7 +343,7 @@ def update_resume_edit(db: Session, resume: ResumeVariant, index: int, status: s
     state[str(index)] = entry
     content["edit_state"] = state
     resume.content = content
-    resume.markdown = build_resume_markdown(get_profile(db), content)
+    resume.markdown = build_resume_markdown(rv.for_job(db, get_profile(db), db.get(Job, resume.job_id)), content)
     db.commit()
 
 
@@ -362,7 +364,7 @@ def review_resume(db: Session, resume: ResumeVariant) -> dict:
     if job is None or not (resume.markdown or "").strip():
         raise ContextError("REVIEW_CONTEXT_INCOMPLETE", "there is no tailored resume text to review")
     llm = LLMClient.for_user(db)
-    profile = get_profile(db)
+    profile = rv.for_job(db, get_profile(db), job)
     context = build_review_context(db, profile, job)  # verified structured truth to check the text against
     prompt = build_review_prompt(candidate_profile=profile, job=job, tailored_resume=resume.markdown, context=context,
                                  tailored_claims=tailored_claims(resume.content or {}))
@@ -453,8 +455,8 @@ def draft_followup(db: Session, app: Application, commit: bool = True) -> Follow
     """Generate (or regenerate) the follow-up draft for one application. Never sends anything."""
     now = datetime.now(UTC).replace(tzinfo=None)
     llm = LLMClient.for_user(db)
-    profile = get_profile(db)
     job = db.get(Job, app.job_id)
+    profile = rv.for_job(db, get_profile(db), job)
     sent = db.scalars(select(FollowUp.draft).where(FollowUp.application_id == app.id, FollowUp.status != "draft")
                       .order_by(FollowUp.id)).all()
     context = build_followup_context(db, profile, job)

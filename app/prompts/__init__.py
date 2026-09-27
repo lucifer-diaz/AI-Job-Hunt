@@ -19,6 +19,7 @@ from app.prompts.contracts import (
                                        FollowUpResult,
                                        InboxClassificationResult,
                                        JobDescriptionParserOutput,
+                                       JobDescriptionRecoveryResult,
                                        OptimizationReport,
                                        RankingResult,
                                        ResumeParserOutput,
@@ -35,6 +36,10 @@ from app.prompts.inbox import (
 from app.prompts.job_description_parser import (
                                        JOB_DESCRIPTION_PARSER_PROMPT_VERSION,
                                        build_job_description_parser_prompt,
+)
+from app.prompts.job_description_recovery import (
+                                       JOB_DESCRIPTION_RECOVERY_PROMPT_VERSION,
+                                       build_job_description_recovery_prompt,
 )
 from app.prompts.mcp_application import MCP_APPLICATION_PROMPT_VERSION
 from app.prompts.mcp_review import MCP_REVIEW_PROMPT_VERSION
@@ -62,6 +67,7 @@ PROMPT_VERSIONS = {
     "followup": FOLLOWUP_PROMPT_VERSION,
     "resume_parser": RESUME_PARSER_PROMPT_VERSION,
     "job_description_parser": JOB_DESCRIPTION_PARSER_PROMPT_VERSION,
+    "job_description_recovery": JOB_DESCRIPTION_RECOVERY_PROMPT_VERSION,
     "evidence_extraction": EVIDENCE_EXTRACTION_PROMPT_VERSION,
     "application_question": APPLICATION_QUESTION_PROMPT_VERSION,
     "inbox": INBOX_PROMPT_VERSION,
@@ -83,6 +89,7 @@ OUTPUT_CONTRACTS = {
     "followup": FollowUpResult,
     "resume_parser": ResumeParserOutput,
     "job_description_parser": JobDescriptionParserOutput,
+    "job_description_recovery": JobDescriptionRecoveryResult,
     "evidence_extraction": EvidenceExtractionResult,
     "application_question": ApplicationAnswerResult,
     "inbox": InboxClassificationResult,
@@ -108,6 +115,7 @@ __all__ = [
                                        "build_followup_prompt",
                                        "build_inbox_classification_prompt",
                                        "build_job_description_parser_prompt",
+                                       "build_job_description_recovery_prompt",
                                        "build_model_health_prompt",
                                        "build_ranking_prompt",
                                        "build_resume_parser_prompt",

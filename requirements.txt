@@ -20,3 +20,7 @@ cryptography>=42,<51
 tzdata>=2024.1
 mcp>=1.12,<2
 pyyaml>=6.0,<7
+# Browser fallback for job-description recovery. The Chromium runtime is a separate step:
+#   python -m playwright install chromium          (local)
+#   python -m playwright install --with-deps chromium   (Debian/Ubuntu servers, installs system libraries)
+playwright>=1.49,<2

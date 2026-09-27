@@ -82,7 +82,9 @@ def summary(resume: Resume) -> dict:
             "verification_status": resume.verification_status, "verified_at": _iso(resume.verified_at),
             "parser": resume.parser, "parser_version": resume.parser_version, "revision": resume.revision,
             "created_at": _iso(resume.created_at), "updated_at": _iso(resume.updated_at),
-            "has_pending_reparse": bool(resume.pending_reparse)}
+            "has_pending_reparse": bool(resume.pending_reparse),
+            # What it is for (app.services.resume_matching): new jobs are matched to the best-tagged resume.
+            "domain": resume.domain, "roles": resume.roles or []}
 
 
 def detail(resume: Resume) -> dict:
@@ -229,6 +231,19 @@ def activate(resume_id: int, db: Session = Depends(get_user_db)):
     resume = _resume(db, resume_id)
     rv.set_active(db, resume)
     return _commit(db, resume)
+
+
+@router.delete("/api/resumes/{resume_id}")
+def delete_version(resume_id: int, db: Session = Depends(get_user_db)):
+    """Delete a resume version (not the active one). Its uploaded file stays in the library; jobs that used it go
+    back to matching by tags, and evidence only it verified is un-verified."""
+    resume = _resume(db, resume_id)
+    try:
+        out = rv.delete_version(db, resume)
+    except rv.ActiveResumeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    db.commit()
+    return {"deleted": resume_id, **out}
 
 
 @router.post("/api/resumes/{resume_id}/default")

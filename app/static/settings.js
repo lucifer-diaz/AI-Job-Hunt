@@ -9,8 +9,10 @@ const SETTINGS_SECTIONS = [
   ['api-keys', 'API keys', 'Connect your own providers', '06'],
   ['ai', 'AI models', 'LiteLLM, models, tiers and which model each worker uses', '07'],
   ['workflow', 'Workflow & cadence', 'Set a pace that works for you', '08'],
+  ['domain', 'Domain filter', 'Which discovered jobs are kept, and what it learned from you', '09'],
 ];
-const SETTINGS_FORMS = ['profile', 'preferences', 'resumes', 'resume-data', 'account', 'keys', 'ai', 'workflow'];
+const SETTINGS_FORMS = ['profile', 'preferences', 'resumes', 'resume-data', 'account', 'keys', 'ai', 'workflow', 'domain'];
+const DOMAIN_FIELDS = ['enabled', 'learn_from_feedback', 'exclude_terms', 'skill_excludes', 'include_terms'];
 const API_KEYS = [['openrouter', 'OpenRouter', 'AI model marketplace'], ['openai', 'OpenAI', 'GPT models'], ['anthropic', 'Anthropic', 'Claude models'], ['gemini', 'Gemini', 'Gemini models (Google AI Studio key)'], ['apify', 'Apify', 'Job discovery']];
 const CHIP_FIELDS = [
   ['target_roles', 'Target roles', 'Choose up to 5 roles', 'Add a role…', '', 'top'],
@@ -78,6 +80,7 @@ function settingsBaseline(form) {
   if (form === 'ai') return { llm_provider: ai.llm_provider || '', model: ai.model || '', require_free: ai.require_free == null ? '' : String(ai.require_free), ...Object.fromEntries(['rank', 'tailor', 'review', 'followup'].map(k => [`stage_${k}`, ai.stage_models?.[k] || ''])) };
   if (form === 'workflow') return { application_mode: st.application_mode, min_review_score: st.min_review_score, execution_mode: st.execution_mode || 'backend', ranking_concurrency: st.ranking_concurrency ?? st.processing_maximums?.ranking_concurrency, tailoring_concurrency: st.tailoring_concurrency ?? st.processing_maximums?.tailoring_concurrency,
     ranking_interval_minutes: st.ranking_interval_minutes ?? 0, rate_limit_backoff: st.rate_limits?.enabled ?? true, rate_limit_base_seconds: st.rate_limits?.base_seconds ?? 30, rate_limit_multiplier: st.rate_limits?.multiplier ?? 2, rate_limit_max_seconds: st.rate_limits?.max_seconds ?? 900, weekly_target: D.prefs?.weekly_target, followup_days: D.prefs?.followup_days };
+  if (form === 'domain') return Object.fromEntries(DOMAIN_FIELDS.map(k => [k, D.domain?.[k] ?? (k === 'enabled' || k === 'learn_from_feedback' ? true : [])]));
   return {};
 }
 function sameSetting(a, b) {
@@ -182,7 +185,7 @@ function renderResumeSettings() {
   const docs = D.resumes || [], stale = docs.find(d => d.active && !d.in_use);
   return settingsGroup('Resume library', 'Your primary resume is the starting point for tailored applications.',
     `${stale ? `<div class="settings-notice"><strong>Your edited text is being used for tailoring</strong><p>It differs from ${esc(stale.filename)}. Keep your edits or restore the file’s text.</p>${btn('Use file text', 'resume-use', { id: stale.id }, 'sm')}</div>` : ''}
-    <div class="settings-resume-list">${docs.map(d => `<article class="settings-resume"><div class="settings-file-icon" aria-hidden="true">${esc(d.filename.split('.').pop().toUpperCase().slice(0, 4))}</div><div class="grow"><strong>${esc(d.filename)}</strong><p>${Math.max(1, Math.round(d.size / 1024))} KB · ${d.words} words${d.active ? ' · Primary' : ''}${d.in_use ? ' · Used for tailoring' : ''}</p></div><div class="row gap8 wrap">${d.active ? '<a class="btn sm" href="/api/profile/resume">Download</a>' : btn('Set primary', 'resume-primary', { id: d.id }, 'sm')}${btn('Delete', 'resume-delete', { id: d.id, name: d.filename }, 'sm')}</div></article>`).join('') || '<div class="settings-empty"><strong>Your experience starts here</strong><p>Upload a resume to make your applications more personal.</p></div>'}</div>
+    <div class="settings-resume-list">${docs.map(d => `<article class="settings-resume"><div class="settings-file-icon" aria-hidden="true">${esc(d.filename.split('.').pop().toUpperCase().slice(0, 4))}</div><div class="grow"><strong>${esc(d.filename)}</strong><p>${Math.max(1, Math.round(d.size / 1024))} KB · ${d.words} words${d.active ? ' · Primary' : ''}${d.in_use ? ' · Used for tailoring' : ''}</p>${resumeTags('file', d.id, d.domain, d.roles || [])}</div><div class="row gap8 wrap">${d.active ? '<a class="btn sm" href="/api/profile/resume">Download</a>' : btn('Set primary', 'resume-primary', { id: d.id }, 'sm')}${btn('Delete', 'resume-delete', { id: d.id, name: d.filename }, 'sm')}</div></article>`).join('') || '<div class="settings-empty"><strong>Your experience starts here</strong><p>Upload a resume to make your applications more personal.</p></div>'}</div>
     <label class="settings-upload" for="resume-file"><strong>＋ Upload ${docs.length ? 'another resume' : 'your resume'}</strong><span>PDF, DOCX or TXT · up to ${BOOT.max_upload_mb} MB</span><input type="file" id="resume-file" accept=".txt,.pdf,.docx" aria-label="Upload resume"></label>`) +
     settingsDetails('resume-text', 'Edit master resume text', `<p class="settings-help">Saving new text creates a new resume version. To correct parsed facts, edit them in <a href="#settings/resume-data">Resume Data</a> instead.</p><label class="field" for="resumes-master_resume">Master resume text${textareaF('resumes', 'master_resume', D.profile.master_resume)}</label>${settingsDetails('resume-format', 'Formatting tips', '<p>Use Summary, Skills, and Experience headings, a role heading for each position, and short bullet points. Include title, company, location and dates for each role.</p>')}`) +
     settingsGroup('Evidence for your applications', 'Extract claims from your saved resume, then verify them in the Knowledge bank.', btn('Re-parse resume into evidence', 'parse-evidence', {}, '', isBusy('settings-resumes'))) + settingsFooter('resumes', 'Save resume text');
@@ -233,7 +236,30 @@ function renderWorkflowSettings() {
       : '<p class="settings-help">Off means every queued job calls the provider again straight away, even while it is rejecting them. Turn this on to stop a rate limit turning into a burst of them.</p>'}`) +
     settingsGroup('Your rhythm', 'Set realistic targets and a helpful follow-up cadence.', `<div class="settings-grid">${settingsField('workflow', 'weekly_target', 'Weekly application target', 'type="number" min="1" max="50" required')}${settingsField('workflow', 'followup_days', 'Follow-up after (days)', 'type="number" min="1" max="60" required')}</div><p class="settings-help">Follow-up drafts are never sent automatically.</p>`) + settingsFooter('workflow');
 }
-const SETTINGS_RENDERERS = { profile: renderProfileSettings, preferences: renderPreferenceSettings, resumes: renderResumeSettings, 'resume-data': () => renderResumeDataSettings(), account: renderAccountSettings, 'api-keys': renderKeySettings, ai: renderAISettings, workflow: renderWorkflowSettings };
+/* Domain filter (app.services.domain_match): deterministic, no model. Hidden jobs are in Discovery → Not matching. */
+const LEARNED_ACTIONS = { active: [['disable', 'Disable'], ['promote', 'Always exclude'], ['delete', 'Forget']], disabled: [['enable', 'Enable'], ['delete', 'Forget']] };
+function renderDomainSettings() {
+  const d = D.domain;
+  if (d === undefined) { api('/api/settings/domain').then(v => { D.domain = v; render(); }).catch(err => { D.domain = null; SETTING_ERRORS.domain = err.message; render(); }); return loading(); }
+  if (!d) return '<p class="settings-help">The domain filter could not be loaded.</p>';
+  const chipList = list => list.length ? `<div class="row wrap gap6">${list.map(t => pill(t, 'plain')).join('')}</div>` : '<span class="settings-help">Nothing yet.</span>';
+  const learned = (d.learned || []).filter(e => !(e.user_disabled && e.status === 'disabled' && e.forgotten));
+  const rules = learned.length ? learned.map(e => `<div class="lrow" style="align-items:flex-start"><div class="grow"><div class="row gap6 wrap"><span class="small b">${esc(e.term)}</span>${pill(e.kind === 'company' ? 'Company' : 'Title', 'plain')}${pill(e.status === 'active' ? 'Active' : 'Off', e.status === 'active' ? 'warn' : 'muted')}</div>
+      <div class="xs muted mt4">Dismissed ${e.evidence}×${e.positive ? ` · kept ${e.positive}×` : ''}${e.examples?.length ? ` · e.g. ${esc(e.examples.join(' · '))}` : ''}</div></div>
+      <div class="row gap6">${(LEARNED_ACTIONS[e.status] || []).map(([action, text]) => btn(text, 'domain-learned', { term: e.term, kind: e.kind, action }, 'sm')).join('')}</div></div>`).join('')
+    : '<p class="settings-help">Nothing learned yet. After you dismiss, reject or delete several similar jobs, their common title words (or company) appear here and similar new jobs are hidden.</p>';
+  return `${settingsGroup('Filter', 'Discovery hides jobs outside your domain before any description is fetched or any model is used. Hidden jobs are listed in Discovery → table → “Not matching”, where you can keep one.',
+    `<div class="col gap10">${checkF('domain', 'enabled', d.enabled, 'Hide jobs outside my domain at discovery')}${checkF('domain', 'learn_from_feedback', d.learn_from_feedback, 'Learn from the jobs I dismiss, reject or delete')}
+      ${d.server_enabled ? '' : '<p class="settings-help">The server has the domain filter turned off (DOMAIN_FILTER_ENABLED=false).</p>'}</div>`)}
+  ${settingsGroup('Outside my domain', 'A job whose title names one of these is hidden — unless it also names one of your include terms.', tagBox('domain', 'exclude_terms', fv('domain', 'exclude_terms', d.exclude_terms), 'Add an area, e.g. sales…', 200))}
+  ${settingsGroup('Other skill sets', 'Hidden when the title names one of these and none of your own skills (so “Python/Java developer” stays).', tagBox('domain', 'skill_excludes', fv('domain', 'skill_excludes', d.skill_excludes), 'Add a skill, e.g. PHP…', 200))}
+  ${settingsGroup('Always keep', 'A title with any of these is always kept.', tagBox('domain', 'include_terms', fv('domain', 'include_terms', d.include_terms), 'Add a term, e.g. machine learning…', 200))}
+  ${settingsGroup('From your profile', 'Read from your target roles, headline, resume and saved searches. A term used here is never excluded.', `<div class="col gap8"><div class="xs muted">Role words</div>${chipList(d.derived.role_words)}<div class="xs muted">Your skills</div>${chipList(d.derived.skills)}${d.overridden.length ? `<div class="xs muted">Excludes cancelled by your profile</div>${chipList(d.overridden)}` : ''}</div>`)}
+  ${settingsGroup('Learned from your choices', 'Deterministic counts of what you dismissed; keeping a job pushes back.', `<div class="col">${rules}</div>`)}
+  ${settingsGroup('Existing jobs', 'After changing the lists, check the jobs that are not ranked yet again. Jobs you kept are never touched.', btn(label('domainReapply', 'Apply to existing jobs', 'Checking…'), 'domain-reapply', {}, 'soft', isBusy('domainReapply')))}
+  ${settingsFooter('domain')}`;
+}
+const SETTINGS_RENDERERS = { profile: renderProfileSettings, preferences: renderPreferenceSettings, resumes: renderResumeSettings, 'resume-data': () => renderResumeDataSettings(), account: renderAccountSettings, 'api-keys': renderKeySettings, ai: renderAISettings, workflow: renderWorkflowSettings, domain: renderDomainSettings };
 function renderSettings() {
   if (D.settingsLoadError) return `<div class="settings-content"><div class="settings-error" role="alert">Settings could not be loaded: ${esc(D.settingsLoadError)}</div>${btn('Try again', 'settings-retry', {}, 'mt16')}</div>`;
   if (!D.profile || !D.settings || !D.prefs) return loading();
@@ -278,6 +304,7 @@ async function settingsSave(form) {
     }
     if (form === 'account') await api('/api/auth/password', { method: 'POST', body: S.forms.account });
     if (form === 'workflow') await saveWorkflowSettings();
+    if (form === 'domain') D.domain = await api('/api/settings/domain', { method: 'PUT', body: { ...settingsBaseline('domain'), ...settingsChanges('domain') } });
     delete S.forms[form];
     if (form === 'preferences') authorizationDraft = null;
     if (form === 'resumes') { D.resumes = await api('/api/profile/resumes'); D.resumeData = undefined; }

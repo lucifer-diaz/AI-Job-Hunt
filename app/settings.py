@@ -204,6 +204,48 @@ class Settings(BaseSettings):
     jd_rerank_after_parse: bool = False
     # Re-rank qualified jobs automatically when the profile, the active resume or the ranking prompt changes.
     ranking_auto_rerank: bool = True
+    # Job description recovery (app.services.jd_recovery): a posting that arrived with no usable description is
+    # read again from its URL in the background — plain HTTP first, a headless browser only when HTTP finds nothing,
+    # and a model only to pick the description out of blocks already fetched. Ingestion never waits for it.
+    jd_fetch_enabled: bool = True
+    jd_recovery_interval_minutes: int = 2
+    # Shorter than this is not a usable posting unless it carries strong job-posting structure (jd_quality).
+    jd_description_min_characters: int = 500
+    jd_fetch_batch_size: int = 10
+    jd_fetch_max_concurrency: int = 2
+    jd_fetch_max_attempts: int = 3
+    jd_fetch_retry_seconds: int = 300
+    jd_fetch_lease_seconds: int = 600
+    jd_fetch_http_timeout_seconds: int = 20
+    jd_fetch_max_redirects: int = 8
+    # Postings discovered before this feature: how many are checked for a missing description per run.
+    jd_fetch_enqueue_batch_size: int = 100
+    # The model only chooses among blocks of text already fetched; it never browses and never writes the text.
+    jd_fetch_llm_enabled: bool = True
+    # Local testing only: lets recovery read from localhost and private addresses. Never enable in production.
+    jd_fetch_allow_private_hosts: bool = False
+    # A posting that no longer exists (404/410, "no longer accepting applications") is deleted, and a tombstone stops
+    # it being imported again (app.services.job_removal). Approved and applied jobs are never deleted.
+    auto_delete_removed_jobs: bool = True
+    # Re-check that postings with a usable description still exist: plain HTTP, bounded, never the browser or a model.
+    listing_check_interval_minutes: int = 720
+    listing_check_batch_size: int = 25
+    listing_check_max_age_days: int = 3
+    # Domain filter (app.services.domain_match): jobs outside the candidate's domain are hidden at discovery and never
+    # recovered, parsed or ranked. Each account edits its own lists; this switches the feature for the server.
+    domain_filter_enabled: bool = True
+    # A title term or company learned from the person's dismissals needs this many dismissed jobs behind it.
+    learn_min_dismissals: int = 3
+    # Shared headless browser (app.infrastructure.browser). Optional: HTTP recovery works without it.
+    playwright_enabled: bool = True
+    playwright_browser: str = "chromium"
+    # PLAYWRIGHT_HEADLESS=false opens a visible window for local debugging of extraction selectors.
+    playwright_headless: bool = True
+    playwright_navigation_timeout_seconds: int = 45
+    playwright_page_timeout_seconds: int = 60
+    playwright_max_concurrency: int = 2
+    # Keep Chromium running between recoveries (faster) or close it after each batch (less memory while idle).
+    playwright_keep_browser_running: bool = True
     compensation_batch_size: int = 50
     # Background tailoring worker (app.services.tailor_tasks)
     tailor_worker_enabled: bool = True

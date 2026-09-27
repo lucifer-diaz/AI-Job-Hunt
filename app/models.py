@@ -74,6 +74,9 @@ class User(Base):
     resume_versions: Mapped[list[ResumeVersion]] = relationship(back_populates="user", passive_deletes=True)
     job_requirements: Mapped[list[JobRequirementEvidence]] = relationship(back_populates="user", passive_deletes=True)
     job_parse_tasks: Mapped[list[JobDescriptionParseTask]] = relationship(back_populates="user", passive_deletes=True)
+    job_fetch_tasks: Mapped[list[JobDescriptionFetchTask]] = relationship(back_populates="user", passive_deletes=True)
+    removed_postings: Mapped[list[RemovedPosting]] = relationship(back_populates="user", passive_deletes=True)
+    job_feedback: Mapped[list[JobFeedbackEvent]] = relationship(back_populates="user", passive_deletes=True)
     job_structured_changes: Mapped[list[JobStructuredDataChange]] = relationship(back_populates="user",
                                                                                  passive_deletes=True)
     ranking_tasks: Mapped[list[JobRankingTask]] = relationship(back_populates="user", passive_deletes=True)
@@ -222,6 +225,11 @@ class Resume(Base):
     verified_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # A re-parse waiting for the user to keep or replace each differing value.
     pending_reparse: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # What this resume is for (app.services.resume_matching): a domain ("Backend", "Product") and the roles it targets
+    # ("Lead Engineer", "Engineering Manager"). New jobs are matched to the best-tagged resume. A library file shares
+    # the tags of its version.
+    domain: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    roles: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
 
@@ -444,6 +452,33 @@ class Job(Base):
     # The raw description the structured version was parsed from, and a re-parse waiting for the user's choices.
     structured_description_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     structured_description_candidate: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # Description provenance (app.services.jd_recovery). `description` stays the text every workflow reads; these
+    # say where it came from. NULL description_source is the text the job board sent (pre-provenance rows included).
+    # A recovered posting that replaces a board's stub keeps the stub in original_description, never discarded.
+    description_source: Mapped[str | None] = mapped_column(String(20), nullable=True)  # SOURCE | RECOVERED | USER
+    description_quality: Mapped[str | None] = mapped_column(String(20), nullable=True)  # jd_quality.QUALITY_LABELS
+    description_content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    original_description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    recovered_description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    description_fetch_method: Mapped[str | None] = mapped_column(String(20), nullable=True)  # HTTP | PLAYWRIGHT | LLM_ASSISTED
+    description_source_url: Mapped[str | None] = mapped_column(String(1200), nullable=True)
+    description_final_url: Mapped[str | None] = mapped_column(String(1200), nullable=True)
+    description_fetched_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    description_recovery_task_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Domain filter (app.services.domain_match): MATCH, NOT_MATCHING (hidden, never recovered, parsed or ranked) or
+    # KEPT (the person kept it anyway; never re-assessed). NULL = not assessed yet.
+    domain_match: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
+    domain_reason: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    domain_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # When the posting URL was last confirmed to still exist (app.services.job_removal.listing_check).
+    listing_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # The resume ranking, tailoring and review use for this job. NULL = the account's active resume.
+    resume_id: Mapped[int | None] = mapped_column(
+        ForeignKey("resumes.id", ondelete="SET NULL", name="fk_jobs_resume_id"), nullable=True, index=True)
+    # How resume_id was chosen: AUTO (matched to resume tags), SETUP (the saved search pinned it), USER (chosen by the
+    # person), ACTIVE (the person pinned the active resume). NULL = never chosen; the active resume is used.
+    # Re-matching only ever changes AUTO and NULL jobs.
+    resume_choice: Mapped[str | None] = mapped_column(String(10), nullable=True)
 
     # Salary enrichment (app.services.compensation): posting salary plus the status of other sources.
     compensation: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
@@ -492,6 +527,8 @@ class Job(Base):
     requirements: Mapped[list[JobRequirementEvidence]] = relationship(back_populates="job", cascade="all, delete-orphan",
                                                                       passive_deletes=True)
     parse_tasks: Mapped[list[JobDescriptionParseTask]] = relationship(back_populates="job", cascade="all, delete-orphan",
+                                                                      passive_deletes=True)
+    fetch_tasks: Mapped[list[JobDescriptionFetchTask]] = relationship(back_populates="job", cascade="all, delete-orphan",
                                                                       passive_deletes=True)
     application: Mapped[Application | None] = relationship(back_populates="job", uselist=False, cascade="all, delete-orphan")
     transitions: Mapped[list[WorkflowTransition]] = relationship(back_populates="job", cascade="all, delete-orphan",
@@ -614,6 +651,114 @@ class JobDescriptionParseTask(Base):
 
     job: Mapped[Job] = relationship(back_populates="parse_tasks")
     user: Mapped[User] = relationship(back_populates="job_parse_tasks")
+
+
+JD_FETCH_STATUSES = ("PENDING", "PROCESSING", "COMPLETED", "FAILED", "BLOCKED", "SKIPPED")
+ACTIVE_JD_FETCH_STATUSES = ("PENDING", "PROCESSING")
+JD_FETCH_METHODS = ("HTTP", "PLAYWRIGHT", "LLM_ASSISTED")
+
+
+class JobDescriptionFetchTask(Base):
+    """One attempt to recover a job's description from its posting URL, claimed by the scheduler.
+
+    A job has at most one PENDING or PROCESSING task (uq_jd_fetch_tasks_active_job). Finished tasks are kept: they are
+    the job's recovery history and the source of the recovery metrics in Monitoring.
+    """
+
+    __tablename__ = "job_description_fetch_tasks"
+    __table_args__ = (
+        CheckConstraint(f"status IN ({_values(JD_FETCH_STATUSES)})", name="ck_jd_fetch_tasks_status"),
+        CheckConstraint("attempt_count >= 0", name="ck_jd_fetch_tasks_attempt_count"),
+        CheckConstraint(f"fetch_method IS NULL OR fetch_method IN ({_values(JD_FETCH_METHODS)})",
+                        name="ck_jd_fetch_tasks_fetch_method"),
+        Index("uq_jd_fetch_tasks_active_job", "job_id", unique=True,
+              postgresql_where=text(f"status IN ({_values(ACTIVE_JD_FETCH_STATUSES)})"),
+              sqlite_where=text(f"status IN ({_values(ACTIVE_JD_FETCH_STATUSES)})")),
+        Index("ix_jd_fetch_tasks_claim", "status", "next_attempt_at"),
+        Index("ix_jd_fetch_tasks_user_created", "user_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("job_description_fetch_tasks")
+    job_id: Mapped[int] = mapped_column(
+        ForeignKey("jobs.id", ondelete="CASCADE", name="fk_jd_fetch_tasks_job_id"), index=True)
+    source_url: Mapped[str] = mapped_column(String(1200), default="")
+    final_url: Mapped[str | None] = mapped_column(String(1200), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="PENDING")
+    reason: Mapped[str] = mapped_column(String(40), default="auto")  # auto | user_request | backlog
+    # Why the task ended the way it did: RECOVERED, UNCHANGED, KEPT_EXISTING, JOB_REMOVED, LOGIN_REQUIRED, ...
+    result_code: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    fetch_method: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_category: Mapped[ErrorCategory | None] = mapped_column(_enum_type(ErrorCategory), nullable=True)
+    http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    redirect_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    recovered_chars: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    playwright_used: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    llm_used: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    llm_model: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Safe per-stage notes (extractor, confidence, validation reasons); never page text.
+    diagnostics: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    locked_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    lock_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lock_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    job: Mapped[Job] = relationship(back_populates="fetch_tasks")
+    user: Mapped[User] = relationship(back_populates="job_fetch_tasks")
+
+
+class RemovedPosting(Base):
+    """A posting deleted because it no longer exists (app.services.job_removal). The next import of the same
+    posting is skipped, so a dead job does not come back with every search."""
+
+    __tablename__ = "removed_postings"
+    __table_args__ = (Index("ix_removed_postings_user_ref", "user_id", "source", "source_ref"),
+                      Index("ix_removed_postings_user_url", "user_id", "canonical_url"),
+                      Index("ix_removed_postings_user_dedupe", "user_id", "dedupe_key"))
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("removed_postings")
+    source: Mapped[str] = mapped_column(String(50), default="")
+    source_ref: Mapped[str] = mapped_column(String(500), default="")
+    canonical_url: Mapped[str | None] = mapped_column(String(1200), nullable=True)
+    dedupe_key: Mapped[str | None] = mapped_column(String(700), nullable=True)
+    title: Mapped[str] = mapped_column(String(300), default="")
+    company: Mapped[str] = mapped_column(String(300), default="")
+    reason: Mapped[str] = mapped_column(String(40), default="JOB_REMOVED")
+    removed_at: Mapped[datetime] = mapped_column(DateTime, default=now, index=True)
+
+    user: Mapped[User] = relationship(back_populates="removed_postings")
+
+
+FEEDBACK_ACTIONS = ("DISMISSED", "REJECTED", "DELETED", "SHORTLISTED", "TAILORED", "APPROVED", "APPLIED", "KEPT")
+NEGATIVE_FEEDBACK = ("DISMISSED", "REJECTED", "DELETED")
+
+
+class JobFeedbackEvent(Base):
+    """What the person did with a job, kept after the job itself is deleted: the domain filter learns from it
+    (app.services.feedback_learning). Only the terms needed to explain a learned rule are stored."""
+
+    __tablename__ = "job_feedback_events"
+    __table_args__ = (CheckConstraint(f"action IN ({_values(FEEDBACK_ACTIONS)})", name="ck_job_feedback_events_action"),
+                      Index("ix_job_feedback_events_user_created", "user_id", "created_at"))
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("job_feedback_events")
+    job_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # the job may be deleted afterwards
+    action: Mapped[str] = mapped_column(String(20))
+    title: Mapped[str] = mapped_column(String(300), default="")
+    company: Mapped[str] = mapped_column(String(300), default="")
+    terms: Mapped[list[str]] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+    user: Mapped[User] = relationship(back_populates="job_feedback")
 
 
 class WorkflowTransition(Base):

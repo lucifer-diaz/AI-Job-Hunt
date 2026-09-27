@@ -106,7 +106,7 @@ def test_profile_api_validates_and_previews():
         "actors": ["openclawai/job-board-scraper", "shahidirfan/Remoteok-Job-Scraper"]}).json()
     assert [r["actor_id"] for r in preview["runs"]] == ["openclawai/job-board-scraper", "shahidirfan/Remoteok-Job-Scraper"]
     catalog = client.get("/api/search/actors").json()
-    assert len([a for a in catalog["actors"] if not a["custom"]]) == 8
+    assert len([a for a in catalog["actors"] if not a["custom"]]) == 9
     assert "Startups" in catalog["groups"]
     assert {a["group"] for a in catalog["actors"] if a["id"] in STARTUP} == {"Startups"}
 
@@ -204,3 +204,59 @@ def test_profile_api_validates_startup_settings():
         "roles": ["AI Engineer"], "locations": ["Remote"], "actors": STARTUP, "yc_batches": ["W24"],
         "hn_month": "2026-09", "min_salary": 100000}).json()
     assert [r["actor_id"] for r in ok["runs"]] == STARTUP
+
+
+# ───────────── Naukri ─────────────
+
+NAUKRI = "crawlerbros/naukri-scraper"
+INDIA = {"locations": ["Bengaluru, Karnataka, India", "Gurugram"], "roles": ["Product Manager", "Lead Engineer"]}
+
+
+def test_naukri_runs_once_per_role_and_city_with_schema_names():
+    runs, warnings = inputs_for(NAUKRI, **INDIA)
+    assert [(r["roles"], r["location"]) for r in runs] == [
+        (["Product Manager"], "Bengaluru, Karnataka, India"), (["Product Manager"], "Gurugram"),
+        (["Lead Engineer"], "Bengaluru, Karnataka, India"), (["Lead Engineer"], "Gurugram")]
+    data = runs[0]["input"]
+    assert data == {"keyword": "Product Manager", "location": "bangalore", "maxItems": 25, "sortBy": "date",
+                    "jobAge": "3", "jobType": "full-time"}  # 72 hours → the 3-day bucket; Naukri's own city slug
+    assert runs[1]["input"]["location"] == "gurgaon" and not warnings
+
+
+def test_naukri_maps_remote_age_and_warns_outside_india():
+    runs, _ = inputs_for(NAUKRI, locations=["Remote"], hours_old=24 * 10, job_type="")
+    assert runs[0]["input"] == {"keyword": "Lead AI Engineer", "maxItems": 25, "sortBy": "date", "workMode": "remote",
+                                "jobAge": "15"}
+    _, old = inputs_for(NAUKRI, **INDIA, hours_old=24 * 60)
+    assert any("at most 30 days" in w for w in old)
+    _, abroad = inputs_for(NAUKRI, roles=["PM"], locations=["London, UK"])
+    assert any("Naukri lists jobs in India" in w for w in abroad)
+
+
+def test_naukri_items_keep_their_description():
+    job = normalize_apify_job(item_normalizer(NAUKRI)({
+        "id": "090426506296", "title": "Associate Product Manager", "companyName": "PayU", "location": "Mumbai",
+        "jdURL": "/job-listings-associate-product-manager-payu-india-mumbai-1-to-6-years-090426506296",
+        "jobDescription": "<p>We are looking for an APM to own <b>checkout</b>.</p><ul><li>Define the roadmap</li></ul>",
+        "experience": "1-6 Yrs", "salary": "Not disclosed", "skills": ["Product management", "SQL"]}), "naukri")
+    assert (job["source"], job["source_ref"], job["company"]) == ("apify:naukri", "naukri:090426506296", "PayU")
+    assert job["url"].startswith("https://www.naukri.com/job-listings-associate-product-manager")
+    assert "own checkout" in job["description"] and "Define the roadmap" in job["description"]
+    assert "Experience: 1-6 Yrs" in job["description"] and "Skills: Product management, SQL" in job["description"]
+
+
+def test_naukri_is_not_scraped_twice_without_a_warning():
+    both = {**BASE, "sites": ["linkedin", "naukri"], "actors": ["openclawai/job-board-scraper", NAUKRI]}
+    _, warnings = plan_runs(both)
+    assert any("untick Naukri there" in w for w in warnings)
+    _, multi_only = plan_runs({**both, "actors": ["openclawai/job-board-scraper"]})
+    assert any("Add the Naukri actor" in w for w in multi_only)
+    _, fine = plan_runs({**both, "sites": ["linkedin"]})
+    assert not any("untick Naukri" in w or "Add the Naukri actor" in w for w in fine)
+
+
+def test_the_catalog_says_which_boards_come_with_descriptions():
+    actors = {a["id"]: a for a in client.get("/api/search/actors").json()["actors"]}
+    assert "Indeed" in actors["openclawai/job-board-scraper"]["summary"]
+    assert "without them" in actors["openclawai/job-board-scraper"]["summary"]
+    assert actors[NAUKRI]["group"] == "Job boards" and actors[NAUKRI]["fan_out"] == "role_location"

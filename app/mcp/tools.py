@@ -21,6 +21,7 @@ from app.prompts.mcp_review import MCP_REVIEW_PROMPT_VERSION, REVIEW_RULES
 from app.prompts.mcp_tailoring import MCP_TAILORING_PROMPT_VERSION, TAILORING_RULES
 from app.prompts.tailoring import fit_analysis_input
 from app.services import apply_queue, conversation_actions, knowledge
+from app.services import resume_verification as rv
 from app.services.context_builder import ContextError
 from app.services.ranker import policy_for, relevant_evidence
 from app.services.resume_format import parse_resume
@@ -190,14 +191,29 @@ def get_tailoring_context(db: Session, job_ids: list[int]) -> dict[str, Any]:
                                          else analysis.get("recommended_resume_focus") or []),
             "resume_gaps": ranking.resume_gaps if ranking else analysis.get("resume_gaps") or [],
             **_retailor_feedback(db, job),
+            **_job_resume(db, profile, job),
         })
-    # The profile and the resume are the same for every job, so they are sent once.
+    # The profile and the active resume are the same for most jobs, so they are sent once; a job that uses another
+    # resume (chosen for its search, or by the person) carries its own `resume`, which replaces active_resume for it.
     return {"ok": True, "prompt_version": MCP_TAILORING_PROMPT_VERSION, "rules": list(TAILORING_RULES),
             "candidate_profile": facts,
             "active_resume": {"text": profile.master_resume,
                               "roles": [{"role_index": i, "title": r.title, "company": r.company, "dates": r.dates,
                                          "bullets": r.bullets} for i, r in enumerate(parsed.roles)]},
             "jobs": jobs}
+
+
+def _job_resume(db: Session, profile: Any, job: Job) -> dict[str, Any]:
+    view = rv.for_job(db, profile, job)
+    if view is profile:
+        return {}
+    parsed = parse_resume(view.master_resume)
+    chosen = view.chosen_resume
+    return {"resume": {"resume_id": chosen.id, "name": chosen.name or f"Version {chosen.version}",
+                       "note": "Tailor this job from this resume, not active_resume",
+                       "text": view.master_resume,
+                       "roles": [{"role_index": i, "title": r.title, "company": r.company, "dates": r.dates,
+                                  "bullets": r.bullets} for i, r in enumerate(parsed.roles)]}}
 
 
 def _retailor_feedback(db: Session, job: Job) -> dict[str, Any]:
@@ -233,7 +249,7 @@ def _save_one_tailored(db: Session, profile: Any, item: Any, seen: set[int]) -> 
     if not _in_tailor_queue(job):
         return {"job_id": job.id, "status": "REJECTED", "errors": [
             {"code": "NOT_IN_QUEUE", "location": "job_id", "message": f"Job is {job.status}, not waiting for tailoring"}]}
-    issues = validate_tailored_resume(db, profile, job, data)
+    issues = validate_tailored_resume(db, rv.for_job(db, profile, job), job, data)
     if issues:
         return {"job_id": job.id, "status": "REJECTED", "errors": issues}
     content = {**to_variant_content(data, source="claude_desktop"), "prompt_version": MCP_TAILORING_PROMPT_VERSION}

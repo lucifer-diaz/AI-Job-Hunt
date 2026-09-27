@@ -22,7 +22,7 @@ The dashboard is a single-page workspace served from `app/static/app.js`; every 
 | Approvals | Pre-submit checklist, resume preview, reusable answers, notes; approve opens the apply kit, send a packet back for another tailoring pass, or reject the job outright with an optional reason | `GET /api/approvals/{job_id}`, `POST /api/jobs/{id}/revision`, `POST /api/jobs/{id}/reject` |
 | Apply kit | Files to upload, answers to paste, link to the posting, confirm "mark applied" | `GET /api/jobs/{id}/apply-kit` |
 | Tracker | Kanban by post-submission stage (drag or "move to"), optional extra stages, timeline, recruiter, interview scheduling, AI follow-up draft | `GET /api/tracker`, `POST /api/applications/{id}/stage`, `POST /api/applications/{id}/events` |
-| Monitoring | Six sections — Overview, LLM usage, External APIs, Apify, Logs and AI optimization. Every LLM request and every third-party call: volume, success rate, latency (avg/p50/p95/p99), failures by type, retries, rate limits, tokens, context utilisation and cost, with filters, detail views, trace lookup and the AI Optimization Advisor | `GET /api/monitoring/dashboard`, `GET /api/monitoring/external/dashboard`, `GET /api/monitoring/apify/summary`, `GET /api/monitoring/logs`, `POST /api/monitoring/analyze` |
+| Monitoring | Seven sections — Overview, LLM usage, External APIs, Apify, JD recovery, Logs and AI optimization. Every LLM request and every third-party call: volume, success rate, latency (avg/p50/p95/p99), failures by type, retries, rate limits, tokens, context utilisation and cost, with filters, detail views, trace lookup and the AI Optimization Advisor | `GET /api/monitoring/dashboard`, `GET /api/monitoring/external/dashboard`, `GET /api/monitoring/apify/summary`, `GET /api/monitoring/jd-recovery`, `GET /api/monitoring/logs`, `POST /api/monitoring/analyze` |
 | Knowledge bank | Searchable Answer library and Evidence bank, focused editors, verification filters, copy and removal | `/api/knowledge`, `/api/evidence` |
 | Settings & profile | Candidate details and chip fields, resume variants, re-parse resume into (unverified) evidence, provider/model, your own API keys (stored encrypted), approval mode, cadence | `/api/profile`, `/api/settings`, `PUT /api/settings/keys`, `/api/preferences` |
 | Sign-in | Create an account (email, password, confirm password), sign in, sign out | `/signup`, `/login`, `POST /api/auth/signup`, `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/auth/me` |
@@ -54,6 +54,7 @@ Auto-submit is intentionally not offered: approved packets always become an appl
 - Simple PDF export
 - Email and password accounts: each account has its own jobs, resumes, settings, schedule and encrypted API keys
 - Prompt-injection hardening for untrusted job descriptions
+- **Job description recovery**: postings that arrive without a usable description are read from their URL in the background (HTTP, then headless Chromium, then AI-assisted block selection), validated and parsed — see [13. Job Description Recovery](#13-job-description-recovery)
 - **LiteLLM gateway**: per-worker model assignments, tiers, auto router, preview/apply, version history and rollback (Settings → AI Models)
 - OpenAI, Anthropic, Gemini, **OpenRouter**, or no-cost mock provider
 - LLM monitoring (tokens, context size, latency, estimated cost, failures) and a recommend-only AI Optimization Advisor
@@ -73,6 +74,7 @@ cp .env.example .env
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
+python -m playwright install chromium   # optional: browser fallback for job-description recovery
 uvicorn app.main:app --reload
 ```
 
@@ -173,7 +175,9 @@ screen is opened, keeping its settings and its daily/manual schedule.
 
 ### Multiple actors
 
-Discovery → Search setup lets you tick one or more actors. A setup's search is translated into each actor's own input schema (`app/services/actors.py`), and each actor gets the filters it supports:
+Discovery → Search setup lets you tick one or more actors. A setup's search is translated into each actor's own input schema (`app/services/actors.py`), and each actor gets the filters it supports.
+
+Descriptions differ by board: Multi Job Board returns full descriptions for **LinkedIn** (with "Fetch full LinkedIn descriptions") and **Indeed** only; its Naukri, ZipRecruiter and Bayt listings arrive without one (and Naukri pages cannot be recovered later — they are built in the browser and block automated browsers). For Naukri, tick the **Naukri** actor and untick Naukri among Multi Job Board's boards; the setup warns when Naukri would be searched twice.
 
 | Actor | Runs | Filters it receives |
 | --- | --- | --- |
@@ -184,6 +188,7 @@ Discovery → Search setup lets you tick one or more actors. A setup's search is
 | `antishock/workatastartup-jobs-scraper` (Work at a Startup) | one for everything | `roles` (role families: each search role is mapped to `eng`, `design`, `sales`, `marketing` or `ops`), `remote`, `ycBatches`, `maxResults`, `includeCompanyDetails` |
 | `automation-lab/ycombinator-jobs-scraper` (Y Combinator Jobs) | one per role | `query`, `maxItems`, `remoteOnly`, `jobType` (full-time or internship), `companyBatch` (the first YC batch), `includeDetails`, `maxDetailRequests` |
 | `parseforge/hn-whoishiring-scraper` (HN Who's Hiring) | one per role | `keyword`, `month` (`current` or `YYYY-MM`), `maxItems`, `remoteOnly`, `minSalary` |
+| `crawlerbros/naukri-scraper` (Naukri) | one per role × city | `keyword`, `location` (Naukri city slug: Bengaluru → `bangalore`, Gurugram → `gurgaon`, Delhi → `delhi-ncr`), `maxItems`, `jobAge` (Posted within, rounded up to 1/3/7/15/30 days), `jobType`, `workMode` (remote), `sortBy=date`. Reads each listing's `description`/`jobDescription` |
 | `blackfalcondata/wellfound-scraper` (Wellfound) | one per role | `query`, `location` (city slugs), `remote`, `jobType`, `experienceLevel` (from the lowest seniority chosen), `salaryMin`, `visaSponsorship`, `maxAgeMinutes`, `excludeKeywords`, `skipReposts`, `maxResults` |
 
 The four startup boards have their own settings on the setup (YC batches, HN thread month, minimum salary,
@@ -779,6 +784,14 @@ List recent runs:
 GET /api/search/apify/runs
 ```
 
+Recover a job's missing description from its posting URL (queued; see section 13), and read where it stands:
+
+```http
+POST /api/jobs/{job_id}/recover-description        ?force=true re-reads even a usable description
+GET  /api/jobs/{job_id}/description-recovery
+GET  /api/system/jd-recovery                        what recovery can use: HTTP, Playwright, the model
+```
+
 FastAPI interactive docs are available at `/docs`.
 
 ## 5. Cheap production architecture
@@ -921,6 +934,8 @@ FastAPI starts → scheduler loop (every SCHEDULER_TICK_SECONDS)
 | `hunter` | `HUNTER_INTERVAL_MINUTES=240` | Starts the Apify runs of every saved search setup that is due ("Saved search setups" in section 2) and of every due Hunter search profile. A guarded UPDATE means two app instances cannot start the same one twice |
 | `apify_sync` | `APIFY_SYNC_INTERVAL_MINUTES=5` | Imports datasets of Apify runs that finished; each run is imported once |
 | `ranking` | `RANKING_INTERVAL_MINUTES=2` | The Job Ranker (section 8). A deterministic sweep hard-filters and queues new jobs, recovers crashed tasks and queues re-ranks; then it claims up to `RANKING_BATCH_SIZE` ranking tasks and runs at most `RANKING_CONCURRENCY` model calls at a time — and no more than each account's own limit (see "Processing limits"). Jobs move RANK_PENDING → RANKING → RANKED → QUALIFIED / ARCHIVED |
+| `listing_check` | `LISTING_CHECK_INTERVAL_MINUTES=720` | Re-reads a bounded batch of postings over plain HTTP and deletes the ones that no longer exist (section 14). Approved and applied jobs are kept |
+| `jd_recovery` | `JD_RECOVERY_INTERVAL_MINUTES=2` | Job description recovery (section 13): assesses descriptions never assessed, claims up to `JD_FETCH_BATCH_SIZE` recovery tasks and reads at most `JD_FETCH_MAX_CONCURRENCY` postings at a time — HTTP first, the shared headless browser only when HTTP finds nothing. Runs on SQLite too (claims are guarded UPDATEs) |
 | `compensation` | `COMPENSATION_INTERVAL_MINUTES=5` | Records the salary stated in the original posting (structured actor fields or explicit salary text) in `jobs.compensation`. Glassdoor and PayScale are recorded as `not_configured` until those actors are integrated |
 | `applications` | `APPLICATION_INTERVAL_MINUTES=5` | Reports READY_TO_APPLY / APPLYING counts. Automatic submission is not enabled, so it always reports `skipped` |
 | `followups` | `FOLLOWUP_INTERVAL_MINUTES=60` | Drafts due follow-ups (never sends) |
@@ -943,6 +958,9 @@ It is a verdict on what arrived, not on the job, so it is reversible — the one
 description turns up (the board is searched again and returns more, or you paste one in), the job goes back to
 `NORMALIZED` and is ranked normally. A parsed structured description counts as a description: the parser only
 produces one from real text.
+
+Usually the description does not have to wait for a re-import: [job description recovery](#13-job-description-recovery)
+reads it from the posting URL in the background, and a recovered job goes back into the queue the same way.
 
 ### Rate-limit backoff
 
@@ -1961,7 +1979,299 @@ Migration `0015` adds the columns and tables and leaves every description untouc
 rankable throughout; the scheduler queues the backlog in batches (`JD_PARSE_ENQUEUE_BATCH_SIZE`), one task per job,
 and existing fit analyses are left alone.
 
-## 13. Recommended next upgrades
+## 13. Job Description Recovery
+
+Many boards hand over a listing without its description: nothing at all, a placeholder ("View job", "Apply here"),
+a teaser cut off at "…see more", or the site's navigation text. Parsing or ranking that is meaningless, so Job Hunt
+OS reads the real description from the posting URL — in the background, without holding up anything else.
+
+```text
+job discovered (Apify sync, Lever/Greenhouse import, a URL you add)
+  → description usable? (app/services/jd_quality.py — deterministic, never by length alone)
+      yes → structured JD parser → requirement evidence → ranking
+      no  → JobDescriptionFetchTask PENDING       ← the import only writes this row
+            → scheduler job jd_recovery claims a bounded batch
+            → HTTP: the board's documented JSON endpoint (Greenhouse, Lever), else the page
+            → Playwright: headless Chromium, only when HTTP found no usable description
+            → model: only to choose which already-fetched blocks are the description, when extraction is ambiguous
+            → deterministic validation → saved with provenance (the board's text is kept)
+            → structured JD parse task → ranking queue (RANK_PENDING; the ranker waits for the parse)
+```
+
+Nothing new in the workflow state machine: a job waiting for recovery keeps its state (a job with no description at
+all is `SKIPPED` "no job description yet", exactly as before), and recovery puts it back through `NORMALIZED →
+FILTERED → RANK_PENDING` when the description lands. Ranking of that one job waits while its recovery task is queued
+or running; every task ends, so the wait always ends.
+
+### What counts as a missing description
+
+`is_job_description_usable(job)` treats as unusable: empty or whitespace, placeholder text, truncated teasers,
+text that is mostly navigation/footer boilerplate, and text shorter than `JD_DESCRIPTION_MIN_CHARACTERS` — unless
+a short text carries real posting structure (responsibilities, requirements, "about the role"…). Text you typed or
+pasted yourself is always usable and is never replaced by recovery.
+
+### Extraction
+
+Every page, whether it came over HTTP or from the browser, goes through the same extractors
+(`app/services/jd_extractors.py`):
+
+1. the board's public JSON endpoint when one is documented (Greenhouse `boards-api`, Lever `api.lever.co`);
+2. schema.org `JobPosting` JSON-LD in the page;
+3. the site's known container — Greenhouse, Lever, Ashby, Workable, LinkedIn, Indeed;
+4. **Generic** (always available): candidate blocks (`main`, `article`, sections, divs) scored on useful length,
+   posting headings and keywords, list structure and `description`-like class names, minus link density and site
+   boilerplate. Navigation, footers, cookie banners, forms and "similar jobs" are removed first.
+
+A clear winner is used as is. When two blocks are close (confidence below 0.6) the page is **ambiguous**, and — if
+`JD_FETCH_LLM_ENABLED` and the account has a working model — the JD Recovery worker (`JD_RECOVERY` in Settings → AI
+Models, prompt `app/prompts/job_description_recovery.py`) is shown up to 8 candidate blocks and answers with block
+ids only. The saved description is the page's own text for those blocks; the model never writes, summarises or
+completes it. If the model is unavailable or unsure, the deterministic pick is used when it validates.
+
+Recovered text is validated before it is saved: long enough, mostly useful text, real posting signals, and not a
+login, CAPTCHA, error or unrelated page (a redirect to a careers home page or search is refused).
+
+### Provenance and the original description
+
+| Column | Meaning |
+| --- | --- |
+| `description` | The text every workflow reads (unchanged meaning) |
+| `description_source` | `SOURCE` (NULL on older rows: what the board sent), `RECOVERED`, or `USER` |
+| `original_description` | The board's text, kept when a recovered posting replaced it |
+| `recovered_description` | What recovery found, even when it was not used |
+| `description_fetch_method` | `HTTP`, `PLAYWRIGHT` or `LLM_ASSISTED` |
+| `description_source_url` / `description_final_url` | The posting URL, and where redirects ended (aggregator → ATS) |
+| `description_fetched_at`, `description_recovery_task_id` | When, and by which task |
+| `description_content_hash` | Normalized-text hash: the same posting reformatted is recognised and changes nothing |
+| `description_quality` | `USABLE`, `EMPTY`, `PLACEHOLDER`, `TRUNCATED`, `BOILERPLATE`, `TOO_SHORT` |
+
+A usable description is only replaced by a clearly fuller version of the same posting; a different, shorter or
+weaker text never replaces it (the task ends `COMPLETED` with `KEPT_EXISTING`). Equivalent text ends `UNCHANGED`
+and triggers no re-parse.
+
+### Configuration
+
+```env
+JD_FETCH_ENABLED=true                 # automatic recovery of new and existing jobs; manual recovery works either way
+JD_RECOVERY_INTERVAL_MINUTES=2        # 0 disables the scheduled job
+JD_DESCRIPTION_MIN_CHARACTERS=500
+JD_FETCH_BATCH_SIZE=10                # tasks claimed per run
+JD_FETCH_MAX_CONCURRENCY=2            # postings read at the same time
+JD_FETCH_MAX_ATTEMPTS=3
+JD_FETCH_RETRY_SECONDS=300            # doubled after each failed attempt
+JD_FETCH_LEASE_SECONDS=600
+JD_FETCH_HTTP_TIMEOUT_SECONDS=20
+JD_FETCH_MAX_REDIRECTS=8
+JD_FETCH_ENQUEUE_BATCH_SIZE=100       # older jobs assessed per run (backlog)
+JD_FETCH_LLM_ENABLED=true
+JD_FETCH_ALLOW_PRIVATE_HOSTS=false    # local testing only: allows localhost / private addresses
+
+PLAYWRIGHT_ENABLED=true
+PLAYWRIGHT_BROWSER=chromium
+PLAYWRIGHT_HEADLESS=true
+PLAYWRIGHT_NAVIGATION_TIMEOUT_SECONDS=45
+PLAYWRIGHT_PAGE_TIMEOUT_SECONDS=60
+PLAYWRIGHT_MAX_CONCURRENCY=2
+PLAYWRIGHT_KEEP_BROWSER_RUNNING=true
+```
+
+Turn automatic recovery off with `JD_FETCH_ENABLED=false` (jobs are then parsed as they arrive, as before); turn the
+browser off with `PLAYWRIGHT_ENABLED=false` (recovery stays HTTP-only).
+
+### Installing Playwright and Chromium
+
+Playwright is a Python dependency (`requirements.txt` / `pyproject.toml`); the browser is a separate download.
+
+```bash
+pip install -r requirements.txt                    # or: pip install -e .
+python -m playwright install chromium              # macOS / Windows / local Linux
+python -m playwright install --with-deps chromium  # Debian/Ubuntu servers: also installs Chromium's system libraries
+```
+
+The Docker image does this during the build (`--with-deps --only-shell chromium`: the headless shell and its
+libraries, into `/ms-playwright`). Build without it using `docker build --build-arg INSTALL_BROWSER=false .` and set
+`PLAYWRIGHT_ENABLED=false`.
+
+If Chromium is missing, the app still starts, HTTP recovery keeps working, and Monitoring → JD recovery and
+`GET /api/system/jd-recovery` say *"Chromium executable missing: run `python -m playwright install chromium`"*.
+
+### Watching the browser locally
+
+```bash
+PLAYWRIGHT_HEADLESS=false PLAYWRIGHT_MAX_CONCURRENCY=1 uvicorn app.main:app --reload
+```
+
+A Chromium window opens for each page the recovery worker renders, which is the quickest way to see why a site's
+container is not found. The Docker image only has the headless shell, so headed mode is for local runs.
+
+### The shared browser
+
+`app/infrastructure/browser/` is the one way Job Hunt OS drives a browser (`get_browser_service()`), so later
+features (ATS form assistance, confirmation capture) reuse it:
+
+- lazy: nothing starts with the app; the first page starts Playwright and one Chromium process;
+- each task gets an isolated context and page — no cookies, storage, service workers or downloads survive it —
+  closed even when the task fails; images, media and fonts are not downloaded;
+- navigation waits for `domcontentloaded`, then a known container and for the text to stop growing, within
+  `PLAYWRIGHT_NAVIGATION_TIMEOUT_SECONDS` / `PLAYWRIGHT_PAGE_TIMEOUT_SECONDS` — never `networkidle`;
+- at most `PLAYWRIGHT_MAX_CONCURRENCY` pages at once; a crashed Chromium is started again on next use;
+- every navigation is checked against private addresses (redirects included), and pages never receive API keys,
+  credentials or environment values;
+- closed at app shutdown and after each `python -m app.cron` run, so no Chromium process is left behind.
+
+Every page load is an External API row (provider `WEB`, service `playwright`), beside the HTTP fetches (`WEB`,
+`job_posting`, operation `jd_recovery_http`).
+
+### Recovery statuses
+
+| Task status | Shown as | Meaning |
+| --- | --- | --- |
+| `PENDING` | Queued | Waiting for the worker, or for a retry after a temporary failure |
+| `PROCESSING` | Fetching | Being read right now |
+| `COMPLETED` | Recovered / Checked | `RECOVERED` saved; `UNCHANGED` or `KEPT_EXISTING` left the description as it was |
+| `BLOCKED` | Blocked – login required / anti-bot challenge / access denied | The site needs a person; never bypassed |
+| `SKIPPED` | Failed – page no longer exists / posting closed / no posting URL | Nothing to recover |
+| `FAILED` | Failed – reason | Attempts used up (network, server errors, nothing found), or a redirect loop / bad certificate |
+
+Temporary problems (timeouts, connection errors, 5xx, 429, a page with nothing extractable yet) are retried up to
+`JD_FETCH_MAX_ATTEMPTS` with backoff. A 404/410 or "no longer accepting applications" ends recovery at once and the
+job is deleted (unless approved or applied) and not imported again — see section 14; with
+`AUTO_DELETE_REMOVED_JOBS=false` the task is only `SKIPPED`.
+
+In the job's Description tab: **Recover Description** for a job without one, the live status while it runs, the
+reason when it could not, and **Retry**. `POST /api/jobs/{job_id}/recover-description` does the same; it never
+fetches during the request, and a second request returns the task already queued.
+
+### CAPTCHA and login policy
+
+Login walls, CAPTCHAs, Cloudflare-style challenges and 403s are recorded as `BLOCKED` with the reason and are
+**never bypassed**: no CAPTCHA solving, no stealth or fingerprint tricks, no retrying a challenge in the browser, no
+retrying a 429 in the browser. The HTTP client identifies itself honestly. Open the posting and paste the description
+yourself — pasted text is never overwritten.
+
+### Monitoring
+
+Monitoring → **JD recovery** (`GET /api/monitoring/jd-recovery`): missing descriptions, tasks created, overall success
+rate, HTTP-only success, Playwright fallback and success rates, model fallback rate, average latency, blocked, failed
+and removed postings, average recovered length, and how many recovered jobs were then parsed and ranked — plus
+whether HTTP, Playwright and the model are available. Each finished task is a Monitoring → Logs line (workflow
+`JD_RECOVERY`) with the job, task, fetch method, host, HTTP status, attempt, redirects, characters recovered,
+whether the browser or the model was used, the model, and the blocked reason or error category.
+
+### Deployment
+
+- Chromium needs roughly 150–300 MB while running plus 50–100 MB per open page, and a CPU core while rendering.
+  On a 512 MB instance use `PLAYWRIGHT_MAX_CONCURRENCY=1` and `PLAYWRIGHT_KEEP_BROWSER_RUNNING=false` (as
+  `render.yaml` does), or `PLAYWRIGHT_ENABLED=false`.
+- `docker-compose.yml` gives the container 512 MB of shared memory; the app also passes `--disable-dev-shm-usage`.
+- The image runs under `tini` so Chromium's child processes are always reaped.
+- PostgreSQL holds every task; several app instances can run the worker (claims use `FOR UPDATE SKIP LOCKED` and a
+  guarded UPDATE).
+
+### Troubleshooting
+
+| Symptom | Check |
+| --- | --- |
+| Playwright shows UNAVAILABLE | `python -m playwright install chromium` (or `--with-deps` on Linux); `pip install playwright` if the package is missing |
+| "Chromium could not start" on Linux | Missing system libraries: `python -m playwright install-deps chromium` |
+| Many `BLOCKED` tasks from one board | The board requires sign-in or runs an anti-bot check; paste descriptions for those jobs |
+| Tasks stay Queued | `JD_RECOVERY_INTERVAL_MINUTES` is 0, or the scheduler is off; `GET /api/system/scheduler` shows the job |
+| A site's text is wrong or incomplete | Watch it with `PLAYWRIGHT_HEADLESS=false`; add its container to a site extractor in `app/services/jd_extractors.py` |
+| Recovery never uses the model | `JD_FETCH_LLM_ENABLED`, and a working model for the account (Settings → AI); only ambiguous pages use it |
+
+## 14. Discovery quality: domain filter, removed postings, resume per job
+
+Discovery keeps quality over quantity. Nothing here calls a model.
+
+```text
+new job (any import)
+  → previously deleted as a dead posting?  → not imported again (removed_postings)
+  → resume: the saved search's chosen resume (else the active resume, at use time)
+  → domain filter: outside your domain?    → hidden (SKIPPED, "Outside your domain: sales"); no recovery, parse or rank
+  → description recovery / structured parse → ranking
+```
+
+### Domain filter (`app/services/domain_match.py`)
+
+A job is hidden at discovery when its title names an area you excluded (seeded: sales, account executive, business
+development, digital marketing, SEO, social media, recruiter, customer support…) or a skill set you excluded (seeded:
+C++, Java — whole word, so JavaScript is unaffected — .NET, PHP, frontend, iOS, Android, QA…) and none of your own
+skills. A title that says nothing about the domain is decided by the description only when it names several excluded
+skills and none of yours. Otherwise the job is kept: only a clear term match hides anything.
+
+Rules come from **Settings → Domain filter**: your exclude lists, an "always keep" list that wins over everything, and
+what your target roles, headline, resume and saved searches imply — a term your own profile uses (a "Sales Engineer"
+target role, "Java" on your resume) is never excluded. Jobs you add yourself are never hidden.
+
+Hidden jobs are listed in **Discovery → table → Domain: Not matching**, with the reason. **Keep this job** (one or a
+selection) puts it through recovery, parsing and ranking like any new job and it is never assessed again. After
+changing the lists, **Apply to existing jobs** re-checks the jobs not ranked yet. Older jobs are assessed once by the
+ranking sweep. `GET /api/jobs/search?domain=not_matching`, `POST /api/jobs/{id}/domain-keep`,
+`POST /api/jobs/bulk-domain-keep`, `GET/PUT /api/settings/domain`, `POST /api/jobs/domain/reapply`.
+
+### Learning from your choices (`app/services/feedback_learning.py`)
+
+Dismissing, rejecting or deleting a job records a feedback event (kept after the job is deleted); shortlisting,
+approving, applying and keeping record positive ones. A title term (1–3 words, without seniority and generic job
+words) or a company becomes a **learned exclusion** once at least `LEARN_MIN_DISMISSALS` (3) dismissed jobs share it
+and 80% of its events are negative — never a word your roles, skills or include list use. Similar new jobs are hidden
+with "Similar to jobs you dismissed: 'underwriter' (4×)". A rule turns itself off when you keep similar jobs (20%
+positive), and Settings lists every rule with its evidence: disable, forget, or promote it to a permanent exclude.
+Deleting jobs the filter had already hidden, and dead postings deleted automatically, teach nothing.
+
+### Postings that no longer exist (`app/services/job_removal.py`)
+
+When JD recovery or the `listing_check` job finds a posting gone (404/410, or "no longer accepting applications"), the
+job is **deleted** with its tasks and a tombstone is kept, so the next search does not import it again. Approved and
+applied jobs are never deleted (the log says the posting closed). A login wall, a challenge, a timeout or a server
+error never deletes anything. `listing_check` re-reads postings over plain HTTP in bounded batches — never the browser
+or a model. Each deletion is a Monitoring → Logs line (`posting_removed`) with the title, company and URL.
+
+```env
+AUTO_DELETE_REMOVED_JOBS=true
+LISTING_CHECK_INTERVAL_MINUTES=720     # 0 disables the job
+LISTING_CHECK_BATCH_SIZE=25
+LISTING_CHECK_MAX_AGE_DAYS=3           # a posting is re-checked at most this often
+DOMAIN_FILTER_ENABLED=true             # server switch; each account has its own lists and switch
+LEARN_MIN_DISMISSALS=3
+```
+
+### Resume per search and per job, matched by tags
+
+Tag each resume with a **domain** and the **roles** it targets — "Backend: Lead Engineer, Engineering Manager",
+"Product: Associate Product Manager, Product Manager" — in Settings → Resumes (library files) or Settings → Resume Data
+→ Versions. A file and the version it became share one set of tags. The editor suggests roles per domain (Backend,
+Product, AI / ML, Data, Frontend, Full Stack, DevOps / SRE, Engineering Leadership); anything can be typed.
+
+Every new job gets its resume (`jobs.resume_id`, `jobs.resume_choice`), deterministically and without a model
+(`app/services/resume_matching.py`):
+
+1. the saved search's choice, when it pinned one — **Resume for these jobs**: a specific resume, or always the active
+   one (`SETUP`);
+2. otherwise the best-tagged resume (`AUTO`): a tagged role named in the title scores most (a longer role beats a
+   shorter one, so "Associate Product Manager" wins over "Product Manager"), the domain in the title less, and the
+   domain in the description only breaks ties;
+3. no clear winner (nothing matches, or two resumes tie) → the active resume, as before.
+
+Ranking, tailoring, review, follow-ups and Claude Desktop's `get_tailoring_context` all use that resume; the choice
+never changes which resume is active. In Discovery, **Use resume…** (a selection) or **Resume used** (one job) switches
+between *Auto*, *Active resume* or a specific version (`USER` / `ACTIVE`, never re-matched); a ranked job is ranked
+again and a tailored packet is marked for re-tailoring. After changing tags, **Re-match existing jobs** (Versions)
+re-matches jobs that were matched automatically or never chosen — it first says how many would change and how many
+would be ranked again.
+
+`GET /api/resumes/choices` (with tags and the role catalog), `PUT /api/resumes/{id}/tags`,
+`PUT /api/profile/resumes/{document_id}/tags`, `PUT /api/resumes/{id}` (rename),
+`PUT /api/jobs/{id}/resume` and `POST /api/jobs/bulk-resume` (`mode`: auto | active | fixed + `resume_id`),
+`POST /api/jobs/resume/rematch[?dry_run=true]`.
+
+**Deleting a version** (Versions → Delete, `DELETE /api/resumes/{id}`): any version except the active one. Its structured
+data and edit history go; the uploaded file stays in the resume library. Jobs and saved searches that used it go back to
+matching by tags (else the active resume) — nothing is re-ranked by itself. Verified evidence it produced is re-linked
+to the newest remaining version that verifies the same fact, and un-verified otherwise, so tailoring never cites a fact
+no remaining resume supports.
+
+## 15. Recommended next upgrades
 
 - Apify webhook endpoint so completed runs are ingested without polling
 - Gmail integration for follow-up drafts and thread matching
@@ -1970,11 +2280,12 @@ and existing fit analyses are left alone.
 - Recruiter discovery/manual outreach queue
 - Evaluation dataset: application → response → interview → offer conversion
 - Evaluate stage-specific OpenRouter routing from application conversion data
-- Optional Playwright **assistive** form filling where permitted, with a hard stop before submit
+- Optional Playwright **assistive** form filling where permitted, with a hard stop before submit (reusing the shared
+  browser service in `app/infrastructure/browser/`)
 
 See [DEPLOY.md](DEPLOY.md) for hosting instructions.
 
-## 14. Google Gemini agent deployment
+## 16. Google Gemini agent deployment
 
 To tailor and review from Claude Desktop instead, see [10. Claude Desktop + MCP](#10-claude-desktop--mcp).
 
