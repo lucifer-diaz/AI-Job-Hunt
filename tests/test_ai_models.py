@@ -11,6 +11,7 @@ from app.main import app
 from app.models import AIConfigAuditEntry, AIConfigVersion, LiteLLMConnection, WorkerModelConfig
 from app.services import ai_model_config as config
 from app.services import model_resolution
+from app.services.ai_workers import WORKERS
 from app.services.model_resolution import resolve, resolve_model
 from app.settings import get_settings
 from tests.litellm_fake import MASTER_KEY, Account, deployment
@@ -152,7 +153,7 @@ def test_seeding_twice_is_harmless(account):
         assert config.ensure_seeded(db, account.user_id) is True
         assert config.ensure_seeded(db, account.user_id) is False
         count = len(db.scalars(select(WorkerModelConfig).where(WorkerModelConfig.user_id == account.user_id)).all())
-        assert count == 14
+        assert count == len(WORKERS)
 
 
 # ───────────── drafts, validation, preview, apply ─────────────

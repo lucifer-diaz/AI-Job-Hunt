@@ -42,6 +42,9 @@ WORKERS: dict[str, Worker] = {w.worker_type: w for w in (
            description="Parses an uploaded resume into structured facts"),
     Worker("JD_PARSER", "JD Parser", ("job_description_parser",), True, 8192, "TIER", PRIMARY_REASONING,
            description="Parses a job posting into structured requirements"),
+    # Fallback only: picks the description out of blocks of a page that deterministic extraction could not settle.
+    Worker("JD_RECOVERY", "JD Recovery", ("job_description_recovery",), True, 8192, "TIER", FAST,
+           description="Identifies which blocks of a fetched posting page are the job description (never writes it)"),
     Worker("RANKER", "Ranker", ("ranking",), True, 8192, "TIER", PRIMARY_REASONING, "rank",
            description="Scores how well a job fits the candidate"),
     Worker("RESUME_MATCHER", "Resume Matcher", (), True, 8192, "TIER", PRIMARY_REASONING,

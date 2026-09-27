@@ -110,6 +110,63 @@ These rules keep the model a worker uses a matter of configuration, never of cod
 * **No secret in configuration**: a managed deployment's credentials are `os.environ/NAME` references; the LiteLLM
   key is encrypted like the provider keys and never returned, logged or snapshotted.
 
+## Job description recovery and the shared browser
+
+`app/services/jd_recovery.py` reads a posting's description from its URL when the board sent none (README §13).
+The rules a change has to keep:
+
+* **JD recovery runs asynchronously.** Ingestion (`sources.upsert_job`), API requests and other workers only write a
+  `JobDescriptionFetchTask`; the `jd_recovery` scheduler job does the fetching. Never fetch a posting inside a
+  request or an import. PostgreSQL (the task table) is the only queue: no Celery, Redis or in-memory queues.
+* **One active task per job** (`uq_jd_fetch_tasks_active_job`), claimed with SKIP LOCKED plus a guarded UPDATE, with
+  bounded attempts. A failure is one task's failure; it never raises out of the scheduled job.
+* **HTTP before the browser.** HTTP goes through `external_client` (`app/services/external_api.py`) with redirects
+  followed one by one and each hop checked by `app/services/url_safety.py`. The browser is used only when HTTP found
+  no usable description, and never to retry a login wall, a challenge or a 429.
+* **Playwright access goes through the shared `BrowserService`** (`app.infrastructure.browser.get_browser_service()`).
+  Workers and features must not import Playwright or launch Chromium themselves. Pages get an isolated context each,
+  are closed in `finally`, and never receive API keys, credentials, cookies or environment values.
+* **CAPTCHA and anti-bot protections are never bypassed.** No solvers, stealth plugins, fingerprint spoofing or
+  challenge retries: a blocked page is recorded as `BLOCKED` with its reason, and a person pastes the text.
+* **Recovered descriptions require deterministic validation before persistence** (`jd_quality.validate_recovered`).
+  Detection (`jd_quality.description_problem`) never decides by length alone.
+* **Original scraped descriptions are never silently destroyed.** The board's text moves to
+  `original_description`; a usable description is replaced only by a fuller version of the same posting
+  (`jd_quality.better_than`); text a person saved (`description_source = USER`) is never replaced. Record provenance
+  (`description_source`, `description_fetch_method`, URLs, `description_fetched_at`, task id) — never invent it.
+* **LLM extraction is a fallback, not the retrieval mechanism.** It runs only on an ambiguous page, sees at most a few
+  already-fetched candidate blocks (never the whole page), and returns block ids (`JobDescriptionRecoveryResult`);
+  the saved text is the page's own. Its prompt lives in `app/prompts/job_description_recovery.py` (this repository's
+  prompt package is `app/prompts/`), treats page text as untrusted data, and has a version constant.
+* **Successful recovery feeds the existing Structured JD pipeline**: `job_description.queue_parse`, then
+  `ranker.reopen_for_description` / `ranker.queue_job`. Recovery never parses or ranks by itself, and there is no
+  second parser or a second workflow state model — recovery status lives on the task.
+* **Site extractors are small.** Add a site to `app/services/jd_extractors.py` only for a documented public endpoint
+  or the one container its postings use; the Generic extractor must keep working for everything else.
+
+## Discovery quality: domain filter, feedback, removed postings, resume per job
+
+* **The domain filter is deterministic** (`app/services/domain_match.py`): never a model. It runs where jobs are
+  created (`app/services/discovery.admit`, called by `sources.upsert_job` and `hunter._save`) before description
+  recovery, parsing or ranking are queued, and in the ranking and recovery sweeps for older jobs. A hidden job
+  (`domain_match = NOT_MATCHING`) must never get a recovery, parse or ranking task; `ranker.hard_filter_reason` refuses
+  it whatever path queued it. When unsure, keep the job. A person's own terms (roles, skills, include list) always win,
+  jobs added by hand are never hidden, and KEPT jobs are never re-assessed.
+* **Learning is counting, not inference** (`app/services/feedback_learning.py`): record feedback with
+  `feedback_learning.record(db, job, action)` *before* deleting a job, then `after_feedback`, which learns inside a
+  savepoint so a failure never undoes the person's action. Automatic deletions (dead postings) are never feedback.
+* **Dead postings go through `job_removal.remove_posting`**: tombstone, log line, `delete_job` (which also removes task
+  rows, for SQLite). Approved or applied jobs are never deleted, and only a page that says the posting is gone counts.
+  Import paths check `job_removal.is_removed` before creating a job.
+* **Resolve the resume through `resume_verification.for_job(db, profile, job)`** in every workflow that has a job
+  (ranking, tailoring, review, follow-ups, MCP), and `resume_for(db, profile)` instead of `active_resume` in context
+  builders. The job view only changes `master_resume` / the resume version read; it never activates a resume or writes
+  the master text. A job without `resume_id` behaves exactly as before.
+* **Resume choice is deterministic and pins win** (`app/services/resume_matching.py`): tags live on `Resume`
+  (`domain`, `roles`); `discovery.choose_resume` applies the setup's pin, else `auto_assign`. Only `resume_choice`
+  NULL or `AUTO` may ever be re-matched; `SETUP`, `USER` and `ACTIVE` are the person's decisions. Changing tags never
+  re-ranks by itself — re-matching is an explicit action, because it can queue model calls.
+
 ## Traces
 
 `app/services/tracing.py` holds an ambient correlation ID. Scheduler jobs and HTTP requests open one; nested
@@ -160,6 +217,7 @@ Checklist and examples: `docs/prompts.md`. The rules a change must keep:
 | `external_api_request_logs` | `app/services/external_api.py` | `EXTERNAL_API_LOG_RETENTION_DAYS` (90), rolled into `external_api_usage_daily` |
 | `llm_request_logs` | `app/services/llm_telemetry.py` (routing columns: worker, requested and actual model, tier, fallback, escalation; structured output: schema enforcement, validation failure reason, context builder version) | `LLM_TELEMETRY_RETENTION_DAYS` (90), rolled into `llm_usage_daily` |
 | `system_logs` | `app/services/system_log.py` | `SYSTEM_LOG_RETENTION_DAYS` (30), deleted |
+| `job_description_fetch_tasks` | `app/services/jd_recovery.py` (owned, in `OWNED_MODELS`) | kept: a job's recovery history and the JD recovery metrics |
 
 An LLM call writes one row in each of the first two: the generic row is the provider call, the LLM row is the
 token and context detail, and `llm_request_logs.external_request_id` joins them. Do not record an LLM call

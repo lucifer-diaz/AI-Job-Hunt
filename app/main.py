@@ -36,7 +36,9 @@ from app.auth import PASSWORD_MIN_LENGTH, CurrentUser, current_user, get_user_db
 from app.auth import router as auth_router
 from app.db import engine
 from app.db_migrations import run_migrations
+from app.discovery_api import router as discovery_router
 from app.hunter_api import router as hunter_router
+from app.infrastructure.browser import shutdown_browser_service
 from app.job_description_api import router as job_description_router
 from app.models import (
     Application,
@@ -76,6 +78,7 @@ from app.security import SecretsUnavailable
 from app.services import (
     backoff,
     context_builder,
+    feedback_learning,
     mcp_tokens,
     ranker,
     resume_verification,
@@ -140,6 +143,8 @@ async def lifespan(_app: FastAPI):
     finally:
         await tailor_worker.stop()
         await scheduler.stop()
+        # The shared browser starts lazily on first use (JD recovery); closing it here leaves no Chromium behind.
+        await shutdown_browser_service()
 
 
 app = FastAPI(title=settings.app_name, version="0.5.0", lifespan=lifespan)
@@ -161,6 +166,7 @@ app.include_router(hunter_router)
 app.include_router(monitoring_router)
 app.include_router(resume_router)
 app.include_router(job_description_router)
+app.include_router(discovery_router)
 app.include_router(ai_models_router)
 
 # Reachable without signing in. Cron and admin routes are protected by their own secrets.
@@ -700,6 +706,9 @@ def approve(job_id: int, payload: ApproveIn | None = None, db: Session = Depends
         app_obj = approve_job(db, job, override=below, note=payload.note)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    feedback_learning.record(db, job, "APPROVED")  # teaches the domain filter what a good job looks like
+    feedback_learning.after_feedback(db, job.user_id)
+    db.commit()
     return {"application_id": app_obj.id, "status": app_obj.status, "apply_url": job.url,
             "approval_override": app_obj.approval_override, "reviewer_score": latest.reviewer_score,
             "min_review_score": min_score}
@@ -714,6 +723,7 @@ def applied(job_id: int, payload: RecruiterIn, db: Session = Depends(get_user_db
         app_obj = mark_applied(db, job)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    feedback_learning.record(db, job, "APPLIED")
     # Only overwrite what the confirmation step actually supplied.
     if payload.recruiter_name or payload.recruiter_email:
         set_primary_recruiter(app_obj, payload.recruiter_name or app_obj.recruiter_name,

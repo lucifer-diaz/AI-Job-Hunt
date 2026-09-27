@@ -45,6 +45,7 @@ from app.models import (
     Job,
     JobRanking,
     JobRankingTask,
+    Resume,
     ResumeDocument,
     ResumeVersion,
     WorkflowTransition,
@@ -57,6 +58,7 @@ from app.prompts.ranking import (
     ranking_profile_facts,
 )
 from app.services import backoff, job_description, user_settings
+from app.services import resume_verification as rv
 from app.services.context_builder import build_ranking_context, latest_ranking_context_hash
 from app.services.lifecycle import ErrorCategory, InvalidTransition
 from app.services.lifecycle import WorkflowState as S
@@ -236,6 +238,10 @@ def hard_filter_reason(job: Job, policy: RankingPolicy) -> str | None:
     """Obvious mismatches that need no model. Unknown values never filter a job out."""
     if job.status == "dismissed":
         return "Dismissed in triage"
+    if job.status == "archived" and job.triaged_at is not None:  # archived by the person, before any ranking
+        return "Archived by you"
+    if getattr(job, "domain_match", None) == "NOT_MATCHING":  # app.services.domain_match: never ranked
+        return job.domain_reason or "Outside your domain"
     if (job.company or "").strip().lower() in policy.exclude_companies:
         return f"{job.company} is an excluded company"
     title = (job.title or "").lower()
@@ -912,22 +918,29 @@ def _process(db: Session, claimed: TaskClaim, clock: Callable[[], datetime]) -> 
     job = db.get(Job, claimed.job_id)
     if job is None:
         return _skip(db, claimed, "The job was deleted", clock())
-    profile = _profile(db, claimed.user_id)
+    # The job's chosen resume (Job.resume_id), else the active one: resume_verification.for_job.
+    profile = rv.for_job(db, _profile(db, claimed.user_id), job)
     problem = "No candidate profile yet: fill in your profile in Settings" if profile is None \
         else resume_problem(profile.master_resume)
     if problem:
         return _wait(db, claimed, problem, clock())
     if missing_description(job):  # queued before the gate existed, or the text was removed since: never score a title
         return _wait(db, claimed, NO_DESCRIPTION, clock())
-    waiting = job_description.waiting_reason(db, job)
-    if waiting:  # the posting is being parsed into requirements; the task waits without using an attempt
+    from app.services import (
+        jd_recovery,  # local import: jd_recovery queues ranking through this module
+    )
+
+    waiting = jd_recovery.waiting_reason(db, job) or job_description.waiting_reason(db, job)
+    if waiting:  # the posting is being recovered or parsed; the task waits without using an attempt
         return _wait(db, claimed, waiting, clock())
     snapshot = resume_snapshot(db, profile)
-    job, profile = db.get(Job, claimed.job_id), _profile(db, claimed.user_id)  # reloaded after the snapshot commit
+    job = db.get(Job, claimed.job_id)  # reloaded after the snapshot commit
+    profile = rv.for_job(db, _profile(db, claimed.user_id), job)
     # Only the facts relevant to this job: selected structured resume data and verified evidence.
     context = build_ranking_context(db, profile, job, get_settings().ranking_max_evidence)
     db.commit()  # a first use may have parsed the active resume version
-    job, profile = db.get(Job, claimed.job_id), _profile(db, claimed.user_id)
+    job = db.get(Job, claimed.job_id)
+    profile = rv.for_job(db, _profile(db, claimed.user_id), job)
     evidence = context.relevant_evidence
     inputs = RankingInputs(
         profile_id=profile.id, resume_id=snapshot.id, resume_version=snapshot.version,
@@ -1006,13 +1019,15 @@ def _queue_stale(db: Session, now: datetime, limit: int) -> int:
     rows = db.execute(
         select(Job.id, Job.user_id, JobRanking.candidate_profile_id, JobRanking.resume_content_hash,
                JobRanking.profile_hash, JobRanking.prompt_version, Job.structured_description_parsed_at,
-               JobRanking.created_at)
+               JobRanking.created_at, Job.resume_id)
         .join(latest, latest.c.job_id == Job.id)
         .join(JobRanking, and_(JobRanking.job_id == Job.id, JobRanking.version == latest.c.version))
         .where(Job.state == S.QUALIFIED).order_by(Job.id)).all()
     current: dict[int, CurrentInputs | None] = {}
+    chosen: dict[int, str | None] = {}  # a job's own resume (Job.resume_id) by id: its content hash
     queued = 0
-    for job_id, user_id, profile_id, resume_hash, profile_hash, prompt_version, parsed_at, ranked_at in rows:
+    for job_id, user_id, profile_id, resume_hash, profile_hash, prompt_version, parsed_at, ranked_at, resume_id \
+            in rows:
         if queued >= limit:
             break
         if user_id not in current:
@@ -1020,6 +1035,12 @@ def _queue_stale(db: Session, now: datetime, limit: int) -> int:
         now_inputs = current[user_id]
         if now_inputs is None:
             continue
+        if resume_id is not None:
+            if resume_id not in chosen:
+                text = db.scalar(select(Resume.raw_text).where(Resume.id == resume_id))
+                chosen[resume_id] = content_hash(text) if text is not None else None
+            if chosen[resume_id] is not None:
+                now_inputs = CurrentInputs(now_inputs.profile_id, now_inputs.profile_hash, chosen[resume_id])
         parsed_after = (get_settings().jd_rerank_after_parse and parsed_at is not None
                         and ranked_at is not None and parsed_at > ranked_at)
         reason = ("job_parsed" if parsed_after
@@ -1079,11 +1100,17 @@ def sweep(db: Session, *, now: datetime | None = None, limit: int | None = None)
         return policies[user_id]
 
     # Jobs created by any path (manual, from a URL, Lever, Greenhouse, older imports) are filtered and queued here.
+    from app.services import domain_match  # local import: domain_match reads ranker's queueing
+
+    rules: dict = {}
     for job_id in db.scalars(select(Job.id).where(Job.state.in_(PRE_RANK_STATES), Job.user_id.is_not(None))
                              .order_by(Job.id).limit(limit)).all():
         job = _lock_job(db, job_id)
         if job is None or job.state not in PRE_RANK_STATES:
             db.rollback()
+            continue
+        if not domain_match.screen(db, job, rules, actor="ranker", now=now):
+            counts["not_matching"] += _commit(db)  # hidden before any model is asked about it
             continue
         skipped = queue_job(db, job, policy=policy_of(job.user_id), actor="ranker", now=now)
         if _commit(db):
@@ -1102,8 +1129,8 @@ def sweep(db: Session, *, now: datetime | None = None, limit: int | None = None)
     counts["archived_by_salary_policy"] = _recheck_salary(db, now, limit, policy_of)
     if settings.ranking_auto_rerank:
         counts["rerank_queued"] = _queue_stale(db, now, limit)
-    return {key: counts.get(key, 0) for key in ("recovered", "queued", "filtered_out", "archived_by_salary_policy",
-                                                "rerank_queued")}
+    return {key: counts.get(key, 0) for key in ("recovered", "queued", "filtered_out", "not_matching",
+                                                "archived_by_salary_policy", "rerank_queued")}
 
 
 # ───────────── read models for the API ─────────────

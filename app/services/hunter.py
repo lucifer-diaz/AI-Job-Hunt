@@ -26,7 +26,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, object_session
 
 from app.models import Job, SearchProfile, SearchRun
-from app.services import job_description, ranker, sources
+from app.services import discovery, job_description, job_removal, ranker, sources
 from app.services.apify_adapters import (FALLBACK_FOR_SITE, PRIMARY, HunterSearch, PlannedRun, RunContext,
                                          SchemaMismatch, get_adapter, older_than, plan_runs)
 from app.services.lifecycle import WorkflowState as S
@@ -233,6 +233,7 @@ def import_run_items(db: Session, run: SearchRun, items: list[Any]) -> dict[str,
     ctx = RunContext(roles=tuple(run.roles or ()), location=run.location or "", actor_id=run.actor_id,
                      run_id=run.external_run_id, reference_time=reference, search_profile_id=run.search_profile_id)
     policy = ranker.policy_for(db, run.user_id)
+    rules_cache: dict = {}  # the account's domain rules, read once per run
     stats: Counter = Counter()
     for item in items:
         if not isinstance(item, dict):
@@ -252,10 +253,10 @@ def import_run_items(db: Session, run: SearchRun, items: list[Any]) -> dict[str,
                                                        job["scraped_at"] or reference, params.get("hours_old")):
             stats["too_old"] += 1
             continue
-        stats[_save(db, run, ctx, job, policy)] += 1
+        stats[_save(db, run, ctx, job, policy, rules_cache)] += 1
     summary = {"seen": len(items), **{key: 0 for key in ("normalized", "created", "duplicates", "filtered_out",
                                                           "missing_title", "missing_company", "missing_posted_date",
-                                                          "too_old")}}
+                                                          "too_old", "not_matching", "previously_removed")}}
     summary.update(stats)
     summary["created"] += summary.pop("created_filtered_out", 0)
     summary["empty"] = not items
@@ -333,7 +334,8 @@ def _new_job(run: SearchRun, ctx: RunContext, job: dict[str, Any]) -> Job:
     )
 
 
-def _save(db: Session, run: SearchRun, ctx: RunContext, job: dict[str, Any], policy: ranker.RankingPolicy) -> str:
+def _save(db: Session, run: SearchRun, ctx: RunContext, job: dict[str, Any], policy: ranker.RankingPolicy,
+          rules_cache: dict | None = None) -> str:
     """Save one normalized result and commit. Returns duplicates, created or created_filtered_out.
 
     A new job passes the ranker's hard filters and is queued for ranking in the same transaction; the model is
@@ -344,14 +346,19 @@ def _save(db: Session, run: SearchRun, ctx: RunContext, job: dict[str, Any], pol
         _merge(existing, run, ctx, job)
         db.commit()
         return "duplicates"
+    if job_removal.is_removed(db, run.user_id, canonical_url=job["canonical_url"], dedupe_key=job["dedupe_key"]):
+        return "previously_removed"  # deleted earlier because the posting no longer existed
     record = _new_job(run, ctx, job)
     try:
         db.add(record)
         db.flush()
         transition(db, record, S.NORMALIZED, actor="hunter",
                    reason=f"Normalized from {run.actor_id} run {run.external_run_id}")
-        # Queued in the same transaction as the ranking task, so ranking waits for the parse from the start.
-        job_description.queue_parse(db, record)
+        # The setup's resume, the domain filter, then a parse (or background recovery of a missing description) —
+        # queued in the same transaction as the ranking task, so ranking waits for them from the start.
+        if discovery.admit(db, record, search_run_id=run.id, rules_cache=rules_cache) == "not_matching":
+            db.commit()
+            return "not_matching"
         reason = ranker.queue_job(db, record, policy=policy, actor="hunter")
         db.commit()
     except IntegrityError:  # another sync saved the same posting a moment ago

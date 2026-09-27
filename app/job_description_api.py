@@ -7,14 +7,21 @@ from __future__ import annotations
 
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import desc, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.auth import get_user_db
-from app.models import Job, JobDescriptionParseTask, JobStructuredDataChange
-from app.services import job_context, job_description
+from app.models import (
+    Job,
+    JobDescriptionFetchTask,
+    JobDescriptionParseTask,
+    JobStructuredDataChange,
+)
+from app.scheduler_hooks import run_soon
+from app.services import jd_quality, jd_recovery, job_context, job_description
 from app.services.job_description import StructuredJobDescriptionIn
 
 router = APIRouter()
@@ -129,3 +136,48 @@ def interview_insights(job_id: int, db: Session = Depends(get_user_db)):
     job = _job(db, job_id)
     context = job_context.build_interview_insights_job_context(db, job)
     return {**context.to_dict(), "stats": context.stats.as_dict()}
+
+
+# ───────────── description recovery (app.services.jd_recovery) ─────────────
+
+def _recovery(db: Session, job: Job) -> dict:
+    history = db.scalars(select(JobDescriptionFetchTask).where(JobDescriptionFetchTask.job_id == job.id)
+                         .order_by(desc(JobDescriptionFetchTask.id)).limit(5)).all()
+    return {"job_id": job.id, **jd_recovery.status_of(db, job),
+            "history": [jd_recovery.task_dict(task) for task in history]}
+
+
+@router.post("/api/jobs/{job_id}/recover-description", status_code=202)
+def recover_description(job_id: int, request: Request, background: BackgroundTasks, force: bool = False,
+                        db: Session = Depends(get_user_db)):
+    """Queue recovery of this job's description from its posting URL. Nothing is fetched in the request: the
+    scheduler's recovery worker does it (started right after this response). A usable description is left alone
+    unless `force` is set, and a recovery already queued or running is returned rather than duplicated."""
+    job = job_description.lock_job(db, job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+    if not (job.url or job.source_url or "").strip():
+        raise HTTPException(422, "This job has no posting URL to recover the description from — paste it instead")
+    if jd_quality.is_job_description_usable(job) and not force:
+        db.rollback()
+        return {**_recovery(db, job), "queued": False, "message": "This job already has a usable description"}
+    try:
+        task = jd_recovery.enqueue(db, job, reason="user_request", force=True)
+        db.commit()
+    except IntegrityError:  # queued by another request at the same moment
+        db.rollback()
+        task = jd_recovery.active_task(db, job.id)
+    run_soon(background, request.app, "jd_recovery")
+    return {**_recovery(db, job), "queued": task is not None, "message": "Recovery queued"}
+
+
+@router.get("/api/jobs/{job_id}/description-recovery")
+def description_recovery(job_id: int, db: Session = Depends(get_user_db)):
+    """Where recovery of this job's description stands, with its recent attempts."""
+    return _recovery(db, _job(db, job_id))
+
+
+@router.get("/api/system/jd-recovery")
+def jd_recovery_diagnostics(db: Session = Depends(get_user_db)):
+    """What description recovery can use right now: HTTP, the browser, the model. No secrets or file paths."""
+    return jd_recovery.diagnostics(db, db.info.get("user_id"))

@@ -776,6 +776,13 @@ class LLMClient:
                                      ("title", "company", "location", "remote_type", "job_type", "seniority")},
                                   source_board=None, source="mock")
             return deterministic_parse(job, text.strip())
+        if "RECOVER_JOB_DESCRIPTION" in user.split("\n", 1)[0]:
+            from app.services.jd_extractors import likely_blocks
+
+            raw = user.split("<untrusted_page_blocks>", 1)[-1].rsplit("</untrusted_page_blocks>", 1)[0].strip()
+            chosen = likely_blocks(json.loads(raw) if raw.startswith("[") else [])
+            return {"is_job_posting": bool(chosen), "selected_block_ids": chosen, "confidence": 0.8 if chosen else 0.1,
+                    "explanation": "Mock: the block with the most job-posting structure."}
         if "COVER_LETTER" in user.split("\n", 1)[0]:
             company = re.search(r'^JOB:\n.*?"company": "([^"]*)"', user, re.MULTILINE | re.DOTALL)
             return {"cover_letter": f"Dear Hiring Team,\n\nI am applying for this role at "

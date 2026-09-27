@@ -18,6 +18,7 @@ from app.prompts import (
     build_followup_prompt,
     build_inbox_classification_prompt,
     build_job_description_parser_prompt,
+    build_job_description_recovery_prompt,
     build_ranking_prompt,
     build_resume_parser_prompt,
     build_review_prompt,
@@ -59,6 +60,8 @@ def build(fixture: dict[str, Any]) -> Prompt:
         return build_resume_parser_prompt(given["resume_text"])
     if name == "job_description_parser":
         return build_job_description_parser_prompt(job, job.description)
+    if name == "job_description_recovery":
+        return build_job_description_recovery_prompt(job, given["blocks"], page_title=given.get("page_title"))
     if name == "application_question":
         return build_application_question_prompt(given["question"], given["context"])
     if name == "inbox":

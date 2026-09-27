@@ -6,15 +6,13 @@ Job Hunt OS never submits applications — the apply kit hands the final click t
 from __future__ import annotations
 
 import hashlib
-import ipaddress
 import json
 import re
-import socket
 from collections import Counter, defaultdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from statistics import median
-from urllib.parse import urlparse
+from typing import Literal
 
 import httpx
 from bs4 import BeautifulSoup
@@ -33,6 +31,7 @@ from app.models import (
     FollowUp,
     Job,
     KnowledgeAnswer,
+    Resume,
     ResumeDocument,
     ResumeVariant,
     SavedSearch,
@@ -40,7 +39,7 @@ from app.models import (
 )
 from app.prompts import build_evidence_extraction_prompt
 from app.scheduler_hooks import run_soon
-from app.services import ranker, resume_verification
+from app.services import feedback_learning, ranker, resume_verification
 from app.services.actors import (
     ACTOR_GROUPS,
     BUILTIN,
@@ -75,6 +74,7 @@ from app.services.contacts import (
 from app.services.exports import DOCX_MEDIA_TYPE, markdown_to_docx, packet_filename, packet_slug
 from app.services.external_api import external_client
 from app.services.external_monitoring import run_location
+from app.services.job_removal import PROTECTED_STATUSES, delete_job
 from app.services.knowledge import question_key
 from app.services.lifecycle import WorkflowState as S
 from app.services.lifecycle import can_transition
@@ -89,6 +89,7 @@ from app.services.sources import (
     start_apify_search,
     upsert_job,
 )
+from app.services.url_safety import UnsafeURL, check_public_url
 from app.services.user_settings import apify_token, lock_settings_row, settings_for
 from app.services.work_queue import transition
 from app.services.workflow import (
@@ -123,8 +124,10 @@ ALL_STAGE_IDS = {s["id"] for s in BASE_STAGES + EXTRA_STAGES} | {"closed"}
 REPLY_STAGES = {"screening", "interviewing", "takehome", "offer", "negotiating"}
 INTERVIEW_STAGES = {"interviewing", "takehome", "offer", "negotiating"}
 INACTIVE_STAGES = {"closed", "rejected"}
+# "archive" puts a job away without judging it: it leaves the queue and is not ranked, but unlike a dismissal it
+# teaches the domain filter nothing (app.services.feedback_learning).
 TRIAGE_ACTIONS = {"shortlist": "shortlisted", "maybe": "maybe", "skip": "dismissed", "dismiss": "dismissed",
-                  "restore": "discovered"}
+                  "archive": "archived", "restore": "discovered"}
 QUEUE_STATUSES = ("discovered", "shortlisted", "archived")
 AGENCY_HINTS = ("staffing", "recruit", "consultan", "talent", "placement", "manpower", "hr services", "headhunt")
 BOARDS = ["linkedin", "indeed", "glassdoor", "naukri", "bayt", "zip_recruiter"]
@@ -204,6 +207,11 @@ def job_card(job: Job) -> dict:
         "snippet": (job.description or "")[:360], "agency": is_agency(job.company),
         # Ranking waits for a real posting (app.services.ranker.missing_description); the UI asks for one.
         "needs_description": ranker.missing_description(job),
+        # Domain filter (app.services.domain_match): NOT_MATCHING jobs are hidden from Discovery unless asked for.
+        "domain_match": job.domain_match, "domain_reason": job.domain_reason,
+        # The resume ranking and tailoring use for this job; None = the active resume. (resume_id in the job detail
+        # is its tailored packet.)
+        "resume_choice_id": job.resume_id, "resume_choice": job.resume_choice,
         "search_run_id": job.search_run_id, "application_id": app.id if app else None,
         "application_status": app.status if app else None, "stage": app.stage if app else None,
         "rejection": rejection_card(job),
@@ -220,7 +228,8 @@ def get_job(db: Session, job_id: int) -> Job:
 # ───────────────────────────── summary / overview / today ─────────────────────────────
 
 def triage_query(db: Session):
-    query = select(Job).where(Job.triaged_at.is_(None), Job.status.in_(QUEUE_STATUSES))
+    query = select(Job).where(Job.triaged_at.is_(None), Job.status.in_(QUEUE_STATUSES),
+                              Job.domain_match.is_distinct_from("NOT_MATCHING"))
     excluded = excluded_companies(db)
     if excluded:
         query = query.where(func.lower(Job.company).not_in(excluded))
@@ -451,7 +460,7 @@ def jobs_search(q: str = "", min_fit: int = 0, board: str = "all", location: str
                 include_applied: bool = False,
                 page: int = Query(1, ge=1), per_page: int = Query(25, ge=1, le=200), queue: bool = False,
                 hide_agencies: bool = False, hide_reposts: bool = False, keywords: str = "",
-                ids_only: bool = False, db: Session = Depends(get_user_db)):
+                domain: str = "matching", ids_only: bool = False, db: Session = Depends(get_user_db)):
     from app.services import job_description  # local import, as app.services.sources does
 
     if description not in ("all", "") and description not in job_description.DESCRIPTION_STATES:
@@ -460,6 +469,8 @@ def jobs_search(q: str = "", min_fit: int = 0, board: str = "all", location: str
         raise HTTPException(422, f"Unknown date window: {within}")
     if date_field not in ("found", "posted"):
         raise HTTPException(422, "date_field must be found or posted")
+    if domain not in ("matching", "not_matching", "all"):
+        raise HTTPException(422, "domain must be matching, not_matching or all")
     cutoff = utcnow() - DATE_WINDOWS[within] if within else None
     # Jobs you already applied to stay out of Discovery unless you ask for them (the Applied stage, or the box).
     show_applied = include_applied or stage in SUBMITTED_STATUSES
@@ -476,11 +487,16 @@ def jobs_search(q: str = "", min_fit: int = 0, board: str = "all", location: str
     seen: set[str] = set()
     rows = []
     applied_hidden = 0
+    domain_counts = Counter()
     for job in jobs:
         key = _dedupe_key(job)
         repost = key in seen
         seen.add(key)
         if job.company.lower() in excluded:
+            continue
+        hidden = job.domain_match == "NOT_MATCHING"
+        domain_counts["not_matching" if hidden else "matching"] += 1
+        if (domain == "matching" and hidden) or (domain == "not_matching" and not hidden):
             continue
         if min_fit and (job.fit_score or 0) < min_fit:
             continue
@@ -521,6 +537,10 @@ def jobs_search(q: str = "", min_fit: int = 0, board: str = "all", location: str
         rows.sort(key=lambda j: j.company.lower())
     else:
         rows.sort(key=lambda j: (j.fit_score is None, -(j.fit_score or 0), -j.id))
+    if queue:  # the triage queue never lists hidden jobs, so their count comes from the table itself
+        domain_counts["not_matching"] = db.scalar(
+            select(func.count(Job.id)).where(Job.triaged_at.is_(None), Job.status.in_(QUEUE_STATUSES),
+                                             Job.domain_match == "NOT_MATCHING")) or 0
     total = len(rows)
     if ids_only:  # "select all matching" across every page
         chosen = rows[:5000]
@@ -535,6 +555,7 @@ def jobs_search(q: str = "", min_fit: int = 0, board: str = "all", location: str
             "description_states": [[key, name, counts.get(key, 0)]
                                    for key, name in job_description.DESCRIPTION_STATES.items()],
             "total_all": total_all, "applied_hidden": applied_hidden,
+            "domain_counts": {"matching": domain_counts["matching"], "not_matching": domain_counts["not_matching"]},
             "page": page, "pages": pages, "per_page": per_page, "boards": boards,
             "locations": location_facets([j.location for j in jobs])}
 
@@ -558,25 +579,40 @@ def apply_triage(job: Job, action: str) -> None:
     job.triaged_at = None if action == "restore" else utcnow()
 
 
+TRIAGE_FEEDBACK = {"shortlist": "SHORTLISTED", "skip": "DISMISSED", "dismiss": "DISMISSED"}
+
+
+def _triage_feedback(db: Session, jobs: list[Job], action: str) -> None:
+    """What the person decided in triage teaches the domain filter (app.services.feedback_learning)."""
+    kind = TRIAGE_FEEDBACK.get(action)
+    if not kind or not jobs:
+        return
+    for job in jobs:
+        feedback_learning.record(db, job, kind)
+    feedback_learning.after_feedback(db, jobs[0].user_id)
+
+
 @router.post("/api/jobs/{job_id}/triage")
 def triage(job_id: int, payload: TriageIn, db: Session = Depends(get_user_db)):
     job = get_job(db, job_id)
     apply_triage(job, payload.action)
+    _triage_feedback(db, [job], payload.action)
     db.commit()
     return job_card(job)
 
 
 @router.post("/api/jobs/bulk-triage")
 def bulk_triage(payload: BulkTriageIn, db: Session = Depends(get_user_db)):
-    changed = 0
+    changed = []
     for job in db.scalars(select(Job).where(Job.id.in_(payload.ids))).all():
         try:
             apply_triage(job, payload.action)
-            changed += 1
+            changed.append(job)
         except HTTPException:
             continue
+    _triage_feedback(db, changed, payload.action)
     db.commit()
-    return {"changed": changed}
+    return {"changed": len(changed)}
 
 
 class BulkIdsIn(BaseModel):
@@ -584,19 +620,25 @@ class BulkIdsIn(BaseModel):
     include_submitted: bool = False
 
 
-PROTECTED_STATUSES = ("approved", "applied")
-
-
 @router.post("/api/jobs/bulk-delete")
 def bulk_delete(payload: BulkIdsIn, db: Session = Depends(get_user_db)):
-    """Permanently delete jobs with their tailored packets. Approved or applied jobs need include_submitted."""
+    """Permanently delete jobs with their tailored packets. Approved or applied jobs need include_submitted.
+
+    Each deletion is remembered as feedback (the job itself is gone), so similar jobs can be hidden later — except
+    for jobs the domain filter had already hidden: clearing those out says nothing new."""
     deleted, protected = 0, []
+    owner = None
     for job in db.scalars(select(Job).where(Job.id.in_(payload.ids))).all():
         if job.status in PROTECTED_STATUSES and not payload.include_submitted:
             protected.append(job.id)
             continue
-        db.delete(job)
+        if job.domain_match != "NOT_MATCHING":
+            feedback_learning.record(db, job, "DELETED")
+            owner = job.user_id
+        delete_job(db, job)
         deleted += 1
+    if owner is not None:
+        feedback_learning.after_feedback(db, owner)
     db.commit()
     return {"deleted": deleted, "protected": protected,
             "missing": max(0, len(set(payload.ids)) - deleted - len(protected))}
@@ -636,8 +678,11 @@ def job_detail(job_id: int, db: Session = Depends(get_user_db)):
     from app.services import job_description  # local import, as app.services.sources does
 
     parse_status = job_description.latest_parse_statuses(db, [job.id]).get(job.id)
+    from app.services import jd_recovery
+
     return {**job_card(job), "description": job.description, "fit_analysis": job.fit_analysis or {},
             "description_state": job_description.description_state(job, parse_status),
+            "description_recovery": jd_recovery.status_of(db, job),
             "rank_pct": rank, "wizard": [{"label": l, "done": d, "meta": m} for l, d, m in steps],
             "gap_notes": gap_notes, "notes": app.notes if app else "",
             "resume_id": resume.id if resume else None}
@@ -652,17 +697,10 @@ class JobUrlIn(BaseModel):
 
 
 def _safe_public_url(url: str) -> None:
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise HTTPException(422, "Enter a full http(s) job URL")
     try:
-        infos = socket.getaddrinfo(parsed.hostname, None)
-    except socket.gaierror as exc:
-        raise HTTPException(422, "That host could not be resolved") from exc
-    for info in infos:
-        address = ipaddress.ip_address(info[4][0])
-        if address.is_private or address.is_loopback or address.is_link_local or address.is_reserved:
-            raise HTTPException(422, "Private network addresses are not allowed")
+        check_public_url(url)
+    except UnsafeURL as exc:
+        raise HTTPException(422, str(exc)) from exc
 
 
 def extract_job_posting(html: str) -> dict:
@@ -762,7 +800,10 @@ class JobDescriptionIn(BaseModel):
 def save_job_description(job_id: int, payload: JobDescriptionIn, request: Request, background: BackgroundTasks,
                          db: Session = Depends(get_user_db)):
     """Set the posting text by hand (typed, pasted or fetched), then parse and rank it."""
-    from app.services import job_description  # local import, as app.services.sources does
+    from app.services import (  # local import, as app.services.sources does
+        jd_recovery,
+        job_description,
+    )
 
     job = job_description.lock_job(db, job_id)
     if job is None:
@@ -774,6 +815,8 @@ def save_job_description(job_id: int, payload: JobDescriptionIn, request: Reques
                                  "characters)")
     job.description = text
     job_description.normalize_job(db, job)
+    # A person's own text: never replaced by recovery, and recovery that has not started is cancelled.
+    jd_recovery.on_description_changed(db, job, by_user=True)
     job_description.queue_parse(db, job, reason="description_changed")
     ranker.reopen_for_description(db, job, actor=f"user:{db.info['user_id']}")
     # A job ranked without a description (or with a different one) is ranked again against the new text.
@@ -822,6 +865,10 @@ class SearchProfileIn(BaseModel):
     min_salary: int = Field(default=0, ge=0, le=10_000_000)
     startup_details: bool = True
     auto_rank: bool = True
+    # The resume jobs from this search are ranked and tailored with: auto (matched by resume tags; the active resume
+    # when nothing matches clearly), active (always the active resume) or fixed (resume_id).
+    resume_mode: Literal["auto", "active", "fixed"] = "auto"
+    resume_id: int | None = None
     schedule: str = "manual"
 
 
@@ -1474,6 +1521,8 @@ def reject_job(job_id: int, payload: RejectionIn, db: Session = Depends(get_user
     job.rejection_reason, job.rejection_note = reason or None, payload.notes.strip() or None
     job.rejected_at = job.triaged_at = utcnow()
     job.status = "dismissed"
+    feedback_learning.record(db, job, "REJECTED")
+    feedback_learning.after_feedback(db, job.user_id)
     # The workflow state follows where the lifecycle allows it (app.services.lifecycle). A job whose state has
     # not caught up with the legacy status is still rejected — the queue is what the user acted on.
     if can_transition(job.state, S.SKIPPED, previous_state=job.previous_state):
@@ -1833,9 +1882,17 @@ def resume_list(db: Session = Depends(get_user_db)):
     # in_use says whether tailoring actually uses this file's text: the master resume text can be
     # edited by hand in Settings, and only the text is sent to the model.
     master = (get_profile(db).master_resume or "").strip()
+    # A file's tags are its resume version's (the newest one it became): the library and Versions always agree.
+    versions: dict[int, Resume] = {}
+    for version in db.scalars(select(Resume).where(Resume.resume_document_id.is_not(None))
+                              .order_by(Resume.version)).all():
+        versions[version.resume_document_id] = version
     return [{"id": d.id, "filename": d.original_filename, "size": d.size, "media_type": d.media_type,
              "active": d.active, "created_at": d.created_at.isoformat(), "words": len(d.extracted_text.split()),
-             "in_use": (d.extracted_text or "").strip() == master} for d in docs]
+             "in_use": (d.extracted_text or "").strip() == master,
+             "version_id": versions[d.id].id if d.id in versions else None,
+             "domain": versions[d.id].domain if d.id in versions else None,
+             "roles": (versions[d.id].roles or []) if d.id in versions else []} for d in docs]
 
 
 @router.post("/api/profile/resumes/{document_id}/primary")

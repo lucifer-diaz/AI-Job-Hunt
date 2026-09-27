@@ -92,7 +92,9 @@ def latest_variant(db: Session, job_id: int) -> ResumeVariant | None:
 
 
 def decide_review(db: Session, job: Job, variant: ResumeVariant, review: ReviewIn) -> ReviewDecision:
-    profile = get_profile(db)
+    from app.services import resume_verification as rv
+
+    profile = rv.for_job(db, get_profile(db), job)  # checked against the resume this job was tailored from
     data, legacy = from_variant_content(job.id, variant.content or {})
     issues = [] if (variant.content or {}).get("untailored") else validate_tailored_resume(
         db, profile, job, data, legacy=legacy)

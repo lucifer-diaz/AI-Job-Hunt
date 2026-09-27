@@ -9,6 +9,8 @@ services:
       - pgdata:/var/lib/postgresql/data
   web:
     build: .
+    # Headless Chromium (job-description recovery) uses shared memory; the app also passes --disable-dev-shm-usage.
+    shm_size: "512m"
     ports: ["8000:8000"]
     env_file: .env
     environment:

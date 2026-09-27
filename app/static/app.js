@@ -11,7 +11,7 @@ const attr = esc;
 function pfDefaults(kind) { return { q: '', min_fit: 0, min_review: 0, board: 'all', location: 'all', status: 'all', sort: kind === 'tailor' ? 'fit' : 'default' }; }
 const S = {
   screen: 'overview', knowledgeSection: 'answers', settingsSection: 'profile', todayVariant: 'focus', discMode: 'triage',
-  filters: { q: '', min_fit: 0, board: 'all', location: 'all', stage: 'all', description: 'all', date_field: 'found', within: '', include_applied: false, sort: 'fit', page: 1, per_page: 25 },
+  filters: { q: '', min_fit: 0, board: 'all', location: 'all', stage: 'all', description: 'all', domain: 'matching', date_field: 'found', within: '', include_applied: false, sort: 'fit', page: 1, per_page: 25 },
   triage: { min_fit: 0, location: 'all', hide_agencies: true, hide_reposts: true, keywords: [] }, triagedThisSession: 0,
   checked: new Set(), rankedIds: new Set(), selJob: null, jobOpen: null, jobTab: 'description',
   paletteOpen: false, paletteQuery: '', paletteJobs: [],
@@ -231,14 +231,21 @@ async function loadQueue() {
   if (!D.setups) D.setups = (await api('/api/search/setups')).setups;
   if (!D.runs) D.runs = await api('/api/search/apify/runs');
 }
+async function loadResumeChoices() {
+  if (!D.resumeChoices) {
+    const out = await api('/api/resumes/choices').catch(() => ({ items: [], catalog: [] }));
+    [D.resumeChoices, D.resumeCatalog] = [out.items, out.catalog || []];
+  }
+  return D.resumeChoices;
+}
 async function loadTable() {
   const f = S.filters;
-  D.jobs = await api('/api/jobs/search?' + qs({ ...f, min_fit: f.min_fit || '' }));
+  [D.jobs] = await Promise.all([api('/api/jobs/search?' + qs({ ...f, min_fit: f.min_fit || '' })), loadResumeChoices()]);
   if (!D.jobs.items.some(j => j.id === S.selJob)) S.selJob = (D.jobs.items[0] || {}).id || null;
   D.selDetail = S.selJob ? await api(`/api/jobs/${S.selJob}`) : null;
 }
 async function loadSetup() {
-  const [setups, runs, actors] = await Promise.all([api('/api/search/setups'), api('/api/search/apify/runs'), api('/api/search/actors')]);
+  const [setups, runs, actors] = await Promise.all([api('/api/search/setups'), api('/api/search/apify/runs'), api('/api/search/actors'), loadResumeChoices()]);
   [D.setups, D.runs, D.actors] = [setups.setups, runs, actors];
   const sel = curSetup();
   if (sel?.id !== S.setupSel) { S.setupSel = sel?.id ?? null; delete S.forms.sp; }
@@ -645,7 +652,8 @@ function renderTriage() {
         <div><div class="xs muted mb4">Must mention (use / for either)</div>${tagBox('triage', 'keywords', S.triage.keywords, 'Hybrid, Lead/Principal…', 6)}</div>
         <label class="check"><input type="checkbox" data-triage="hide_agencies" ${S.triage.hide_agencies ? 'checked' : ''}>Hide staffing agencies</label>
         <label class="check"><input type="checkbox" data-triage="hide_reposts" ${S.triage.hide_reposts ? 'checked' : ''}>Hide reposts I've seen</label>
-        ${q.items.some(i => i.fit == null) ? btn(label('rankBatch', 'Rank every unranked job', 'Queueing…'), 'rank-batch', {}, 'soft block', isBusy('rankBatch')) : ''}</div></section>
+        ${q.items.some(i => i.fit == null) ? btn(label('rankBatch', 'Rank every unranked job', 'Queueing…'), 'rank-batch', {}, 'soft block', isBusy('rankBatch')) : ''}
+        ${q.domain_counts?.not_matching ? `<a href="#" class="xs" data-act="show-not-matching" title="Outside your domain: hidden at discovery, never ranked">${q.domain_counts.not_matching} hidden as not matching →</a>` : ''}</div></section>
     <section class="card pad16"><div class="row between mb10"><div class="card-title sm">Saved searches</div>${setups.length ? pill(`${setups.length} setup${setups.length === 1 ? '' : 's'}`, 'muted') : ''}</div>
       <div class="col gap6">${setups.map(x => `<div class="box" style="cursor:pointer" data-act="open-setup" data-id="${x.id}"><div class="row between gap8"><span class="small b ellipsis">${esc(x.name)}</span>${pill(x.schedule_label, x.schedule_kind !== 'manual' && x.enabled ? 'good' : 'muted')}</div><div class="xs muted mt4">${esc((x.settings.roles || []).join(' · ') || 'No roles yet')} · ${esc((x.settings.locations || []).join(' · ') || 'Any location')}</div></div>`).join('') || '<div class="small muted">No saved searches yet.</div>'}</div>
       <div class="col gap6 mt10">${(D.runs || []).slice(0, 3).map(r => `<div class="xs muted row gap8"><span class="dot" style="background:${r.status === 'SUCCEEDED' ? '#0f9c86' : r.completed_at ? '#c22f4e' : '#e0a136'}"></span>Run #${r.id} · ${r.created_jobs} new from ${r.item_count} · ${fmtDay(r.created_at)}</div>`).join('')}</div>
@@ -707,6 +715,7 @@ function renderTable() {
       <select class="select" id="flt-date-field" data-filter="date_field" aria-label="Date to filter by">${opts([['found', 'Found'], ['posted', 'Posted']], f.date_field)}</select>
       <select class="select" id="flt-within" data-filter="within" aria-label="How recent">${opts([['', 'Any time'], ['24h', 'Last 24 hours'], ['3d', 'Last 3 days'], ['7d', 'Last 7 days'], ['15d', 'Last 15 days'], ['30d', 'Last 30 days']], f.within)}</select>
       <label class="check small" title="Jobs you already applied to are hidden from Discovery; the Applied stage always shows them"><input type="checkbox" id="flt-applied" data-filter="include_applied" ${f.include_applied ? 'checked' : ''}>Show applied</label>
+      <select class="select" id="flt-domain" data-filter="domain" aria-label="Domain" title="Jobs outside your domain are hidden at discovery and never ranked (Settings → Domain filter)">${opts([['matching', `Matching (${j.domain_counts?.matching ?? 0})`], ['not_matching', `Not matching (${j.domain_counts?.not_matching ?? 0})`], ['all', 'Any domain']], f.domain || 'matching')}</select>
       <select class="select" id="flt-description" data-filter="description" aria-label="Job description">${opts([['all', 'Any description'], ...(j.description_states || []).map(([k, name, n]) => [k, `${name} (${n})`])], f.description)}</select>
       <select class="select" id="flt-stage" data-filter="stage">${opts([['all', 'All stages'], ['unranked', 'Unranked'], ...['discovered', 'shortlisted', 'maybe', 'archived', 'dismissed', 'tailored', 'needs_retailor', 'pending_approval', 'approved', 'applied'].map(s => [s, statusTitle(s)])], f.stage)}</select>
       <select class="select" id="flt-sort" data-filter="sort">${opts([['fit', 'Sort: best fit'], ['new', 'Sort: newest found'], ['posted', 'Sort: newest posted'], ['company', 'Sort: company']], f.sort)}</select>
@@ -716,8 +725,11 @@ function renderTable() {
       ${btn(isBusy('bulkRank') ? esc(S.rankProgress || 'Queueing…') : `Rank${S.checked.size ? ` ${S.checked.size}` : ''}`, 'bulk-rank', {}, 'sm', !S.checked.size || isBusy('bulkRank'))}
       ${btn(`Shortlist${S.checked.size ? ` ${S.checked.size}` : ''}`, 'bulk', { action: 'shortlist' }, 'sm soft', !S.checked.size)}
       <span title="${attr(unranked ? `${unranked} selected job${unranked === 1 ? ' is' : 's are'} not ranked yet. Rank ${unranked === 1 ? 'it' : 'them'} first: tailoring works from the ranking.` : 'Send the selected ranked jobs to Bulk tailor')}">${btn(label('bulkToTailor', `Bulk tailor${tailorable ? ` ${tailorable}` : ''}`, 'Queueing…'), 'bulk-to-tailor', {}, 'sm primary', !tailorable || isBusy('bulkToTailor'))}</span>
+      ${btn('Archive', 'bulk', { action: 'archive' }, 'sm', !S.checked.size)}
       ${btn('Dismiss', 'bulk', { action: 'dismiss' }, 'sm', !S.checked.size)}
       ${btn(label('bulkDelete', `Delete${S.checked.size ? ` ${S.checked.size}` : ''}`, 'Deleting…'), 'bulk-delete', {}, 'sm danger', !S.checked.size || isBusy('bulkDelete'))}
+      ${f.domain !== 'matching' ? btn(label('bulkKeep', `Keep${S.checked.size ? ` ${S.checked.size}` : ''}`, 'Keeping…'), 'bulk-domain-keep', {}, 'sm soft', !S.checked.size || isBusy('bulkKeep')) : ''}
+      ${resumeSelect('bulk-resume', '', { placeholder: 'Use resume…', disabled: !S.checked.size || isBusy('bulkResume'), fill: false })}
     </div>
     <div class="row between wrap" style="padding:9px 14px;border-bottom:1px solid var(--line2);background:#fbfbfe"><span class="small muted">${j.total ? `Showing ${start}–${Math.min(j.page * j.per_page, j.total)} of ${j.total} jobs` : 'No matches'}</span><span class="small muted">Page ${j.page} of ${j.pages} · ${j.total + (j.applied_hidden || 0) === j.total_all ? 'no filters applied' : `${j.total_all - j.total - (j.applied_hidden || 0)} hidden by filters`}${j.applied_hidden ? ` · ${j.applied_hidden} applied job${j.applied_hidden === 1 ? '' : 's'} hidden` : ''}</span></div>
     ${allOnPage && j.total > j.items.length && S.checked.size < j.total ? `<div class="banner" style="border-radius:0;border-width:0 0 1px">All ${j.items.length} on this page are selected. <a href="#" data-act="select-all-matching">${isBusy('selectAll') ? 'Selecting…' : `Select all ${j.total} matching jobs`}</a></div>` : ''}
@@ -726,7 +738,7 @@ function renderTable() {
     ${j.items.map(r => `<div class="jgrid jrow ${r.id === S.selJob ? 'sel' : ''}" data-act="select-job" data-id="${r.id}">
       <input type="checkbox" data-act="check" data-id="${r.id}" ${S.checked.has(r.id) ? 'checked' : ''} aria-label="Select">
       <div style="min-width:0"><div class="b ellipsis" style="font-size:13.5px">${esc(r.title)}</div><div class="xs muted ellipsis">${esc(r.company)}${r.location ? ' · ' + esc(r.location) : ''}</div></div>
-      <div class="tr mono bb ${fitCls(r.fit)}" style="font-size:13.5px">${fitTxt(r.fit)}</div><div class="col gap4" style="align-items:flex-start">${statusPill(r.status)}${descBadge(r.description_state)}</div><div class="xs muted">${esc(r.board)}</div><div class="tr xs ${r.posted_ago || r.posted_raw ? 'muted' : 'faint'}" title="${attr(`found ${r.posted}`)}">${esc(r.posted_ago || r.posted_raw || `found ${r.posted}`)}</div></div>`).join('')}
+      <div class="tr mono bb ${fitCls(r.fit)}" style="font-size:13.5px">${fitTxt(r.fit)}</div><div class="col gap4" style="align-items:flex-start">${r.domain_match === 'NOT_MATCHING' ? `<span title="${attr(r.domain_reason || 'Outside your domain')}">${pill('Not matching', 'warn')}</span>` : statusPill(r.status)}${descBadge(r.description_state)}</div><div class="xs muted">${esc(r.board)}</div><div class="tr xs ${r.posted_ago || r.posted_raw ? 'muted' : 'faint'}" title="${attr(`found ${r.posted}`)}">${esc(r.posted_ago || r.posted_raw || `found ${r.posted}`)}</div></div>`).join('')}
     ${!j.total ? `<div class="empty small muted">No jobs match these filters. <a href="#" data-act="reset-filters">Reset</a> to see all ${j.total_all}.</div>` : ''}
     <div class="row wrap gap10 pager" style="padding:12px 14px;background:#fbfbfe"><div class="row gap6"><span class="small muted">Rows</span><select class="select" style="margin:0;width:auto;padding:6px 8px" id="flt-per" data-filter="per_page">${opts([[10, 10], [25, 25], [50, 50]], f.per_page)}</select></div><div class="grow"></div>
       ${btn('← Prev', 'page', { page: j.page - 1 }, 'sm', j.page <= 1)}${pages.map(p => btn(String(p), 'page', { page: p }, 'sm ' + (p === j.page ? 'on' : ''))).join('')}${btn('Next →', 'page', { page: j.page + 1 }, 'sm', j.page >= j.pages)}</div>
@@ -734,7 +746,9 @@ function renderTable() {
   <section class="card pad18 c-side sticky-panel">${sel ? `
     <div class="row top-align between gap10"><div class="grow"><div style="font-size:17px;font-weight:600">${esc(sel.title)}</div><div class="base muted mt4">${esc(sel.company)}${sel.location ? ' · ' + esc(sel.location) : ''}</div></div><div class="mono bb ${fitCls(sel.fit)}" style="font-size:24px">${fitTxt(sel.fit)}</div></div>
     <div class="row gap6 wrap" style="margin:14px 0">${statusPill(sel.status)}${pill(sel.board + ' · found ' + sel.posted, 'plain', 'lg')}${postedTxt(sel) ? pill(postedTxt(sel), 'plain', 'lg') : ''}${pill(`${sel.matches.length} matched`, 'good', 'lg')}${pill(`${sel.gaps.length + sel.missing.length} gaps`, 'warn', 'lg')}</div>
+    ${sel.domain_match === 'NOT_MATCHING' ? `<div class="banner warn mb12" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span class="grow"><b>Hidden: not matching.</b> ${esc(sel.domain_reason || 'Outside your domain')}. It is not ranked, so no model is used on it.</span>${btn(label('keep' + sel.id, 'Keep this job', 'Keeping…'), 'domain-keep', { id: sel.id }, 'sm soft', isBusy('keep' + sel.id))}</div>` : ''}
     <div class="base pretty" style="color:var(--ink3);line-height:1.6;border-top:1px solid var(--line2);padding-top:14px">${esc(sel.summary || (sel.description || '').slice(0, 420) || 'No description captured.')}</div>
+    <div class="mt12"><div class="row gap8" style="align-items:center;min-width:0"><span class="xs muted" style="white-space:nowrap">Resume used</span>${resumeSelect('job-resume', sel.resume_choice_id, { id: sel.id, choice: sel.resume_choice })}</div>${sel.resume_choice === 'AUTO' ? '<div class="xs faint mt4">Matched by resume tags</div>' : ''}</div>
     <div class="row gap8 mt16">${['tailored', 'needs_retailor', 'approved', 'applied', 'pending_approval'].includes(sel.status) ? btn(sel.status === 'needs_retailor' ? 'Re-tailor' : 'Open packet', 'go', { screen: sel.status === 'applied' ? 'tracker' : sel.status === 'approved' ? 'approvals' : 'tailor', job: sel.id }, 'primary grow') : sel.needs_description ? `<span class="grow" title="Ranking needs the job description">${btn('Add description', 'open-job', { id: sel.id }, 'primary grow')}</span>`
       : sel.fit == null ? `<span class="grow" title="Tailoring works from the ranking: rank this job first">${btn(label('rank' + sel.id, 'Rank first', 'Queueing…'), 'rank-job', { id: sel.id }, 'primary', isBusy('rank' + sel.id))}</span>`
       : btn('Tailor', 'triage', { id: sel.id, action: 'shortlist', tailor: 1 }, 'primary grow')}${btn('Full description', 'open-job', { id: sel.id }, 'grow')}</div>` : empty('Select a job', 'Pick a row to see its details.')}
@@ -782,6 +796,7 @@ function renderSetup() {
           <label class="field">Search radius (miles)${inputF(F, 'distance', p.distance, 'type="number" min="0" max="500"')}</label>
           <label class="field">Skip first N results${inputF(F, 'offset', p.offset, 'type="number" min="0" max="1000"')}</label></div>
         <div class="mt12"><div class="xs muted mb4">LinkedIn company IDs <span class="faint">· optional, restricts LinkedIn to these companies</span></div>${tagBox(F, 'linkedin_company_ids', p.linkedin_company_ids || [], 'e.g. 1441, then Enter', 20)}</div>
+        <div class="helper mt8" role="note">Descriptions: this actor returns full descriptions for <b>LinkedIn</b> (with the option below) and <b>Indeed</b> only — Naukri, ZipRecruiter and Bayt listings arrive without one.${sites.includes('naukri') ? (on('crawlerbros/naukri-scraper') ? ' <span style="color:var(--warn)">Naukri is also searched by the Naukri actor (with descriptions): untick Naukri here so it is not scraped twice.</span>' : ' For Naukri with descriptions, add the <b>Naukri</b> actor above and untick Naukri here.') : ''}</div>
         <div class="row gap16 wrap mt12">${checkF(F, 'fetch_description', p.fetch_description, 'Fetch full LinkedIn descriptions')}${checkF(F, 'enforce_annual_salary', p.enforce_annual_salary, 'Normalize salaries to annual')}${checkF(F, 'residential_proxy', p.residential_proxy, 'Residential proxy (recommended for LinkedIn)')}</div></div>` : ''}
       ${on('benthepythondev/remote-jobs-aggregator') ? `<div class="box soft" style="padding:14px"><div class="small b mb8">Remote Jobs Aggregator boards</div>
         <div class="grid-auto w140">${(D.actors?.remote_platforms || []).map(pl => `<label class="board-opt ${platforms.includes(pl) ? 'on' : ''}"><input type="checkbox" data-act="toggle-list" data-key="remote_platforms" data-value="${pl}" ${platforms.includes(pl) ? 'checked' : ''}><span class="grow">${pl}</span></label>`).join('')}</div></div>` : ''}
@@ -803,6 +818,7 @@ function renderSetup() {
         <div class="mt12" role="group" aria-labelledby="seniority-label" aria-describedby="use-seniority"><div class="xs muted mb4" id="seniority-label">Seniority</div><div class="row gap6 wrap">${(D.actors?.seniority || []).map(s => `<button type="button" class="btn sm ${seniority.includes(s) ? 'soft' : ''}" data-act="toggle-list" data-key="seniority" data-value="${s}" aria-pressed="${seniority.includes(s) ? 'true' : 'false'}">${seniority.includes(s) ? '✓ ' : ''}${s}</button>`).join('')}</div>${filterNote(catalogList, on, 'seniority')}</div>
         <div class="mt12"><label class="xs muted mb4" for="sp-exclude_keywords" style="display:block">Exclude titles or keywords</label>${tagBox(F, 'exclude_keywords', p.exclude_keywords || [], 'e.g. intern, then Enter', 20)}${filterNote(catalogList, on, 'exclude_keywords')}</div>
         <div class="row gap16 wrap mt12">${usedCheck(catalogList, on, 'remote', 'is_remote', p.is_remote, 'Remote only')}${usedCheck(catalogList, on, 'easy_apply', 'easy_apply', p.easy_apply, 'Easy Apply only')}${usedCheck(catalogList, on, 'salary_only', 'salary_only', p.salary_only, 'Salary listed only')}${usedCheck(catalogList, on, 'visa_sponsorship', 'visa_sponsorship', p.visa_sponsorship, 'Offers visa sponsorship')}${usedCheck(catalogList, on, 'skip_agencies', 'skip_agencies', p.skip_agencies, 'Skip agencies &amp; reposts')}${checkF(F, 'auto_rank', p.auto_rank, 'Auto-rank on import')}</div>
+        <label class="field strong mt12">Resume for these jobs<span class="xs muted" style="font-weight:400"> — ranking, tailoring and review of jobs this search finds use it</span>${selectF(F, 'resume_select', setupResumeValue(p), [['auto', 'Auto — best match by resume tags (default)'], ['active', 'Active resume'], ...(D.resumeChoices || []).map(r => [r.id, `${r.domain ? `${r.domain}: ` : ''}${resumeLabel(r)}`])])}</label>
         <div class="helper">“Not used” means none of the actors you picked reads that setting.</div></section>
       <div class="box soft" style="padding:14px"><div class="row between wrap gap8 mb8"><span class="small b">Schedule <span class="faint" style="font-weight:400">· this setup only</span></span>
         ${kind === 'manual' ? '' : checkF(F, 'enabled', setup ? setup.enabled : true, 'Scheduled')}</div>
@@ -1286,11 +1302,101 @@ const KIND_DOT = { applied: '#5b4ae8', stage: '#0f9c86', note: '#c6cad8', call: 
 const rejectionBanner = j => !j.rejection ? ''
   : `<div class="banner warn" style="margin:0 24px;display:block"><b>Rejected ${esc(j.rejection.on)}</b> · ${esc(j.rejection.label)}${j.rejection.note ? ` — ${esc(j.rejection.note)}` : ''}</div>`;
 
+// The resume a job is ranked and tailored with (Job.resume_id / resume_choice): auto = the best-tagged resume
+// (app.services.resume_matching), active = always the active resume, or one specific version.
+const resumeLabel = r => `${r.name}${r.roles?.length ? ` — ${r.roles.slice(0, 2).join(', ')}${r.roles.length > 2 ? '…' : ''}` : ''}${r.is_active ? ' (active)' : ''}`;
+const resumeValue = (id, choice) => choice === 'ACTIVE' || (choice === 'SETUP' && id == null) ? 'active' : id == null ? 'auto' : String(id);
+function resumeOptions(choices) {
+  const groups = {};
+  for (const r of choices) (groups[r.domain || 'Untagged'] ||= []).push(r);
+  return Object.entries(groups).sort(([a], [b]) => (a === 'Untagged') - (b === 'Untagged') || a.localeCompare(b))
+    .map(([domain, list]) => ({ domain, list }));
+}
+function resumeSelect(kind, current, { id = '', placeholder = '', disabled = false, choice = null, fill = true } = {}) {
+  const choices = D.resumeChoices || [];
+  if (!choices.length) return '';
+  const cur = placeholder ? '' : resumeValue(current, choice);
+  const opt = (v, t) => `<option value="${attr(v)}" ${String(v) === cur ? 'selected' : ''}>${esc(t)}</option>`;
+  const groups = resumeOptions(choices).map(g => `<optgroup label="${attr(g.domain)}">${g.list.map(r => opt(r.id, resumeLabel(r))).join('')}</optgroup>`).join('');
+  // Option text can be long (name — roles): the select fills the space it has and never grows past it.
+  const size = fill ? 'flex:1 1 0;width:100%' : 'flex:0 1 240px;width:240px';
+  return `<select class="select" style="margin:0;${size};min-width:0;max-width:100%;padding:6px 8px;text-overflow:ellipsis" data-resume-choice="${kind}" data-id="${attr(id)}" aria-label="Resume" ${disabled ? 'disabled' : ''}>${placeholder ? opt('', placeholder) : ''}${opt('auto', 'Auto — best match by tags')}${opt('active', 'Active resume')}${groups}</select>`;
+}
+
+// Tagging a resume with its domain and the roles it targets. A library file and its version share one set of tags.
+function resumeTags(kind, id, domain, roles = []) {
+  if (S.tagEdit === `${kind}:${id}`) return resumeTagEditor(kind, id);
+  const has = domain || roles.length;
+  return `<div class="row wrap gap6 mt6" style="align-items:center">${domain ? pill(domain, 'brand') : ''}${roles.map(r => pill(r, 'plain')).join('')}${btn(has ? 'Edit tags' : 'Tag domain &amp; roles', 'rtag-edit', { kind, id, domain: domain || '', roles: JSON.stringify(roles) }, 'sm ghost')}</div>`;
+}
+function resumeTagEditor(kind, id) {
+  const catalog = D.resumeCatalog || [], domain = String(fv('rtag', 'domain', '') || ''), roles = fv('rtag', 'roles', []);
+  const known = catalog.find(c => c.domain.toLowerCase() === domain.trim().toLowerCase());
+  const suggestions = (known ? known.roles : []).filter(r => !roles.includes(r));
+  return `<div class="box mt8 col gap10" data-rtag-editor style="max-width:620px">
+    <label class="field"><span class="xs muted">Domain</span>${inputF('rtag', 'domain', domain, 'list="resume-domain-list" placeholder="e.g. Backend, Product" maxlength="80"')}<datalist id="resume-domain-list">${catalog.map(c => `<option value="${attr(c.domain)}"></option>`).join('')}</datalist></label>
+    <div><div class="xs muted mb4">Roles this resume targets</div>${tagBox('rtag', 'roles', roles, 'Add a role, e.g. Lead Engineer…', 30)}</div>
+    ${suggestions.length ? `<div class="row wrap gap6">${suggestions.map(r => btn(`+ ${esc(r)}`, 'rtag-add', { role: r }, 'sm ghost')).join('')}</div>` : domain ? '' : `<div class="xs muted">Pick a domain to see suggested roles: ${catalog.map(c => esc(c.domain)).join(' · ')}</div>`}
+    <div class="xs faint">New jobs are matched to the resume whose roles their title names (then the domain). Pinned choices are never changed.</div>
+    <div class="row gap8">${btn(label('rtagSave', 'Save tags', 'Saving…'), 'rtag-save', { kind, id }, 'sm primary', isBusy('rtagSave'))}${btn('Cancel', 'rtag-cancel', {}, 'sm')}</div></div>`;
+}
+
+// Changing a job's resume ranks it again with that resume (and a tailored packet is marked for re-tailoring).
+function chooseResume(el) {
+  if (el.value === '') return;
+  const body = ['auto', 'active'].includes(el.value) ? { mode: el.value } : { mode: 'fixed', resume_id: Number(el.value) };
+  const bulk = el.dataset.resumeChoice === 'bulk-resume';
+  return busy(bulk ? 'bulkResume' : 'resume' + el.dataset.id, async () => {
+    const out = bulk
+      ? await api('/api/jobs/bulk-resume', { method: 'POST', body: { ids: [...S.checked], ...body } })
+      : await api(`/api/jobs/${el.dataset.id}/resume`, { method: 'PUT', body });
+    if (bulk) S.checked.clear();
+    if (S.jobOpen) D.jobModal = await api(`/api/jobs/${S.jobOpen}`).catch(() => D.jobModal);
+    await load();
+    if (out.ranking_queued.length) watchRanking(out.ranking_queued);
+    return out;
+  }, out => `Resume set for ${out.changed.length} job${out.changed.length === 1 ? '' : 's'}${out.ranking_queued.length ? ` · ${out.ranking_queued.length} queued for ranking again` : ''}`);
+}
+
+// Job description recovery (app.services.jd_recovery): a posting that arrived without a usable description is read
+// from its URL in the background. This strip says where that stands, in plain words, and offers Recover / Retry.
+const RECOVERY_TONE = { PENDING: 'brand', PROCESSING: 'brand', COMPLETED: 'good', BLOCKED: 'warn', FAILED: 'bad', SKIPPED: 'bad' };
+const RECOVERY_VIA = { HTTP: 'the posting page', PLAYWRIGHT: 'the posting page (browser)', LLM_ASSISTED: 'the posting page (AI-assisted)' };
+const recoveryActive = r => !!r && ['PENDING', 'PROCESSING'].includes(r.state);
+function recoveryStrip(j) {
+  const r = j.description_recovery;
+  if (!r) return '';
+  const active = recoveryActive(r), ended = ['BLOCKED', 'FAILED', 'SKIPPED'].includes(r.state);
+  const recovered = r.description_source === 'RECOVERED';
+  if (r.usable && !active && !recovered && !ended) return '';
+  const action = r.can_recover && (!r.usable || ended)
+    ? btn(label('recover' + j.id, ended ? 'Retry' : 'Recover Description', 'Queueing…'), 'recover-description', { id: j.id }, 'sm soft', isBusy('recover' + j.id)) : '';
+  const hint = !r.has_url ? 'This job has no posting URL — paste the description instead.'
+    : active ? 'Reading the posting in the background — you can close this and come back.'
+    : r.state === 'BLOCKED' ? 'The site needs a person: open the posting and paste the description.'
+    : ended ? (r.task?.message || '') : '';
+  const via = recovered ? `<span class="xs muted">Recovered from ${esc(RECOVERY_VIA[r.fetch_method] || 'the posting')}${r.fetched_at ? ` · ${esc(fmtDateTime(r.fetched_at))}` : ''}${r.has_original ? ' · the board\'s original text is kept' : ''}</span>` : '';
+  return `<div class="banner ${r.usable ? '' : 'warn'}" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap" data-recovery="${attr(r.state)}">
+    ${r.usable ? '' : '<b>Job description unavailable.</b>'}${r.label && !(recovered && r.state === 'COMPLETED') ? pill(r.label, RECOVERY_TONE[r.state] || 'muted') : ''}
+    ${hint ? `<span class="xs muted">${esc(hint)}</span>` : ''}${via}<span class="grow"></span>${action}</div>`;
+}
+async function watchRecovery(id) {
+  for (let i = 0; i < 40; i++) {
+    await new Promise(r => setTimeout(r, 3000));
+    const out = await api(`/api/jobs/${id}/description-recovery`).catch(() => null);
+    if (!out || !recoveryActive(out)) break;
+    if (D.jobModal?.id === Number(id)) { D.jobModal = { ...D.jobModal, description_recovery: out }; render(); }
+  }
+  if (S.jobOpen) D.jobModal = await api(`/api/jobs/${S.jobOpen}`).catch(() => D.jobModal);
+  await load();
+}
+
 // Ranking needs the employer's words. With none (or while editing), the Description tab offers to read them from
 // the posting URL or to paste them; the text is saved only when the user says so.
 function renderDescriptionEditor(j) {
   const fetched = S.descFetched?.[j.id];
   return `<div class="col gap10" style="padding:20px 22px">
+    ${recoveryStrip(j)}
     ${j.needs_description ? `<div class="banner warn" style="display:block"><b>No job description yet.</b> ${j.fit == null ? 'Ranking waits until there is one' : 'This fit score was made without one — saving a description ranks the job again'}.</div>` : ''}
     <div class="row gap8 wrap">${j.url ? btn(label('descfetch' + j.id, 'Fetch from posting', 'Reading the posting…'), 'fetch-job-description', { id: j.id }, 'sm soft', isBusy('descfetch' + j.id)) : ''}
       ${j.url ? `<a class="btn sm" href="${attr(j.url)}" target="_blank" rel="noopener">Open posting to copy ↗</a>` : ''}</div>
@@ -1307,7 +1413,7 @@ function renderJobModal() {
   const actionable = ['discovered', 'shortlisted', 'maybe', 'archived', 'dismissed'].includes(j.status);
   let tab = '';
   if (S.jobTab === 'description' && (j.needs_description || S.descEdit === j.id)) tab = renderDescriptionEditor(j);
-  else if (S.jobTab === 'description') tab = `<div class="desc" style="font-size:13.5px;line-height:1.7;padding:20px 22px">${paragraphs(j.description, [...j.matches, ...j.keywords], [...j.gaps, ...j.missing])}
+  else if (S.jobTab === 'description') tab = `<div class="desc" style="font-size:13.5px;line-height:1.7;padding:20px 22px">${recoveryStrip(j) ? `<div class="mb12">${recoveryStrip(j)}</div>` : ''}${paragraphs(j.description, [...j.matches, ...j.keywords], [...j.gaps, ...j.missing])}
       <div class="row gap12 wrap xs faint" style="margin-top:20px;padding-top:16px;border-top:1px solid var(--line2)"><span class="row gap6"><span style="width:9px;height:9px;border-radius:3px;background:#9fe0d2"></span>matched to your evidence</span><span class="row gap6"><span style="width:9px;height:9px;border-radius:3px;background:#ffd79a"></span>gap — needs a real answer</span><span>source: ${esc(j.board)}${j.search_run_id ? ` · pulled in run #${j.search_run_id}` : ''}</span>${descBadge(j.description_state, true)}${btn('Edit description', 'edit-job-description', { id: j.id }, 'sm ghost')}</div></div>`;
   else if (S.jobTab === 'requirements') tab = `<div style="padding:20px 22px" class="col gap14">${fitSummary(j)}${j.fit_analysis.must_have_missing?.length ? `<div class="box bad"><div class="xs b mb4" style="color:var(--bad)">MUST-HAVES MISSING</div><div class="small">${esc(j.fit_analysis.must_have_missing.join(' · '))}</div></div>` : ''}<div><div class="caps mb8">KEYWORDS</div><div class="row wrap gap6">${j.keywords.map(k => pill(k, 'plain', 'lg')).join('') || '<span class="small muted">Rank this job to extract keywords.</span>'}</div></div></div>`;
   else if (S.jobTab === 'structured') tab = renderJobStructured(j);
@@ -1323,10 +1429,12 @@ function renderJobModal() {
           : btn('Tailor resume', 'modal-tailor', { id: j.id }, 'primary')}${btn('Close', 'close-job')}</div></div>
       <div class="wizard">${j.wizard.map((w, i) => `<div class="${w.done ? 'done' : i === hereIdx ? 'here' : ''}"><div class="row gap6"><span class="m">${w.done ? '✓' : i + 1}</span><span class="small b" style="color:${w.done ? 'var(--ink)' : i === hereIdx ? 'var(--brand-ink)' : 'var(--faint)'}">${w.label}</span></div><div class="xs muted mt4">${esc(i === hereIdx && !w.done ? 'next step' : w.meta)}</div></div>`).join('')}</div></div>
     ${rejectionBanner(j)}
+    ${j.domain_match === 'NOT_MATCHING' ? `<div class="banner warn" style="margin:0 24px;display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span class="grow"><b>Hidden: not matching.</b> ${esc(j.domain_reason || 'Outside your domain')} — not ranked, no model used.</span>${btn(label('keep' + j.id, 'Keep this job', 'Keeping…'), 'domain-keep', { id: j.id }, 'sm soft', isBusy('keep' + j.id))}</div>` : ''}
     <div class="split gap16" style="padding:18px 24px 24px">
       <section class="card flush" style="flex:1 1 420px;min-width:0"><div class="tabs under">${[['description', 'Description'], ['structured', 'Structured JD'], ['requirements', 'Requirements map'], ['notes', 'Notes']].map(([id, t]) => `<button class="${S.jobTab === id ? 'on' : ''}" data-act="job-tab" data-id="${id}">${t}</button>`).join('')}</div>${tab}</section>
       <div class="col gap14" style="flex:1 1 280px;min-width:0">
         <section class="card pad18"><div class="row gap8 mb14">${pill('AI', 'brand')}<span class="card-title sm">Fit breakdown</span></div>
+          ${D.resumeChoices?.length ? `<div class="mb12"><div class="row gap8" style="align-items:center;min-width:0"><span class="xs muted" style="white-space:nowrap">Resume used</span>${resumeSelect('job-resume', j.resume_choice_id, { id: j.id, choice: j.resume_choice })}</div>${j.resume_choice === 'AUTO' ? '<div class="xs faint mt4">Matched by resume tags</div>' : ''}</div>` : ''}
           ${j.fit == null && j.needs_description ? '<div class="small muted">Not ranked: add the job description first — a score from a title alone would mean nothing.</div>'
           : j.fit == null ? `<div class="small muted mb12">Not ranked yet.</div>${btn(label('rank' + j.id, 'Rank this job', 'Queueing…'), 'rank-job', { id: j.id }, 'soft', isBusy('rank' + j.id))}` : `
           <div class="row base gap8 mb14"><span class="mono bb" style="font-size:34px;color:var(--brand-ink);line-height:1">${fitTxt(j.fit)}</span><span class="small muted">${j.rank_pct != null ? `top ${j.rank_pct}% of your ranked jobs` : ''}</span></div>
@@ -1338,7 +1446,7 @@ function renderJobModal() {
           ? `<div class="box"><div class="small b">${esc(g.gap)}</div><div class="small muted mt4" style="line-height:1.5">Partial: ${esc(g.partial)}</div></div>`
           : `<div class="box warn"><div class="small b" style="color:var(--warn-deep)">${esc(g.gap)}</div><div class="small mt4" style="color:var(--warn-deep);line-height:1.5">No verified evidence. Add a claim or leave it out — tailoring never invents experience.</div>${btn('Add evidence', 'add-evidence-for', { gap: g.gap }, 'sm mt8')}</div>`).join('') : '<div class="small muted">No gaps flagged.</div>'}</div></section>
         <section class="card pad18"><div class="card-title sm mb10">Move this job</div><div class="row gap6 wrap">${actionable
-          ? `${btn('Shortlist', 'modal-triage', { id: j.id, action: 'shortlist' }, 'sm soft')}${btn('Maybe later', 'modal-triage', { id: j.id, action: 'maybe' }, 'sm')}${btn('Dismiss', 'modal-triage', { id: j.id, action: 'dismiss' }, 'sm danger')}`
+          ? `${btn('Shortlist', 'modal-triage', { id: j.id, action: 'shortlist' }, 'sm soft')}${btn('Maybe later', 'modal-triage', { id: j.id, action: 'maybe' }, 'sm')}${['archived', 'dismissed'].includes(j.status) ? `<span title="Back to Discovery as a new job">${btn('Restore', 'modal-triage', { id: j.id, action: 'restore' }, 'sm')}</span>` : `<span title="Put it away without dismissing it: it leaves the queue and is not ranked, and the domain filter learns nothing from it">${btn('Archive', 'modal-triage', { id: j.id, action: 'archive' }, 'sm')}</span>`}${j.status === 'dismissed' ? '' : btn('Dismiss', 'modal-triage', { id: j.id, action: 'dismiss' }, 'sm danger')}`
           : `<span class="small muted">This job is ${esc(statusText(j.status))} — manage it from ${j.status === 'applied' ? 'the Tracker' : ['tailored', 'needs_retailor'].includes(j.status) ? 'Tailor' : 'Approvals'}.</span>`}</div></section>
       </div></div></div></div>`;
 }
@@ -1434,7 +1542,10 @@ function queueTailoring(ids, mode, regenerate, busyKey, onQueued) {
 /* ───────────── actions ───────────── */
 async function openJob(id) {
   S.jobOpen = Number(id); S.jobTab = 'description'; render();
-  try { D.jobModal = await api(`/api/jobs/${id}`); } catch (e) { toast(e.message, true); S.jobOpen = null; }
+  try {
+    [D.jobModal] = await Promise.all([api(`/api/jobs/${id}`), loadResumeChoices()]);
+    if (recoveryActive(D.jobModal.description_recovery)) watchRecovery(id);
+  } catch (e) { toast(e.message, true); S.jobOpen = null; }
   render();
 }
 async function openKit(id) {
@@ -1447,7 +1558,7 @@ async function triageJob(id, action, thenTailor) {
     await api(`/api/jobs/${id}/triage`, { method: 'POST', body: { action } });
     if (S.screen === 'discovery' && S.discMode === 'triage') S.triagedThisSession++;
     if (thenTailor) return go('tailor', { tailorJob: Number(id), tailorTab: 'diff' });
-    toast({ shortlist: 'Shortlisted', maybe: 'Parked for later', skip: 'Skipped', dismiss: 'Dismissed' }[action]);
+    toast({ shortlist: 'Shortlisted', maybe: 'Parked for later', skip: 'Skipped', dismiss: 'Dismissed', archive: 'Archived', restore: 'Restored to Discovery' }[action]);
     await load();
   } catch (e) { toast(e.message, true); }
 }
@@ -1521,6 +1632,8 @@ function addActorForm() {
     ${S.caFields ? `<div class="xs muted mt8">This actor accepts: ${S.caFields.map(f => `<span class="mono">${esc(f.name)}${f.required ? '*' : ''}</span>`).join(', ') || 'no documented inputs'}</div>` : ''}
     ${btn('Add actor', 'add-actor', {}, 'primary sm mt10')}</div>`;
 }
+const setupResumeValue = p => p.resume_mode === 'fixed' || (!p.resume_mode && p.resume_id) ? String(p.resume_id) : (p.resume_mode || 'auto');
+const setupResume = value => ['auto', 'active'].includes(String(value)) ? { resume_mode: String(value), resume_id: null } : { resume_mode: 'fixed', resume_id: Number(value) };
 function searchPayload() {
   const p = D.searchProfile.profile, F = 'sp', v = (k, d) => fv(F, k, p[k] ?? d);
   return {
@@ -1535,6 +1648,7 @@ function searchPayload() {
     skip_agencies: !!v('skip_agencies', true), auto_rank: !!v('auto_rank', true), schedule: v('schedule', 'manual'),
     yc_batches: v('yc_batches', []), hn_month: String(v('hn_month', 'current') || 'current').trim(),
     min_salary: Math.max(0, Number(v('min_salary', 0)) || 0), startup_details: !!v('startup_details', true),
+    ...setupResume(v('resume_select', setupResumeValue(p))),
   };
 }
 let previewTimer;
@@ -1702,6 +1816,52 @@ const A = {
     D.jobModal = await api(`/api/jobs/${id}`).catch(() => D.jobModal);
     return out;
   }, out => out.ranking_queued ? 'Description saved · queued for ranking' : `Description saved${out.ranking_skipped ? ` · not re-ranked: ${out.ranking_skipped}` : ''}`),
+  'domain-learned': el => busy('domainLearned', async () => {
+    D.domain = await api('/api/settings/domain/learned', { method: 'PUT', body: { term: el.dataset.term, kind: el.dataset.kind, action: el.dataset.action } });
+    return el.dataset.action;
+  }, action => ({ disable: 'Rule turned off', enable: 'Rule turned on', promote: 'Added to your permanent excludes', delete: 'Rule forgotten' }[action])),
+  'domain-reapply': () => busy('domainReapply', () => api('/api/jobs/domain/reapply', { method: 'POST' }),
+    out => `Checked ${out.checked} unranked job${out.checked === 1 ? '' : 's'} · ${out.hidden} hidden · ${out.restored} back in the queue`),
+  'show-not-matching': (el, e) => { e.preventDefault(); S.filters = { ...S.filters, domain: 'not_matching', page: 1 }; go('discovery', { discMode: 'table' }); },
+  'rtag-edit': el => {
+    S.tagEdit = `${el.dataset.kind}:${el.dataset.id}`;
+    S.forms.rtag = { domain: el.dataset.domain || '', roles: JSON.parse(el.dataset.roles || '[]') };
+    loadResumeChoices().then(render); render();
+  },
+  'rtag-add': el => { const roles = fv('rtag', 'roles', []); if (!roles.includes(el.dataset.role)) setF('rtag', 'roles', [...roles, el.dataset.role]); render(); },
+  'rtag-cancel': () => { S.tagEdit = null; delete S.forms.rtag; render(); },
+  'rtag-save': el => busy('rtagSave', async () => {
+    document.querySelectorAll('input[data-tag][data-form="rtag"]').forEach(input => { if (input.value.trim()) commitTag(input, false); });
+    const body = { domain: String(fv('rtag', 'domain', '') || '').trim() || null, roles: fv('rtag', 'roles', []) };
+    const url = el.dataset.kind === 'file' ? `/api/profile/resumes/${el.dataset.id}/tags` : `/api/resumes/${el.dataset.id}/tags`;
+    const out = await api(url, { method: 'PUT', body });
+    S.tagEdit = null; delete S.forms.rtag; D.resumeChoices = null;
+    [D.resumes, D.resumeData] = await Promise.all([api('/api/profile/resumes').catch(() => D.resumes), api('/api/settings/resume').catch(() => D.resumeData)]);
+    return out;
+  }, 'Tags saved — new jobs are matched with them'),
+  'resume-rematch': () => busy('resumeRematch', async () => {
+    const plan = await api('/api/jobs/resume/rematch?dry_run=true', { method: 'POST' });
+    if (!plan.changing) return { ...plan, skipped: true };
+    if (!confirm(`${plan.changing} of ${plan.jobs} job${plan.jobs === 1 ? '' : 's'} would switch resume${plan.reranked ? `, and ${plan.reranked} ranked job${plan.reranked === 1 ? '' : 's'} would be ranked again (model calls)` : ''}. Pinned choices are not touched. Continue?`)) return { cancelled: true };
+    return api('/api/jobs/resume/rematch', { method: 'POST' });
+  }, out => out.cancelled ? '' : out.skipped ? 'Every job already has its best-matching resume' : `${out.changing} job${out.changing === 1 ? '' : 's'} re-matched · ${out.reranked} queued for ranking`),
+  'domain-keep': el => busy('keep' + el.dataset.id, async () => {
+    const out = await api(`/api/jobs/${el.dataset.id}/domain-keep`, { method: 'POST' });
+    if (S.jobOpen) D.jobModal = await api(`/api/jobs/${S.jobOpen}`).catch(() => D.jobModal);
+    await load();
+    return out;
+  }, out => out.kept.length ? 'Kept — it goes through ranking like any new job' : (out.skipped[0]?.reason || 'Nothing to keep')),
+  'bulk-domain-keep': () => busy('bulkKeep', async () => {
+    const out = await api('/api/jobs/bulk-domain-keep', { method: 'POST', body: { ids: [...S.checked] } });
+    S.checked.clear(); await load(); return out;
+  }, out => `Kept ${out.kept.length} job${out.kept.length === 1 ? '' : 's'}`),
+  'recover-description': el => busy('recover' + el.dataset.id, async () => {
+    const id = el.dataset.id;
+    const out = await api(`/api/jobs/${id}/recover-description`, { method: 'POST' });
+    if (D.jobModal?.id === Number(id)) D.jobModal = { ...D.jobModal, description_recovery: out };
+    if (recoveryActive(out)) watchRecovery(id);
+    return out;
+  }, out => out.queued ? 'Recovering the description from the posting…' : out.message),
   'rank-job': el => busy('rank' + el.dataset.id, async () => {
     const out = await api(`/api/jobs/${el.dataset.id}/rank`, { method: 'POST' });
     watchRanking(out.queued);
@@ -1765,7 +1925,7 @@ const A = {
     }, out => `Deleted ${out.deleted} job${out.deleted === 1 ? '' : 's'}${out.protected.length ? ` · kept ${out.protected.length} approved or applied` : ''}`);
   },
   'pf-reset': el => { S.pf[el.dataset.kind] = pfDefaults(el.dataset.kind); load(); },
-  'reset-filters': (el, e) => { e.preventDefault(); S.filters = { q: '', min_fit: 0, board: 'all', location: 'all', stage: 'all', description: 'all', date_field: 'found', within: '', include_applied: false, sort: 'fit', page: 1, per_page: S.filters.per_page }; load(); },
+  'reset-filters': (el, e) => { e.preventDefault(); S.filters = { q: '', min_fit: 0, board: 'all', location: 'all', stage: 'all', description: 'all', domain: 'matching', date_field: 'found', within: '', include_applied: false, sort: 'fit', page: 1, per_page: S.filters.per_page }; load(); },
   page: el => { S.filters.page = Number(el.dataset.page); load(); },
   // setup
   'focus-tag': (el, e) => { if (e.target === el) document.getElementById(el.dataset.target)?.focus(); },
@@ -2071,6 +2231,8 @@ const A = {
 };
 function tagFallback(form, key) {
   if (form === 'sp') return D.searchProfile?.profile?.[key] || [];
+  if (form === 'domain') return D.domain?.[key] || [];
+  if (form === 'rtag') return S.forms.rtag?.[key] || [];
   if (form === 'preferences') { const c = CHIP_FIELDS.find(x => x[0] === key); return (c && c[5] === 'sp' ? D.profile?.search_preferences?.[key] : D.profile?.[key]) || []; }
   return [];
 }
@@ -2099,6 +2261,8 @@ document.addEventListener('input', e => {
   if (el.dataset.authEntry || el.dataset.authNotes) { settingsAuthUpdate(); return; }
   if (el.dataset.rdPath) { resumeDataInput(el); return; }
   if (el.dataset.jdPath) { jobDataInput(el); return; }
+  if (el.dataset.resumeChoice) { chooseResume(el); return; }
+  if (el.dataset.form === 'rtag' && el.dataset.field === 'domain') { setF('rtag', 'domain', el.value); render(); return; }
   if (el.dataset.form && el.dataset.field) {
     setF(el.dataset.form, el.dataset.field, el.type === 'checkbox' ? el.checked : el.value);
     if (el.dataset.live || el.type === 'radio') render();

@@ -172,8 +172,9 @@ function rdHeader(data) {
       <div class="rd-overview">${p.sections.filter(s => s.state !== 'EMPTY').map(s => `<a href="#settings/resume-data" data-act="rd-jump" data-section="${s.section}" class="rd-overview-row"><span>${esc(s.label)}</span><span class="pill ${RD_STATE[s.state][1]}">${RD_STATE[s.state][0]}</span></a>`).join('')}${p.entries.filter(e => e.section === 'experience').map(e => `<div class="rd-overview-row rd-overview-entry"><span>${esc(e.label)}</span><span class="pill ${RD_STATE[e.state][1]}">${RD_STATE[e.state][0]}</span></div>`).join('')}</div>
       ${blocking.length ? `<div class="settings-notice"><strong>${blocking.length} required item${blocking.length === 1 ? '' : 's'} still need review</strong><p>${blocking.slice(0, 5).map(b => esc(b.label)).join(' · ')}${blocking.length > 5 ? ' …' : ''}</p></div>` : ''}
       <div class="row gap8 wrap mt12">${btn('Verify Resume', 'rd-verify-resume', {}, 'primary', locked || blocking.length > 0)}${btn('Re-parse resume', 'rd-reparse', { ai: 0 }, '', locked)}${btn('Re-parse with AI', 'rd-reparse', { ai: 1 }, '', locked)}</div>`) +
-    settingsGroup('Versions', 'Each upload is a new version. The active version is what AI workflows use; older versions stay unchanged.',
-      `<div class="settings-resume-list">${versions.map(v => `<article class="settings-resume"><div class="grow"><strong>${esc(v.name || 'Resume')} · v${v.version}</strong><p>${esc((RD_RESUME[v.verification_status] || RD_RESUME.UNVERIFIED)[0])}${v.is_active ? ' · Active' : ''}${v.is_default ? ' · Default' : ''}</p></div><div class="row gap8 wrap">${v.is_active ? '' : btn('Make active', 'rd-activate', { id: v.id }, 'sm', locked)}${v.is_default ? '' : btn('Make default', 'rd-default', { id: v.id }, 'sm', locked)}</div></article>`).join('')}</div>`) +
+    settingsGroup('Versions', 'Each upload is a new version. The active version is what AI workflows use unless a job is matched to another: tag a version with its domain and roles, and new jobs whose title names those roles use it.',
+      `<div class="settings-resume-list">${versions.map(v => `<article class="settings-resume"><div class="grow"><strong>${esc(v.name || 'Resume')} · v${v.version}</strong><p>${esc((RD_RESUME[v.verification_status] || RD_RESUME.UNVERIFIED)[0])}${v.is_active ? ' · Active' : ''}${v.is_default ? ' · Default' : ''}</p>${resumeTags('version', v.id, v.domain, v.roles || [])}</div><div class="row gap8 wrap">${v.is_active ? '' : btn('Make active', 'rd-activate', { id: v.id }, 'sm', locked)}${v.is_default ? '' : btn('Make default', 'rd-default', { id: v.id }, 'sm', locked)}${v.is_active ? '' : btn('Delete', 'rd-delete-version', { id: v.id, name: `${v.name || 'Resume'} · v${v.version}` }, 'sm danger', locked)}</div></article>`).join('')}</div>
+      ${versions.some(v => v.domain || v.roles?.length) ? `<div class="row gap8 mt12" style="align-items:center">${btn(label('resumeRematch', 'Re-match existing jobs', 'Checking…'), 'resume-rematch', {}, 'sm soft', isBusy('resumeRematch'))}<span class="settings-help">New jobs use the tags right away; this re-matches jobs found earlier (not ones you or a search pinned).</span></div>` : ''}`) +
     settingsGroup('Candidate policy', 'Which resume AI works from, and how it may use facts you have not verified.',
       `<fieldset class="settings-options" style="border:0;padding:0;margin:0 0 14px"><legend class="settings-help" style="margin-bottom:8px">Resume source for AI</legend>${[
         ['structured', 'Structured data', 'The facts in Resume Data. Your corrections win, role titles and employers included; unverified facts only as allowed below.'],
@@ -258,6 +259,16 @@ const RESUME_DATA_ACTIONS = {
     return rdPost('reparse/resolve', { decisions }, 'Re-parse choices applied');
   },
   'rd-activate': el => rdRun(async () => { await api(`/api/resumes/${el.dataset.id}/activate`, { method: 'POST' }); D.resumeData = await api('/api/settings/resume'); D.profile = await api('/api/profile'); RD.changes = null; RD.raw = null; }, 'Active resume changed'),
+  // The active version cannot be deleted (the server refuses too); its uploaded file stays in the library.
+  'rd-delete-version': el => {
+    if (!confirm(`Delete ${el.dataset.name}? Its structured data and verification are removed. Jobs or searches that used it go back to matching by tags (else the active resume), and facts only it verified stop being used. The uploaded file stays in your resume library.`)) return;
+    return rdRun(async () => {
+      const out = await api(`/api/resumes/${el.dataset.id}`, { method: 'DELETE' });
+      D.resumeData = await api('/api/settings/resume'); D.resumeChoices = null; RD.changes = null; RD.raw = null;
+      D.resumes = await api('/api/profile/resumes').catch(() => D.resumes);
+      toast(`Version deleted${out.jobs ? ` · ${out.jobs} job${out.jobs === 1 ? '' : 's'} now matched by tags` : ''}${out.evidence_retired ? ` · ${out.evidence_retired} fact${out.evidence_retired === 1 ? '' : 's'} no longer verified` : ''}`);
+    });
+  },
   'rd-default': el => rdRun(async () => { await api(`/api/resumes/${el.dataset.id}/default`, { method: 'POST' }); D.resumeData = await api('/api/settings/resume'); }, 'Default resume changed'),
   'rd-policy-source': el => rdRun(async () => { D.resumeData = { ...D.resumeData, policy: await api('/api/settings/resume/policy', { method: 'PUT', body: { resume_source: el.value } }) }; }, el.value === 'master_text' ? 'AI now works from your master resume text' : 'AI now works from your structured resume data'),
   'rd-policy': el => rdRun(async () => { D.resumeData = { ...D.resumeData, policy: await api('/api/settings/resume/policy', { method: 'PUT', body: { [el.dataset.key]: el.checked } }) }; }, 'Candidate policy saved'),

@@ -25,7 +25,8 @@ from sqlalchemy.orm import Session, with_loader_criteria
 from app.models import (AIConfigAuditEntry, AIConfigVersion, AIModel, AIOptimizationReport, AIOptimizationTask,
                         AIRoutingConfig, AppSetting, Application, ApplicationEvent, CandidateProfile, LiteLLMConnection,
                         ModelTier, WorkerModelConfig,
-                        ConversationAction, Evidence, FollowUp, Job, JobDescriptionParseTask, JobRanking, JobRankingTask,
+                        ConversationAction, Evidence, FollowUp, Job, JobDescriptionFetchTask, JobDescriptionParseTask,
+                        JobFeedbackEvent, JobRanking, JobRankingTask, RemovedPosting,
                         JobRequirementEvidence, JobStructuredDataChange, KnowledgeAnswer, McpToken, Resume,
                         ProviderCooldown, ResumeDataChange, ResumeDocument, ResumeVariant, ResumeVersion, SavedSearch,
                         SearchProfile,
@@ -35,6 +36,7 @@ OWNED_MODELS = (CandidateProfile, AppSetting, ResumeDocument, KnowledgeAnswer, E
                 SavedSearch, ProviderCooldown, Application, ResumeVariant, WorkflowTransition, ApplicationEvent, FollowUp, TailorTask, ResumeVersion,
                 JobRankingTask, JobRanking, AIOptimizationTask, AIOptimizationReport, ConversationAction, McpToken, Resume,
                 ResumeDataChange, JobRequirementEvidence, JobStructuredDataChange, JobDescriptionParseTask,
+                JobDescriptionFetchTask, RemovedPosting, JobFeedbackEvent,
                 LiteLLMConnection, AIModel, ModelTier, WorkerModelConfig, AIRoutingConfig, AIConfigVersion,
                 AIConfigAuditEntry)
 # Rows that inherit their owner from a parent row: model -> (relationship, foreign key, parent model).
@@ -47,6 +49,7 @@ INHERITED_OWNER = {
     JobRequirementEvidence: ("job", "job_id", Job),
     JobStructuredDataChange: ("job", "job_id", Job),
     JobDescriptionParseTask: ("job", "job_id", Job),
+    JobDescriptionFetchTask: ("job", "job_id", Job),
     WorkflowTransition: ("job", "job_id", Job),
     ApplicationEvent: ("application", "application_id", Application),
     FollowUp: ("application", "application_id", Application),

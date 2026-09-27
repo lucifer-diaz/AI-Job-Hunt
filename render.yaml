@@ -18,6 +18,12 @@ services:
         value: gpt-5.6-luna
       - key: BRAVE_SEARCH_API_KEY
         sync: false
+      # Headless Chromium for job-description recovery. On a small instance keep one page at a time and close the
+      # browser between batches (about 200-400 MB while it runs); PLAYWRIGHT_ENABLED=false keeps recovery HTTP-only.
+      - key: PLAYWRIGHT_MAX_CONCURRENCY
+        value: "1"
+      - key: PLAYWRIGHT_KEEP_BROWSER_RUNNING
+        value: "false"
 
   - type: cron
     name: job-hunt-followups

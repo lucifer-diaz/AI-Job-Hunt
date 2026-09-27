@@ -8,9 +8,17 @@ import asyncio
 import json
 import sys
 
+from app.infrastructure.browser import shutdown_browser_service
 from app.scheduler import build_scheduler
 
 ALIASES = {"searches": "hunter"}
+
+
+async def _run(scheduler, name: str):
+    try:
+        return await scheduler.run_job(name, trigger="cron")
+    finally:
+        await shutdown_browser_service()  # a cron process never leaves a Chromium process behind
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -20,7 +28,7 @@ def main(argv: list[str] | None = None) -> int:
     if name not in scheduler.specs:
         print(f"Unknown job '{name}'. Choose from: {', '.join(scheduler.specs)}")
         return 2
-    outcome = asyncio.run(scheduler.run_job(name, trigger="cron"))
+    outcome = asyncio.run(_run(scheduler, name))
     print(json.dumps(outcome.public(), default=str))
     return 1 if outcome.status == "failed" else 0
 
