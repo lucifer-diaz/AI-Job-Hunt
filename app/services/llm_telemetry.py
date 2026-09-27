@@ -67,6 +67,41 @@ _SECTION_LINE = re.compile(
     + r")(?: \(untrusted data\))?:(?: |$)", re.M)
 MAX_ERROR_MESSAGE = redaction.MAX_ERROR_MESSAGE
 DEBUG_TEXT_LIMIT = 200_000
+CAPTURE_PREFERENCE = "capture_llm_payloads"  # AppSetting.preferences["monitoring"][...], per account, off by default
+_CAPTURE_TTL_SECONDS = 30
+_capture_cache: dict[int, tuple[float, bool]] = {}
+
+
+def capture_payloads(user_id: int | None) -> bool:
+    """Whether this call's full prompt and response are stored: LLM_PROMPT_DEBUG for everyone, or the account's own
+    switch (Monitoring → LLM requests). Read through a short cache; never raises (telemetry is best effort)."""
+    if get_settings().llm_prompt_debug:
+        return True
+    if user_id is None:
+        return False
+    import time
+
+    now = time.monotonic()
+    cached = _capture_cache.get(user_id)
+    if cached and now - cached[0] < _CAPTURE_TTL_SECONDS:
+        return cached[1]
+    try:
+        from sqlalchemy import select
+
+        from app.models import AppSetting
+
+        with _session_factory()() as db:
+            prefs = db.scalar(select(AppSetting.preferences).where(AppSetting.user_id == user_id)) or {}
+        value = bool((prefs.get("monitoring") or {}).get(CAPTURE_PREFERENCE))
+    except Exception:  # noqa: BLE001  telemetry is best effort by design
+        value = False
+    _capture_cache[user_id] = (now, value)
+    return value
+
+
+def forget_capture_setting(user_id: int) -> None:
+    """Called when the switch changes, so the next call sees it at once."""
+    _capture_cache.pop(user_id, None)
 
 
 def utcnow() -> datetime:
@@ -219,7 +254,7 @@ def build_entry(attempt: Attempt, *, latency_ms: int, error: BaseException | Non
     total = (usage.input_tokens + usage.output_tokens
              if usage and usage.input_tokens is not None and usage.output_tokens is not None else None)
     call = attempt.call
-    debug = settings.llm_prompt_debug
+    debug = capture_payloads(attempt.user_id)
     return {
         "request_id": str(uuid.uuid4()), "user_id": attempt.user_id,
         "external_request_id": attempt.external_request_id, "trace_id": tracing.current_trace_id(),
@@ -305,7 +340,35 @@ def record(attempt: Attempt, *, latency_ms: int, error: BaseException | None = N
     try:
         if not get_settings().llm_telemetry_enabled:
             return
-        persist(build_entry(attempt, latency_ms=latency_ms, error=error, error_type=error_type))
+        entry = build_entry(attempt, latency_ms=latency_ms, error=error, error_type=error_type)
+        persist(entry)
+        log_call(entry)
     except Exception:  # noqa: BLE001  telemetry is best effort by design
         log.warning("could not record LLM telemetry for %s/%s", attempt.provider, attempt.requested_model,
                     exc_info=True)
+
+
+def log_call(entry: dict[str, Any]) -> None:
+    """One Monitoring → Logs line for this call: INFO when it succeeded, ERROR when it failed. It names the request
+    row (details.llm_request_id), which holds the prompt and response when they were captured. Never raises."""
+    from app.services import system_log
+
+    failed = entry["status"] == "FAILED"
+    if not failed and not get_settings().system_log_llm_calls:
+        return
+    who = (entry.get("worker_type") or entry["stage"] or "LLM").replace("_", " ").title()
+    tokens = (f" · {entry['input_tokens']:,} in / {entry['output_tokens']:,} out tokens"
+              if entry.get("input_tokens") is not None and entry.get("output_tokens") is not None else "")
+    model = entry.get("model") or entry.get("requested_model") or entry["provider"]
+    outcome = f"failed: {entry['error_type']}" if failed else "succeeded"
+    system_log.log_event(
+        level="ERROR" if failed else "INFO", category="LLM",
+        message=f"{who} call {outcome} · {model} · {entry['latency_ms'] or 0:,} ms{tokens}",
+        provider=(entry["provider"] or "").upper(), operation=entry.get("prompt_name"),
+        trace_id=entry.get("trace_id"), user_id=entry.get("user_id"),
+        entity_type=entry.get("workflow_type"), entity_id=entry.get("workflow_entity_id"),
+        status=entry["error_type"] if failed else "SUCCEEDED", duration_ms=entry.get("latency_ms"),
+        external_request_id=entry.get("external_request_id"),
+        details={"llm_request_id": entry["request_id"], "model": model, "prompt": entry.get("prompt_name"),
+                 "prompt_version": entry.get("prompt_version"), "error": entry.get("error_message"),
+                 "captured": bool(entry.get("debug_prompt") or entry.get("debug_response"))})

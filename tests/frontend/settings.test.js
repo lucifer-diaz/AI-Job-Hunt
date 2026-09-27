@@ -485,6 +485,10 @@ describe('resume data', () => {
     await ui.A['rd-policy']({ dataset: { key: 'allow_unverified_resume_facts' }, checked: true });
     expect(policy).toEqual({ allow_unverified_resume_facts: true });
     expect(ui.D.resumeData.policy.allow_unverified_resume_facts).toBe(true);
+    const sources = [...document.querySelectorAll('#view input[name="rd-resume-source"]')];
+    expect(sources.map(r => r.value)).toEqual(['structured', 'master_text']);
+    await ui.A['rd-policy-source']({ value: 'master_text' });
+    expect(policy).toEqual({ resume_source: 'master_text' });
     ui.A['rd-jump']({ dataset: { section: 'skills' } }, { preventDefault() {} });
     expect(ui.RD.tab).toBe('structured');
   });

@@ -19,7 +19,7 @@ import asyncio
 from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import func, select, update
@@ -38,7 +38,7 @@ from app.services import work_queue as wq
 from app.services.compensation import enrich_compensation
 from app.services.hunter import run_due_profiles
 from app.services.lifecycle import WorkflowState as S
-from app.services.sources import refresh_apify_run
+from app.services.sources import give_up_on_run, refresh_apify_run
 from app.services.user_settings import ai_ready, apify_token
 from app.services.workflow import create_due_followups
 from app.settings import get_settings
@@ -134,7 +134,8 @@ def hunter(ctx: JobContext) -> dict[str, Any]:
 
 def apify_sync(ctx: JobContext) -> dict[str, Any]:
     """Check unfinished Apify runs of every account and import the datasets of the ones that finished."""
-    summary: dict[str, Any] = {"checked": 0, "completed": 0, "created": 0, "no_token": 0, "errors": []}
+    summary: dict[str, Any] = {"checked": 0, "completed": 0, "created": 0, "no_token": 0, "gave_up": 0, "errors": []}
+    max_age = timedelta(hours=max(1, get_settings().apify_run_max_age_hours))
     with ctx.sessions() as db:
         pending = db.execute(select(SearchRun.id, SearchRun.user_id)
                              .where(SearchRun.provider == "apify", SearchRun.completed_at.is_(None))
@@ -150,6 +151,12 @@ def apify_sync(ctx: JobContext) -> dict[str, Any]:
                              .with_for_update(skip_locked=True)).first()
             if run is None:
                 continue  # finished meanwhile, or another instance is importing it right now
+            if run.created_at and ctx.now - run.created_at > max_age:
+                # Checking forever is what kept stale runs hammering Apify: no run lasts this long.
+                give_up_on_run(db, run, f"Still unfinished {max_age.total_seconds() / 3600:.0f} hours after it "
+                                        "started, so it is no longer checked")
+                summary["gave_up"] += 1
+                continue
             try:
                 out = refresh_apify_run(db, run)
             except Exception as exc:  # one bad run must not stop the others
@@ -157,6 +164,7 @@ def apify_sync(ctx: JobContext) -> dict[str, Any]:
                 summary["errors"].append({"run_id": run_id, "error": str(exc)[:300]})
                 continue
             summary["checked"] += 1
+            summary["gave_up"] += int(bool(out.get("gave_up")))
             summary["completed"] += int(bool(out.get("completed")))
             summary["created"] += (out.get("import") or {}).get("created", 0)
     return summary

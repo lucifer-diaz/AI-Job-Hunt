@@ -10,6 +10,7 @@ Terminal states: OFFER, REJECTED, ARCHIVED, SKIPPED, FAILED. FAILED is terminal 
 processing; an operator may requeue it, and only back to the state it failed in. An ARCHIVED job that was
 archived by ranking (from RANKED or QUALIFIED) may be reopened for re-ranking, and only to RANK_PENDING.
 A job SKIPPED before ranking for want of a description returns to NORMALIZED once it has one.
+A job the user removed from the ranking queue returns to NORMALIZED when they ask for it to be ranked after all.
 """
 from __future__ import annotations
 
@@ -102,10 +103,12 @@ TERMINAL_STATES: frozenset[WorkflowState] = frozenset(s for s, targets in TRANSI
 FAILABLE_STATES: frozenset[WorkflowState] = frozenset(s for s, targets in TRANSITIONS.items() if S.FAILED in targets)
 # ARCHIVED stays terminal for automation; a job archived by ranking may be reopened, only for re-ranking.
 REOPENABLE_ARCHIVE_SOURCES: frozenset[WorkflowState] = frozenset({S.RANKED, S.QUALIFIED})
-# SKIPPED stays terminal too, with one exception: a posting skipped *before* ranking — because it arrived
-# without a usable description — is ranked after all once that description turns up (a fuller re-import, or
-# one pasted by hand). Nothing else about a skip is reversible.
-REOPENABLE_SKIP_SOURCES: frozenset[WorkflowState] = frozenset({S.NORMALIZED})
+# SKIPPED stays terminal too, with two exceptions, both from before a ranking was made: a posting that arrived
+# without a usable description is ranked after all once that description turns up (a fuller re-import, or one
+# pasted by hand), and a job the user took out of the ranking queue is ranked if they ask for it after all. The
+# code decides which skips those are (app.services.ranker.reopen_for_description, removed_by_user); nothing else
+# about a skip is reversible.
+REOPENABLE_SKIP_SOURCES: frozenset[WorkflowState] = frozenset({S.NORMALIZED, S.FILTERED, S.RANK_PENDING})
 
 
 class InvalidState(ValueError):

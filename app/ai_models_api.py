@@ -142,6 +142,12 @@ def connection_test(db: Session = Depends(get_user_db)):
     return _call(config.test_connection, db, require_user_id(db))
 
 
+@router.get("/gateway")
+def gateway_get(db: Session = Depends(get_user_db)):
+    """The route every worker's requests take now (LiteLLM or the direct provider), and whether each is ready."""
+    return config.gateway_status(db, require_user_id(db))
+
+
 @router.put("/gateway")
 def gateway_put(payload: GatewayIn, db: Session = Depends(get_user_db)):
     """Turn LiteLLM gateway mode on or off: which path every worker's requests take."""
@@ -165,7 +171,8 @@ def gateway_put(payload: GatewayIn, db: Session = Depends(get_user_db)):
     config.audit(db, user_id, "GATEWAY", actor=config._actor(db, user_id),
                  changes=[{"path": "gateway", "before": current == "litellm", "after": payload.enabled}])
     db.commit()
-    return {"gateway_enabled": payload.enabled, "llm_provider": ai["llm_provider"] or get_settings().llm_provider}
+    return {"gateway_enabled": payload.enabled, "llm_provider": ai["llm_provider"] or get_settings().llm_provider,
+            **config.gateway_status(db, user_id)}
 
 
 # ───────────── models ─────────────

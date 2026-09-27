@@ -336,6 +336,39 @@ def test_the_gateway_switch_needs_a_base_url_and_can_be_turned_off(account, monk
     account.call("PUT", "/gateway", json={"enabled": True}, expect=422)
 
 
+def test_the_overview_switch_names_both_routes_and_returns_to_the_chosen_direct_provider(account, monkeypatch):
+    """Overview offers exactly two routes: LiteLLM, or the direct provider (with its model) chosen in Settings."""
+    monkeypatch.setattr(get_settings(), "llm_provider", "openrouter")
+    body = {"llm_provider": "openrouter", "model": "openrouter/free", "application_mode": "manual_approval",
+            "min_review_score": 70}
+    assert account.client.put("/api/settings", json=body).status_code == 200
+    status = account.get("/gateway")
+    assert status["gateway_enabled"] is False and status["direct_provider"] == "openrouter"
+    assert status["direct_label"] == "OpenRouter" and status["direct_model"] == "openrouter/free"
+    assert status["direct_ready"] is False, "no OpenRouter key saved yet"
+    assert status["litellm_ready"] is True
+
+    on = account.gateway(True)
+    assert on["gateway_enabled"] is True and on["direct_provider"] == "openrouter", "still knows where off goes back to"
+    off = account.gateway(False)
+    assert off["gateway_enabled"] is False and off["direct_provider"] == "openrouter"
+    assert off["direct_model"] == "openrouter/free", "the direct provider keeps its own model"
+
+
+def test_saving_the_direct_provider_form_never_turns_the_gateway_off(account, monkeypatch):
+    """The form edits the provider that turning the gateway off returns to; only the gateway switch picks a route."""
+    monkeypatch.setattr(get_settings(), "llm_provider", "openrouter")
+    assert account.gateway(True)["gateway_enabled"] is True
+    patch = account.client.patch("/api/settings", json={"llm_provider": "openai", "model": "gpt-5.6-luna"})
+    assert patch.status_code == 200, patch.text
+    assert patch.json()["ai"]["saved"]["llm_provider"] == "openai", "the form shows the direct provider"
+    status = account.get("/gateway")
+    assert status["gateway_enabled"] is True, "still on LiteLLM"
+    assert status["direct_provider"] == "openai" and status["direct_model"] == "gpt-5.6-luna"
+    off = account.gateway(False)
+    assert off["gateway_enabled"] is False and off["direct_provider"] == "openai"
+
+
 def test_runtime_view_distinguishes_desired_active_and_served(account, litellm):
     account.call("POST", "/models/sync")
     account.apply()

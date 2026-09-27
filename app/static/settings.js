@@ -282,6 +282,7 @@ async function settingsSave(form) {
     if (form === 'preferences') authorizationDraft = null;
     if (form === 'resumes') { D.resumes = await api('/api/profile/resumes'); D.resumeData = undefined; }
     if (['profile', 'preferences', 'ai'].includes(form)) await refreshSettingsSummary(form);
+    if (form === 'ai' && typeof aimLoad === 'function') await aimLoad();  // the Route card shows the direct model
   }, form === 'account' ? 'Password updated. Other sessions are signed out.' : 'Changes saved');
 }
 async function saveWorkflowSettings() {

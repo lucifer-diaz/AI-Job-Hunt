@@ -56,6 +56,23 @@ def _upper(value: Any) -> Any:
     return value.strip().upper().replace(" ", "_").replace("-", "_") if isinstance(value, str) else value
 
 
+def _phrase(value: Any) -> Any:
+    """A short free-text field as models actually send it: null or "N/A" is empty, a list of phrases is one phrase.
+    Anything else is left for validation to reject."""
+    if value is None:
+        return ""
+    if isinstance(value, list) and all(isinstance(v, str) for v in value):
+        value = "; ".join(v.strip() for v in value if v.strip())
+    if isinstance(value, str) and value.strip().upper().strip(".") in ("N/A", "NA", "NONE", "-"):
+        return ""
+    return value
+
+
+def _text_id(value: Any) -> Any:
+    """An id copied from the input: 7 and "7" are the same id."""
+    return str(value) if isinstance(value, int) and not isinstance(value, bool) else value
+
+
 def _clean_strings(values: Any) -> Any:
     return [v.strip() for v in values if isinstance(v, str) and v.strip()] if isinstance(values, list) else values
 
@@ -77,23 +94,35 @@ class Contract(BaseModel):
 
 class RequirementAssessment(Contract):
     requirement: str = Field(min_length=1, max_length=300, description="the requirement as the posting states it")
-    requirement_id: str | None = Field(default=None, max_length=60,
-                                       description="its id from JOB REQUIREMENTS, or null")
+    requirement_id: Annotated[str | None, BeforeValidator(_text_id)] = Field(
+        default=None, max_length=60, description="its id from JOB REQUIREMENTS, or null")
     level: Annotated[Literal["REQUIRED", "PREFERRED", "INFORMATIONAL", "UNKNOWN"], BeforeValidator(_upper)] = Field(
         default="UNKNOWN", description="copied from JOB REQUIREMENTS, never reclassified")
     status: Annotated[Literal["MATCH", "PARTIAL_MATCH", "MISSING", "UNKNOWN"], BeforeValidator(_upper)] = Field(
         description="MATCH fully supported; PARTIAL_MATCH part supported; MISSING the facts show it is absent; "
                     "UNKNOWN the facts cannot tell")
-    supported: str = Field(default="", max_length=400, description="what the candidate's facts do support")
-    unsupported: str = Field(default="", max_length=400, description="what they do not support")
+    supported: Annotated[str, BeforeValidator(_phrase)] = Field(
+        default="", max_length=400, description="what the candidate's facts do support")
+    unsupported: Annotated[str, BeforeValidator(_phrase)] = Field(
+        default="", max_length=400, description="what they do not support")
     evidence_ids: EvidenceIds = Field(description="VERIFIED EVIDENCE ids behind `supported`")
     fatal: bool = Field(default=False, description="true only for an explicit hard requirement that is MISSING")
+
+    @model_validator(mode="after")
+    def _only_missing_is_fatal(self) -> RequirementAssessment:
+        """The rule the prompt states, applied by code: only a MISSING requirement can be fatal (unknown lowers
+        confidence instead). A model's fatal flag on anything else would archive a job by itself."""
+        if self.status != "MISSING":
+            self.fatal = False
+        return self
 
 
 class RankingResult(Contract):
     worker: ClassVar[str] = "RANKER"
 
-    job_id: int = Field(description="the JOB ID given in the input")
+    # The application knows which job it asked about (app.services.ranker.validate_output fills a missing one); a
+    # different id is still rejected there.
+    job_id: int | None = Field(default=None, description="the JOB ID given in the input")
     overall_fit_score: Score
     confidence: Confidence = Field(description="how complete the posting and the candidate's facts are")
     candidate_fit_score: Score = Field(description="does the person fit, from all their facts")
@@ -138,7 +167,9 @@ class RankingResult(Contract):
                 for a in by_status["PARTIAL_MATCH"]]
         if not self.missing_requirements:
             self.missing_requirements = [a.requirement for a in by_status["MISSING"] if not a.fatal]
-        if not self.fatal_gaps:
+        if self.requirement_assessments or not self.fatal_gaps:
+            # Fatal gaps decide archiving (app.services.ranker.qualify), so with assessments they are what the
+            # assessments show — MISSING and fatal — never a list the model wrote alongside them.
             self.fatal_gaps = [a.requirement for a in by_status["MISSING"] if a.fatal]
         return self
 
@@ -278,12 +309,30 @@ class EvidenceExtractionResult(Contract):
     claims: list[ExtractedClaim] = Field(default_factory=list, max_length=80)
 
 
+class ParsedRequirement(Contract):
+    """One requirement in the shape the prompt shows (REQUIREMENT_TEMPLATE). Typed here, not left as a dict, so that
+    an answer like {"skill": "..."} fails the contract and gets the gateway's schema correction instead of passing
+    through to the service and failing there on every attempt. Unknown type and level values are normalised by the
+    service (app.services.job_description.RequirementIn), so a model is not failed over vocabulary."""
+
+    id: str | None = Field(default=None, max_length=60)
+    type: Annotated[str, BeforeValidator(_upper)] = Field(default="OTHER", max_length=25)
+    normalized_value: str = Field(min_length=1, max_length=300, description="the requirement in a few words")
+    requirement_level: Annotated[str, BeforeValidator(_upper)] = Field(default="UNKNOWN", max_length=15)
+    source_text: str = Field(default="", max_length=4000)
+    source_section: str | None = Field(default=None, max_length=120)
+    confidence: Confidence = 0.5
+    is_explicit: bool = True
+    is_derived: bool = False
+
+
 class JobDescriptionParserOutput(Contract):
     worker: ClassVar[str] = "JD_PARSER"
 
-    # Validated in depth (and grounded in the posting's own text) by app.services.job_description.validated/ground.
+    # The structured document is validated in depth (and grounded in the posting's own text) by
+    # app.services.job_description.validated/ground.
     structured_description: dict[str, Any]
-    requirements: list[dict[str, Any]]
+    requirements: list[ParsedRequirement]  # no length cap: the service keeps the first 200 of a long list
 
 
 # ───────────── AI Optimization Advisor ─────────────

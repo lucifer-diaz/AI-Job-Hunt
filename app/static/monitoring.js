@@ -40,7 +40,7 @@ function monSchemaReason(reason) {
 function monState() {
   if (!S.mon) S.mon = { tab: 'overview', range: '7d', provider: '', model: '', stage: '', prompt_version: '', status: '', job_id: '', worker_type: '', all: false, page: 1, tables: new Set(), request: null,
     ext: { provider: '', operation: '', workflow: '', status: '', error_type: '', http_status_code: '', error_only: false, page: 1, request: null },
-    logs: { category: '', level: '', provider: '', workflow: '', search: '', page: 1, entry: null } };
+    logs: { category: '', level: '', provider: '', workflow: '', search: '', trace_id: '', page: 1, entry: null } };
   return S.mon;
 }
 function monQuery(extra = {}) {
@@ -54,7 +54,7 @@ function monExtQuery(extra = {}) {
 }
 function monLogQuery(extra = {}) {
   const m = monState(), l = m.logs;
-  return qs({ range: m.range, category: l.category, level: l.level, provider: l.provider, search: l.search,
+  return qs({ range: m.range, category: l.category, level: l.level, provider: l.provider, search: l.search, trace_id: l.trace_id,
     all_accounts: m.all ? 'true' : '', ...extra });
 }
 async function loadMonitoring() {
@@ -62,16 +62,17 @@ async function loadMonitoring() {
   // Each section asks only for what it draws, so opening Logs does not aggregate every LLM request.
   const wantsLlm = ['overview', 'llm', 'advisor'].includes(m.tab);
   const wantsExternal = ['overview', 'external', 'apify'].includes(m.tab);
-  const [dash, reqs, rec, ext, extReqs, logs] = await Promise.all([
+  const [dash, reqs, capture, rec, ext, extReqs, logs] = await Promise.all([
     wantsLlm ? api('/api/monitoring/dashboard?' + monQuery()) : Promise.resolve(D.mon),
     m.tab === 'llm' ? api('/api/monitoring/requests?' + monQuery({ page: m.page, per_page: 20 })) : Promise.resolve(D.monRequests),
+    ['llm', 'logs'].includes(m.tab) ? api('/api/monitoring/capture').catch(() => D.monCapture) : Promise.resolve(D.monCapture),
     api('/api/monitoring/recommendations'),
     wantsExternal ? api('/api/monitoring/external/dashboard?' + monExtQuery()) : Promise.resolve(D.monExt),
     m.tab === 'external' ? api('/api/monitoring/external/requests?' + monExtQuery({ page: m.ext.page, per_page: 25 })) : Promise.resolve(D.monExtRequests),
     m.tab === 'logs' ? api('/api/monitoring/logs?' + monLogQuery({ page: m.logs.page, per_page: 50 })) : Promise.resolve(D.monLogs),
   ]);
   const wasActive = D.monRec?.active;
-  Object.assign(D, { mon: dash, monRequests: reqs, monRec: rec, monExt: ext, monExtRequests: extReqs, monLogs: logs });
+  Object.assign(D, { mon: dash, monRequests: reqs, monCapture: capture, monRec: rec, monExt: ext, monExtRequests: extReqs, monLogs: logs });
   if (wasActive && !rec.active) {
     const task = rec.tasks[0];
     toast(task?.status === 'FAILED' ? `AI usage analysis failed: ${task.error || 'unknown error'}` : 'AI usage analysis finished: recommendations updated', task?.status === 'FAILED');
@@ -296,9 +297,9 @@ function renderMonRequests() {
     <td class="mono">${x.context_utilization_percent == null ? '—' : x.context_utilization_percent.toFixed(1) + '%'}</td>
     <td class="mono">${monMs(x.latency_ms)}</td><td class="mono">${monUSD(x.estimated_cost)}</td><td class="mono">${x.retry_count}</td></tr>`).join('');
   return `<section class="card flush"><div class="row between wrap gap10" style="padding:14px 18px;border-bottom:1px solid var(--line2)">
-      <div><div class="card-title">LLM requests</div><div class="card-sub">${r.total.toLocaleString()} matching · click a request for details (no prompt or resume text is shown)</div></div>
+      <div><div class="card-title">LLM requests</div><div class="card-sub">${r.total.toLocaleString()} matching · click a request for its details${D.monCapture?.enabled || D.monCapture?.server_wide ? ', full prompt and response' : ''} and its logs</div>${monCaptureSwitch()}</div>
       <div class="row gap8 xs muted">${btn('‹ Prev', 'mon-page', { dir: -1 }, 'sm', r.page <= 1)}<span>Page ${r.page} of ${pages}</span>${btn('Next ›', 'mon-page', { dir: 1 }, 'sm', r.page >= pages)}</div></div>
-    ${r.items.length ? `<div class="mon-table-wrap"><table class="mon-table"><thead><tr><th>Time</th><th>Worker / stage</th><th>Model</th><th>Status</th><th>Tokens in / out</th><th>Context</th><th>Latency</th><th>Cost</th><th>Retry</th></tr></thead><tbody>${rows}</tbody></table></div>`
+    ${r.items.length ? `<div class="mon-table-wrap" data-scroll-key="mon-llm"><table class="mon-table"><thead><tr><th>Time</th><th>Worker / stage</th><th>Model</th><th>Status</th><th>Tokens in / out</th><th>Context</th><th>Latency</th><th>Cost</th><th>Retry</th></tr></thead><tbody>${rows}</tbody></table></div>`
       : `<div style="padding:18px">${empty('No LLM requests', 'Requests appear here as ranking, tailoring, reviews and follow-ups call a model.')}</div>`}</section>`;
 }
 
@@ -396,7 +397,7 @@ function renderMonExtRequests() {
   return `<section class="card flush"><div class="row between wrap gap10" style="padding:14px 18px;border-bottom:1px solid var(--line2)">
       <div><div class="card-title">API calls</div><div class="card-sub">${r.total.toLocaleString()} matching${filtered ? ' with these filters' : ''} · click any value to filter by it, or a row for its safe detail (no headers, credentials or bodies are stored)</div></div>
       <div class="row gap8 xs muted">${btn('‹ Prev', 'mon-ext-page', { dir: -1 }, 'sm', r.page <= 1)}<span>Page ${r.page} of ${r.pages}</span>${btn('Next ›', 'mon-ext-page', { dir: 1 }, 'sm', r.page >= r.pages)}</div></div>
-    ${r.items.length ? `<div class="mon-table-wrap"><table class="mon-table"><thead><tr><th>Time</th><th>Provider</th><th>Operation</th><th>Workflow</th><th>Status</th><th>Latency</th><th>Retries</th><th>Cost</th></tr></thead><tbody>${rows}</tbody></table></div>`
+    ${r.items.length ? `<div class="mon-table-wrap" data-scroll-key="mon-external"><table class="mon-table"><thead><tr><th>Time</th><th>Provider</th><th>Operation</th><th>Workflow</th><th>Status</th><th>Latency</th><th>Retries</th><th>Cost</th></tr></thead><tbody>${rows}</tbody></table></div>`
       : `<div style="padding:18px">${filtered
         ? empty('No calls match these filters', 'Nothing in this range matches every filter at once. Clear one of them to widen the search.', btn('Reset filters', 'mon-ext-reset', {}, 'primary'))
         : empty('No external API calls', 'Calls appear here as searches, job boards and models are contacted.')}</div>`}</section>`;
@@ -441,7 +442,7 @@ function renderMonApify() {
     <td class="mono">${x.duration_ms == null ? '—' : monMs(x.duration_ms)}</td></tr>`).join('');
   const runTable = `<section class="card flush"><div style="padding:14px 18px;border-bottom:1px solid var(--line2)">
       <div class="card-title">Recent runs</div><div class="card-sub">Compute units and cost are Apify's own figures; a dash means Apify reported none.</div></div>
-    ${runs.length ? `<div class="mon-table-wrap"><table class="mon-table"><thead><tr><th>Started</th><th>Actor</th><th>Saved search</th><th>Location</th><th>Status</th><th>Found</th><th>Duplicates</th><th>New</th><th>Compute</th><th>Cost</th><th>Duration</th></tr></thead><tbody>${runRows}</tbody></table></div>`
+    ${runs.length ? `<div class="mon-table-wrap" data-scroll-key="mon-apify"><table class="mon-table"><thead><tr><th>Started</th><th>Actor</th><th>Saved search</th><th>Location</th><th>Status</th><th>Found</th><th>Duplicates</th><th>New</th><th>Compute</th><th>Cost</th><th>Duration</th></tr></thead><tbody>${runRows}</tbody></table></div>`
       : `<div style="padding:18px">${empty('No Apify runs', 'Runs appear here once a saved search starts one.')}</div>`}</section>`;
   return `${tiles}
     <div class="mon-grid">${group('by_actor', 'By actor', 'Runs and what each actor found', 'actor_id')}${group('by_saved_search', 'By saved search', 'Which setup started the runs', 'saved_search')}</div>
@@ -456,6 +457,7 @@ function renderMonLogs() {
   const f = m.logs;
   const opts = (key, all, values) => `<select class="select mon-select" data-act-change="mon-log-filter" data-key="${key}" aria-label="${attr(all)}">${[['', all], ...values].map(([v, t]) => `<option value="${attr(v)}" ${String(f[key]) === String(v) ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select>`;
   const filters = `<section class="card pad16"><div class="row wrap gap8" style="align-items:center">
+    ${f.trace_id ? `<span class="pill brand lg"><span class="pt">Trace ${esc(f.trace_id.slice(0, 12))}</span></span>${btn('Show all logs', 'mon-log-clear-trace', {}, 'sm')}` : ''}
     <input class="input mon-select" style="width:210px" placeholder="Search messages" value="${attr(f.search)}" data-act-change="mon-log-filter" data-key="search" aria-label="Search messages">
     ${opts('category', 'All categories', (l.categories?.length ? l.categories : l.all_categories).map(c => [c, c.replace(/_/g, ' ').toLowerCase()]))}
     ${opts('level', 'All levels', l.levels.map(v => [v, v.toLowerCase()]))}
@@ -473,9 +475,9 @@ function renderMonLogs() {
     <td class="ellipsis" style="max-width:320px" title="${attr(x.message)}">${esc(x.message)}</td>
     <td class="mono">${x.duration_ms == null ? '—' : monMs(x.duration_ms)}</td><td>${esc(x.status || '—')}</td></tr>`).join('');
   return `${filters}<section class="card flush"><div class="row between wrap gap10" style="padding:14px 18px;border-bottom:1px solid var(--line2)">
-      <div><div class="card-title">Logs</div><div class="card-sub">${l.total.toLocaleString()} event${l.total === 1 ? '' : 's'} · failed and slow calls, scheduler runs and workflow milestones</div></div>
+      <div><div class="card-title">Logs</div><div class="card-sub">${l.total.toLocaleString()} event${l.total === 1 ? '' : 's'} · every LLM call, failed and slow API calls, scheduler runs and workflow milestones · open an LLM line for its prompt and response</div>${monCaptureSwitch()}</div>
       <div class="row gap8 xs muted">${btn('‹ Prev', 'mon-log-page', { dir: -1 }, 'sm', l.page <= 1)}<span>Page ${l.page} of ${l.pages}</span>${btn('Next ›', 'mon-log-page', { dir: 1 }, 'sm', l.page >= l.pages)}</div></div>
-    ${l.items.length ? `<div class="mon-table-wrap"><table class="mon-table"><thead><tr><th>Time</th><th>Level</th><th>Category</th><th>Provider</th><th>Workflow</th><th>Trace</th><th>Entity</th><th>Message</th><th>Duration</th><th>Status</th></tr></thead><tbody>${rows}</tbody></table></div>`
+    ${l.items.length ? `<div class="mon-table-wrap" data-scroll-key="mon-logs"><table class="mon-table"><thead><tr><th>Time</th><th>Level</th><th>Category</th><th>Provider</th><th>Workflow</th><th>Trace</th><th>Entity</th><th>Message</th><th>Duration</th><th>Status</th></tr></thead><tbody>${rows}</tbody></table></div>`
       : `<div style="padding:18px">${empty('No log entries', 'Events appear here when an external call fails or crawls, and after each scheduled job.')}</div>`}</section>`;
 }
 
@@ -501,6 +503,25 @@ function renderAdvisor() {
     <div class="box soft"><div class="small" style="line-height:1.55">${esc(r.summary)}</div>
       <div class="xs muted mt6">${source} · ${esc(fmtDay(r.time_range_start))} – ${esc(fmtDay(r.time_range_end))} · created ${esc(fmtDateTime(r.created_at))}${r.estimated_savings && r.estimated_savings !== 'unknown' ? ` · estimated savings ${esc(r.estimated_savings)}` : ''}</div></div>
     ${body || '<div class="small muted mt12">No recommendations: nothing in this period needs attention.</div>'}</section>`;
+}
+
+// Full prompt and response capture: off unless the account (or LLM_PROMPT_DEBUG on the server) turns it on.
+function monCaptureSwitch() {
+  const c = D.monCapture; if (!c) return '';
+  if (c.server_wide) return '<div class="xs muted mt6">Full prompts and responses are captured for every account (LLM_PROMPT_DEBUG is on).</div>';
+  return `<label class="check xs mt6" title="Stores the full prompt and response of each new request, redacted, for ${c.retention_days} days. They include your resume and job text."><input type="checkbox" data-act-change="mon-capture" data-on="${c.enabled ? '' : '1'}" ${c.enabled ? 'checked' : ''} ${isBusy('monCapture') ? 'disabled' : ''}>Capture full prompts and responses${c.enabled ? ` · kept ${c.retention_days} days` : ''}</label>`;
+}
+function monPayloads(x) {
+  if (!x.debug) {
+    const c = D.monCapture;
+    return `<div class="box soft"><div class="caps-sm mb4">INPUT AND OUTPUT</div><div class="small muted">The prompt and response were not captured for this request; only metadata and token counts were kept.</div>
+      ${c && !c.enabled && !c.server_wide ? `<div class="mt8">${btn('Capture them for new requests', 'mon-capture', { on: 1 }, 'sm')}</div>` : ''}</div>`;
+  }
+  const block = (title, text, open) => `<details ${open ? 'open' : ''}><summary class="small b row between"><span>${title} <span class="faint" style="font-weight:400">· ${(text || '').length.toLocaleString()} characters</span></span></summary>
+    <div class="row mt6" style="justify-content:flex-end">${btn('Copy', 'mon-copy', {}, 'sm')}</div><pre class="mon-debug">${esc(text || '(empty)')}</pre></details>`;
+  return `<div class="col gap10"><div class="caps-sm">INPUT AND OUTPUT <span class="faint" style="font-weight:400">· redacted: keys and tokens are masked</span></div>
+    ${block('Input · the full prompt sent (system, then user message)', x.debug.prompt, x.status === 'FAILED')}
+    ${block('Output · the model’s response as received', x.debug.response || (x.status === 'FAILED' ? 'No response was received.' : ''), true)}</div>`;
 }
 
 function renderMonRequestModal() {
@@ -532,7 +553,9 @@ function renderMonRequestModal() {
       </div>
       ${breakdown.length ? `<div><div class="caps-sm mb8">Estimated context by source</div>${monBars(breakdown, b => b.v, b => `${monTokens(b.v)} tokens`, b => `${b._label}: ${b.v.toLocaleString()} estimated tokens`, { labelWidth: 130, valueWidth: 96 })}</div>` : ''}
       ${x.error_message ? `<div class="box bad"><div class="xs b mb4" style="color:var(--bad)">ERROR</div><div class="small mono" style="white-space:pre-wrap;word-break:break-word">${esc(x.error_message)}</div></div>` : ''}
-      ${x.debug ? `<details><summary class="small b">Prompt debugging (stored because LLM_PROMPT_DEBUG is on)</summary><pre class="mon-debug">${esc(x.debug.prompt || '')}</pre><pre class="mon-debug">${esc(x.debug.response || '')}</pre></details>` : '<div class="xs faint">Prompt and response text are not stored. Only metadata and token counts are kept.</div>'}
+      ${x.trace_id ? `<div class="box soft row between wrap gap10"><div><div class="caps-sm">LOGS</div><div class="small mt4">${x.trace_log_count ? `${x.trace_log_count} log line${x.trace_log_count === 1 ? '' : 's'} written by the same run (trace <span class="mono">${esc(x.trace_id.slice(0, 12))}</span>)` : 'No log lines were written by this run'}</div></div>
+        ${x.trace_log_count ? btn('View logs', 'mon-logs-trace', { id: x.trace_id }, 'sm') : ''}</div>` : ''}
+      ${monPayloads(x)}
     </div>
     <div class="card-foot row gap8" style="justify-content:flex-end">${x.entity?.job_id ? btn('Open job', 'mon-open-job', { id: x.entity.job_id }) : ''}${btn('Close', 'mon-close')}</div></div></div>`;
 }
@@ -589,9 +612,12 @@ function renderMonLogModal() {
       ${call ? `<div class="box soft"><div class="caps-sm mb8">The call it describes</div>
         <div class="small">${esc(call.provider)} ${esc(call.http_method || '')} ${esc(call.endpoint_host || '')}${esc(call.endpoint_path || '')} · ${call.http_status_code ?? '—'} · ${monMs(call.latency_ms)}</div>
         <div class="mt8">${btn('Open the call', 'mon-ext-request', { id: call.id }, 'sm')}</div></div>` : ''}
+      ${x.llm_requests?.length ? `<div class="box soft"><div class="caps-sm mb8">LLM request${x.llm_requests.length === 1 ? '' : 's'} behind this line</div>
+        ${x.llm_requests.map(q => `<div class="row between gap10 small" style="padding:3px 0"><span class="ellipsis">${esc(monStage(q.stage))} · ${esc(q.model || '—')} · ${esc(q.status.toLowerCase())}${q.captured ? ' · prompt and response captured' : ''}</span>${btn('Open request', 'mon-log-request', { id: q.id }, 'sm')}</div>`).join('')}</div>` : ''}
+      ${x.llm_requests?.length === 1 ? monPayloads({ status: x.llm_requests[0].status, debug: x.llm_requests[0].payload }) : ''}
       ${details.length ? `<div><div class="caps-sm mb8">Details</div><div class="mon-kv-grid">${details.map(([k, v]) => row(k.replace(/_/g, ' '), esc(typeof v === 'object' ? JSON.stringify(v) : String(v)))).join('')}</div></div>` : ''}
       ${x.related?.length ? `<div><div class="caps-sm mb8">Same trace</div>${x.related.map(r => `<div class="row between gap10 small" style="padding:3px 0"><span class="ellipsis">${esc(r.message)}</span><span class="xs faint none">${esc(fmtDateTime(r.created_at))}</span></div>`).join('')}</div>` : ''}
-      <div class="xs faint">Messages and details are redacted before they are stored: no credentials, headers or payloads.</div>
+      <div class="xs faint">Messages and details are redacted before they are stored: no credentials or headers. Prompts and responses are kept only while capture is on.</div>
     </div>
     <div class="card-foot row gap8" style="justify-content:flex-end">${btn('Close', 'mon-close')}</div></div></div>`;
 }
@@ -639,7 +665,7 @@ const MONITORING_ACTIONS = {
     render();
   },
   'mon-log-filter': el => { monState().logs[el.dataset.key] = el.value; monState().logs.page = 1; load(); },
-  'mon-log-reset': () => { Object.assign(monState().logs, { category: '', level: '', provider: '', workflow: '', search: '', page: 1 }); load(); },
+  'mon-log-reset': () => { Object.assign(monState().logs, { category: '', level: '', provider: '', workflow: '', search: '', trace_id: '', page: 1 }); load(); },
   'mon-log-page': el => { const l = monState().logs; l.page = Math.max(1, l.page + Number(el.dataset.dir)); load(); },
   'mon-log': async el => {
     const m = monState(); m.logs.entry = Number(el.dataset.id); D.monLog = null; render();
@@ -648,6 +674,20 @@ const MONITORING_ACTIONS = {
     render();
   },
   'mon-open-job': el => { monState().request = null; openJob(el.dataset.id); },
+  // From an LLM request to the log lines its run wrote, and back.
+  'mon-logs-trace': el => {
+    const m = monState();
+    m.request = null; D.monRequest = null;
+    Object.assign(m.logs, { category: '', level: '', provider: '', workflow: '', search: '', trace_id: el.dataset.id, page: 1, entry: null });
+    m.tab = 'logs'; load();
+  },
+  'mon-log-clear-trace': () => { Object.assign(monState().logs, { trace_id: '', page: 1 }); load(); },
+  'mon-log-request': el => { monState().logs.entry = null; MONITORING_ACTIONS['mon-request'](el); },
+  'mon-capture': el => busy('monCapture', async () => {
+    D.monCapture = await api('/api/monitoring/capture', { method: 'PUT', body: { enabled: !!el.dataset.on } });
+    return D.monCapture;
+  }, c => c.enabled ? 'New LLM requests keep their full prompt and response' : 'Capture off: new requests keep metadata only'),
+  'mon-copy': el => copyText(el.closest('details')?.querySelector('pre')?.textContent || ''),
   'mon-analyze': () => busy('monAnalyze', async () => {
     await api('/api/monitoring/analyze', { method: 'POST', body: { range: monState().range === 'today' ? 'today' : monState().range } });
     await loadMonitoring();

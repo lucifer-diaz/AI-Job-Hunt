@@ -10,6 +10,8 @@ the issue is listed for review (GET /api/evidence/diagnostics).
 
     EVIDENCE_COMPANY_MISMATCH   ERROR    the evidence's company is not the employer of its source role
     EVIDENCE_ROLE_MISMATCH      ERROR    the evidence's role is not the title of its source role
+    CLAIM_UNDER_OTHER_EMPLOYER  ERROR    manual or extracted evidence stating a bullet the active resume places at a
+                                         different employer
     MISSING_SOURCE_RESUME       WARNING  resume evidence whose resume no longer exists
     MISSING_SOURCE_ITEM         WARNING  the source resume no longer has the item it came from
     UNKNOWN_EMPLOYER            WARNING  manual or extracted evidence naming an employer no verified role has
@@ -62,10 +64,17 @@ def diagnose(db: Session, user_id: int, *, verified_only: bool = True) -> list[P
     if verified_only:
         query = query.where(Evidence.verified.is_(True))
     rows = db.scalars(query.order_by(Evidence.id)).all()
+    from app.services.context_builder import same_claim
+
     resumes: dict[int, Resume | None] = {}
     employers: set[str] = set()
+    bullets: list[tuple[str, dict[str, Any]]] = []  # (bullet text, its role) in the active resume
     for resume in db.scalars(select(Resume).where(Resume.user_id == user_id)).all():
         employers |= {_norm(r.get("company")) for r in _roles(resume.structured_data) if r.get("company")}
+        if resume.is_active:
+            bullets = [(b["text"], role) for role in _roles(resume.structured_data)
+                       for kind in ("achievements", "responsibilities") for b in role.get(kind) or []
+                       if isinstance(b, dict) and b.get("text")]
     issues: list[ProvenanceIssue] = []
     for item in rows:
         said = {"company": item.company or "", "role": item.role or ""}
@@ -92,6 +101,12 @@ def diagnose(db: Session, user_id: int, *, verified_only: bool = True) -> list[P
                 issues.append(ProvenanceIssue(item.id, "EVIDENCE_ROLE_MISMATCH", ERROR,
                                               f"Filed under the role {item.role!r}, but its source role is "
                                               f"{source['role']!r}", said, source))
+        elif (twin := next((role for text, role in bullets if same_claim(item.claim, text)
+                            and not same_name(item.company, role.get("company"))), None)) is not None:
+            source = {"company": twin.get("company") or "", "role": twin.get("job_title") or ""}
+            issues.append(ProvenanceIssue(item.id, "CLAIM_UNDER_OTHER_EMPLOYER", ERROR,
+                                          f"Filed under {item.company!r}, but your resume states this at "
+                                          f"{source['company']!r}", said, source))
         elif item.company and employers and _norm(item.company) not in employers \
                 and not any(same_name(item.company, e) for e in employers):
             issues.append(ProvenanceIssue(item.id, "UNKNOWN_EMPLOYER", WARNING,

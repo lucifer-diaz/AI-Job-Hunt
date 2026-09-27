@@ -44,6 +44,14 @@ context builder → prompt builder → LLM gateway → output contract → evide
   CandidateProfile, search or scraper settings (`candidate_preferences` removes them), or a raw document when a
   structured version exists (raw text is for parsing, auditing and fallback).
 - Filter by CandidatePolicy before the prompt: unverified and rejected facts are removed unless the policy allows them.
+- Send each fact once. The verified resume (experience and projects) is the single source of candidate facts: each
+  bullet carries one `id`, the evidence row created from it, which is what a model cites. Evidence created from the
+  resume is never listed again, and evidence repeating any resume bullet drops out, so VERIFIED EVIDENCE holds only
+  verified facts that are not on the resume (and is not sent when there are none). Evidence goes to a prompt as
+  `{id, company, role, claim}` only.
+- Trust follows verification: verified facts are application data (`section()`); only unverified or rejected resume
+  text, and external text, go through `untrusted()`. A raw posting is sent as the job context's cleaned copy
+  (`posting_text`: repeats and legal boilerplate removed).
 - Never send an empty placeholder for another worker's output. If an upstream result is missing, raise
   `ContextError` (`RANKING_REQUIRED`, `TAILOR_CONTEXT_INCOMPLETE`, ...) and do not call the model.
 - Validate input consistency first (`validate_tailoring_context`): ids unique and valid, the FitAnalysis belongs to

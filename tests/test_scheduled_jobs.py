@@ -233,6 +233,57 @@ def test_apify_sync_imports_each_finished_run_once_with_the_owners_token(sqlite_
     assert second["checked"] == 0 and len(second["errors"]) == 1  # the finished run is not imported again
 
 
+def test_a_run_apify_refuses_is_given_up_on_instead_of_checked_forever(sqlite_sessions, monkeypatch):
+    """Regression: runs started with another Apify token answered 403 on every check, and were checked every five
+    minutes for days. A 403 or 404 now ends the run, with the reason, after one check."""
+    import httpx
+
+    from app.services import sources
+
+    account = make_user(sqlite_sessions)
+    with sqlite_sessions() as db:
+        set_user_keys(db, {"apify": "apify_api_account"}, user_id=account)
+        db.add_all([SearchRun(user_id=account, provider="apify", external_run_id="forbidden", actor_id="a/b",
+                              status="RUNNING"),
+                    SearchRun(user_id=account, provider="apify", external_run_id="flaky", actor_id="a/b",
+                              status="RUNNING")])
+        db.commit()
+    calls = []
+
+    def fake_get(path, params=None, token=None, **kw):
+        calls.append(path)
+        code = 403 if "forbidden" in path else 500
+        request = httpx.Request("GET", f"https://api.apify.com/v2{path}")
+        raise httpx.HTTPStatusError("refused", request=request, response=httpx.Response(code, request=request))
+
+    monkeypatch.setattr(sources, "apify_get", fake_get)
+    first = sj.apify_sync(ctx(sqlite_sessions))
+    assert first["gave_up"] == 1 and len(first["errors"]) == 1, "a 500 may clear up; a 403 will not"
+    with sqlite_sessions() as db:
+        gone = db.scalar(select(SearchRun).where(SearchRun.external_run_id == "forbidden"))
+        assert gone.completed_at is not None and gone.status == "FAILED" and "HTTP 403" in gone.error
+    calls.clear()
+    sj.apify_sync(ctx(sqlite_sessions))
+    assert calls == ["/actor-runs/flaky"], "the refused run is not asked about again"
+
+
+def test_runs_too_old_to_still_be_running_are_no_longer_checked(sqlite_sessions, monkeypatch):
+    from datetime import timedelta
+
+    account = make_user(sqlite_sessions)
+    with sqlite_sessions() as db:
+        set_user_keys(db, {"apify": "apify_api_account"}, user_id=account)
+        db.add(SearchRun(user_id=account, provider="apify", external_run_id="ancient", actor_id="a/b",
+                         status="RUNNING", created_at=utcnow() - timedelta(days=9)))
+        db.commit()
+    monkeypatch.setattr(sj, "refresh_apify_run", lambda db, run: pytest.fail("an ancient run is not checked"))
+    out = sj.apify_sync(ctx(sqlite_sessions))
+    assert out["gave_up"] == 1 and out["checked"] == 0
+    with sqlite_sessions() as db:
+        run = db.scalar(select(SearchRun).where(SearchRun.external_run_id == "ancient"))
+        assert run.completed_at is not None and "no longer checked" in run.error
+
+
 def test_follow_ups_run_per_account_and_reports(sqlite_sessions, monkeypatch):
     account = make_user(sqlite_sessions)
     add_jobs(sqlite_sessions, 2, account)

@@ -52,13 +52,23 @@ from app.prompts.common import candidate_preferences, job_facts, profile_facts
 from app.services import job_context as jc
 from app.services import resume_verification as rv
 from app.services import structured_resume as sr
+from app.services.job_description import normalize_description
 from app.services.llm_telemetry import estimate_tokens
 from app.services.resume_format import parse_resume
 from app.services.user_settings import candidate_policy
 
+# v3: one copy of each fact. The resume (experience and projects) is the single source: each bullet carries one id,
+# the evidence row created from it, and evidence created from the resume is never listed again as evidence. The
+# evidence list holds only verified facts that are not on the resume; copies of resume bullets drop out, and
+# near-identical items collapse to one. Evidence is sent as {id, company, role, claim}.
 # v2: task-specific projections (no search configuration), the Tailor's canonical source resume with evidence ids per
 # bullet, the completed-FitAnalysis gate, provenance exclusion and pre-prompt consistency checks.
-CONTEXT_BUILDER_VERSION = "v2"
+CONTEXT_BUILDER_VERSION = "v3"
+# Two texts state the same fact when this share of their distinctive words overlaps (Jaccard).
+SAME_CLAIM = 0.6
+BULLET_KINDS = {"achievements": "achievement", "responsibilities": "responsibility"}
+MAX_PROJECTS = 3
+BULLETS_PER_PROJECT = 3
 VERIFIED_ONLY = ("VERIFIED",)
 WITH_UNVERIFIED = ("VERIFIED", "UNVERIFIED", "EDITED")
 THEMES = {
@@ -121,6 +131,7 @@ class TaskContext:
     candidate: dict[str, Any]
     resume: dict[str, Any]
     relevant_experience: list[dict[str, Any]] = field(default_factory=list)
+    relevant_projects: list[dict[str, Any]] = field(default_factory=list)
     relevant_skills: list[str] = field(default_factory=list)
     relevant_evidence: list[dict[str, Any]] = field(default_factory=list)
     unverified_facts: list[dict[str, Any]] = field(default_factory=list)
@@ -147,7 +158,10 @@ class TaskContext:
 
     @property
     def evidence_ids(self) -> set[int]:
-        return {item["id"] for item in self.relevant_evidence}
+        """Every evidence id this context lets a model cite: the evidence list and the ids on verified bullets."""
+        return {item["id"] for item in self.relevant_evidence} | {
+            i for unit in [*self.relevant_experience, *self.relevant_projects] for bullet in unit.get("bullets") or []
+            for i in bullet.get("evidence_ids") or []}
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -234,7 +248,7 @@ def _select_experience(data: dict[str, Any], terms: JobTerms, allowed: tuple[str
         bullets = []
         for _, trusted, bullet, kind in chosen:
             if trusted:
-                bullets.append({"id": bullet["id"], "text": bullet["text"], "type": kind.removesuffix("s")})
+                bullets.append({"id": bullet["id"], "text": bullet["text"], "type": BULLET_KINDS[kind]})
             else:
                 unverified.append({"id": bullet["id"], "text": bullet["text"], "role": role.get("job_title") or "",
                                    "company": role.get("company") or "", "status": _status(bullet)})
@@ -248,6 +262,31 @@ def _select_experience(data: dict[str, Any], terms: JobTerms, allowed: tuple[str
     return roles, unverified
 
 
+def _select_projects(data: dict[str, Any], terms: JobTerms, allowed: tuple[str, ...]) -> list[dict[str, Any]]:
+    """Resume projects related to the posting, with their related verified bullets. Projects are resume facts like
+    roles; they used to reach prompts only as evidence rows."""
+    scored = []
+    for project in data.get("projects") or []:
+        if _status(project) == "REJECTED" or _status(project) not in allowed:
+            continue
+        bullets = []
+        for kind in ("achievements", "responsibilities"):
+            for bullet in project.get(kind) or []:
+                verified = _status(bullet) == "VERIFIED" and _status(project) == "VERIFIED"
+                if verified or (allowed != VERIFIED_ONLY and _status(bullet) in allowed):
+                    bullets.append((terms.score(bullet["text"]), bullet))
+        header = " ".join([project.get("name") or "", project.get("description") or "",
+                           " ".join(project.get("technologies") or [])])
+        score = terms.score(header) + sum(points for points, _ in bullets)
+        chosen = [b for points, b in sorted(bullets, key=lambda pair: -pair[0]) if points > 0][:BULLETS_PER_PROJECT]
+        if score > 0 and (chosen or bullets):
+            scored.append((score, {"id": project.get("id"), "name": project.get("name") or "",
+                                   "technologies": project.get("technologies") or [],
+                                   "bullets": [{"id": b["id"], "text": b["text"]}
+                                               for b in (chosen or [bullets[0][1]])]}))
+    return [project for _, project in sorted(scored, key=lambda pair: -pair[0])[:MAX_PROJECTS]]
+
+
 def _select_skills(data: dict[str, Any], terms: JobTerms, allowed: tuple[str, ...]) -> list[str]:
     names = [s["name"] for s in data.get("skills") or [] if _status(s) in allowed]
     matched = sr._mentions(terms.text, names)
@@ -255,21 +294,65 @@ def _select_skills(data: dict[str, Any], terms: JobTerms, allowed: tuple[str, ..
 
 
 def select_evidence(db: Session, user_id: int, terms: JobTerms, limit: int,
-                    exclude: set[int] | frozenset[int] = frozenset()) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+                    exclude: set[int] | frozenset[int] = frozenset(), resume_items: set[str] | frozenset[str] = frozenset()
+                    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """(relevant verified evidence, all verified evidence). Evidence never comes from rejected or unverified data;
-    `exclude` holds ids generation must not use (provenance conflicts)."""
+    `exclude` holds ids generation must not use (provenance conflicts). Evidence created from one of `resume_items`
+    is the resume itself: the context carries it as that item's bullet, so it is not selected again here."""
     rows = [e for e in db.scalars(select(Evidence).where(Evidence.user_id == user_id, Evidence.verified.is_(True))
-                                  .order_by(Evidence.id)).all() if e.id not in exclude]
+                                  .order_by(Evidence.id)).all()
+            if e.id not in exclude and not (e.source == "resume" and e.structured_item_id in resume_items)]
     every = [{"id": e.id, "company": e.company, "role": e.role, "claim": e.claim, "context": e.context,
               "skills": e.skills or [], "tags": e.tags or []} for e in rows]
     scored = [(terms.score(" ".join([e["claim"], e["context"], e["role"], " ".join(e["skills"]), " ".join(e["tags"])])), e)
               for e in every]
     chosen = [e for score, e in sorted(scored, key=lambda p: (-p[0], p[1]["id"])) if score > 0][:max(0, limit)]
-    return sorted(chosen, key=lambda e: e["id"]), every
+    # What a prompt receives: the claim and where it happened. Skills and tags were only used for relevance above
+    # (and are often attached loosely), the context is provenance text such as "Verified from resume v2".
+    projected = [{k: e[k] for k in ("id", "company", "role", "claim") if e[k]} | {"id": e["id"]} for e in chosen]
+    return sorted(projected, key=lambda e: e["id"]), every
+
+
+def same_claim(a: str, b: str) -> bool:
+    """Whether two texts state the same fact in different words (typos and small rewordings included)."""
+    left, right = tokens(a), tokens(b)
+    return bool(left and right) and len(left & right) / len(left | right) >= SAME_CLAIM
+
+
+def consolidate(db: Session, user_id: int, units: list[dict[str, Any]], evidence: list[dict[str, Any]],
+                exclude: set[int], resume_texts: list[str] | None = None) -> list[dict[str, Any]]:
+    """One copy of each fact. Each verified bullet (of a role or a project) gets the ids of the evidence behind it:
+    first the evidence created from it (its citation id), then evidence at the same employer stating the same thing.
+    Evidence a bullet states leaves the list, and evidence stating one fact twice collapses to the newest item.
+    Evidence repeating any other bullet of the resume (`resume_texts`, including bullets not selected for this job)
+    is resume data too and is dropped. Returns the evidence still to send: verified facts that are not on the resume."""
+    from app.services.evidence_provenance import same_name
+
+    item_evidence = _item_evidence(db, user_id, exclude)
+    covered: set[int] = set()
+    for unit in units:
+        for bullet in unit.get("bullets") or []:
+            own = item_evidence.get(bullet.get("id") or "", [])
+            merged = []
+            for item in evidence:
+                if same_claim(item["claim"], bullet["text"]):
+                    covered.add(item["id"])  # the bullet says it; a different employer is a provenance issue
+                    if same_name(item.get("company"), unit.get("company")) and item["id"] not in own:
+                        merged.append(item["id"])
+            bullet["evidence_ids"] = [*own, *sorted(merged)]
+            covered |= set(bullet["evidence_ids"])
+    covered |= {item["id"] for item in evidence
+                if any(same_claim(item["claim"], text) for text in resume_texts or [])}
+    kept: list[dict[str, Any]] = []
+    for item in sorted((e for e in evidence if e["id"] not in covered), key=lambda e: -e["id"]):
+        if not any(same_claim(item["claim"], other["claim"]) for other in kept):
+            kept.append(item)
+    return sorted(kept, key=lambda e: e["id"])
 
 
 def _reviewed_list(data: dict[str, Any], section: str, allowed: tuple[str, ...], fields: tuple[str, ...]) -> list[dict[str, Any]]:
-    return [{f: item.get(f) for f in fields if item.get(f)} | {"verified": _status(item) == "VERIFIED"}
+    """Education or certifications with the fields a prompt uses; "verified": false marks only what is not verified."""
+    return [{f: item.get(f) for f in fields if item.get(f)} | ({} if _status(item) == "VERIFIED" else {"verified": False})
             for item in data.get(section) or [] if _status(item) in allowed]
 
 
@@ -320,19 +403,26 @@ def _base(db: Session, profile: CandidateProfile, job: Job, task: str, allowed: 
     experience, unverified = _select_experience(data or {}, terms, allowed)
     candidate, unverified_summary = _candidate(profile, data or {}, allowed)
     held_back = excluded_ids(db, profile.user_id) if task in GENERATION_TASKS else {}
-    relevant, every = select_evidence(db, profile.user_id, terms, evidence_limit, exclude=set(held_back))
+    resume_items = {unit.item_id for unit in sr.iter_units(data or {})}
+    relevant, every = select_evidence(db, profile.user_id, terms, evidence_limit, exclude=set(held_back),
+                                      resume_items=resume_items)
+    projects = _select_projects(data or {}, terms, allowed)
     education_fields = ("degree", "field_of_study", "institution", "university", "grade", "end_date",
                         "raw_end_date")
     context = TaskContext(
         task=task, candidate=candidate,
         resume={"id": resume.id, "version": resume.version, "verification_status": resume.verification_status}
         if resume is not None else {},
-        relevant_experience=experience, relevant_skills=_select_skills(data or {}, terms, allowed),
+        relevant_experience=experience, relevant_projects=projects,
+        relevant_skills=_select_skills(data or {}, terms, allowed),
         relevant_evidence=relevant, unverified_facts=unverified_summary + unverified,
         education=_reviewed_list(data or {}, "education", allowed, education_fields),
         certifications=_reviewed_list(data or {}, "certifications", allowed, ("name", "issuer", "issue_date")),
         job={**job_facts(job), "id": getattr(job, "id", None)}, policy=policy,
         excluded_evidence=[{"id": i, "code": code} for i, code in sorted(held_back.items())])
+    resume_texts = [unit.node.get("text") or "" for unit in sr.iter_units(data or {}) if unit.kind == "bullet"]
+    context.relevant_evidence = consolidate(db, profile.user_id, [*context.relevant_experience, *projects],
+                                            context.relevant_evidence, set(held_back), resume_texts)
     if allowed == VERIFIED_ONLY:
         context.unverified_facts = []  # includes verified bullets of unverified roles: not trusted either
     return context, data or {}, every, resume
@@ -357,6 +447,10 @@ def _render(context: TaskContext) -> str:
     for role in context.relevant_experience:
         lines.append(" | ".join(filter(None, [role["job_title"], role["company"], role["location"], role["dates"]])))
         lines += [f"- {b['text']}" for b in role["bullets"]]
+        lines.append("")
+    for project in context.relevant_projects:
+        lines.append(f"Project: {project['name']}")
+        lines += [f"- {b['text']}" for b in project["bullets"]]
         lines.append("")
     if context.education:
         lines += ["Education", *[" | ".join(str(v) for k, v in e.items() if k != "verified") for e in context.education]]
@@ -405,6 +499,15 @@ def stored_fit_analysis(job: Job) -> dict[str, Any] | None:
     return job.fit_analysis or None
 
 
+def is_ranked(job: Job) -> bool:
+    """Whether the Ranker has completed a fit analysis for this job: the precondition for tailoring it."""
+    analysis = stored_fit_analysis(job)
+    return bool(analysis) and all(analysis.get(key) is not None for key in REQUIRED_FIT_FIELDS)
+
+
+RANKING_REQUIRED_REASON = "not ranked yet: rank it before tailoring"
+
+
 def completed_fit_analysis(db: Session, job: Job) -> dict[str, Any]:
     """The Ranker's completed FitAnalysis for this job, or ContextError. Checked, never padded with defaults."""
     analysis = stored_fit_analysis(job)
@@ -437,21 +540,26 @@ def _plain_lines(profile: CandidateProfile) -> list[dict[str, Any]]:
     from app.services.resume_format import to_plain
 
     lines = [line.strip(" -*\t") for line in to_plain(profile.master_resume or "").splitlines()]
-    return [{"text": line, "evidence_ids": []} for line in dict.fromkeys(lines) if len(line) > 20][:15]
+    return [{"text": line} for line in dict.fromkeys(lines) if len(line) > 20][:15]
 
 
 def source_resume(context: TaskContext, item_evidence: dict[str, list[int]],
                   highlights: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    """The Tailor's single view of the resume: every fact once, each bullet with the evidence ids behind it."""
+    """The Tailor's single view of the resume: every fact once, each bullet with the one id to cite for it (the
+    evidence row created from it). Projects are read-only context the summary may draw on."""
+    from app.prompts.common import bullet_facts, project_facts
+
     roles = []
     for role in context.roles:
         ids = role.get("bullet_ids") or [None] * len(role["bullets"])
+        cited = role.get("bullet_evidence_ids") or [None] * len(role["bullets"])
+        bullets = [{"text": text, "evidence_ids": evidence or item_evidence.get(item_id or "", [])}
+                   for text, item_id, evidence in zip(role["bullets"], ids, cited, strict=False)]
         roles.append({"role_index": role["role_index"], "title": role["title"], "company": role["company"],
-                      "dates": role["dates"],
-                      "bullets": [{"text": text, "evidence_ids": item_evidence.get(item_id or "", [])}
-                                  for text, item_id in zip(role["bullets"], ids, strict=False)]})
+                      "dates": role["dates"], "bullets": bullet_facts(bullets)})
     out: dict[str, Any] = {"summary": context.candidate.get("summary") or "", "skills": context.relevant_skills,
-                           "roles": roles, "highlights": [] if roles else (highlights or [])}
+                           "roles": roles, "projects": project_facts(context),
+                           "highlights": [] if roles else (highlights or [])}
     return {k: v for k, v in out.items() if v}
 
 
@@ -478,9 +586,20 @@ def build_tailoring_context(db: Session, profile: CandidateProfile, job: Job) ->
     Raises ContextError(RANKING_REQUIRED) without a completed FitAnalysis, UnverifiedResumeError without verified
     facts, and ContextError for inconsistent input — all before a prompt exists."""
     policy = candidate_policy(db, profile.user_id)
+    from_text = policy["resume_source"] == "master_text"
     allowed = WITH_UNVERIFIED if policy["allow_unverified_resume_facts"] else VERIFIED_ONLY
     analysis = completed_fit_analysis(db, job)
     context, data, every, resume = _base(db, profile, job, "tailoring", allowed, TAILOR_EVIDENCE)
+    if from_text:
+        # The candidate chose the master resume text as the source: its roles and bullets, used as written.
+        context.fit_analysis = analysis
+        context = _with_job(context, jc.build_tailoring_job_context(db, job))
+        context.roles = master_text_roles(profile)
+        context.resume_text = _render(context)
+        context.source_resume = source_resume(context, {}, None if context.roles else _plain_lines(profile))
+        validate_tailoring_context(context, len(parse_resume(profile.master_resume or "").roles))
+        _measure(context, profile.master_resume or "", every, job)
+        return context
     if not policy["allow_unverified_resume_facts"] and not has_verified_facts(data, every):
         raise UnverifiedResumeError(
             "Tailoring uses verified facts only. Verify your resume in Settings → Resume Data (or allow unverified "
@@ -561,7 +680,7 @@ def build_cover_letter_context(db: Session, profile: CandidateProfile, job: Job)
                          "name": context.candidate.get("name") or personal.get("full_name") or "",
                          "location": profile.location or personal.get("location") or "",
                          "work_authorization": profile.work_authorization or ""}
-    context.job = {**context.job, "description": job.description or "",
+    context.job = {**context.job, "description": jc.compact_posting(normalize_description(job.description or "")),
                    **{field: getattr(job, field) for field in ("remote_type", "job_type", "seniority", "experience")
                       if getattr(job, field, None)}}
     context.knowledge = select_knowledge(db, profile.user_id, job, job_terms(job))
@@ -610,34 +729,109 @@ def build_inbox_context(db: Session, user_id: int, limit: int = 40) -> list[dict
     return [{"application_id": r.id, "company": r.company, "role": r.title, "status": r.status} for r in rows]
 
 
-def master_roles(profile: CandidateProfile, data: dict[str, Any], selected: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Map selected structured roles onto the roles of the master resume as tailoring renders it (role_index)."""
+def map_roles(parsed: Any, experience: list[dict[str, Any]]) -> dict[str, int]:
+    """Structured role id → the index of the same role in the parsed master resume (what tailoring renders).
+
+    Both lists are in document order, so when they hold the same number of roles they are matched by position: a
+    corrected title ("SDE 3" where the text says "SDE 4") must not lose its role. Otherwise a role is matched by its
+    recorded source_role_index when that still names it, then by title and employer."""
     from app.services.workflow import _best_match
 
-    parsed = parse_resume(profile.master_resume or "")  # the same parse tailoring renders from
+    roles = [entry for entry in experience or [] if entry.get("id")]
     headers = [role.header for role in parsed.roles]
-    by_id = {role["id"]: role for role in data.get("experience") or []}
-    out, used = [], set()
-    for role in selected:
-        entry = by_id.get(role["id"], {})
+    if roles and len(roles) == len(headers):
+        return {entry["id"]: index for index, entry in enumerate(roles)}
+    out: dict[str, int] = {}
+    used: set[int] = set()
+    for entry in roles:
+        label = f"{entry.get('job_title') or ''} {entry.get('company') or ''}"
         index = entry.get("source_role_index")
-        label = f"{role['job_title']} {role['company']}"
         if not (isinstance(index, int) and 0 <= index < len(headers) and index not in used
                 and _best_match(label, [headers[index]])[1] >= 0.5):
-            match, score = _best_match(label, [h for i, h in enumerate(headers) if i not in used])
-            index = headers.index(match) if score >= 0.5 else None
-        if index is None:
+            remaining = [h for i, h in enumerate(headers) if i not in used]
+            match, score = _best_match(label, remaining) if remaining else (None, 0)
+            index = headers.index(match) if match is not None and score >= 0.5 else None
+        if index is not None:
+            used.add(index)
+            out[entry["id"]] = index
+    return out
+
+
+def _clean(value: Any) -> str:
+    return " ".join(str(value or "").split())
+
+
+def _corrected(verified: Any, written: str) -> str:
+    """The verified value when it really differs from what the master text says; a difference of punctuation or
+    case only ("Zendrive Inc" for "Zendrive Inc.") keeps the text as written."""
+    value = _clean(verified)
+    same = re.sub(r"[^a-z0-9]", "", value.lower()) == re.sub(r"[^a-z0-9]", "", (written or "").lower())
+    return written if not value or same else value
+
+
+def role_headings(db: Session, profile: CandidateProfile, parsed: Any | None = None) -> dict[int, dict[str, str]]:
+    """Verified corrections to role headings, by master resume role index: {"title", "company"}.
+
+    Only with the structured resume source: a title or employer the user verified in Resume Data replaces what the
+    master text says (location and dates stay as written). With resume_source "master_text" the text is used as is.
+    """
+    if candidate_policy(db, profile.user_id)["resume_source"] != "structured":
+        return {}
+    resume = rv.active_resume(db, profile, create=False)
+    data = (resume.structured_data if resume is not None else None) or {}
+    parsed = parsed or parse_resume(profile.master_resume or "")
+    experience = data.get("experience") or []
+    by_id = {entry.get("id"): entry for entry in experience}
+    out: dict[int, dict[str, str]] = {}
+    for role_id, index in map_roles(parsed, experience).items():
+        entry = by_id[role_id]
+        if _status(entry) != "VERIFIED":
+            continue
+        role = parsed.roles[index]
+        title, company = _corrected(entry.get("job_title"), role.title), _corrected(entry.get("company"), role.company)
+        if (title, company) != (role.title, role.company):
+            out[index] = {"title": title, "company": company}
+    return out
+
+
+def master_text_roles(profile: CandidateProfile) -> list[dict[str, Any]]:
+    """resume_source "master_text": every role of the master resume with its own heading and bullets, as written.
+    No bullet cites evidence; tailoring_results accepts a rewrite only when it closely restates a master bullet."""
+    parsed = parse_resume(profile.master_resume or "")
+    return [{"role_index": index, "title": role.title, "company": role.company, "dates": role.dates,
+             "bullets": [b for b in role.bullets if b.strip()], "bullet_ids": [], "bullet_evidence_ids": [],
+             "verified": False}
+            for index, role in enumerate(parsed.roles)]
+
+
+def master_roles(profile: CandidateProfile, data: dict[str, Any], selected: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Map selected structured roles onto the roles of the master resume as tailoring renders it (role_index).
+    Headings carry the user's verified corrections (role_headings)."""
+    parsed = parse_resume(profile.master_resume or "")  # the same parse tailoring renders from
+    by_id = {role["id"]: role for role in data.get("experience") or []}
+    mapping = map_roles(parsed, list(by_id.values()))
+    out, used = [], set()
+    for role in selected:
+        index = mapping.get(role["id"])
+        if index is None or index in used:
             continue
         used.add(index)
-        out.append({"role_index": index, "title": parsed.roles[index].title, "company": parsed.roles[index].company,
+        written = parsed.roles[index]
+        verified = bool(role.get("verified"))
+        out.append({"role_index": index,
+                    "title": _corrected(role.get("job_title"), written.title) if verified else written.title,
+                    "company": _corrected(role.get("company"), written.company) if verified else written.company,
                     "dates": parsed.roles[index].dates, "bullets": [b["text"] for b in role["bullets"]],
-                    "bullet_ids": [b.get("id") for b in role["bullets"]], "verified": role["verified"]})
+                    "bullet_ids": [b.get("id") for b in role["bullets"]],
+                    "bullet_evidence_ids": [b.get("evidence_ids") or [] for b in role["bullets"]],
+                    "verified": role["verified"]})
     return sorted(out, key=lambda r: r["role_index"])
 
 
 def latest_ranking_context_hash(context: TaskContext) -> dict[str, Any]:
     """The parts of a ranking context that should trigger a fresh ranking when they change."""
-    return {"experience": context.relevant_experience, "skills": context.relevant_skills,
+    return {"experience": context.relevant_experience, "projects": context.relevant_projects,
+            "skills": context.relevant_skills,
             "unverified": context.unverified_facts, "candidate": context.candidate.get("summary"),
             "resume": context.resume.get("verification_status"), "evidence": context.relevant_evidence}
 

@@ -214,7 +214,8 @@ def test_tailoring_context_holds_verified_relevant_facts_and_fit_analysis(user):
     assert "SOURCE RESUME:" in prompt.user and "Reliability impact" in prompt.user
     source = context.source_resume["roles"][0]["bullets"]
     assert [b["text"] for b in source] == bullets(context)
-    assert all(b["evidence_ids"] for b in source), "a verified bullet carries the evidence created from it"
+    assert all(isinstance(b.get("id"), int) for b in source), "a verified bullet carries one id: its evidence row"
+    assert set(source[0]) == {"id", "text"}
 
     review = build(user, cb.build_review_context, job_id)
     assert {f["text"] for f in review.rejected_facts} == {rejected["text"]}

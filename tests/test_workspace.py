@@ -10,7 +10,7 @@ from app.db import SessionLocal
 from app.main import app
 from app.models import Job, ResumeVariant, SearchRun
 from app.settings import get_settings
-from app.workspace import extract_job_posting
+from app.workspace import extract_job_posting, location_key
 
 client = TestClient(app)
 
@@ -25,11 +25,11 @@ def mock_llm(monkeypatch):
     monkeypatch.setattr(get_settings(), "llm_provider", "mock")
 
 
-def make_job(title="Lead AI Engineer", company=None):
+def make_job(title="Lead AI Engineer", company=None, location="Remote"):
     tag = uuid.uuid4().hex[:8]
     response = client.post("/api/jobs/from-url", json={
         "url": f"https://example.com/jobs/{tag}", "title": title, "company": company or f"Acme {tag}",
-        "location": "Remote", "description": POSTING})
+        "location": location, "description": POSTING})
     assert response.status_code == 200, response.text
     return response.json()["job"]
 
@@ -409,3 +409,83 @@ def test_interview_is_scheduled_in_its_time_zone_with_a_contact():
     # An offset-aware occurred_at is converted, not truncated.
     out = client.post(url, json={"kind": "note", "title": "Call", "occurred_at": "2026-09-16T16:00:00+05:30"}).json()
     assert any(e["at"] == "2026-09-16T10:30:00" for e in out["timeline"])
+
+
+def test_location_filters_group_by_city():
+    assert location_key("Bengaluru, Karnataka, India") == location_key("Bengaluru, India") == "Bengaluru"
+    assert location_key("Remote - India") == location_key("remote") == "Remote"
+    assert location_key("") == location_key(None) == "Not listed"
+
+
+def test_discovery_tailor_and_approvals_filter_by_location():
+    assert client.put("/api/profile", json={"name": "Test Candidate", "headline": "Engineer",
+                                            "master_resume": "Built Python FastAPI services at 10k rps"}).status_code == 200
+    tag = uuid.uuid4().hex[:8]
+    blr, blr2, ggn = (make_job(title=f"Engineer {tag} {n}", company=f"Place {tag} {n}", location=where)["id"]
+                      for n, where in enumerate(["Bengaluru, Karnataka, India", "Bengaluru, India", "Gurugram, India"]))
+
+    def search(**params):
+        out = client.get("/api/jobs/search", params={"q": tag, **params}).json()
+        return {r["id"] for r in out["items"]}, out
+
+    ids, out = search()
+    assert ids == {blr, blr2, ggn}
+    facets = dict(out["locations"])
+    assert facets["Bengaluru"] >= 2 and facets["Gurugram"] >= 1, "one option per city, with its count"
+    assert search(location="Bengaluru")[0] == {blr, blr2}
+    assert search(location="Gurugram")[0] == {ggn}
+
+    for job_id in (blr, blr2, ggn):
+        client.post(f"/api/jobs/{job_id}/triage", json={"action": "shortlist"})
+    tailor = client.get("/api/tailor/queue", params={"q": tag, "location": "Bengaluru", "with_facets": True}).json()
+    assert {r["id"] for r in tailor["items"]} == {blr, blr2} and "Gurugram" in dict(tailor["locations"])
+
+    assert client.post(f"/api/jobs/{ggn}/tailor").status_code == 200
+    assert client.post(f"/api/jobs/{blr}/tailor").status_code == 200
+    approvals = client.get("/api/approvals", params={"q": tag, "location": "Gurugram", "with_facets": True}).json()
+    assert [r["id"] for r in approvals["items"]] == [ggn]
+    assert {"Bengaluru", "Gurugram"} <= set(dict(approvals["locations"])), "options come from before filtering"
+
+
+def test_a_job_carries_its_posting_date_apart_from_when_it_was_found():
+    job = make_job()
+    detail = client.get(f"/api/jobs/{job['id']}").json()
+    assert detail["posted_at"] is None and detail["posted_raw"] is None, "unknown stays unknown, never the found date"
+    assert detail["posted"].endswith("ago"), "`posted` is still when it was found, for older screens"
+    with SessionLocal() as db:
+        row = db.get(Job, job["id"])
+        row.posted_at, row.posted_date_raw = datetime(2026, 9, 14), "2026-09-14"
+        db.commit()
+    detail = client.get(f"/api/jobs/{job['id']}").json()
+    assert detail["posted_at"].startswith("2026-09-14") and detail["posted_ago"].endswith("d ago")
+
+
+def test_discovery_filters_by_found_or_posted_date_and_hides_applied_jobs():
+    from app.models import Application
+
+    tag = uuid.uuid4().hex[:8]
+    fresh, old, never_posted, applied = (make_job(title=f"Engineer {tag} {n}", company=f"Dated {tag} {n}")["id"]
+                                         for n in range(4))
+    now = datetime.now(UTC).replace(tzinfo=None)
+    with SessionLocal() as db:
+        db.get(Job, fresh).posted_at = now - timedelta(hours=5)
+        stale = db.get(Job, old)
+        stale.discovered_at, stale.posted_at = now - timedelta(days=20), now - timedelta(days=40)
+        db.get(Job, applied).posted_at = now - timedelta(days=2)
+        db.get(Job, applied).status = "applied"
+        db.add(Application(job_id=applied, user_id=db.get(Job, applied).user_id, applied_at=now))
+        db.commit()
+
+    def ids(**params):
+        out = client.get("/api/jobs/search", params={"q": tag, "per_page": 200, **params}).json()
+        return {r["id"] for r in out["items"]}, out
+
+    everything, out = ids()
+    assert applied not in everything and out["applied_hidden"] >= 1, "applied jobs stay out of Discovery"
+    assert applied in ids(include_applied=True)[0] and applied in ids(stage="applied")[0]
+    assert ids(within="7d")[0] == {fresh, never_posted}, "found in the last 7 days"
+    assert ids(within="24h", date_field="posted")[0] == {fresh}, "a job without a posting date is never 'recent'"
+    assert ids(within="30d", date_field="posted")[0] == {fresh}, "posted 40 days ago is out"
+    assert client.get("/api/jobs/search", params={"within": "2y"}).status_code == 422
+    newest = client.get("/api/jobs/search", params={"q": tag, "sort": "posted", "include_applied": True}).json()
+    assert [r["id"] for r in newest["items"]][:3] == [fresh, applied, old], "newest posting first, undated last"

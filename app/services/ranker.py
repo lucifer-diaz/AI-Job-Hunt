@@ -47,6 +47,7 @@ from app.models import (
     JobRankingTask,
     ResumeDocument,
     ResumeVersion,
+    WorkflowTransition,
 )
 from app.prompts.contracts import RankingResult
 from app.prompts.ranking import (
@@ -69,6 +70,7 @@ from app.services.llm import (
     LLMResult,
     LLMTimeoutError,
 )
+from app.services.locations import location_facets, location_key
 from app.services.user_settings import ai_ready
 from app.services.work_queue import transition
 from app.settings import get_settings
@@ -268,6 +270,47 @@ def prepare(db: Session, job: Job, policy: RankingPolicy, *, actor: str, now: da
     return None
 
 
+REMOVED_BY_USER = "Removed from ranking by you"
+
+
+def removed_by_user(db: Session, job: Job) -> bool:
+    """True when the job is SKIPPED because the user took it out of the ranking queue (remove_from_ranking)."""
+    if job.state is not S.SKIPPED or job.previous_state not in (S.NORMALIZED, S.FILTERED, S.RANK_PENDING):
+        return False
+    reason = db.scalar(select(WorkflowTransition.reason).where(WorkflowTransition.job_id == job.id,
+                                                               WorkflowTransition.to_state == S.SKIPPED)
+                       .order_by(desc(WorkflowTransition.id)).limit(1))
+    return reason == REMOVED_BY_USER
+
+
+def remove_from_ranking(db: Session, job_ids: Iterable[int], *, actor: str,
+                        now: datetime | None = None) -> dict[str, Any]:
+    """Take jobs out of the ranking queue: their waiting task is cancelled and the job is SKIPPED, so no sweep
+    queues it again. Asking for a ranking later puts it back (queue_job). A job being ranked right now is left
+    alone — its model call is already running. Commits."""
+    now = now or utcnow()
+    removed, skipped = [], []
+    for job_id in dict.fromkeys(job_ids):
+        job = _lock_job(db, job_id, skip_locked=False)  # waits for a worker's claim to settle
+        if job is None:
+            skipped.append({"id": job_id, "reason": "not found"})
+            continue
+        if job.state is S.RANKING:
+            skipped.append({"id": job_id, "reason": "This job is being ranked right now"})
+            continue
+        if job.state not in (*PRE_RANK_STATES, S.RANK_PENDING):
+            skipped.append({"id": job_id, "reason": "This job is not waiting for a ranking"})
+            continue
+        for task in db.scalars(select(JobRankingTask).where(JobRankingTask.job_id == job.id,
+                                                            JobRankingTask.status == PENDING)).all():
+            _clear_lease(task)
+            task.status, task.completed_at, task.last_error = SKIPPED, now, REMOVED_BY_USER
+        transition(db, job, S.SKIPPED, actor=actor, reason=REMOVED_BY_USER, now=now)
+        removed.append(job_id)
+    db.commit()
+    return {"removed": removed, "skipped": skipped}
+
+
 def reopen_for_description(db: Session, job: Job, *, actor: str = "ranker", now: datetime | None = None) -> bool:
     """Put a job skipped for want of a description back in the queue now that it has one. Does not commit."""
     if job.state is not S.SKIPPED or job.previous_state is not S.NORMALIZED or missing_description(job):
@@ -280,7 +323,8 @@ def reopen_for_description(db: Session, job: Job, *, actor: str = "ranker", now:
 # ───────────── queueing ─────────────
 
 RERANK_REASONS = {"user_request": "Re-ranking requested by the user", "profile_changed": "Candidate profile changed",
-                  "resume_changed": "Active resume changed", "prompt_changed": "Ranking prompt version changed"}
+                  "resume_changed": "Active resume changed", "prompt_changed": "Ranking prompt version changed",
+                  "description_changed": "Job description added or changed"}
 
 
 def enqueue(db: Session, job: Job, *, reason: str = "new", force: bool = False,
@@ -305,6 +349,10 @@ def queue_job(db: Session, job: Job, *, policy: RankingPolicy, actor: str, reaso
               now: datetime | None = None) -> str | None:
     """Put one job in line for the ranker. Returns None when queued, otherwise why not. Does not commit."""
     state = job.state
+    if state not in PRE_RANK_STATES and state is not S.RANKING and missing_description(job):
+        # prepare() holds back a first ranking; this holds back every later one. Nothing changes state: the job
+        # keeps what it has until a description arrives (app.workspace.save_job_description).
+        return NO_DESCRIPTION
     if state in PRE_RANK_STATES:
         skipped = prepare(db, job, policy, actor=actor, now=now)
         if skipped:
@@ -319,6 +367,12 @@ def queue_job(db: Session, job: Job, *, policy: RankingPolicy, actor: str, reaso
         job.attempt_count, job.retryable, job.next_attempt_at = 0, None, None
     elif state is S.RANKING:
         return "This job is being ranked right now"
+    elif state is S.SKIPPED and removed_by_user(db, job):
+        # Taken out of the queue earlier and asked for again: it goes back through the filters like a new job.
+        transition(db, job, S.NORMALIZED, actor=actor, reason="Ranking asked for again", now=now)
+        skipped = prepare(db, job, policy, actor=actor, now=now)
+        if skipped:
+            return skipped
     elif state is not S.RANK_PENDING:
         return f"This job is {state.value.replace('_', ' ').lower()}; ranking can no longer change it"
     if job.state is S.FILTERED:
@@ -386,7 +440,11 @@ def auto_rank_on(db: Session, user_id: int) -> bool:
 
 
 def accounts(db: Session, now: datetime | None = None) -> tuple[list[int], list[int], dict[str, int]]:
-    """Accounts with waiting tasks: those that can be ranked, those with auto-ranking on, and why others wait."""
+    """Accounts with waiting tasks: those that can be ranked at all (`ready`: their user-requested tasks run now),
+    those whose automatic ranking may run now (`auto`: auto-ranking on and their cadence due), and why others wait.
+
+    The cadence (Settings → Workflow & cadence) paces automatic ranking only. A ranking the user asked for is never
+    held back by it: claim() takes forced tasks from every ready account."""
     owners = db.scalars(select(JobRankingTask.user_id).where(JobRankingTask.status == PENDING).distinct()).all()
     ready, auto, waiting = [], [], Counter()
     for user_id in sorted(owners):
@@ -394,20 +452,21 @@ def accounts(db: Session, now: datetime | None = None) -> tuple[list[int], list[
         if problem:
             waiting[problem] += 1
             continue
-        if next_run_at(db, user_id, now=now) is not None:
-            waiting["Waiting for this account's next ranking run"] += 1
-            continue
         ready.append(user_id)
-        if auto_rank_on(db, user_id):
-            auto.append(user_id)
-        else:
+        if not auto_rank_on(db, user_id):
             waiting["Auto-ranking is off (only rankings you request run)"] += 1
+        elif next_run_at(db, user_id, now=now) is not None:
+            waiting["Waiting for this account's next ranking run"] += 1
+        else:
+            auto.append(user_id)
     return ready, auto, dict(waiting)
 
 
 def last_ranking_start(db: Session, user_id: int) -> datetime | None:
-    """When this account last started ranking something."""
-    return db.scalar(select(func.max(JobRankingTask.started_at)).where(JobRankingTask.user_id == user_id))
+    """When this account's automatic ranking last started. Rankings the user asked for do not count: running one
+    must not push the next automatic run back by a whole cadence."""
+    return db.scalar(select(func.max(JobRankingTask.started_at)).where(JobRankingTask.user_id == user_id,
+                                                                      JobRankingTask.force.is_(False)))
 
 
 def next_run_at(db: Session, user_id: int, now: datetime | None = None) -> datetime | None:
@@ -498,7 +557,9 @@ def validate_output(data: Any, job_id: int, verified_ids: set[int]) -> tuple[Ran
         problems = "; ".join(f"{'.'.join(str(p) for p in error['loc']) or 'output'}: {error['msg']}"
                              for error in exc.errors()[:5])
         raise RankingSchemaError(f"Ranking output failed validation: {problems}") from exc
-    if output.job_id != job_id:
+    if output.job_id is None:
+        output.job_id = job_id  # the application knows which job it asked about
+    elif output.job_id != job_id:
         raise RankingSchemaError(f"Ranking output is for job {output.job_id}, not job {job_id}")
     cited = list(dict.fromkeys(output.relevant_evidence_ids))
     output.relevant_evidence_ids = [i for i in cited if i in verified_ids]
@@ -856,6 +917,8 @@ def _process(db: Session, claimed: TaskClaim, clock: Callable[[], datetime]) -> 
         else resume_problem(profile.master_resume)
     if problem:
         return _wait(db, claimed, problem, clock())
+    if missing_description(job):  # queued before the gate existed, or the text was removed since: never score a title
+        return _wait(db, claimed, NO_DESCRIPTION, clock())
     waiting = job_description.waiting_reason(db, job)
     if waiting:  # the posting is being parsed into requirements; the task waits without using an attempt
         return _wait(db, claimed, waiting, clock())
@@ -875,7 +938,8 @@ def _process(db: Session, claimed: TaskClaim, clock: Callable[[], datetime]) -> 
         job_hash=_hash({**posting_facts(job), "description": job.description or "",
                         "structured": job.structured_description_hash,
                         "requirements": context.job_context.get("required", []) + context.job_context.get("preferred", [])}),
-        verified_ids=frozenset(item["id"] for item in evidence), policy=policy_for(db, claimed.user_id))
+        # Citable: the evidence list and the evidence behind each verified bullet (app.services.context_builder).
+        verified_ids=frozenset(context.evidence_ids), policy=policy_for(db, claimed.user_id))
     if not claimed.force:
         existing = _identical(db, job.id, inputs)
         if existing is not None:  # the same inputs were already ranked: no second model call
@@ -966,7 +1030,7 @@ def _queue_stale(db: Session, now: datetime, limit: int) -> int:
         if reason is None:
             continue
         job = _lock_job(db, job_id)
-        if job is None or job.state is not S.QUALIFIED:
+        if job is None or job.state is not S.QUALIFIED or missing_description(job):
             db.rollback()
             continue
         transition(db, job, S.RANK_PENDING, actor="ranker", reason=RERANK_REASONS[reason], now=now)
@@ -1081,6 +1145,7 @@ def ranking_dict(ranking: JobRanking) -> dict[str, Any]:
 
 TRACKER_WINDOW = timedelta(hours=24)
 TRACKER_LIMIT = 200
+TRACKER_SCAN_LIMIT = 5000  # rows read when the tracker is filtered, so a match past the first page is still found
 
 
 def _typical_ranking_seconds(db: Session, user_id: int, since: datetime) -> int | None:
@@ -1105,7 +1170,8 @@ RANKING_CEILING = 95  # a running ranking never shows as finished until it is
 
 
 def _with_progress(task: dict[str, Any], place: int, *, now: datetime, concurrency: int,
-                   typical_seconds: int | None) -> dict[str, Any]:
+                   typical_seconds: int | None, automatic_due: datetime | None = None,
+                   auto_rank: bool = True) -> dict[str, Any]:
     """Where this task is in the queue, how far along it is, and when it should start.
 
     The estimate only exists once this account has finished some rankings: with nothing measured, `eta_seconds`
@@ -1130,6 +1196,13 @@ def _with_progress(task: dict[str, Any], place: int, *, now: datetime, concurren
         eta = round((place // max(1, concurrency)) * typical_seconds)
     elif retrying:
         eta = max(0, round((_parse(task["next_attempt_at"]) - now).total_seconds()))
+    if not running and not retrying and not task["force"]:
+        # Automatic rankings follow the account's cadence and its auto-ranking switch; requested ones do not.
+        if not auto_rank:
+            label, eta = "Waits: auto-ranking is off, so only rankings you ask for run", None
+        elif automatic_due is not None:
+            label = "Next automatic run"
+            eta = round((automatic_due - now).total_seconds()) + (eta or 0)
     return {**task, "queue_position": place + 1, "stage": stage, "stage_label": label,
             "percent": percent, "elapsed_seconds": None if elapsed is None else round(elapsed),
             "eta_seconds": eta}
@@ -1139,13 +1212,47 @@ def _parse(value: str) -> datetime:
     return datetime.fromisoformat(value)
 
 
-def tracker(db: Session, user_id: int, now: datetime | None = None) -> dict[str, Any]:
+TRACKER_PREFERENCES = "ranking_tracker"  # AppSetting.preferences[...]: {"finished_cleared_at": ISO time}
+
+
+def finished_cleared_at(db: Session, user_id: int) -> datetime | None:
+    """When the user last cleared the tracker's finished list, or None. Read-only."""
+    prefs = db.scalar(select(AppSetting.preferences).where(AppSetting.user_id == user_id)) or {}
+    value = (prefs.get(TRACKER_PREFERENCES) or {}).get("finished_cleared_at")
+    try:
+        return datetime.fromisoformat(value) if value else None
+    except ValueError:
+        return None
+
+
+def clear_finished(db: Session, user_id: int, *, clear: bool = True, now: datetime | None = None) -> None:
+    """Hide (or, with clear=False, show again) the tracker's finished rankings. Nothing is deleted: the tasks stay
+    the history behind each job's rankings and retries. Commits."""
+    row = user_settings.lock_settings_row(db, user_settings.settings_for(db, user_id))
+    prefs = dict(row.preferences or {})
+    tracker_prefs = {k: v for k, v in (prefs.get(TRACKER_PREFERENCES) or {}).items() if k != "finished_cleared_at"}
+    if clear:
+        tracker_prefs["finished_cleared_at"] = (now or utcnow()).isoformat()
+    row.preferences = {**prefs, TRACKER_PREFERENCES: tracker_prefs}
+    db.commit()
+
+
+def tracker(db: Session, user_id: int, now: datetime | None = None, *, q: str = "",
+            location: str = "all") -> dict[str, Any]:
     """Where the account's ranking work stands: waiting, running, retrying and finished in the last day.
 
     Only this account's tasks and jobs are read. `retried` marks a failed task that has a newer task for its job.
+    `q` (title, company or location) and `location` (a city, as app.workspace.location_key groups it) narrow the
+    lists, never the counts, and a job keeps its real place in the queue. `locations` lists the cities present
+    before filtering.
     """
+    needle, filtering = q.strip().lower(), bool(q.strip()) or location not in ("all", "")
     now = now or utcnow()
-    since = now - TRACKER_WINDOW
+    window = now - TRACKER_WINDOW
+    cleared_at = finished_cleared_at(db, user_id)
+    # The finished list (and its counts) start at the last "Clear", if that is within the window. Timing estimates
+    # still use the whole window: clearing the list does not make the ranker any faster.
+    since = max(window, cleared_at) if cleared_at else window
     count = lambda *where: db.scalar(select(func.count()).select_from(JobRankingTask).where(
         JobRankingTask.user_id == user_id, *where)) or 0
     active_where = JobRankingTask.status.in_(ACTIVE_RANKING_TASK_STATUSES)
@@ -1171,23 +1278,28 @@ def tracker(db: Session, user_id: int, now: datetime | None = None) -> dict[str,
         "skipped": count(JobRankingTask.status == SKIPPED, JobRankingTask.completed_at >= since),
     }
     rows = db.execute(
-        select(JobRankingTask, Job.title, Job.company, Job.state, JobRanking)
+        select(JobRankingTask, Job.title, Job.company, Job.state, JobRanking, Job.location)
         .join(Job, Job.id == JobRankingTask.job_id)
         .outerjoin(JobRanking, JobRanking.id == JobRankingTask.ranking_id)
         .where(JobRankingTask.user_id == user_id, or_(active_where, finished_where))
         .order_by(JobRankingTask.status.in_(ACTIVE_RANKING_TASK_STATUSES).desc(),
                   func.coalesce(JobRankingTask.completed_at, JobRankingTask.created_at).desc(), JobRankingTask.id.desc())
-        .limit(TRACKER_LIMIT * 2)).all()
+        .limit(TRACKER_SCAN_LIMIT if filtering else TRACKER_LIMIT * 2)).all()
     latest_task = dict(db.execute(select(JobRankingTask.job_id, func.max(JobRankingTask.id))
                                   .where(JobRankingTask.user_id == user_id,
                                          JobRankingTask.job_id.in_({row[0].job_id for row in rows}))
                                   .group_by(JobRankingTask.job_id)).all()) if rows else {}
 
-    def row_dict(task: JobRankingTask, title: str, company: str, state: S, ranking: JobRanking | None) -> dict[str, Any]:
-        return {**task_dict(task), "title": title, "company": company, "job_state": state.value,
+    def row_dict(task: JobRankingTask, title: str, company: str, state: S, ranking: JobRanking | None,
+                 where: str | None) -> dict[str, Any]:
+        return {**task_dict(task), "title": title, "company": company, "location": where or "",
+                "job_state": state.value,
                 "max_attempts": get_settings().ranking_max_attempts,
                 "lease_expires_at": _iso(task.lock_expires_at),
                 "retried": task.status == FAILED and latest_task.get(task.job_id, task.id) > task.id,
+                # Taken out of the queue by the user and not asked for since: the tracker offers to rank it again.
+                "removed": task.status == SKIPPED and task.last_error == REMOVED_BY_USER and state is S.SKIPPED
+                and latest_task.get(task.job_id, task.id) == task.id,
                 "ranking": None if ranking is None else {
                     "version": ranking.version, "overall_fit_score": ranking.overall_fit_score,
                     "candidate_fit_score": ranking.candidate_fit_score, "resume_fit_score": ranking.resume_fit_score,
@@ -1202,12 +1314,22 @@ def tracker(db: Session, user_id: int, now: datetime | None = None) -> dict[str,
 
     limits = user_settings.processing_limits(db, user_id)
     limit = limits["ranking_concurrency"]
-    typical = _typical_ranking_seconds(db, user_id, since)
-    active = [_with_progress(row_dict(*row), place, now=now, concurrency=limit, typical_seconds=typical)
+    typical = _typical_ranking_seconds(db, user_id, window)
+    def wanted(item: dict[str, Any]) -> bool:
+        return ((not needle or needle in f"{item['title']} {item['company']} {item['location']}".lower())
+                and (location in ("all", "") or location_key(item["location"]) == location))
+
+    # Places are counted over the whole queue first, so a filtered list still says where each job really stands.
+    automatic_due, auto_rank = next_run_at(db, user_id, now=now), auto_rank_on(db, user_id)
+    active = [_with_progress(row_dict(*row), place, now=now, concurrency=limit, typical_seconds=typical,
+                             automatic_due=automatic_due, auto_rank=auto_rank)
               for place, row in enumerate(sorted((row for row in rows if row[0].status in ACTIVE_RANKING_TASK_STATUSES),
-                                                 key=active_order))][:TRACKER_LIMIT]
-    recent = [row_dict(*row) for row in rows if row[0].status not in ACTIVE_RANKING_TASK_STATUSES][:TRACKER_LIMIT]
-    decisions = Counter(r["ranking"]["decision"] for r in recent if r["ranking"])
+                                                 key=active_order))]
+    recent = [row_dict(*row) for row in rows if row[0].status not in ACTIVE_RANKING_TASK_STATUSES]
+    locations = location_facets([item["location"] for item in {i["job_id"]: i for i in active + recent}.values()])
+    decisions = Counter(r["ranking"]["decision"] for r in recent[:TRACKER_LIMIT] if r["ranking"])
+    active = [item for item in active if wanted(item)][:TRACKER_LIMIT]
+    recent = [item for item in recent if wanted(item)][:TRACKER_LIMIT]
     in_flight = counts["queued"] + counts["retry_scheduled"] + counts["waiting"] + counts["processing"]
     finished = counts["completed"] + counts["failed"] + counts["skipped"]
     return {
@@ -1223,4 +1345,7 @@ def tracker(db: Session, user_id: int, now: datetime | None = None) -> dict[str,
         "in_flight": in_flight,
         "active": active,
         "recent": recent,
+        "locations": locations,
+        "filtered": filtering,
+        "finished_cleared_at": _iso(cleared_at) if cleared_at and cleared_at > window else None,
     }

@@ -98,6 +98,25 @@ class LLMSchemaError(LLMResponseError):
 MAX_SCHEMA_CORRECTIONS = 1
 
 
+def unwrap(contract: Any, data: Any) -> Any:
+    """An answer wrapped in one outer key ({"fit_analysis": {...}}, often the prompt's marker echoed back) is its
+    inner object — only when the whole answer fails the contract and that inner object passes it on its own.
+    Nothing is inferred. Anything else is returned unchanged."""
+    from app.prompts.contracts import SIGNAL_FIELDS
+
+    if contract is None or not isinstance(data, dict):
+        return data
+    keys = [k for k in data if k not in SIGNAL_FIELDS]
+    if len(keys) != 1 or keys[0] in contract.model_fields or not isinstance(data[keys[0]], dict):
+        return data
+    inner = data[keys[0]]
+    try:
+        contract.model_validate({k: v for k, v in inner.items() if k not in SIGNAL_FIELDS})
+    except ValidationError:
+        return data
+    return inner
+
+
 def check_contract(contract: Any, data: dict[str, Any]) -> Any:
     """The answer as the contract's model. Escalation signals are routing hints, not part of any result."""
     from app.prompts.contracts import SIGNAL_FIELDS, diagnose
@@ -352,6 +371,9 @@ class LLMClient:
         if call.contract is None and call.validate is None:
             return result
         validated: Any = None
+        unwrapped = unwrap(call.contract, result.data)
+        if unwrapped is not result.data:
+            result = replace(result, data=unwrapped)  # the service and the stored result see the same answer
         try:
             if call.contract is not None:
                 validated = check_contract(call.contract, result.data)
@@ -782,9 +804,11 @@ class LLMClient:
         bullet of each role kept with its evidence ids."""
         found = re.search(r"^SOURCE RESUME:\n(.*)$", user, re.MULTILINE)
         source = json.loads(found.group(1)) if found else {}
-        updates = [{"role_index": role["role_index"], "bullets": role["bullets"][:1]}
+        def claim(bullet: dict[str, Any]) -> dict[str, Any]:
+            return {"text": bullet["text"], "evidence_ids": [bullet["id"]] if "id" in bullet else []}
+        updates = [{"role_index": role["role_index"], "bullets": [claim(b) for b in role["bullets"][:1]]}
                    for role in source.get("roles") or [] if role.get("bullets")][:3]
-        highlights = [] if source.get("roles") else (source.get("highlights") or [])[:3]
+        highlights = [] if source.get("roles") else [claim(b) for b in (source.get("highlights") or [])[:3]]
         skills = list(reversed(source.get("skills") or []))
         cited = sorted({i for unit in [*highlights, *(b for u in updates for b in u["bullets"])]
                         for i in unit.get("evidence_ids") or []})

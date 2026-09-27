@@ -258,6 +258,19 @@ def apify_runs(db: Session, f: ExternalFilter, limit: int = 200) -> list[SearchR
     return list(db.scalars(query.order_by(SearchRun.id.desc()).limit(limit)).all())
 
 
+def run_location(run: SearchRun) -> str:
+    """Where a run searched, as one label. The actor's input holds whatever that actor takes: a string for most, a
+    list for multi-location actors (["Bengaluru", "Singapore"]), occasionally an object. Grouping needs a string."""
+    value = (run.input_json or {}).get("location") if isinstance(run.input_json, dict) else None
+    if isinstance(value, (list, tuple)):
+        value = ", ".join(str(v).strip() for v in value if v not in (None, "") and str(v).strip())
+    elif isinstance(value, dict):
+        value = ", ".join(str(v).strip() for v in value.values() if isinstance(v, (str, int, float)) and str(v).strip())
+    elif value is not None and not isinstance(value, str):
+        value = str(value)
+    return (value or "").strip() or run.location or ""
+
+
 def run_card(run: SearchRun, setup_names: dict[int, str]) -> dict[str, Any]:
     stats = _run_import(run)
     return {"id": run.id, "external_run_id": run.external_run_id, "actor_id": run.actor_id, "status": run.status,
@@ -265,7 +278,7 @@ def run_card(run: SearchRun, setup_names: dict[int, str]) -> dict[str, Any]:
             "finished_at": run.completed_at.isoformat() if run.completed_at else None,
             "duration_ms": (int((run.completed_at - run.created_at).total_seconds() * 1000)
                             if run.completed_at else None),
-            "location": (run.input_json or {}).get("location") or run.location or "",
+            "location": run_location(run),
             "saved_search_id": run.saved_search_id, "saved_search": setup_names.get(run.saved_search_id or -1),
             "search_profile_id": run.search_profile_id,
             "dataset_id": run.dataset_id or None, "dataset_item_count": run.dataset_item_count,
@@ -327,7 +340,7 @@ def apify_summary(db: Session, f: ExternalFilter, items: list[Any] | None = None
         "api": health(calls),
         "by_actor": group(lambda r: r.actor_id, "actor_id"),
         "by_saved_search": group(lambda r: setups.get(r.saved_search_id or -1), "saved_search"),
-        "by_location": group(lambda r: (r.input_json or {}).get("location") or r.location, "location"),
+        "by_location": group(run_location, "location"),
         "by_site": _by_site(db, f),
         "by_day": sorted(group(lambda r: r.created_at.date().isoformat(), "day"), key=lambda row: row["day"]),
         "recent_runs": [run_card(r, setups) for r in runs[:25]],
@@ -396,9 +409,44 @@ def log_detail(db: Session, log_id: int, user_id: int | None) -> dict[str, Any] 
         if item.external_request_id else None
     return {**_log_card(item),
             "external_request": row_card(external) if external is not None else None,
+            "llm_requests": _llm_requests_for(db, item, user_id),
             "related": [_log_card(other) for other in db.scalars(
                 select(SystemLogEntry).where(SystemLogEntry.trace_id == item.trace_id, SystemLogEntry.id != item.id)
                 .order_by(SystemLogEntry.id).limit(20)).all()] if item.trace_id else []}
+
+
+def _llm_requests_for(db: Session, item: SystemLogEntry, user_id: int | None) -> list[dict[str, Any]]:
+    """The LLM requests a log line is about: the one behind its external call, else those in its trace. Each opens
+    in Monitoring → LLM requests, where the full prompt and response are when they were captured."""
+    from app.models import LLMRequestLog
+
+    exact = (item.details or {}).get("llm_request_id")
+    if exact:  # a line written for one LLM call (app.services.llm_telemetry.log_call)
+        query = select(LLMRequestLog).where(LLMRequestLog.request_id == str(exact))
+    elif item.external_request_id:
+        query = select(LLMRequestLog).where(LLMRequestLog.external_request_id == item.external_request_id)
+    elif item.trace_id:
+        query = select(LLMRequestLog).where(LLMRequestLog.trace_id == item.trace_id)
+    else:
+        return []
+    if user_id is not None:
+        query = query.where(LLMRequestLog.user_id == user_id)
+    rows_ = db.scalars(query.order_by(LLMRequestLog.id).limit(20)).all()
+    return [{"id": r.id, "stage": r.stage, "model": r.model or r.requested_model, "status": r.status,
+             "created_at": r.created_at.isoformat(), "captured": bool(r.debug_prompt or r.debug_response),
+             # The line is about exactly this call: its prompt and response come with it, redacted again on read.
+             "payload": _payload(r) if len(rows_) == 1 else None}
+            for r in rows_]
+
+
+def _payload(row: Any) -> dict[str, str] | None:
+    from app.services.monitoring import DEBUG_TEXT_LIMIT
+    from app.services.redaction import redact_text
+
+    if not (row.debug_prompt or row.debug_response):
+        return None
+    return {"prompt": redact_text(row.debug_prompt, DEBUG_TEXT_LIMIT) or "",
+            "response": redact_text(row.debug_response, DEBUG_TEXT_LIMIT) or ""}
 
 
 def trace_detail(db: Session, trace_id: str, user_id: int | None) -> dict[str, Any]:

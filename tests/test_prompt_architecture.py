@@ -17,6 +17,7 @@ from app.prompts import (
 )
 from app.prompts.contracts import TailoringResult
 from app.prompts.cover_letter import COVER_LETTER_PROMPT_VERSION
+from app.prompts.review import REVIEW_PROMPT_VERSION
 from app.services import context_builder as cb
 from app.services import model_resolution
 from app.services.llm import LLMClient
@@ -181,7 +182,7 @@ def test_a_tailor_answering_like_the_ranker_is_corrected_once(user, monkeypatch)
         "FAILED", "SCHEMA_VALIDATION", "POSSIBLE_CROSS_WORKER_OUTPUT", False)
     assert (second.status, second.structured_output_valid, second.structured_output_retry_count) == (
         "SUCCEEDED", True, 1)
-    assert first.schema_enforcement == "prompt_only" and first.context_builder_version == "v2"
+    assert first.schema_enforcement == "prompt_only" and first.context_builder_version == cb.CONTEXT_BUILDER_VERSION
 
 
 def test_a_second_wrong_answer_fails_and_nothing_is_stored(user, monkeypatch):
@@ -255,7 +256,7 @@ def test_mismatched_evidence_is_flagged_and_held_back_but_never_rewritten(user):
     context = build(user, cb.build_tailoring_context, job_id)
     assert {"id": bad, "code": "EVIDENCE_COMPANY_MISMATCH"} in context.excluded_evidence
     assert bad not in context.evidence_ids
-    assert bad not in {i for role in context.source_resume["roles"] for b in role["bullets"] for i in b["evidence_ids"]}
+    assert bad not in {b.get("id") for role in context.source_resume["roles"] for b in role["bullets"]}
     with session(user) as db:
         assert db.get(Evidence, bad).company == "Globex", "diagnostics never correct candidate history"
     ranking = build(user, cb.build_ranking_context, job_id)
@@ -274,7 +275,7 @@ def test_review_notes_keep_the_fields_the_tailor_screen_reads(user):
     assert isinstance(letter["validation_issues"], list) and letter["evidence_ids"] == []
     assert notes["recommendation"] == "PASS" and notes["review_score"] == notes["score"] == 86
     assert notes["strengths"] and notes["improvements"] == ["Keep bullets concise"] and notes["reject_reasons"] == []
-    assert (notes["provider"], notes["prompt_version"]) == ("mock", "v4")
+    assert (notes["provider"], notes["prompt_version"]) == ("mock", REVIEW_PROMPT_VERSION)
 
 
 # ───────────── secrets: redacted centrally, before anything is stored ─────────────
@@ -318,3 +319,109 @@ def test_debug_prompt_text_is_redacted_before_it_is_stored(user, monkeypatch):
         LLMClient.for_user(db).generate_prompt(prompt, LLMCall(workflow_type="system"))
     row = logs(user, "followup")[-1]
     assert row.debug_prompt and "sk-live-abcdefghijklmnop99" not in row.debug_prompt and "[redacted]" in row.debug_prompt
+
+
+# ───────────── each fact once, verified facts as application data ─────────────
+
+def test_each_fact_reaches_the_prompt_once(user):
+    verify("experience", "skills")
+    job_id = add_job(user)
+    with session(user) as db:
+        bullet = "Reduced production incidents by 45% across Kafka pipelines"
+        from_resume = db.scalar(select(Evidence).where(Evidence.source == "resume", Evidence.claim == bullet)).id
+        # An older, reworded copy of the same achievement, and two copies of a fact no bullet states.
+        reworded = Evidence(user_id=user, company="Zendrive", role="Lead Engineer", verified=True, skills=["SRE"],
+                            claim="Reduced production incidents by 45 percent across the Kafka pipelines", tags=["x"])
+        old = Evidence(user_id=user, company="Zendrive", verified=True,
+                       claim="Cut Kafka consumer lag by half during peak production traffic")
+        new = Evidence(user_id=user, company="Zendrive", verified=True,
+                       claim="Cut Kafka consumer lag by half during the peak production traffic")
+        db.add_all([reworded, old, new])
+        db.commit()
+        ids = reworded.id, old.id, new.id
+    context = build(user, cb.build_ranking_context, job_id)
+    lead = next(b for role in context.relevant_experience for b in role["bullets"] if b["text"] == bullet)
+    assert lead["evidence_ids"] == sorted([from_resume, ids[0]])  # the bullet carries the evidence behind it
+    listed = {item["id"] for item in context.relevant_evidence}
+    assert from_resume not in listed and ids[0] not in listed, "evidence a bullet states is not repeated"
+    assert ids[2] in listed and ids[1] not in listed, "two copies of one fact collapse to the newest"
+    assert all(set(item) <= {"id", "company", "role", "claim"} for item in context.relevant_evidence)
+    assert {from_resume, ids[0], ids[2]} <= context.evidence_ids  # all still citable
+
+    with session(user) as db:
+        prompt = build_ranking_prompt(profile_for(db), job=db.get(Job, job_id), context=context)
+    assert "RELEVANT EXPERIENCE:\n[" in prompt.user and "RELEVANT EXPERIENCE (untrusted data)" not in prompt.user
+    assert f'{{"id": {from_resume}, "text": "{bullet}"}}' in prompt.user  # one id per bullet: its own evidence row
+    assert not any(item["id"] == from_resume for item in context.relevant_evidence)
+    # Unverified facts (the summary here, which this test's lenient policy lets through) stay untrusted.
+    assert "UNVERIFIED RESUME FACTS (untrusted data):\n<untrusted_resume_facts>" in prompt.user
+    assert prompt.user.count("Reduced production incidents by 45") == 1
+    for noise in ("responsibilitie", '"type"', '"verified": true', "Verified from resume", '"skills": ["SRE"]'):
+        assert noise not in prompt.user, noise
+
+
+def test_the_posting_loses_repeats_and_boilerplate_but_keeps_what_it_asks():
+    from app.services.job_context import compact_posting
+
+    posting = ("We need a Kafka lead.\n\nMust have 5+ years of Python.\n\nCome as you are\nAcme is an equal "
+               "opportunity employer regardless of age or race.\n\nMust have 5+ years of Python.\n\nWe provide "
+               "reasonable accommodation on request.\n\nAcme builds logistics software.")
+    assert compact_posting(posting) == ("We need a Kafka lead.\n\nMust have 5+ years of Python.\n\n"
+                                        "Acme builds logistics software.")
+
+
+def test_a_claim_filed_under_the_wrong_employer_is_flagged(user):
+    from app.services.evidence_provenance import diagnose
+
+    verify("experience", "skills")
+    with session(user) as db:
+        wrong = Evidence(user_id=user, company="Pixel Co", verified=True,
+                         claim="Reduced production incidents by 45% across Kafka pipelines")
+        db.add(wrong)
+        db.commit()
+        issues = {i.evidence_id: i for i in diagnose(db, user)}
+        wrong_id = wrong.id
+    assert issues[wrong_id].code == "CLAIM_UNDER_OTHER_EMPLOYER" and issues[wrong_id].severity == "ERROR"
+    assert issues[wrong_id].source["company"] == "Zendrive"
+
+
+def test_resume_data_is_never_listed_again_as_evidence(user):
+    verify("experience", "skills")
+    job_id = add_job(user, description="Kafka reliability lead. Build React dashboards. Python required.")
+    with session(user) as db:
+        from_resume = set(db.scalars(select(Evidence.id).where(Evidence.source == "resume")).all())
+        # A copy of a resume bullet the job does not select, and a genuine fact the resume does not hold.
+        db.add_all([Evidence(user_id=user, company="Pixel Co", verified=True,
+                             claim="Improved page load time by 30% on the Pixel Co storefront"),
+                    Evidence(user_id=user, company="Zendrive", verified=True,
+                             claim="Spoke at KafkaConf about Kafka reliability for Python pipelines")])
+        db.commit()
+    context = build(user, cb.build_ranking_context, job_id)
+    listed = [item["claim"] for item in context.relevant_evidence]
+    assert not from_resume & {item["id"] for item in context.relevant_evidence}
+    assert listed == ["Spoke at KafkaConf about Kafka reliability for Python pipelines"]
+
+
+# ───────────── tailoring is only offered for ranked jobs ─────────────
+
+@pytest.mark.strict_ranking
+def test_unranked_jobs_are_not_queued_for_tailoring(user, spy):
+    verify("experience", "skills")
+    unranked, ranked = add_job(user), add_job(user, title="Kafka Lead")
+    set_fit(user, ranked, COMPLETED)
+    with session(user) as db:
+        db.get(Job, ranked).fit_score = 78
+        db.commit()
+    out = client.post("/api/tailor-tasks", json={"ids": [unranked, ranked], "mode": "tailor"}).json()
+    assert [t["job_id"] for t in out["queued"]] == [ranked]
+    assert out["skipped"] == [{"id": unranked, "reason": cb.RANKING_REQUIRED_REASON}]
+    # Skipping tailoring sends the master resume unchanged and needs no ranking.
+    skip = client.post("/api/tailor-tasks", json={"ids": [unranked], "mode": "skip"}).json()
+    assert [t["job_id"] for t in skip["queued"]] == [unranked]
+
+    batch = client.post("/api/jobs/bulk-tailor", json={"ids": [unranked], "mode": "tailor"}).json()
+    assert batch["not_ranked"] == [unranked] and batch["done"] == [] and batch["errors"] == []
+    assert "tailoring" not in spy, "an unranked job never reaches the Tailor's model"
+
+    found = client.get("/api/jobs/search", params={"ids_only": True, "q": "Globex"}).json()
+    assert ranked in found["ranked_ids"] and unranked not in found["ranked_ids"]

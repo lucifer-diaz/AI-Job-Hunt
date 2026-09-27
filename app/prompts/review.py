@@ -20,6 +20,7 @@ from app.prompts.common import (
     job_facts,
     job_sections,
     job_structured,
+    posting_text,
     resume_facts,
     section,
     to_json,
@@ -28,8 +29,10 @@ from app.prompts.common import (
 )
 from app.prompts.contracts import REVIEW_RECOMMENDATIONS, ReviewResult, describe_fields
 
+# v5: verified resume facts are application data, not untrusted text; each fact is sent once (bullets carry their
+# evidence ids); the posting arrives without duplicate paragraphs or legal boilerplate.
 # v4: the shared ReviewResult contract (PASS / RETAILOR / SKIP), per-claim evidence checks, no search configuration.
-REVIEW_PROMPT_VERSION = "v4"
+REVIEW_PROMPT_VERSION = "v5"
 REVIEW_MARKER = "REVIEW_RESUME"
 __all__ = ["REVIEW_PROMPT_VERSION", "REVIEW_RECOMMENDATIONS", "build_review_prompt"]
 # The candidate policy flags a reviewer checks claims against.
@@ -75,7 +78,7 @@ def build_review_prompt(candidate_profile: Any, evidence: list[dict[str, Any]] |
         rejected = context_value(context, "rejected_facts", [])
         policy = context_value(context, "policy", {}) or {}
         truth = [
-            untrusted("VERIFIED RESUME FACTS", "untrusted_resume_facts", to_json(resume_facts(context), limit=24000)),
+            section("VERIFIED RESUME FACTS", to_json(resume_facts(context), limit=24000)),
             untrusted("REJECTED RESUME FACTS", "untrusted_resume_facts", to_json(rejected, limit=6000))
             if rejected else "",
             section("CANDIDATE POLICY", to_json({k: policy.get(k, False) for k in POLICY_FIELDS})),
@@ -88,7 +91,7 @@ def build_review_prompt(candidate_profile: Any, evidence: list[dict[str, Any]] |
         section("JOB", to_json(job_facts(job))),
         *job_sections(context, with_source=True),
         "" if job_structured(context) else untrusted("JOB DESCRIPTION", "untrusted_job_description",
-                                                     getattr(job, "description", ""), limit=24000),
+                                                     posting_text(context, job), limit=24000),
         untrusted("TAILORED RESUME", "untrusted_tailored_resume", tailored_resume, limit=24000),
         untrusted("TAILORED CLAIMS", "untrusted_tailored_claims", to_json(tailored_claims, limit=12000))
         if tailored_claims else "",

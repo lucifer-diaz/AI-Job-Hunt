@@ -8,17 +8,17 @@ const attr = esc;
 
 /* ───────────── state ───────────── */
 // Filters on the Tailor and Approvals screens, sent to /api/tailor/queue and /api/approvals.
-function pfDefaults(kind) { return { q: '', min_fit: 0, min_review: 0, board: 'all', status: 'all', sort: kind === 'tailor' ? 'fit' : 'default' }; }
+function pfDefaults(kind) { return { q: '', min_fit: 0, min_review: 0, board: 'all', location: 'all', status: 'all', sort: kind === 'tailor' ? 'fit' : 'default' }; }
 const S = {
   screen: 'overview', knowledgeSection: 'answers', settingsSection: 'profile', todayVariant: 'focus', discMode: 'triage',
-  filters: { q: '', min_fit: 0, board: 'all', stage: 'all', sort: 'fit', page: 1, per_page: 25 },
-  triage: { min_fit: 0, hide_agencies: true, hide_reposts: true, keywords: [] }, triagedThisSession: 0,
-  checked: new Set(), selJob: null, jobOpen: null, jobTab: 'description',
+  filters: { q: '', min_fit: 0, board: 'all', location: 'all', stage: 'all', description: 'all', date_field: 'found', within: '', include_applied: false, sort: 'fit', page: 1, per_page: 25 },
+  triage: { min_fit: 0, location: 'all', hide_agencies: true, hide_reposts: true, keywords: [] }, triagedThisSession: 0,
+  checked: new Set(), rankedIds: new Set(), selJob: null, jobOpen: null, jobTab: 'description',
   paletteOpen: false, paletteQuery: '', paletteJobs: [],
   kitJob: null, tailorJob: null, tailorTab: 'diff', editing: null,
   tailorMode: 'single', tailorChecked: new Set(), tailorRegenerate: false,
   pf: { tailor: pfDefaults('tailor'), approvals: pfDefaults('approvals') },
-  approvalJob: null, rejecting: null, overriding: null, selApp: null, trackerView: 'board', runSel: null, setupSel: null,
+  approvalJob: null, rejecting: null, overriding: null, selApp: null, trackerView: 'board', tf: { q: '', location: 'all', min_fit: 0 }, rf: { q: '', location: 'all' }, runSel: null, setupSel: null,
   scheduling: false, editingRecruiter: false, recruiterDraft: [], ivDraft: null, manualMissing: null,
   polling: null, busy: {}, forms: {}, apifyImport: false, importPick: new Set(), autoRefreshed: false,
 };
@@ -44,6 +44,10 @@ async function api(url, { method = 'GET', body, form } = {}) {
   }
   return data;
 }
+// Location filters group by city (the first part of "Bengaluru, Karnataka, India"), and anything remote as Remote.
+// The server does the same for Discovery, Tailor and Approvals (app.workspace.location_key); facets are [city, count].
+const locationOptions = facets => [['all', 'All locations'], ...(facets || []).map(([k, n]) => [k, `${k} (${n})`])];
+const locationKey = loc => { const l = (loc || '').trim(); return !l ? 'Not listed' : /remote/i.test(l) ? 'Remote' : l.split(',')[0].trim(); };
 const qs = obj => new URLSearchParams(Object.entries(obj).filter(([, v]) => v !== '' && v !== null && v !== undefined)).toString();
 let toastTimer;
 function toast(msg, bad = false) {
@@ -80,6 +84,21 @@ const statusTitle = s => statusText(s).charAt(0).toUpperCase() + statusText(s).s
 const statusPill = s => pill(STATUS_LABEL[s] || (s || '').replace(/_/g, ' '), STATUS_TONE[s] || 'muted');
 const toDate = iso => iso ? new Date(/Z|[+-]\d\d:\d\d$/.test(iso) ? iso : iso + 'Z') : null;
 const fmtDay = iso => iso ? toDate(iso).toLocaleDateString(undefined, { day: 'numeric', month: 'short' }) : '';
+// When the employer posted the job (a calendar date, so read in UTC: midnight must not slip to the day before),
+// as the board gave it. Never the date we found it — that is j.posted ("found 44m ago").
+const postedTxt = j => {
+  if (j.posted_at) {
+    const d = toDate(j.posted_at), thisYear = d.getUTCFullYear() === new Date().getUTCFullYear();
+    return `posted ${d.toLocaleDateString(undefined, { day: 'numeric', month: 'short', ...(thisYear ? {} : { year: 'numeric' }), timeZone: 'UTC' })} (${j.posted_ago})`;
+  }
+  return j.posted_raw ? `posted ${j.posted_raw}` : '';
+};
+// Where a posting's parse stands (app.services.job_description.DESCRIPTION_STATES). Parsed is the normal case, so
+// only the others get a badge in lists.
+const DESC_STATE = { PARSED: ['Parsed', 'good'], PARSING: ['Parsing…', 'brand'], FAILED: ['Parse failed', 'bad'],
+  NOT_PARSED: ['Not parsed', 'muted'], NO_DESCRIPTION: ['No description', 'warn'] };
+const descBadge = (state, always = false) => !state || (state === 'PARSED' && !always) ? ''
+  : pill(DESC_STATE[state]?.[0] || state, DESC_STATE[state]?.[1] || 'muted');
 const fmtDateTime = iso => iso ? toDate(iso).toLocaleString(undefined, { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) : '';
 const loading = () => '<div class="loading">Loading…</div>';
 const empty = (title, body, actions = '') => `<div class="empty"><div class="empty-title">${esc(title)}</div><div class="muted small">${esc(body)}</div>${actions ? `<div class="row gap8 center wrap mt14">${actions}</div>` : ''}</div>`;
@@ -162,7 +181,7 @@ function go(screen, extra = {}) {
 }
 
 const LOADERS = {
-  async overview() { D.overview = await api('/api/workspace/overview'); },
+  async overview() { [D.overview, D.gateway] = await Promise.all([api('/api/workspace/overview'), api('/api/settings/ai/gateway').catch(() => null)]); },
   async today() { D.today = await api('/api/workspace/today'); },
   async discovery() {
     if (S.discMode === 'triage') await loadQueue();
@@ -207,7 +226,7 @@ const LOADERS = {
 };
 async function loadQueue() {
   const t = S.triage;
-  D.queue = await api('/api/jobs/search?' + qs({ queue: true, per_page: 60, min_fit: t.min_fit || '', hide_agencies: t.hide_agencies, hide_reposts: t.hide_reposts, keywords: t.keywords.join(',') }));
+  D.queue = await api('/api/jobs/search?' + qs({ queue: true, per_page: 60, min_fit: t.min_fit || '', location: t.location, hide_agencies: t.hide_agencies, hide_reposts: t.hide_reposts, keywords: t.keywords.join(',') }));
   D.queueTotal = D.queue.total;
   if (!D.setups) D.setups = (await api('/api/search/setups')).setups;
   if (!D.runs) D.runs = await api('/api/search/apify/runs');
@@ -339,6 +358,30 @@ function renderTop() {
 }
 
 /* ───────────── overview ───────────── */
+// Where every AI worker sends its requests: the LiteLLM gateway, or the direct provider chosen in Settings → AI
+// models (with its model). Choosing which direct provider stays in Settings, where its model is chosen too.
+// Shared by the Overview screen and Settings → AI models → Overview; `g` is /api/settings/ai/gateway.
+function gatewaySegment(g) {
+  const option = (on, name, ready, why) => `<button type="button" class="${on ? 'on' : ''}" data-act="${on ? '' : 'set-gateway'}" data-on="${name === 'litellm' ? '1' : ''}"
+    ${!on && (!ready || isBusy('gateway')) ? `disabled title="${attr(ready ? 'Switching…' : why)}"` : ''} aria-pressed="${on}">${esc(name === 'litellm' ? 'LiteLLM gateway' : `${g.direct_label} (direct)`)}</button>`;
+  return `<div class="seg" role="group" aria-label="AI gateway">${option(g.gateway_enabled, 'litellm', g.litellm_ready, 'Save a LiteLLM base URL in Settings → AI models first')}${option(!g.gateway_enabled, g.direct_provider, g.direct_ready, `Save a ${g.direct_label} API key in Settings → API keys first`)}</div>`;
+}
+function gatewayNow(g) {
+  return g.gateway_enabled
+    ? `Every AI worker sends its requests through LiteLLM${g.litellm_base_url ? ` at ${g.litellm_base_url}` : ''}, using the models set per worker.`
+    : `Every AI worker calls ${g.direct_label} directly${g.direct_model ? `, default model ${g.direct_model}` : ''}.`;
+}
+function gatewayMissing(g) {
+  const missing = !g.litellm_ready ? 'LiteLLM needs a base URL first (Settings → AI models → LiteLLM).'
+    : !g.direct_ready ? `${g.direct_label} needs an API key first (Settings → API keys).` : '';
+  return missing ? `<div class="xs muted mt8">${esc(missing)} <a href="#settings/${!g.litellm_ready ? 'ai' : 'api-keys'}">Open settings</a></div>` : '';
+}
+function renderGatewaySwitch() {
+  const g = D.gateway; if (!g) return '';
+  return `<section class="card"><div class="row base between wrap gap12"><div style="min-width:0"><div class="card-title">AI gateway</div>
+      <div class="card-sub">${esc(gatewayNow(g))}</div></div>${gatewaySegment(g)}</div>${gatewayMissing(g)}</section>`;
+}
+
 function renderOverview() {
   const o = D.overview; if (!o) return loading();
   const perf = o.source_perf;
@@ -352,7 +395,7 @@ function renderOverview() {
   const days = v => v == null ? '—' : `${v} days`;
   const bottleneck = o.stale_approved ? `${o.stale_approved} approved packet${o.stale_approved === 1 ? ' has' : 's have'} sat unsubmitted for over 2 days.`
     : o.approvals ? `${o.approvals} packet${o.approvals === 1 ? ' is' : 's are'} waiting for your approval.` : 'Nothing is stuck right now.';
-  return `<div class="stack">
+  return `<div class="stack">${renderGatewaySwitch()}
   <section class="card"><div class="row base between wrap mb16"><div><div class="card-title">Pipeline health</div><div class="card-sub">Where ${o.total} discovered job${o.total === 1 ? '' : 's'} actually ended up. Click a stage to work it.</div></div><span class="small muted">last 30 days</span></div>
     <div class="row wrap gap10">${o.funnel.map(f => `<button class="stage-btn" data-act="go" data-screen="${f.screen}"><div class="stage-label">${esc(f.label)}</div><div class="mono big">${f.n}</div>${bar(f.pct, f.color)}<div class="tiny faint mt6">${esc(f.conv) || '&nbsp;'}</div></button>`).join('')}</div></section>
   <div class="split gap16">
@@ -457,7 +500,7 @@ function renderDiscovery() {
 // The asynchronous ranker's work for this account (/api/ranking/tracker): waiting, running, retrying and finished.
 let rankingTimer = null;
 const onRankingTab = () => S.screen === 'discovery' && S.discMode === 'ranking';
-const RANK_REASON = { new: 'New job', user_request: 'You asked', resume_changed: 'Resume changed', profile_changed: 'Profile changed', prompt_changed: 'Ranking prompt updated' };
+const RANK_REASON = { new: 'New job', user_request: 'You asked', resume_changed: 'Resume changed', profile_changed: 'Profile changed', prompt_changed: 'Ranking prompt updated', job_parsed: 'Posting parsed', description_changed: 'Description added' };
 const until = iso => {
   if (!iso) return '';
   const sec = Math.round((new Date(iso.slice(0, 23) + 'Z') - Date.now()) / 1000);
@@ -478,8 +521,8 @@ function rankProgress(t, total) {
 }
 async function loadRanking() {
   const before = new Set((D.ranking?.active || []).map(t => t.id));
-  D.ranking = await api('/api/ranking/tracker');
-  const done = D.ranking.recent.filter(t => before.has(t.id));
+  D.ranking = await api('/api/ranking/tracker?' + qs(S.rf));
+  const done = (D.ranking.recent || []).filter(t => before.has(t.id));
   if (done.length) {
     const one = done.length === 1 ? done[0] : null, failed = done.filter(t => t.status === 'FAILED').length;
     toast(one ? `${one.company}: ${rankTaskDetail(one)}` : `${done.length} rankings finished${failed ? ` · ${failed} failed` : ''}`, failed === done.length);
@@ -494,7 +537,7 @@ function scheduleRankingPoll() {
     if (!onRankingTab()) return;
     try { await loadRanking(); } catch { scheduleRankingPoll(); return; }
     if (onRankingTab()) render();
-  }, D.ranking?.active.length ? 4000 : 20000);
+  }, D.ranking?.active?.length ? 4000 : 20000);
 }
 function rankTaskPill(t) {
   if (t.status === 'PROCESSING') return pill('ranking…', 'brand');
@@ -541,19 +584,29 @@ function renderRanking() {
   const blocked = r.blocked ? `<div class="banner warn mb14"><span class="grow">Ranking is paused for your account: ${esc(r.blocked)}</span>${btn('Open settings', 'go', { screen: 'settings' }, 'sm')}</div>` : '';
   const autoOff = r.auto_rank ? '' : `<div class="banner mb14"><span class="grow">Auto-rank on import is off, so only the jobs you ask to rank are ranked.</span>${btn('Search setup', 'go', { screen: 'discovery', mode: 'setup' }, 'sm')}</div>`;
   const row = t => {
-    const retry = t.status !== 'FAILED' ? '' : t.retried ? btn('Retried', 'ranking-retry', {}, 'sm', true)
+    const retry = t.removed ? btn(isBusy('rankRetry' + t.job_id) ? 'Queueing…' : 'Rank again', 'ranking-retry', { job: t.job_id }, 'sm', isBusy('rankRetry' + t.job_id))
+      : t.status !== 'FAILED' ? '' : t.retried ? btn('Retried', 'ranking-retry', {}, 'sm', true)
       : btn(isBusy('rankRetry' + t.job_id) ? 'Queueing…' : 'Retry', 'ranking-retry', { job: t.job_id }, 'sm', isBusy('rankRetry' + t.job_id));
+    // A waiting job can be taken out of the queue; one being ranked right now cannot (its model call is running).
+    const remove = t.status === 'PENDING' ? btn(label('rankRemove' + t.job_id, 'Remove', 'Removing…'), 'ranking-remove', { ids: t.job_id }, 'sm ghost danger', isBusy('rankRemove' + t.job_id)) : '';
     const detail = rankTaskDetail(t), why = RANK_REASON[t.reason] || t.reason;
     return `<div class="lrow ${t.status === 'PROCESSING' ? 'sel' : ''}" style="gap:12px;align-items:flex-start">
       <div class="grow" style="min-width:0"><div class="small b ellipsis">${esc(t.title)} <span class="muted" style="font-weight:400">· ${esc(t.company)}</span></div>
         <div class="xs ellipsis ${t.status === 'FAILED' ? '' : 'muted'}" style="${t.status === 'FAILED' ? 'color:var(--bad)' : ''}" title="${attr(detail)}">${esc(why)} · ${esc(detail)}</div>
         ${rankProgress(t, r.in_flight)}</div>
-      ${retry}${btn('Job', 'open-job', { id: t.job_id }, 'sm')}${rankTaskPill(t)}</div>`;
+      ${retry}${remove}${btn('Job', 'open-job', { id: t.job_id }, 'sm')}${rankTaskPill(t)}</div>`;
   };
-  const section = (title, sub, items) => `<section class="card flush">
-    <div style="padding:14px 18px;border-bottom:1px solid var(--line2)"><div class="card-title" style="font-size:16px">${esc(title)}</div><div class="card-sub">${esc(sub)}</div></div>
-    <div style="max-height:460px;overflow:auto">${items.map(row).join('')}</div></section>`;
-  const nothing = !inFlight && !r.recent.length && !c.filtering;
+  const section = (key, title, sub, items, actions = '') => `<section class="card flush">
+    <div class="row between wrap gap10" style="padding:14px 18px;border-bottom:1px solid var(--line2)"><div><div class="card-title" style="font-size:16px">${esc(title)}</div><div class="card-sub">${esc(sub)}</div></div>${actions ? `<div class="row gap8">${actions}</div>` : ''}</div>
+    <div style="max-height:460px;overflow:auto" data-scroll-key="ranking-${key}">${items.map(row).join('')}</div></section>`;
+  const nothing = !inFlight && !r.recent.length && !c.filtering && !r.filtered && !r.finished_cleared_at;
+  const removable = r.active.filter(t => t.status === 'PENDING').map(t => t.job_id);
+  const opts = (list, cur) => list.map(([v, t]) => `<option value="${attr(v)}" ${String(v) === String(cur) ? 'selected' : ''}>${esc(t)}</option>`).join('');
+  const filters = `<section class="card flush"><div class="toolbar" style="border-bottom:0">
+    <input class="input grow" style="min-width:180px" id="rf-q" data-rf="q" value="${attr(S.rf.q)}" placeholder="Search title, company or location…">
+    <select class="select" id="rf-location" data-rf="location" aria-label="Location">${opts(locationOptions(r.locations), S.rf.location)}</select>
+    ${r.filtered ? `<span class="small muted">${r.active.length} in progress · ${r.recent.length} finished match</span>${btn('Reset', 'ranking-reset-filters', {}, 'sm')}` : ''}
+    ${r.filtered && removable.length ? btn(label('rankRemoveAll', `Remove ${removable.length} shown from ranking`, 'Removing…'), 'ranking-remove', { ids: removable.join(','), confirm: 1 }, 'sm danger', isBusy('rankRemoveAll')) : ''}</div></section>`;
   return `<div class="stack">${blocked}${autoOff}
     <section class="card">
       <div class="row wrap gap10 mb14"><div class="grow" style="min-width:220px"><div class="card-title">${inFlight || c.filtering ? 'Ranking in the background' : 'Ranking is idle'}</div>
@@ -563,9 +616,14 @@ function renderRanking() {
         ${btn(label('rankBatch', 'Queue unranked jobs', 'Queueing…'), 'rank-batch', {}, 'sm', isBusy('rankBatch'))}
         ${btn(label('rankRefresh', 'Refresh', 'Refreshing…'), 'ranking-refresh', {}, 'sm', isBusy('rankRefresh'))}</div>
       <div class="row wrap gap16" style="align-items:flex-start">${tiles}</div></section>
+    ${inFlight || r.recent.length || r.filtered ? filters : ''}
+    ${r.filtered && !r.active.length && !r.recent.length ? `<section class="card">${empty('No ranking work matches', 'Try another location or clear the filters.', btn('Reset filters', 'ranking-reset-filters', {}, 'primary'))}</section>` : ''}
     ${nothing ? `<section class="card">${empty('No ranking activity in the last day', 'Jobs from your searches are filtered and ranked automatically. Rankings you request from a job, the table or the triage queue show up here too.', btn('Go to triage', 'go-triage', {}, 'primary'))}</section>` : ''}
-    ${inFlight ? section('In progress', `${inFlight} job${inFlight === 1 ? '' : 's'} waiting, ranking or retrying`, r.active) : ''}
-    ${r.recent.length ? section('Finished in the last 24 hours', `${c.completed} ranked · ${c.failed} failed${c.skipped ? ` · ${c.skipped} skipped` : ''}`, r.recent) : ''}
+    ${r.active.length ? section('active', 'In progress', `${r.filtered ? `${r.active.length} of ${inFlight}` : inFlight} job${inFlight === 1 ? '' : 's'} waiting, ranking or retrying`, r.active) : ''}
+    ${r.recent.length ? section('recent', r.finished_cleared_at ? `Finished since you cleared the list at ${fmtDateTime(r.finished_cleared_at)}` : 'Finished in the last 24 hours',
+      `${c.completed} ranked · ${c.failed} failed${c.skipped ? ` · ${c.skipped} skipped` : ''}`, r.recent,
+      (r.finished_cleared_at ? btn('Show cleared', 'ranking-unclear', {}, 'sm ghost') : '') + btn(label('rankClear', 'Clear list', 'Clearing…'), 'ranking-clear', {}, 'sm', isBusy('rankClear')))
+      : r.finished_cleared_at ? `<section class="card pad16 row between wrap gap10"><span class="small muted">Finished rankings cleared at ${esc(fmtDateTime(r.finished_cleared_at))}. New results show up here as they finish.</span>${btn('Show cleared', 'ranking-unclear', {}, 'sm')}</section>` : ''}
   </div>`;
 }
 function fitSummary(j) {
@@ -583,6 +641,7 @@ function renderTriage() {
     <section class="card pad16"><div class="card-title sm mb10">Up next</div><div class="col gap4">${q.items.slice(1, 6).map((u, i) => `<div class="row gap10" style="padding:9px;border-radius:9px;cursor:pointer;background:${i === 0 ? 'var(--softer)' : 'transparent'}" data-act="open-job" data-id="${u.id}"><span class="mono bb ${fitCls(u.fit)}" style="width:24px">${fitTxt(u.fit)}</span><div class="grow"><div class="small ellipsis" style="font-weight:500">${esc(u.title)}</div><div class="tiny muted ellipsis">${esc(u.company)}</div></div></div>`).join('') || '<div class="small muted">Nothing else in the queue.</div>'}</div></section>
     <section class="card pad16"><div class="card-title sm mb4">Filters for this batch</div><div class="small muted mb12">Narrowing re-ranks the queue instantly.</div>
       <div class="col gap12"><label class="field strong">Minimum fit · <span class="mono">${S.triage.min_fit}</span><input type="range" min="0" max="100" step="5" id="triage-min" data-triage="min_fit" value="${S.triage.min_fit}"></label>
+        <label class="field strong">Location<select class="select" style="margin:4px 0 0" id="triage-location" data-triage="location">${locationOptions(q.locations).map(([v, t]) => `<option value="${attr(v)}" ${v === S.triage.location ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select></label>
         <div><div class="xs muted mb4">Must mention (use / for either)</div>${tagBox('triage', 'keywords', S.triage.keywords, 'Hybrid, Lead/Principal…', 6)}</div>
         <label class="check"><input type="checkbox" data-triage="hide_agencies" ${S.triage.hide_agencies ? 'checked' : ''}>Hide staffing agencies</label>
         <label class="check"><input type="checkbox" data-triage="hide_reposts" ${S.triage.hide_reposts ? 'checked' : ''}>Hide reposts I've seen</label>
@@ -602,8 +661,8 @@ function renderTriage() {
       <div class="row top-align gap16 wrap" style="padding:22px 24px;border-bottom:1px solid var(--line2)">
         <div class="avatar lg">${esc(initials(job.company))}</div>
         <div style="flex:1 1 210px;min-width:0"><div style="font-size:20px;font-weight:600;letter-spacing:-.01em">${esc(job.title)}</div><div class="muted mt4" style="font-size:13.5px">${esc(job.company)}${job.location ? ' · ' + esc(job.location) : ''}</div>
-          <div class="row gap6 wrap mt10">${pill(`${job.board} · ${job.posted}`, 'plain', 'lg')}${job.agency ? pill('Likely agency', 'warn', 'lg') : ''}${job.url ? `<a class="pill plain lg" href="${attr(job.url)}" target="_blank" rel="noopener">Posting ↗</a>` : ''}</div></div>
-        ${job.fit == null ? `<div class="scorebox"><div class="n" style="color:var(--grey)">—</div><div class="l">NOT RANKED</div>${btn(label('rank' + job.id, 'Rank now', 'Queueing…'), 'rank-job', { id: job.id }, 'sm soft mt8', isBusy('rank' + job.id))}</div>` : `<div class="scorebox"><div class="n">${fitTxt(job.fit)}</div><div class="l">FIT SCORE</div></div>`}
+          <div class="row gap6 wrap mt10">${pill(`${job.board} · found ${job.posted}`, 'plain', 'lg')}${postedTxt(job) ? pill(postedTxt(job), 'plain', 'lg') : ''}${job.agency ? pill('Likely agency', 'warn', 'lg') : ''}${job.url ? `<a class="pill plain lg" href="${attr(job.url)}" target="_blank" rel="noopener">Posting ↗</a>` : ''}</div></div>
+        ${job.fit == null ? `<div class="scorebox"><div class="n" style="color:var(--grey)">—</div><div class="l">NOT RANKED</div>${job.needs_description ? btn('Add description', 'open-job', { id: job.id }, 'sm soft mt8') : btn(label('rank' + job.id, 'Rank now', 'Queueing…'), 'rank-job', { id: job.id }, 'sm soft mt8', isBusy('rank' + job.id))}</div>` : `<div class="scorebox"><div class="n">${fitTxt(job.fit)}</div><div class="l">FIT SCORE</div></div>`}
       </div>
       <div style="padding:18px 24px;border-bottom:1px solid var(--line2)">
         <div class="row gap8 mb10">${pill('AI', 'brand')}<span class="base b">${job.fit == null ? 'Not ranked yet' : `Why this scores ${fitTxt(job.fit)}`}</span></div>
@@ -623,9 +682,16 @@ function renderTriage() {
     </div>
   </div>${side}</div>`;
 }
+// Tailoring works from the Ranker's analysis, so only ranked jobs can be sent to tailoring. A job is ranked once it
+// has a fit score; rows on the page and "select all matching" both say which selected jobs are.
+function noteRanked(rows) { rows.forEach(r => r.fit == null ? S.rankedIds.delete(r.id) : S.rankedIds.add(r.id)); }
+const rankedSelection = () => [...S.checked].filter(id => S.rankedIds.has(id));
+
 function renderTable() {
   const j = D.jobs; if (!j) return loading();
+  noteRanked(j.items);
   const f = S.filters;
+  const tailorable = rankedSelection().length, unranked = S.checked.size - tailorable;
   const sel = D.selDetail;
   const opts = (list, cur) => list.map(([v, t]) => `<option value="${attr(v)}" ${String(v) === String(cur) ? 'selected' : ''}>${esc(t)}</option>`).join('');
   const pages = []; for (let p = Math.max(1, j.page - 2); p <= Math.min(j.pages, Math.max(1, j.page - 2) + 4); p++) pages.push(p);
@@ -637,34 +703,41 @@ function renderTable() {
       <input class="input grow" style="min-width:180px" id="flt-q" data-filter="q" value="${attr(f.q)}" placeholder="Search title, company or location…">
       <select class="select" id="flt-min" data-filter="min_fit">${opts([[0, 'Any fit'], [50, 'Fit ≥ 50'], [70, 'Fit ≥ 70'], [80, 'Fit ≥ 80']], f.min_fit)}</select>
       <select class="select" id="flt-board" data-filter="board">${opts([['all', 'All boards'], ...j.boards.map(b => [b, b])], f.board)}</select>
+      <select class="select" id="flt-location" data-filter="location" aria-label="Location">${opts(locationOptions(j.locations), f.location)}</select>
+      <select class="select" id="flt-date-field" data-filter="date_field" aria-label="Date to filter by">${opts([['found', 'Found'], ['posted', 'Posted']], f.date_field)}</select>
+      <select class="select" id="flt-within" data-filter="within" aria-label="How recent">${opts([['', 'Any time'], ['24h', 'Last 24 hours'], ['3d', 'Last 3 days'], ['7d', 'Last 7 days'], ['15d', 'Last 15 days'], ['30d', 'Last 30 days']], f.within)}</select>
+      <label class="check small" title="Jobs you already applied to are hidden from Discovery; the Applied stage always shows them"><input type="checkbox" id="flt-applied" data-filter="include_applied" ${f.include_applied ? 'checked' : ''}>Show applied</label>
+      <select class="select" id="flt-description" data-filter="description" aria-label="Job description">${opts([['all', 'Any description'], ...(j.description_states || []).map(([k, name, n]) => [k, `${name} (${n})`])], f.description)}</select>
       <select class="select" id="flt-stage" data-filter="stage">${opts([['all', 'All stages'], ['unranked', 'Unranked'], ...['discovered', 'shortlisted', 'maybe', 'archived', 'dismissed', 'tailored', 'needs_retailor', 'pending_approval', 'approved', 'applied'].map(s => [s, statusTitle(s)])], f.stage)}</select>
-      <select class="select" id="flt-sort" data-filter="sort">${opts([['fit', 'Sort: best fit'], ['new', 'Sort: newest'], ['company', 'Sort: company']], f.sort)}</select>
+      <select class="select" id="flt-sort" data-filter="sort">${opts([['fit', 'Sort: best fit'], ['new', 'Sort: newest found'], ['posted', 'Sort: newest posted'], ['company', 'Sort: company']], f.sort)}</select>
       ${btn('Reset', 'reset-filters', {}, 'sm')}
       ${S.checked.size ? '' : btn(label('rankBatch', 'Rank unranked', 'Queueing…'), 'rank-batch', {}, 'sm', isBusy('rankBatch'))}
       ${S.checked.size ? `<span class="small b" style="color:var(--brand-ink)">${S.checked.size} selected</span>` : ''}
       ${btn(isBusy('bulkRank') ? esc(S.rankProgress || 'Queueing…') : `Rank${S.checked.size ? ` ${S.checked.size}` : ''}`, 'bulk-rank', {}, 'sm', !S.checked.size || isBusy('bulkRank'))}
       ${btn(`Shortlist${S.checked.size ? ` ${S.checked.size}` : ''}`, 'bulk', { action: 'shortlist' }, 'sm soft', !S.checked.size)}
-      ${btn(label('bulkToTailor', `Bulk tailor${S.checked.size ? ` ${S.checked.size}` : ''}`, 'Queueing…'), 'bulk-to-tailor', {}, 'sm primary', !S.checked.size || isBusy('bulkToTailor'))}
+      <span title="${attr(unranked ? `${unranked} selected job${unranked === 1 ? ' is' : 's are'} not ranked yet. Rank ${unranked === 1 ? 'it' : 'them'} first: tailoring works from the ranking.` : 'Send the selected ranked jobs to Bulk tailor')}">${btn(label('bulkToTailor', `Bulk tailor${tailorable ? ` ${tailorable}` : ''}`, 'Queueing…'), 'bulk-to-tailor', {}, 'sm primary', !tailorable || isBusy('bulkToTailor'))}</span>
       ${btn('Dismiss', 'bulk', { action: 'dismiss' }, 'sm', !S.checked.size)}
       ${btn(label('bulkDelete', `Delete${S.checked.size ? ` ${S.checked.size}` : ''}`, 'Deleting…'), 'bulk-delete', {}, 'sm danger', !S.checked.size || isBusy('bulkDelete'))}
     </div>
-    <div class="row between wrap" style="padding:9px 14px;border-bottom:1px solid var(--line2);background:#fbfbfe"><span class="small muted">${j.total ? `Showing ${start}–${Math.min(j.page * j.per_page, j.total)} of ${j.total} jobs` : 'No matches'}</span><span class="small muted">Page ${j.page} of ${j.pages} · ${j.total === j.total_all ? 'no filters applied' : `${j.total_all - j.total} hidden by filters`}</span></div>
+    <div class="row between wrap" style="padding:9px 14px;border-bottom:1px solid var(--line2);background:#fbfbfe"><span class="small muted">${j.total ? `Showing ${start}–${Math.min(j.page * j.per_page, j.total)} of ${j.total} jobs` : 'No matches'}</span><span class="small muted">Page ${j.page} of ${j.pages} · ${j.total + (j.applied_hidden || 0) === j.total_all ? 'no filters applied' : `${j.total_all - j.total - (j.applied_hidden || 0)} hidden by filters`}${j.applied_hidden ? ` · ${j.applied_hidden} applied job${j.applied_hidden === 1 ? '' : 's'} hidden` : ''}</span></div>
     ${allOnPage && j.total > j.items.length && S.checked.size < j.total ? `<div class="banner" style="border-radius:0;border-width:0 0 1px">All ${j.items.length} on this page are selected. <a href="#" data-act="select-all-matching">${isBusy('selectAll') ? 'Selecting…' : `Select all ${j.total} matching jobs`}</a></div>` : ''}
     ${S.checked.size && S.checked.size >= j.total && j.total > j.items.length ? `<div class="banner" style="border-radius:0;border-width:0 0 1px">All ${S.checked.size} matching jobs are selected. <a href="#" data-act="clear-selection">Clear selection</a></div>` : ''}
     <div class="jgrid jhead"><input type="checkbox" data-act="check-all" ${allOnPage ? 'checked' : ''} aria-label="Select page"><span>OPPORTUNITY</span><span class="tr">FIT</span><span>STAGE</span><span>SOURCE</span><span class="tr">POSTED</span></div>
     ${j.items.map(r => `<div class="jgrid jrow ${r.id === S.selJob ? 'sel' : ''}" data-act="select-job" data-id="${r.id}">
       <input type="checkbox" data-act="check" data-id="${r.id}" ${S.checked.has(r.id) ? 'checked' : ''} aria-label="Select">
       <div style="min-width:0"><div class="b ellipsis" style="font-size:13.5px">${esc(r.title)}</div><div class="xs muted ellipsis">${esc(r.company)}${r.location ? ' · ' + esc(r.location) : ''}</div></div>
-      <div class="tr mono bb ${fitCls(r.fit)}" style="font-size:13.5px">${fitTxt(r.fit)}</div><div>${statusPill(r.status)}</div><div class="xs muted">${esc(r.board)}</div><div class="tr xs faint">${esc(r.posted)}</div></div>`).join('')}
+      <div class="tr mono bb ${fitCls(r.fit)}" style="font-size:13.5px">${fitTxt(r.fit)}</div><div class="col gap4" style="align-items:flex-start">${statusPill(r.status)}${descBadge(r.description_state)}</div><div class="xs muted">${esc(r.board)}</div><div class="tr xs ${r.posted_ago || r.posted_raw ? 'muted' : 'faint'}" title="${attr(`found ${r.posted}`)}">${esc(r.posted_ago || r.posted_raw || `found ${r.posted}`)}</div></div>`).join('')}
     ${!j.total ? `<div class="empty small muted">No jobs match these filters. <a href="#" data-act="reset-filters">Reset</a> to see all ${j.total_all}.</div>` : ''}
     <div class="row wrap gap10 pager" style="padding:12px 14px;background:#fbfbfe"><div class="row gap6"><span class="small muted">Rows</span><select class="select" style="margin:0;width:auto;padding:6px 8px" id="flt-per" data-filter="per_page">${opts([[10, 10], [25, 25], [50, 50]], f.per_page)}</select></div><div class="grow"></div>
       ${btn('← Prev', 'page', { page: j.page - 1 }, 'sm', j.page <= 1)}${pages.map(p => btn(String(p), 'page', { page: p }, 'sm ' + (p === j.page ? 'on' : ''))).join('')}${btn('Next →', 'page', { page: j.page + 1 }, 'sm', j.page >= j.pages)}</div>
   </section>
   <section class="card pad18 c-side sticky-panel">${sel ? `
     <div class="row top-align between gap10"><div class="grow"><div style="font-size:17px;font-weight:600">${esc(sel.title)}</div><div class="base muted mt4">${esc(sel.company)}${sel.location ? ' · ' + esc(sel.location) : ''}</div></div><div class="mono bb ${fitCls(sel.fit)}" style="font-size:24px">${fitTxt(sel.fit)}</div></div>
-    <div class="row gap6 wrap" style="margin:14px 0">${statusPill(sel.status)}${pill(sel.board + ' · ' + sel.posted, 'plain', 'lg')}${pill(`${sel.matches.length} matched`, 'good', 'lg')}${pill(`${sel.gaps.length + sel.missing.length} gaps`, 'warn', 'lg')}</div>
+    <div class="row gap6 wrap" style="margin:14px 0">${statusPill(sel.status)}${pill(sel.board + ' · found ' + sel.posted, 'plain', 'lg')}${postedTxt(sel) ? pill(postedTxt(sel), 'plain', 'lg') : ''}${pill(`${sel.matches.length} matched`, 'good', 'lg')}${pill(`${sel.gaps.length + sel.missing.length} gaps`, 'warn', 'lg')}</div>
     <div class="base pretty" style="color:var(--ink3);line-height:1.6;border-top:1px solid var(--line2);padding-top:14px">${esc(sel.summary || (sel.description || '').slice(0, 420) || 'No description captured.')}</div>
-    <div class="row gap8 mt16">${['tailored', 'needs_retailor', 'approved', 'applied', 'pending_approval'].includes(sel.status) ? btn(sel.status === 'needs_retailor' ? 'Re-tailor' : 'Open packet', 'go', { screen: sel.status === 'applied' ? 'tracker' : sel.status === 'approved' ? 'approvals' : 'tailor', job: sel.id }, 'primary grow') : btn('Tailor', 'triage', { id: sel.id, action: 'shortlist', tailor: 1 }, 'primary grow')}${btn('Full description', 'open-job', { id: sel.id }, 'grow')}</div>` : empty('Select a job', 'Pick a row to see its details.')}
+    <div class="row gap8 mt16">${['tailored', 'needs_retailor', 'approved', 'applied', 'pending_approval'].includes(sel.status) ? btn(sel.status === 'needs_retailor' ? 'Re-tailor' : 'Open packet', 'go', { screen: sel.status === 'applied' ? 'tracker' : sel.status === 'approved' ? 'approvals' : 'tailor', job: sel.id }, 'primary grow') : sel.needs_description ? `<span class="grow" title="Ranking needs the job description">${btn('Add description', 'open-job', { id: sel.id }, 'primary grow')}</span>`
+      : sel.fit == null ? `<span class="grow" title="Tailoring works from the ranking: rank this job first">${btn(label('rank' + sel.id, 'Rank first', 'Queueing…'), 'rank-job', { id: sel.id }, 'primary', isBusy('rank' + sel.id))}</span>`
+      : btn('Tailor', 'triage', { id: sel.id, action: 'shortlist', tailor: 1 }, 'primary grow')}${btn('Full description', 'open-job', { id: sel.id }, 'grow')}</div>` : empty('Select a job', 'Pick a row to see its details.')}
   </section></div>`;
 }
 function renderSetup() {
@@ -798,6 +871,7 @@ function renderPacketFilters(kind, facets) {
     ${sel('min_fit', [[0, 'Any fit'], [50, 'Fit ≥ 50'], [70, 'Fit ≥ 70'], [80, 'Fit ≥ 80']])}
     ${sel('min_review', [[0, 'Any reviewer score'], [50, 'Reviewer ≥ 50'], [65, 'Reviewer ≥ 65'], [75, 'Reviewer ≥ 75'], [85, 'Reviewer ≥ 85']])}
     ${sel('board', [['all', 'All boards'], ...facets.boards.map(b => [b, b])])}
+    ${sel('location', locationOptions(facets.locations))}
     ${sel('status', PF_STATUS[kind])}${sel('sort', PF_SORT[kind])}
     <span class="small muted none">${facets.total === facets.total_all ? `${facets.total_all} job${facets.total_all === 1 ? '' : 's'}` : `${facets.total} of ${facets.total_all}`}</span>
     ${btn('Reset', 'pf-reset', { kind }, 'sm', !pfActive(kind))}
@@ -858,7 +932,8 @@ function renderTaskStack() {
 function renderBulkTailor(queue) {
   const selected = queue.filter(j => S.tailorChecked.has(j.id));
   const needsWork = j => !j.has_resume || j.status === 'needs_retailor';
-  const eligible = selected.filter(j => !activeTask(j.id) && (S.tailorRegenerate || needsWork(j))).length;
+  const pending = selected.filter(j => !activeTask(j.id) && (S.tailorRegenerate || needsWork(j)));
+  const eligible = pending.length, tailorable = pending.filter(j => j.fit != null).length;
   const untailored = queue.filter(needsWork);
   const allOn = queue.every(j => S.tailorChecked.has(j.id));
   const allToggle = `<input type="checkbox" data-act="tailor-select" data-which="${allOn ? 'none' : 'all'}" ${allOn ? 'checked' : ''} aria-label="Select all jobs">`;
@@ -872,7 +947,9 @@ function renderBulkTailor(queue) {
     const retailor = j.status === 'needs_retailor';
     const status = task ? taskPill(task)
       : retailor ? `<span title="${attr((j.review_reasons || []).join(' · ') || 'Review sent this packet back to be tailored again')}">${pill('re-tailor', 'warn')}</span>`
-      : j.has_resume ? pill(j.status === 'pending_approval' ? 'sent back' : 'has packet', 'muted') : pill('not tailored', 'warn');
+      : j.has_resume ? pill(j.status === 'pending_approval' ? 'sent back' : 'has packet', 'muted')
+      : j.fit == null ? `<span title="Tailoring works from the ranking: rank this job first, or skip tailoring">${pill('rank first', 'warn')}</span>`
+      : pill('not tailored', 'warn');
     return `<div class="lrow click ${task?.status === 'running' ? 'sel' : ''}" data-act="tailor-check" data-id="${j.id}" style="gap:12px">
       <input type="checkbox" data-act="tailor-check" data-id="${j.id}" ${S.tailorChecked.has(j.id) ? 'checked' : ''} aria-label="Select ${attr(j.title)}">
       <span class="mono bb ${fitCls(j.fit)}" style="width:26px" title="Fit score">${fitTxt(j.fit)}</span>
@@ -889,7 +966,7 @@ function renderBulkTailor(queue) {
       ${btn(`Select not tailored (${untailored.length})`, 'tailor-select', { which: 'untailored' }, 'sm', !untailored.length)}
       ${btn(allOn ? 'Clear' : 'Select all', 'tailor-select', { which: allOn ? 'none' : 'all' }, 'sm')}
       ${btn(`Skip tailoring${eligible ? ` ${eligible}` : ''}`, 'bulk-tailor', { mode: 'skip' }, 'sm', !eligible || queueing)}
-      ${btn(queueing ? 'Queueing…' : `Tailor${eligible ? ` ${eligible}` : ''}`, 'bulk-tailor', { mode: 'tailor' }, 'sm primary', !eligible || queueing)}
+      <span title="${attr(eligible > tailorable ? `${eligible - tailorable} selected job${eligible - tailorable === 1 ? ' is' : 's are'} not ranked yet: rank first, or skip tailoring` : 'Tailor the selected jobs')}">${btn(queueing ? 'Queueing…' : `Tailor${tailorable ? ` ${tailorable}` : ''}`, 'bulk-tailor', { mode: 'tailor' }, 'sm primary', !tailorable || queueing)}</span>
     </div>
     <div class="row wrap gap10 xs muted" style="padding:10px 18px;border-bottom:1px solid var(--line2)">
       <label class="row gap6"><input type="checkbox" data-act="tailor-regenerate" ${S.tailorRegenerate ? 'checked' : ''}> Redo jobs that already have a packet</label>
@@ -1072,20 +1149,44 @@ function renderKit() {
 }
 
 /* ───────────── tracker ───────────── */
+// Tracker filters run in the browser: /api/tracker already returns every submitted application.
+function trackerLocations(apps) {
+  const counts = {};
+  for (const a of apps) { const k = locationKey(a.location); counts[k] = (counts[k] || 0) + 1; }
+  return Object.entries(counts).sort((x, y) => y[1] - x[1] || x[0].localeCompare(y[0]));
+}
+function filterTracker(apps, f) {
+  const q = f.q.trim().toLowerCase();
+  return apps.filter(a => (f.location === 'all' || locationKey(a.location) === f.location)
+    && (!f.min_fit || (a.fit ?? -1) >= f.min_fit)
+    && (!q || `${a.title} ${a.company} ${a.location || ''}`.toLowerCase().includes(q)));
+}
+function renderTrackerFilters(all, shown) {
+  const f = S.tf, active = f.q || f.location !== 'all' || f.min_fit;
+  const opts = (list, cur) => list.map(([v, t]) => `<option value="${attr(v)}" ${String(v) === String(cur) ? 'selected' : ''}>${esc(t)}</option>`).join('');
+  return `<section class="card flush"><div class="toolbar" style="border-bottom:0">
+    <input class="input grow" style="min-width:180px" id="tf-q" data-tf="q" value="${attr(f.q)}" placeholder="Search role, company or location…">
+    <select class="select" id="tf-location" data-tf="location" aria-label="Location">${opts(locationOptions(trackerLocations(all)), f.location)}</select>
+    <select class="select" id="tf-min" data-tf="min_fit" aria-label="Minimum fit">${opts([[0, 'Any fit'], [50, 'Fit ≥ 50'], [70, 'Fit ≥ 70'], [80, 'Fit ≥ 80']], f.min_fit)}</select>
+    ${active ? `<span class="small muted">Showing ${shown} of ${all.length}</span>${btn('Reset', 'tracker-reset-filters', {}, 'sm')}` : ''}</div></section>`;
+}
+
 function renderTracker() {
   const t = D.tracker; if (!t) return loading();
-  const apps = t.applications;
+  const all = t.applications, apps = filterTracker(all, S.tf);
   const stats = [[t.stats.live, 'Live applications', 'var(--ink)'], [t.stats.replies, 'Replies', 'var(--good)'], [t.stats.due, 'Follow-ups due', 'var(--warn)'], [t.stats.response_rate, 'Response rate', 'var(--brand-ink)']];
   const head = `<div class="row wrap gap10"><div class="row wrap gap10 grow statrow">${stats.map(([n, l, c]) => `<div class="card" style="padding:11px 15px;min-width:130px;border-radius:11px"><div class="mono bb" style="font-size:20px;color:${c}">${esc(n)}</div><div class="xs muted mt4">${l}</div></div>`).join('')}</div>
     ${btn('Board', 'tracker-view', { id: 'board' }, S.trackerView === 'board' ? '' : 'ghost')}${btn('Timeline', 'tracker-view', { id: 'timeline' }, S.trackerView === 'timeline' ? '' : 'ghost')}</div>`;
-  if (!apps.length) return `<div class="stack">${head}<section class="card">${empty('No submitted applications yet', 'Approve a packet and confirm you applied from the apply kit — it lands here.', btn('Open approvals', 'go', { screen: 'approvals' }, 'primary'))}</section></div>`;
+  if (!all.length) return `<div class="stack">${head}<section class="card">${empty('No submitted applications yet', 'Approve a packet and confirm you applied from the apply kit — it lands here.', btn('Open approvals', 'go', { screen: 'approvals' }, 'primary'))}</section></div>`;
+  const filters = renderTrackerFilters(all, apps.length);
+  if (!apps.length) return `<div class="stack">${head}${filters}<section class="card">${empty('No applications match', 'Try another location or clear the filters.', btn('Reset filters', 'tracker-reset-filters', {}, 'primary'))}</section></div>`;
   if (S.trackerView === 'timeline') {
     const events = apps.flatMap(a => a.timeline.map(e => ({ ...e, app: a }))).sort((x, y) => y.at.localeCompare(x.at));
-    return `<div class="stack">${head}<section class="card">${events.map(e => `<div class="tl"><div class="tl-rail"><span class="d" style="background:${KIND_DOT[e.kind] || '#c6cad8'}"></span><span class="l"></span></div><div style="padding-bottom:16px" class="grow"><div class="small b">${esc(e.app.company)} · ${esc(e.title)}</div><div class="xs muted mt4">${fmtDateTime(e.at)}${e.detail && e.kind !== 'stage' ? ' · ' + esc(e.detail) : ''}</div></div>${btn('Open', 'select-app', { id: e.app.id, board: 1 }, 'sm none')}</div>`).join('')}</section></div>`;
+    return `<div class="stack">${head}${filters}<section class="card">${events.map(e => `<div class="tl"><div class="tl-rail"><span class="d" style="background:${KIND_DOT[e.kind] || '#c6cad8'}"></span><span class="l"></span></div><div style="padding-bottom:16px" class="grow"><div class="small b">${esc(e.app.company)} · ${esc(e.title)}</div><div class="xs muted mt4">${fmtDateTime(e.at)}${e.detail && e.kind !== 'stage' ? ' · ' + esc(e.detail) : ''}</div></div>${btn('Open', 'select-app', { id: e.app.id, board: 1 }, 'sm none')}</div>`).join('')}</section></div>`;
   }
   const sel = apps.find(a => a.id === S.selApp) || apps[0];
   const stageLabel = (t.stages.find(s => s.id === sel.stage) || { label: sel.stage }).label;
-  return `<div class="stack" style="gap:14px">${head}
+  return `<div class="stack" style="gap:14px">${head}${filters}
   <div class="kanban">${t.stages.map(st => { const cards = apps.filter(a => a.stage === st.id); return `<div class="kcol" data-drop-stage="${st.id}">
       <div class="row between" style="padding:2px 4px"><div class="row gap6"><span class="dot" style="width:7px;height:7px;background:${st.dot}"></span><span class="small b">${esc(st.label)}</span></div><span class="mono xs muted">${cards.length}</span></div>
       ${cards.map(k => `<div class="kcard ${k.id === sel.id ? 'sel' : ''}" draggable="true" data-drag-app="${k.id}" data-act="select-app" data-id="${k.id}">
@@ -1185,30 +1286,49 @@ const KIND_DOT = { applied: '#5b4ae8', stage: '#0f9c86', note: '#c6cad8', call: 
 const rejectionBanner = j => !j.rejection ? ''
   : `<div class="banner warn" style="margin:0 24px;display:block"><b>Rejected ${esc(j.rejection.on)}</b> · ${esc(j.rejection.label)}${j.rejection.note ? ` — ${esc(j.rejection.note)}` : ''}</div>`;
 
+// Ranking needs the employer's words. With none (or while editing), the Description tab offers to read them from
+// the posting URL or to paste them; the text is saved only when the user says so.
+function renderDescriptionEditor(j) {
+  const fetched = S.descFetched?.[j.id];
+  return `<div class="col gap10" style="padding:20px 22px">
+    ${j.needs_description ? `<div class="banner warn" style="display:block"><b>No job description yet.</b> ${j.fit == null ? 'Ranking waits until there is one' : 'This fit score was made without one — saving a description ranks the job again'}.</div>` : ''}
+    <div class="row gap8 wrap">${j.url ? btn(label('descfetch' + j.id, 'Fetch from posting', 'Reading the posting…'), 'fetch-job-description', { id: j.id }, 'sm soft', isBusy('descfetch' + j.id)) : ''}
+      ${j.url ? `<a class="btn sm" href="${attr(j.url)}" target="_blank" rel="noopener">Open posting to copy ↗</a>` : ''}</div>
+    ${fetched === 'page_text' ? '<div class="xs muted">This page has no structured job data, so this is all of its text. Trim menus, cookie notices and other jobs before saving.</div>' : fetched === 'posting' ? '<div class="xs muted">Read from the posting. Check it before saving.</div>' : ''}
+    ${textareaF('jobdesc', j.id, j.description, 'placeholder="Paste the full job description — responsibilities, requirements, nice-to-haves…" style="min-height:220px"')}
+    <div class="row gap8">${btn(label('descsave' + j.id, j.fit == null ? 'Save and rank' : 'Save and re-rank', 'Saving…'), 'save-job-description', { id: j.id }, 'primary sm', isBusy('descsave' + j.id))}
+      ${j.needs_description ? '' : btn('Cancel', 'cancel-job-description', { id: j.id }, 'sm')}</div></div>`;
+}
+
 function renderJobModal() {
   const j = D.jobModal;
   if (!j || j.id !== S.jobOpen) return `<div class="overlay" data-act="overlay-close"><div class="modal" style="padding:40px">${loading()}</div></div>`;
   const hereIdx = j.wizard.findIndex(w => !w.done);
   const actionable = ['discovered', 'shortlisted', 'maybe', 'archived', 'dismissed'].includes(j.status);
   let tab = '';
-  if (S.jobTab === 'description') tab = `<div class="desc" style="font-size:13.5px;line-height:1.7;padding:20px 22px">${paragraphs(j.description, [...j.matches, ...j.keywords], [...j.gaps, ...j.missing])}
-      <div class="row gap12 wrap xs faint" style="margin-top:20px;padding-top:16px;border-top:1px solid var(--line2)"><span class="row gap6"><span style="width:9px;height:9px;border-radius:3px;background:#9fe0d2"></span>matched to your evidence</span><span class="row gap6"><span style="width:9px;height:9px;border-radius:3px;background:#ffd79a"></span>gap — needs a real answer</span><span>source: ${esc(j.board)}${j.search_run_id ? ` · pulled in run #${j.search_run_id}` : ''}</span></div></div>`;
+  if (S.jobTab === 'description' && (j.needs_description || S.descEdit === j.id)) tab = renderDescriptionEditor(j);
+  else if (S.jobTab === 'description') tab = `<div class="desc" style="font-size:13.5px;line-height:1.7;padding:20px 22px">${paragraphs(j.description, [...j.matches, ...j.keywords], [...j.gaps, ...j.missing])}
+      <div class="row gap12 wrap xs faint" style="margin-top:20px;padding-top:16px;border-top:1px solid var(--line2)"><span class="row gap6"><span style="width:9px;height:9px;border-radius:3px;background:#9fe0d2"></span>matched to your evidence</span><span class="row gap6"><span style="width:9px;height:9px;border-radius:3px;background:#ffd79a"></span>gap — needs a real answer</span><span>source: ${esc(j.board)}${j.search_run_id ? ` · pulled in run #${j.search_run_id}` : ''}</span>${descBadge(j.description_state, true)}${btn('Edit description', 'edit-job-description', { id: j.id }, 'sm ghost')}</div></div>`;
   else if (S.jobTab === 'requirements') tab = `<div style="padding:20px 22px" class="col gap14">${fitSummary(j)}${j.fit_analysis.must_have_missing?.length ? `<div class="box bad"><div class="xs b mb4" style="color:var(--bad)">MUST-HAVES MISSING</div><div class="small">${esc(j.fit_analysis.must_have_missing.join(' · '))}</div></div>` : ''}<div><div class="caps mb8">KEYWORDS</div><div class="row wrap gap6">${j.keywords.map(k => pill(k, 'plain', 'lg')).join('') || '<span class="small muted">Rank this job to extract keywords.</span>'}</div></div></div>`;
   else if (S.jobTab === 'structured') tab = renderJobStructured(j);
   else tab = `<div style="padding:20px 22px">${textareaF('jobnotes', j.id, j.notes, 'placeholder="Anything worth remembering about this role…" style="min-height:160px"')}${btn(label('jobnotes', 'Save notes', 'Saving…'), 'save-job-notes', { id: j.id }, 'primary sm mt10', isBusy('jobnotes'))}</div>`;
-  return `<div class="overlay" data-act="overlay-close"><div class="modal" role="dialog" aria-label="Job detail">
+  return `<div class="overlay" data-act="overlay-close"><div class="modal" role="dialog" aria-label="Job detail" data-scroll-key="job-modal-${j.id}">
     <div class="modal-head"><div class="row top-align gap16 wrap"><div class="avatar lg">${esc(initials(j.company))}</div>
-      <div style="flex:1 1 240px;min-width:0"><div style="font-size:21px;font-weight:600;letter-spacing:-.02em">${esc(j.title)}</div><div class="muted mt4" style="font-size:13.5px">${esc(j.company)}${j.location ? ' · ' + esc(j.location) : ''} · ${esc(j.board)} · found ${esc(j.posted)}</div></div>
+      <div style="flex:1 1 240px;min-width:0"><div style="font-size:21px;font-weight:600;letter-spacing:-.02em">${esc(j.title)}</div><div class="muted mt4" style="font-size:13.5px">${esc(j.company)}${j.location ? ' · ' + esc(j.location) : ''} · ${esc(j.board)} · ${postedTxt(j) ? `<span class="ink2">${esc(postedTxt(j))}</span>` : '<span class="faint" title="The job board did not give a posting date">posting date not listed</span>'} · found ${esc(j.posted)}</div></div>
       <div class="row gap8 wrap"><div class="scorebox sm"><div class="n">${fitTxt(j.fit)}</div><div class="l">FIT</div></div>
         ${j.url ? `<a class="btn" href="${attr(j.url)}" target="_blank" rel="noopener">Open posting ↗</a>` : ''}
-        ${btn(j.resume_id ? 'Open packet' : 'Tailor resume', 'modal-tailor', { id: j.id }, 'primary')}${btn('Close', 'close-job')}</div></div>
+        ${j.resume_id ? btn('Open packet', 'modal-tailor', { id: j.id }, 'primary')
+          : j.needs_description ? `<span title="Ranking and tailoring need the job description">${btn('Add description', 'edit-job-description', { id: j.id }, 'primary')}</span>`
+          : j.fit == null ? `<span title="Tailoring works from the ranking: rank this job first">${btn(label('rank' + j.id, 'Rank first', 'Queueing…'), 'rank-job', { id: j.id }, 'primary', isBusy('rank' + j.id))}</span>`
+          : btn('Tailor resume', 'modal-tailor', { id: j.id }, 'primary')}${btn('Close', 'close-job')}</div></div>
       <div class="wizard">${j.wizard.map((w, i) => `<div class="${w.done ? 'done' : i === hereIdx ? 'here' : ''}"><div class="row gap6"><span class="m">${w.done ? '✓' : i + 1}</span><span class="small b" style="color:${w.done ? 'var(--ink)' : i === hereIdx ? 'var(--brand-ink)' : 'var(--faint)'}">${w.label}</span></div><div class="xs muted mt4">${esc(i === hereIdx && !w.done ? 'next step' : w.meta)}</div></div>`).join('')}</div></div>
     ${rejectionBanner(j)}
     <div class="split gap16" style="padding:18px 24px 24px">
       <section class="card flush" style="flex:1 1 420px;min-width:0"><div class="tabs under">${[['description', 'Description'], ['structured', 'Structured JD'], ['requirements', 'Requirements map'], ['notes', 'Notes']].map(([id, t]) => `<button class="${S.jobTab === id ? 'on' : ''}" data-act="job-tab" data-id="${id}">${t}</button>`).join('')}</div>${tab}</section>
       <div class="col gap14" style="flex:1 1 280px;min-width:0">
         <section class="card pad18"><div class="row gap8 mb14">${pill('AI', 'brand')}<span class="card-title sm">Fit breakdown</span></div>
-          ${j.fit == null ? `<div class="small muted mb12">Not ranked yet.</div>${btn(label('rank' + j.id, 'Rank this job', 'Queueing…'), 'rank-job', { id: j.id }, 'soft', isBusy('rank' + j.id))}` : `
+          ${j.fit == null && j.needs_description ? '<div class="small muted">Not ranked: add the job description first — a score from a title alone would mean nothing.</div>'
+          : j.fit == null ? `<div class="small muted mb12">Not ranked yet.</div>${btn(label('rank' + j.id, 'Rank this job', 'Queueing…'), 'rank-job', { id: j.id }, 'soft', isBusy('rank' + j.id))}` : `
           <div class="row base gap8 mb14"><span class="mono bb" style="font-size:34px;color:var(--brand-ink);line-height:1">${fitTxt(j.fit)}</span><span class="small muted">${j.rank_pct != null ? `top ${j.rank_pct}% of your ranked jobs` : ''}</span></div>
           <div class="col gap10"><div><div class="row between small mb4"><span class="muted">Strong matches</span><span class="mono b">${j.matches.length}</span></div>${bar(Math.min(100, j.matches.length * 15) + '%', '#5b4ae8')}</div>
             <div><div class="row between small mb4"><span class="muted">Gaps flagged</span><span class="mono b">${j.gaps.length + j.missing.length}</span></div>${bar(Math.min(100, (j.gaps.length + j.missing.length) * 20) + '%', '#e0a136')}</div>
@@ -1239,20 +1359,33 @@ function renderPalette() {
 
 /* ───────────── render ───────────── */
 const RENDER = { overview: renderOverview, today: renderToday, discovery: renderDiscovery, tailor: renderTailor, approvals: renderApprovals, tracker: renderTracker, monitoring: renderMonitoring, knowledge: renderKnowledge, settings: renderSettings };
+// Re-rendering replaces the markup, so a scrolled box would snap back to the top on every refresh (the ranking
+// tracker polls every few seconds). A box with data-scroll-key keeps its position across renders.
+function keptScroll() {
+  return new Map([...document.querySelectorAll('[data-scroll-key]')].map(el => [el.dataset.scrollKey, [el.scrollTop, el.scrollLeft]]));
+}
+function restoreScroll(kept) {
+  for (const el of document.querySelectorAll('[data-scroll-key]')) {
+    const at = kept.get(el.dataset.scrollKey);
+    if (at) [el.scrollTop, el.scrollLeft] = at;
+  }
+}
 function render() {
+  const kept = keptScroll();
   const active = document.activeElement;
   const fid = active && active.id;
   let selRange = null;
   try { if (fid && typeof active.selectionStart === 'number') selRange = [active.selectionStart, active.selectionEnd]; } catch { /* not a text field */ }
   $('#nav').innerHTML = renderNav();
   $('#side-foot').innerHTML = renderSideFoot();
-  if (D.summary) $('#side-meta').textContent = `${D.summary.model || D.summary.llm_provider} · ${D.summary.application_mode.replace('_', ' ')}`;
+  if (D.summary) $('#side-meta').textContent = `${D.summary.model || D.summary.llm_provider || ''} · ${(D.summary.application_mode || '').replace('_', ' ')}`;
   if (D.summary?.profile) $('#brand-sub').textContent = [D.summary.profile.name, D.summary.profile.headline].filter(Boolean).join(' · ') || 'Set up your profile';
   $('#top').innerHTML = renderTop();
   $('#view').innerHTML = RENDER[S.screen]();
   $('#overlays').innerHTML = (S.jobOpen ? renderJobModal() : '') + (S.kitJob ? renderKit() : '') + (S.paletteOpen ? renderPalette() : '') + (S.mon?.request ? renderMonRequestModal() : '')
     + (S.mon?.ext?.request ? renderMonExtRequestModal() : '') + (S.mon?.logs?.entry ? renderMonLogModal() : '');
   document.body.style.overflow = (S.jobOpen || S.kitJob || S.paletteOpen || S.mon?.request) ? 'hidden' : '';
+  restoreScroll(kept);
   if (fid) {
     const el = document.getElementById(fid);
     if (el) { el.focus({ preventScroll: true }); if (selRange) { try { el.setSelectionRange(...selRange); } catch { /* ignore */ } } }
@@ -1542,6 +1675,33 @@ const A = {
     go('knowledge', { knowledgeSection: 'evidence' });
     document.getElementById('ev-claim')?.focus();
   },
+  'tracker-reset-filters': () => { S.tf = { q: '', location: 'all', min_fit: 0 }; render(); },
+  'set-gateway': el => busy('gateway', async () => {
+    D.gateway = await api('/api/settings/ai/gateway', { method: 'PUT', body: { enabled: !!el.dataset.on } });
+    api('/api/workspace/summary').then(sum => { D.summary = sum; render(); }).catch(() => {});
+    if (S.screen === 'settings' && typeof aimLoad === 'function') await aimLoad();  // Settings → AI models shows it too
+    return D.gateway;
+  }, g => g.gateway_enabled ? 'Workers now use the LiteLLM gateway' : `Workers now call ${g.direct_label} directly`),
+  'edit-job-description': el => { S.jobTab = 'description'; S.descEdit = Number(el.dataset.id); render(); },
+  'cancel-job-description': el => {
+    S.descEdit = null; if (S.forms.jobdesc) delete S.forms.jobdesc[el.dataset.id];
+    if (S.descFetched) delete S.descFetched[el.dataset.id];
+    render();
+  },
+  'fetch-job-description': el => busy('descfetch' + el.dataset.id, async () => {
+    const out = await api(`/api/jobs/${el.dataset.id}/description/fetch`, { method: 'POST' });
+    (S.forms.jobdesc ||= {})[el.dataset.id] = out.description;
+    (S.descFetched ||= {})[el.dataset.id] = out.source;
+    return out;
+  }, 'Description read from the posting — check it, then save'),
+  'save-job-description': el => busy('descsave' + el.dataset.id, async () => {
+    const id = el.dataset.id;
+    const out = await api(`/api/jobs/${id}/description`, { method: 'PUT', body: { description: fv('jobdesc', id, D.jobModal?.description || '') } });
+    S.descEdit = null; delete S.forms.jobdesc?.[id]; delete S.descFetched?.[id];
+    if (out.ranking_queued) watchRanking([Number(id)]);
+    D.jobModal = await api(`/api/jobs/${id}`).catch(() => D.jobModal);
+    return out;
+  }, out => out.ranking_queued ? 'Description saved · queued for ranking' : `Description saved${out.ranking_skipped ? ` · not re-ranked: ${out.ranking_skipped}` : ''}`),
   'rank-job': el => busy('rank' + el.dataset.id, async () => {
     const out = await api(`/api/jobs/${el.dataset.id}/rank`, { method: 'POST' });
     watchRanking(out.queued);
@@ -1561,21 +1721,25 @@ const A = {
     S.checked.clear(); await load(); return out;
   }, out => `${out.changed} job${out.changed === 1 ? '' : 's'} updated`),
   // Shortlist the selection so it reaches the Tailor queue, then open Bulk tailor with exactly those jobs ticked.
+  // Only ranked jobs go: tailoring works from the ranking. Unranked ones stay selected here, ready to rank.
   'bulk-to-tailor': () => busy('bulkToTailor', async () => {
-    const ids = [...S.checked];
+    const ids = rankedSelection();
+    const unranked = S.checked.size - ids.length;
     await api('/api/jobs/bulk-triage', { method: 'POST', body: { ids, action: 'shortlist' } });
     const queue = await api('/api/tailor/queue'), inQueue = new Set(queue.map(j => j.id));
     const queued = ids.filter(id => inQueue.has(id));
-    S.checked.clear();
+    ids.forEach(id => S.checked.delete(id));
     go('tailor', { tailorMode: 'bulk', tailorChecked: new Set(queued) });
-    return { queued: queued.length, left: ids.length - queued.length };
-  }, r => `${r.queued} job${r.queued === 1 ? '' : 's'} ready to bulk tailor${r.left ? ` · ${r.left} already approved or applied` : ''}`),
+    return { queued: queued.length, left: ids.length - queued.length, unranked };
+  }, r => `${r.queued} job${r.queued === 1 ? '' : 's'} ready to bulk tailor${r.left ? ` · ${r.left} already approved or applied` : ''}${r.unranked ? ` · ${r.unranked} not ranked yet, left out` : ''}`),
   'select-all-matching': (el, e) => {
     e.preventDefault();
     return busy('selectAll', async () => {
       const f = S.filters;
       const out = await api('/api/jobs/search?' + qs({ ...f, min_fit: f.min_fit || '', ids_only: true }));
       out.ids.forEach(id => S.checked.add(id));
+      const ranked = new Set(out.ranked_ids || []);
+      out.ids.forEach(id => ranked.has(id) ? S.rankedIds.add(id) : S.rankedIds.delete(id));
     });
   },
   'clear-selection': (el, e) => { e.preventDefault(); S.checked.clear(); render(); },
@@ -1601,7 +1765,7 @@ const A = {
     }, out => `Deleted ${out.deleted} job${out.deleted === 1 ? '' : 's'}${out.protected.length ? ` · kept ${out.protected.length} approved or applied` : ''}`);
   },
   'pf-reset': el => { S.pf[el.dataset.kind] = pfDefaults(el.dataset.kind); load(); },
-  'reset-filters': (el, e) => { e.preventDefault(); S.filters = { q: '', min_fit: 0, board: 'all', stage: 'all', sort: 'fit', page: 1, per_page: S.filters.per_page }; load(); },
+  'reset-filters': (el, e) => { e.preventDefault(); S.filters = { q: '', min_fit: 0, board: 'all', location: 'all', stage: 'all', description: 'all', date_field: 'found', within: '', include_applied: false, sort: 'fit', page: 1, per_page: S.filters.per_page }; load(); },
   page: el => { S.filters.page = Number(el.dataset.page); load(); },
   // setup
   'focus-tag': (el, e) => { if (e.target === el) document.getElementById(el.dataset.target)?.focus(); },
@@ -1742,6 +1906,23 @@ const A = {
     return out;
   }, rankQueuedMsg),
   'ranking-refresh': () => busy('rankRefresh', () => loadRanking()),
+  // Clearing hides finished rankings from this list only: each job keeps its rankings, errors and history.
+  'ranking-clear': () => {
+    const n = D.ranking?.recent.length || 0;
+    if (!confirm(`Clear ${n} finished ranking${n === 1 ? '' : 's'} from this list? Jobs keep their rankings and history, and failed ones can still be ranked again from the job.`)) return;
+    return busy('rankClear', async () => { await api('/api/ranking/finished/clear', { method: 'POST' }); await loadRanking(); }, 'Finished list cleared');
+  },
+  'ranking-unclear': () => busy('rankClear', async () => { await api('/api/ranking/finished/clear', { method: 'DELETE' }); await loadRanking(); }),
+  'ranking-reset-filters': () => { S.rf = { q: '', location: 'all' }; loadRanking().then(render); },
+  'ranking-remove': el => {
+    const ids = String(el.dataset.ids).split(',').map(Number);
+    if (el.dataset.confirm && !confirm(`Take ${ids.length} job${ids.length === 1 ? '' : 's'} out of the ranking queue? You can rank ${ids.length === 1 ? 'it' : 'any of them'} again later from the job.`)) return;
+    return busy(el.dataset.confirm ? 'rankRemoveAll' : 'rankRemove' + ids[0], async () => {
+      const out = await api('/api/ranking/remove', { method: 'POST', body: { ids } });
+      await loadRanking();
+      return out;
+    }, out => `Removed ${out.removed.length} from ranking${out.skipped.length ? ` · ${out.skipped.length} not removed: ${out.skipped[0].reason}` : ''}`);
+  },
   'rank-batch': () => busy('rankBatch', async () => {
     const out = await api('/api/jobs/rank-batch', { method: 'POST' });
     if (!out.queued.length && !out.skipped.length) throw new Error('Every job is already ranked');
@@ -1774,7 +1955,8 @@ const A = {
   },
   'tailor-regenerate': (el, e) => { e.stopPropagation(); S.tailorRegenerate = !S.tailorRegenerate; render(); },
   'bulk-tailor': el => {
-    const ids = (D.tailorQueue || []).filter(j => S.tailorChecked.has(j.id) && !activeTask(j.id) && (S.tailorRegenerate || !j.has_resume || j.status === 'needs_retailor')).map(j => j.id);
+    const ids = (D.tailorQueue || []).filter(j => S.tailorChecked.has(j.id) && !activeTask(j.id) && (S.tailorRegenerate || !j.has_resume || j.status === 'needs_retailor')
+      && (el.dataset.mode === 'skip' || j.fit != null)).map(j => j.id);
     return queueTailoring(ids, el.dataset.mode, S.tailorRegenerate, 'bulkTailor', () => ids.forEach(id => S.tailorChecked.delete(id)));
   },
   'skip-tailor': el => queueTailoring([Number(el.dataset.id)], 'skip', true, 'queue' + el.dataset.id),
@@ -1925,6 +2107,8 @@ document.addEventListener('input', e => {
   if (el.dataset.rec !== undefined && S.recruiterDraft?.[el.dataset.rec]) S.recruiterDraft[el.dataset.rec][el.dataset.recfield] = el.value;
   if (el.dataset.iv && S.ivDraft) S.ivDraft[el.dataset.iv] = el.value;
   if (el.dataset.pf && el.dataset.pfkey === 'q') { S.pf[el.dataset.pf].q = el.value; clearTimeout(filterTimer); filterTimer = setTimeout(load, 250); }
+  if (el.dataset.tf === 'q') { S.tf.q = el.value; render(); }
+  if (el.dataset.rf === 'q') { S.rf.q = el.value; clearTimeout(filterTimer); filterTimer = setTimeout(() => loadRanking().then(render), 250); }
   if (el.dataset.filter === 'q') { S.filters.q = el.value; S.filters.page = 1; clearTimeout(filterTimer); filterTimer = setTimeout(load, 250); }
   if (el.dataset.triage === 'min_fit') { S.triage.min_fit = Number(el.value); clearTimeout(filterTimer); filterTimer = setTimeout(load, 250); render(); }
   if (el.dataset.palette) {
@@ -1948,8 +2132,10 @@ document.addEventListener('change', e => {
   }
   if (el.dataset.iv && S.ivDraft) S.ivDraft[el.dataset.iv] = el.value;
   if (el.dataset.pf && el.dataset.pfkey !== 'q') { const k = el.dataset.pfkey; S.pf[el.dataset.pf][k] = k.startsWith('min_') ? Number(el.value) : el.value; load(); }
-  if (el.dataset.filter && el.dataset.filter !== 'q') { S.filters[el.dataset.filter] = el.dataset.filter === 'per_page' || el.dataset.filter === 'min_fit' ? Number(el.value) : el.value; S.filters.page = 1; load(); }
-  if (el.dataset.triage && el.dataset.triage !== 'min_fit') { S.triage[el.dataset.triage] = el.checked; load(); }
+  if (el.dataset.rf && el.dataset.rf !== 'q') { S.rf[el.dataset.rf] = el.value; loadRanking().then(render); }
+  if (el.dataset.tf && el.dataset.tf !== 'q') { S.tf[el.dataset.tf] = el.dataset.tf === 'min_fit' ? Number(el.value) : el.value; render(); }
+  if (el.dataset.filter && el.dataset.filter !== 'q') { S.filters[el.dataset.filter] = el.type === 'checkbox' ? el.checked : el.dataset.filter === 'per_page' || el.dataset.filter === 'min_fit' ? Number(el.value) : el.value; S.filters.page = 1; load(); }
+  if (el.dataset.triage && el.dataset.triage !== 'min_fit') { S.triage[el.dataset.triage] = el.type === 'checkbox' ? el.checked : el.value; load(); }
   if (el.dataset.actChange) A[el.dataset.actChange](el, e);
   if (el.id === 'resume-file' && el.files[0]) { settingsUploadResume(el.files[0]); el.value = ''; }
 });

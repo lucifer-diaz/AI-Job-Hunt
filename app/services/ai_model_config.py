@@ -195,6 +195,35 @@ def gateway_settings(db: Session, user_id: int) -> tuple[str | None, str | None]
     return normalize_base_url(settings.litellm_base_url), key
 
 
+def gateway_status(db: Session, user_id: int) -> dict[str, Any]:
+    """Which way workers send requests now, and what each way needs, for the Overview switch. Read-only.
+
+    There are two routes: the LiteLLM gateway, or the one direct provider chosen in Settings (with its model).
+    `direct_provider` is the one turning the gateway off returns to (app.ai_models_api.gateway_put)."""
+    from app.services.ai_config import resolve as resolve_ai_config
+    from app.services.user_settings import KEY_LABELS, ai_overrides, user_keys
+
+    overrides = ai_overrides(db, user_id)
+    current = resolve_ai_config(get_settings(), overrides)["llm_provider"]
+    gateway = current == "litellm"
+    if gateway:
+        direct = (overrides.get("previous_provider") or "").strip().lower()
+        if not direct or direct == "litellm":
+            env = (get_settings().llm_provider or "").lower()
+            direct = env if env and env != "litellm" else "openrouter"
+    else:
+        direct = current
+    direct_model = resolve_ai_config(get_settings(), {**overrides, "llm_provider": direct})["model"]
+    base, _key = gateway_settings(db, user_id)
+    conn = db.scalar(select(LiteLLMConnection).where(LiteLLMConnection.user_id == user_id))
+    return {"gateway_enabled": gateway,
+            "direct_provider": direct, "direct_label": KEY_LABELS.get(direct, direct.title()),
+            "direct_model": direct_model, "direct_ready": direct == "mock" or bool(user_keys(db, user_id).get(direct)),
+            "litellm_ready": bool(base), "litellm_base_url": base or "",
+            "litellm_status": conn.status if conn else None,
+            "litellm_version": conn.litellm_version if conn else None}
+
+
 def connection_public(db: Session, conn: LiteLLMConnection) -> dict[str, Any]:
     key = api_key(db, conn)
     settings = get_settings()
@@ -1414,6 +1443,7 @@ def overview(db: Session, user_id: int) -> dict[str, Any]:
     ai = resolve_ai_config(get_settings(), ai_overrides(db, user_id))
     return {
         "gateway_enabled": ai["llm_provider"] == "litellm", "llm_provider": ai["llm_provider"],
+        "gateway": gateway_status(db, user_id),
         "connection": connection_public(db, conn),
         "active_version": active.version_number if active else 0,
         "draft": draft, "active": active.configuration_snapshot if active else {},

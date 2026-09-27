@@ -482,3 +482,118 @@ def test_monitoring_api_summarises_filters_and_isolates_accounts(user_id, signed
     assert everyone["requests"] >= 4
     assert admin.get(f"/api/monitoring/requests/{other_id}", params={"all_accounts": True}).status_code == 200
     assert client.get("/api/monitoring/summary", params={"range": "year"}).status_code == 422
+
+
+# ───────────── full prompt and response capture, and links to the logs ─────────────
+
+def set_capture(user_id, enabled):
+    from app.models import AppSetting
+
+    with SessionLocal() as db:
+        row = db.scalar(select(AppSetting).where(AppSetting.user_id == user_id))
+        if row is None:
+            row = AppSetting(user_id=user_id)
+            db.add(row)
+        prefs = dict(row.preferences or {})
+        row.preferences = {**prefs, "monitoring": {llm_telemetry.CAPTURE_PREFERENCE: enabled}}
+        db.commit()
+    llm_telemetry.forget_capture_setting(user_id)
+
+
+def test_an_account_can_capture_its_own_prompts_and_responses(user_id):
+    other = make_user(SessionLocal)
+    client_for(user_id, "mock").generate_prompt(ranking_prompt())
+    assert logs_for(user_id)[-1].debug_prompt is None, "off by default"
+
+    set_capture(user_id, True)
+    client_for(user_id, "mock").generate_prompt(ranking_prompt())
+    client_for(other, "mock").generate_prompt(ranking_prompt())
+    captured = logs_for(user_id)[-1]
+    assert RESUME in captured.debug_prompt and "overall_fit_score" in captured.debug_response
+    assert logs_for(other)[-1].debug_prompt is None, "one account's switch never captures another's"
+
+    set_capture(user_id, False)
+    client_for(user_id, "mock").generate_prompt(ranking_prompt())
+    assert logs_for(user_id)[-1].debug_prompt is None
+
+
+def test_the_capture_switch_is_saved_per_account_through_the_api(user_id, monkeypatch):
+    monkeypatch.setattr(auth, "authenticate", lambda request: CurrentUser(user_id, f"{user_id}@jobhunt.test", False))
+    api = TestClient(app)
+    assert api.get("/api/monitoring/capture").json()["enabled"] is False
+    out = api.put("/api/monitoring/capture", json={"enabled": True}).json()
+    assert out["enabled"] is True and out["retention_days"] == get_settings().llm_prompt_debug_retention_days
+    assert llm_telemetry.capture_payloads(user_id) is True, "the next call sees it at once"
+    assert api.put("/api/monitoring/capture", json={"enabled": False}).json()["enabled"] is False
+    assert llm_telemetry.capture_payloads(user_id) is False
+
+
+def test_captured_text_is_cleared_after_its_own_retention_but_the_row_stays(user_id):
+    with SessionLocal() as db:
+        db.add(add_log_row(user_id, created_at=utcnow() - timedelta(days=10), debug_prompt="PROMPT", debug_response="OUT"))
+        db.add(add_log_row(user_id, created_at=utcnow() - timedelta(days=1), debug_prompt="PROMPT", debug_response="OUT"))
+        db.commit()
+        out = monitoring.prune(db, retention_days=90)
+    assert out["debug_text_cleared"] >= 1
+    old, recent = logs_for(user_id)
+    assert (old.debug_prompt, old.debug_response) == (None, None) and recent.debug_prompt == "PROMPT"
+
+
+def test_a_request_links_to_its_logs_and_a_log_line_back_to_its_request(user_id):
+    from app.models import SystemLogEntry
+    from app.services import external_monitoring
+
+    trace = uuid.uuid4().hex
+    with SessionLocal() as db:
+        request = add_log_row(user_id, trace_id=trace, debug_prompt="PROMPT")
+        db.add(request)
+        db.add_all([SystemLogEntry(user_id=user_id, trace_id=trace, message="Ranking failed", level="ERROR",
+                                   category="WORKFLOW"),
+                    SystemLogEntry(user_id=user_id, trace_id=trace, message="Retrying", category="WORKFLOW")])
+        db.commit()
+        detail = monitoring.request_detail(db, request.id, user_id)
+        line = db.scalar(select(SystemLogEntry).where(SystemLogEntry.trace_id == trace).order_by(SystemLogEntry.id))
+        back = external_monitoring.log_detail(db, line.id, user_id)
+    assert detail["trace_log_count"] == 2
+    assert [r["id"] for r in back["llm_requests"]] == [request.id] and back["llm_requests"][0]["captured"] is True
+
+
+def log_lines(user_id, category=None):
+    from app.models import SystemLogEntry
+
+    with SessionLocal() as db:
+        query = select(SystemLogEntry).where(SystemLogEntry.user_id == user_id)
+        if category:
+            query = query.where(SystemLogEntry.category == category)
+        return db.scalars(query.order_by(SystemLogEntry.id)).all()
+
+
+def test_every_llm_call_writes_a_log_line_that_opens_its_prompt_and_response(user_id):
+    from app.services import external_monitoring
+
+    set_capture(user_id, True)
+    client_for(user_id, "mock").generate_prompt(ranking_prompt())
+    line, = log_lines(user_id, "LLM")
+    assert line.level == "INFO" and line.status == "SUCCEEDED" and "call succeeded" in line.message
+    request = logs_for(user_id)[-1]
+    assert line.details["llm_request_id"] == request.request_id and line.details["captured"] is True
+    with SessionLocal() as db:
+        detail = external_monitoring.log_detail(db, line.id, user_id)
+    linked, = detail["llm_requests"]
+    assert linked["id"] == request.id
+    assert RESUME in linked["payload"]["prompt"] and "overall_fit_score" in linked["payload"]["response"]
+
+
+def test_a_failed_llm_call_is_one_error_line_not_two(user_id, fake_openai):
+    fake_openai.reply = {"raise": Exception("upstream exploded")}
+    with pytest.raises(Exception):
+        client_for(user_id, "openai", {"openai": "k"}, model="gpt-5.6-luna").generate_prompt(ranking_prompt())
+    lines = log_lines(user_id)
+    assert [(l.category, l.level) for l in lines] == [("LLM", "ERROR")], "the generic API failure line is not repeated"
+    assert lines[0].details["captured"] is False
+
+
+def test_success_lines_can_be_turned_off(user_id, monkeypatch):
+    monkeypatch.setattr(get_settings(), "system_log_llm_calls", False)
+    client_for(user_id, "mock").generate_prompt(ranking_prompt())
+    assert log_lines(user_id, "LLM") == []

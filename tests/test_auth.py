@@ -179,7 +179,7 @@ def test_each_account_only_sees_and_changes_its_own_data():
     assert bob.post("/api/knowledge", json={"question": "Notice period?", "answer": "60 days"}).status_code == 200
 
     # Alice's data is intact.
-    assert alice.get("/api/jobs/search").json()["total"] == 1
+    assert alice.get("/api/jobs/search", params={"include_applied": True}).json()["total"] == 1
     assert [k["answer"] for k in alice.get("/api/knowledge").json()] == ["30 days"]
     assert alice.get(f"/api/jobs/{job['id']}").status_code == 200
     assert alice.get("/api/profile/resume").content == b"Alice's resume\nBuilt Python services at 10k rps for payments"

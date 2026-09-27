@@ -166,7 +166,12 @@ def ai_ready(db: Session, user_id: int) -> tuple[bool, str]:
 
 
 # CandidatePolicy: how AI workflows may use resume facts the user has not verified.
+# Where AI workflows take the candidate's resume from (CandidatePolicy.resume_source):
+#   structured   the facts in Settings → Resume Data. Verified corrections win, headings included.
+#   master_text  the master resume text as written: its role headings and bullets, used as-is.
+RESUME_SOURCES = ("structured", "master_text")
 CANDIDATE_POLICY_DEFAULTS = {
+    "resume_source": "structured",
     # Tailoring, review, follow-ups and application answers: verified facts only unless this is on.
     "allow_unverified_resume_facts": False,
     # Ranking may read unverified parsed facts as clearly marked, lower-confidence context.
@@ -174,6 +179,10 @@ CANDIDATE_POLICY_DEFAULTS = {
 }
 
 
-def candidate_policy(db: Session, user_id: int | None = None) -> dict[str, bool]:
+def candidate_policy(db: Session, user_id: int | None = None) -> dict[str, Any]:
     stored = (settings_for(db, user_id).preferences or {}).get("candidate_policy") or {}
-    return {key: bool(stored.get(key, default)) for key, default in CANDIDATE_POLICY_DEFAULTS.items()}
+    policy: dict[str, Any] = {key: bool(stored.get(key, default)) for key, default in CANDIDATE_POLICY_DEFAULTS.items()
+                              if isinstance(default, bool)}
+    source = stored.get("resume_source")
+    policy["resume_source"] = source if source in RESUME_SOURCES else CANDIDATE_POLICY_DEFAULTS["resume_source"]
+    return policy

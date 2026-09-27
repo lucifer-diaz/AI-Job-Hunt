@@ -23,9 +23,10 @@ from app.prompts.common import (
 )
 from app.prompts.contracts import APPLICATION_DECISIONS, ApplicationAnswerResult, describe_fields
 
+# v3: verified resume facts are application data, not untrusted text; each fact is sent once.
 # v2: answers from a prepared context (verified facts and verified knowledge answers, not the raw resume), a
 # NEEDS_INPUT decision for questions only the candidate can answer, and a typed output contract.
-APPLICATION_QUESTION_PROMPT_VERSION = "v2"
+APPLICATION_QUESTION_PROMPT_VERSION = "v3"
 APPLICATION_QUESTION_MARKER = "APPLICATION_QUESTION"
 __all__ = ["APPLICATION_DECISIONS", "APPLICATION_QUESTION_PROMPT_VERSION", "build_application_question_prompt"]
 
@@ -55,7 +56,7 @@ def build_application_question_prompt(question: str, context: Any, options: list
         section("CANDIDATE PROFILE", to_json(context_value(context, "candidate", {}) or {})),
         section("CANDIDATE POLICY", to_json(context_value(context, "policy", {}) or {})),
         section("KNOWN ANSWERS", to_json(knowledge)) if knowledge else "",
-        untrusted("VERIFIED RESUME FACTS", "untrusted_resume_facts", to_json(resume_facts(context), limit=16000)),
+        section("VERIFIED RESUME FACTS", to_json(resume_facts(context), limit=16000)),
         section("VERIFIED EVIDENCE", to_json(context_value(context, "relevant_evidence", []), limit=16000)),
     )
     return Prompt("application_question", APPLICATION_QUESTION_PROMPT_VERSION, APPLICATION_QUESTION_MARKER,

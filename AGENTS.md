@@ -65,6 +65,9 @@ call before a request, because a developer can forget one; the client *is* the t
 * **Never store request or response bodies by default.** Sizes are recorded instead.
   `EXTERNAL_API_DEBUG_PAYLOADS=true` stores short, redacted, capped extracts for debugging. It is off in
   production, and leaving it off is the default answer.
+* **LLM prompts and responses are captured only on request**: `LLM_PROMPT_DEBUG` (every account) or an account's own
+  switch in Monitoring → LLM requests (`AppSetting.preferences["monitoring"]["capture_llm_payloads"]`, off by default).
+  The text is redacted on write and on read, and cleared after `LLM_PROMPT_DEBUG_RETENTION_DAYS` (7).
 * **Never guess a cost.** `record_usage(cost=...)` takes a figure the provider reported. Unknown cost stays
   NULL; NULL means unknown, not free.
 * **Telemetry must not change an outcome.** Every failure inside `external_api` and `system_log` is caught and
@@ -115,9 +118,10 @@ a new integration inherits it. Annotate what becomes known mid-flight with `trac
 
 ## Operational logging
 
-`app/services/system_log.py` writes the Monitoring → Logs table: failed or slow external calls, scheduler runs
-and workflow milestones. It is for events a person would want to see, not a debug stream — ordinary successful
-calls are already one row each in the request table.
+`app/services/system_log.py` writes the Monitoring → Logs table: failed or slow external calls, every LLM call
+(`llm_telemetry.log_call`, INFO on success, linked to its request row; `SYSTEM_LOG_LLM_CALLS=false` keeps only
+failures), scheduler runs and workflow milestones. It is for events a person would want to see, not a debug
+stream — ordinary successful non-LLM calls are already one row each in the request table.
 
 ## Prompts and LLM workers
 

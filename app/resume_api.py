@@ -58,6 +58,7 @@ class ResolveIn(BaseModel):
 
 
 class PolicyIn(BaseModel):
+    resume_source: Literal["structured", "master_text"] | None = None
     allow_unverified_resume_facts: bool | None = None
     ranking_uses_unverified: bool | None = None
 

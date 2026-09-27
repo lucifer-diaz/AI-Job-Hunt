@@ -855,3 +855,82 @@ def test_the_parse_lock_holds_the_sqlite_writer_lock_until_commit(user):
             other.commit()
         other.close()
         db.rollback()
+
+
+# ───────────── a requirement in the wrong shape ─────────────
+
+SKILL_SHAPED = {"structured_description": {}, "requirements": [
+    {"skill": "Strong hands-on Google Cloud Platform (GCP) experience"},
+    {"skill": "Deep production experience with Kubernetes (GKE preferred)"}]}
+
+
+def test_requirements_without_the_template_fields_break_the_contract():
+    """Regression: {"skill": ...} items used to pass the contract (typed as plain dicts) and only failed in the
+    service, on every attempt, so the gateway never sent its one schema correction."""
+    from pydantic import ValidationError
+
+    from app.prompts.contracts import JobDescriptionParserOutput
+
+    with pytest.raises(ValidationError) as caught:
+        JobDescriptionParserOutput.model_validate(SKILL_SHAPED)
+    fields = {".".join(str(p) for p in e["loc"]) for e in caught.value.errors()}
+    assert {"requirements.0.normalized_value", "requirements.0.skill"} <= fields
+    ok = JobDescriptionParserOutput.model_validate({"structured_description": {}, "requirements": [
+        {"type": "skill", "normalized_value": "GCP", "requirement_level": "required",
+         "source_text": "Strong hands-on GCP experience"}] * 250})
+    assert ok.requirements[0].requirement_level == "REQUIRED", "levels are normalised, not failed"
+    assert len(ok.requirements) == 250, "a long list is not a contract failure: the service keeps the first 200"
+
+
+def test_a_skill_shaped_answer_is_corrected_once_and_then_parses(user, monkeypatch):
+    from app.services.llm import LLMClient
+
+    job_id = add_job(user)
+    answers = []
+    real = LLMClient._mock
+
+    def mock(self, task, user_text):
+        if "PARSE_JOB_DESCRIPTION" in user_text.split("\n", 1)[0]:
+            answers.append(user_text)
+            if len(answers) == 1:
+                return SKILL_SHAPED
+        return real(self, task, user_text)
+    monkeypatch.setattr(LLMClient, "_mock", mock)
+    parse(user, job_id)
+    assert len(answers) == 2 and "SCHEMA CORRECTION" in answers[1]
+    assert "normalized_value" in answers[1].split("SCHEMA CORRECTION", 1)[1], "it says what was missing"
+    with session(user) as db:
+        rows = db.scalars(select(JobRequirementEvidence).where(JobRequirementEvidence.job_id == job_id)).all()
+    assert rows and all(row.normalized_value for row in rows)
+
+
+# ───────────── the parse state lists show and filter by ─────────────
+
+def test_the_description_state_says_where_the_parse_stands(user):
+    job_id = add_job(user)
+    with session(user) as db:
+        job = db.get(Job, job_id)
+        assert jd.description_state(Job(description=""), None) == "NO_DESCRIPTION"
+        assert jd.description_state(job, "PENDING") == "PARSING"
+        assert jd.description_state(job, None) == "NOT_PARSED"
+    parse(user, job_id)
+    with session(user) as db:
+        job = db.get(Job, job_id)
+        status = jd.latest_parse_statuses(db, [job_id]).get(job_id)
+        assert jd.description_state(job, status) == "PARSED"
+        job.description = job.description + "\nAlso: Rust."  # new wording: the old parse no longer counts
+        assert jd.description_state(job, status) == "NOT_PARSED"
+        job.structured_description_status = jd.NEEDS_REVIEW
+        assert jd.description_state(job, "FAILED") == "FAILED"
+
+
+def test_the_jobs_table_filters_by_description_state(user):
+    parsed, waiting = add_job(user), add_job(user)
+    parse(user, parsed)
+    out = client.get("/api/jobs/search", params={"q": "Globex", "description": "PARSED", "per_page": 200}).json()
+    ids = {item["id"] for item in out["items"]}
+    assert parsed in ids and waiting not in ids
+    assert all(item["description_state"] == "PARSED" for item in out["items"])
+    assert {key for key, _name, _n in out["description_states"]} == set(jd.DESCRIPTION_STATES)
+    assert client.get("/api/jobs/search", params={"description": "nope"}).status_code == 422
+    assert client.get(f"/api/jobs/{parsed}").json()["description_state"] == "PARSED"

@@ -9,26 +9,35 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.concurrency import run_in_threadpool
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, Field
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from app import auth
+from app.ai_models_api import router as ai_models_router
 from app.auth import PASSWORD_MIN_LENGTH, CurrentUser, current_user, get_user_db
 from app.auth import router as auth_router
 from app.db import engine
 from app.db_migrations import run_migrations
-from app.ai_models_api import router as ai_models_router
 from app.hunter_api import router as hunter_router
-from app.monitoring_api import router as monitoring_router
 from app.job_description_api import router as job_description_router
-from app.resume_api import router as resume_router
 from app.models import (
     Application,
     CandidateProfile,
@@ -41,10 +50,11 @@ from app.models import (
     SchedulerJob,
     SearchRun,
 )
+from app.monitoring_api import router as monitoring_router
+from app.resume_api import router as resume_router
 from app.scheduler import build_scheduler
 from app.scheduler_hooks import run_soon
 from app.schemas import (
-    McpTokenIn,
     ApifySearchIn,
     ApiKeysIn,
     ApplicationUpdateIn,
@@ -53,6 +63,7 @@ from app.schemas import (
     EvidenceIn,
     KnowledgeIn,
     ManualJobIn,
+    McpTokenIn,
     ProfileIn,
     ProfilePatch,
     RecruiterIn,
@@ -62,16 +73,23 @@ from app.schemas import (
     TailorTasksIn,
 )
 from app.security import SecretsUnavailable
-from app.services import backoff, mcp_tokens, ranker, resume_verification, tailor_tasks, tracing
+from app.services import (
+    backoff,
+    context_builder,
+    mcp_tokens,
+    ranker,
+    resume_verification,
+    tailor_tasks,
+    tracing,
+)
 from app.services.ai_config import PROVIDERS as AI_PROVIDERS
-from app.services.ai_model_config import gateway_settings
 from app.services.ai_config import STAGES as AI_STAGES
 from app.services.ai_config import env_defaults as ai_env_defaults
 from app.services.ai_config import resolve as resolve_ai_config
+from app.services.ai_model_config import gateway_settings
 from app.services.contacts import recruiters_of, set_primary_recruiter
 from app.services.exports import markdown_to_simple_pdf
 from app.services.knowledge import question_key
-from app.services.structured_resume import clean_raw_text
 from app.services.sources import (
     import_greenhouse,
     import_lever,
@@ -79,6 +97,7 @@ from app.services.sources import (
     start_apify_search,
     upsert_job,
 )
+from app.services.structured_resume import clean_raw_text
 from app.services.user_settings import (
     EXECUTION_MODES,
     PROCESSING_LIMITS,
@@ -190,9 +209,11 @@ def job_dict(j: Job) -> dict:
 
 
 def _asset_version() -> str:
-    # Cache-bust static assets whenever they change, not only on version bumps.
+    # Cache-bust static assets whenever any of them changes, not only on version bumps. Every script and stylesheet
+    # counts: a hand-kept list once left resume_data.js out, and browsers kept running its old copy.
     static = Path(__file__).parent / "static"
-    return f"{app.version}-{max(int((static / name).stat().st_mtime) for name in ('app.js', 'app.css', 'settings.js', 'knowledge.js', 'ai_models.js', 'monitoring.js'))}"
+    assets = [path for pattern in ("*.js", "*.css") for path in static.glob(pattern)]
+    return f"{app.version}-{max((int(path.stat().st_mtime) for path in assets), default=0)}"
 
 
 @app.get("/health")
@@ -287,7 +308,11 @@ def settings_get(db: Session = Depends(get_user_db)):
             "keys": keys,
             "secret_storage": bool(settings.secret_key),
             # Raw saved values (blank = inherit) plus the server defaults, for the editor.
-            "ai": {"saved": {"llm_provider": overrides.get("llm_provider") or "", "model": overrides.get("model") or "",
+            # In gateway mode the form shows the direct provider the gateway switch returns to, not "litellm".
+            "ai": {"saved": {"llm_provider": (overrides.get("previous_provider") or ""
+                                              if (overrides.get("llm_provider") or "") == "litellm"
+                                              else overrides.get("llm_provider") or ""),
+                             "model": overrides.get("model") or "",
                              "stage_models": overrides.get("stage_models") or {},
                              "require_free": overrides.get("require_free")},
                    "env": ai_env_defaults(settings), "effective": effective}}
@@ -310,6 +335,12 @@ def settings_put(payload: SettingsIn, db: Session = Depends(get_user_db)):
     ai = {"llm_provider": provider, "model": payload.model.strip(),
           "stage_models": {k: v.strip()[:300] for k, v in payload.stage_models.items() if v.strip()},
           "require_free": payload.require_free}
+    # The route (LiteLLM or direct) is chosen only with the gateway switch (PUT /api/settings/ai/gateway). While the
+    # gateway is on, this form edits the direct provider that turning it off returns to — never the route itself.
+    saved_ai = (value.preferences or {}).get("ai") or {}
+    if resolve_ai_config(settings, saved_ai)["llm_provider"] == "litellm":
+        ai["previous_provider"] = provider if provider != "litellm" else saved_ai.get("previous_provider", "")
+        ai["llm_provider"] = "litellm"
     ceilings = processing_maximums()
     limits = {**processing_limits(db),
               **{name: min(asked, ceilings[name]) for name in PROCESSING_LIMITS
@@ -500,9 +531,11 @@ def ranking_tasks(job_ids: str = "", db: Session = Depends(get_user_db)):
 
 
 @app.get("/api/ranking/tracker")
-def ranking_tracker(request: Request, db: Session = Depends(get_user_db)):
-    """The ranking tracker: this account's waiting, running, retrying and recently finished ranking work."""
-    out = ranker.tracker(db, require_user_id(db))
+def ranking_tracker(request: Request, q: str = Query("", max_length=200), location: str = Query("all", max_length=200),
+                    db: Session = Depends(get_user_db)):
+    """The ranking tracker: this account's waiting, running, retrying and recently finished ranking work.
+    `q` and `location` narrow the lists (never the counts)."""
+    out = ranker.tracker(db, require_user_id(db), q=q, location=location)
     worker = getattr(request.app.state, "scheduler", None)
     row = db.get(SchedulerJob, "ranking")
     live = bool(row and row.lock_expires_at and row.lock_expires_at > datetime.now(UTC).replace(tzinfo=None))
@@ -512,6 +545,30 @@ def ranking_tracker(request: Request, db: Session = Depends(get_user_db)):
                      "next_run_at": row.next_run_at.isoformat() if row and row.next_run_at else None,
                      "last_finished_at": row.last_finished_at.isoformat() if row and row.last_finished_at else None}
     return out
+
+
+class RankingRemoveIn(BaseModel):
+    ids: list[int] = Field(min_length=1, max_length=5000)
+
+
+@app.post("/api/ranking/remove")
+def remove_from_ranking(payload: RankingRemoveIn, db: Session = Depends(get_user_db)):
+    """Take jobs out of the ranking queue. Asking to rank one again later puts it back."""
+    return ranker.remove_from_ranking(db, payload.ids, actor=f"user:{require_user_id(db)}")
+
+
+@app.post("/api/ranking/finished/clear")
+def clear_finished_rankings(db: Session = Depends(get_user_db)):
+    """Clear the tracker's finished list. Only the view changes; ranking history is kept."""
+    ranker.clear_finished(db, require_user_id(db))
+    return {"ok": True}
+
+
+@app.delete("/api/ranking/finished/clear")
+def show_finished_rankings(db: Session = Depends(get_user_db)):
+    """Show every ranking finished in the last 24 hours again."""
+    ranker.clear_finished(db, require_user_id(db), clear=False)
+    return {"ok": True}
 
 
 @app.get("/api/jobs/{job_id}/rankings")
@@ -562,6 +619,9 @@ def bulk_tailor(payload: BulkTailorIn, db: Session = Depends(get_user_db)):
     has_packet = set(db.scalars(select(ResumeVariant.job_id).where(ResumeVariant.job_id.in_(wanted))).all())
     queue = [i for i in wanted if i in jobs and jobs[i].status in SKIP_TAILORING_STATUSES
              and (payload.regenerate or i not in has_packet)]
+    # The Tailor works from the Ranker's analysis: unranked jobs are reported, not sent to a model to fail.
+    not_ranked = [i for i in queue if payload.mode != "skip" and not context_builder.is_ranked(jobs[i])]
+    queue = [i for i in queue if i not in not_ranked]
     batch, remaining = queue[:payload.batch_size], queue[payload.batch_size:]
     run = skip_tailoring if payload.mode == "skip" else tailor_job
     done, errors = [], []
@@ -574,8 +634,8 @@ def bulk_tailor(payload: BulkTailorIn, db: Session = Depends(get_user_db)):
             db.rollback()
             errors.append({"id": job_id, "error": str(exc)[:300]})
     found = [i for i in wanted if i in jobs]
-    return {"done": done, "errors": errors, "remaining": remaining,
-            "skipped": len(found) - len(queue), "missing": len(wanted) - len(found)}
+    return {"done": done, "errors": errors, "remaining": remaining, "not_ranked": not_ranked,
+            "skipped": len(found) - len(queue) - len(not_ranked), "missing": len(wanted) - len(found)}
 
 
 def _packet_response(db: Session, job: Job, resume: ResumeVariant) -> dict:

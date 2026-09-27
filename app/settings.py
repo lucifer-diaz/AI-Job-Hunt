@@ -93,6 +93,10 @@ class Settings(BaseSettings):
     llm_telemetry_enabled: bool = True
     llm_telemetry_retention_days: int = 90
     llm_prompt_debug: bool = False
+    # Full prompts and responses (LLM_PROMPT_DEBUG, or an account's own switch in Monitoring) hold resume and job
+    # text, so they are cleared from request rows after this many days; the rest of the row stays until the
+    # retention above.
+    llm_prompt_debug_retention_days: int = 7
     # Model prices and context windows (app.services.model_catalog). Blank uses app/model_catalog.json.
     model_catalog_file: str | None = None
 
@@ -128,6 +132,9 @@ class Settings(BaseSettings):
     external_api_telemetry_enabled: bool = True
     external_api_log_retention_days: int = 90
     system_log_retention_days: int = 30
+    # One Monitoring → Logs line per LLM call, successful ones included (INFO), each linked to its request row
+    # (and its prompt and response when they were captured). Off keeps Logs to failures and slow calls only.
+    system_log_llm_calls: bool = True
     # Off by design: bodies can hold a candidate's resume or an employer's posting. When it is on, extracts are
     # still redacted and capped at external_api_payload_limit bytes.
     external_api_debug_payloads: bool = False
@@ -153,6 +160,9 @@ class Settings(BaseSettings):
     scheduler_lease_minutes: int = 30
     hunter_interval_minutes: int = 240
     apify_sync_interval_minutes: int = 5
+    # The scheduler stops checking an Apify run this long after it started: no actor run lasts that long, so a run
+    # still "unfinished" by then is one Apify will never report (it is marked failed, with the reason).
+    apify_run_max_age_hours: int = 48
     ranking_interval_minutes: int = 2
     compensation_interval_minutes: int = 5
     application_interval_minutes: int = 5

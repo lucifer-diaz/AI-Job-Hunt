@@ -459,11 +459,12 @@ def test_services_store_prompt_versions_with_results(monkeypatch):
 
     from app.db import SessionLocal
     from app.models import Job
+    from app.services.context_builder import CONTEXT_BUILDER_VERSION
     with SessionLocal() as db:
         variant = db.get(Job, job_id).resumes[-1]
         assert variant.content["prompt_version"] == prompts.TAILOR_PROMPT_VERSION
         assert (variant.content["provider"], variant.content["model"]) == ("mock", "mock")
-        assert variant.content["context"]["context_builder_version"] == "v2"
+        assert variant.content["context"]["context_builder_version"] == CONTEXT_BUILDER_VERSION
         assert variant.reviewer_notes["prompt_version"] == prompts.REVIEW_PROMPT_VERSION
         assert variant.reviewer_score == 86 and variant.reviewer_notes["recommendation"] == "PASS"
         assert isinstance(variant.content["skills"], list) and "bullet_evidence" in variant.content

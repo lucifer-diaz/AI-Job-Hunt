@@ -535,11 +535,51 @@ def import_remote_run(db: Session, external_run_id: str, reimport: bool = False)
     return refresh_apify_run(db, search_run, reimport=reimport)
 
 
+# Apify answers 403 when the saved token may not see a run (it was started with another token or account) and 404
+# when the run or its dataset no longer exists. Neither changes on a retry, so the run is given up on at once.
+RUN_GONE_CODES = {403: "Apify refused access to this run (HTTP 403): it was probably started with a different "
+                       "Apify token or account than the one saved now",
+                  404: "Apify no longer has this run or its dataset (HTTP 404)"}
+
+
+def give_up_on_run(db: Session, search_run: SearchRun, reason: str) -> dict[str, Any]:
+    """Mark a run that can never be imported as finished-and-failed, so the scheduler stops checking it. Logs it once.
+    Commits."""
+    search_run.status = "FAILED"
+    search_run.error = reason[:2000]
+    search_run.completed_at = search_run.completed_at or datetime.now(UTC).replace(tzinfo=None)
+    if search_run.adapter:  # a Hunter run keeps its own status too
+        from app.services.hunter import FAILED as HUNTER_FAILED
+
+        search_run.hunter_status = HUNTER_FAILED
+    db.commit()
+    system_log.log_event(category="APIFY", level="WARNING", provider="APIFY", operation="actor_run_status",
+                         message=f"Stopped checking Apify run {search_run.external_run_id}: {reason}",
+                         status="GAVE_UP", user_id=search_run.user_id, entity_type="search_run",
+                         entity_id=search_run.id, details={"actor_id": search_run.actor_id})
+    return {"id": search_run.id, "provider": search_run.provider, "external_run_id": search_run.external_run_id,
+            "actor_id": search_run.actor_id, "status": search_run.status, "completed": True, "gave_up": True,
+            "error": search_run.error, "import": None}
+
+
 def refresh_apify_run(db: Session, search_run: SearchRun, reimport: bool = False) -> dict[str, Any]:
     """Update a run's status and import its dataset once it finishes; reimport pulls it again.
 
-    Uses the Apify token of the account that owns the run, so the scheduler can sync every account's runs.
+    Uses the Apify token of the account that owns the run, so the scheduler can sync every account's runs. A run
+    Apify refuses (403) or no longer has (404) is given up on instead of being checked again forever.
     """
+    try:
+        return _refresh_run(db, search_run, reimport=reimport)
+    except httpx.HTTPStatusError as exc:
+        reason = RUN_GONE_CODES.get(exc.response.status_code)
+        if reason is None:
+            raise
+        db.rollback()
+        run = db.get(SearchRun, search_run.id)
+        return give_up_on_run(db, run, reason) if run is not None else {"id": search_run.id, "gave_up": True}
+
+
+def _refresh_run(db: Session, search_run: SearchRun, reimport: bool = False) -> dict[str, Any]:
     if search_run.provider != "apify":
         raise ValueError("Search run is not an Apify run")
     if search_run.adapter:  # a Hunter run: its actor's adapter normalizes and deduplicates the dataset

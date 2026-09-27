@@ -26,10 +26,11 @@ from app.prompts.common import (
 )
 from app.prompts.contracts import CoverLetterResult, describe_fields
 
+# v4: verified resume facts are application data, not untrusted text; each fact is sent once.
 # v3: about a third shorter (one shape paragraph, one avoid list), no personal name in the instructions.
 # v2: typed output contract; gaps stay gaps; only the candidate fields a letter uses; the FitAnalysis only when the
 # Ranker completed one; the candidate policy applied before the prompt instead of sent for the model to reason about.
-COVER_LETTER_PROMPT_VERSION = "v3"
+COVER_LETTER_PROMPT_VERSION = "v4"
 COVER_LETTER_MARKER = "COVER_LETTER"
 CANDIDATE_FIELDS = ("name", "headline", "location", "work_authorization")
 
@@ -66,7 +67,7 @@ def build_cover_letter_prompt(context: Any, recruiters: list[dict[str, str]] | N
     user = user_message(
         COVER_LETTER_MARKER,
         section("CANDIDATE PROFILE", to_json(compact({k: candidate.get(k) for k in CANDIDATE_FIELDS}))),
-        untrusted("VERIFIED RESUME FACTS", "untrusted_resume_facts", to_json(resume_facts(context), limit=16000)),
+        section("VERIFIED RESUME FACTS", to_json(resume_facts(context), limit=16000)),
         section("VERIFIED EVIDENCE", to_json(context_value(context, "relevant_evidence", []), limit=16000)),
         section("KNOWN ANSWERS", to_json(knowledge)) if knowledge else "",
         section("JOB", to_json({k: v for k, v in job.items() if k != "description"})),

@@ -58,9 +58,25 @@ function aimChangeBar() {
 function aimOverview() {
   const d = aimData(), conn = d.connection || {}, [connLabel, connTone] = AIM_CONN[conn.status] || AIM_CONN.UNKNOWN;
   const rows = (d.workers || []).map(w => `<tr class="click" data-act="aim-worker" data-worker="${attr(w.worker_type)}"><td>${esc(w.label)}</td><td class="mono">${esc(w.resolved?.model || '—')}</td><td>${esc(AIM_MODES[w.config?.mode] || '—')}${w.resolved?.note ? ` <span class="settings-help">(${esc(w.resolved.note)})</span>` : ''}</td></tr>`).join('');
-  return settingsGroup('Gateway', 'Where every AI worker sends its requests.', `<div class="aim-cards"><div class="aim-card"><strong>${d.gateway_enabled ? 'LiteLLM gateway' : 'Direct provider'}</strong><p>${d.gateway_enabled ? 'Workers use the models configured here, through LiteLLM. Nothing calls Ollama or a provider directly.' : 'Workers call the provider chosen under Advanced → Direct providers. The configuration here is kept ready.'}</p>${btn(d.gateway_enabled ? 'Turn gateway off' : 'Use LiteLLM gateway', 'aim-gateway', { on: d.gateway_enabled ? '' : '1' }, 'sm', isBusy('aim-gateway'))}</div><div class="aim-card"><strong>LiteLLM</strong><p>${pill(connLabel, connTone)} ${conn.litellm_version ? `v${esc(conn.litellm_version)}` : ''}</p><p class="settings-help">${conn.base_url ? esc(conn.base_url) : 'No base URL yet'}${conn.last_successful_sync_at ? ` · models synced ${esc(fmtDateTime(conn.last_successful_sync_at))}` : ''}</p></div><div class="aim-card"><strong>Configuration</strong><p>Active version v${d.active_version ?? 0}</p><p class="settings-help">${conn.last_sync_at ? `Last applied ${esc(fmtDateTime(conn.last_sync_at))}` : 'Not applied yet'}${conn.last_sync_error ? ` · ${esc(conn.last_sync_error)}` : ''}</p></div></div>`) +
-    settingsGroup('Workers', 'Which model each worker uses under your current settings. Select one to change it.', `<div class="mon-table-wrap"><table class="mon-table"><thead><tr><th>Worker</th><th>Model</th><th>Mode</th></tr></thead><tbody>${rows}</tbody></table></div>`) +
+  // The same two-way choice as the Overview screen: LiteLLM, or the direct provider set up below.
+  const g = d.gateway;
+  const route = g ? `<div class="aim-card"><strong>Route</strong><div class="mt8">${gatewaySegment(g)}</div><p class="settings-help">${esc(gatewayNow(g))}</p>${gatewayMissing(g)}</div>`
+    : `<div class="aim-card"><strong>${d.gateway_enabled ? 'LiteLLM gateway' : 'Direct provider'}</strong>${btn(d.gateway_enabled ? 'Turn gateway off' : 'Use LiteLLM gateway', 'aim-gateway', { on: d.gateway_enabled ? '' : '1' }, 'sm', isBusy('aim-gateway'))}</div>`;
+  return settingsGroup('Gateway', 'Where every AI worker sends its requests.', `<div class="aim-cards">${route}<div class="aim-card"><strong>LiteLLM</strong><p>${pill(connLabel, connTone)} ${conn.litellm_version ? `v${esc(conn.litellm_version)}` : ''}</p><p class="settings-help">${conn.base_url ? esc(conn.base_url) : 'No base URL yet'}${conn.last_successful_sync_at ? ` · models synced ${esc(fmtDateTime(conn.last_successful_sync_at))}` : ''}</p></div><div class="aim-card"><strong>Configuration</strong><p>Active version v${d.active_version ?? 0}</p><p class="settings-help">${conn.last_sync_at ? `Last applied ${esc(fmtDateTime(conn.last_sync_at))}` : 'Not applied yet'}${conn.last_sync_error ? ` · ${esc(conn.last_sync_error)}` : ''}</p></div></div>`) +
+    aimModelSelection(d, rows);
+}
+// Model selection follows the route: through LiteLLM each worker's model is set here per worker; calling a
+// provider directly, the provider's default model (and optional per-stage models) apply. The other route's
+// settings are kept, one click away, for when you switch.
+function aimModelSelection(d, rows) {
+  const workers = settingsGroup('Models · LiteLLM workers', 'Which model each worker uses through LiteLLM. Select one to change it.', `<div class="mon-table-wrap"><table class="mon-table"><thead><tr><th>Worker</th><th>Model</th><th>Mode</th></tr></thead><tbody>${rows}</tbody></table></div>`) +
     settingsGroup('Desired and active', 'Compare your settings with what workers run now and what LiteLLM serves.', `${btn(isBusy('aim-runtime') ? 'Checking…' : 'Check runtime', 'aim-runtime', {}, 'sm', isBusy('aim-runtime'))}${AIM.runtime ? aimRuntimeTable() : ''}`);
+  const direct = D.settings?.ai ? renderAISettings() : '';
+  const label = d.gateway?.direct_label || 'the direct provider';
+  if (d.gateway_enabled) {
+    return workers + (direct ? settingsDetails('aim-direct', `Direct provider · ${esc(label)} (kept ready for when you switch the route)`, direct) : '');
+  }
+  return `<div class="aim-direct-models" data-route="direct"><p class="settings-help" style="margin:18px 0 0">Workers call ${esc(label)} directly with the models below. The LiteLLM worker models stay on the Workers tab for when you switch.</p>${direct}</div>`;
 }
 function aimRuntimeTable() {
   const r = AIM.runtime;
@@ -181,8 +197,7 @@ function aimAdvanced() {
   const versions = (AIM.versions || []).map((v, i) => `<tr><td class="mono">v${v.version}${i === 0 ? ' ' + pill('Active', 'good') : ''}</td><td>${esc(fmtDateTime(v.created_at))}</td><td>${esc(v.changed_by)} <span class="settings-help">${esc(v.source)}</span></td><td>${esc(v.summary)}${v.restored_from_version ? ` <span class="settings-help">(from v${v.restored_from_version})</span>` : ''}</td><td>${i === 0 ? '' : btn('Roll back', 'aim-restore', { id: v.id, version: v.version }, 'sm', isBusy('aim-restore'))}</td></tr>`).join('');
   const audit = (AIM.audit || []).slice(0, 30).map(a => `<tr><td>${esc(fmtDateTime(a.created_at))}</td><td>${esc(a.action)}</td><td>${pill(a.result, a.result === 'SUCCEEDED' ? 'good' : a.result === 'REJECTED' ? 'warn' : 'bad')}</td><td>${esc(a.actor)} <span class="settings-help">${esc(a.source)}</span></td><td class="settings-help">${esc(a.error || (a.version ? `v${a.version}` : ''))}</td></tr>`).join('');
   return settingsGroup('Version history', 'Every applied configuration is kept. Rolling back applies an old version as a new one; history never changes.', versions ? `<div class="mon-table-wrap aim-wide"><table class="mon-table"><thead><tr><th>Version</th><th>When</th><th>By</th><th>Change</th><th></th></tr></thead><tbody>${versions}</tbody></table></div>` : loading()) +
-    settingsGroup('Audit trail', 'Every attempt to change the configuration, including rejected and failed ones.', audit ? `<div class="mon-table-wrap aim-wide"><table class="mon-table"><thead><tr><th>When</th><th>Action</th><th>Result</th><th>By</th><th>Detail</th></tr></thead><tbody>${audit}</tbody></table></div>` : '<p class="settings-help">Nothing recorded yet.</p>') +
-    settingsDetails('aim-direct', 'Direct providers (used when the LiteLLM gateway is off)', renderAISettings());
+    settingsGroup('Audit trail', 'Every attempt to change the configuration, including rejected and failed ones.', audit ? `<div class="mon-table-wrap aim-wide"><table class="mon-table"><thead><tr><th>When</th><th>Action</th><th>Result</th><th>By</th><th>Detail</th></tr></thead><tbody>${audit}</tbody></table></div>` : '<p class="settings-help">Nothing recorded yet.</p>');  // direct provider settings live on the Overview tab, beside the route
 }
 async function aimHistory() {
   S.busy['aim-history'] = true;

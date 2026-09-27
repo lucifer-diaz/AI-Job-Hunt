@@ -198,16 +198,50 @@ def context_value(context: Any, name: str, default: Any = None) -> Any:
     return getattr(context, name, default)
 
 
+ROLE_FIELDS = ("job_title", "company", "location", "dates", "technologies")
+
+
+def bullet_facts(bullets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Bullets as a prompt reads them: the text and one id to cite (the evidence row created from the bullet). A
+    bullet with no evidence row, such as an unverified one the candidate policy allows, has no id."""
+    return [{"id": b["evidence_ids"][0], "text": b.get("text")} if b.get("evidence_ids") else {"text": b.get("text")}
+            for b in bullets or []]
+
+
 def experience_facts(context: Any) -> list[dict[str, Any]]:
-    """Selected roles without the internal relevance score."""
-    return [{k: v for k, v in role.items() if k != "relevance"} for role in context_value(context, "relevant_experience", [])]
+    """Selected roles as a prompt reads them: the header, and each bullet with its id.
+
+    Internal ids, relevance scores and bullet types stay out; "verified" appears only on a role that is not."""
+    roles = []
+    for role in context_value(context, "relevant_experience", []):
+        out = compact({key: role.get(key) for key in ROLE_FIELDS})
+        if role.get("verified") is False:
+            out["verified"] = False
+        out["bullets"] = bullet_facts(role.get("bullets"))
+        roles.append(out)
+    return roles
+
+
+def project_facts(context: Any) -> list[dict[str, Any]]:
+    """Selected resume projects: name, technologies, and each related bullet with its id."""
+    return [compact({"name": p.get("name"), "technologies": p.get("technologies"),
+                     "bullets": bullet_facts(p.get("bullets"))})
+            for p in context_value(context, "relevant_projects", []) or []]
+
+
+def posting_text(context: Any, job: Any) -> str:
+    """The raw posting for a prompt that has no parsed requirements: the job context's cleaned copy (duplicates and
+    legal boilerplate removed, app.services.job_context.compact_posting), else the stored description."""
+    job_context = context_value(context, "job_context", {}) or {} if context is not None else {}
+    return job_context.get("raw_description") or getattr(job, "description", "") or ""
 
 
 def resume_facts(context: Any) -> dict[str, Any]:
     """The structured resume facts a context selected, for prompts that check or use them."""
     candidate = context_value(context, "candidate", {}) or {}
     return compact({"summary": candidate.get("summary"), "background": candidate.get("verified_background") or {},
-                    "experience": experience_facts(context), "skills": context_value(context, "relevant_skills", []),
+                    "experience": experience_facts(context), "projects": project_facts(context),
+                    "skills": context_value(context, "relevant_skills", []),
                     "education": context_value(context, "education", []),
                     "certifications": context_value(context, "certifications", [])})
 

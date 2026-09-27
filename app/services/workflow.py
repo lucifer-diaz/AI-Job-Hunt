@@ -9,9 +9,11 @@ Models recommend (a review's PASS / RETAILOR / SKIP); this module and app.servic
 """
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
@@ -53,6 +55,8 @@ from app.services.resume_format import (
 from app.services.user_settings import profile_for, settings_for
 from app.settings import get_settings
 
+log = logging.getLogger("jobhunt.workflow")
+
 
 def followup_days(db: Session) -> int:
     prefs = settings_for(db).preferences or {}
@@ -93,8 +97,10 @@ def tailor_job(db: Session, job: Job, progress: Progress = _no_progress) -> Resu
     prompt = build_tailoring_prompt(candidate_profile=profile, job=job, context=context)
     result = llm.generate_prompt(prompt, LLMCall(workflow_type="job", entity_id=job.id,
                                                  context_stats=context.call_stats()))
-    allowed = context.evidence_ids | {i for role in context.source_resume.get("roles") or []
-                                      for bullet in role["bullets"] for i in bullet["evidence_ids"]}
+    # Citable: the evidence list, and the id of every source bullet and project bullet the context showed.
+    allowed = context.evidence_ids | {bullet["id"] for part in ("roles", "projects")
+                                      for unit in context.source_resume.get(part) or []
+                                      for bullet in unit["bullets"] if "id" in bullet}
     content = apply_tailoring_patch(db, profile, job, result.validated, allowed_evidence=allowed)
     content.update(generation_provenance(prompt.version, result))
     content["context"] = {**context.resume, **context.stats.as_dict(), "evidence_ids": sorted(context.evidence_ids),
@@ -117,7 +123,11 @@ def write_cover_letter(db: Session, profile: CandidateProfile, job: Job, llm: LL
     prompt = build_cover_letter_prompt(context, recruiters=recruiters_of(job.application) if job.application else [])
     result = llm.generate_prompt(prompt, LLMCall(workflow_type="job", entity_id=job.id,
                                                  context_stats=context.call_stats()))
-    from app.services.tailoring_results import TailoredResumeIn, validate_tailored_resume, verified_evidence
+    from app.services.tailoring_results import (
+        TailoredResumeIn,
+        validate_tailored_resume,
+        verified_evidence,
+    )
 
     letter = to_plain(result.validated.cover_letter).strip()
     # The same deterministic checks as a letter saved over MCP (invented numbers, names nothing supports, work
@@ -298,7 +308,25 @@ def build_resume_markdown(profile: CandidateProfile, content: dict) -> str:
         if value and value not in bucket:
             bucket.append(value)
     return render_resume(parsed, name=profile.name, headline=profile.headline, summary=summary or None,
-                         top_skills=relevant_skills(parsed, skill_list), role_bullets=role_bullets, highlights=highlights)
+                         top_skills=relevant_skills(parsed, skill_list), role_bullets=role_bullets, highlights=highlights,
+                         role_headings=_role_headings(profile, parsed))
+
+
+def _role_headings(profile: CandidateProfile, parsed: Any) -> dict[int, dict[str, str]]:
+    """The user's verified heading corrections (per the candidate policy's resume source). Best effort: without a
+    session, or on any error, the master resume's own headings are used."""
+    from sqlalchemy.orm import object_session
+
+    from app.services.context_builder import role_headings
+
+    db = object_session(profile)
+    if db is None:
+        return {}
+    try:
+        return role_headings(db, profile, parsed)
+    except Exception:  # noqa: BLE001  a heading correction must never stop a resume from rendering
+        log.warning("could not apply verified role headings", exc_info=True)
+        return {}
 
 
 def update_resume_edit(db: Session, resume: ResumeVariant, index: int, status: str | None, text: str | None) -> None:

@@ -14,6 +14,7 @@ const model = (name, extra = {}) => ({ name, display_name: name, enabled: true, 
 function overview() {
   return {
     gateway_enabled: true, llm_provider: 'litellm', active_version: 4,
+    gateway: { gateway_enabled: true, direct_provider: 'openrouter', direct_label: 'OpenRouter', direct_model: 'openrouter/free', direct_ready: true, litellm_ready: true, litellm_base_url: 'http://localhost:4000' },
     connection: { base_url: 'http://localhost:4000', base_url_saved: 'http://localhost:4000', base_url_env: null, api_key_configured: true, api_key_hint: '…3456', sync_mode: 'admin_api', sync_modes: ['disabled', 'admin_api'], status: 'CONNECTED', litellm_version: '1.102.1', last_successful_sync_at: '2026-09-25T10:00:00', sync_status: 'SYNCED', draft_revision: 7, secret_storage: true },
     draft: { workers: {} }, active: { workers: {} },
     pending_changes: [{ path: 'effective.REVIEWER', label: 'Reviewer · effective model', before: 'local-reasoning', after: 'local-deep', kind: 'effective' }],
@@ -58,6 +59,41 @@ beforeEach(() => {
 });
 
 describe('Settings → AI Models', () => {
+  it('shows model selection for the route in use: LiteLLM workers, or the direct provider’s models', async () => {
+    await open();
+    expect(text()).toContain('Models · LiteLLM workers');
+    expect(document.querySelector('#view details[data-settings-details="aim-direct"] summary').textContent)
+      .toContain('Direct provider · OpenRouter (kept ready for when you switch the route)');
+    expect(document.querySelector('#view .aim-direct-models')).toBeNull();
+
+    routes['GET /api/settings/ai'] = () => ({ ...overview(), gateway_enabled: false, llm_provider: 'openrouter',
+      gateway: { ...overview().gateway, gateway_enabled: false } });
+    await open();
+    const direct = document.querySelector('#view .aim-direct-models');
+    expect(direct.textContent).toContain('Model defaults');
+    expect(direct.querySelector('#ai-llm_provider')).not.toBeNull();
+    expect(text()).not.toContain('Models · LiteLLM workers');
+  });
+
+  it('keeps direct provider settings off the Advanced tab', async () => {
+    await open('advanced');
+    expect(text()).not.toContain('Direct providers');
+    expect(document.querySelector('#view #ai-llm_provider')).toBeNull();
+  });
+
+  it('chooses between LiteLLM and the direct provider in the Gateway section', async () => {
+    routes['PUT /api/settings/ai/gateway'] = sent => ({ ...overview().gateway, gateway_enabled: sent.enabled });
+    await open();
+    const buttons = [...document.querySelectorAll('#view .seg[aria-label="AI gateway"] button')];
+    expect(buttons.map(b => b.textContent.trim())).toEqual(['LiteLLM gateway', 'OpenRouter (direct)']);
+    expect(buttons[0].getAttribute('aria-pressed')).toBe('true');
+    expect(buttons.every(b => b.type === 'button')).toBe(true);  // inside the settings form: never a submit
+    buttons[1].click();
+    await flush(); await flush(); await flush();
+    expect(body('PUT', '/api/settings/ai/gateway')).toEqual({ enabled: false });
+    expect(call('GET', '/api/settings/ai').length).toBeGreaterThan(1);  // the tab reloads to show the new route
+  });
+
   it('loads the overview and shows gateway, version, pending changes and each worker', async () => {
     await open();
     expect(call('GET', '/api/settings/ai').length).toBe(1);

@@ -21,9 +21,10 @@ from app.prompts.common import (
 )
 from app.prompts.contracts import FollowUpResult, describe_fields
 
+# v4: the verified highlights are application data, not untrusted text.
 # v3: typed output contract; the candidate is a name and headline; the job is its title, company and location
 # (a follow-up does not need the whole posting).
-FOLLOWUP_PROMPT_VERSION = "v3"
+FOLLOWUP_PROMPT_VERSION = "v4"
 FOLLOWUP_MARKER = "FOLLOW_UP"
 
 FOLLOWUP_SYSTEM = instructions(
@@ -45,8 +46,7 @@ def build_followup_prompt(candidate_profile: Any, job: Any = None, application: 
     """With a follow-up context (app.services.context_builder.build_followup_context) only a few verified highlights
     relevant to the role are sent; `resume` and `evidence` are for callers without one."""
     if context is not None:
-        resume_section = untrusted("VERIFIED RESUME FACTS", "untrusted_resume_facts",
-                                   context_value(context, "resume_text", ""), limit=6000)
+        resume_section = section("VERIFIED RESUME FACTS", context_value(context, "resume_text", "")[:6000])
         evidence = context_value(context, "relevant_evidence", [])
     else:
         resume_section = untrusted("RESUME", "untrusted_resume", resume, limit=6000)

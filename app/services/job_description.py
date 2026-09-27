@@ -27,7 +27,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import desc, or_, select, update
+from sqlalchemy import desc, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -907,6 +907,38 @@ def waiting_reason(db: Session, job: Job) -> str | None:
     # Queued or running, including its final attempt. Every task ends COMPLETED or FAILED (lease recovery fails a
     # task that used its last attempt), so this wait always ends.
     return "The job description is still being parsed"
+
+
+# ───────────── where a posting's parse stands, for lists and filters ─────────────
+
+# What a user sees and filters by. Not a workflow state: a job is "Discovered" and "Parsed" at the same time.
+DESCRIPTION_STATES = {"PARSED": "Parsed", "PARSING": "Parsing", "FAILED": "Parse failed", "NOT_PARSED": "Not parsed",
+                      "NO_DESCRIPTION": "No description"}
+
+
+def latest_parse_statuses(db: Session, job_ids: list[int] | None = None) -> dict[int, str]:
+    """Each job's most recent parse task status, in one query (for the whole account when job_ids is None)."""
+    latest = select(JobDescriptionParseTask.job_id, func.max(JobDescriptionParseTask.id).label("id"))
+    if job_ids is not None:
+        if not job_ids:
+            return {}
+        latest = latest.where(JobDescriptionParseTask.job_id.in_(job_ids))
+    latest = latest.group_by(JobDescriptionParseTask.job_id).subquery()
+    return dict(db.execute(select(JobDescriptionParseTask.job_id, JobDescriptionParseTask.status)
+                           .join(latest, JobDescriptionParseTask.id == latest.c.id)).all())
+
+
+def description_state(job: Job, latest_task_status: str | None) -> str:
+    """One of DESCRIPTION_STATES. A parse of older wording does not count: the text has changed since."""
+    if not (job.description or "").strip():
+        return "NO_DESCRIPTION"
+    if latest_task_status in ACTIVE_JD_PARSE_STATUSES:
+        return "PARSING"
+    if job.structured_description_status in (PARSED, MANUALLY_CORRECTED) and is_current(job):
+        return "PARSED"
+    if job.structured_description_status == NEEDS_REVIEW:
+        return "FAILED"  # its attempts ran out; ranking and tailoring use the raw text (_mark_unparsed)
+    return "NOT_PARSED"
 
 
 # ───────────── manual correction and re-parse ─────────────

@@ -418,10 +418,25 @@ def request_detail(db: Session, request_id: int, user_id: int | None) -> dict[st
             "structured_output_retry_count": log.structured_output_retry_count, "error_message": log.error_message,
             "completed_at": log.completed_at.isoformat() if log.completed_at else None,
             "entity": _entity(db, log.workflow_type, log.workflow_entity_id),
+            "trace_log_count": _trace_log_count(db, log.trace_id, user_id),
             # Redacted again on the way out: rows stored before debug text was redacted at write time are cleaned too.
             "debug": ({"prompt": redaction.redact_text(log.debug_prompt, DEBUG_TEXT_LIMIT),
                        "response": redaction.redact_text(log.debug_response, DEBUG_TEXT_LIMIT)}
                       if log.debug_prompt or log.debug_response else None)}
+
+
+def _trace_log_count(db: Session, trace_id: str | None, user_id: int | None) -> int:
+    """Monitoring → Logs lines written under the same trace as a request (its link to the logs)."""
+    from sqlalchemy import func
+
+    from app.models import SystemLogEntry
+
+    if not trace_id:
+        return 0
+    query = select(func.count(SystemLogEntry.id)).where(SystemLogEntry.trace_id == trace_id)
+    if user_id is not None:
+        query = query.where(SystemLogEntry.user_id == user_id)
+    return db.scalar(query) or 0
 
 
 # ───────────── advisor input ─────────────
@@ -517,14 +532,25 @@ def prune(db: Session, now: datetime | None = None, retention_days: int | None =
     from app.models import LLMUsageDaily
     from app.settings import get_settings
 
+    from sqlalchemy import update
+
+    debug_days = get_settings().llm_prompt_debug_retention_days
+    cleared = 0
+    if debug_days > 0:  # full prompt and response text goes first; the metadata row stays
+        cleared = db.execute(update(LLMRequestLog)
+                             .where(LLMRequestLog.created_at < (now or utcnow()) - timedelta(days=debug_days),
+                                    (LLMRequestLog.debug_prompt.is_not(None)) | (LLMRequestLog.debug_response.is_not(None)))
+                             .values(debug_prompt=None, debug_response=None)
+                             .execution_options(synchronize_session=False)).rowcount or 0
+        db.commit()
     days = retention_days if retention_days is not None else get_settings().llm_telemetry_retention_days
     if days <= 0:
-        return {"rolled_up": 0, "deleted": 0}
+        return {"rolled_up": 0, "deleted": 0, "debug_text_cleared": cleared}
     cutoff = (now or utcnow()) - timedelta(days=days)
     old = db.execute(select(*ROW_COLUMNS).where(LLMRequestLog.created_at < cutoff)
                      .order_by(LLMRequestLog.id).limit(PRUNE_BATCH)).all()
     if not old:
-        return {"rolled_up": 0, "deleted": 0}
+        return {"rolled_up": 0, "deleted": 0, "debug_text_cleared": cleared}
     groups: dict[tuple, list[Any]] = defaultdict(list)
     for r in old:
         groups[(r.user_id, r.created_at.date(), r.stage, r.provider, r.model or "", r.prompt_version or "")].append(r)
@@ -555,4 +581,4 @@ def prune(db: Session, now: datetime | None = None, retention_days: int | None =
     deleted = db.execute(delete(LLMRequestLog).where(LLMRequestLog.id.in_([r.id for r in old]))
                          .execution_options(synchronize_session=False)).rowcount or 0
     db.commit()
-    return {"rolled_up": len(groups), "deleted": deleted}
+    return {"rolled_up": len(groups), "deleted": deleted, "debug_text_cleared": cleared}

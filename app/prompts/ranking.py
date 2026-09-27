@@ -20,7 +20,9 @@ from app.prompts.common import (
     experience_facts,
     instructions,
     job_sections,
+    posting_text,
     profile_facts,
+    project_facts,
     prompt_profile,
     section,
     to_json,
@@ -29,9 +31,13 @@ from app.prompts.common import (
 )
 from app.prompts.contracts import QUALIFICATION_RECOMMENDATIONS, RankingResult, describe_fields
 
+# v6: each fact once. The verified resume (experience and projects) is application data, no longer wrapped as
+# untrusted; each bullet has one id to cite; VERIFIED EVIDENCE holds only verified facts that are not on the resume;
+# the background skills are not repeated beside RELEVANT SKILLS; the posting arrives without duplicate paragraphs or
+# legal boilerplate.
 # v5: per-requirement MATCH / PARTIAL_MATCH / MISSING / UNKNOWN assessments (the match lists are derived from them),
 # no job-search configuration in the profile, and requirement ids instead of duplicated candidate-match copies.
-RANKING_PROMPT_VERSION = "v5"
+RANKING_PROMPT_VERSION = "v6"
 RANKING_MARKER = "FIT_ANALYSIS"
 SCORE_FIELDS = ("overall_fit_score", "candidate_fit_score", "resume_fit_score", "seniority_match_score",
                 "skills_match_score", "leadership_match_score", "domain_match_score", "location_match_score")
@@ -64,9 +70,11 @@ REQUIRED first. Keep supported and unsupported to a short phrase each, and leave
   never a gap. strong_matches, partial_matches and missing_requirements may be omitted: they are derived.""",
     REQUIREMENT_LEVELS_RULE + " term_overlap lists requirement ids whose words appear in the verified facts: a hint "
     "to confirm, not a verdict. When only JOB DESCRIPTION is given, the posting is unparsed: read it yourself.",
-    "RELEVANT EXPERIENCE keeps every role header but only the bullets related to this posting; do not penalize "
-    "missing unrelated detail. " + UNVERIFIED_FACTS_RULE + " A match resting only on unverified facts is at most "
-    "PARTIAL_MATCH. relevant_evidence_ids and evidence_ids may only name VERIFIED EVIDENCE ids.",
+    "RELEVANT EXPERIENCE and RELEVANT PROJECTS are the candidate's verified resume: every role header, but only the "
+    "bullets related to this posting, so do not penalize missing unrelated detail. VERIFIED EVIDENCE holds verified "
+    "facts that are not on the resume. Cite a fact by its id (a bullet's id, or an evidence id) in evidence_ids and "
+    "relevant_evidence_ids; cite nothing else. " + UNVERIFIED_FACTS_RULE + " A match resting only on unverified "
+    "facts is at most PARTIAL_MATCH.",
     JSON_ONLY_RULE,
     describe_fields(RankingResult),
 )
@@ -100,8 +108,12 @@ def build_ranking_prompt(candidate_profile: Any, resume: str = "", evidence: lis
     without one, the whole resume text and the given evidence are."""
     if context is not None:
         candidate = context_value(context, "candidate", {}) or {}
+        skills = context_value(context, "relevant_skills", [])
+        background = dict(candidate.get("verified_background") or {})
+        if skills:  # RELEVANT SKILLS already lists them, selected for this posting
+            background.pop("primary_skills", None)
         facts = {**_prompt_profile(candidate_profile), "summary": candidate.get("summary"),
-                 "verified_background": candidate.get("verified_background") or {},
+                 "verified_background": background,
                  "education": context_value(context, "education", []),
                  "certifications": context_value(context, "certifications", [])}
         facts["search_preferences"] = candidate_preferences(facts.get("search_preferences"))
@@ -109,12 +121,14 @@ def build_ranking_prompt(candidate_profile: Any, resume: str = "", evidence: lis
         unverified = context_value(context, "unverified_facts", [])
         data_sections = [
             section("CANDIDATE PROFILE", to_json({k: v for k, v in facts.items() if v not in (None, "", [], {})})),
-            untrusted("RELEVANT EXPERIENCE", "untrusted_resume_facts", to_json(experience, limit=20000))
+            # Verified facts are application data. Only an unstructured resume (nothing verified) travels as text.
+            section("RELEVANT EXPERIENCE", to_json(experience, limit=20000))
             if experience else untrusted("ACTIVE RESUME", "untrusted_resume", context_value(context, "resume_text", ""),
                                          limit=20000),
-            section("RELEVANT SKILLS", to_json(context_value(context, "relevant_skills", [])))
-            if context_value(context, "relevant_skills", []) else "",
-            section("VERIFIED EVIDENCE", to_json(context_value(context, "relevant_evidence", []), limit=30000)),
+            section("RELEVANT PROJECTS", to_json(project_facts(context))) if project_facts(context) else "",
+            section("RELEVANT SKILLS", to_json(skills)) if skills else "",
+            section("VERIFIED EVIDENCE", to_json(context_value(context, "relevant_evidence", []), limit=30000))
+            if context_value(context, "relevant_evidence", []) else "",
             untrusted("UNVERIFIED RESUME FACTS", "untrusted_resume_facts", to_json(unverified, limit=8000))
             if unverified else "",
         ]
@@ -131,7 +145,7 @@ def build_ranking_prompt(candidate_profile: Any, resume: str = "", evidence: lis
         *data_sections,
         section("JOB POSTING", to_json(posting_facts(job))),
         *requirements,
-        "" if requirements else untrusted("JOB DESCRIPTION", "untrusted_job_description",
-                                          getattr(job, "description", ""), limit=24000),
+        "" if requirements else untrusted("JOB DESCRIPTION", "untrusted_job_description", posting_text(context, job),
+                                          limit=24000),
     )
     return Prompt("ranking", RANKING_PROMPT_VERSION, RANKING_MARKER, RANKING_SYSTEM, user, RankingResult)

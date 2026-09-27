@@ -26,6 +26,7 @@ from app.prompts.common import (
     job_facts,
     job_sections,
     job_structured,
+    posting_text,
     section,
     to_json,
     untrusted,
@@ -33,9 +34,11 @@ from app.prompts.common import (
 )
 from app.prompts.contracts import TailoringResult, describe_fields
 
+# v6: evidence a source bullet already states is not repeated in RELEVANT EVIDENCE, and the posting arrives
+# without duplicate paragraphs or legal boilerplate.
 # v5: patch output with evidence ids per claim; completed FitAnalysis as read-only input (no score, no empty fields);
 # one canonical source resume instead of roles + resume text + policy; candidate context is name and headline only.
-TAILOR_PROMPT_VERSION = "v5"
+TAILOR_PROMPT_VERSION = "v6"
 TAILOR_MARKER = "TAILOR_RESUME"
 # The FitAnalysis fields the Tailor reads. Scores are deliberately absent: the Tailor does not work with them.
 FIT_ANALYSIS_FIELDS = ("strong_matches", "partial_matches", "resume_gaps", "recommended_resume_focus")
@@ -58,7 +61,8 @@ rewrite bullets using that role's own bullets and RELEVANT EVIDENCE from the sam
 bullet, most relevant first. Transferable experience may be emphasised; it is never renamed as the missing skill.
 Change only what helps this job: a role you leave out of role_updates keeps its source bullets unchanged, and a role
 you include shows exactly the 1-5 bullets you return. Update at most 3 roles.
-Every summary and bullet lists in evidence_ids the ids (from SOURCE RESUME bullets or RELEVANT EVIDENCE) it rests on,
+Every summary and bullet lists in evidence_ids the ids it rests on: the id of a SOURCE RESUME bullet or project
+bullet, or of RELEVANT EVIDENCE (verified facts that are not on the resume),
 and uses only numbers that appear in what it cites.""",
     UNTRUSTED_DATA_RULE,
     REQUIREMENT_LEVELS_RULE,
@@ -100,7 +104,7 @@ def build_tailoring_prompt(candidate_profile: Any, job: Any, context: Any) -> Pr
         *job_sections(context, fields=("identity", "role_summary", "required", "preferred", "responsibilities",
                                        "leadership_expectations", "technical_domains")),
         "" if job_structured(context) else untrusted("JOB DESCRIPTION", "untrusted_job_description",
-                                                     getattr(job, "description", ""), limit=20000),
+                                                     posting_text(context, job), limit=20000),
         section("FIT ANALYSIS (completed by the Ranker; read-only)", to_json(fit_analysis_input(analysis))),
     )
     return Prompt("tailoring", TAILOR_PROMPT_VERSION, TAILOR_MARKER, TAILOR_SYSTEM, user, TailoringResult)
