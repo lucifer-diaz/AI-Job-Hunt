@@ -975,7 +975,7 @@ def process(sessions: SessionFactory, claimed: TaskClaim, clock: Callable[[], da
     with sessions() as db:
         db.info["user_id"] = claimed.user_id
         try:
-            return _process(db, claimed, clock)
+            outcome = _process(db, claimed, clock)
         except LeaseLost:
             db.rollback()
             return "lost"
@@ -985,6 +985,14 @@ def process(sessions: SessionFactory, claimed: TaskClaim, clock: Callable[[], da
                 return _failed(db, claimed, exc, clock())
             except LeaseLost:
                 return "lost"
+    if outcome == "qualified":
+        # The ranking is committed; queueing it for tailoring (when the account wants that) never changes it.
+        from app.services import (
+            auto_tailor,  # local import: auto_tailor reads what this module writes
+        )
+
+        auto_tailor.after_qualified(sessions, claimed.user_id, claimed.job_id)
+    return outcome
 
 
 # ───────────── the scheduler's sweep ─────────────

@@ -942,7 +942,7 @@ function renderTaskStack() {
       ${finished ? btn(`Clear finished (${finished})`, 'tasks-clear', {}, 'sm') : ''}
       ${done ? btn('Review in Approvals', 'go', { screen: 'approvals' }, 'sm soft') : ''}
     </div>
-    <div style="max-height:420px;overflow:auto">${rows}</div></section>`;
+    <div style="max-height:420px;overflow:auto" data-scroll-key="tailor-tasks">${rows}</div></section>`;
 }
 
 function renderBulkTailor(queue) {
@@ -2292,7 +2292,8 @@ document.addEventListener('change', e => {
   if (el.dataset.jdPath) { jobDataInput(el); return; }
   if (el.dataset.form && el.dataset.field && (el.tagName === 'SELECT' || el.type === 'checkbox' || el.type === 'radio')) {
     setF(el.dataset.form, el.dataset.field, el.type === 'checkbox' ? el.checked : el.value);
-    if (el.type === 'radio') render();
+    // Radios, and checkboxes marked data-rerender, change which fields the form shows.
+    if (el.type === 'radio' || 'rerender' in el.dataset) render();
   }
   if (el.dataset.iv && S.ivDraft) S.ivDraft[el.dataset.iv] = el.value;
   if (el.dataset.pf && el.dataset.pfkey !== 'q') { const k = el.dataset.pfkey; S.pf[el.dataset.pf][k] = k.startsWith('min_') ? Number(el.value) : el.value; load(); }

@@ -28,6 +28,7 @@ from sqlalchemy.orm import Session
 from app.models import Application, Job, SearchRun, User
 from app.services import (
     ai_advisor,
+    auto_tailor,
     external_monitoring,
     jd_recovery,
     job_description,
@@ -346,6 +347,26 @@ def followups(ctx: JobContext) -> dict[str, Any]:
     return summary
 
 
+def auto_tailor_job(ctx: JobContext) -> dict[str, Any]:
+    """Queue qualified jobs for tailoring in accounts that turned automatic tailoring on. Ranking queues them
+    straight away; this catches any the ranking hook missed. The tailor worker runs them."""
+    accounts = _account_ids(ctx)
+    enabled, queued, errors = 0, 0, []
+    for user_id in accounts:
+        try:
+            with _as_user(ctx.sessions(), user_id) as db:
+                result = auto_tailor.sweep(db)
+                if result is not None:
+                    enabled += 1
+                    queued += result["queued"]
+        except Exception as exc:
+            errors.append(_error(user_id, exc))
+    summary = {"accounts": enabled, "queued": queued, "errors": errors}
+    if not enabled and not errors:
+        return skipped("No account has automatic tailoring on", **summary)
+    return summary
+
+
 def inbox(ctx: JobContext) -> dict[str, Any]:
     return skipped("No email provider is configured, so there is no inbox to sync yet")
 
@@ -433,6 +454,9 @@ JOBS: list[JobSpec] = [
             "Re-reads postings over HTTP and deletes the ones that no longer exist (applied jobs are kept)."),
     JobSpec("compensation", "Salary enrichment", "compensation_interval_minutes", compensation,
             "Records the salary stated in each posting."),
+    JobSpec("auto_tailor", "Automatic tailoring", "auto_tailor_interval_minutes", auto_tailor_job,
+            "Queues newly qualified jobs for tailoring in accounts that turned it on; the tailor worker runs them "
+            "within each account's tailoring limit."),
     JobSpec("applications", "Application processing", "application_interval_minutes", applications,
             "Reports the application queue; submission is not automated."),
     JobSpec("followups", "Follow-ups", "followup_interval_minutes", followups,

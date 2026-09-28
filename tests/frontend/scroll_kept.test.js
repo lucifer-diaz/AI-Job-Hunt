@@ -29,7 +29,7 @@ beforeEach(() => {
       runInContext(readFileSync(`app/static/${file}`, 'utf8'), context, { filename: resolve(`app/static/${file}`) });
     }
     runInContext(appSource, context, { filename: resolve('app/static/app.js') });
-    ui = runInContext('({ S, D, render })', context);
+    ui = runInContext('({ S, D, render, renderTaskStack })', context);
   }
   ui.S.screen = 'discovery'; ui.S.discMode = 'ranking'; ui.S.jobOpen = null; ui.S.busy = {};
   ui.D.ranking = ranking();
@@ -42,6 +42,15 @@ describe('Ranking tracker · scrolling', () => {
     ui.D.ranking = ranking();  // what a poll brings back
     ui.render();
     expect(list().scrollTop).toBe(900);
+  });
+});
+
+describe('Tailoring in the background · scrolling', () => {
+  it('keeps the task list where you scrolled it when the Tailor screen polls', () => {
+    ui.D.tasks = Array.from({ length: 20 }, (_, i) => ({ id: i + 1, job_id: i + 1, title: `Engineer ${i + 1}`, company: 'Acme',
+      mode: 'tailor', status: i < 2 ? 'running' : 'queued', stage: 'queued', progress: 0, created_at: null }));
+    document.getElementById('view').innerHTML = ui.renderTaskStack();
+    expect(document.querySelector('[data-scroll-key="tailor-tasks"]')).not.toBeNull();
   });
 });
 

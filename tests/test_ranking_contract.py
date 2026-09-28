@@ -94,3 +94,36 @@ def test_the_gateway_hands_the_unwrapped_answer_to_the_ranker(monkeypatch):
     result = client.generate_prompt(ranking_prompt(7), LLMCall(validate=lambda data: ranker.validate_output(data, 7, set())))
     output, _ = result.validated
     assert output.job_id == 7 and "fit_analysis" not in result.data
+
+
+def test_requirement_ids_in_the_lists_become_the_requirement_text():
+    """Job 597: missing_requirements came back as ["req_003", ...], and the job view showed the ids."""
+    result = RankingResult.model_validate(answer(
+        requirement_assessments=[assessment(requirement="Java", requirement_id="req_003", status="MISSING")],
+        missing_requirements=["req_003", "req_099", "Maven"]))
+    assert result.missing_requirements == ["Java", "req_099", "Maven"]
+
+
+def test_the_job_view_names_requirements_an_older_ranking_listed_by_id():
+    from app.workspace import ranked_list
+
+    analysis = {"gaps": ["req_003", "Maven"], "requirement_assessments": [
+        {"requirement": "Java", "requirement_id": "req_003", "status": "MISSING"}]}
+    assert ranked_list(analysis, "gaps") == ["Java", "Maven"]
+    assert ranked_list({}, "gaps") == []
+
+
+def test_keyword_coverage_shows_requirements_listed_by_number():
+    """Jobs 558 and 570: strong_matches came back as ["1", "2", ...], and Tailor & review showed the numbers."""
+    from types import SimpleNamespace
+
+    from app.workspace import keyword_coverage
+
+    analysis = {"keywords": [], "strong_matches": ["1", "2", "Docker"], "gaps": ["3"], "requirement_assessments": [
+        {"requirement": "Python", "requirement_id": 1, "status": "MATCH"},
+        {"requirement": "Kubernetes", "requirement_id": 2, "status": "MATCH"},
+        {"requirement": "Java", "requirement_id": 3, "status": "MISSING"}]}
+    resume = SimpleNamespace(markdown="Built Python services on Kubernetes")
+    assert keyword_coverage(SimpleNamespace(fit_analysis=analysis), resume) == [
+        {"word": "Python", "status": "covered"}, {"word": "Kubernetes", "status": "covered"},
+        {"word": "Docker", "status": "missing"}]
