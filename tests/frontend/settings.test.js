@@ -37,6 +37,7 @@ beforeEach(() => {
     runInContext(resumeDataSource, context, { filename: resolve('app/static/resume_data.js') });
     runInContext(jobDataSource, context, { filename: resolve('app/static/job_data.js') });
     runInContext(readFileSync('app/static/knowledge.js', 'utf8'), context, { filename: 'knowledge.js' });
+    runInContext(readFileSync('app/static/inbox.js', 'utf8'), context, { filename: 'inbox.js' });
     runInContext(appSource, context, { filename: resolve('app/static/app.js') });
     ui = runInContext(`({${names.join(',')}})`, context);
   }

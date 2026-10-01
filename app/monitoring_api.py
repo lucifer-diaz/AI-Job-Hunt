@@ -253,6 +253,18 @@ def jd_recovery_metrics(f: monitoring.MonitoringFilter = Filter, db: Session = D
             "diagnostics": jd_recovery.diagnostics(db, db.info.get("user_id"))}
 
 
+@router.get("/application-inbox")
+def application_inbox_metrics(f: monitoring.MonitoringFilter = Filter,
+                              db: Session = Depends(get_user_db)) -> dict[str, Any]:
+    """Application Inbox: sync runs, Gmail requests and failures, matching (deterministic, model-assisted, by you),
+    classifications, stage changes applied or suggested, reviews and corrections. Model calls themselves are in the
+    LLM requests view under the Inbox stage."""
+    from app.services.application_inbox import service as inbox
+
+    return {"filters": f.public(), "metrics": inbox.metrics(db, f.user_id, f.start, f.end),
+            "status": inbox.status(db)}
+
+
 @router.get("/logs")
 def logs(user: CurrentUser = Depends(current_user),
          range: str = Query("7d", pattern="^(today|7d|30d|90d)$"),  # noqa: A002  query parameter name

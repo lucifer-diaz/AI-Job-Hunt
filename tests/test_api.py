@@ -26,8 +26,9 @@ def test_the_asset_version_changes_when_any_script_changes():
     before = main._asset_version()
     target = static / "resume_data.js"
     stat = target.stat()
-    try:
-        os.utime(target, (stat.st_atime, stat.st_mtime + 10_000))
+    newest = max(path.stat().st_mtime for pattern in ("*.js", "*.css") for path in static.glob(pattern))
+    try:  # newer than every other asset, however recently one of them was edited
+        os.utime(target, (stat.st_atime, max(stat.st_mtime, newest) + 10_000))
         assert main._asset_version() != before
     finally:
         os.utime(target, (stat.st_atime, stat.st_mtime))

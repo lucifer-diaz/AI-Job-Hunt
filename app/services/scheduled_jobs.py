@@ -346,8 +346,47 @@ def followups(ctx: JobContext) -> dict[str, Any]:
     return summary
 
 
-def inbox(ctx: JobContext) -> dict[str, Any]:
-    return skipped("No email provider is configured, so there is no inbox to sync yet")
+async def inbox(ctx: JobContext) -> dict[str, Any]:
+    """Read each connected account's Gmail (read-only) for updates on its submitted applications.
+
+    One account at a time, each in its own session: a Gmail outage, an expired grant or a rate limit stops that
+    account's sync and nothing else. Model analyses that failed earlier are retried even without Gmail."""
+    from app.models import ApplicationEmailMessage, GmailConnection
+    from app.services.application_inbox.sync import sync_account
+
+    settings = get_settings()
+    if not settings.application_inbox_enabled and ctx.trigger == "schedule":
+        return skipped("The application inbox is off (APPLICATION_INBOX_ENABLED)")
+    if not settings.gmail_oauth_configured:
+        return skipped("Gmail is not set up on this server (GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET)")
+
+    def accounts() -> list[int]:
+        with ctx.sessions() as db:
+            connected = set(db.scalars(select(GmailConnection.user_id)
+                                       .where(GmailConnection.status == "CONNECTED")).all())
+            waiting = set(db.scalars(select(ApplicationEmailMessage.user_id).distinct()
+                                     .where(ApplicationEmailMessage.analysis_status == "PENDING")).all())
+        return sorted(connected | waiting)
+
+    users = await asyncio.to_thread(accounts)
+    if not users:
+        return skipped("No account has connected Gmail")
+    statuses: Counter = Counter()
+    totals: Counter = Counter()
+    errors = []
+    for user_id in users:
+        try:
+            result = await asyncio.to_thread(sync_account, ctx.sessions, user_id, trigger=ctx.trigger,
+                                             worker_id=ctx.worker_id, now=ctx.now)
+        except Exception as exc:  # noqa: BLE001  one account's failure must not stop the others
+            errors.append(_error(user_id, exc))
+            continue
+        statuses[result.get("status", "unknown")] += 1
+        totals.update({k: v for k, v in result.items() if isinstance(v, int) and k not in ("user_id", "limit",
+                                                                                          "duration_ms")})
+        if result.get("status") not in ("succeeded", "skipped"):
+            errors.append({"user_id": user_id, "status": result.get("status"), "error": result.get("error")})
+    return {"accounts": len(users), "statuses": dict(statuses), **dict(totals), "errors": errors}
 
 
 # ───────────── analytics, cleanup ─────────────
@@ -437,8 +476,8 @@ JOBS: list[JobSpec] = [
             "Reports the application queue; submission is not automated."),
     JobSpec("followups", "Follow-ups", "followup_interval_minutes", followups,
             "Drafts due follow-ups without sending them."),
-    JobSpec("inbox", "Inbox sync", "inbox_interval_minutes", inbox,
-            "Reserved for an email provider; currently not configured."),
+    JobSpec("inbox", "Application inbox", "application_inbox_interval_minutes", inbox,
+            "Reads connected Gmail accounts (read-only) for updates on submitted applications."),
     JobSpec("analytics", "Analytics", "analytics_interval_minutes", analytics,
             "Stores a pipeline snapshot."),
     JobSpec("ai_optimization", "AI optimization advisor", "ai_optimization_interval_minutes", ai_optimization,

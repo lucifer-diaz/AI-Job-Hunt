@@ -167,7 +167,6 @@ class Settings(BaseSettings):
     compensation_interval_minutes: int = 5
     application_interval_minutes: int = 5
     followup_interval_minutes: int = 60
-    inbox_interval_minutes: int = 5
     analytics_interval_minutes: int = 60
     cleanup_interval_minutes: int = 15
     # AI Optimization Advisor (app.services.ai_advisor): processes queued and scheduled analyses.
@@ -247,6 +246,30 @@ class Settings(BaseSettings):
     # Keep Chromium running between recoveries (faster) or close it after each batch (less memory while idle).
     playwright_keep_browser_running: bool = True
     compensation_batch_size: int = 50
+    # Application Inbox (app.services.application_inbox): reads Gmail, read-only, for mail about applications that
+    # were actually submitted. Needs a Google OAuth client (Web application) whose redirect URI is
+    # GOOGLE_OAUTH_REDIRECT_URI (default {APP_BASE_URL}/api/gmail/oauth/callback); each account connects its own Gmail.
+    google_oauth_client_id: str | None = None
+    google_oauth_client_secret: str | None = None
+    google_oauth_redirect_uri: str | None = None
+    application_inbox_enabled: bool = False
+    application_inbox_interval_hours: int = 24
+    # How far back the first sync of an application looks, and how much each later sync re-reads before the last one.
+    gmail_initial_lookback_days: int = 30
+    gmail_sync_overlap_hours: int = 24
+    gmail_max_messages_per_sync: int = 200
+    # Retries of one Gmail request after a server error or a timeout. A 429 ends the sync; the next run resumes.
+    gmail_max_retries: int = 2
+    # Email → application association: at or above AUTO the email is linked; between REVIEW and AUTO a model may help
+    # decide and the link is otherwise left for a person; below REVIEW the email is not linked (and never analysed).
+    application_email_auto_match_threshold: float = 0.90
+    application_email_review_threshold: float = 0.70
+    # A stage change the email implies is applied only at or above this confidence (and when it is explicit and valid).
+    application_stage_auto_update_threshold: float = 0.90
+    application_inbox_analysis_max_attempts: int = 3
+    application_inbox_retry_seconds: int = 900
+    # The most text kept per matched email (its relevant part, redacted). Unmatched mail keeps no body at all.
+    application_inbox_body_chars: int = 4000
     # Background tailoring worker (app.services.tailor_tasks)
     tailor_worker_enabled: bool = True
     tailor_concurrency: int = 2
@@ -264,6 +287,19 @@ class Settings(BaseSettings):
     admin_token: str | None = None
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    @property
+    def application_inbox_interval_minutes(self) -> int:
+        """The scheduler interval of the inbox job: 0 (off) unless APPLICATION_INBOX_ENABLED."""
+        return max(0, self.application_inbox_interval_hours) * 60 if self.application_inbox_enabled else 0
+
+    @property
+    def gmail_oauth_configured(self) -> bool:
+        return bool(self.google_oauth_client_id and self.google_oauth_client_secret)
+
+    @property
+    def gmail_redirect_uri(self) -> str:
+        return self.google_oauth_redirect_uri or f"{self.app_base_url.rstrip('/')}/api/gmail/oauth/callback"
 
 
 @lru_cache

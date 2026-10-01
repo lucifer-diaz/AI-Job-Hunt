@@ -440,10 +440,20 @@ def create_due_followups(db: Session) -> int:
             Application.followup_due_at <= now,
         )
     ).all()
+    from app.services.application_inbox.service import blocks_followup
+
     created = 0
     for app in apps:
         existing = db.scalar(select(FollowUp).where(FollowUp.application_id == app.id))
         if existing:
+            continue
+        if blocks_followup(db, app):
+            # The Application Inbox saw a reply (or the application moved on): a nudge would be noise.
+            app.followup_due_at = None
+            db.add(ApplicationEvent(application=app, kind="note", title="Follow-up not needed",
+                                    detail="The employer already replied, or the application moved beyond Acknowledged, "
+                                           "so no follow-up was drafted.",
+                                    meta={"source": "application_inbox"}))
             continue
         draft_followup(db, app, commit=False)
         created += 1

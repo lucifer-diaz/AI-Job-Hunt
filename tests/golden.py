@@ -13,6 +13,8 @@ from types import SimpleNamespace
 from typing import Any
 
 from app.prompts import (
+    build_application_email_match_prompt,
+    build_application_inbox_prompt,
     build_application_question_prompt,
     build_cover_letter_prompt,
     build_followup_prompt,
@@ -67,6 +69,10 @@ def build(fixture: dict[str, Any]) -> Prompt:
     if name == "inbox":
         return build_inbox_classification_prompt(given["sender"], given["subject"], given["body"],
                                                  given["known_applications"])
+    if name == "application_inbox":
+        return build_application_inbox_prompt(given["application"], given["email"], rule_hint=given.get("rule_hint"))
+    if name == "application_email_match":
+        return build_application_email_match_prompt(given["candidates"], given["email"])
     if name == "followup":
         return build_followup_prompt(profile, job=job, application=given["application"],
                                      recruiters=given["recruiters"], resume=given["resume"], evidence=evidence)

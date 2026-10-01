@@ -39,6 +39,7 @@ STAGE_BY_PROMPT = {
     "ranking": "RANKER", "tailoring": "TAILOR", "cover_letter": "TAILOR", "review": "REVIEWER", "resume_parser": "RESUME_PARSER",
     "evidence_extraction": "RESUME_PARSER", "application_question": "APPLICATION", "followup": "FOLLOW_UP",
     "inbox": "INBOX", "company_insights": "COMPANY_INSIGHTS", "job_description_parser": "OTHER", "ai_optimization": "ADVISOR",
+    "application_inbox": "INBOX", "application_email_match": "INBOX",
 }
 VALIDATION_FAILURE_REASONS = ("INVALID_JSON", "WRONG_OUTPUT_SCHEMA", "POSSIBLE_CROSS_WORKER_OUTPUT",
                               "SEMANTIC_VALIDATION")
@@ -59,6 +60,8 @@ SECTION_CONTRIBUTOR = {
     "JOB DESCRIPTION": "job_description", "FIT ANALYSIS": "job_description",
     "PREVIOUS FOLLOW-UPS": "conversation", "EMAIL SENDER": "conversation", "EMAIL SUBJECT": "conversation",
     "EMAIL BODY": "conversation", "APPLICATION": "conversation", "KNOWN APPLICATIONS": "conversation",
+    "EMAIL RECEIVED": "conversation", "TRACKED APPLICATION": "conversation", "CANDIDATE APPLICATIONS": "conversation",
+    "RULE HINT": "other",
     "RECRUITERS (the first is the primary contact)": "conversation",
     "COMPANY RESEARCH": "research",
 }

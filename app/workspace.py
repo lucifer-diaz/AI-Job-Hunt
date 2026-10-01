@@ -58,6 +58,7 @@ from app.services.actors import catalog as actor_catalog
 from app.services.ai_config import STAGES as AI_STAGES
 from app.services.ai_config import is_free_model
 from app.services.ai_config import resolve as resolve_ai_config
+from app.services.application_inbox import service as inbox_service
 from app.services.contacts import (
     MAX_RECRUITERS,
     ContactIn,
@@ -89,6 +90,16 @@ from app.services.sources import (
     start_apify_search,
     upsert_job,
 )
+from app.services.tracker import (
+    ALL_STAGE_IDS,
+    BASE_STAGES,
+    CLOSED_STAGE,
+    EXTRA_STAGES,
+    INACTIVE_STAGES,
+    INTERVIEW_STAGES,
+    REPLY_STAGES,
+    set_stage,
+)
 from app.services.url_safety import UnsafeURL, check_public_url
 from app.services.user_settings import apify_token, lock_settings_row, settings_for
 from app.services.work_queue import transition
@@ -105,25 +116,6 @@ from app.settings import get_settings
 
 router = APIRouter()
 
-BASE_STAGES = [
-    {"id": "applied", "label": "Applied", "dot": "#5b4ae8"},
-    {"id": "acknowledged", "label": "Acknowledged", "dot": "#a79bf0"},
-    {"id": "screening", "label": "Screening", "dot": "#0f9c86"},
-    {"id": "interviewing", "label": "Interviewing", "dot": "#0e7a68"},
-]
-EXTRA_STAGES = [
-    {"id": "takehome", "label": "Take-home", "dot": "#e0a136"},
-    {"id": "offer", "label": "Offer", "dot": "#0f9c86"},
-    {"id": "negotiating", "label": "Negotiating", "dot": "#b26b00"},
-    {"id": "onhold", "label": "On hold", "dot": "#9aa1b2"},
-    {"id": "rejected", "label": "Rejected", "dot": "#c22f4e"},
-    {"id": "referral", "label": "Referral outreach", "dot": "#a79bf0"},
-]
-CLOSED_STAGE = {"id": "closed", "label": "Closed", "dot": "#c6cad8"}
-ALL_STAGE_IDS = {s["id"] for s in BASE_STAGES + EXTRA_STAGES} | {"closed"}
-REPLY_STAGES = {"screening", "interviewing", "takehome", "offer", "negotiating"}
-INTERVIEW_STAGES = {"interviewing", "takehome", "offer", "negotiating"}
-INACTIVE_STAGES = {"closed", "rejected"}
 # "archive" puts a job away without judging it: it leaves the queue and is not ranked, but unlike a dismissal it
 # teaches the domain filter nothing (app.services.feedback_learning).
 TRIAGE_ACTIONS = {"shortlist": "shortlisted", "maybe": "maybe", "skip": "dismissed", "dismiss": "dismissed",
@@ -1678,6 +1670,10 @@ def app_payload(db: Session, app: Application) -> dict:
         "resume_id": resume.id if resume else None,
         "draft": draft.draft if draft else "", "draft_id": draft.id if draft else None,
         "next": next_step[0], "next_date": next_step[1],
+        # The Application Inbox: the email about this application, and whether the employer has already replied
+        # (a follow-up would then be unnecessary).
+        "email_activity": inbox_service.events_for_application(db, app.id)[:10],
+        "inbox_reply": inbox_service.reply_received(db, app) is not None,
         "timeline": [{"id": e.id, "kind": e.kind, "title": e.title, "detail": e.detail,
                       "at": e.occurred_at.isoformat(), **event_meta(e.meta),
                       "at_local": format_in_zone(e.occurred_at, event_meta(e.meta)["timezone"], "%-d %b %Y, %H:%M")
@@ -1734,10 +1730,7 @@ def move_stage(application_id: int, payload: StageIn, db: Session = Depends(get_
         raise HTTPException(422, "Unknown stage")
     if not app.applied_at:
         raise HTTPException(400, "Only submitted applications can move through the tracker")
-    if app.stage != payload.stage:
-        label = next(s["label"] for s in [*BASE_STAGES, *EXTRA_STAGES, CLOSED_STAGE] if s["id"] == payload.stage)
-        db.add(ApplicationEvent(application=app, kind="stage", title=f"Moved to {label}", detail=payload.stage))
-        app.stage = payload.stage
+    if set_stage(db, app, payload.stage) is not None:
         db.commit()
     return app_payload(db, app)
 

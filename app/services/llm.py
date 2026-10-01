@@ -803,6 +803,15 @@ class LLMClient:
             return {"claims": [{"claim": c, "company": "", "role": "", "skills": []} for c in claims]}
         if "TAILOR_RESUME" in user.split("\n", 1)[0]:
             return self._mock_tailoring(user)
+        if "ANALYZE_APPLICATION_EMAIL" in user.split("\n", 1)[0]:
+            # No spend and no guesses: a neutral update that a person reviews (the deterministic rules come first).
+            return {"event_type": "GENERAL_RECRUITING_UPDATE", "confidence": 0.5,
+                    "summary": "Mock: an update about this application.", "application_stage_detected": "UNKNOWN",
+                    "requires_user_action": False, "action_items": [], "interview": None, "assessment": None,
+                    "recruiter": None, "important_facts": [], "recommended_tracker_action": "NO_CHANGE",
+                    "needs_review": True}
+        if "MATCH_APPLICATION_EMAIL" in user.split("\n", 1)[0]:
+            return {"matched_application_id": None, "confidence": 0.0, "reason": "Mock: no explicit match."}
         return {"summary": "Mock answer."}
 
     @staticmethod

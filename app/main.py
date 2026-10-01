@@ -32,6 +32,7 @@ from sqlalchemy.orm import Session
 
 from app import auth
 from app.ai_models_api import router as ai_models_router
+from app.application_inbox_api import router as application_inbox_router
 from app.auth import PASSWORD_MIN_LENGTH, CurrentUser, current_user, get_user_db
 from app.auth import router as auth_router
 from app.db import engine
@@ -168,6 +169,7 @@ app.include_router(resume_router)
 app.include_router(job_description_router)
 app.include_router(discovery_router)
 app.include_router(ai_models_router)
+app.include_router(application_inbox_router)
 
 # Reachable without signing in. Cron and admin routes are protected by their own secrets.
 PUBLIC_PATHS = {"/health", "/login", "/signup", "/api/auth/login", "/api/auth/signup", "/api/auth/logout"}

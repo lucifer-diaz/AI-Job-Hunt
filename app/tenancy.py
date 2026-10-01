@@ -23,7 +23,8 @@ from sqlalchemy import event
 from sqlalchemy.orm import Session, with_loader_criteria
 
 from app.models import (AIConfigAuditEntry, AIConfigVersion, AIModel, AIOptimizationReport, AIOptimizationTask,
-                        AIRoutingConfig, AppSetting, Application, ApplicationEvent, CandidateProfile, LiteLLMConnection,
+                        AIRoutingConfig, AppSetting, Application, ApplicationCommunicationEvent, ApplicationEmailMessage,
+                        ApplicationEvent, ApplicationInboxDigest, CandidateProfile, GmailConnection, LiteLLMConnection,
                         ModelTier, WorkerModelConfig,
                         ConversationAction, Evidence, FollowUp, Job, JobDescriptionFetchTask, JobDescriptionParseTask,
                         JobFeedbackEvent, JobRanking, JobRankingTask, RemovedPosting,
@@ -38,7 +39,8 @@ OWNED_MODELS = (CandidateProfile, AppSetting, ResumeDocument, KnowledgeAnswer, E
                 ResumeDataChange, JobRequirementEvidence, JobStructuredDataChange, JobDescriptionParseTask,
                 JobDescriptionFetchTask, RemovedPosting, JobFeedbackEvent,
                 LiteLLMConnection, AIModel, ModelTier, WorkerModelConfig, AIRoutingConfig, AIConfigVersion,
-                AIConfigAuditEntry)
+                AIConfigAuditEntry, GmailConnection, ApplicationEmailMessage, ApplicationCommunicationEvent,
+                ApplicationInboxDigest)
 # Rows that inherit their owner from a parent row: model -> (relationship, foreign key, parent model).
 INHERITED_OWNER = {
     Application: ("job", "job_id", Job),

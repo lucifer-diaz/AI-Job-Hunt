@@ -16,6 +16,8 @@ from app.prompts import (
     OUTPUT_CONTRACTS,
     PROMPT_VERSIONS,
     build_ai_optimization_prompt,
+    build_application_email_match_prompt,
+    build_application_inbox_prompt,
     build_application_question_prompt,
     build_cover_letter_prompt,
     build_evidence_extraction_prompt,
@@ -108,6 +110,12 @@ def all_prompts() -> dict[str, Prompt]:
             page_title="Lead AI Engineer - Globex"),
         "application_question": build_application_question_prompt("Do you require visa sponsorship?", answer_context),
         "inbox": build_inbox_classification_prompt("hr@globex.com", "Interview", f"Hi Asha. {EMAIL_INJECTION}"),
+        "application_inbox": build_application_inbox_prompt(
+            {"company": "Globex", "role": "Lead AI Engineer", "current_stage": "applied", "applied_at": "2026-09-10"},
+            {"sender": "hr@globex.com", "subject": "Interview", "body": f"Hi Asha. {EMAIL_INJECTION}"}),
+        "application_email_match": build_application_email_match_prompt(
+            [{"application_id": 3, "company": "Globex", "role": "Lead AI Engineer"}],
+            {"sender": "hr@globex.com", "subject": "Interview", "body": f"Hi Asha. {EMAIL_INJECTION}"}),
         "ai_optimization": build_ai_optimization_prompt({"totals": {"requests": 3}}, []),
     }
 

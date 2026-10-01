@@ -1192,7 +1192,8 @@ function renderTracker() {
   const all = t.applications, apps = filterTracker(all, S.tf);
   const stats = [[t.stats.live, 'Live applications', 'var(--ink)'], [t.stats.replies, 'Replies', 'var(--good)'], [t.stats.due, 'Follow-ups due', 'var(--warn)'], [t.stats.response_rate, 'Response rate', 'var(--brand-ink)']];
   const head = `<div class="row wrap gap10"><div class="row wrap gap10 grow statrow">${stats.map(([n, l, c]) => `<div class="card" style="padding:11px 15px;min-width:130px;border-radius:11px"><div class="mono bb" style="font-size:20px;color:${c}">${esc(n)}</div><div class="xs muted mt4">${l}</div></div>`).join('')}</div>
-    ${btn('Board', 'tracker-view', { id: 'board' }, S.trackerView === 'board' ? '' : 'ghost')}${btn('Timeline', 'tracker-view', { id: 'timeline' }, S.trackerView === 'timeline' ? '' : 'ghost')}</div>`;
+    ${btn('Board', 'tracker-view', { id: 'board' }, S.trackerView === 'board' ? '' : 'ghost')}${btn('Timeline', 'tracker-view', { id: 'timeline' }, S.trackerView === 'timeline' ? '' : 'ghost')}${btn('Inbox insights', 'tracker-view', { id: 'inbox' }, S.trackerView === 'inbox' ? '' : 'ghost')}</div>`;
+  if (S.trackerView === 'inbox') return `<div class="stack">${head}${renderInboxInsights()}</div>`;
   if (!all.length) return `<div class="stack">${head}<section class="card">${empty('No submitted applications yet', 'Approve a packet and confirm you applied from the apply kit — it lands here.', btn('Open approvals', 'go', { screen: 'approvals' }, 'primary'))}</section></div>`;
   const filters = renderTrackerFilters(all, apps.length);
   if (!apps.length) return `<div class="stack">${head}${filters}<section class="card">${empty('No applications match', 'Try another location or clear the filters.', btn('Reset filters', 'tracker-reset-filters', {}, 'primary'))}</section></div>`;
@@ -1221,6 +1222,7 @@ function renderTracker() {
     <div class="split gap18">
       <div style="flex:1 1 320px;min-width:0"><div class="caps mb12">HISTORY</div>
         <div class="col">${sel.timeline.map(e => `<div class="tl"><div class="tl-rail"><span class="d" style="background:${KIND_DOT[e.kind] || '#c6cad8'}"></span><span class="l"></span></div><div style="padding-bottom:16px"><div class="small b">${esc(e.title)}</div><div class="xs muted mt4 pretty">${eventTime(e)}${e.detail && e.kind !== 'stage' ? ' · ' + esc(e.detail) : ''}</div>${eventContact(e)}</div></div>`).join('')}</div>
+        ${renderEmailActivity(sel)}
         <div class="logbox"><select class="select" style="width:auto;padding:6px 8px" id="log-kind">${['note', 'call', 'email', 'referral'].map(k => `<option value="${k}">${k[0].toUpperCase() + k.slice(1)}</option>`).join('')}</select>
           <input class="input bare grow" id="log-text" placeholder="Log something — call, email, referral…" data-enter="log-event" data-app="${sel.id}">${btn(label('log', 'Add', 'Adding…'), 'log-event', { app: sel.id }, 'sm', isBusy('log'))}</div>
       </div>
@@ -1230,6 +1232,7 @@ function renderTracker() {
         <div class="box" style="padding:13px"><div class="caps mb8">SUBMITTED</div>
           <div class="small ink2" style="line-height:1.5">${sel.resume_id ? `<a href="#" data-act="go" data-screen="tailor" data-job="${sel.job_id}">${esc(sel.docs)}</a>` : esc(sel.docs)}</div>${sel.notes ? `<div class="xs muted mt8 pretty">${esc(sel.notes)}</div>` : ''}</div>
         <div class="box" style="padding:13px;border-color:#e2ddff;background:var(--brand-softer)"><div class="row gap6 mb8">${pill('AI', 'brand')}<span class="xs b" style="color:var(--brand-ink)">Follow-up draft</span></div>
+          ${sel.inbox_reply ? '<div class="xs mb8" style="color:var(--good)">The employer already replied (Email activity), so a follow-up is probably unnecessary.</div>' : ''}
           <div class="small ink2 pretty" style="line-height:1.55;white-space:pre-wrap">${esc(sel.draft || 'No draft yet. Generate one — nothing is ever sent for you.')}</div>
           <div class="row gap8 mt10">${sel.draft ? btn('Review &amp; copy', 'copy-draft', { app: sel.id }, 'sm primary') : ''}${btn(label('nudge' + sel.id, sel.draft ? 'Regenerate' : 'Draft follow-up', 'Drafting…'), 'draft-nudge', { app: sel.id, stay: 1 }, 'sm' + (sel.draft ? '' : ' primary'), isBusy('nudge' + sel.id))}</div></div>
         ${S.scheduling ? renderScheduleForm(sel) : btn('Schedule an interview', 'schedule-start', {}, 'block')}
@@ -2172,7 +2175,7 @@ const A = {
     go('tracker', { selApp: app?.id, trackerView: 'board' });
   }, 'Marked applied · follow-up scheduled'),
   // tracker
-  'tracker-view': el => { S.trackerView = el.dataset.id; render(); },
+  'tracker-view': el => { S.trackerView = el.dataset.id; if (el.dataset.id === 'inbox') D.inbox = undefined; render(); },
   'select-app': el => { S.selApp = Number(el.dataset.id); S.editingRecruiter = false; S.scheduling = false; if (el.dataset.board) S.trackerView = 'board'; render(); },
   'move-stage': el => moveStage(el.dataset.app, el.dataset.stage),
   'add-stage': el => busy('stages', async () => { D.tracker = await api('/api/tracker/stages', { method: 'PUT', body: { extra_stages: [...D.tracker.extra_stages, el.dataset.id] } }); }),
@@ -2228,6 +2231,7 @@ const A = {
   ...RESUME_DATA_ACTIONS,
   ...JOB_DATA_ACTIONS,
   ...MONITORING_ACTIONS,
+  ...INBOX_ACTIONS,
 };
 function tagFallback(form, key) {
   if (form === 'sp') return D.searchProfile?.profile?.[key] || [];
