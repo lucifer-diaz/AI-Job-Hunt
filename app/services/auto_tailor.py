@@ -9,7 +9,12 @@ A job is queued automatically only when all of these hold:
 * the job is QUALIFIED and still in the Tailor queue (`shortlisted`);
 * it meets the account's automatic-tailoring fit score, when one is set;
 * it was ranked after automatic tailoring was turned on — jobs that were already waiting are never backfilled;
-* it never had a tailoring task, so a task the person cancelled is never queued again.
+* automatic tailoring has not decided about it yet (`jobs.auto_tailor_status` is NULL) and it has no tailoring
+  task. The decision is kept on the job, not the task: QUEUED once this module queued it, DECLINED once the person
+  cancelled one of its tasks. Clearing finished tasks therefore never lets a cancelled or failed job back in.
+
+Each job is claimed with a guarded UPDATE before it is queued, and `uq_tailor_tasks_active_job` allows one active
+task per job, so the ranking hook, the sweep and a person clicking Tailor at the same moment queue it once.
 
 `after_qualified` runs straight after a ranking; `sweep` is the scheduler's safety net for a job the hook missed.
 Neither ever changes the ranking's outcome: every failure is caught and logged.
@@ -21,7 +26,7 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import exists, func, select
+from sqlalchemy import exists, func, select, update
 from sqlalchemy.orm import Session
 
 from app.models import Job, JobRanking, TailorTask
@@ -51,7 +56,7 @@ def _candidates(db: Session, config: dict[str, Any]):
                  .correlate(Job).scalar_subquery())
     query = select(Job).where(Job.state == S.QUALIFIED, Job.status == TAILOR_QUEUE_STATUS,
                               Job.fit_score.is_not(None), ranked_at >= since,
-                              ~exists().where(TailorTask.job_id == Job.id))
+                              Job.auto_tailor_status.is_(None), ~exists().where(TailorTask.job_id == Job.id))
     if config["min_fit_score"] is not None:
         query = query.where(Job.fit_score >= config["min_fit_score"])
     return query
@@ -65,9 +70,16 @@ def queue(db: Session, job_ids: list[int] | None = None) -> dict[str, Any]:
     if job_ids is not None:
         query = query.where(Job.id.in_(job_ids))
     ids = list(db.scalars(query.with_only_columns(Job.id).order_by(Job.fit_score.desc(), Job.id)).all())
-    if not ids:
+    # Claim each job before queueing it. The ranking hook and the sweep can pick the same job at the same moment; the
+    # guarded UPDATE lets exactly one of them win (the other waits on the row and then matches nothing). The claim
+    # commits together with the task in enqueue, so a failure undoes both and the sweep can try again.
+    claimed = [job_id for job_id in ids if db.execute(
+        update(Job).where(Job.id == job_id, Job.auto_tailor_status.is_(None))
+        .values(auto_tailor_status=tailor_tasks.AUTO_QUEUED).execution_options(synchronize_session=False)).rowcount]
+    if not claimed:
+        db.rollback()
         return {"queued": [], "skipped": []}
-    result = tailor_tasks.enqueue(db, ids)
+    result = tailor_tasks.enqueue(db, claimed)
     for task in result["queued"]:
         system_log.log_event(message=f"Automatic tailoring queued job {task['job_id']} after ranking",
                              category="WORKFLOW", workflow="auto_tailor", user_id=db.info.get("user_id"),

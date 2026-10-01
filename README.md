@@ -1022,8 +1022,11 @@ ranking qualifies it (`app/services/auto_tailor.py`). The task starts at once wh
 slots is free; otherwise it waits in the queue and the tailor worker starts it when a slot frees up. An optional
 **fit score** (0 = every qualified job) holds back jobs that qualified with a lower score.
 
-It only covers jobs ranked after it was turned on: jobs already waiting in the Tailor queue are not backfilled. A
-job whose tailoring you cancelled is never queued again, and in Claude Desktop mode nothing is queued. Queueing
+It only covers jobs ranked after it was turned on: jobs already waiting in the Tailor queue are not backfilled. Each
+job is queued automatically at most once: the decision is kept on the job (`jobs.auto_tailor_status`: QUEUED, or
+DECLINED once you cancel one of its tasks), so a cancelled or failed job stays out even after **Clear finished**. In
+Claude Desktop mode nothing is queued. A job has at most one queued or running tailoring task
+(`uq_tailor_tasks_active_job`), so the ranking hook, the sweep and a Tailor click at the same moment queue it once. Queueing
 happens right after the ranking is saved and never changes it; the `auto_tailor` scheduler job
 (`AUTO_TAILOR_INTERVAL_MINUTES=5`) queues any qualified job that step missed.
 

@@ -21,6 +21,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import delete, func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import Job, ResumeVariant, TailorTask
@@ -46,7 +47,9 @@ STAGE_PROGRESS = {
     "tailor": {"queued": 0, "ranking": 5, "tailoring": 25, "reviewing": 70, "done": 100},
     "skip": {"queued": 0, "ranking": 0, "tailoring": 0, "reviewing": 30, "done": 100},
 }
-DESKTOP_MODE_REASON = "Claude Desktop mode: tailor and review this job from Claude Desktop"
+# jobs.auto_tailor_status (app.services.auto_tailor): automatic tailoring queued the job, or the person cancelled it.
+AUTO_QUEUED, DECLINED = "QUEUED", "DECLINED"
+DESKTOP_MODE_REASON ="Claude Desktop mode: tailor and review this job from Claude Desktop"
 # Finished tasks stay on the Tailor screen this long unless cleared.
 RECENT = timedelta(hours=24)
 
@@ -110,8 +113,15 @@ def enqueue(db: Session, ids: list[int], mode: str = "tailor", regenerate: bool 
         if reason:
             skipped.append({"id": job_id, "reason": reason})
             continue
-        task = TailorTask(job=job, mode=mode, regenerate=regenerate, status="queued", stage="queued", attempts=0)
-        db.add(task)
+        task = TailorTask(job_id=job.id, mode=mode, regenerate=regenerate, status="queued", stage="queued", attempts=0)
+        try:
+            # uq_tailor_tasks_active_job: another request may have queued this job since the check above.
+            with db.begin_nested():
+                db.add(task)
+                db.flush()
+        except IntegrityError:
+            skipped.append({"id": job_id, "reason": "already queued"})
+            continue
         tasks.append(task)
     db.commit()
     return {"queued": [task_dict(t) for t in tasks], "skipped": skipped}
@@ -134,9 +144,14 @@ def cancel_queued(db: Session, task_ids: list[int] | None = None, now: datetime 
     if task_ids is not None:
         query = query.where(TailorTask.id.in_(task_ids))
     result = db.execute(query.values(status="cancelled", stage="done", finished_at=now or utcnow())
-                        .execution_options(synchronize_session=False))
+                        .returning(TailorTask.job_id).execution_options(synchronize_session=False))
+    job_ids = list(result.scalars().all())
+    if job_ids:
+        # The person's decision outlives the task row ("Clear finished"): automatic tailoring never queues these again.
+        db.execute(update(Job).where(Job.id.in_(job_ids)).values(auto_tailor_status=DECLINED)
+                   .execution_options(synchronize_session=False))
     db.commit()
-    return result.rowcount or 0
+    return len(job_ids)
 
 
 def clear_finished(db: Session) -> int:
