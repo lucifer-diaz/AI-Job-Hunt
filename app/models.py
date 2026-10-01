@@ -487,6 +487,10 @@ class Job(Base):
     # person), ACTIVE (the person pinned the active resume). NULL = never chosen; the active resume is used.
     # Re-matching only ever changes AUTO and NULL jobs.
     resume_choice: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    # Automatic tailoring's decision for this job (app.services.auto_tailor), kept when task history is cleared:
+    # QUEUED (it queued the job once) or DECLINED (the person cancelled a tailoring task for it). NULL = undecided;
+    # only an undecided job is ever queued automatically.
+    auto_tailor_status: Mapped[str | None] = mapped_column(String(10), nullable=True)
 
     # Salary enrichment (app.services.compensation): posting salary plus the status of other sources.
     compensation: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
@@ -889,6 +893,10 @@ class TailorTask(Base):
         CheckConstraint("mode IN ('tailor', 'skip')", name="ck_tailor_tasks_mode"),
         CheckConstraint("status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')", name="ck_tailor_tasks_status"),
         Index("ix_tailor_tasks_status", "status", "id"),
+        # At most one queued or running task per job, so two paths queueing the same job at once cannot both win.
+        Index("uq_tailor_tasks_active_job", "job_id", unique=True,
+              postgresql_where=text("status IN ('queued', 'running')"),
+              sqlite_where=text("status IN ('queued', 'running')")),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)

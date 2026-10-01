@@ -158,6 +158,11 @@ class RankingResult(Contract):
         by_status: dict[str, list[RequirementAssessment]] = {s: [] for s in MATCH_STATUSES}
         for item in self.requirement_assessments:
             by_status[item.status].append(item)
+        # A model sometimes lists a requirement by its JOB REQUIREMENTS id ("req_003"); people read these lists, so
+        # an id it also assessed is replaced by that requirement's text.
+        names = {a.requirement_id: a.requirement for a in self.requirement_assessments if a.requirement_id}
+        for field in ("strong_matches", "partial_matches", "missing_requirements", "fatal_gaps", "resume_gaps"):
+            setattr(self, field, [names.get(value, value) for value in getattr(self, field)])
         if not self.strong_matches:
             self.strong_matches = [a.requirement for a in by_status["MATCH"]]
         if not self.partial_matches:

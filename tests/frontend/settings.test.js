@@ -157,6 +157,24 @@ describe('focused settings UI', () => {
     expect(ui.settingsChanges('workflow')).toEqual({ weekly_target: '20' });
     expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({ weekly_target: 20 });
   });
+  it('turns on automatic tailoring with its own fit score', async () => {
+    section('workflow');
+    expect(document.getElementById('view').textContent).toContain('qualified jobs wait in the Tailor queue');
+    expect(document.getElementById('workflow-auto_tailor_min_fit_score')).toBeNull();
+    const box = document.querySelector('[data-field="auto_tailor"]'); box.checked = true;
+    box.dispatchEvent(new Event('change', { bubbles: true }));  // the checkbox itself reveals the fit score field
+    expect(document.getElementById('workflow-auto_tailor_min_fit_score')).not.toBeNull();
+    expect(document.getElementById('view').textContent).toContain('starts at once when a tailoring slot is free (up to 2 at a time)');
+    ui.setF('workflow', 'auto_tailor_min_fit_score', '80'); ui.render();
+    expect(document.getElementById('view').textContent).toContain('fit score of 80 or more');
+    fetchMock.mockResolvedValueOnce(response({ ...ui.D.settings, auto_tailor: { enabled: true, min_fit_score: 80, enabled_at: '2026-09-28T10:00:00' } }));
+    await ui.settingsSave('workflow');
+    const [url, options] = fetchMock.mock.calls[0];
+    expect([url, options.method, JSON.parse(options.body)]).toEqual(['/api/settings', 'PATCH', { auto_tailor: true, auto_tailor_min_fit_score: 80 }]);
+    ui.D.settings.execution_mode = 'claude_desktop'; section('workflow');
+    expect(document.querySelector('[data-field="auto_tailor"]').disabled).toBe(true);
+    expect(document.getElementById('view').textContent).toContain('only runs on Job Hunt OS workers');
+  });
   it('protects dirty resume text before primary selection and upload', async () => {
     section('resumes'); ui.setF('resumes', 'master_resume', 'Unsaved resume');
     confirm.mockReturnValue(false); await ui.settingsUseResume(1); await ui.settingsUploadResume(new File(['test'], 'test.txt'));

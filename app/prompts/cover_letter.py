@@ -26,11 +26,12 @@ from app.prompts.common import (
 )
 from app.prompts.contracts import CoverLetterResult, describe_fields
 
+# v5: evidence ids go in selected_evidence_ids only, never in the letter text.
 # v4: verified resume facts are application data, not untrusted text; each fact is sent once.
 # v3: about a third shorter (one shape paragraph, one avoid list), no personal name in the instructions.
 # v2: typed output contract; gaps stay gaps; only the candidate fields a letter uses; the FitAnalysis only when the
 # Ranker completed one; the candidate policy applied before the prompt instead of sent for the model to reason about.
-COVER_LETTER_PROMPT_VERSION = "v4"
+COVER_LETTER_PROMPT_VERSION = "v5"
 COVER_LETTER_MARKER = "COVER_LETTER"
 CANDIDATE_FIELDS = ("name", "headline", "location", "work_authorization")
 
@@ -48,7 +49,8 @@ concrete reason from the posting. Paragraphs 2-3: the two strongest proofs for t
 its real number or scope, in fresh words rather than resume bullets. Paragraph 4: what they bring, anything from KNOWN
 ANSWERS the posting raises (work authorization, notice period, relocation, remote), a plain close. Then "Sincerely,"
 and the name from CANDIDATE PROFILE. 250-300 words, plain ASCII, no markdown, lists, headings, em dashes or
-placeholders such as [Company].
+placeholders such as [Company]. Never cite evidence
+ids, fact ids or sources in the letter ("(evidence id 24)", "[E12]"): ids go only in selected_evidence_ids.
 AVOID: "passionate about", "thrilled", "I am writing to express my interest" and other cliches; listing technologies;
 company claims the posting does not make; salary or visa details it never raises; drawing attention to anything the
 candidate lacks.""",

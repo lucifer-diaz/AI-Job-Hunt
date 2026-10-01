@@ -953,6 +953,7 @@ FastAPI starts → scheduler loop (every SCHEDULER_TICK_SECONDS)
 | `hunter` | `HUNTER_INTERVAL_MINUTES=240` | Starts the Apify runs of every saved search setup that is due ("Saved search setups" in section 2) and of every due Hunter search profile. A guarded UPDATE means two app instances cannot start the same one twice |
 | `apify_sync` | `APIFY_SYNC_INTERVAL_MINUTES=5` | Imports datasets of Apify runs that finished; each run is imported once |
 | `ranking` | `RANKING_INTERVAL_MINUTES=2` | The Job Ranker (section 8). A deterministic sweep hard-filters and queues new jobs, recovers crashed tasks and queues re-ranks; then it claims up to `RANKING_BATCH_SIZE` ranking tasks and runs at most `RANKING_CONCURRENCY` model calls at a time — and no more than each account's own limit (see "Processing limits"). Jobs move RANK_PENDING → RANKING → RANKED → QUALIFIED / ARCHIVED |
+| `auto_tailor` | `AUTO_TAILOR_INTERVAL_MINUTES=5` | Automatic tailoring's safety net (see "Automatic tailoring"): queues qualified jobs ranked since an account turned it on that have no tailoring task yet. The tailor worker runs them within the account's tailoring limit |
 | `listing_check` | `LISTING_CHECK_INTERVAL_MINUTES=720` | Re-reads a bounded batch of postings over plain HTTP and deletes the ones that no longer exist (section 14). Approved and applied jobs are kept |
 | `jd_recovery` | `JD_RECOVERY_INTERVAL_MINUTES=2` | Job description recovery (section 13): assesses descriptions never assessed, claims up to `JD_FETCH_BATCH_SIZE` recovery tasks and reads at most `JD_FETCH_MAX_CONCURRENCY` postings at a time — HTTP first, the shared headless browser only when HTTP finds nothing. Runs on SQLite too (claims are guarded UPDATEs) |
 | `compensation` | `COMPENSATION_INTERVAL_MINUTES=5` | Records the salary stated in the original posting (structured actor fields or explicit salary text) in `jobs.compensation`. Glassdoor and PayScale are recorded as `not_configured` until those actors are integrated |
@@ -1032,6 +1033,21 @@ Both limits are enforced where work is claimed, counting what is already running
 worker's bookkeeping, so they hold across restarts and across several workers. A ranking task over the limit is
 left PENDING, untouched and first in line next run; a tailoring task over the limit stays queued. Nothing is
 dropped — the queue just moves at the pace you chose.
+
+### Automatic tailoring
+
+**Settings → Workflow & cadence → Automatic tailoring** (off by default) queues a job for tailoring as soon as the
+ranking qualifies it (`app/services/auto_tailor.py`). The task starts at once when one of the account's tailoring
+slots is free; otherwise it waits in the queue and the tailor worker starts it when a slot frees up. An optional
+**fit score** (0 = every qualified job) holds back jobs that qualified with a lower score.
+
+It only covers jobs ranked after it was turned on: jobs already waiting in the Tailor queue are not backfilled. Each
+job is queued automatically at most once: the decision is kept on the job (`jobs.auto_tailor_status`: QUEUED, or
+DECLINED once you cancel one of its tasks), so a cancelled or failed job stays out even after **Clear finished**. In
+Claude Desktop mode nothing is queued. A job has at most one queued or running tailoring task
+(`uq_tailor_tasks_active_job`), so the ranking hook, the sweep and a Tailor click at the same moment queue it once. Queueing
+happens right after the ranking is saved and never changes it; the `auto_tailor` scheduler job
+(`AUTO_TAILOR_INTERVAL_MINUTES=5`) queues any qualified job that step missed.
 
 The Discovery → Ranking tracker shows the effect: every waiting job has a progress bar, its place in the queue
 and, once the account has finished some rankings, an estimate of when it will start. The estimate comes from the

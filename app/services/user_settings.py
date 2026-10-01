@@ -90,6 +90,20 @@ def ranking_interval_minutes(db: Session, user_id: int | None = None) -> int:
         return 0
 
 
+def auto_tailor_for(db: Session, user_id: int | None = None) -> dict[str, Any]:
+    """Automatic tailoring (app.services.auto_tailor): whether ranking queues qualified jobs for tailoring, the fit
+    score they need (None = every qualified job) and when it was turned on (jobs ranked before that are not
+    included)."""
+    saved = (settings_for(db, user_id).preferences or {}).get("auto_tailor") or {}
+    try:
+        minimum = int(saved.get("min_fit_score") or 0)
+    except (TypeError, ValueError):
+        minimum = 0
+    enabled = bool(saved.get("enabled"))
+    return {"enabled": enabled, "min_fit_score": max(0, min(100, minimum)) or None,
+            "enabled_at": saved.get("enabled_at") if enabled else None}
+
+
 def processing_maximums() -> dict[str, int]:
     """The server's ceilings — the most an account is allowed to ask for."""
     settings = get_settings()

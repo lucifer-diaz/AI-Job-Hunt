@@ -50,6 +50,7 @@ from app.services.resume_format import (
     render_legacy,
     render_resume,
     skills_text,
+    strip_citations,
     summary_text,
     to_plain,
 )
@@ -130,7 +131,7 @@ def write_cover_letter(db: Session, profile: CandidateProfile, job: Job, llm: LL
         verified_evidence,
     )
 
-    letter = to_plain(result.validated.cover_letter).strip()
+    letter = strip_citations(to_plain(result.validated.cover_letter)).strip()
     # The same deterministic checks as a letter saved over MCP (invented numbers, names nothing supports, work
     # authorization the profile does not state). A letter is one unit a person approves before it is sent, so its
     # issues are recorded with it for that review rather than silently cutting sentences out of it.
@@ -145,6 +146,8 @@ def write_cover_letter(db: Session, profile: CandidateProfile, job: Job, llm: LL
 def persist_tailored_resume(db: Session, job: Job, content: dict, *, markdown: str | None = None) -> ResumeVariant:
     """Store a new tailored version for a job. Every tailoring path (backend worker, Claude Desktop over MCP,
     the ADK agent) saves through here. The master resume is only read, never written."""
+    # Evidence ids are kept in the structured content; the letter itself is what a recruiter reads.
+    content = {**content, "cover_letter": strip_citations(content.get("cover_letter", "") or "").strip()}
     version = (db.scalar(select(ResumeVariant.version).where(ResumeVariant.job_id == job.id)
                          .order_by(desc(ResumeVariant.version)).limit(1)) or 0) + 1
     resume = ResumeVariant(job_id=job.id, version=version, content=content,

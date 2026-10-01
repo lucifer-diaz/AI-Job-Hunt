@@ -134,10 +134,10 @@ def test_an_expired_lease_does_not_hold_a_ranking_slot(owner):
 
 def test_tailoring_claims_no_more_than_the_account_allows(owner):
     set_limits(tailoring_concurrency=1)
-    job_id = queue_jobs(owner, 1)[0]
+    running, waiting = queue_jobs(owner, 2)  # one active task per job (uq_tailor_tasks_active_job)
     with SessionLocal() as db:
-        db.add(TailorTask(user_id=owner, job_id=job_id, status="running", stage="tailoring"))
-        db.add(TailorTask(user_id=owner, job_id=job_id, status="queued", stage="queued"))
+        db.add(TailorTask(user_id=owner, job_id=running, status="running", stage="tailoring"))
+        db.add(TailorTask(user_id=owner, job_id=waiting, status="queued", stage="queued"))
         db.commit()
         assert tailor_tasks._account_quota(db, {owner}) == {owner: 0}
         assert tailor_tasks.claim_next(SessionLocal, "worker-1", 900) is None, "the queued packet waits its turn"

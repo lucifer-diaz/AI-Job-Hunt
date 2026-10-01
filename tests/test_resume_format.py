@@ -7,7 +7,7 @@ from io import BytesIO
 
 from app.main import app
 from app.services.exports import markdown_to_simple_pdf
-from app.services.resume_format import parse_resume, render_legacy, render_resume, to_plain
+from app.services.resume_format import parse_resume, render_legacy, render_resume, strip_citations, to_plain
 from app.settings import get_settings
 
 client = TestClient(app)
@@ -210,3 +210,22 @@ def test_exports_show_contact_details_not_markdown_link_syntax():
 def test_pdf_draws_bold_runs_for_labels():
     pdf = markdown_to_simple_pdf("## Core Skills\n- **Data and Streaming:** Kafka, Spark\n")
     assert b"Helvetica-Bold" in pdf
+
+
+def test_strip_citations_removes_evidence_ids_from_cover_letter_prose():
+    letter = (
+        "In my recent role as Lead Engineer at Zendrive Inc (evidence id 24), I reduced incidents by 45% "
+        "(evidence id 23). I designed RAG pipelines (evidence ids 36, 37) and agents (Evidence IDs: E38 and E39). "
+        "I mentored a team [E12]. I scaled throughput (E28, E29). Built a CRM bot, evidence id 40.\n\n"
+        "Sincerely,\nRohan Roy"
+    )
+    assert strip_citations(letter) == (
+        "In my recent role as Lead Engineer at Zendrive Inc, I reduced incidents by 45%. "
+        "I designed RAG pipelines and agents. I mentored a team. I scaled throughput. Built a CRM bot.\n\n"
+        "Sincerely,\nRohan Roy"
+    )
+
+
+def test_strip_citations_keeps_ordinary_parentheses_and_numbers():
+    text = "I cut latency from 10 minutes to 500 ms (a 20x improvement) for 6 million events (2023)."
+    assert strip_citations(text) == text

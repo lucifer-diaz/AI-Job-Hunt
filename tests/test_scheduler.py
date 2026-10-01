@@ -57,12 +57,12 @@ def row(sessions, name) -> SchedulerJob:
 def test_app_scheduler_has_every_job_configured_from_settings():
     scheduler = build_scheduler(enabled=False)
     assert list(scheduler.specs) == ["hunter", "apify_sync", "ranking", "jd_parsing", "jd_recovery", "listing_check",
-                                     "compensation",
+                                     "compensation", "auto_tailor",
                                      "applications", "followups", "inbox", "analytics", "ai_optimization",
                                      "litellm_telemetry", "cleanup"]
     assert scheduler.interval("jd_recovery") == 2
     assert scheduler.interval("ranking") == 2 and scheduler.interval("hunter") == 240
-    assert scheduler.interval("ai_optimization") == 5
+    assert scheduler.interval("ai_optimization") == 5 and scheduler.interval("auto_tailor") == 5
     assert {spec.name for spec in JOBS} == set(scheduler.specs)
 
 

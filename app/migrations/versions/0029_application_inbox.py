@@ -5,8 +5,11 @@ application_email_messages is the deduplication record and analysis queue for ev
 application_communication_events is what a matched email means for an application; application_inbox_digests is the
 daily digest. Nothing existing is changed.
 
-Revision ID: 0028
-Revises: 0027
+Each table is created only when it is missing: installs that ran this revision while it was numbered 0028 (before the
+automatic tailoring guards took that number) already have them.
+
+Revision ID: 0029
+Revises: 0028
 Create Date: 2026-09-28 20:00:00
 """
 from collections.abc import Sequence
@@ -14,8 +17,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = '0028'
-down_revision: str | None = '0027'
+revision: str = '0029'
+down_revision: str | None = '0028'
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -42,7 +45,22 @@ def _owner(table: str) -> sa.Column:
                      nullable=False)
 
 
+def _missing(table: str) -> bool:
+    return table not in sa.inspect(op.get_bind()).get_table_names()
+
+
 def upgrade() -> None:
+    if _missing('gmail_connections'):
+        _create_gmail_connections()
+    if _missing('application_email_messages'):
+        _create_application_email_messages()
+    if _missing('application_communication_events'):
+        _create_application_communication_events()
+    if _missing('application_inbox_digests'):
+        _create_application_inbox_digests()
+
+
+def _create_gmail_connections() -> None:
     op.create_table(
         'gmail_connections',
         sa.Column('id', sa.Integer(), primary_key=True),
@@ -64,6 +82,8 @@ def upgrade() -> None:
     )
     op.create_index('ix_gmail_connections_user_id', 'gmail_connections', ['user_id'], unique=True)
 
+
+def _create_application_email_messages() -> None:
     op.create_table(
         'application_email_messages',
         sa.Column('id', sa.Integer(), primary_key=True),
@@ -106,6 +126,8 @@ def upgrade() -> None:
     op.create_index('ix_application_email_messages_thread', 'application_email_messages',
                     ['user_id', 'gmail_thread_id'])
 
+
+def _create_application_communication_events() -> None:
     op.create_table(
         'application_communication_events',
         sa.Column('id', sa.Integer(), primary_key=True),
@@ -161,6 +183,8 @@ def upgrade() -> None:
     op.create_index('ix_application_communication_events_user_received', 'application_communication_events',
                     ['user_id', 'received_at'])
 
+
+def _create_application_inbox_digests() -> None:
     op.create_table(
         'application_inbox_digests',
         sa.Column('id', sa.Integer(), primary_key=True),

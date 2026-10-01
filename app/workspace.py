@@ -81,6 +81,7 @@ from app.services.lifecycle import WorkflowState as S
 from app.services.lifecycle import can_transition
 from app.services.llm import LLMCall, LLMClient
 from app.services.locations import location_facets, location_key
+from app.services.resume_format import strip_citations
 from app.services.saved_searches import SCHEDULE_KINDS, next_due, schedule_label, schedule_problems
 from app.services.sources import (
     apify_client,
@@ -181,8 +182,20 @@ def latest_resume(db: Session, job_id: int) -> ResumeVariant | None:
                      .order_by(desc(ResumeVariant.version)).limit(1))
 
 
+def requirement_names(analysis: dict) -> dict[str, str]:
+    """Requirement id -> text, from a ranking's assessments. Older rankings may list "req_003" instead of the text."""
+    return {str(a["requirement_id"]): str(a["requirement"]) for a in analysis.get("requirement_assessments") or []
+            if isinstance(a, dict) and a.get("requirement_id") and a.get("requirement")}
+
+
+def ranked_list(analysis: dict, key: str, names: dict[str, str] | None = None) -> list:
+    names = requirement_names(analysis) if names is None else names
+    return [names.get(item, item) if isinstance(item, str) else item for item in analysis.get(key) or []]
+
+
 def job_card(job: Job) -> dict:
     analysis = job.fit_analysis or {}
+    names = requirement_names(analysis)
     app = job.application
     return {
         "id": job.id, "title": job.title, "company": job.company, "location": job.location, "url": job.url,
@@ -193,8 +206,8 @@ def job_card(job: Job) -> dict:
         "status": job.status, "discovered_at": job.discovered_at.isoformat(), "posted": ago(job.discovered_at),
         "posted_at": job.posted_at.isoformat() if job.posted_at else None,
         "posted_ago": ago(job.posted_at) if job.posted_at else None, "posted_raw": job.posted_date_raw or None,
-        "matches": analysis.get("strong_matches") or [], "gaps": analysis.get("gaps") or [],
-        "missing": analysis.get("must_have_missing") or [], "keywords": analysis.get("keywords") or [],
+        "matches": ranked_list(analysis, "strong_matches", names), "gaps": ranked_list(analysis, "gaps", names),
+        "missing": ranked_list(analysis, "must_have_missing", names), "keywords": analysis.get("keywords") or [],
         "summary": analysis.get("summary") or "", "strategy": analysis.get("application_strategy") or "",
         "snippet": (job.description or "")[:360], "agency": is_agency(job.company),
         # Ranking waits for a real posting (app.services.ranker.missing_description); the UI asks for one.
@@ -663,7 +676,8 @@ def job_detail(job_id: int, db: Session = Depends(get_user_db)):
     ]
     evidence = db.scalars(select(Evidence).where(Evidence.verified.is_(True))).all()
     gap_notes = []
-    for gap in [*((job.fit_analysis or {}).get("must_have_missing") or []), *((job.fit_analysis or {}).get("gaps") or [])][:4]:
+    analysis = job.fit_analysis or {}
+    for gap in [*ranked_list(analysis, "must_have_missing"), *ranked_list(analysis, "gaps")][:4]:
         words = {w for w in re.findall(r"[a-z0-9]{3,}", str(gap).lower())}
         partial = next((e for e in evidence if words & set(re.findall(r"[a-z0-9]{3,}", f"{e.claim} {' '.join(e.skills or [])}".lower()))), None)
         gap_notes.append({"gap": str(gap), "partial": f"{partial.company or 'Evidence'}: {partial.claim}" if partial else ""})
@@ -1258,8 +1272,11 @@ def run_detail(run_id: int, db: Session = Depends(get_user_db)):
 def keyword_coverage(job: Job, resume: ResumeVariant | None) -> list[dict]:
     analysis = job.fit_analysis or {}
     text = (resume.markdown.split("## Source Resume")[0] if resume else "").lower()
-    gaps = " ".join(str(g) for g in (analysis.get("gaps") or []) + (analysis.get("must_have_missing") or [])).lower()
-    words = list(dict.fromkeys([*(analysis.get("keywords") or []), *(analysis.get("strong_matches") or [])]))[:14]
+    names = requirement_names(analysis)  # a ranking may list requirements by id ("1", "req_002"): show their text
+    gaps = " ".join(str(g) for g in ranked_list(analysis, "gaps", names)
+                    + ranked_list(analysis, "must_have_missing", names)).lower()
+    words = list(dict.fromkeys(str(w) for w in [*ranked_list(analysis, "keywords", names),
+                                                 *ranked_list(analysis, "strong_matches", names)]))[:14]
     out = []
     for word in words:
         status = "covered" if str(word).lower() in text else "partial" if str(word).lower() in gaps else "missing"
@@ -1365,7 +1382,7 @@ def packet(db: Session, job: Job) -> dict:
         "id": resume.id, "version": resume.version, "created_at": resume.created_at.isoformat(),
         "generated": ago(resume.created_at), "reviewer_score": resume.reviewer_score, "markdown": resume.markdown,
         "untailored": bool((resume.content or {}).get("untailored")),
-        "cover_letter": resume.cover_letter, "cover_words": len(resume.cover_letter.split()),
+        "cover_letter": strip_citations(resume.cover_letter), "cover_words": len(resume.cover_letter.split()),
         "edits": edits, "review": review, "keywords": coverage,
         "ats_pct": round(100 * covered / len(coverage)) if coverage else None,
     }}
@@ -1625,7 +1642,8 @@ def cover_letter_txt(job_id: int, db: Session = Depends(get_user_db)):
     resume = latest_resume(db, job_id)
     if not resume:
         raise HTTPException(404, "No tailored resume for this job")
-    return Response(resume.cover_letter, media_type="text/plain; charset=utf-8",
+    # Letters saved before citations were stripped on write still download clean.
+    return Response(strip_citations(resume.cover_letter), media_type="text/plain; charset=utf-8",
                     headers=download_headers(packet_download_name(db, job_id, "cover_letter")))
 
 

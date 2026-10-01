@@ -105,6 +105,7 @@ from app.services.structured_resume import clean_raw_text
 from app.services.user_settings import (
     EXECUTION_MODES,
     PROCESSING_LIMITS,
+    auto_tailor_for,
     execution_mode_for,
     key_status,
     lock_settings_row,
@@ -311,6 +312,8 @@ def settings_get(db: Session = Depends(get_user_db)):
             **processing_limits(db), "processing_maximums": processing_maximums(),
             # How it backs off when a provider rate limits it, with the first few waits spelled out.
             "rate_limits": backoff.policy_for(db, value.user_id).public(),
+            # Whether ranking queues qualified jobs for tailoring by itself (app.services.auto_tailor).
+            "auto_tailor": auto_tailor_for(db),
             "ranking_interval_server_minutes": settings.ranking_interval_minutes,
             "configured": {**configured, "mock": True, "litellm": bool(gateway_settings(db, value.user_id)[0])},
             "keys": keys,
@@ -362,8 +365,19 @@ def settings_put(payload: SettingsIn, db: Session = Depends(get_user_db)):
                                       ("base_seconds", payload.rate_limit_base_seconds),
                                       ("multiplier", payload.rate_limit_multiplier),
                                       ("max_seconds", payload.rate_limit_max_seconds)) if given is not None}})
+    # Turning automatic tailoring on marks the moment: only jobs ranked after it are queued (no backfill).
+    auto_tailor = {**((value.preferences or {}).get("auto_tailor") or {})}
+    was_on = bool(auto_tailor.get("enabled"))
+    if payload.auto_tailor is not None:
+        auto_tailor["enabled"] = payload.auto_tailor
+    if payload.auto_tailor_min_fit_score is not None:
+        auto_tailor["min_fit_score"] = payload.auto_tailor_min_fit_score or None
+    if auto_tailor.get("enabled") and (not was_on or not auto_tailor.get("enabled_at")):
+        auto_tailor["enabled_at"] = datetime.now(UTC).replace(tzinfo=None).isoformat()
+    elif not auto_tailor.get("enabled"):
+        auto_tailor.pop("enabled_at", None)
     value.preferences = {**(value.preferences or {}), "ai": ai, "execution_mode": execution_mode,
-                         "processing": limits,
+                         "processing": limits, "auto_tailor": auto_tailor,
                          "rate_limits": {k: v for k, v in rate_limits.public().items() if k != "ladder"}}
     effective = resolve_ai_config(settings, ai)
     value.llm_provider, value.model = effective["llm_provider"], effective["model"][:300]

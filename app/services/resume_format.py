@@ -58,6 +58,24 @@ def to_plain(text: str) -> str:
     return "".join(out)
 
 
+# Evidence citations a model leaves in prose: "(evidence id 24)", "(evidence ids 36, 37)", "[E12]", ", evidence ID E3".
+# The ids belong in the structured output, never in the text a recruiter reads.
+_EVIDENCE_REF = r"#?E?\d+(?:\s*(?:,|and|&)\s*#?E?\d+)*"
+CITATION_RES = (
+    re.compile(r"\s*[(\[]\s*(?:verified\s+)?evidence\s+ids?\s*[:#]?\s*" + _EVIDENCE_REF + r"\s*[)\]]", re.IGNORECASE),
+    re.compile(r"\s*[(\[]\s*E\d+(?:\s*,\s*E\d+)*\s*[)\]]"),
+    re.compile(r",?\s*\b(?:verified\s+)?evidence\s+ids?\s*[:#]?\s*" + _EVIDENCE_REF + r"\b", re.IGNORECASE),
+)
+
+
+def strip_citations(text: str) -> str:
+    """Remove evidence-id citations from prose meant for a reader, leaving the sentence around them intact."""
+    for pattern in CITATION_RES:
+        text = pattern.sub("", text or "")
+    text = re.sub(r"[ \t]+([.,;:!?)])", r"\1", text)
+    return re.sub(r"[ \t]{2,}", " ", text)
+
+
 DATE_RANGE_RE = re.compile(
     r"((?:[A-Za-z]{3,9}\.?\s+)?\d{4}|\d{1,2}/\d{4})\s*(?:-|–|—|to)\s*"
     r"((?:[A-Za-z]{3,9}\.?\s+)?\d{4}|\d{1,2}/\d{4}|present|current|now|today)", re.IGNORECASE)
