@@ -170,6 +170,8 @@ class Settings(BaseSettings):
     inbox_interval_minutes: int = 5
     analytics_interval_minutes: int = 60
     cleanup_interval_minutes: int = 15
+    # Automatic tailoring's safety net (app.services.auto_tailor): queues qualified jobs the ranking hook missed.
+    auto_tailor_interval_minutes: int = 5
     # AI Optimization Advisor (app.services.ai_advisor): processes queued and scheduled analyses.
     ai_optimization_interval_minutes: int = 5
     # Imports the auto router's decisions (tier and cause) from LiteLLM's spend logs into Monitoring.

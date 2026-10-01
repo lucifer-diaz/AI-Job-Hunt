@@ -200,3 +200,30 @@ def test_0014_turns_existing_resumes_into_unverified_versions(tmp_path):
     assert not inspect(engine).has_table("resumes")
     assert "fact_key" not in {c["name"] for c in inspect(engine).get_columns("evidence")}
     engine.dispose()
+
+
+def test_0028_keeps_one_active_tailoring_task_per_job(tmp_path):
+    """The unique index needs at most one queued or running task per job: the running one (else the oldest) stays."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'tailor.db'}")
+    with engine.begin() as connection:
+        command.upgrade(alembic_config(connection), "0027")
+        user = _insert(connection, "users", email="tailor@example.com", password_hash="!")
+        both = _insert(connection, "jobs", user_id=user, title="A", company="Acme", source="test", source_ref="a")
+        queued_only = _insert(connection, "jobs", user_id=user, title="B", company="Acme", source="test", source_ref="b")
+        tasks = {name: _insert(connection, "tailor_tasks", user_id=user, job_id=job, status=status, mode="tailor")
+                 for name, job, status in [("old_queued", both, "queued"), ("running", both, "running"),
+                                           ("done", both, "succeeded"), ("first", queued_only, "queued"),
+                                           ("second", queued_only, "queued")]}
+    with engine.begin() as connection:
+        command.upgrade(alembic_config(connection), "0028")
+    with engine.connect() as connection:
+        status = dict(connection.execute(text("SELECT id, status FROM tailor_tasks")).all())
+        assert "auto_tailor_status" in {c["name"] for c in inspect(connection).get_columns("jobs")}
+    assert {name: status[task_id] for name, task_id in tasks.items()} == {
+        "old_queued": "cancelled", "running": "running", "done": "succeeded", "first": "queued", "second": "cancelled"}
+    with engine.begin() as connection, pytest.raises(IntegrityError):
+        _insert(connection, "tailor_tasks", user_id=user, job_id=queued_only, status="queued", mode="tailor")
+    with engine.begin() as connection:
+        command.downgrade(alembic_config(connection), "0027")
+    assert "auto_tailor_status" not in {c["name"] for c in inspect(engine).get_columns("jobs")}
+    engine.dispose()

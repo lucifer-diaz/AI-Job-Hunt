@@ -111,6 +111,10 @@ class SettingsIn(BaseModel):
     rate_limit_base_seconds: int | None = Field(default=None, ge=1, le=600)
     rate_limit_multiplier: float | None = Field(default=None, ge=1.0, le=10.0)
     rate_limit_max_seconds: int | None = Field(default=None, ge=5, le=86_400)
+    # Queue qualified jobs for tailoring when ranking finishes (app.services.auto_tailor). Omitted keeps what is
+    # saved; a minimum fit score of 0 means every qualified job.
+    auto_tailor: bool | None = None
+    auto_tailor_min_fit_score: int | None = Field(default=None, ge=0, le=100)
 
 
 class ProfilePatch(ProfileIn):
