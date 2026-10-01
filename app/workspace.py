@@ -80,6 +80,7 @@ from app.services.lifecycle import WorkflowState as S
 from app.services.lifecycle import can_transition
 from app.services.llm import LLMCall, LLMClient
 from app.services.locations import location_facets, location_key
+from app.services.resume_format import strip_citations
 from app.services.saved_searches import SCHEDULE_KINDS, next_due, schedule_label, schedule_problems
 from app.services.sources import (
     apify_client,
@@ -1373,7 +1374,7 @@ def packet(db: Session, job: Job) -> dict:
         "id": resume.id, "version": resume.version, "created_at": resume.created_at.isoformat(),
         "generated": ago(resume.created_at), "reviewer_score": resume.reviewer_score, "markdown": resume.markdown,
         "untailored": bool((resume.content or {}).get("untailored")),
-        "cover_letter": resume.cover_letter, "cover_words": len(resume.cover_letter.split()),
+        "cover_letter": strip_citations(resume.cover_letter), "cover_words": len(resume.cover_letter.split()),
         "edits": edits, "review": review, "keywords": coverage,
         "ats_pct": round(100 * covered / len(coverage)) if coverage else None,
     }}
@@ -1633,7 +1634,8 @@ def cover_letter_txt(job_id: int, db: Session = Depends(get_user_db)):
     resume = latest_resume(db, job_id)
     if not resume:
         raise HTTPException(404, "No tailored resume for this job")
-    return Response(resume.cover_letter, media_type="text/plain; charset=utf-8",
+    # Letters saved before citations were stripped on write still download clean.
+    return Response(strip_citations(resume.cover_letter), media_type="text/plain; charset=utf-8",
                     headers=download_headers(packet_download_name(db, job_id, "cover_letter")))
 
 
