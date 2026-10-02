@@ -253,6 +253,15 @@ def jd_recovery_metrics(f: monitoring.MonitoringFilter = Filter, db: Session = D
             "diagnostics": jd_recovery.diagnostics(db, db.info.get("user_id"))}
 
 
+@router.get("/jd-parsing")
+def jd_parsing_metrics(f: monitoring.MonitoringFilter = Filter, db: Session = Depends(get_user_db)) -> dict[str, Any]:
+    """Job description parsing: parse tasks and their outcomes, the queue, the parser's model calls (LLM stage
+    JD_PARSER) and the scheduler job."""
+    from app.services import job_description
+
+    return {"filters": f.public(), "metrics": job_description.metrics(db, f.user_id, f.start, f.end)}
+
+
 @router.get("/application-inbox")
 def application_inbox_metrics(f: monitoring.MonitoringFilter = Filter,
                               db: Session = Depends(get_user_db)) -> dict[str, Any]:

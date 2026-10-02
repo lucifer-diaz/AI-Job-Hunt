@@ -17,7 +17,8 @@ from app.prompts.contracts import (
 
 # v2 adds third-party API telemetry (app.services.external_monitoring) alongside the LLM aggregates.
 # v3 adds model-routing aggregates (worker → model, auto-router tiers, escalation, fallback, inference share).
-AI_OPTIMIZATION_PROMPT_VERSION = "v3"
+# v4: job description parsing and recovery are their own stages (JD_PARSER, JD_RECOVERY) instead of OTHER.
+AI_OPTIMIZATION_PROMPT_VERSION = "v4"
 AI_OPTIMIZATION_MARKER = "AI_OPTIMIZATION"
 __all__ = ["ADVISOR_STAGES", "AI_OPTIMIZATION_PROMPT_VERSION", "RECOMMENDATION_CATEGORIES",
            "RECOMMENDATION_PRIORITIES", "build_ai_optimization_prompt"]

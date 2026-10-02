@@ -3,7 +3,7 @@
    tokens (brand + orange, validated for colour-vision deficiency); every chart has hover details and a table view. */
 'use strict';
 
-const MON_STAGES = { RANKER: 'Ranker', TAILOR: 'Tailor', REVIEWER: 'Reviewer', RESUME_PARSER: 'Resume parser', APPLICATION: 'Application', FOLLOW_UP: 'Follow-up', INBOX: 'Inbox', COMPANY_INSIGHTS: 'Company insights', ADVISOR: 'Advisor', OTHER: 'Other' };
+const MON_STAGES = { RANKER: 'Ranker', TAILOR: 'Tailor', REVIEWER: 'Reviewer', RESUME_PARSER: 'Resume parser', JD_PARSER: 'JD parser', JD_RECOVERY: 'JD recovery', APPLICATION: 'Application', FOLLOW_UP: 'Follow-up', INBOX: 'Inbox', COMPANY_INSIGHTS: 'Company insights', ADVISOR: 'Advisor', OTHER: 'Other' };
 const MON_ERRORS = { TIMEOUT: 'Timeouts', RATE_LIMIT: 'Rate limits', INVALID_JSON: 'Invalid JSON', SCHEMA_VALIDATION: 'Schema validation', PROVIDER_ERROR: 'Provider errors', CONTEXT_OVERFLOW: 'Context overflow', CONFIGURATION: 'Configuration', OTHER: 'Other' };
 const MON_RANGES = [['today', 'Today'], ['7d', '7 days'], ['30d', '30 days']];
 const MON_SERIES = { input: '#5b4ae8', output: '#eb6834' };
@@ -14,7 +14,7 @@ let monTimer = null;
 
 // Monitoring is one screen with seven sections; each loads only what it shows (loadMonitoring).
 const MON_TABS = [['overview', 'Overview'], ['llm', 'LLM usage'], ['external', 'External APIs'],
-                  ['apify', 'Apify'], ['jd_recovery', 'JD recovery'], ['inbox', 'Application inbox'], ['logs', 'Logs'], ['advisor', 'AI optimization']];
+                  ['apify', 'Apify'], ['jd_parsing', 'JD parsing'], ['jd_recovery', 'JD recovery'], ['inbox', 'Application inbox'], ['logs', 'Logs'], ['advisor', 'AI optimization']];
 const MON_CATEGORY_TONE = { EXTERNAL_API: 'brand', APIFY: 'brand', LLM: 'muted', SCHEDULER: 'muted',
                             WORKFLOW: 'muted', APPLICATION: 'muted', EMAIL: 'muted', SYSTEM: 'muted' };
 const MON_LEVEL_TONE = { ERROR: 'bad', WARNING: 'warn', INFO: 'muted', DEBUG: 'muted' };
@@ -62,7 +62,7 @@ async function loadMonitoring() {
   // Each section asks only for what it draws, so opening Logs does not aggregate every LLM request.
   const wantsLlm = ['overview', 'llm', 'advisor'].includes(m.tab);
   const wantsExternal = ['overview', 'external', 'apify'].includes(m.tab);
-  const [dash, reqs, capture, rec, ext, extReqs, logs, jdr, inbox] = await Promise.all([
+  const [dash, reqs, capture, rec, ext, extReqs, logs, jdr, inbox, jdp] = await Promise.all([
     wantsLlm ? api('/api/monitoring/dashboard?' + monQuery()) : Promise.resolve(D.mon),
     m.tab === 'llm' ? api('/api/monitoring/requests?' + monQuery({ page: m.page, per_page: 20 })) : Promise.resolve(D.monRequests),
     ['llm', 'logs'].includes(m.tab) ? api('/api/monitoring/capture').catch(() => D.monCapture) : Promise.resolve(D.monCapture),
@@ -72,9 +72,10 @@ async function loadMonitoring() {
     m.tab === 'logs' ? api('/api/monitoring/logs?' + monLogQuery({ page: m.logs.page, per_page: 50 })) : Promise.resolve(D.monLogs),
     m.tab === 'jd_recovery' ? api('/api/monitoring/jd-recovery?' + monQuery()) : Promise.resolve(D.monJdr),
     m.tab === 'inbox' ? api('/api/monitoring/application-inbox?' + monQuery()) : Promise.resolve(D.monInbox),
+    m.tab === 'jd_parsing' ? api('/api/monitoring/jd-parsing?' + monQuery()) : Promise.resolve(D.monJdp),
   ]);
   const wasActive = D.monRec?.active;
-  Object.assign(D, { mon: dash, monRequests: reqs, monCapture: capture, monRec: rec, monExt: ext, monExtRequests: extReqs, monLogs: logs, monJdr: jdr, monInbox: inbox });
+  Object.assign(D, { mon: dash, monRequests: reqs, monCapture: capture, monRec: rec, monExt: ext, monExtRequests: extReqs, monLogs: logs, monJdr: jdr, monInbox: inbox, monJdp: jdp });
   if (wasActive && !rec.active) {
     const task = rec.tasks[0];
     toast(task?.status === 'FAILED' ? `AI usage analysis failed: ${task.error || 'unknown error'}` : 'AI usage analysis finished: recommendations updated', task?.status === 'FAILED');
@@ -151,7 +152,7 @@ function renderMonitoring() {
     <div class="seg">${MON_TABS.map(([id, t]) => `<button class="${m.tab === id ? 'on' : ''}" data-act="mon-tab" data-id="${id}">${t}</button>`).join('')}</div>
     <div class="seg">${MON_RANGES.map(([id, t]) => `<button class="${m.range === id ? 'on' : ''}" data-act="mon-range" data-id="${id}">${t}</button>`).join('')}</div></div></section>`;
   const body = m.tab === 'llm' ? renderMonLlm() : m.tab === 'external' ? renderMonExternal()
-    : m.tab === 'apify' ? renderMonApify() : m.tab === 'jd_recovery' ? renderMonJdRecovery() : m.tab === 'inbox' ? renderMonInbox() : m.tab === 'logs' ? renderMonLogs()
+    : m.tab === 'apify' ? renderMonApify() : m.tab === 'jd_parsing' ? renderMonJdParsing() : m.tab === 'jd_recovery' ? renderMonJdRecovery() : m.tab === 'inbox' ? renderMonInbox() : m.tab === 'logs' ? renderMonLogs()
     : m.tab === 'advisor' ? renderAdvisor() : renderMonOverview();
   return `<div class="stack">${tabs}${body}</div>`;
 }
@@ -406,6 +407,35 @@ function renderMonExtRequests() {
 }
 
 /* ───────────── Apify ───────────── */
+/* JD parsing: postings turned into structured requirements, the queue, the parser's model calls and its job. */
+function renderMonJdParsing() {
+  const data = D.monJdp;
+  if (!data) return loading();
+  const x = data.metrics, llm = x.llm, job = x.scheduler;
+  const cost = llm.estimated_cost == null ? '—' : `$${llm.estimated_cost.toFixed(4)}`;
+  const tiles = `<section class="mon-tiles">
+    ${monTile('Parse tasks', (x.tasks_created || 0).toLocaleString(), 'created in range')}
+    ${monTile('Parsed', (x.completed || 0).toLocaleString(), `${x.jobs_parsed || 0} jobs got structured requirements`)}
+    ${monTile('Success rate', monPct(x.success_rate), `${x.failed || 0} failed`, x.success_rate != null && x.success_rate < 0.8 ? 'warn' : '')}
+    ${monTile('Queue now', `${x.queue.pending} · ${x.queue.processing}`, `waiting · running${x.queue.oldest_pending_at ? ` · oldest ${fmtDateTime(x.queue.oldest_pending_at)}` : ''}`, x.queue.pending > 50 ? 'warn' : '')}
+    ${monTile('Retrying', (x.retrying || 0).toLocaleString(), 'waiting for another attempt', x.retrying ? 'warn' : '')}
+    ${monTile('Average time', monMs(x.average_duration_ms), 'per parse')}
+    ${monTile('Model calls', (llm.requests || 0).toLocaleString(), `${llm.failed || 0} failed`, llm.failed ? 'warn' : '')}
+    ${monTile('Tokens', `${(llm.input_tokens || 0).toLocaleString()} · ${(llm.output_tokens || 0).toLocaleString()}`, 'in · out')}
+    ${monTile('Cost', cost, llm.estimated_cost == null ? 'not reported' : 'estimated')}
+    ${monTile('Model latency', monMs(llm.average_latency_ms), 'average per call')}
+  </section>`;
+  const sched = job ? `<section class="card mon-card"><div class="card-title mb12">Scheduler job</div><div class="col gap8 small">
+    <div class="row gap8 wrap">${pill(job.enabled ? (job.last_status || 'not run yet') : 'off (JD_PARSE_ENABLED=false)', job.last_status === 'failed' ? 'bad' : job.last_status === 'succeeded' ? 'good' : 'muted')}
+      ${job.last_finished_at ? `<span class="xs muted">last run ${esc(fmtDateTime(job.last_finished_at))}</span>` : ''}${job.next_run_at ? `<span class="xs muted">· next ${esc(fmtDateTime(job.next_run_at))}</span>` : ''}</div>
+    ${job.last_error ? `<div class="xs" style="color:var(--bad)">${esc(job.last_error)}</div>` : ''}
+    <div class="xs muted">Models: ${Object.entries(llm.models || {}).map(([k, n]) => `${esc(k)} (${n})`).join(', ') || 'none in range'}. Each call is in LLM usage under the JD parser stage.</div></div></section>` : '';
+  const errors = monCard('jdp-errors', 'Failures', 'Why parse tasks failed in this range',
+    x.top_errors.length ? `<div class="col gap8">${x.top_errors.map(e => `<div class="small"><span class="mono b">${e.tasks}</span> <span class="ink2">${esc(e.error)}</span></div>`).join('')}</div>` : '<div class="small muted">No failed parse tasks in this range.</div>',
+    monTable(['Category', 'Tasks'], Object.entries(x.failures_by_category || {})));
+  return `${tiles}<div class="mon-grid">${sched}${errors}</div>`;
+}
+
 /* JD recovery: how often a missing job description was read back from its posting, and by which route. */
 const JDR_STATUS_TONE = { AVAILABLE: 'good', UNAVAILABLE: 'bad', UNKNOWN: 'muted' };
 function renderMonJdRecovery() {

@@ -237,7 +237,9 @@ def test_context_size_and_contributors_are_estimated_from_prompt_sections(user_i
 @pytest.mark.parametrize("prompt_name,stage", [("ranking", "RANKER"), ("tailoring", "TAILOR"), ("review", "REVIEWER"),
                                                ("resume_parser", "RESUME_PARSER"), ("evidence_extraction", "RESUME_PARSER"),
                                                ("application_question", "APPLICATION"), ("followup", "FOLLOW_UP"),
-                                               ("inbox", "INBOX"), ("ai_optimization", "ADVISOR"), ("anything", "OTHER")])
+                                               ("inbox", "INBOX"), ("ai_optimization", "ADVISOR"),
+                                               ("job_description_parser", "JD_PARSER"),
+                                               ("job_description_recovery", "JD_RECOVERY"), ("anything", "OTHER")])
 def test_every_prompt_is_attributed_to_its_stage(prompt_name, stage):
     assert llm_telemetry.STAGE_BY_PROMPT.get(prompt_name, "OTHER") == stage
 
@@ -597,3 +599,39 @@ def test_success_lines_can_be_turned_off(user_id, monkeypatch):
     monkeypatch.setattr(get_settings(), "system_log_llm_calls", False)
     client_for(user_id, "mock").generate_prompt(ranking_prompt())
     assert log_lines(user_id, "LLM") == []
+
+
+def test_jd_parsing_has_its_own_stage_and_monitoring_view(user_id, monkeypatch):
+    """Regression: JD parser calls were filed under OTHER, and nothing in Monitoring showed parsing at all."""
+    from app.models import JobDescriptionParseTask
+    from app.prompts import build_job_description_parser_prompt
+
+    posting = "Responsibilities:\n- Build Python services on AWS.\nRequirements:\n- 5+ years of Python."
+    client_for(user_id, "mock").generate_prompt(build_job_description_parser_prompt(job(description=posting), posting),
+                                                LLMCall(workflow_type="job", entity_id=7))
+    log, = logs_for(user_id)
+    assert log.stage == "JD_PARSER" and log.prompt_name == "job_description_parser"
+    now = utcnow()
+    with SessionLocal() as db:
+        db.info["user_id"] = user_id
+        parsed = Job(user_id=user_id, source="manual", source_ref=uuid.uuid4().hex, title="Engineer", company="Acme",
+                     description=posting, structured_description_parsed_at=now)
+        db.add(parsed)
+        db.flush()
+        db.add_all([
+            JobDescriptionParseTask(user_id=user_id, job_id=parsed.id, description_hash="a", status="COMPLETED",
+                                    started_at=now - timedelta(seconds=3), completed_at=now),
+            JobDescriptionParseTask(user_id=user_id, job_id=parsed.id, description_hash="b", status="FAILED",
+                                    last_error="LLMRateLimitError: rate limit exceeded", completed_at=now),
+            JobDescriptionParseTask(user_id=user_id, job_id=parsed.id, description_hash="c", status="PENDING",
+                                    attempt_count=1)])
+        db.commit()
+    monkeypatch.setattr(auth, "authenticate", lambda request: CurrentUser(user_id, "x@jobhunt.test", False))
+    x = TestClient(app).get("/api/monitoring/jd-parsing?range=7d").json()["metrics"]
+    assert (x["tasks_created"], x["completed"], x["failed"], x["retrying"]) == (3, 1, 1, 1)
+    assert x["success_rate"] == 0.5 and x["average_duration_ms"] == 3000 and x["jobs_parsed"] == 1
+    assert x["queue"]["pending"] == 1 and x["top_errors"][0]["error"].startswith("LLMRateLimitError")
+    assert x["llm"]["requests"] == 1 and x["llm"]["models"] == {"mock": 1}
+    assert x["llm"]["estimated_cost"] is None or x["llm"]["estimated_cost"] == 0
+    stages = {s["stage"] for s in TestClient(app).get("/api/monitoring/dashboard?range=7d").json()["stages"]}
+    assert "JD_PARSER" in stages

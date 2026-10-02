@@ -76,6 +76,7 @@ WORKERS: dict[str, Worker] = {w.worker_type: w for w in (
 WORKER_BY_PROMPT = {prompt: w.worker_type for w in WORKERS.values() for prompt in w.prompts}
 # The Monitoring stage (llm_request_logs.stage) each worker's requests have always been recorded under.
 MONITORING_STAGE = {"RESUME_PARSER": "RESUME_PARSER", "EVIDENCE_EXTRACTION": "RESUME_PARSER", "RANKER": "RANKER",
+                    "JD_PARSER": "JD_PARSER", "JD_RECOVERY": "JD_RECOVERY",
                     "TAILOR": "TAILOR", "REVIEWER": "REVIEWER", "APPLICATION_ANSWER": "APPLICATION",
                     "FOLLOWUP": "FOLLOW_UP", "INBOX_CLASSIFIER": "INBOX", "COMPANY_INSIGHTS": "COMPANY_INSIGHTS",
                     "AI_OPTIMIZATION": "ADVISOR"}

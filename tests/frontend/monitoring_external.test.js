@@ -81,9 +81,9 @@ const show = tab => { ui.monState().tab = tab; ui.render(); return document.getE
 describe('Monitoring · external APIs', () => {
   it('offers every section', () => {
     show('external');
-    expect(ui.MON_TABS.map(([id]) => id)).toEqual(['overview', 'llm', 'external', 'apify', 'jd_recovery', 'inbox', 'logs', 'advisor']);
+    expect(ui.MON_TABS.map(([id]) => id)).toEqual(['overview', 'llm', 'external', 'apify', 'jd_parsing', 'jd_recovery', 'inbox', 'logs', 'advisor']);
     expect([...document.querySelectorAll('[data-act="mon-tab"]')].map(b => b.textContent.trim()))
-      .toEqual(['Overview', 'LLM usage', 'External APIs', 'Apify', 'JD recovery', 'Application inbox', 'Logs', 'AI optimization']);
+      .toEqual(['Overview', 'LLM usage', 'External APIs', 'Apify', 'JD parsing', 'JD recovery', 'Application inbox', 'Logs', 'AI optimization']);
   });
 
   it('shows the headline numbers the dashboard is for', () => {
