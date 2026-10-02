@@ -57,7 +57,7 @@ beforeEach(() => {
   vi.stubGlobal('fetch', fetchMock);
   if (!ui) {
     context = createContext({ document, window, location, history, navigator, URLSearchParams, FormData, File, Intl, setTimeout, clearTimeout, setInterval, clearInterval, console });
-    for (const file of ['monitoring.js', 'settings.js', 'resume_data.js', 'job_data.js', 'knowledge.js']) {
+    for (const file of ['monitoring.js', 'settings.js', 'resume_data.js', 'job_data.js', 'knowledge.js', 'inbox.js']) {
       runInContext(readFileSync(`app/static/${file}`, 'utf8'), context, { filename: resolve(`app/static/${file}`) });
     }
     runInContext(appSource, context, { filename: resolve('app/static/app.js') });
@@ -81,9 +81,9 @@ const show = tab => { ui.monState().tab = tab; ui.render(); return document.getE
 describe('Monitoring · external APIs', () => {
   it('offers every section', () => {
     show('external');
-    expect(ui.MON_TABS.map(([id]) => id)).toEqual(['overview', 'llm', 'external', 'apify', 'jd_recovery', 'logs', 'advisor']);
+    expect(ui.MON_TABS.map(([id]) => id)).toEqual(['overview', 'llm', 'external', 'apify', 'jd_parsing', 'jd_recovery', 'inbox', 'logs', 'advisor']);
     expect([...document.querySelectorAll('[data-act="mon-tab"]')].map(b => b.textContent.trim()))
-      .toEqual(['Overview', 'LLM usage', 'External APIs', 'Apify', 'JD recovery', 'Logs', 'AI optimization']);
+      .toEqual(['Overview', 'LLM usage', 'External APIs', 'Apify', 'JD parsing', 'JD recovery', 'Application inbox', 'Logs', 'AI optimization']);
   });
 
   it('shows the headline numbers the dashboard is for', () => {

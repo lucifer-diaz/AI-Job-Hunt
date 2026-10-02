@@ -19,6 +19,7 @@ Everything here is provider-independent: pydantic models and plain JSON Schema, 
 from __future__ import annotations
 
 import re
+from datetime import date, datetime
 from typing import Annotated, Any, ClassVar, Literal
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator, model_validator
@@ -36,8 +37,8 @@ INBOX_CATEGORIES = ("RECRUITER_RESPONSE", "INTERVIEW_INVITATION", "ASSESSMENT", 
 RECOMMENDATION_CATEGORIES = ("COST", "LATENCY", "CONTEXT", "MODEL", "PROMPT", "RELIABILITY", "ARCHITECTURE",
                              "EXTERNAL_API")
 RECOMMENDATION_PRIORITIES = ("HIGH", "MEDIUM", "LOW")
-ADVISOR_STAGES = ("RANKER", "TAILOR", "REVIEWER", "RESUME_PARSER", "APPLICATION", "FOLLOW_UP", "INBOX",
-                  "COMPANY_INSIGHTS", "ADVISOR", "OTHER", "ALL")
+ADVISOR_STAGES = ("RANKER", "TAILOR", "REVIEWER", "RESUME_PARSER", "JD_PARSER", "JD_RECOVERY", "APPLICATION", "FOLLOW_UP",
+                  "INBOX", "COMPANY_INSIGHTS", "ADVISOR", "OTHER", "ALL")
 
 
 def _ids(values: Any) -> Any:
@@ -293,6 +294,187 @@ class InboxClassificationResult(Contract):
         return value
 
 
+# ───────────── Application Inbox (app.services.application_inbox) ─────────────
+
+APPLICATION_EMAIL_EVENT_TYPES = (
+    "APPLICATION_CONFIRMATION", "RECRUITER_RESPONSE", "INTERVIEW_INVITATION", "INTERVIEW_RESCHEDULE",
+    "ASSESSMENT_INVITATION", "ASSESSMENT_REMINDER", "ADDITIONAL_INFORMATION_REQUEST", "DOCUMENT_REQUEST",
+    "FOLLOWUP_RESPONSE", "APPLICATION_ON_HOLD", "APPLICATION_REJECTION", "OFFER", "OFFER_UPDATE", "BACKGROUND_CHECK",
+    "ONBOARDING", "GENERAL_RECRUITING_UPDATE", "AUTOMATED_NOTIFICATION", "UNKNOWN")
+# What the email says about where the application stands. The tracker's own stages are decided by code from this.
+APPLICATION_STAGES_DETECTED = (
+    "APPLIED", "RECRUITER_SCREEN", "ASSESSMENT", "HIRING_MANAGER", "TECHNICAL_INTERVIEW", "SYSTEM_DESIGN",
+    "BEHAVIORAL", "FINAL_INTERVIEW", "HR_DISCUSSION", "OFFER", "ON_HOLD", "REJECTED", "UNKNOWN")
+# A recommendation only: app.services.application_inbox.stage_policy validates it and decides.
+TRACKER_ACTIONS = ("NO_CHANGE", "MOVE_TO_ACKNOWLEDGED", "MOVE_TO_SCREENING", "MOVE_TO_INTERVIEWING",
+                   "MOVE_TO_TAKEHOME", "MOVE_TO_OFFER", "MOVE_TO_ON_HOLD", "MOVE_TO_REJECTED")
+# Interview-round names a model may use for the action; all of them are the tracker's Interviewing column.
+_INTERVIEW_ACTIONS = {"MOVE_TO_" + s for s in ("TECHNICAL_INTERVIEW", "SYSTEM_DESIGN", "BEHAVIORAL", "HIRING_MANAGER",
+                                                "FINAL_INTERVIEW", "HR_DISCUSSION", "INTERVIEW")}
+_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_DATETIME = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2})?(Z|[+-]\d{2}:\d{2})?$")
+_TIME = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+_OFFSET = re.compile(r"^(UTC)?[+-](0\d|1[0-4]):[0-5]\d$")
+_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _tracker_action(value: Any) -> Any:
+    value = _upper(value)
+    return "MOVE_TO_INTERVIEWING" if value in _INTERVIEW_ACTIONS else value
+
+
+def _blank_to_none(value: Any) -> Any:
+    if isinstance(value, str) and (not value.strip() or value.strip().upper() in ("NULL", "NONE", "N/A", "UNKNOWN")):
+        return None
+    return value
+
+
+def _https_only(value: Any) -> Any:
+    """A meeting link is kept only when it is an https URL; anything else (javascript:, http:) is dropped."""
+    value = _blank_to_none(value)
+    return value if isinstance(value, str) and value.startswith("https://") and " " not in value else None
+
+
+def check_deadline(value: str | None) -> str | None:
+    """An explicit date (YYYY-MM-DD) or date and time (ISO 8601). Anything vaguer is not a deadline."""
+    if value is None:
+        return None
+    if not (_DATE.match(value) or _DATETIME.match(value)):
+        raise ValueError("must be an ISO 8601 date or datetime, or null")
+    try:  # a real calendar date and time: 2026-02-31 or 25:00 is rejected here, not deep in the service
+        datetime.fromisoformat(value.replace("Z", "+00:00").replace(" ", "T"))
+    except ValueError as exc:
+        raise ValueError(f"{value} is not a real date") from exc
+    return value
+
+
+def check_timezone(value: str | None) -> str | None:
+    """An IANA zone name (Asia/Kolkata), UTC, or a UTC offset (+05:30). Abbreviations like IST are ambiguous."""
+    if value is None:
+        return None
+    if value.upper() == "UTC" or _OFFSET.match(value.upper()):
+        return value
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    if "/" not in value:
+        raise ValueError("must be an IANA time zone name such as Europe/London, a UTC offset, or null")
+    try:
+        ZoneInfo(value)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(f"unknown time zone {value}") from exc
+    return value
+
+
+OptionalText = Annotated[str | None, BeforeValidator(_blank_to_none)]
+Deadline = Annotated[str | None, BeforeValidator(_blank_to_none)]
+
+
+class EmailActionItem(Contract):
+    action: str = Field(min_length=1, max_length=300, description="what the candidate is asked to do")
+    deadline: Deadline = Field(default=None, description="ISO 8601 date or datetime the email states, else null")
+    confidence: Confidence
+
+    _deadline = field_validator("deadline")(classmethod(lambda cls, v: check_deadline(v)))
+
+
+class EmailInterview(Contract):
+    date: OptionalText = Field(default=None, description="YYYY-MM-DD, only if the email states it")
+    time: OptionalText = Field(default=None, description="HH:MM (24h), only if the email states it")
+    timezone: OptionalText = Field(default=None, description="IANA name or UTC offset the email states, else null")
+    round: OptionalText = Field(default=None, max_length=120, description="e.g. Technical Interview, as written")
+    format: OptionalText = Field(default=None, max_length=60, description="Video, Phone, Onsite, as written")
+    meeting_link: Annotated[str | None, BeforeValidator(_https_only)] = Field(default=None, max_length=1000)
+    interviewer_name: OptionalText = Field(default=None, max_length=200)
+
+    @field_validator("date")
+    @classmethod
+    def _date(cls, value: str | None) -> str | None:
+        if value is not None and not _DATE.match(value):
+            raise ValueError("must be YYYY-MM-DD or null")
+        if value is not None:
+            try:
+                date.fromisoformat(value)
+            except ValueError as exc:
+                raise ValueError(f"{value} is not a real date") from exc
+        return value
+
+    @field_validator("time")
+    @classmethod
+    def _time(cls, value: str | None) -> str | None:
+        if value is not None and not _TIME.match(value):
+            raise ValueError("must be HH:MM (24 hour) or null")
+        return value
+
+    _timezone = field_validator("timezone")(classmethod(lambda cls, v: check_timezone(v)))
+
+    @model_validator(mode="after")
+    def _time_needs_date(self) -> EmailInterview:
+        if self.time and not self.date:
+            raise ValueError("an interview time needs its date")
+        return self
+
+
+class EmailAssessment(Contract):
+    platform: OptionalText = Field(default=None, max_length=120, description="e.g. HackerRank, as written")
+    deadline: Deadline = Field(default=None, description="ISO 8601 date or datetime the email states, else null")
+    assessment_type: OptionalText = Field(default=None, max_length=120, description="coding test, take-home, ...")
+    instructions_summary: OptionalText = Field(default=None, max_length=500)
+
+    _deadline = field_validator("deadline")(classmethod(lambda cls, v: check_deadline(v)))
+
+
+class EmailRecruiter(Contract):
+    name: OptionalText = Field(default=None, max_length=200, description="only as the email states it")
+    email: OptionalText = Field(default=None, max_length=300)
+    title: OptionalText = Field(default=None, max_length=200)
+    company: OptionalText = Field(default=None, max_length=300)
+
+    @field_validator("email")
+    @classmethod
+    def _email(cls, value: str | None) -> str | None:
+        if value is not None and not _EMAIL.match(value):
+            raise ValueError("must be an email address or null")
+        return value
+
+
+class ApplicationEmailAnalysis(Contract):
+    """One recruiting email, already matched to one tracked application. Extraction only: it never moves the
+    application (app.services.application_inbox.stage_policy decides)."""
+
+    worker: ClassVar[str] = "INBOX_CLASSIFIER"
+
+    event_type: Annotated[Literal[APPLICATION_EMAIL_EVENT_TYPES], BeforeValidator(_upper)] = Field(
+        description="one of the event types above")
+    confidence: Confidence
+    summary: str = Field(min_length=1, max_length=500, description="one or two neutral sentences")
+    application_stage_detected: Annotated[Literal[APPLICATION_STAGES_DETECTED], BeforeValidator(_upper)] = Field(
+        default="UNKNOWN", description="the stage the email explicitly shows, else UNKNOWN")
+    requires_user_action: bool
+    action_items: list[EmailActionItem] = Field(default_factory=list, max_length=10)
+    interview: EmailInterview | None = None
+    assessment: EmailAssessment | None = None
+    recruiter: EmailRecruiter | None = None
+    important_facts: Phrases = Field(description="short facts the email states (at most 10)")
+    recommended_tracker_action: Annotated[Literal[TRACKER_ACTIONS], BeforeValidator(_tracker_action)] = Field(
+        default="NO_CHANGE", description="a recommendation only; NO_CHANGE unless the email is explicit")
+    needs_review: bool = Field(description="true when anything is uncertain or ambiguous")
+
+    @field_validator("important_facts")
+    @classmethod
+    def _few_facts(cls, value: list[str]) -> list[str]:
+        return [fact[:300] for fact in value[:10]]
+
+
+class ApplicationEmailMatchResult(Contract):
+    """Which of the candidate applications an email is about, or none. Never an application outside the list."""
+
+    worker: ClassVar[str] = "INBOX_CLASSIFIER"
+
+    matched_application_id: int | None = Field(default=None, description="an id from CANDIDATE APPLICATIONS, or null")
+    confidence: Confidence
+    reason: str = Field(min_length=1, max_length=300, description="the explicit evidence in the email")
+
+
 # ───────────── extraction workers ─────────────
 
 class ResumeParserOutput(Contract):
@@ -410,8 +592,8 @@ class OptimizationReport(Contract):
 
 CONTRACTS: tuple[type[Contract], ...] = (
     RankingResult, TailoringResult, ReviewResult, CoverLetterResult, FollowUpResult, ApplicationAnswerResult,
-    InboxClassificationResult, ResumeParserOutput, EvidenceExtractionResult, JobDescriptionParserOutput,
-    JobDescriptionRecoveryResult, OptimizationReport)
+    InboxClassificationResult, ApplicationEmailAnalysis, ApplicationEmailMatchResult, ResumeParserOutput,
+    EvidenceExtractionResult, JobDescriptionParserOutput, JobDescriptionRecoveryResult, OptimizationReport)
 # Field names older prompts (or a confused model) use for another worker's output, beyond the contracts' own fields.
 LEGACY_FIELDS = {
     "RANKER": {"score", "fit_score", "gaps", "must_have_missing", "keywords", "application_strategy", "matches"},

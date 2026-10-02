@@ -50,6 +50,10 @@ SECRET_PATTERNS = [
     re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|xox[abprs]-[A-Za-z0-9\-]{10,}|AKIA[0-9A-Z]{16})\b"),
     re.compile(r"sk-(?:or-v1-|ant-|proj-)?[A-Za-z0-9_\-]{8,}"),
     re.compile(r"AIza[0-9A-Za-z_\-]{20,}"),
+    # Google OAuth: access tokens, refresh tokens and client secrets (the Gmail connection, app.services.gmail).
+    re.compile(r"\bya29\.[0-9A-Za-z_\-]{10,}"),
+    re.compile(r"(?<![\w/])1//[0-9A-Za-z_\-]{20,}"),
+    re.compile(r"\bGOCSPX-[0-9A-Za-z_\-]{10,}"),
     re.compile(r"apify_api_[A-Za-z0-9]{10,}"),
     re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-]{8,}"),
     re.compile(r"(?i)((?:x-)?api[_-]?key[\"']?\s*[:=]\s*[\"']?)[^\s\"',}]{6,}"),

@@ -11,9 +11,16 @@ from app.prompts.application import (
                                        APPLICATION_QUESTION_PROMPT_VERSION,
                                        build_application_question_prompt,
 )
+from app.prompts.application_inbox import (
+                                       APPLICATION_INBOX_PROMPT_VERSION,
+                                       build_application_email_match_prompt,
+                                       build_application_inbox_prompt,
+)
 from app.prompts.common import Prompt
 from app.prompts.contracts import (
                                        ApplicationAnswerResult,
+                                       ApplicationEmailAnalysis,
+                                       ApplicationEmailMatchResult,
                                        CoverLetterResult,
                                        EvidenceExtractionResult,
                                        FollowUpResult,
@@ -71,6 +78,8 @@ PROMPT_VERSIONS = {
     "evidence_extraction": EVIDENCE_EXTRACTION_PROMPT_VERSION,
     "application_question": APPLICATION_QUESTION_PROMPT_VERSION,
     "inbox": INBOX_PROMPT_VERSION,
+    "application_inbox": APPLICATION_INBOX_PROMPT_VERSION,
+    "application_email_match": APPLICATION_INBOX_PROMPT_VERSION,
     "agents": AGENT_PROMPT_VERSION,
     "ai_optimization": AI_OPTIMIZATION_PROMPT_VERSION,
     "mcp_tailoring": MCP_TAILORING_PROMPT_VERSION,
@@ -93,6 +102,8 @@ OUTPUT_CONTRACTS = {
     "evidence_extraction": EvidenceExtractionResult,
     "application_question": ApplicationAnswerResult,
     "inbox": InboxClassificationResult,
+    "application_inbox": ApplicationEmailAnalysis,
+    "application_email_match": ApplicationEmailMatchResult,
     "ai_optimization": OptimizationReport,
 }
 # Worker prompt names reserved in app.services.ai_workers with no production prompt yet (nothing calls them).
@@ -109,6 +120,8 @@ __all__ = [
                                        "RESERVED_PROMPTS",
                                        "Prompt",
                                        "build_ai_optimization_prompt",
+                                       "build_application_email_match_prompt",
+                                       "build_application_inbox_prompt",
                                        "build_application_question_prompt",
                                        "build_cover_letter_prompt",
                                        "build_evidence_extraction_prompt",

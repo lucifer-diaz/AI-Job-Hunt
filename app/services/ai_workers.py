@@ -56,8 +56,10 @@ WORKERS: dict[str, Worker] = {w.worker_type: w for w in (
            description="Independently reviews a tailored resume"),
     Worker("APPLICATION_ANSWER", "Application Answer", ("application_question",), True, 4096, "TIER",
            PRIMARY_REASONING, description="Drafts answers to application form questions"),
-    Worker("INBOX_CLASSIFIER", "Inbox Classifier", ("inbox",), True, 4096, "AUTO_ROUTER", FAST,
-           description="Classifies recruiter and application email"),
+    # The Application Inbox (app.services.application_inbox): extracts what a matched recruiting email says, and
+    # helps decide which application an email belongs to when deterministic matching is unsure. Never moves a job.
+    Worker("INBOX_CLASSIFIER", "Inbox Classifier", ("inbox", "application_inbox", "application_email_match"), True,
+           4096, "AUTO_ROUTER", FAST, description="Classifies recruiter and application email"),
     Worker("FOLLOWUP", "Follow-Up", ("followup",), False, 4096, "AUTO_ROUTER", FAST, "followup",
            description="Drafts follow-up messages"),
     Worker("COMPANY_INSIGHTS", "Company Insights", ("company_insights",), False, 8192, "AUTO_ROUTER",
@@ -74,6 +76,7 @@ WORKERS: dict[str, Worker] = {w.worker_type: w for w in (
 WORKER_BY_PROMPT = {prompt: w.worker_type for w in WORKERS.values() for prompt in w.prompts}
 # The Monitoring stage (llm_request_logs.stage) each worker's requests have always been recorded under.
 MONITORING_STAGE = {"RESUME_PARSER": "RESUME_PARSER", "EVIDENCE_EXTRACTION": "RESUME_PARSER", "RANKER": "RANKER",
+                    "JD_PARSER": "JD_PARSER", "JD_RECOVERY": "JD_RECOVERY",
                     "TAILOR": "TAILOR", "REVIEWER": "REVIEWER", "APPLICATION_ANSWER": "APPLICATION",
                     "FOLLOWUP": "FOLLOW_UP", "INBOX_CLASSIFIER": "INBOX", "COMPANY_INSIGHTS": "COMPANY_INSIGHTS",
                     "AI_OPTIMIZATION": "ADVISOR"}

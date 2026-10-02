@@ -94,6 +94,14 @@ class User(Base):
                                                                       passive_deletes=True)
     ai_config_versions: Mapped[list[AIConfigVersion]] = relationship(back_populates="user", passive_deletes=True)
     ai_config_audit: Mapped[list[AIConfigAuditEntry]] = relationship(back_populates="user", passive_deletes=True)
+    gmail_connection: Mapped[GmailConnection | None] = relationship(back_populates="user", uselist=False,
+                                                                    passive_deletes=True)
+    application_email_messages: Mapped[list[ApplicationEmailMessage]] = relationship(back_populates="user",
+                                                                                     passive_deletes=True)
+    application_communication_events: Mapped[list[ApplicationCommunicationEvent]] = relationship(
+        back_populates="user", passive_deletes=True)
+    application_inbox_digests: Mapped[list[ApplicationInboxDigest]] = relationship(back_populates="user",
+                                                                                   passive_deletes=True)
 
 
 class UserSession(Base):
@@ -985,6 +993,196 @@ class FollowUp(Base):
     user: Mapped[User] = relationship(back_populates="followups")
 
 
+# ───────────── Application Inbox (app.services.application_inbox) ─────────────
+
+GMAIL_CONNECTION_STATUSES = ("CONNECTED", "CONNECTION_REQUIRED", "REVOKED", "ERROR")
+EMAIL_MATCH_STATUSES = ("MATCHED", "NEEDS_REVIEW", "UNMATCHED", "IGNORED")
+EMAIL_MATCH_METHODS = ("DETERMINISTIC", "LLM_ASSISTED", "USER", "NONE")
+EMAIL_ANALYSIS_STATUSES = ("PENDING", "PROCESSING", "COMPLETED", "FAILED", "SKIPPED")
+EMAIL_EVENT_TYPES = (
+    "APPLICATION_CONFIRMATION", "RECRUITER_RESPONSE", "INTERVIEW_INVITATION", "INTERVIEW_RESCHEDULE",
+    "ASSESSMENT_INVITATION", "ASSESSMENT_REMINDER", "ADDITIONAL_INFORMATION_REQUEST", "DOCUMENT_REQUEST",
+    "FOLLOWUP_RESPONSE", "APPLICATION_ON_HOLD", "APPLICATION_REJECTION", "OFFER", "OFFER_UPDATE", "BACKGROUND_CHECK",
+    "ONBOARDING", "GENERAL_RECRUITING_UPDATE", "AUTOMATED_NOTIFICATION", "UNKNOWN")
+EMAIL_STAGE_DECISIONS = ("APPLIED", "SUGGESTED", "NONE", "INVALID")
+EMAIL_REVIEW_STATUSES = ("OPEN", "ACCEPTED", "DISMISSED")
+
+
+class GmailConnection(Base):
+    """An account's read-only Gmail connection. Only the OAuth refresh token is kept, encrypted with SECRET_KEY
+    (app.security); access tokens live in memory for one sync and are never stored or logged."""
+
+    __tablename__ = "gmail_connections"
+    __table_args__ = (
+        CheckConstraint(f"status IN ({_values(GMAIL_CONNECTION_STATUSES)})", name="ck_gmail_connections_status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("gmail_connections", unique=True)
+    email_address: Mapped[str] = mapped_column(String(320), default="")
+    refresh_token_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    scopes: Mapped[str] = mapped_column(String(500), default="")
+    status: Mapped[str] = mapped_column(String(30), default="CONNECTED")
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    connected_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_sync_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_successful_sync_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Gmail's mailbox history id at the last successful sync: the incremental checkpoint.
+    history_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    # One sync per account at a time (a guarded UPDATE takes it; an expired lease is taken over).
+    sync_locked_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    sync_lock_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Where the running (or last) sync is: {phase, label, done, total, percent, started_at, updated_at}. Counts only,
+    # never message content; read by GET /api/application-inbox/status for the progress bar.
+    sync_progress: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+    user: Mapped[User] = relationship(back_populates="gmail_connection")
+
+
+class ApplicationEmailMessage(Base):
+    """One Gmail message the inbox worker has seen: the deduplication record and the analysis queue.
+
+    Saved before any model call, so a failed analysis never loses the message. Unmatched messages keep metadata only.
+    """
+
+    __tablename__ = "application_email_messages"
+    __table_args__ = (
+        UniqueConstraint("user_id", "gmail_message_id", name="uq_application_email_messages_user_message"),
+        CheckConstraint(f"match_status IN ({_values(EMAIL_MATCH_STATUSES)})",
+                        name="ck_application_email_messages_match_status"),
+        CheckConstraint(f"match_method IN ({_values(EMAIL_MATCH_METHODS)})",
+                        name="ck_application_email_messages_match_method"),
+        CheckConstraint(f"analysis_status IN ({_values(EMAIL_ANALYSIS_STATUSES)})",
+                        name="ck_application_email_messages_analysis_status"),
+        Index("ix_application_email_messages_analysis", "analysis_status", "next_attempt_at"),
+        Index("ix_application_email_messages_thread", "user_id", "gmail_thread_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("application_email_messages")
+    gmail_message_id: Mapped[str] = mapped_column(String(64))
+    gmail_thread_id: Mapped[str] = mapped_column(String(64), default="")
+    sender: Mapped[str] = mapped_column(String(500), default="")
+    sender_domain: Mapped[str] = mapped_column(String(255), default="")
+    subject: Mapped[str] = mapped_column(String(1000), default="")
+    received_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    snippet: Mapped[str] = mapped_column(Text, default="")
+    # The relevant part of the body (quoted replies removed), redacted and capped. Empty for unmatched mail.
+    relevant_text: Mapped[str] = mapped_column(Text, default="")
+    automated: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    application_id: Mapped[int | None] = mapped_column(
+        ForeignKey("applications.id", ondelete="SET NULL", name="fk_application_email_messages_application_id"),
+        nullable=True, index=True)
+    match_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    match_signals: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    match_method: Mapped[str] = mapped_column(String(20), default="NONE")
+    match_status: Mapped[str] = mapped_column(String(20), default="UNMATCHED")
+    # The other applications the email could belong to, when the match is ambiguous: [{application_id, score}].
+    match_candidates: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    analysis_status: Mapped[str] = mapped_column(String(20), default="SKIPPED")
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+    user: Mapped[User] = relationship(back_populates="application_email_messages")
+
+
+class ApplicationCommunicationEvent(Base):
+    """What one matched email means for an application: the Email activity timeline entry.
+
+    The model extracts; code decides (stage_decision). A person's correction (user_corrected) is never overwritten.
+    """
+
+    __tablename__ = "application_communication_events"
+    __table_args__ = (
+        UniqueConstraint("user_id", "gmail_message_id", name="uq_application_communication_events_user_message"),
+        CheckConstraint(f"event_type IN ({_values(EMAIL_EVENT_TYPES)})",
+                        name="ck_application_communication_events_event_type"),
+        CheckConstraint(f"stage_decision IN ({_values(EMAIL_STAGE_DECISIONS)})",
+                        name="ck_application_communication_events_stage_decision"),
+        CheckConstraint(f"review_status IN ({_values(EMAIL_REVIEW_STATUSES)})",
+                        name="ck_application_communication_events_review_status"),
+        Index("ix_application_communication_events_user_received", "user_id", "received_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("application_communication_events")
+    application_id: Mapped[int | None] = mapped_column(
+        ForeignKey("applications.id", ondelete="CASCADE", name="fk_application_communication_events_application_id"),
+        nullable=True, index=True)
+    message_id: Mapped[int | None] = mapped_column(
+        ForeignKey("application_email_messages.id", ondelete="SET NULL",
+                   name="fk_application_communication_events_message_id"), nullable=True)
+    gmail_message_id: Mapped[str] = mapped_column(String(64))
+    gmail_thread_id: Mapped[str] = mapped_column(String(64), default="")
+    event_type: Mapped[str] = mapped_column(String(40), default="UNKNOWN")
+    sender: Mapped[str] = mapped_column(String(500), default="")
+    subject: Mapped[str] = mapped_column(String(1000), default="")
+    received_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    summary: Mapped[str] = mapped_column(Text, default="")
+    requires_action: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    action_items: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    deadline: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    interview: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    assessment: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    recruiter: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    important_facts: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    classification_method: Mapped[str] = mapped_column(String(10), default="RULE")  # RULE | LLM | USER
+    detected_stage: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    recommended_tracker_action: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    stage_decision: Mapped[str] = mapped_column(String(20), default="NONE")
+    stage_from: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    stage_to: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    stage_reason: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    needs_review: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    review_status: Mapped[str] = mapped_column(String(20), default="OPEN")
+    user_corrected: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    # Each correction a person made: [{field, old, new, at}].
+    corrections: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    prompt_version: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # The tracker timeline entry (ApplicationEvent) this email produced, kept in step with corrections.
+    application_event_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+    user: Mapped[User] = relationship(back_populates="application_communication_events")
+
+
+class ApplicationInboxDigest(Base):
+    """The daily Application Inbox digest: one per account and day, rewritten by later syncs that day."""
+
+    __tablename__ = "application_inbox_digests"
+    __table_args__ = (UniqueConstraint("user_id", "date", name="uq_application_inbox_digests_user_date"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("application_inbox_digests")
+    date: Mapped[date] = mapped_column(Date)
+    applications_checked: Mapped[int] = mapped_column(Integer, default=0)
+    messages_scanned: Mapped[int] = mapped_column(Integer, default=0)
+    messages_matched: Mapped[int] = mapped_column(Integer, default=0)
+    new_updates: Mapped[int] = mapped_column(Integer, default=0)
+    needs_action_count: Mapped[int] = mapped_column(Integer, default=0)
+    interviews: Mapped[int] = mapped_column(Integer, default=0)
+    assessments: Mapped[int] = mapped_column(Integer, default=0)
+    rejections: Mapped[int] = mapped_column(Integer, default=0)
+    offers: Mapped[int] = mapped_column(Integer, default=0)
+    summary: Mapped[str] = mapped_column(Text, default="")
+    # needs_attention, stage_changes, new_responses, upcoming, waiting — built from the database, never by a model.
+    sections: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # The day's sync runs and their counters, for Monitoring.
+    sync_runs: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+    user: Mapped[User] = relationship(back_populates="application_inbox_digests")
+
+
 class ResumeVersion(Base):
     """An immutable snapshot of the resume text a candidate profile used, one row per distinct content.
 
@@ -1143,8 +1341,8 @@ class JobRankingTask(Base):
     user: Mapped[User] = relationship(back_populates="ranking_tasks")
 
 
-LLM_STAGES = ("RANKER", "TAILOR", "REVIEWER", "RESUME_PARSER", "APPLICATION", "FOLLOW_UP", "INBOX", "COMPANY_INSIGHTS",
-              "ADVISOR", "OTHER")
+LLM_STAGES = ("RANKER", "TAILOR", "REVIEWER", "RESUME_PARSER", "JD_PARSER", "JD_RECOVERY", "APPLICATION", "FOLLOW_UP",
+              "INBOX", "COMPANY_INSIGHTS", "ADVISOR", "OTHER")
 LLM_ERROR_TYPES = ("TIMEOUT", "RATE_LIMIT", "INVALID_JSON", "SCHEMA_VALIDATION", "PROVIDER_ERROR", "CONTEXT_OVERFLOW",
                    "CONFIGURATION", "OTHER")
 OPTIMIZATION_TASK_STATUSES = ("PENDING", "PROCESSING", "COMPLETED", "FAILED")
@@ -1284,7 +1482,7 @@ EXTERNAL_ERROR_TYPES = ("TIMEOUT", "CONNECTION", "DNS", "RATE_LIMIT", "CLIENT_ER
                         "INVALID_RESPONSE", "RETRY_EXHAUSTED", "CONFIGURATION", "SDK_ERROR", "OTHER")
 # Providers seen so far. Deliberately NOT a database constraint: a new integration must not need a migration.
 KNOWN_EXTERNAL_PROVIDERS = ("APIFY", "OPENROUTER", "OPENAI", "ANTHROPIC", "GEMINI", "LITELLM", "OLLAMA", "EMAIL",
-                            "SEARCH", "JOB_BOARD", "WEB", "OTHER")
+                            "GMAIL", "GOOGLE_OAUTH", "SEARCH", "JOB_BOARD", "WEB", "OTHER")
 SYSTEM_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 SYSTEM_LOG_CATEGORIES = ("EXTERNAL_API", "LLM", "SCHEDULER", "WORKFLOW", "APIFY", "APPLICATION", "EMAIL", "SYSTEM")
 

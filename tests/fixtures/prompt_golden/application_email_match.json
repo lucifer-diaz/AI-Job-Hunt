@@ -1,0 +1,14 @@
+{
+  "worker": "INBOX_CLASSIFIER", "prompt": "application_email_match",
+  "input": {"candidates": [{"application_id": 11, "company": "Initech", "role": "Backend Engineer", "applied_at": "2026-09-10"},
+                           {"application_id": 12, "company": "Initech", "role": "Frontend Engineer", "applied_at": "2026-09-12"}],
+            "email": {"sender": "Talent <talent@initech.com>", "subject": "Your Backend Engineer application", "received_at": "2026-09-28T10:00:00",
+                      "body": "Thanks for applying to the Backend Engineer role at Initech. Could you share your notice period?"}},
+  "must_include": ["CANDIDATE APPLICATIONS", "<untrusted_email_body>", "Never guess", "Never choose an id that is not in CANDIDATE APPLICATIONS"],
+  "must_exclude": ["resume"],
+  "valid_output": {"matched_application_id": 11, "confidence": 0.93, "reason": "The subject names the Backend Engineer role."},
+  "expect": {"matched_application_id": 11},
+  "prohibited_claims": [],
+  "invalid_outputs": [
+    {"name": "no reason", "output": {"matched_application_id": 11, "confidence": 0.9}, "reason": "WRONG_OUTPUT_SCHEMA"}]
+}

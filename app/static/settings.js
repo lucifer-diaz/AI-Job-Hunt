@@ -10,6 +10,7 @@ const SETTINGS_SECTIONS = [
   ['ai', 'AI models', 'LiteLLM, models, tiers and which model each worker uses', '07'],
   ['workflow', 'Workflow & cadence', 'Set a pace that works for you', '08'],
   ['domain', 'Domain filter', 'Which discovered jobs are kept, and what it learned from you', '09'],
+  ['gmail', 'Gmail inbox', 'Read-only updates on the applications you submitted', '10'],
 ];
 const SETTINGS_FORMS = ['profile', 'preferences', 'resumes', 'resume-data', 'account', 'keys', 'ai', 'workflow', 'domain'];
 const DOMAIN_FIELDS = ['enabled', 'learn_from_feedback', 'exclude_terms', 'skill_excludes', 'include_terms'];
@@ -271,7 +272,7 @@ function renderDomainSettings() {
   ${settingsGroup('Existing jobs', 'After changing the lists, check the jobs that are not ranked yet again. Jobs you kept are never touched.', btn(label('domainReapply', 'Apply to existing jobs', 'Checking…'), 'domain-reapply', {}, 'soft', isBusy('domainReapply')))}
   ${settingsFooter('domain')}`;
 }
-const SETTINGS_RENDERERS = { profile: renderProfileSettings, preferences: renderPreferenceSettings, resumes: renderResumeSettings, 'resume-data': () => renderResumeDataSettings(), account: renderAccountSettings, 'api-keys': renderKeySettings, ai: renderAISettings, workflow: renderWorkflowSettings, domain: renderDomainSettings };
+const SETTINGS_RENDERERS = { profile: renderProfileSettings, preferences: renderPreferenceSettings, resumes: renderResumeSettings, 'resume-data': () => renderResumeDataSettings(), account: renderAccountSettings, 'api-keys': renderKeySettings, ai: renderAISettings, workflow: renderWorkflowSettings, domain: renderDomainSettings, gmail: () => renderInboxSettings() };
 function renderSettings() {
   if (D.settingsLoadError) return `<div class="settings-content"><div class="settings-error" role="alert">Settings could not be loaded: ${esc(D.settingsLoadError)}</div>${btn('Try again', 'settings-retry', {}, 'mt16')}</div>`;
   if (!D.profile || !D.settings || !D.prefs) return loading();

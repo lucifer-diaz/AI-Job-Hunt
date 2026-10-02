@@ -312,7 +312,7 @@ def test_running_an_analysis_changes_no_configuration(user_id, monkeypatch):
 
 def test_the_advisor_prompt_lives_in_app_prompts():
     prompt = build_ai_optimization_prompt({"totals": {"requests": 3}}, [{"category": "COST"}])
-    assert PROMPT_VERSIONS["ai_optimization"] == AI_OPTIMIZATION_PROMPT_VERSION == "v3"
+    assert PROMPT_VERSIONS["ai_optimization"] == AI_OPTIMIZATION_PROMPT_VERSION == "v4"
     assert prompt.user.startswith("AI_OPTIMIZATION") and prompt.name == "ai_optimization"
     assert "cannot and must never claim to change model configuration" in " ".join(prompt.system.split())
     for field in ("title", "category", "priority", "finding", "evidence", "recommended_change", "expected_benefit",

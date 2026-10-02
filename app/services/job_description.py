@@ -1038,3 +1038,78 @@ def resolve_reparse(db: Session, job: Job, decisions: dict[str, str]) -> dict[st
                                                     for item in candidate["requirements"]])
     job.structured_description_candidate = None
     return {"accepted": accepted, "structured_description": structured, "unmatched": reconciled.unmatched}
+
+
+# ───────────── monitoring ─────────────
+
+def _count(values: Any) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for value in values:
+        out[value] = out.get(value, 0) + 1
+    return out
+
+
+def metrics(db: Session, user_id: int | None, start: datetime, end: datetime) -> dict[str, Any]:
+    """JD parsing for Monitoring: the parse tasks created in the window, the queue right now, the parser's model calls
+    (LLM stage JD_PARSER) and the scheduler job. One account, or every account for the admin."""
+    from app.models import LLMRequestLog, SchedulerJob
+    from app.services.redaction import redact_text
+
+    def owned(model: Any, query: Any) -> Any:
+        return query.where(model.user_id == user_id) if user_id is not None else query
+
+    T = JobDescriptionParseTask
+    tasks = db.execute(owned(T, select(T.status, T.attempt_count, T.error_category, T.last_error, T.started_at,
+                                       T.completed_at).where(T.created_at >= start, T.created_at <= end))).all()
+    done = [t for t in tasks if t.status == COMPLETED]
+    failed = [t for t in tasks if t.status == FAILED]
+    durations = [(t.completed_at - t.started_at).total_seconds() * 1000 for t in done
+                 if t.started_at and t.completed_at and t.completed_at >= t.started_at]
+    errors: dict[str, int] = {}
+    for t in failed:
+        key = (redact_text((t.last_error or "unknown").split("\n")[0], 160) or "unknown").strip()
+        errors[key] = errors.get(key, 0) + 1
+    queue = dict(db.execute(owned(T, select(T.status, func.count()).where(T.status.in_(ACTIVE_JD_PARSE_STATUSES))
+                                  .group_by(T.status))).all())
+    oldest = db.scalar(owned(T, select(func.min(T.created_at)).where(T.status == PENDING)))
+    parsed = db.scalar(owned(Job, select(func.count(Job.id)).where(Job.structured_description_parsed_at >= start,
+                                                                     Job.structured_description_parsed_at <= end))) or 0
+    calls = db.execute(owned(LLMRequestLog, select(
+        LLMRequestLog.status, LLMRequestLog.error_type, LLMRequestLog.model, LLMRequestLog.input_tokens,
+        LLMRequestLog.output_tokens, LLMRequestLog.latency_ms, LLMRequestLog.estimated_cost)
+        .where(LLMRequestLog.stage == "JD_PARSER", LLMRequestLog.created_at >= start,
+               LLMRequestLog.created_at <= end))).all()
+    latencies = [c.latency_ms for c in calls if c.latency_ms is not None]
+    costs = [c.estimated_cost for c in calls if c.estimated_cost is not None]
+    by_model: dict[str, int] = {}
+    llm_errors: dict[str, int] = {}
+    for c in calls:
+        by_model[c.model or "unknown"] = by_model.get(c.model or "unknown", 0) + 1
+        if c.status == "FAILED":
+            llm_errors[c.error_type or "OTHER"] = llm_errors.get(c.error_type or "OTHER", 0) + 1
+    job_row = db.get(SchedulerJob, "jd_parsing")
+    return {
+        "tasks_created": len(tasks), "completed": len(done), "failed": len(failed),
+        "retrying": sum(1 for t in tasks if t.status == PENDING and (t.attempt_count or 0) > 0),
+        "success_rate": round(len(done) / (len(done) + len(failed)), 3) if done or failed else None,
+        "average_duration_ms": round(sum(durations) / len(durations)) if durations else None,
+        "jobs_parsed": parsed,
+        "failures_by_category": dict(sorted(_count(str(t.error_category.value) if t.error_category else "UNKNOWN"
+                                                   for t in failed).items(), key=lambda kv: -kv[1])),
+        "top_errors": [{"error": e, "tasks": n} for e, n in sorted(errors.items(), key=lambda kv: -kv[1])[:5]],
+        "queue": {"pending": queue.get(PENDING, 0), "processing": queue.get(PROCESSING, 0),
+                  "oldest_pending_at": oldest.isoformat() if oldest else None},
+        "llm": {"requests": len(calls), "failed": sum(1 for c in calls if c.status == "FAILED"),
+                "input_tokens": sum(c.input_tokens or 0 for c in calls),
+                "output_tokens": sum(c.output_tokens or 0 for c in calls),
+                # Unknown cost stays unknown: None unless at least one call reported or priced one.
+                "estimated_cost": float(sum(costs)) if costs else None,
+                "average_latency_ms": round(sum(latencies) / len(latencies)) if latencies else None,
+                "models": dict(sorted(by_model.items(), key=lambda kv: -kv[1])), "errors": llm_errors},
+        "scheduler": None if job_row is None else {
+            "enabled": get_settings().jd_parse_enabled, "last_status": job_row.last_status,
+            "last_finished_at": job_row.last_finished_at.isoformat() if job_row.last_finished_at else None,
+            "next_run_at": job_row.next_run_at.isoformat() if job_row.next_run_at else None,
+            "last_error": redact_text((job_row.last_error or "").split("\n")[0], 300) or None,
+            "last_result": job_row.last_result},
+    }

@@ -31,11 +31,11 @@ beforeEach(() => {
       : url.includes('/api/tailor/queue') ? { items: [], total: 0, total_all: 0, boards: [] }
       : url.includes('/api/tailor/') ? { job: { id: 11, status: 'applied' }, resume: null, min_review_score: 55 }
       : url.includes('/api/knowledge') ? { answers: [] }
-      : url.includes('/api/tailor-tasks') ? { tasks: [] } : {}) }));
+      : url.includes('/api/tailor-tasks') ? [] : {}) }));  // the endpoint returns a list
   vi.stubGlobal('fetch', fetchMock);
   if (!ui) {
     context = createContext({ document, window, location, history, navigator, URLSearchParams, FormData, File, Intl, setTimeout, clearTimeout, setInterval, clearInterval, console });
-    for (const file of ['monitoring.js', 'settings.js', 'resume_data.js', 'job_data.js', 'knowledge.js']) {
+    for (const file of ['monitoring.js', 'settings.js', 'resume_data.js', 'job_data.js', 'knowledge.js', 'inbox.js']) {
       runInContext(readFileSync(`app/static/${file}`, 'utf8'), context, { filename: resolve(`app/static/${file}`) });
     }
     runInContext(appSource, context, { filename: resolve('app/static/app.js') });
@@ -99,5 +99,21 @@ describe('opening the packet from the tracker', () => {
     await ui.A['modal-tailor']({ dataset: { id: '11' } });
     expect(ui.S.screen).toBe('tracker');
     expect(ui.S.selApp).toBe(3);
+  });
+});
+
+describe('landing on the packet', () => {
+  it('scrolls straight to the opened job’s packet once it has loaded, and only once', async () => {
+    const scrolled = [];
+    window.HTMLElement.prototype.scrollIntoView = function scrollIntoView() { scrolled.push(this.id); };
+    ui.D.jobModal = { id: 11, status: 'applied', resume_id: 7, application_id: 3, title: 'Lead Software Engineer',
+      company: 'Epsilon', wizard: [], matches: [], gaps: [], missing: [], keywords: [], fit_analysis: {},
+      description: 'x', notes: '', rejection: null, board: 'Manual', fit: 85 };
+    await ui.A['modal-tailor']({ dataset: { id: '11' } });
+    for (let i = 0; i < 20 && !scrolled.length; i += 1) await new Promise(r => setTimeout(r, 0));
+    expect(scrolled).toEqual(['tailor-packet']);
+    expect(ui.S.tailorFocus).toBe(false);
+    ui.render();  // later re-renders (task polling) leave the page where the reader put it
+    expect(scrolled).toEqual(['tailor-packet']);
   });
 });

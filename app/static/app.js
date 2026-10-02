@@ -176,8 +176,18 @@ function readHash() {
 }
 function go(screen, extra = {}) {
   if (!settingsCanLeave(screen, extra.settingsSection || S.settingsSection)) return;
-  Object.assign(S, { screen, editing: null, scheduling: false, editingRecruiter: false }, extra);
+  // Opening one job's packet lands on that packet, not on the task list and filters above it (focusPacket).
+  const tailorFocus = screen === 'tailor' && !!extra.tailorJob;
+  Object.assign(S, { screen, editing: null, scheduling: false, editingRecruiter: false, tailorFocus }, extra);
   setHash(); window.scrollTo(0, 0); render(); load();
+}
+// Scroll the requested job's packet ("Tailoring for …") into view once it has loaded, then forget the request so
+// later re-renders (task polling) never move the page again.
+function focusPacket() {
+  if (!S.tailorFocus || S.screen !== 'tailor' || !D.packet) return;
+  S.tailorFocus = false;  // one attempt per navigation, whatever was found
+  const target = document.getElementById('tailor-packet');
+  if (target && D.packet.job?.id === S.tailorJob) target.scrollIntoView({ block: 'start', behavior: 'auto' });
 }
 
 const LOADERS = {
@@ -315,7 +325,7 @@ async function load() {
   try {
     await Promise.all([LOADERS[S.screen](), api('/api/workspace/summary').then(s => { D.summary = s; })]);
   } catch (e) { toast(e.message, true); }
-  if (seq === loadSeq) render();
+  if (seq === loadSeq) { render(); focusPacket(); }
 }
 
 /* ───────────── shell ───────────── */
@@ -1016,7 +1026,7 @@ function renderTailorSingle(queue) {
         : '<b>This packet is approved.</b> Edits below change the approved resume and cover letter directly. To regenerate it or skip tailoring, send it back for revision first.'}</span>
       ${job.status === 'approved' ? btn(label('revise', 'Send back for revision', 'Sending back…'), 'revise', { id: job.id }, 'sm', isBusy('revise')) + btn('Open apply kit', 'open-kit', { id: job.id }, 'sm good') : ''}</section>` : '');
   if (!r) {
-    return `<div class="stack">${stack}<section class="card row gap16 wrap"><div class="grow" style="min-width:220px"><div class="card-title" style="font-size:16px">Tailoring for ${esc(job.title)} · ${esc(job.company)}</div><div class="card-sub">Fit ${fitTxt(job.fit)} · no packet generated yet</div></div>${picker}</section>
+    return `<div class="stack">${stack}<section class="card row gap16 wrap" id="tailor-packet"><div class="grow" style="min-width:220px"><div class="card-title" style="font-size:16px">Tailoring for ${esc(job.title)} · ${esc(job.company)}</div><div class="card-sub">Fit ${fitTxt(job.fit)} · no packet generated yet</div></div>${picker}</section>
       <section class="card">${empty(generating ? 'Drafting your packet…' : skipping ? 'Reviewing your master resume…' : 'No packet yet', generating ? `${task ? `${STAGE_LABEL[task.stage]} · ${task.progress}%. ` : ''}Tailoring and an independent review run on the server. You can leave this page.` : skipping ? `${STAGE_LABEL[task.stage]}. Your master resume is used unchanged; the reviewer is scoring it against this posting.` : 'Generate a tailored resume, cover letter and reviewer score. Tailoring may only cite your master resume and verified evidence. If this posting needs no tailoring, skip it and send your master resume as-is.', btn(generating ? 'Generating…' : 'Generate tailored packet', 'generate', { id: job.id }, 'primary lg', working) + btn(skipping ? 'Skipping…' : 'Skip tailoring', 'skip-tailor', { id: job.id }, 'lg', working) + btn('Read the posting', 'open-job', { id: job.id }))}</section></div>`;
   }
   const accepted = r.edits.filter(e => e.status === 'accepted').length;
@@ -1046,7 +1056,7 @@ function renderTailorSingle(queue) {
     body = `<div style="padding:18px" class="col gap9">${ans.length ? ans.slice(0, 12).map(a => `<div class="box"><div class="small muted">${esc(a.question)}</div><div class="row gap8 mt4"><span class="small b grow">${esc(a.answer || 'Awaiting answer')}</span>${pill(a.sensitive ? 'confirm each time' : a.verified ? 'verified' : 'needs review', a.sensitive || !a.verified ? 'warn' : 'good')}</div></div>`).join('') : '<div class="small muted">No saved ATS answers yet. Add them in the Knowledge bank.</div>'}</div>`;
   }
   return `<div class="stack">${stack}
-  <section class="card row gap16 wrap" style="padding:16px 20px">
+  <section class="card row gap16 wrap" id="tailor-packet" style="padding:16px 20px">
     <div class="grow" style="min-width:220px"><div class="card-title" style="font-size:16px">Tailoring for ${esc(job.title)} · ${esc(job.company)}</div><div class="card-sub">v${r.version} · generated ${esc(r.generated)} · ${r.untailored ? 'master resume, not tailored' : 'edits must trace to verified evidence'}</div></div>
     ${picker}
     <div class="row gap14"><div class="metric"><div class="n" style="color:${r.reviewer_score >= p.min_review_score ? 'var(--good)' : 'var(--warn)'}">${fitTxt(r.reviewer_score)}</div><div class="l">REVIEWER</div></div>
@@ -1192,7 +1202,8 @@ function renderTracker() {
   const all = t.applications, apps = filterTracker(all, S.tf);
   const stats = [[t.stats.live, 'Live applications', 'var(--ink)'], [t.stats.replies, 'Replies', 'var(--good)'], [t.stats.due, 'Follow-ups due', 'var(--warn)'], [t.stats.response_rate, 'Response rate', 'var(--brand-ink)']];
   const head = `<div class="row wrap gap10"><div class="row wrap gap10 grow statrow">${stats.map(([n, l, c]) => `<div class="card" style="padding:11px 15px;min-width:130px;border-radius:11px"><div class="mono bb" style="font-size:20px;color:${c}">${esc(n)}</div><div class="xs muted mt4">${l}</div></div>`).join('')}</div>
-    ${btn('Board', 'tracker-view', { id: 'board' }, S.trackerView === 'board' ? '' : 'ghost')}${btn('Timeline', 'tracker-view', { id: 'timeline' }, S.trackerView === 'timeline' ? '' : 'ghost')}</div>`;
+    ${btn('Board', 'tracker-view', { id: 'board' }, S.trackerView === 'board' ? '' : 'ghost')}${btn('Timeline', 'tracker-view', { id: 'timeline' }, S.trackerView === 'timeline' ? '' : 'ghost')}${btn('Inbox insights', 'tracker-view', { id: 'inbox' }, S.trackerView === 'inbox' ? '' : 'ghost')}</div>`;
+  if (S.trackerView === 'inbox') return `<div class="stack">${head}${renderInboxInsights()}</div>`;
   if (!all.length) return `<div class="stack">${head}<section class="card">${empty('No submitted applications yet', 'Approve a packet and confirm you applied from the apply kit — it lands here.', btn('Open approvals', 'go', { screen: 'approvals' }, 'primary'))}</section></div>`;
   const filters = renderTrackerFilters(all, apps.length);
   if (!apps.length) return `<div class="stack">${head}${filters}<section class="card">${empty('No applications match', 'Try another location or clear the filters.', btn('Reset filters', 'tracker-reset-filters', {}, 'primary'))}</section></div>`;
@@ -1221,6 +1232,7 @@ function renderTracker() {
     <div class="split gap18">
       <div style="flex:1 1 320px;min-width:0"><div class="caps mb12">HISTORY</div>
         <div class="col">${sel.timeline.map(e => `<div class="tl"><div class="tl-rail"><span class="d" style="background:${KIND_DOT[e.kind] || '#c6cad8'}"></span><span class="l"></span></div><div style="padding-bottom:16px"><div class="small b">${esc(e.title)}</div><div class="xs muted mt4 pretty">${eventTime(e)}${e.detail && e.kind !== 'stage' ? ' · ' + esc(e.detail) : ''}</div>${eventContact(e)}</div></div>`).join('')}</div>
+        ${renderEmailActivity(sel)}
         <div class="logbox"><select class="select" style="width:auto;padding:6px 8px" id="log-kind">${['note', 'call', 'email', 'referral'].map(k => `<option value="${k}">${k[0].toUpperCase() + k.slice(1)}</option>`).join('')}</select>
           <input class="input bare grow" id="log-text" placeholder="Log something — call, email, referral…" data-enter="log-event" data-app="${sel.id}">${btn(label('log', 'Add', 'Adding…'), 'log-event', { app: sel.id }, 'sm', isBusy('log'))}</div>
       </div>
@@ -1230,6 +1242,7 @@ function renderTracker() {
         <div class="box" style="padding:13px"><div class="caps mb8">SUBMITTED</div>
           <div class="small ink2" style="line-height:1.5">${sel.resume_id ? `<a href="#" data-act="go" data-screen="tailor" data-job="${sel.job_id}">${esc(sel.docs)}</a>` : esc(sel.docs)}</div>${sel.notes ? `<div class="xs muted mt8 pretty">${esc(sel.notes)}</div>` : ''}</div>
         <div class="box" style="padding:13px;border-color:#e2ddff;background:var(--brand-softer)"><div class="row gap6 mb8">${pill('AI', 'brand')}<span class="xs b" style="color:var(--brand-ink)">Follow-up draft</span></div>
+          ${sel.inbox_reply ? '<div class="xs mb8" style="color:var(--good)">The employer already replied (Email activity), so a follow-up is probably unnecessary.</div>' : ''}
           <div class="small ink2 pretty" style="line-height:1.55;white-space:pre-wrap">${esc(sel.draft || 'No draft yet. Generate one — nothing is ever sent for you.')}</div>
           <div class="row gap8 mt10">${sel.draft ? btn('Review &amp; copy', 'copy-draft', { app: sel.id }, 'sm primary') : ''}${btn(label('nudge' + sel.id, sel.draft ? 'Regenerate' : 'Draft follow-up', 'Drafting…'), 'draft-nudge', { app: sel.id, stay: 1 }, 'sm' + (sel.draft ? '' : ' primary'), isBusy('nudge' + sel.id))}</div></div>
         ${S.scheduling ? renderScheduleForm(sel) : btn('Schedule an interview', 'schedule-start', {}, 'block')}
@@ -2172,7 +2185,7 @@ const A = {
     go('tracker', { selApp: app?.id, trackerView: 'board' });
   }, 'Marked applied · follow-up scheduled'),
   // tracker
-  'tracker-view': el => { S.trackerView = el.dataset.id; render(); },
+  'tracker-view': el => { S.trackerView = el.dataset.id; if (el.dataset.id === 'inbox') D.inbox = undefined; render(); },
   'select-app': el => { S.selApp = Number(el.dataset.id); S.editingRecruiter = false; S.scheduling = false; if (el.dataset.board) S.trackerView = 'board'; render(); },
   'move-stage': el => moveStage(el.dataset.app, el.dataset.stage),
   'add-stage': el => busy('stages', async () => { D.tracker = await api('/api/tracker/stages', { method: 'PUT', body: { extra_stages: [...D.tracker.extra_stages, el.dataset.id] } }); }),
@@ -2228,6 +2241,7 @@ const A = {
   ...RESUME_DATA_ACTIONS,
   ...JOB_DATA_ACTIONS,
   ...MONITORING_ACTIONS,
+  ...INBOX_ACTIONS,
 };
 function tagFallback(form, key) {
   if (form === 'sp') return D.searchProfile?.profile?.[key] || [];

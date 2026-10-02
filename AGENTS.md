@@ -167,6 +167,40 @@ The rules a change has to keep:
   NULL or `AUTO` may ever be re-matched; `SETUP`, `USER` and `ACTIVE` are the person's decisions. Changing tags never
   re-ranks by itself — re-matching is an explicit action, because it can queue model calls.
 
+## Application Inbox (Gmail)
+
+`app/services/application_inbox/` reads Gmail, read-only, for updates on submitted applications (README: Application
+Inbox Agent). The rules a change has to keep:
+
+* **Gmail processing is asynchronous.** The scheduler's `inbox` job and `POST /api/application-inbox/sync` (a background
+  task) run `sync.sync_account`; no request reads Gmail or calls a model while it waits. An account's sync lease on
+  `gmail_connections` keeps runs from overlapping.
+* **Gmail is read-only for this worker.** The only scope is `gmail.readonly`, and `app/services/gmail.py` issues GET
+  requests only, through `external_client` (providers `GMAIL`, `GOOGLE_OAUTH`). Never add a send, modify or label call.
+* **Only submitted, tracked applications are monitored**, and searches are targeted (`queries.py`): a sender, a domain,
+  ATS senders *with* the company name, or a reference — bounded by `after:`. Never list or download the mailbox.
+* **Only emails relevant to tracked applications may be analysed.** A body is fetched only when the headers already
+  point at an application; only MATCHED (or review-band) messages reach a model; unmatched ones keep ids only.
+* **Gmail content is untrusted external data**: it goes through `untrusted()` in `app/prompts/application_inbox.py`, and
+  instructions in it are never followed. Reusable prompts remain under `app/prompts/` (this repository's name for the
+  prompt package).
+* **Application-email matching must be confidence-aware, and never guesses** (`matching.py`): deterministic signals
+  first; `APPLICATION_EMAIL_AUTO_MATCH_THRESHOLD` links, the review band waits for a person (the model may only confirm
+  the deterministic favourite among the candidates it was shown), ambiguity or another tracked company → NEEDS_REVIEW.
+* **LLM output never directly mutates tracker state.** The model recommends `recommended_tracker_action`;
+  `stage_policy.decide` validates it and only `tracker.set_stage` changes a stage. Low confidence, non-explicit wording
+  or an invalid transition → a stored suggestion, never a change. No response never means rejection.
+* **Duplicate emails are never reprocessed**: `(user_id, gmail_message_id)` is unique on messages and events.
+* **User corrections override automated analysis**: corrections are recorded per field on the event
+  (`corrections`, `user_corrected`) and `analysis.save_event` never overwrites a corrected field.
+* **Gmail credentials must never appear in logs**: only the encrypted refresh token is stored; access tokens stay in
+  memory; `redaction.py` knows Google token shapes (`ya29.`, `1//`, `GOCSPX-`).
+* **Follow-Up must check inbox events before drafting or sending**: `create_due_followups` calls
+  `application_inbox.service.blocks_followup`; a recruiter reply cancels the pending follow-up.
+* **Gmail failures do not affect unrelated workers**: Gmail, OAuth and rate-limit errors end that account's sync with a
+  status (`failed`, `connection_required`, `rate_limited`); a model failure leaves the message PENDING for retry and
+  never loses it.
+
 ## Traces
 
 `app/services/tracing.py` holds an ambient correlation ID. Scheduler jobs and HTTP requests open one; nested

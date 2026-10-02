@@ -290,7 +290,7 @@ def test_follow_ups_run_per_account_and_reports(sqlite_sessions, monkeypatch):
     add_jobs(sqlite_sessions, 1, account, state=S.READY_TO_APPLY)
     apps = sj.applications(ctx(sqlite_sessions))
     assert apps["ready_to_apply"] == 1 and "not enabled" in apps["skipped"]
-    assert "email provider" in sj.inbox(ctx(sqlite_sessions))["skipped"]
+    assert "APPLICATION_INBOX_ENABLED" in asyncio.run(sj.inbox(ctx(sqlite_sessions)))["skipped"]
     stats = sj.analytics(ctx(sqlite_sessions))
     assert stats["accounts"] == 1 and stats["jobs_by_state"] == {"DISCOVERED": 2, "READY_TO_APPLY": 1}
     assert stats["pending"] == {"ranking": 2, "compensation": 3, "search_runs": 0}

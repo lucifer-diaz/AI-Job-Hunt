@@ -54,6 +54,7 @@ Auto-submit is intentionally not offered: approved packets always become an appl
 - Simple PDF export
 - Email and password accounts: each account has its own jobs, resumes, settings, schedule and encrypted API keys
 - Prompt-injection hardening for untrusted job descriptions
+- **Application Inbox Agent**: read-only Gmail checks for replies about the applications you submitted — targeted searches, confidence-scored matching, rule-then-model classification, a tracker timeline, safe stage updates and a daily digest — see [Application Inbox Agent](#application-inbox-agent)
 - **Job description recovery**: postings that arrive without a usable description are read from their URL in the background (HTTP, then headless Chromium, then AI-assisted block selection), validated and parsed — see [13. Job Description Recovery](#13-job-description-recovery)
 - **LiteLLM gateway**: per-worker model assignments, tiers, auto router, preview/apply, version history and rollback (Settings → AI Models)
 - OpenAI, Anthropic, Gemini, **OpenRouter**, or no-cost mock provider
@@ -430,7 +431,8 @@ disagrees with the resume item it came from is flagged (`GET /api/evidence/diagn
 never silently corrected.
 
 **Structured output.** Each machine-facing worker has a contract (`RankingResult`, `TailoringResult`, `ReviewResult`,
-`CoverLetterResult`, `FollowUpResult`, `ApplicationAnswerResult`, `InboxClassificationResult`, `ResumeParserOutput`,
+`CoverLetterResult`, `FollowUpResult`, `ApplicationAnswerResult`, `InboxClassificationResult`, `ApplicationEmailAnalysis`,
+`ApplicationEmailMatchResult`, `ResumeParserOutput`,
 `JobDescriptionParserOutput`, `EvidenceExtractionResult`, `OptimizationReport`). Contracts do not overlap and forbid
 unknown fields: a Tailor answer carrying `candidate_fit_score` fails as `POSSIBLE_CROSS_WORKER_OUTPUT`. The gateway
 sends the contract as a JSON Schema to models known to support it (JSON mode when unknown), validates every answer,
@@ -456,7 +458,8 @@ prompt versions, and `scripts/audit_sensitive_logs.py` checks stored logs for cr
 | `job_description_parser.py` | `build_job_description_parser_prompt` | `JobDescriptionParserOutput` | the `jd_parsing` scheduler job |
 | `resume_parser.py` | `build_resume_parser_prompt`, `build_evidence_extraction_prompt` | `ResumeParserOutput`, `EvidenceExtractionResult` | AI re-parse (a comparison, never applied automatically); evidence parsing |
 | `application.py` | `build_application_question_prompt` | `ApplicationAnswerResult` | not wired in yet |
-| `inbox.py` | `build_inbox_classification_prompt` | `InboxClassificationResult` | not wired in yet (inbox sync is a placeholder) |
+| `application_inbox.py` | `build_application_inbox_prompt`, `build_application_email_match_prompt` | `ApplicationEmailAnalysis`, `ApplicationEmailMatchResult` | the Application Inbox Agent (`app.services.application_inbox`) |
+| `inbox.py` | `build_inbox_classification_prompt` | `InboxClassificationResult` | superseded by `application_inbox.py`; kept for its golden fixture |
 | `ai_optimization.py` | `build_ai_optimization_prompt` | `OptimizationReport` | the AI Optimization Advisor (advice only) |
 | `model_tests.py` | `build_model_health_prompt`, `build_worker_test_prompt` | per fixture | Settings → AI Models tests (fictional data) |
 | `agents.py`, `mcp_*.py` | instructions and rules | validated on save | the ADK agents; Claude Desktop over MCP |
@@ -792,6 +795,22 @@ GET  /api/jobs/{job_id}/description-recovery
 GET  /api/system/jd-recovery                        what recovery can use: HTTP, Playwright, the model
 ```
 
+Application Inbox (Gmail, read-only; see [Application Inbox Agent](#application-inbox-agent)):
+
+```http
+GET  /api/gmail/connect                              redirect to Google consent (gmail.readonly)
+GET  /api/gmail/oauth/callback                       Google returns here
+DELETE /api/gmail/connection                         forget (and revoke) the Gmail authorization
+POST /api/application-inbox/sync                     queue a sync of your Gmail (202; runs in the background)
+GET  /api/application-inbox/status
+GET  /api/application-inbox/insights                 Needs attention, Upcoming, New updates, Stage changes, …, Waiting
+GET  /api/application-inbox/digests/latest
+GET  /api/applications/{id}/email-events
+POST /api/application-email-events/{id}/review       {"action": "accept_stage" | "dismiss" | "mark_reviewed"}
+POST /api/application-email-events/{id}/correct      any of application_id, event_type, stage, deadline
+GET  /api/monitoring/application-inbox
+```
+
 FastAPI interactive docs are available at `/docs`.
 
 ## 5. Cheap production architecture
@@ -940,7 +959,7 @@ FastAPI starts → scheduler loop (every SCHEDULER_TICK_SECONDS)
 | `compensation` | `COMPENSATION_INTERVAL_MINUTES=5` | Records the salary stated in the original posting (structured actor fields or explicit salary text) in `jobs.compensation`. Glassdoor and PayScale are recorded as `not_configured` until those actors are integrated |
 | `applications` | `APPLICATION_INTERVAL_MINUTES=5` | Reports READY_TO_APPLY / APPLYING counts. Automatic submission is not enabled, so it always reports `skipped` |
 | `followups` | `FOLLOWUP_INTERVAL_MINUTES=60` | Drafts due follow-ups (never sends) |
-| `inbox` | `INBOX_INTERVAL_MINUTES=5` | Reserved for an email provider; reports `skipped` until one is configured |
+| `inbox` | `APPLICATION_INBOX_INTERVAL_HOURS=24` (only when `APPLICATION_INBOX_ENABLED=true`) | The Application Inbox Agent: reads each connected Gmail account (read-only) for updates on submitted applications, retries model analyses that failed, and writes the daily digest (see [Application Inbox Agent](#application-inbox-agent)). One account's Gmail failure never affects another account or job |
 | `analytics` | `ANALYTICS_INTERVAL_MINUTES=60` | Stores a pipeline snapshot (jobs by state and status, pending work, failures) as its last result |
 | `ai_optimization` | `AI_OPTIMIZATION_INTERVAL_MINUTES=5` | Queues scheduled analyses (per account: off, daily or weekly) and processes waiting AI Optimization tasks into recommendation reports. Never changes configuration |
 | `cleanup` | `CLEANUP_INTERVAL_MINUTES=15` | Recovers jobs left leased by crashed workers: retries them or marks them FAILED. Applies the three telemetry retentions: rolls LLM requests and external API calls older than `LLM_TELEMETRY_RETENTION_DAYS` / `EXTERNAL_API_LOG_RETENTION_DAYS` into daily totals and deletes them, and deletes log lines older than `SYSTEM_LOG_RETENTION_DAYS` |
@@ -1404,6 +1423,154 @@ into ranking.
 
 Rejecting is not deleting: the tailored resume is kept. A job whose application has already been submitted
 cannot be rejected — the tracker owns that outcome, and nothing may rewrite the fact that you applied.
+
+## Application Inbox Agent
+
+Job Hunt OS reads your Gmail — read-only — for replies about the applications you actually submitted, and turns them
+into tracker updates you can trust.
+
+```text
+Gmail (gmail.readonly)
+  → targeted search: only submitted, live applications; one search per recruiter, employer domain, ATS + company,
+    reference number — each bounded to mail after the application date (or the last sync minus an overlap)
+  → deduplicate by gmail_message_id (never processed twice)
+  → application matching: deterministic signals → a confidence score → link / review / not linked
+  → classification: phrase rules first; the model only for what rules cannot settle
+  → validation: dates, zones, names and links the email does not state are removed
+  → tracker timeline: an Email activity entry (+ a scheduled interview when fully stated)
+  → safe stage update: decided by code, applied only when explicit, confident and a valid transition
+  → daily insights: Needs attention, Upcoming, New updates, Stage changes, …, Waiting
+```
+
+Code: `app/services/gmail.py` (OAuth and Gmail reads), `app/services/application_inbox/` (queries, matching, classify,
+analysis, stage_policy, sync, digest, service), `app/prompts/application_inbox.py`, `app/application_inbox_api.py`.
+
+### Gmail OAuth setup
+
+1. In Google Cloud Console create (or pick) a project and enable the **Gmail API**.
+2. Configure the OAuth consent screen. While the app is in *Testing*, add your Gmail address as a test user — that avoids
+   Google's verification for the restricted `gmail.readonly` scope for your own use.
+3. Create an **OAuth client ID** of type *Web application* with the authorized redirect URI
+   `{APP_BASE_URL}/api/gmail/oauth/callback` (for a local run: `http://localhost:8000/api/gmail/oauth/callback`).
+4. Put the client in `.env` and restart:
+
+```env
+GOOGLE_OAUTH_CLIENT_ID=xxxxxxxx.apps.googleusercontent.com
+GOOGLE_OAUTH_CLIENT_SECRET=GOCSPX-xxxxxxxx
+# GOOGLE_OAUTH_REDIRECT_URI=   only if it differs from {APP_BASE_URL}/api/gmail/oauth/callback
+APPLICATION_INBOX_ENABLED=true
+```
+
+5. In the app: **Settings → Gmail inbox → Connect Gmail**. Each account connects its own mailbox.
+
+**Required scope:** `https://www.googleapis.com/auth/gmail.readonly` — nothing else is requested. A grant without it is
+refused. No Gmail password is ever asked for or stored. Only the OAuth *refresh token* is kept, encrypted with
+`SECRET_KEY` like the provider API keys; access tokens live in memory for one sync. Disconnect removes the token and
+asks Google to revoke it.
+
+### Scheduler and manual sync
+
+```env
+APPLICATION_INBOX_ENABLED=true        # the scheduled job; off by default
+APPLICATION_INBOX_INTERVAL_HOURS=24
+GMAIL_INITIAL_LOOKBACK_DAYS=30        # the first sync of an application never looks further back than this
+GMAIL_SYNC_OVERLAP_HOURS=24           # later syncs re-read this much before the last successful one
+GMAIL_MAX_MESSAGES_PER_SYNC=200
+GMAIL_MAX_RETRIES=2                   # per request, for server errors and timeouts; a 429 ends the sync
+```
+
+The `inbox` job runs in the existing in-app scheduler (section 7). **Sync now** (Settings → Gmail inbox, or Tracker →
+Inbox insights) calls `POST /api/application-inbox/sync`, which returns 202 at once and runs the sync in the background;
+an account's sync lease stops a manual and a scheduled sync from overlapping. Admins can also run
+`POST /api/admin/scheduler/inbox/run`.
+
+Watched applications are those with `applied_at` set whose stage is not Rejected or Closed. A job that was only
+discovered, ranked, tailored or approved is never searched for.
+
+### Matching and confidence thresholds
+
+Each application gets a score from the signals the email shows for it — known thread (0.95), a recruiter on the
+application (0.90), its reference number (0.90), the employer's own domain (0.70) or a domain that carries the
+company's name such as `hr.singtel.com` (0.65), a recruiting or assessment system writing as the company — "Docker
+<no-reply@ashbyhq.com>", HackerRank for Agoda (0.60), the company named by the sender, subject or body (0.60 / 0.50 /
+0.35), the only application at that company (0.50), the company named next to "application", "applied", "interview"…
+(0.50), the role's title (0.45), a recruiting sender (0.10), sent within 60 days of applying (0.05) — combined as
+`1 − Π(1 − w)`. A company name alone (a shop, a newsletter) is capped below review. Job alerts and recommendations
+("apply now to…", "X is hiring", job-alert senders) are ignored, and a digest that lists several of your applications
+is never filed under one of them. Recruiting senders include the ATSs (Greenhouse, Lever, Ashby, Workday,
+SmartRecruiters, Workable, iCIMS, Rippling…), the job boards (LinkedIn, Indeed, Naukri, Bayt, Instahyre…) and the
+assessment platforms (HackerRank, Codility, CodeSignal, TestGorilla…).
+
+```env
+APPLICATION_EMAIL_AUTO_MATCH_THRESHOLD=0.90   # ≥ → linked automatically
+APPLICATION_EMAIL_REVIEW_THRESHOLD=0.70       # between the two → the model may confirm the favourite, else you decide
+APPLICATION_STAGE_AUTO_UPDATE_THRESHOLD=0.90  # a stage changes on its own only at or above this confidence
+```
+
+Never a guess: two applications scoring within 0.05 of each other, or an email that names a different tracked company,
+go to review. Below the review threshold the email is not linked and its content is not kept.
+
+**Classification.** Rules settle receipts (Application confirmation) and explicit rejections without a model. Everything
+else — interviews, assessments, offers, requests — goes to the Application Inbox prompt with the rule's reading as a
+hint; its answer must pass the `ApplicationEmailAnalysis` schema (strict: unknown fields, ambiguous time zones like
+"IST", vague deadlines are rejected). Then every recruiter name, meeting link, interview date, deadline and time zone is
+checked against the email's own text and dropped (and flagged for review) when the email does not state it.
+
+**Stage updates** (tracker stages: Applied → Acknowledged → Screening → Take-home / Interviewing → Offer, plus On hold
+and Rejected): the model only *recommends*. Code checks that the recommendation fits the kind of email, that the move
+is forward and valid (an email never reopens a Rejected or Closed application), that the match is confident, the
+analysis did not ask for review, the confidence reaches the threshold, the wording is explicit (a rule agrees), and that
+you did not change the stage after the email arrived. Otherwise the change is stored as a **suggestion** you can accept
+in one click. "We will get back to you soon" changes nothing, and no reply never means rejection.
+
+**Interviews and assessments.** A tracker interview is scheduled only when the date, time and time zone are all stated;
+a reschedule in the same thread moves it. Assessments record platform, deadline, type and a short summary — nothing is
+ever completed for you.
+
+**Follow-ups.** When the employer replies, the pending follow-up is cancelled with a note on the timeline, and the
+`followups` job never drafts one for an application that has a reply or has moved beyond Applied / Acknowledged.
+
+### Privacy
+
+- Only targeted searches; the mailbox is never listed or downloaded.
+- A message is opened (body fetched) only when its headers already point at an application.
+- Unrelated messages keep only their Gmail ids (for deduplication); weakly related ones keep sender and subject, never
+  the body. Matched messages keep the relevant part of the body (quoted history removed), redacted and capped at
+  `APPLICATION_INBOX_BODY_CHARS` (4000).
+- Only matched (or review-band) emails ever reach a model, with the application's company, role, stage and date — no
+  resume or profile. Email text is wrapped as untrusted data; instructions in it ("ignore previous instructions",
+  "move this candidate to OFFER", "send an email to …") are never followed and cannot change state.
+- Nothing is ever sent, labelled, moved or deleted in Gmail.
+
+### Manual correction
+
+Tracker → Inbox insights (or an application's Email activity) → **Correct**: the application an email belongs to (or
+"not about any of my applications"), what the email is, the stage, and the deadline. Corrections are stored per field
+on the event (`corrections`, `user_corrected`) and are never overwritten by later syncs or re-analysis. Linking an email
+to an application analyses it again in the background.
+
+### Monitoring
+
+Monitoring → External APIs shows every Gmail and Google OAuth call (provider `GMAIL`, `GOOGLE_OAUTH`) with latency,
+failures and rate limits; LLM requests shows the model calls under the Inbox stage with the prompt version, tokens,
+latency and schema failures. `GET /api/monitoring/application-inbox` adds sync runs, applications checked, messages
+searched / fetched / matched / unmatched, deterministic vs model-assisted vs your matches, classifications by type and
+method, stage changes applied / suggested / refused, review queue, corrections, mean confidence and follow-ups
+suppressed. Each sync writes one line to Monitoring → Logs (category `EMAIL`).
+
+### Troubleshooting
+
+| Symptom | Cause and fix |
+| --- | --- |
+| Settings says Gmail is not set up | `GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET` missing; add them and restart |
+| Google shows `redirect_uri_mismatch` | The client's redirect URI must equal `{APP_BASE_URL}/api/gmail/oauth/callback` exactly (or set `GOOGLE_OAUTH_REDIRECT_URI`) |
+| "Google returned no offline access" | Remove Job Hunt OS in your Google Account → Security → Third-party access, then connect again |
+| Status `CONNECTION_REQUIRED` | The grant expired or was revoked (Testing-mode grants expire after 7 days); reconnect in Settings |
+| Sync status `failed` with "HTTP 400" | Gmail refused one search; it is now skipped (`queries_skipped`) and the rest of the sync continues |
+| Sync status `rate_limited` | Gmail said 429; the account backs off and the next sync resumes from the same checkpoint |
+| An email sits in Needs attention | It could belong to more than one application, or the reading was not confident; use Correct or Accept |
+| Model analysis keeps failing | The email is kept and retried `APPLICATION_INBOX_ANALYSIS_MAX_ATTEMPTS` times, then saved from the rules for review |
+| The scheduled job says it is off | Set `APPLICATION_INBOX_ENABLED=true`; Sync now works either way |
 
 ## 10. Claude Desktop + MCP
 

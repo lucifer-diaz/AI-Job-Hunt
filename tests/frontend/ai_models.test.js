@@ -46,7 +46,7 @@ beforeEach(() => {
   });
   if (!ui) {
     context = createContext({ document, window, location, history, navigator, URLSearchParams, FormData, File, setTimeout, clearTimeout, setInterval, clearInterval, console });
-    for (const file of ['monitoring.js', 'settings.js', 'ai_models.js', 'resume_data.js', 'job_data.js', 'knowledge.js']) {
+    for (const file of ['monitoring.js', 'settings.js', 'ai_models.js', 'resume_data.js', 'job_data.js', 'knowledge.js', 'inbox.js']) {
       runInContext(readFileSync(`app/static/${file}`, 'utf8'), context, { filename: resolve(`app/static/${file}`) });
     }
     runInContext(appSource, context, { filename: resolve('app/static/app.js') });

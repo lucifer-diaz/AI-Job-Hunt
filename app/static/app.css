@@ -572,3 +572,17 @@ p.settings-help{margin:10px 0}
 .aim-checks{list-style:none;padding:0;margin:10px 0 0;display:flex;flex-direction:column;gap:4px}
 .aim-add{margin:10px 0}
 @media (min-width:1100px){.aim-drawer{position:sticky;bottom:16px}}
+
+/* Application Inbox (inbox.js) */
+.inbox-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px;margin-top:14px}
+.inbox-event{padding:12px 0;border-top:1px solid var(--line3)}
+.inbox-event:first-child{border-top:0;padding-top:4px}
+.inbox-actions{margin:6px 0 0;padding-left:18px}
+.inbox-actions li{margin:2px 0}
+.inbox-progress-track{height:8px;border-radius:99px;background:var(--line3);overflow:hidden;position:relative}
+.inbox-progress-fill{height:100%;border-radius:99px;background:var(--brand,#5b4ae8);transition:width .6s ease}
+.inbox-progress-fill.indeterminate{width:35%;position:absolute;animation:inbox-progress-slide 1.2s ease-in-out infinite}
+@keyframes inbox-progress-slide{0%{left:-35%}100%{left:100%}}
+@media (prefers-reduced-motion:reduce){.inbox-progress-fill{transition:none}.inbox-progress-fill.indeterminate{animation:none;left:0;opacity:.5}}
+/* Opening a packet scrolls it to the top of the page, clear of the sticky top bar (focusPacket in app.js). */
+#tailor-packet{scroll-margin-top:112px}

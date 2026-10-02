@@ -6,7 +6,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 // Job description recovery in the UI: the job modal says where recovery stands and offers Recover / Retry, and
 // Monitoring → JD recovery shows its metrics and what it can use. Never a stack trace.
 const appSource = readFileSync('app/static/app.js', 'utf8').split('/* ───────────── boot ───────────── */')[0];
-const names = ['S', 'D', 'render', 'A', 'recoveryStrip', 'monState', 'MON_TABS', 'renderMonJdRecovery'];
+const names = ['S', 'D', 'render', 'A', 'recoveryStrip', 'monState', 'MON_TABS', 'renderMonJdRecovery', 'renderMonJdParsing', 'MON_STAGES'];
 let ui, context, fetchMock;
 
 const response = (data, status = 200) => ({ ok: status < 400, status, text: async () => JSON.stringify(data) });
@@ -29,7 +29,7 @@ beforeEach(() => {
   vi.stubGlobal('fetch', fetchMock);
   if (!ui) {
     context = createContext({ document, window, location, history, navigator, URLSearchParams, FormData, File, Intl, setTimeout, clearTimeout, setInterval, clearInterval, console });
-    for (const file of ['monitoring.js', 'settings.js', 'resume_data.js', 'job_data.js', 'knowledge.js']) {
+    for (const file of ['monitoring.js', 'settings.js', 'resume_data.js', 'job_data.js', 'knowledge.js', 'inbox.js']) {
       runInContext(readFileSync(`app/static/${file}`, 'utf8'), context, { filename: resolve(`app/static/${file}`) });
     }
     runInContext(appSource, context, { filename: resolve('app/static/app.js') });
@@ -120,5 +120,28 @@ describe('Monitoring → JD recovery', () => {
     expect(text).toContain('HTTP extraction');
     expect(text).toContain('LOGIN_REQUIRED');
     expect(text).toContain('13 · 9');
+  });
+});
+
+describe('Monitoring → JD parsing', () => {
+  it('shows parse outcomes, the queue, the scheduler job and the parser model calls', () => {
+    expect(ui.MON_TABS.map(([id]) => id)).toContain('jd_parsing');
+    expect(ui.MON_STAGES.JD_PARSER).toBe('JD parser');
+    ui.D.monJdp = { metrics: {
+      tasks_created: 40, completed: 30, failed: 8, retrying: 2, success_rate: 0.789, average_duration_ms: 4200, jobs_parsed: 30,
+      failures_by_category: { RATE_LIMITED: 7, LEASE_EXPIRED: 1 },
+      top_errors: [{ error: 'LLMRateLimitError: OpenRouter rate limit exceeded', tasks: 7 }],
+      queue: { pending: 3, processing: 1, oldest_pending_at: '2026-10-01T10:00:00' },
+      llm: { requests: 41, failed: 9, input_tokens: 120000, output_tokens: 30000, estimated_cost: null,
+        average_latency_ms: 3800, models: { 'openrouter/free': 41 }, errors: { RATE_LIMIT: 9 } },
+      scheduler: { enabled: true, last_status: 'failed', last_finished_at: '2026-10-01T12:00:00', next_run_at: null,
+        last_error: 'ProgrammingError: column jobs.auto_tailor_status does not exist', last_result: null } } };
+    const div = document.createElement('div');
+    div.innerHTML = ui.renderMonJdParsing();
+    const text = div.textContent;
+    for (const bit of ['Parse tasks', '78.9%', '3 · 1', 'Model calls', '120,000 · 30,000', 'not reported',
+      'column jobs.auto_tailor_status does not exist', 'openrouter/free (41)', 'LLMRateLimitError']) {
+      expect(text).toContain(bit);
+    }
   });
 });

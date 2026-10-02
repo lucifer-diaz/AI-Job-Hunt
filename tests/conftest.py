@@ -16,8 +16,11 @@ os.environ["JD_FETCH_ENABLED"] = "false"
 os.environ["PLAYWRIGHT_HEADLESS"] = "true"
 os.environ["SECRET_KEY"] = "test-secret-key-for-encrypting-api-keys"
 for key in ("APIFY_API_TOKEN", "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY",
-            "ADMIN_TOKEN", "JOBHUNT_MCP_TOKEN"):
+            "ADMIN_TOKEN", "JOBHUNT_MCP_TOKEN", "GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET",
+            "GOOGLE_OAUTH_REDIRECT_URI"):
     os.environ[key] = ""
+# No real Gmail: the inbox tests turn the worker on and serve Google from tests/gmail_fake.py.
+os.environ["APPLICATION_INBOX_ENABLED"] = "false"
 
 import pytest  # noqa: E402
 from sqlalchemy import create_engine, select, text  # noqa: E402
