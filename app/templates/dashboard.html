@@ -22,6 +22,7 @@
         {% endfor %}
       </div>
       <div class="nav-group"><div class="nav-caps">SETUP</div>
+        <a class="nav-btn" href="#"><span>Setup quest</span></a>
         <a class="nav-btn" href="#knowledge"><span>Knowledge bank</span></a>
         <a class="nav-btn" href="#settings"><span>Settings &amp; profile</span></a>
       </div>
@@ -35,6 +36,7 @@
   </main>
 </div>
 <div id="overlays"></div>
+<div id="guide-root"></div>
 <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 <script type="application/json" id="boot">{{ {"max_upload_mb": max_upload_mb, "version": version, "user": user}|tojson }}</script>
 <script src="/static/settings.js?v={{ version }}"></script>
@@ -44,6 +46,7 @@
 <script src="/static/monitoring.js?v={{ version }}"></script>
 <script src="/static/knowledge.js?v={{ version }}"></script>
 <script src="/static/inbox.js?v={{ version }}"></script>
+<script src="/static/guide.js?v={{ version }}"></script>
 <script src="/static/app.js?v={{ version }}"></script>
 </body>
 </html>

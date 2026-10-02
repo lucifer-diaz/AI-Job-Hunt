@@ -123,6 +123,7 @@ from app.services.workflow import (
     tailor_job,
 )
 from app.settings import get_settings
+from app.setup_guide_api import router as setup_guide_router
 from app.tenancy import require_user_id
 from app.workspace import download_headers, packet_download_name
 from app.workspace import router as workspace_router
@@ -171,6 +172,7 @@ app.include_router(job_description_router)
 app.include_router(discovery_router)
 app.include_router(ai_models_router)
 app.include_router(application_inbox_router)
+app.include_router(setup_guide_router)
 
 # Reachable without signing in. Cron and admin routes are protected by their own secrets.
 PUBLIC_PATHS = {"/health", "/login", "/signup", "/api/auth/login", "/api/auth/signup", "/api/auth/logout"}
