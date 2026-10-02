@@ -176,8 +176,18 @@ function readHash() {
 }
 function go(screen, extra = {}) {
   if (!settingsCanLeave(screen, extra.settingsSection || S.settingsSection)) return;
-  Object.assign(S, { screen, editing: null, scheduling: false, editingRecruiter: false }, extra);
+  // Opening one job's packet lands on that packet, not on the task list and filters above it (focusPacket).
+  const tailorFocus = screen === 'tailor' && !!extra.tailorJob;
+  Object.assign(S, { screen, editing: null, scheduling: false, editingRecruiter: false, tailorFocus }, extra);
   setHash(); window.scrollTo(0, 0); render(); load();
+}
+// Scroll the requested job's packet ("Tailoring for …") into view once it has loaded, then forget the request so
+// later re-renders (task polling) never move the page again.
+function focusPacket() {
+  if (!S.tailorFocus || S.screen !== 'tailor' || !D.packet) return;
+  S.tailorFocus = false;  // one attempt per navigation, whatever was found
+  const target = document.getElementById('tailor-packet');
+  if (target && D.packet.job?.id === S.tailorJob) target.scrollIntoView({ block: 'start', behavior: 'auto' });
 }
 
 const LOADERS = {
@@ -315,7 +325,7 @@ async function load() {
   try {
     await Promise.all([LOADERS[S.screen](), api('/api/workspace/summary').then(s => { D.summary = s; })]);
   } catch (e) { toast(e.message, true); }
-  if (seq === loadSeq) render();
+  if (seq === loadSeq) { render(); focusPacket(); }
 }
 
 /* ───────────── shell ───────────── */
@@ -1016,7 +1026,7 @@ function renderTailorSingle(queue) {
         : '<b>This packet is approved.</b> Edits below change the approved resume and cover letter directly. To regenerate it or skip tailoring, send it back for revision first.'}</span>
       ${job.status === 'approved' ? btn(label('revise', 'Send back for revision', 'Sending back…'), 'revise', { id: job.id }, 'sm', isBusy('revise')) + btn('Open apply kit', 'open-kit', { id: job.id }, 'sm good') : ''}</section>` : '');
   if (!r) {
-    return `<div class="stack">${stack}<section class="card row gap16 wrap"><div class="grow" style="min-width:220px"><div class="card-title" style="font-size:16px">Tailoring for ${esc(job.title)} · ${esc(job.company)}</div><div class="card-sub">Fit ${fitTxt(job.fit)} · no packet generated yet</div></div>${picker}</section>
+    return `<div class="stack">${stack}<section class="card row gap16 wrap" id="tailor-packet"><div class="grow" style="min-width:220px"><div class="card-title" style="font-size:16px">Tailoring for ${esc(job.title)} · ${esc(job.company)}</div><div class="card-sub">Fit ${fitTxt(job.fit)} · no packet generated yet</div></div>${picker}</section>
       <section class="card">${empty(generating ? 'Drafting your packet…' : skipping ? 'Reviewing your master resume…' : 'No packet yet', generating ? `${task ? `${STAGE_LABEL[task.stage]} · ${task.progress}%. ` : ''}Tailoring and an independent review run on the server. You can leave this page.` : skipping ? `${STAGE_LABEL[task.stage]}. Your master resume is used unchanged; the reviewer is scoring it against this posting.` : 'Generate a tailored resume, cover letter and reviewer score. Tailoring may only cite your master resume and verified evidence. If this posting needs no tailoring, skip it and send your master resume as-is.', btn(generating ? 'Generating…' : 'Generate tailored packet', 'generate', { id: job.id }, 'primary lg', working) + btn(skipping ? 'Skipping…' : 'Skip tailoring', 'skip-tailor', { id: job.id }, 'lg', working) + btn('Read the posting', 'open-job', { id: job.id }))}</section></div>`;
   }
   const accepted = r.edits.filter(e => e.status === 'accepted').length;
@@ -1046,7 +1056,7 @@ function renderTailorSingle(queue) {
     body = `<div style="padding:18px" class="col gap9">${ans.length ? ans.slice(0, 12).map(a => `<div class="box"><div class="small muted">${esc(a.question)}</div><div class="row gap8 mt4"><span class="small b grow">${esc(a.answer || 'Awaiting answer')}</span>${pill(a.sensitive ? 'confirm each time' : a.verified ? 'verified' : 'needs review', a.sensitive || !a.verified ? 'warn' : 'good')}</div></div>`).join('') : '<div class="small muted">No saved ATS answers yet. Add them in the Knowledge bank.</div>'}</div>`;
   }
   return `<div class="stack">${stack}
-  <section class="card row gap16 wrap" style="padding:16px 20px">
+  <section class="card row gap16 wrap" id="tailor-packet" style="padding:16px 20px">
     <div class="grow" style="min-width:220px"><div class="card-title" style="font-size:16px">Tailoring for ${esc(job.title)} · ${esc(job.company)}</div><div class="card-sub">v${r.version} · generated ${esc(r.generated)} · ${r.untailored ? 'master resume, not tailored' : 'edits must trace to verified evidence'}</div></div>
     ${picker}
     <div class="row gap14"><div class="metric"><div class="n" style="color:${r.reviewer_score >= p.min_review_score ? 'var(--good)' : 'var(--warn)'}">${fitTxt(r.reviewer_score)}</div><div class="l">REVIEWER</div></div>

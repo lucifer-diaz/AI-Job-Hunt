@@ -584,3 +584,5 @@ p.settings-help{margin:10px 0}
 .inbox-progress-fill.indeterminate{width:35%;position:absolute;animation:inbox-progress-slide 1.2s ease-in-out infinite}
 @keyframes inbox-progress-slide{0%{left:-35%}100%{left:100%}}
 @media (prefers-reduced-motion:reduce){.inbox-progress-fill{transition:none}.inbox-progress-fill.indeterminate{animation:none;left:0;opacity:.5}}
+/* Opening a packet scrolls it to the top of the page, clear of the sticky top bar (focusPacket in app.js). */
+#tailor-packet{scroll-margin-top:112px}
