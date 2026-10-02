@@ -175,8 +175,8 @@ QUESTS: tuple[Quest, ...] = (
            "completes this quest."),
           100, "settings", "ai", check=_check_ai,
           recommended="Ollama account + LiteLLM · nemotron-3-nano:30b-cloud",
-          snippet=("export OLLAMA_API_KEY=...            # from ollama.com/settings/keys\n"
-                   "export LITELLM_MASTER_KEY=sk-jobhunt-local   # any secret; Job Hunt OS asks for it\n"
+          snippet=("export OLLAMA_API_KEY=...  # ollama.com/settings/keys\n"
+                   "export LITELLM_MASTER_KEY=sk-jobhunt-local\n"
                    "pip install 'litellm[proxy]'\n"
                    "litellm --config integrations/litellm/config.ollama-cloud.yaml --port 4000"),
           links=(("Ollama API keys", "https://ollama.com/settings/keys"),

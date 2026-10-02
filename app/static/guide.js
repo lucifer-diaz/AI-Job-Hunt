@@ -5,13 +5,16 @@
 'use strict';
 
 const GUIDE = {
-  data: null, open: false, view: 'map', sel: null, active: null, booted: false,
+  data: null, open: false, view: 'map', sel: null, active: null, booted: false, pane: 'list', entering: false, trackerShown: false,
   shownXp: 0, timer: null, loading: false, lastFetch: 0, queue: [],
 };
 const GUIDE_POLL_MS = 15000;
 const GUIDE_CONFETTI = ['#5b4ae8', '#a79bf0', '#0f9c86', '#e0a136', '#c22f4e', '#7c69ee'];
 const guideReduced = () => window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
 const guideRoot = () => document.getElementById('guide-root');
+// Phones show the quest list or one quest's details, not both (the CSS breakpoint is the same).
+const guideNarrow = () => window.matchMedia ? window.matchMedia('(max-width: 760px)').matches : window.innerWidth <= 760;
+const GUIDE_SCROLLERS = ['.gq-modal', '.gq-body', '.gq-trail', '.gq-detail'];
 const guideQuest = id => GUIDE.data?.quests?.find(q => q.id === id);
 
 /* ───────────── data ───────────── */
@@ -27,7 +30,7 @@ async function guideBoot() {
   GUIDE.shownXp = GUIDE.data.xp;
   const fresh = GUIDE.data.quests.filter(q => q.done && !GUIDE.data.celebrated.includes(q.id)).map(q => q.id);
   if (fresh.length) guideSave({ celebrated: fresh });  // done before the guide existed: no confetti for those
-  if (!GUIDE.data.welcomed && !GUIDE.data.complete) { GUIDE.open = true; GUIDE.view = 'welcome'; }
+  if (!GUIDE.data.welcomed && !GUIDE.data.complete) Object.assign(GUIDE, { open: true, entering: true, view: 'welcome' });
   guideSchedule(); guideRender(); render();
 }
 // Later loads: anything newly done is celebrated once (per account, on any device).
@@ -110,8 +113,9 @@ function guideTrail(g) {
 function guideDetail(g) {
   const q = guideQuest(GUIDE.sel) || guideQuest(g.next) || g.quests[0];
   return `<section class="gq-detail" aria-labelledby="gq-detail-title">
+    <button class="gq-back" data-act="guide-back">← All quests</button>
     <div class="row between base gap8"><span class="gq-caps">${esc(q.chapter.toUpperCase())}${q.optional ? ' · OPTIONAL' : ''}</span><span class="gq-reward ${q.done ? 'won' : ''}">${q.done ? 'Earned' : 'Reward'} · ${q.xp} XP</span></div>
-    <h3 id="gq-detail-title">${esc(q.title)}</h3>
+    <h3 id="gq-detail-title" tabindex="-1">${esc(q.title)}</h3>
     <p class="gq-why">${esc(q.why)}</p>
     <div class="gq-status ${q.done ? 'done' : ''}"><span class="dot"></span>${esc(q.detail || (q.done ? 'Done' : 'Not started'))}</div>
     ${q.recommended ? `<div class="gq-recommend"><span class="gq-recommend-star" aria-hidden="true">★</span><div><div class="gq-caps">RECOMMENDED</div><div class="gq-recommend-text">${esc(q.recommended)}</div></div></div>` : ''}
@@ -144,7 +148,7 @@ function guideComplete(g) {
 function guideTracker(g) {
   if (g.complete || g.dismissed) return '';
   const q = guideQuest(GUIDE.active) || guideQuest(g.next); if (!q) return '';
-  return `<div class="gq-tracker" role="complementary" aria-label="Setup quest progress">
+  return `<div class="gq-tracker ${GUIDE.trackerShown ? '' : 'gq-enter'}" role="complementary" aria-label="Setup quest progress">
     <button class="gq-tracker-main" data-act="guide-open" data-id="${attr(q.id)}">${guideRing(g.done / g.total)}
       <span class="grow"><span class="gq-caps">${GUIDE.active === q.id ? 'IN PROGRESS' : 'NEXT QUEST'} · ${g.done}/${g.total}</span><span class="gq-tracker-title">${esc(q.title)}</span></span>
       <span class="gq-node-xp mono">+${q.xp}</span></button>
@@ -153,15 +157,25 @@ function guideTracker(g) {
 function guideRender() {
   const root = guideRoot(), g = GUIDE.data; if (!root) return;
   const layers = [...root.querySelectorAll('.gq-celebrate')];  // keep a running celebration
+  // A re-render (the poll every few seconds) must not move what the person is reading.
+  const scroll = GUIDE_SCROLLERS.map(sel => root.querySelector(sel)?.scrollTop || 0);
+  const samePane = root.dataset.pane === `${GUIDE.view}:${GUIDE.pane}:${GUIDE.sel}`;
+  document.documentElement.classList.toggle('gq-lock', !!(GUIDE.open && g));
   if (!g) { root.innerHTML = ''; layers.forEach(l => root.appendChild(l)); return; }
   let modal = '';
   if (GUIDE.open) {
     const view = g.complete && GUIDE.view !== 'map' ? guideComplete(g) : GUIDE.view === 'welcome' ? guideWelcome(g) : null;
-    modal = `<div class="gq-overlay" data-act="guide-backdrop"><div class="gq-modal ${view ? 'narrow' : ''}" role="dialog" aria-modal="true" aria-labelledby="gq-title">
-      ${view ? `<button class="gq-x abs" data-act="guide-close" aria-label="Close setup guide">×</button>${view}` : `${guideHeader(g)}<div class="gq-body">${guideTrail(g)}${guideDetail(g)}</div>`}</div></div>`;
+    modal = `<div class="gq-overlay ${GUIDE.entering ? 'gq-enter' : ''}" data-act="guide-backdrop"><div class="gq-modal ${view ? 'narrow' : ''}" role="dialog" aria-modal="true" aria-labelledby="gq-title">
+      ${view ? `<button class="gq-x abs" data-act="guide-close" aria-label="Close setup guide">×</button>${view}` : `${guideHeader(g)}<div class="gq-body ${GUIDE.pane === 'detail' ? 'pane-detail' : ''}">${guideTrail(g)}${guideDetail(g)}</div>`}</div></div>`;
   }
-  root.innerHTML = modal + (GUIDE.open ? '' : guideTracker(g));
+  const tracker = GUIDE.open ? '' : guideTracker(g);
+  root.innerHTML = modal + tracker;
+  root.dataset.pane = `${GUIDE.view}:${GUIDE.pane}:${GUIDE.sel}`;
+  if (tracker) GUIDE.trackerShown = true; else if (!GUIDE.open) GUIDE.trackerShown = false;
+  document.documentElement.classList.toggle('gq-has-tracker', !!tracker);  // room for it below the page
+  GUIDE.entering = false;
   layers.forEach(l => root.appendChild(l));
+  if (samePane) GUIDE_SCROLLERS.forEach((sel, i) => { const el = root.querySelector(sel); if (el) el.scrollTop = scroll[i]; });
   // Animate the XP bar from what was last shown to the current value.
   const fill = root.querySelector('.gq-xpbar i');
   if (fill) requestAnimationFrame(() => requestAnimationFrame(() => { fill.style.width = fill.dataset.target + '%'; }));
@@ -179,7 +193,7 @@ function guideNavItem() {
 function guideOpen(view = 'map', sel = null) {
   if (!GUIDE.data) return;
   const kept = guideQuest(GUIDE.sel)?.done ? null : GUIDE.sel;  // reopen on unfinished work, not a ticked quest
-  Object.assign(GUIDE, { open: true, view, sel: sel || kept || GUIDE.data.next });
+  Object.assign(GUIDE, { open: true, entering: !GUIDE.open, view, sel: sel || kept || GUIDE.data.next, pane: sel ? 'detail' : 'list' });
   guideRender(); guideFocus(); guideRefresh(true);
 }
 function guideClose() {
@@ -196,15 +210,19 @@ const GUIDE_ACTIONS = {
   'guide-open': el => guideOpen(GUIDE.data?.complete ? 'complete' : 'map', el.dataset.id || null),
   'guide-close': () => guideClose(),
   'guide-backdrop': (el, e) => { if (e.target === el) guideClose(); },
-  'guide-begin': () => { Object.assign(GUIDE.data, { welcomed: true, dismissed: false }); guideSave({ welcomed: true, dismissed: false }); GUIDE.view = 'map'; GUIDE.sel = GUIDE.data.next; guideRender(); guideFocus(); },
+  'guide-begin': () => { Object.assign(GUIDE.data, { welcomed: true, dismissed: false }); guideSave({ welcomed: true, dismissed: false }); Object.assign(GUIDE, { view: 'map', sel: GUIDE.data.next, pane: 'list' }); guideRender(); guideFocus(); },
   'guide-later': () => guideClose(),
-  'guide-map': () => { GUIDE.view = 'map'; guideRender(); guideFocus(); },
+  'guide-map': () => { Object.assign(GUIDE, { view: 'map', pane: 'list' }); guideRender(); guideFocus(); },
   'guide-finish': () => { guideClose(); go('today'); },
   'guide-select': el => {
-    GUIDE.sel = el.dataset.id; guideRender();
-    [...document.querySelectorAll('.gq-node')].find(n => n.dataset.id === el.dataset.id)?.focus({ preventScroll: true });
-    // On a phone the details sit below the trail.
-    if (window.innerWidth <= 760) document.querySelector('.gq-detail')?.scrollIntoView?.({ block: 'start', behavior: guideReduced() ? 'auto' : 'smooth' });
+    Object.assign(GUIDE, { sel: el.dataset.id, pane: 'detail' }); guideRender();
+    if (guideNarrow()) document.getElementById('gq-detail-title')?.focus({ preventScroll: true });
+    else [...document.querySelectorAll('.gq-node')].find(n => n.dataset.id === el.dataset.id)?.focus({ preventScroll: true });
+  },
+  'guide-back': () => {
+    GUIDE.pane = 'list'; guideRender();
+    const node = [...document.querySelectorAll('.gq-node')].find(n => n.dataset.id === GUIDE.sel);
+    node?.scrollIntoView?.({ block: 'center' }); node?.focus({ preventScroll: true });
   },
   'guide-check': () => busy('guide-check', () => guideRefresh(true)),
   'guide-copy': el => { const q = guideQuest(el.dataset.id); if (q?.snippet) copyText(q.snippet); },

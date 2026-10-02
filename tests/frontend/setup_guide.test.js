@@ -171,4 +171,33 @@ describe('setup quest', () => {
     expect(writeText).toHaveBeenCalledWith('litellm --config integrations/litellm/config.ollama-cloud.yaml');
     expect(root().querySelector('.gq-node[data-id="search"] .gq-recommend')).toBeNull();
   });
+
+  it('on a phone shows the list or one quest, with a way back', async () => {
+    await ui.guideBoot();
+    ui.A['guide-open']({ dataset: {} }); await flush();
+    const body = () => root().querySelector('.gq-body');
+    expect(body().classList.contains('pane-detail')).toBe(false);
+    click('.gq-node[data-id="search"]');
+    expect(body().classList.contains('pane-detail')).toBe(true);
+    click('.gq-detail [data-act="guide-back"]');
+    expect(body().classList.contains('pane-detail')).toBe(false);
+    expect(root().querySelector('.gq-node.sel').dataset.id).toBe('search');
+    // Opening a quest from the tracker goes straight to its details.
+    ui.A['guide-close'](); ui.A['guide-open']({ dataset: { id: 'ai' } });
+    expect(body().classList.contains('pane-detail')).toBe(true);
+  });
+
+  it('a background refresh keeps the scroll position and does not replay the entrance', async () => {
+    await ui.guideBoot();
+    ui.A['guide-open']({ dataset: {} });
+    expect(root().querySelector('.gq-overlay').classList.contains('gq-enter')).toBe(true);
+    await flush();
+    root().querySelector('.gq-trail').scrollTop = 120;
+    await ui.guideRefresh(true);
+    expect(root().querySelector('.gq-overlay').classList.contains('gq-enter')).toBe(false);
+    expect(root().querySelector('.gq-trail').scrollTop).toBe(120);
+    expect(document.documentElement.classList.contains('gq-lock')).toBe(true);
+    ui.A['guide-close']();
+    expect(document.documentElement.classList.contains('gq-lock')).toBe(false);
+  });
 });
