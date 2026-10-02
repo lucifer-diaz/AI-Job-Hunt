@@ -11,13 +11,16 @@ let ui, context, fetchMock, guide;
 const response = (data, status = 200) => ({ ok: status < 400, status, text: async () => JSON.stringify(data) });
 const QUESTS = [
   ['profile', 'Who you are', 50, 'settings', 'profile'], ['preferences', 'Who you are', 50, 'settings', 'preferences'],
-  ['resume', 'Your story', 100, 'settings', 'resumes'], ['search', 'The hunt', 100, 'discovery', 'setup'],
+  ['resume', 'Your story', 100, 'settings', 'resumes'], ['ai', 'Power up', 100, 'settings', 'ai'],
+  ['search', 'The hunt', 100, 'discovery', 'setup'],
   ['answers', 'Ready to apply', 75, 'knowledge', 'answers'], ['gmail', 'Bonus', 50, 'settings', 'gmail', true],
 ];
 function progress({ done = [], celebrated = done, welcomed = true, dismissed = false, level = 1 } = {}) {
   const quests = QUESTS.map(([id, chapter, xp, screen, section, optional = false]) => ({
     id, chapter, title: `Quest ${id}`, summary: `Do ${id}`, why: `Why ${id}`, steps: [`Step one of ${id}`, 'Step two'],
-    xp, screen, section, optional, done: done.includes(id), detail: done.includes(id) ? `${id} done` : `${id} to do` }));
+    xp, screen, section, optional, recommended: id === 'ai' ? 'Ollama account + LiteLLM · nemotron-3-nano:30b-cloud' : '',
+    snippet: id === 'ai' ? 'litellm --config integrations/litellm/config.ollama-cloud.yaml' : '',
+    links: id === 'ai' ? [{ label: 'Ollama API keys', url: 'https://ollama.com/settings/keys' }] : [], done: done.includes(id), detail: done.includes(id) ? `${id} done` : `${id} to do` }));
   const required = quests.filter(q => !q.optional);
   const xp = quests.filter(q => q.done).reduce((n, q) => n + q.xp, 0);
   return { quests, xp, xp_total: 425, level: { number: level, title: level === 1 ? 'Rookie' : 'Job Seeker', floor: level === 1 ? 0 : 150, next: level === 1 ? 150 : 400, next_title: level === 1 ? 'Job Seeker' : 'Pathfinder' },
@@ -64,11 +67,11 @@ describe('setup quest', () => {
   it('welcomes a new account once, then shows the quest map', async () => {
     guide = progress({ welcomed: false });
     await ui.guideBoot();
-    expect(root().textContent).toContain('Set up your hunt in 5 quests');
+    expect(root().textContent).toContain('Set up your hunt in 6 quests');
     click('[data-act="guide-begin"]'); await flush();
     expect(puts()).toContainEqual({ welcomed: true, dismissed: false });
     const nodes = [...root().querySelectorAll('.gq-node')];
-    expect(nodes.map(n => n.dataset.id)).toEqual(['profile', 'preferences', 'resume', 'search', 'answers', 'gmail']);
+    expect(nodes.map(n => n.dataset.id)).toEqual(['profile', 'preferences', 'resume', 'ai', 'search', 'answers', 'gmail']);
     expect(root().querySelector('.gq-node.next').dataset.id).toBe('profile');
     expect(root().querySelector('.gq-detail').textContent).toContain('Step one of profile');
   });
@@ -86,7 +89,7 @@ describe('setup quest', () => {
     guide = progress({ done: ['profile'] });
     await ui.guideBoot();
     expect(root().querySelector('.gq-modal')).toBeNull();
-    expect(document.getElementById('nav').textContent).toContain('1/5');
+    expect(document.getElementById('nav').textContent).toContain('1/6');
   });
 
   it('quests completed before the guide existed are recorded without a celebration', async () => {
@@ -145,12 +148,27 @@ describe('setup quest', () => {
   });
 
   it('shows the trophy when every required quest is done, and no tracker', async () => {
-    guide = progress({ done: ['profile', 'preferences', 'resume', 'search', 'answers'], level: 2 });
+    guide = progress({ done: ['profile', 'preferences', 'resume', 'ai', 'search', 'answers'], level: 2 });
     await ui.guideBoot();
     expect(root().querySelector('.gq-tracker')).toBeNull();
     ui.A['guide-open']({ dataset: {} });
-    expect(root().textContent).toContain('ALL 5 QUESTS DONE');
+    expect(root().textContent).toContain('ALL 6 QUESTS DONE');
     expect(root().textContent).toContain('Level 2 · Job Seeker');
     expect(document.getElementById('nav').textContent).toContain('✓');
+  });
+
+  it('recommends Ollama Cloud through LiteLLM, with commands to copy', async () => {
+    const writeText = vi.fn(async () => {});
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+    await ui.guideBoot();
+    ui.A['guide-open']({ dataset: { id: 'ai' } }); await flush();
+    const detail = root().querySelector('.gq-detail');
+    expect(detail.querySelector('.gq-recommend').textContent).toContain('nemotron-3-nano:30b-cloud');
+    expect(detail.querySelector('.gq-snippet pre').textContent).toContain('config.ollama-cloud.yaml');
+    const link = detail.querySelector('.gq-links a');
+    expect([link.href, link.target, link.rel]).toEqual(['https://ollama.com/settings/keys', '_blank', 'noopener noreferrer']);
+    click('.gq-snippet [data-act="guide-copy"]'); await flush();
+    expect(writeText).toHaveBeenCalledWith('litellm --config integrations/litellm/config.ollama-cloud.yaml');
+    expect(root().querySelector('.gq-node[data-id="search"] .gq-recommend')).toBeNull();
   });
 });

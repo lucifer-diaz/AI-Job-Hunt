@@ -48,6 +48,10 @@ class Quest:
     screen: str
     section: str = ""
     optional: bool = False
+    # A recommended route, shown as a callout above the steps; commands to copy; reference links.
+    recommended: str = ""
+    snippet: str = ""
+    links: tuple[tuple[str, str], ...] = ()
     check: Callable[[Session, int, CandidateProfile | None], tuple[bool, str]] = field(default=lambda *_: (False, ""))
 
 
@@ -96,7 +100,10 @@ def _check_ai(db, user_id, p):
     if provider == "mock":
         return False, "Using the mock model: no real AI yet"
     ready, why = ai_ready(db, user_id)
-    return ready, f"{provider} connected" if ready else why
+    if not ready:
+        return False, why
+    return True, ("LiteLLM gateway connected" if provider == "litellm"
+                  else f"{provider} connected · LiteLLM + Ollama Cloud is recommended")
 
 
 def _check_apify(db, user_id, p):
@@ -154,11 +161,27 @@ QUESTS: tuple[Quest, ...] = (
           ("Open Settings → Resume Data.", "Read each parsed role, skill and achievement.", "Verify the ones that are true; fix or reject the rest."),
           100, "settings", "resume-data", check=_check_verified),
     Quest("ai", "Power up", "Connect an AI model",
-          "A provider key, or a LiteLLM gateway.",
-          "Ranking, tailoring and review need a real model. OpenRouter's free models cost nothing.",
-          ("Open Settings → API keys.", "Paste an OpenRouter, OpenAI, Anthropic or Gemini key (stored encrypted).",
-           "Pick the provider and model in Settings → AI models."),
-          100, "settings", "api-keys", check=_check_ai),
+          "Recommended: Ollama Cloud through a local LiteLLM gateway.",
+          "Ranking, tailoring and review need a real model. One Ollama account behind LiteLLM covers most of them: "
+          "nemotron-3-nano:30b-cloud runs in Ollama Cloud, so you need no GPU, and LiteLLM lets you change models "
+          "later in Settings without touching code.",
+          ("Sign in at ollama.com and create an API key under Settings → Keys.",
+           "Install LiteLLM and start it with this repository's Ollama Cloud config (commands below).",
+           "In Settings → AI models → LiteLLM, enter http://localhost:4000 and your LiteLLM master key, then press "
+           "Test Connection.",
+           "Press Sync models from LiteLLM, switch on Use LiteLLM gateway, and assign nemotron-3-nano:30b-cloud to "
+           "every tier.",
+           "Prefer a direct key? An OpenRouter, OpenAI, Anthropic or Gemini key in Settings → API keys also "
+           "completes this quest."),
+          100, "settings", "ai", check=_check_ai,
+          recommended="Ollama account + LiteLLM · nemotron-3-nano:30b-cloud",
+          snippet=("export OLLAMA_API_KEY=...            # from ollama.com/settings/keys\n"
+                   "export LITELLM_MASTER_KEY=sk-jobhunt-local   # any secret; Job Hunt OS asks for it\n"
+                   "pip install 'litellm[proxy]'\n"
+                   "litellm --config integrations/litellm/config.ollama-cloud.yaml --port 4000"),
+          links=(("Ollama API keys", "https://ollama.com/settings/keys"),
+                 ("Nemotron 3 Nano on Ollama", "https://ollama.com/library/nemotron-3-nano"),
+                 ("LiteLLM proxy docs", "https://docs.litellm.ai/docs/simple_proxy"))),
     Quest("apify", "Power up", "Connect job discovery",
           "An Apify token to search the job boards.",
           "Apify runs the scrapers that search LinkedIn, Indeed, Glassdoor and more for you.",
@@ -234,7 +257,9 @@ def progress(db: Session, user_id: int) -> dict[str, Any]:
         xp += q.xp if done else 0
         quests.append({"id": q.id, "chapter": q.chapter, "title": q.title, "summary": q.summary, "why": q.why,
                        "steps": list(q.steps), "xp": q.xp, "screen": q.screen, "section": q.section,
-                       "optional": q.optional, "done": done, "detail": detail})
+                       "optional": q.optional, "recommended": q.recommended, "snippet": q.snippet,
+                       "links": [{"label": label, "url": url} for label, url in q.links],
+                       "done": done, "detail": detail})
     required = [q for q in quests if not q["optional"]]
     next_quest = next((q["id"] for q in quests if not q["done"] and not q["optional"]),
                       next((q["id"] for q in quests if not q["done"]), None))

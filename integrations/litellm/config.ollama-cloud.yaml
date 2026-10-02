@@ -1,0 +1,36 @@
+# Recommended starter: a local LiteLLM proxy in front of Ollama Cloud, serving NVIDIA Nemotron 3 Nano for every
+# Job Hunt OS worker. No GPU is needed; the model runs in Ollama Cloud on your Ollama account.
+#
+#   export OLLAMA_API_KEY=...                 # ollama.com → Settings → Keys
+#   export LITELLM_MASTER_KEY=sk-jobhunt-local  # any secret; enter it in Settings → AI Models → LiteLLM
+#   pip install 'litellm[proxy]'
+#   litellm --config integrations/litellm/config.ollama-cloud.yaml --port 4000
+#
+# Then in Job Hunt OS: Settings → AI Models → LiteLLM → base URL http://localhost:4000 and the master key →
+# Test Connection → Sync models from LiteLLM → Use LiteLLM gateway → assign nemotron-3-nano:30b-cloud to the tiers.
+#
+# Credentials stay environment references (os.environ/...): never paste a key into this file.
+# This minimal setup has no LiteLLM database, so use sync mode `disabled` or `config_file`; for `admin_api`
+# (runtime-managed models) add STORE_MODEL_IN_DB=True and a DATABASE_URL as in config.example.yaml.
+
+model_list:
+  # The name Job Hunt OS sees and assigns to workers.
+  - model_name: nemotron-3-nano:30b-cloud
+    litellm_params:
+      # Direct Ollama Cloud API: the model ID is the CLI name without the "-cloud" suffix.
+      model: ollama_chat/nemotron-3-nano:30b
+      api_base: https://ollama.com
+      api_key: os.environ/OLLAMA_API_KEY
+
+  # Alternative without an API key: run Ollama locally, `ollama signin`, and let it forward the cloud model.
+  # - model_name: nemotron-3-nano:30b-cloud
+  #   litellm_params:
+  #     model: ollama_chat/nemotron-3-nano:30b-cloud
+  #     api_base: http://localhost:11434
+
+router_settings:
+  num_retries: 1
+  timeout: 300
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

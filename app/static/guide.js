@@ -114,7 +114,10 @@ function guideDetail(g) {
     <h3 id="gq-detail-title">${esc(q.title)}</h3>
     <p class="gq-why">${esc(q.why)}</p>
     <div class="gq-status ${q.done ? 'done' : ''}"><span class="dot"></span>${esc(q.detail || (q.done ? 'Done' : 'Not started'))}</div>
+    ${q.recommended ? `<div class="gq-recommend"><span class="gq-recommend-star" aria-hidden="true">★</span><div><div class="gq-caps">RECOMMENDED</div><div class="gq-recommend-text">${esc(q.recommended)}</div></div></div>` : ''}
     <ol class="gq-steps">${q.steps.map(s => `<li>${esc(s)}</li>`).join('')}</ol>
+    ${q.snippet ? `<div class="gq-snippet"><div class="row between base"><span class="gq-caps">RUN ON YOUR MACHINE</span>${btn('Copy', 'guide-copy', { id: q.id }, 'sm')}</div><pre>${esc(q.snippet)}</pre></div>` : ''}
+    ${(q.links || []).length ? `<div class="gq-links">${q.links.map(l => `<a href="${attr(l.url)}" target="_blank" rel="noopener noreferrer">${esc(l.label)} ↗</a>`).join('')}</div>` : ''}
     <div class="row gap8 wrap mt14">${q.done ? btn('Revisit', 'guide-go', { id: q.id }) : btn(`Start quest →`, 'guide-go', { id: q.id }, 'primary')}
       ${btn(label('guide-check', 'Check progress', 'Checking…'), 'guide-check', {}, 'ghost', isBusy('guide-check'))}</div>
     <p class="gq-hint">Quests tick off by themselves when the work is done — the guide checks your workspace, not this button.</p></section>`;
@@ -204,6 +207,7 @@ const GUIDE_ACTIONS = {
     if (window.innerWidth <= 760) document.querySelector('.gq-detail')?.scrollIntoView?.({ block: 'start', behavior: guideReduced() ? 'auto' : 'smooth' });
   },
   'guide-check': () => busy('guide-check', () => guideRefresh(true)),
+  'guide-copy': el => { const q = guideQuest(el.dataset.id); if (q?.snippet) copyText(q.snippet); },
   'guide-hide': () => { GUIDE.data.dismissed = true; guideSave({ dismissed: true }); guideRender(); render(); toast('Setup quest hidden — reopen it from the sidebar any time.'); },
   'guide-go': el => {
     const q = guideQuest(el.dataset.id); if (!q) return;

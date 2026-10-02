@@ -89,3 +89,24 @@ def test_levels(xp, number, title):
 
 def test_every_quest_fits_in_the_xp_ladder():
     assert sum(q.xp for q in setup_guide.QUESTS) >= setup_guide.LEVELS[-1][0]
+
+
+def test_the_ai_quest_recommends_ollama_cloud_through_litellm(client):
+    ai = quest(client.get("/api/setup/guide").json(), "ai")
+    assert ai["screen"] == "settings" and ai["section"] == "ai"
+    assert "nemotron-3-nano:30b-cloud" in ai["recommended"] and "LiteLLM" in ai["recommended"]
+    assert "integrations/litellm/config.ollama-cloud.yaml" in ai["snippet"]
+    assert any(link["url"] == "https://ollama.com/settings/keys" for link in ai["links"])
+
+
+def test_the_ollama_cloud_config_keeps_credentials_in_the_environment():
+    from pathlib import Path
+
+    import yaml
+
+    config = yaml.safe_load(Path("integrations/litellm/config.ollama-cloud.yaml").read_text())
+    [model] = config["model_list"]
+    assert model["model_name"] == "nemotron-3-nano:30b-cloud"
+    assert model["litellm_params"] == {"model": "ollama_chat/nemotron-3-nano:30b", "api_base": "https://ollama.com",
+                                       "api_key": "os.environ/OLLAMA_API_KEY"}
+    assert config["general_settings"]["master_key"] == "os.environ/LITELLM_MASTER_KEY"
