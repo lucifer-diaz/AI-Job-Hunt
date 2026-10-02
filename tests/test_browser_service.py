@@ -88,7 +88,8 @@ def test_every_page_gets_an_isolated_context_that_is_closed_afterwards(runtime):
     assert first is not second
     for context in runtime.contexts:
         assert context.closed and all(page.closed for page in context.pages)
-        assert context.options["accept_downloads"] is False and context.options["service_workers"] == "block"
+        assert context.options["accept_downloads"] is False and context.options["service_workers"] == "allow"
+        assert "user_agent" not in context.options, "Chromium's native User-Agent must be preserved"
         assert "storage_state" not in context.options and "extra_http_headers" not in context.options
 
 
@@ -175,6 +176,17 @@ def test_headless_is_the_default_and_can_be_turned_off_for_debugging(runtime, mo
     headed.record_telemetry = False
     run(headed.fetch_rendered_page(URL))
     assert runtime.launches[-1]["headless"] is False and headed.diagnostics()["headless"] is False
+
+
+def test_compatibility_defaults_and_diagnostics(runtime):
+    browser = service()
+    run(browser.fetch_rendered_page(URL))
+    assert runtime.launches[-1] == {"headless": True}
+    diagnostics = browser.diagnostics()
+    assert diagnostics["enabled"] is True
+    assert diagnostics["service_workers"] == "allow"
+    assert diagnostics["block_nonessential_resources"] is False
+    assert diagnostics["debug_artifacts"] is False
 
 
 def test_navigation_waits_for_dom_content_not_network_idle(runtime):
@@ -313,7 +325,7 @@ class FakeRoute:
 
 @pytest.mark.parametrize("url,kind,navigation,allowed", [
     ("https://cdn.example.com/app.js", "script", False, True),
-    ("https://cdn.example.com/logo.png", "image", False, False),  # images, media and fonts are never downloaded
+    ("https://cdn.example.com/logo.png", "image", False, True),
     ("http://169.254.169.254/latest/meta-data/", "fetch", False, False),  # cloud metadata
     ("http://localhost:5432/", "xhr", False, False),
     ("http://10.0.0.8/admin", "document", True, False),
@@ -323,6 +335,15 @@ def test_pages_cannot_make_the_browser_reach_internal_services(url, kind, naviga
     route = FakeRoute(url, kind, navigation)
     run(service()._route(route))
     assert route.continued is allowed and (route.aborted is None) is allowed
+
+
+@pytest.mark.parametrize("kind", ["image", "media", "font"])
+def test_nonessential_resource_blocking_is_opt_in(kind):
+    allowed = FakeRoute("https://cdn.example.com/asset", kind)
+    blocked = FakeRoute("https://cdn.example.com/asset", kind)
+    run(service()._route(allowed))
+    run(service(block_nonessential_resources=True)._route(blocked))
+    assert allowed.continued and blocked.aborted == "blockedbyclient"
 
 
 def test_the_cheap_private_check():

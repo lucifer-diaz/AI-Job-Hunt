@@ -4,7 +4,7 @@ Lifecycle:
 * Nothing starts at import or at app startup. The first page load starts Playwright and Chromium, under a lock so
   concurrent callers share one launch. The app keeps running if that fails; the failure is reported, not raised at
   startup.
-* Each task gets its own context (no cookies, storage, service workers or downloads) and page, closed afterwards.
+* Each task gets its own context (no shared cookies or storage) and page, closed afterwards.
 * A crashed or disconnected Chromium is noticed (the `disconnected` event, `is_connected()`) and started again on the
   next use. A page crash fails only that page.
 * `stop()` closes the browser and Playwright; the app calls it at shutdown so no Chromium process is left behind.
@@ -13,8 +13,8 @@ Lifecycle:
 The service belongs to the event loop it started in. A new loop (a `python -m app.cron` run) gets a fresh browser.
 
 Security: pages never receive application data — no extra headers, no cookies, no init scripts. Navigation requests
-are checked against app.services.url_safety, so a redirect cannot reach a private address, and images, media and
-fonts are not downloaded at all.
+are checked against app.services.url_safety, so a redirect or subrequest cannot reach a private address. Resource
+blocking is an independent, opt-in performance setting; normal contexts preserve modern page behaviour.
 """
 from __future__ import annotations
 
@@ -56,8 +56,7 @@ SKIPPED_RESOURCES = frozenset({"image", "media", "font"})
 SETTLE_POLL_SECONDS = 0.5
 SETTLE_MAX_SECONDS = 6.0
 SELECTOR_WAIT_SECONDS = 8.0
-USER_AGENT = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) "
-              "Chrome/124.0 Safari/537.36 JobHuntOS/0.2")
+DEBUG_ARTIFACT_LIMIT = 20
 
 
 def _utcnow() -> datetime:
@@ -125,7 +124,8 @@ def classify_navigation_error(exc: BaseException) -> str:
 class PlaywrightBrowserService(BrowserService):
     def __init__(self, *, enabled: bool = True, browser: str = "chromium", headless: bool = True,
                  navigation_timeout_seconds: float = 45, page_timeout_seconds: float = 60, max_concurrency: int = 2,
-                 keep_running: bool = True, allow_private_hosts: bool = False, record_telemetry: bool = True):
+                 keep_running: bool = True, allow_private_hosts: bool = False, record_telemetry: bool = True,
+                 block_nonessential_resources: bool = False, debug_artifacts: bool = False):
         self.enabled = enabled
         self.browser_name = (browser or "chromium").lower()
         self.headless = headless
@@ -135,6 +135,8 @@ class PlaywrightBrowserService(BrowserService):
         self.keep_running = keep_running
         self.allow_private_hosts = allow_private_hosts
         self.record_telemetry = record_telemetry
+        self.block_nonessential_resources = block_nonessential_resources
+        self.debug_artifacts = debug_artifacts
         self._playwright: Any = None
         self._browser: Any = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -154,7 +156,9 @@ class PlaywrightBrowserService(BrowserService):
                    navigation_timeout_seconds=s.playwright_navigation_timeout_seconds,
                    page_timeout_seconds=s.playwright_page_timeout_seconds,
                    max_concurrency=s.playwright_max_concurrency, keep_running=s.playwright_keep_browser_running,
-                   allow_private_hosts=s.jd_fetch_allow_private_hosts)
+                   allow_private_hosts=s.jd_fetch_allow_private_hosts,
+                   block_nonessential_resources=s.playwright_block_nonessential_resources,
+                   debug_artifacts=s.playwright_debug_artifacts)
 
     # ───────────── availability ─────────────
 
@@ -179,6 +183,9 @@ class PlaywrightBrowserService(BrowserService):
             reason = (CHROMIUM_MISSING, "Chromium executable missing: run `python -m playwright install chromium`")
         return {"status": "UNAVAILABLE" if reason else "AVAILABLE", "reason_code": reason[0] if reason else None,
                 "reason": reason[1] if reason else None, "browser": self.browser_name, "headless": self.headless,
+                "enabled": self.enabled, "service_workers": "allow",
+                "block_nonessential_resources": self.block_nonessential_resources,
+                "debug_artifacts": self.debug_artifacts,
                 "package_installed": playwright_installed(), "chromium_installed": installed,
                 "running": self._running(), "max_concurrency": self.max_concurrency,
                 "keep_browser_running": self.keep_running, "launches": self.launches, "crashes": self.crashes,
@@ -221,9 +228,7 @@ class PlaywrightBrowserService(BrowserService):
                 from playwright.async_api import async_playwright
 
                 self._playwright = await async_playwright().start()
-                self._browser = await self._playwright.chromium.launch(
-                    headless=self.headless, args=["--disable-dev-shm-usage", "--no-first-run",
-                                                  "--disable-extensions", "--mute-audio"])
+                self._browser = await self._playwright.chromium.launch(headless=self.headless)
             except Exception as exc:
                 await self._discard()
                 text = str(exc)
@@ -284,7 +289,8 @@ class PlaywrightBrowserService(BrowserService):
     async def _route(self, route: Any) -> None:
         request = route.request
         try:
-            if request.resource_type in SKIPPED_RESOURCES:
+            # Performance filtering is optional and separate from the always-on SSRF checks below.
+            if self.block_nonessential_resources and request.resource_type in SKIPPED_RESOURCES:
                 await route.abort("blockedbyclient")
                 return
             from app.services.url_safety import UnsafeURL, check_public_url, obviously_private
@@ -306,7 +312,7 @@ class PlaywrightBrowserService(BrowserService):
         browser = await self._ensure()
         try:
             context = await browser.new_context(
-                accept_downloads=False, service_workers="block", java_script_enabled=True, user_agent=USER_AGENT,
+                accept_downloads=False, service_workers="allow", java_script_enabled=True,
                 viewport={"width": 1280, "height": 900}, locale="en-US", ignore_https_errors=False)
         except Exception as exc:
             # A browser that died between the check and this call: forget it so the next task starts a new one.
@@ -373,14 +379,38 @@ class PlaywrightBrowserService(BrowserService):
 
     async def _render(self, url: str, wait_for: Sequence[str]) -> RenderedPage:
         async with self.page_session() as page:
-            response = await page.goto(url, wait_until="domcontentloaded", timeout=self.navigation_timeout * 1000)
-            status = response.status if response is not None else None
-            redirects, request = 0, response.request if response is not None else None
-            while request is not None and request.redirected_from is not None and redirects < 50:
-                redirects, request = redirects + 1, request.redirected_from
-            await self._settle(page, wait_for)
-            return RenderedPage(url=url, final_url=page.url, status=status, html=await page.content(),
-                                title=await page.title(), redirect_count=redirects)
+            response = None
+            try:
+                response = await page.goto(url, wait_until="domcontentloaded", timeout=self.navigation_timeout * 1000)
+                status = response.status if response is not None else None
+                redirects, request = 0, response.request if response is not None else None
+                while request is not None and request.redirected_from is not None and redirects < 50:
+                    redirects, request = redirects + 1, request.redirected_from
+                await self._settle(page, wait_for)
+                return RenderedPage(url=url, final_url=page.url, status=status, html=await page.content(),
+                                    title=await page.title(), redirect_count=redirects)
+            except Exception:
+                if self.debug_artifacts:
+                    await self._capture_failure(page, response)
+                raise
+
+    async def _capture_failure(self, page: Any, response: Any) -> None:
+        """Write bounded, failure-only local diagnostics. Deliberately omit HTML, headers, cookies and paths."""
+        import json
+        from app.services.redaction import redact_text, redact_url
+
+        directory = Path("data/playwright-debug")
+        with contextlib.suppress(Exception):
+            directory.mkdir(parents=True, exist_ok=True)
+            stamp = f"{int(time.time() * 1000)}-{os.getpid()}"
+            await page.screenshot(path=str(directory / f"{stamp}.png"), full_page=True)
+            metadata = {"captured_at": _utcnow().isoformat(), "title": redact_text(await page.title(), 300),
+                        "final_url": redact_url(page.url)[:1200],
+                        "status": response.status if response is not None else None}
+            (directory / f"{stamp}.json").write_text(json.dumps(metadata), encoding="utf-8")
+            files = sorted(directory.glob("*"), key=lambda item: item.stat().st_mtime, reverse=True)
+            for old in files[DEBUG_ARTIFACT_LIMIT * 2:]:
+                old.unlink(missing_ok=True)
 
     async def _settle(self, page: Any, wait_for: Sequence[str]) -> None:
         """Wait, within bounds, for the posting to appear: a known container, then the text to stop growing."""

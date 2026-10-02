@@ -245,6 +245,10 @@ class Settings(BaseSettings):
     playwright_navigation_timeout_seconds: int = 45
     playwright_page_timeout_seconds: int = 60
     playwright_max_concurrency: int = 2
+    # Compatibility-first by default. Security routing remains enabled regardless of this performance option.
+    playwright_block_nonessential_resources: bool = False
+    # Failure-only screenshots and redacted metadata for local diagnosis; never HTML, cookies, or headers.
+    playwright_debug_artifacts: bool = False
     # Keep Chromium running between recoveries (faster) or close it after each batch (less memory while idle).
     playwright_keep_browser_running: bool = True
     compensation_batch_size: int = 50

@@ -555,6 +555,18 @@ def _stage_note(result: PageResult) -> dict[str, Any]:
             "detail": (result.detail or "")[:200] or None}
 
 
+def should_try_browser_after_http(result: PageResult) -> bool:
+    """Central policy for a single ordinary browser attempt after HTTP.
+
+    A bare HTTP access denial is not evidence of a challenge: Chromium may render that public page normally.
+    Explicit policy controls and terminal results are never retried as a way around them.
+    """
+    if result.code in {jd_quality.CAPTCHA_OR_ANTI_BOT, jd_quality.LOGIN_REQUIRED, "RATE_LIMITED",
+                       jd_quality.JOB_REMOVED, jd_quality.JOB_CLOSED, "INVALID_URL", "NOT_HTML"}:
+        return False
+    return result.kind == "empty" or (result.kind == "blocked" and result.code == jd_quality.ACCESS_DENIED)
+
+
 def _done(snapshot: Snapshot, result: PageResult, method: str, outcome: Outcome) -> Outcome:
     outcome.status, outcome.code, outcome.method = COMPLETED, "RECOVERED", method
     outcome.text = result.extraction.text if result.extraction else ""
@@ -593,22 +605,27 @@ async def recover(sessions: Callable[[], Session], snapshot: Snapshot, *, browse
     outcome.final_url, outcome.http_status, outcome.redirect_count = http.final_url, http.status, http.redirect_count
     if http.kind == "found":
         return _done(snapshot, http, HTTP, outcome)
-    if http.kind in ("removed", "blocked", "permanent", "not_html") or http.code == "RATE_LIMITED":
-        # A login wall, a challenge or a rate limit is never retried in a browser: that would be working around it.
+    try_browser = should_try_browser_after_http(http)
+    if ((http.kind in ("removed", "blocked", "permanent", "not_html") and not try_browser)
+            or http.code == "RATE_LIMITED"):
+        # Explicit login/challenge/rate-limit controls and terminal results are never worked around.
+        outcome.diagnostics["playwright"] = {"attempted": False, "kind": "skipped",
+                                             "reason": message_for(http.code)}
         return _stop(http, outcome)
 
     best = http if http.kind == "ambiguous" else None
     candidates_from = http if http.extraction and http.extraction.candidates else None
     last_problem = http
-    if best is None:
+    if best is None and try_browser:
         if browser is None or not browser.is_available():
-            outcome.diagnostics["playwright"] = {"kind": "unavailable", "code": "PLAYWRIGHT_UNAVAILABLE",
+            outcome.diagnostics["playwright"] = {"attempted": False, "kind": "unavailable",
+                                                 "code": "PLAYWRIGHT_UNAVAILABLE",
                                                  "detail": (browser.diagnostics().get("reason")
                                                             if browser is not None else "no browser service")}
         else:
             outcome.playwright_used = True
             rendered = await _browser_stage(snapshot, browser, http.final_url or snapshot.url)
-            outcome.diagnostics["playwright"] = _stage_note(rendered)
+            outcome.diagnostics["playwright"] = {"attempted": True, **_stage_note(rendered)}
             if rendered.kind == "found":
                 return _done(snapshot, rendered, PLAYWRIGHT, outcome)
             if rendered.kind in ("removed", "blocked", "permanent"):
@@ -926,9 +943,11 @@ def diagnostics(db: Session | None = None, user_id: int | None = None) -> dict[s
             llm = {"status": "AVAILABLE" if ready else "UNAVAILABLE", "reason": None if ready else why}
     return {"enabled": settings.jd_fetch_enabled,
             "http": {"status": "AVAILABLE"},
-            "playwright": {k: browser.get(k) for k in ("status", "reason_code", "reason", "browser", "headless",
-                                                       "running", "max_concurrency", "keep_browser_running",
-                                                       "package_installed", "chromium_installed")},
+            "playwright": {k: browser.get(k) for k in (
+                "status", "reason_code", "reason", "enabled", "browser", "headless", "running", "launches",
+                "crashes", "max_concurrency", "keep_browser_running", "service_workers",
+                "block_nonessential_resources", "debug_artifacts", "package_installed", "chromium_installed",
+                "last_error")},
             "llm": llm,
             "settings": {"min_characters": settings.jd_description_min_characters,
                          "batch_size": settings.jd_fetch_batch_size,

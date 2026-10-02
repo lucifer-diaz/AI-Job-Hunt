@@ -433,7 +433,6 @@ def test_the_recovery_prompt_lives_in_the_prompts_package():
 @pytest.mark.parametrize("path,status,code", [
     ("login.html", "BLOCKED", "LOGIN_REQUIRED"),
     ("captcha.html", "BLOCKED", "CAPTCHA_OR_ANTI_BOT"),
-    ("forbidden", "BLOCKED", "ACCESS_DENIED"),
 ])
 def test_login_walls_and_challenges_are_blocked_and_never_bypassed(owner, server, path, status, code):
     browser = FakeBrowser({path: (200, page("posting"))})  # a browser *could* get through: it must not be tried
@@ -443,6 +442,28 @@ def test_login_walls_and_challenges_are_blocked_and_never_bypassed(owner, server
     assert (task.status, task.result_code) == (status, code) and task.error_category == "BLOCKED"
     assert browser.calls == [] and not task.playwright_used
     assert job_of(job_id).description == "View job"
+
+
+def test_generic_http_access_denied_falls_back_to_browser(owner, server):
+    browser = FakeBrowser({"forbidden": (200, page("posting"))})
+    job_id = new_job(owner, server.url("forbidden"))
+    assert run_recovery(browser) == ["recovered"]
+    task = task_of(job_id)
+    assert browser.calls == [server.url("forbidden")]
+    assert task.fetch_method == "PLAYWRIGHT" and task.playwright_used
+    diagnostics = task.diagnostics["attempt_1"]
+    assert diagnostics["http"]["code"] == "ACCESS_DENIED"
+    assert diagnostics["playwright"]["attempted"] is True
+    assert diagnostics["playwright"]["kind"] == "found"
+
+
+def test_access_denied_by_http_and_rendered_page_is_blocked(owner, server):
+    browser = FakeBrowser({"forbidden": (403, "<title>Forbidden</title><h1>Access denied</h1>")})
+    job_id = new_job(owner, server.url("forbidden"))
+    assert run_recovery(browser) == ["blocked"]
+    task = task_of(job_id)
+    assert (task.status, task.result_code, task.playwright_used) == ("BLOCKED", "ACCESS_DENIED", True)
+    assert task.diagnostics["attempt_1"]["playwright"]["kind"] == "blocked"
 
 
 @pytest.mark.parametrize("path,code", [("gone", "JOB_REMOVED"), ("expired", "JOB_REMOVED"),

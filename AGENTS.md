@@ -122,7 +122,8 @@ The rules a change has to keep:
   bounded attempts. A failure is one task's failure; it never raises out of the scheduled job.
 * **HTTP before the browser.** HTTP goes through `external_client` (`app/services/external_api.py`) with redirects
   followed one by one and each hop checked by `app/services/url_safety.py`. The browser is used only when HTTP found
-  no usable description, and never to retry a login wall, a challenge or a 429.
+  no usable description. A generic HTTP `ACCESS_DENIED` may receive one normal browser rendering attempt; an explicit
+  login wall, anti-bot challenge or 429 never does.
 * **Playwright access goes through the shared `BrowserService`** (`app.infrastructure.browser.get_browser_service()`).
   Workers and features must not import Playwright or launch Chromium themselves. Pages get an isolated context each,
   are closed in `finally`, and never receive API keys, credentials, cookies or environment values.
