@@ -6,6 +6,8 @@ Analyses are queued for the scheduler and produce recommendations only.
 """
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Any
 
@@ -243,13 +245,29 @@ def apify_runs(f: external_monitoring.ExternalFilter = ExtFilter, page: int = Qu
             "page": page, "per_page": per_page, "has_more": len(runs) > page * per_page}
 
 
+@contextmanager
+def owned_scope(f: monitoring.MonitoringFilter, db: Session) -> Iterator[Session]:
+    """The session for metrics over owned tables. The request's session only ever sees the signed-in account
+    (app.tenancy), so the admin's every-account view (user_id None) reads through an unscoped one; a person's
+    own view keeps the scoped session, with the explicit user filter as a second guard."""
+    if f.user_id is not None:
+        yield db
+        return
+    from app.db import SessionLocal
+
+    with SessionLocal() as everyone:
+        yield everyone
+
+
 @router.get("/jd-recovery")
 def jd_recovery_metrics(f: monitoring.MonitoringFilter = Filter, db: Session = Depends(get_user_db)) -> dict[str, Any]:
     """Job description recovery: success and fallback rates, blocked and failed pages, and what recovered jobs did
     next (parsed, ranked), plus what recovery can use right now."""
     from app.services import jd_recovery
 
-    return {"filters": f.public(), "metrics": jd_recovery.metrics(db, f.user_id, f.start, f.end),
+    with owned_scope(f, db) as scope:
+        found = jd_recovery.metrics(scope, f.user_id, f.start, f.end)
+    return {"filters": f.public(), "metrics": found,
             "diagnostics": jd_recovery.diagnostics(db, db.info.get("user_id"))}
 
 
@@ -259,7 +277,8 @@ def jd_parsing_metrics(f: monitoring.MonitoringFilter = Filter, db: Session = De
     JD_PARSER) and the scheduler job."""
     from app.services import job_description
 
-    return {"filters": f.public(), "metrics": job_description.metrics(db, f.user_id, f.start, f.end)}
+    with owned_scope(f, db) as scope:
+        return {"filters": f.public(), "metrics": job_description.metrics(scope, f.user_id, f.start, f.end)}
 
 
 @router.get("/application-inbox")
@@ -270,8 +289,9 @@ def application_inbox_metrics(f: monitoring.MonitoringFilter = Filter,
     LLM requests view under the Inbox stage."""
     from app.services.application_inbox import service as inbox
 
-    return {"filters": f.public(), "metrics": inbox.metrics(db, f.user_id, f.start, f.end),
-            "status": inbox.status(db)}
+    with owned_scope(f, db) as scope:
+        found = inbox.metrics(scope, f.user_id, f.start, f.end)
+    return {"filters": f.public(), "metrics": found, "status": inbox.status(db)}
 
 
 @router.get("/logs")

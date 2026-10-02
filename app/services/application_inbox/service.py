@@ -62,7 +62,7 @@ def status(db: Session) -> dict[str, Any]:
         "connection": None if conn is None else {
             "status": conn.status, "email": conn.email_address, "connected_at": _iso(conn.connected_at),
             "last_sync_at": _iso(conn.last_sync_at), "last_successful_sync_at": _iso(conn.last_successful_sync_at),
-            "last_error": conn.last_error, "syncing": bool(conn.sync_locked_by),
+            "last_error": conn.last_error, "syncing": syncing(conn),
             # The running sync's phase and percent; after it ends, how the last one finished.
             "progress": conn.sync_progress},
         "thresholds": {"auto_match": settings.application_email_auto_match_threshold,
@@ -71,6 +71,12 @@ def status(db: Session) -> dict[str, Any]:
         "last_run": (latest.sync_runs or [None])[-1] if latest else None,
         **digest.pending_counts(db),
     }
+
+
+def syncing(conn: GmailConnection, now: datetime | None = None) -> bool:
+    """A sync holds a live lease. A lease left by a crashed worker has expired: the account is free to sync again
+    (sync._take_lease would take it), so it is not shown as syncing."""
+    return bool(conn.sync_locked_by and conn.sync_lock_expires_at and conn.sync_lock_expires_at > (now or utcnow()))
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -138,10 +144,8 @@ def correct(db: Session, event: ApplicationCommunicationEvent, changes: dict[str
                 raise ValueError("Choose a submitted application")
         if new_id != event.application_id:
             _record(event, "application_id", event.application_id, new_id)
-            old_entry = _mirror_entry(db, event)
-            if old_entry is not None:
-                db.delete(old_entry)
-                event.application_event_id = None
+            if event.application_id:
+                _withdraw(db, db.get(Application, event.application_id), event)
             event.application_id = new_id
             if msg is not None:
                 msg.application_id = new_id
@@ -172,10 +176,11 @@ def correct(db: Session, event: ApplicationCommunicationEvent, changes: dict[str
         if not event.application_id:
             raise ValueError("Link the email to an application before changing its stage")
         app = db.get(Application, event.application_id)
-        _record(event, "stage", app.stage, stage)
+        before = app.stage or "applied"  # read before set_stage changes it
+        _record(event, "stage", before, stage)
         tracker.enable_extra_stage(db, app, stage)
         tracker.set_stage(db, app, stage, meta={"source": "application_inbox_correction", "email_event_id": event.id})
-        event.stage_decision, event.stage_from, event.stage_to = "APPLIED", event.stage_from or app.stage, stage
+        event.stage_decision, event.stage_from, event.stage_to = "APPLIED", before, stage
         event.stage_reason = "set by you"
     if event.user_corrected and not reanalyse:
         event.needs_review = False
@@ -186,6 +191,27 @@ def correct(db: Session, event: ApplicationCommunicationEvent, changes: dict[str
             entry.title = f"{classify.label(event.event_type)} · {entry.title.split(' · ', 1)[-1]}"[:300]
     db.commit()
     return event, reanalyse
+
+
+def _withdraw(db: Session, app: Application | None, event: ApplicationCommunicationEvent) -> None:
+    """The email turned out not to be about `app`: remove what it put on that application's timeline (its email
+    entry, a scheduled interview, the follow-up note) and undo the stage move it made, when nothing moved it since.
+    The stage events stay as history, with the move back recorded after them."""
+    if app is None:
+        return
+    derived = [e for e in app.events if (e.meta or {}).get("email_event_id") == event.id]
+    moves = sorted((e for e in app.events if e.kind == "stage"), key=lambda e: (e.created_at, e.id))
+    if (event.stage_decision == "APPLIED" and event.stage_to and (app.stage or "applied") == event.stage_to
+            and moves and (moves[-1].meta or {}).get("email_event_id") == event.id):
+        tracker.set_stage(db, app, event.stage_from or "applied",
+                          meta={"source": "application_inbox_correction", "email_event_id": event.id},
+                          title=f"Moved back to {tracker.stage_label(event.stage_from or 'applied')} "
+                                "(the email was about another application)")
+    for entry in derived:
+        if entry.kind != "stage":
+            db.delete(entry)
+    event.application_event_id = None
+    event.stage_decision, event.stage_from, event.stage_to, event.stage_reason = "NONE", None, None, None
 
 
 def reanalyse_message(sessions: Any, user_id: int, message_id: int) -> None:

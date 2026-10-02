@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -110,6 +110,44 @@ def _zone_supported(zone: str, text: str) -> bool:
     return False
 
 
+MONTHS = ("january", "february", "march", "april", "may", "june", "july", "august", "september", "october",
+          "november", "december")
+
+
+def _date_stated(value: str, text: str) -> bool:
+    """Whether the email itself states this date: ISO, "3 Oct", "3rd October", "October 3", "03/10", "10/3" …
+    A weekday alone ("Thursday") or a relative word ("tomorrow") does not count."""
+    try:
+        day = date.fromisoformat(value)
+    except ValueError:
+        return False
+    if value in text:
+        return True
+    month = MONTHS[day.month - 1]
+    names = f"(?:{month}|{month[:3]}\\.?)"
+    d = f"0?{day.day}(?:st|nd|rd|th)?"
+    m = f"0?{day.month}"
+    patterns = (rf"(?<!\d){d}(?:\s+of)?\s+{names}\b", rf"\b{names}\s+{d}(?!\d)",
+                rf"(?<!\d)0?{day.day}[/.-]{m}(?:[/.-](?:\d{{2}}){{1,2}})?(?!\d)",
+                rf"(?<!\d){m}[/.-]0?{day.day}(?:[/.-](?:\d{{2}}){{1,2}})?(?!\d)")
+    return any(re.search(p, text) for p in patterns)
+
+
+def _time_stated(value: str, text: str) -> bool:
+    """Whether the email itself states this time: "15:00", "15.00", "3 pm", "3:00 PM", "1500 hrs"."""
+    try:
+        hour, minute = (int(part) for part in value.split(":"))
+    except ValueError:
+        return False
+    h12, ampm = (hour - 1) % 12 + 1, "a\\.?m\\.?" if hour < 12 else "p\\.?m\\.?"
+    mm = f"{minute:02d}"
+    patterns = [rf"(?<!\d)0?{hour}[:.]{mm}(?!\d)", rf"(?<!\d){hour:02d}{mm}\s*(?:hrs|hours|h)\b",
+                rf"(?<!\d){h12}[:.]{mm}\s*{ampm}"]
+    if minute == 0:
+        patterns.append(rf"(?<![\d:.]){h12}\s*{ampm}")
+    return any(re.search(p, text) for p in patterns)
+
+
 def _parse_deadline(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -142,6 +180,12 @@ def verify(analysis: ApplicationEmailAnalysis, msg: ApplicationEmailMessage) -> 
         if interview.get("interviewer_name") and not _contains(text, interview["interviewer_name"]):
             interview["interviewer_name"] = None
             dropped.append("interviewer not named in the email")
+        if interview.get("date") and not _date_stated(interview["date"], text):
+            interview["date"] = interview["time"] = None
+            dropped.append("interview date not stated in the email")
+        if interview.get("time") and not _time_stated(interview["time"], text):
+            interview["time"] = None
+            dropped.append("interview time not stated in the email")
         if interview.get("timezone") and not _zone_supported(interview["timezone"], text):
             interview["timezone"] = None
             dropped.append("time zone not stated unambiguously")
@@ -210,17 +254,24 @@ def _mirror(db: Session, app: Application, event: ApplicationCommunicationEvent)
 
 
 def _schedule_interview(db: Session, app: Application, event: ApplicationCommunicationEvent) -> None:
-    """A tracker interview entry, only for a confident email that states the date, time and time zone."""
+    """A tracker interview entry, only for a confident email that states the date, time and time zone.
+
+    The email's own entry is updated when the email is analysed again. A reschedule moves the latest interview
+    this inbox scheduled in the same thread; any other invitation (a second round in the same thread) is a new one."""
     start = interview_start(event.interview)
-    if start is None or event.needs_review:
+    if start is None or event.needs_review or event.confidence < get_settings().application_stage_auto_update_threshold:
         return
     interview = event.interview or {}
     meta = {"source": SOURCE, "email_event_id": event.id, "timezone": interview["timezone"],
             "contact_name": interview.get("interviewer_name") or "", "gmail_thread_id": event.gmail_thread_id}
-    existing = next((e for e in app.events if e.kind == "interview" and (e.meta or {}).get("source") == SOURCE
-                     and (e.meta or {}).get("gmail_thread_id") == event.gmail_thread_id), None)
+    scheduled = sorted((e for e in app.events if e.kind == "interview" and (e.meta or {}).get("source") == SOURCE),
+                       key=lambda e: (e.created_at or utcnow(), e.id or 0))
+    existing = next((e for e in scheduled if (e.meta or {}).get("email_event_id") == event.id), None)
+    if existing is None and event.event_type == "INTERVIEW_RESCHEDULE":
+        existing = next((e for e in reversed(scheduled)
+                         if (e.meta or {}).get("gmail_thread_id") == event.gmail_thread_id), None)
     title = (interview.get("round") or "Interview")[:300]
-    if existing is not None:  # a reschedule in the same thread moves the interview, it does not add a second one
+    if existing is not None:
         existing.occurred_at, existing.title, existing.meta = start, title, {**(existing.meta or {}), **meta}
         return
     db.add(ApplicationEvent(application=app, kind="interview", title=title, occurred_at=start,
@@ -250,10 +301,16 @@ def _user_changed_stage_at(app: Application) -> datetime | None:
 
 
 def suppress_followup(db: Session, app: Application, event: ApplicationCommunicationEvent) -> bool:
-    """A reply from the employer makes the pending follow-up unnecessary: the due date is cleared, with a note."""
-    if event.event_type not in classify.HUMAN_REPLY_TYPES or app.followup_due_at is None:
+    """A reply from the employer makes the pending follow-up unnecessary: the due date is cleared, an unsent draft
+    is cancelled (the tracker stops offering it), and a note says why."""
+    if event.event_type not in classify.HUMAN_REPLY_TYPES:
+        return False
+    drafts = [f for f in app.followups if f.status == "draft"]
+    if app.followup_due_at is None and not drafts:
         return False
     app.followup_due_at = None
+    for draft in drafts:
+        draft.status = "cancelled"
     db.add(ApplicationEvent(application=app, kind="note", title="Follow-up not needed",
                             detail=f"{classify.label(event.event_type)} received"
                                    f"{' on ' + event.received_at.strftime('%-d %b') if event.received_at else ''}; "

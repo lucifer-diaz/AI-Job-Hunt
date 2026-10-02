@@ -95,7 +95,7 @@ describe('email activity on an application', () => {
 
   it('sends only the fields a person corrected', async () => {
     click(view().querySelector('[data-act="inbox-correct-open"]'));
-    document.getElementById('inbox-fix-type').value = 'DOCUMENT_REQUEST';
+    view().querySelector('[data-fix="type"]').value = 'DOCUMENT_REQUEST';
     click(view().querySelector('[data-act="inbox-correct-save"]'));
     await settle();
     expect(posted).toContainEqual({ url: '/api/application-email-events/41/correct', body: { event_type: 'DOCUMENT_REQUEST' } });
@@ -190,5 +190,31 @@ describe('sync progress', () => {
     await ui.inboxPoll();
     expect(document.getElementById('toast').textContent).toBe('Gmail sync rate limited: Gmail is rate limiting this account');
     ui.S.screen = 'overview';
+  });
+});
+
+describe('correcting an email listed in several sections', () => {
+  it('opens one editor, in the copy that was clicked, and saves that copy\'s fields', async () => {
+    ui.S.trackerView = 'inbox'; ui.render();
+    const copies = () => [...view().querySelectorAll('[data-inbox-event="41"]')];
+    expect(copies().length).toBeGreaterThan(1);  // Needs attention, New updates and Interviews all list it
+    click(copies()[2].querySelector('[data-act="inbox-correct-open"]'));
+    expect(view().querySelectorAll('[data-fix="type"]').length).toBe(1);
+    const editor = copies().find(c => c.querySelector('[data-fix="type"]'));
+    expect(editor).toBe(copies()[2]);
+    expect([...editor.querySelectorAll('[data-fix="type"] option')].map(o => o.value)).toContain('DOCUMENT_REQUEST');
+    editor.querySelector('[data-fix="type"]').value = 'DOCUMENT_REQUEST';
+    click(editor.querySelector('[data-act="inbox-correct-save"]'));
+    await settle();
+    expect(posted).toContainEqual({ url: '/api/application-email-events/41/correct', body: { event_type: 'DOCUMENT_REQUEST' } });
+    ui.S.screen = 'overview';
+  });
+
+  it('offers every event type from the tracker alone, before Inbox insights has loaded', () => {
+    ui.D.inbox = undefined;
+    ui.D.tracker.email_event_types = [{ id: 'INTERVIEW_INVITATION', label: 'Interview invitation' }, { id: 'OFFER', label: 'Offer' }];
+    ui.render();
+    click(view().querySelector('[data-act="inbox-correct-open"]'));
+    expect([...view().querySelectorAll('[data-fix="type"] option')].map(o => o.value)).toEqual(['INTERVIEW_INVITATION', 'OFFER']);
   });
 });

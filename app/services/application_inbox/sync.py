@@ -19,10 +19,13 @@ from sqlalchemy.orm import Session
 from app.models import ApplicationEmailMessage, GmailConnection
 from app.services import gmail, system_log, tracing
 from app.services.application_inbox import analysis, digest, matching, queries
+from app.services.redaction import redact_text
 from app.settings import get_settings
 
 log = logging.getLogger("jobhunt.application_inbox")
 LEASE_MINUTES = 30
+# Message ids listed per sync, as a multiple of the messages read: listing is cheap (ids only), reading is not.
+ID_LISTING_FACTOR = 10
 PENDING_BATCH = 50
 COUNTERS = ("applications_checked", "queries", "queries_skipped", "messages_skipped", "messages_searched",
             "messages_new", "messages_fetched", "bodies_fetched", "messages_matched", "messages_needs_review", "messages_unmatched", "messages_ignored",
@@ -108,20 +111,28 @@ def _known_ids(db: Session, ids: list[str]) -> set[str]:
 
 
 def _search(client: gmail.GmailClient, apps: list[queries.TrackedApplication], last_success: datetime | None,
-            now: datetime, limit: int, counters: dict[str, int], progress: Callable = _no_progress) -> dict[str, str]:
-    """Message id → thread id for everything the targeted searches (and known threads) return, newest first."""
+            now: datetime, limit: int, counters: dict[str, int],
+            progress: Callable = _no_progress) -> tuple[dict[str, str], bool]:
+    """Message id → thread id for everything the targeted searches (and known threads) return, newest first, and
+    whether the listing is complete. Listing ids is cheap (no content), so it covers far more than one sync reads;
+    an incomplete listing keeps the checkpoint where it was, so the next sync searches the same window again."""
     found: dict[str, str] = {}
+    complete = True
     searches = queries.build_queries(apps, last_success, now)
     for index, query in enumerate(searches):
         if len(found) >= limit:
+            complete = False
             break
         progress("searching", index, len(searches))
         counters["queries"] += 1
+        wanted = limit - len(found)
         try:
-            hits = client.list_message_ids(query, limit - len(found))
+            hits = client.list_message_ids(query, wanted + 1)  # one more than wanted: tells whether more exist
         except gmail.GmailBadRequest:
-            counters["queries_skipped"] += 1  # one unusable search never stops the others
+            counters["queries_skipped"] += 1  # Gmail refuses this search every time: skipping it loses nothing new
             continue
+        if len(hits) > wanted:
+            complete, hits = False, hits[:wanted]
         for message_id, thread_id in hits:
             found.setdefault(message_id, thread_id)
     for app in apps:
@@ -129,22 +140,24 @@ def _search(client: gmail.GmailClient, apps: list[queries.TrackedApplication], l
             continue
         for thread_id in sorted(app.known_threads):
             if len(found) >= limit:
+                complete = False
                 break
             for message_id, thread in client.thread_message_ids(thread_id):
                 found.setdefault(message_id, thread)
     counters["messages_searched"] = len(found)
-    return found
+    return found, complete
 
 
 def _store(db: Session, meta: gmail.EmailMeta, body: str, result: matching.MatchResult) -> ApplicationEmailMessage | None:
     """Save one message with the least content its match needs. Returns None when another sync saved it first."""
-    keep_content = result.status in ("MATCHED", "NEEDS_REVIEW")
-    keep_headers = result.status != "IGNORED"  # an email with no application signal keeps only its ids
+    # Linked (or review-band) mail keeps what a person and the analysis need; anything else keeps its ids only —
+    # enough to never read it again, and nothing about what it said or who sent it.
+    keep = result.status in ("MATCHED", "NEEDS_REVIEW")
     row = ApplicationEmailMessage(
         gmail_message_id=meta.message_id, gmail_thread_id=meta.thread_id,
-        sender=meta.sender if keep_headers else "", sender_domain=meta.sender_domain if keep_headers else "",
-        subject=meta.subject if keep_headers else "", received_at=meta.received_at,
-        snippet=meta.snippet if keep_content else "", relevant_text=body if keep_content else "",
+        sender=meta.sender if keep else "", sender_domain=meta.sender_domain if keep else "",
+        subject=meta.subject if keep else "", received_at=meta.received_at if keep else None,
+        snippet=meta.snippet if keep else "", relevant_text=body if keep else "",
         automated=meta.automated, application_id=result.application_id if result.status == "MATCHED" else None,
         match_score=result.score, match_signals=result.signals or None, match_method=result.method,
         match_status=result.status, match_candidates=result.candidates if result.status == "NEEDS_REVIEW" else None,
@@ -168,12 +181,11 @@ def _read_message(db: Session, client: gmail.GmailClient, message_id: str, own_a
     if own_address and meta.sender_email == own_address.lower():
         result = matching.MatchResult(None, 0.0, [], "IGNORED", "NONE", reason="sent by you")
         return _store(db, meta, "", result)
-    result = matching.match(meta, "", apps)
     body = ""
-    if result.signals:  # only mail that already points at an application is opened
+    if matching.headers_point_at_application(meta, apps):  # only mail whose headers point at an application is opened
         body = gmail.body_text(client.get_full(message_id), max(500, settings.application_inbox_body_chars))
         counters["bodies_fetched"] += 1
-        result = matching.match(meta, body, apps)
+    result = matching.match(meta, body, apps)
     row = _store(db, meta, body, result)
     if row is not None and row.match_status == "NEEDS_REVIEW":
         _assist(db, row, counters)
@@ -205,6 +217,25 @@ def _review_event(db: Session, row: ApplicationEmailMessage) -> None:
     db.commit()
 
 
+def _count_failure(db: Session, message_id: int, now: datetime, exc: Exception) -> None:
+    """An unexpected analysis error is an attempt like a model failure: retried with backoff, then left FAILED (the
+    message itself is kept). Without this, the same error would re-run — and re-bill — the analysis every sync."""
+    settings = get_settings()
+    try:
+        row = db.get(ApplicationEmailMessage, message_id)
+        if row is None:
+            return
+        row.attempts += 1
+        row.last_error = redact_text(f"{type(exc).__name__}: {exc}", 1000)
+        if row.attempts >= max(1, settings.application_inbox_analysis_max_attempts):
+            row.analysis_status, row.next_attempt_at = "FAILED", None
+        else:
+            row.next_attempt_at = now + timedelta(seconds=settings.application_inbox_retry_seconds * row.attempts)
+        db.commit()
+    except Exception:  # noqa: BLE001  bookkeeping must never stop the sync
+        db.rollback()
+
+
 def process_pending(db: Session, now: datetime, counters: dict[str, int], limit: int = PENDING_BATCH,
                     progress: Callable = _no_progress) -> None:
     """Analyse matched messages waiting for it (new ones, and earlier model failures whose retry time has come)."""
@@ -217,9 +248,10 @@ def process_pending(db: Session, now: datetime, counters: dict[str, int], limit:
         try:
             with tracing.trace("application_inbox_analysis", user_id=row.user_id):
                 outcome = analysis.process_message(db, row, now=now, counters=counters)
-        except Exception:  # one message failing must not stop the others
+        except Exception as exc:  # one message failing must not stop the others
             db.rollback()
             log.warning("inbox analysis failed for message %s", row.id, exc_info=True)
+            _count_failure(db, row.id, now, exc)
             continue
         if outcome == "retrying":
             counters["pending_retry"] += 1
@@ -261,7 +293,7 @@ def sync_account(sessions: Callable[[], Session], user_id: int, *, trigger: str 
         finally:
             progress("done", status=summary["status"])
             _release(db, conn_id, owner)
-    level = "INFO" if summary["status"] == "succeeded" else "WARNING"
+    level = "INFO" if summary["status"] in ("succeeded", "partial") else "WARNING"
     system_log.log_event(message=f"Application inbox sync {summary['status']}: {counters['messages_new']} new, "
                                  f"{counters['messages_matched']} matched, {counters['stage_applied']} stage changes",
                          category="EMAIL", level=level, provider="GMAIL", operation="inbox_sync", user_id=user_id,
@@ -283,10 +315,15 @@ def _run(db: Session, conn: GmailConnection, now: datetime, counters: dict[str, 
         try:
             token = gmail.access_token(db, conn)
             with gmail.GmailClient(token, conn.user_id) as client:
-                found = _search(client, apps, conn.last_successful_sync_at, now,
-                                max(1, settings.gmail_max_messages_per_sync), counters, progress)
+                per_sync = max(1, settings.gmail_max_messages_per_sync)
+                found, listed_all = _search(client, apps, conn.last_successful_sync_at, now,
+                                            per_sync * ID_LISTING_FACTOR, counters, progress)
                 known = _known_ids(db, list(found))
                 new = [mid for mid in found if mid not in known]
+                # At most GMAIL_MAX_MESSAGES_PER_SYNC are read per run; the rest wait for the next one, which finds
+                # them again because the checkpoint does not move until a run has read everything it found.
+                complete = listed_all and len(new) <= per_sync
+                new = new[:per_sync]
                 counters["messages_new"] = len(new)
                 for index, message_id in enumerate(new):
                     progress("reading", index, len(new))
@@ -294,7 +331,8 @@ def _run(db: Session, conn: GmailConnection, now: datetime, counters: dict[str, 
                         row = _read_message(db, client, message_id, conn.email_address, apps, counters)
                     except gmail.GmailBadRequest:
                         db.rollback()
-                        counters["messages_skipped"] += 1  # unreadable now; not stored, so the next sync retries
+                        counters["messages_skipped"] += 1  # unreadable: not stored, and the checkpoint waits for it
+                        complete = False
                         continue
                     if row is None:
                         continue
@@ -307,6 +345,8 @@ def _run(db: Session, conn: GmailConnection, now: datetime, counters: dict[str, 
                         _review_event(db, row)
                 progress("reading", len(new), len(new))
                 conn.history_id = str(client.profile().get("historyId") or "")[:40] or conn.history_id
+                if not complete:
+                    status = "partial"
         except gmail.GmailConnectionRequired as exc:
             db.rollback()
             gmail.mark(db, conn, gmail.CONNECTION_REQUIRED, str(exc))
@@ -320,6 +360,8 @@ def _run(db: Session, conn: GmailConnection, now: datetime, counters: dict[str, 
     process_pending(db, now, counters, progress=progress)
     if status == "succeeded":
         conn.last_successful_sync_at, conn.last_error = now, None
+    elif status == "partial":
+        conn.last_error = None  # nothing wrong: more mail than one run reads; the next run carries on from here
     else:
         conn.last_error = (error or status)[:1000]
     db.commit()

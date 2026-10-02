@@ -19,6 +19,7 @@ Everything here is provider-independent: pydantic models and plain JSON Schema, 
 from __future__ import annotations
 
 import re
+from datetime import date, datetime
 from typing import Annotated, Any, ClassVar, Literal
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator, model_validator
@@ -340,6 +341,10 @@ def check_deadline(value: str | None) -> str | None:
         return None
     if not (_DATE.match(value) or _DATETIME.match(value)):
         raise ValueError("must be an ISO 8601 date or datetime, or null")
+    try:  # a real calendar date and time: 2026-02-31 or 25:00 is rejected here, not deep in the service
+        datetime.fromisoformat(value.replace("Z", "+00:00").replace(" ", "T"))
+    except ValueError as exc:
+        raise ValueError(f"{value} is not a real date") from exc
     return value
 
 
@@ -386,6 +391,11 @@ class EmailInterview(Contract):
     def _date(cls, value: str | None) -> str | None:
         if value is not None and not _DATE.match(value):
             raise ValueError("must be YYYY-MM-DD or null")
+        if value is not None:
+            try:
+                date.fromisoformat(value)
+            except ValueError as exc:
+                raise ValueError(f"{value} is not a real date") from exc
         return value
 
     @field_validator("time")

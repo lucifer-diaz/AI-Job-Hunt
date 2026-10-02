@@ -360,6 +360,7 @@ def test_unrelated_mail_keeps_no_content_and_never_reaches_the_model(google, use
     row = message(user, "m-news")
     assert row.match_status in ("UNMATCHED", "IGNORED") and row.application_id is None
     assert row.relevant_text == "" and row.snippet == ""
+    assert (row.sender, row.sender_domain, row.subject, row.received_at) == ("", "", "", None), "ids only"
     assert llm.prompts == []
     assert event(user, "m-news") is None
 
@@ -563,7 +564,8 @@ def test_the_analysis_contract_is_strict():
     ApplicationEmailAnalysis.model_validate(base)
     for bad in ({"surprise": 1}, {"event_type": "SEND_EMAIL"}, {"confidence": 1.5},
                 {"interview": {"time": "15:00"}}, {"interview": {"date": "2026-10-03", "timezone": "IST"}},
-                {"interview": {"date": "3rd October"}},
+                {"interview": {"date": "3rd October"}}, {"interview": {"date": "2026-02-31"}},
+                {"action_items": [{"action": "x", "deadline": "2026-13-01", "confidence": 0.5}]},
                 {"action_items": [{"action": "x", "deadline": "next week", "confidence": 0.5}]},
                 {"recommended_tracker_action": "DELETE_APPLICATION"}):
         with pytest.raises(ValidationError):
@@ -1086,3 +1088,202 @@ def test_a_digest_of_several_applications_is_not_filed_under_one():
     digest_mail = _meta("Naukri <info@naukri.com>", "You applied for 5 jobs on 22 Sep")
     body = "Lead AI Engineer at Epam Systems. Senior AI Platform Engineer at Tredence. Lead AI Engineer at Sutherland."
     assert matching.match(digest_mail, body, apps).status != "MATCHED"
+
+
+# ───────────── code review regressions (PR #52) ─────────────
+
+def test_a_body_is_opened_only_when_the_headers_point_at_an_application(google, user, llm):
+    """The snippet is body text: a company named only there never opens the message."""
+    connect(user)
+    add_application(user, "Snippetco", "Engineer")
+    google.add("m-snip", sender="Friend <pal@example.org>", subject="Weekend plans", received_at=ago(1),
+               body="Snippetco application role interview offer position — anyway, see you Saturday.")
+    sync(user)
+    assert google.fetched("m-snip", "metadata") == 1 and google.fetched("m-snip", "full") == 0
+
+
+def test_a_capped_sync_keeps_its_checkpoint_until_everything_is_read(google, user, llm, monkeypatch):
+    monkeypatch.setattr(get_settings(), "gmail_max_messages_per_sync", 2)
+    connect(user)
+    add_application(user, "Busy Inbox Co", "Engineer", recruiters=[("Bo", "bo@busyinbox.co")])
+    for n in range(3):
+        google.add(f"m-cap-{n}", sender="Bo <bo@busyinbox.co>", subject=f"Note {n}",
+                   body="Thank you for applying to Busy Inbox Co.", received_at=ago(n + 1))
+    first = sync(user)
+    assert first["status"] == "partial" and first["messages_new"] == 2
+    with SessionLocal() as db:
+        conn = db.scalar(select(GmailConnection).where(GmailConnection.user_id == user))
+        assert conn.last_successful_sync_at is None and conn.last_error is None
+    second = sync(user)
+    assert second["status"] == "succeeded" and second["messages_new"] == 1
+    with SessionLocal() as db:
+        assert db.scalar(select(GmailConnection).where(GmailConnection.user_id == user)).last_successful_sync_at
+
+
+def test_admin_all_account_inbox_metrics_cover_every_account(google, llm, monkeypatch):
+    from app import auth
+    from app.auth import CurrentUser
+
+    admin, other = make_user(SessionLocal, is_admin=True), make_user(SessionLocal)
+    for owner, company in ((admin, "Admin Co"), (other, "Other Co")):
+        connect(owner)
+        domain = company.lower().replace(" ", "") + ".com"
+        add_application(owner, company, "Engineer", recruiters=[("R", f"r@{domain}")])
+        google.add(f"m-{owner}", sender=f"R <r@{domain}>", subject="Hello",
+                   body=f"Thank you for applying to {company}.", received_at=ago(1))
+        sync(owner)
+    monkeypatch.setattr(auth, "authenticate", lambda request: CurrentUser(admin, "a@jobhunt.test", True))
+    own = client.get("/api/monitoring/application-inbox").json()["metrics"]
+    everyone = client.get("/api/monitoring/application-inbox?all_accounts=true").json()["metrics"]
+    assert own["messages_matched"] == 1 and everyone["messages_matched"] >= 2
+    assert client.get("/api/monitoring/jd-parsing?all_accounts=true").status_code == 200
+
+
+def test_an_expired_sync_lease_is_not_shown_as_syncing(google, user):
+    connect(user)
+    with SessionLocal() as db:
+        db.query(GmailConnection).filter(GmailConnection.user_id == user).update(
+            {"sync_locked_by": "crashed:worker", "sync_lock_expires_at": utcnow() - timedelta(minutes=1)})
+        db.commit()
+        db.info["user_id"] = user
+        assert inbox.status(db)["connection"]["syncing"] is False
+
+
+def test_a_second_round_in_the_same_thread_is_a_new_interview(google, user, llm):
+    connect(user)
+    app_id = add_application(user, "Rounds Co", "Engineer", recruiters=[("Jo", "jo@rounds.co")])
+    first, second = (utcnow() + timedelta(days=3)).date(), (utcnow() + timedelta(days=8)).date()
+    google.add("m-r1", thread="thr-r", sender="Jo <jo@rounds.co>", subject="Interview",
+               body=f"Please join round one on {first} at 15:00 Asia/Kolkata.", received_at=ago(5))
+    google.add("m-r2", thread="thr-r", sender="Jo <jo@rounds.co>", subject="Re: Interview",
+               body=f"Great news: we invite you to round two on {second} at 16:00 Asia/Kolkata.", received_at=ago(1))
+    base = {**interview_answer()["interview"], "meeting_link": None}
+    llm.answers = [interview_answer(recruiter=None, interview={**base, "date": first.isoformat(), "round": "Round 1"}),
+                   interview_answer(recruiter=None, interview={**base, "date": second.isoformat(), "time": "16:00",
+                                                               "round": "Round 2"})]
+    sync(user)
+    rounds = sorted(e.title for e in application(user, app_id).events if e.kind == "interview")
+    assert rounds == ["Round 1", "Round 2"]
+
+
+def test_an_unexpected_analysis_error_is_retried_with_backoff_not_forever(google, user, llm, monkeypatch):
+    connect(user)
+    add_application(user, "Crashy Co", "Engineer", recruiters=[("Cy", "cy@crashy.co")])
+    google.add("m-crash", sender="Cy <cy@crashy.co>", subject="Hi", body="Let us talk about the role.",
+               received_at=ago(1))
+    monkeypatch.setattr(analysis, "process_message", lambda *a, **k: (_ for _ in ()).throw(ValueError("boom")))
+    sync(user)
+    row = message(user, "m-crash")
+    assert row.analysis_status == "PENDING" and row.attempts == 1 and row.next_attempt_at > utcnow()
+    assert "boom" in row.last_error
+
+
+def test_a_reply_cancels_an_existing_follow_up_draft(google, user, llm, monkeypatch):
+    from app import auth
+    from app.auth import CurrentUser
+
+    connect(user)
+    app_id = add_application(user, "Draft Co", "Engineer", recruiters=[("Di", "di@draftco.com")])
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        db.add(FollowUp(application_id=app_id, user_id=user, due_at=utcnow(), draft="Just checking in…",
+                        status="draft"))
+        db.commit()
+    google.add("m-draft", sender="Di <di@draftco.com>", subject="Re: your application",
+               body="Thanks! Could you share your notice period?", received_at=ago(1))
+    llm.answers = [{"event_type": "RECRUITER_RESPONSE", "confidence": 0.9, "summary": "Asked for notice period.",
+                    "requires_user_action": True, "important_facts": [], "needs_review": False}]
+    sync(user)
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        assert [f.status for f in db.scalars(select(FollowUp).where(FollowUp.application_id == app_id))] == \
+            ["cancelled"]
+    monkeypatch.setattr(auth, "authenticate", lambda request: CurrentUser(user, "x@jobhunt.test", False))
+    tracker = client.get("/api/tracker").json()
+    card = next(a for a in tracker["applications"] if a["id"] == app_id)
+    assert card["draft"] == "" and card["draft_id"] is None
+    assert {t["id"] for t in tracker["email_event_types"]} >= {"DOCUMENT_REQUEST", "OFFER"}
+
+
+def test_interviews_need_a_stated_date_and_a_confident_reading(google, user, llm):
+    connect(user)
+    app_id = add_application(user, "Ground Co", "Engineer", recruiters=[("Gi", "gi@ground.co")])
+    stated = (utcnow() + timedelta(days=4)).date()
+    google.add("m-invent", sender="Gi <gi@ground.co>", subject="Interview",
+               body="We would like to invite you to an interview. Please share your availability.", received_at=ago(2))
+    google.add("m-unsure", sender="Gi <gi@ground.co>", subject="Interview slot",
+               body=f"Proposed: {stated} at 15:00 Asia/Kolkata.", received_at=ago(1))
+    invented = interview_answer(recruiter=None, interview={**interview_answer()["interview"], "meeting_link": None,
+                                                           "date": (utcnow() + timedelta(days=9)).date().isoformat()})
+    unsure = interview_answer(recruiter=None, confidence=0.8, interview={
+        **interview_answer()["interview"], "meeting_link": None, "date": stated.isoformat()})
+    llm.answers = [invented, unsure]
+    sync(user)
+    assert event(user, "m-invent").interview["date"] is None and event(user, "m-invent").needs_review
+    assert event(user, "m-unsure").interview["date"] == stated.isoformat()
+    assert not [e for e in application(user, app_id).events if e.kind == "interview"]
+
+
+def test_relinking_an_email_withdraws_what_it_did_to_the_first_application(google, user, llm, monkeypatch):
+    from app import auth
+    from app.auth import CurrentUser
+
+    connect(user)
+    wrong = add_application(user, "Twin", "Backend Engineer", recruiters=[("Tw", "tw@twin.io")], stage="screening")
+    right = add_application(user, "Other Twin Co", "Engineer", stage="applied")
+    day = (utcnow() + timedelta(days=3)).date()
+    google.add("m-relink", sender="Tw <tw@twin.io>", subject="Interview",
+               body=f"We would like to invite you to an interview on {day} at 15:00 Asia/Kolkata.", received_at=ago(1))
+    llm.answers = [interview_answer(recruiter=None, interview={**interview_answer()["interview"],
+                                                               "meeting_link": None, "date": day.isoformat()}),
+                   {"event_type": "GENERAL_RECRUITING_UPDATE", "confidence": 0.6, "summary": "An update.",
+                    "requires_user_action": False, "important_facts": [], "needs_review": True}]
+    sync(user)
+    first = application(user, wrong)
+    assert first.stage == "interviewing" and [e for e in first.events if e.kind == "interview"]
+    monkeypatch.setattr(auth, "authenticate", lambda request: CurrentUser(user, "x@jobhunt.test", False))
+    ev = event(user, "m-relink")
+    assert client.post(f"/api/application-email-events/{ev.id}/correct",
+                       json={"application_id": right}).status_code == 200
+    first = application(user, wrong)
+    assert first.stage == "screening", "the move this email made is undone"
+    assert not [e for e in first.events if e.kind in ("interview", "email")], "its entries are withdrawn"
+    assert [e for e in first.events if e.kind == "stage"], "the moves stay as history"
+
+
+def test_a_correction_records_the_stage_it_moved_from(google, user, llm, monkeypatch):
+    from app import auth
+    from app.auth import CurrentUser
+
+    connect(user)
+    one = add_application(user, "Initech", "Backend Engineer", url="https://initech.com/jobs/1", stage="screening")
+    add_application(user, "Initech", "Frontend Engineer", url="https://initech.com/jobs/2")
+    google.add("m-from", sender="Talent <talent@initech.com>", subject="Your Initech application",
+               body="Thanks for your interest in Initech. Let's talk.", received_at=ago(1))
+    sync(user)
+    monkeypatch.setattr(auth, "authenticate", lambda request: CurrentUser(user, "x@jobhunt.test", False))
+    ev = event(user, "m-from")
+    out = client.post(f"/api/application-email-events/{ev.id}/correct",
+                      json={"application_id": one, "stage": "interviewing"}).json()["event"]
+    assert (out["stage_from"], out["stage_to"]) == ("screening", "interviewing")
+
+
+def test_stage_changes_are_dated_by_the_move_not_by_later_edits(google, user, llm):
+    from app.services.application_inbox import digest as digest_module
+
+    connect(user)
+    add_application(user, "Old Move Co", "Engineer", url="https://oldmove.com/jobs/1")
+    google.add("m-old", sender="Old Move Co <jobs@oldmove.com>", subject="Your application",
+               body="Thank you for applying. We have decided not to move forward with your application.",
+               received_at=ago(1))
+    sync(user)
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        assert digest_module.sections(db)["stage_changes"], "a fresh move is listed"
+        for moved in db.scalars(select(ApplicationEvent).where(ApplicationEvent.kind == "stage")).all():
+            moved.created_at = utcnow() - timedelta(days=3)
+        ev = db.scalar(select(ApplicationCommunicationEvent).where(
+            ApplicationCommunicationEvent.gmail_message_id == "m-old"))
+        ev.updated_at = utcnow()  # a later edit to the event
+        db.commit()
+        assert digest_module.sections(db)["stage_changes"] == []

@@ -16,7 +16,9 @@ const inboxDate = iso => iso ? toDate(iso).toLocaleDateString(undefined, { day: 
 const inboxConfidence = value => `${Math.round((Number(value) || 0) * 100)}%`;
 const inboxSender = sender => String(sender || '').replace(/\s*<[^>]*>\s*$/, '') || sender || '';
 
-function inboxEventRow(e, { showCompany = true, gmail = true } = {}) {
+function inboxEventRow(e, { showCompany = true, gmail = true, where = 'activity' } = {}) {
+  // The same email can be listed in several sections at once: the editor opens in the one copy that was clicked.
+  const key = `${where}:${e.id}`;
   const stage = e.stage_decision === 'SUGGESTED' && e.stage_to ? pill(`Suggests: ${inboxLabel(e.stage_to)}`, 'warn') : e.stage_decision === 'APPLIED' && e.stage_to ? pill(`Moved to ${inboxLabel(e.stage_to)}`, 'good') : '';
   const flags = [e.requires_action ? pill('Action required', 'warn') : '', e.needs_review ? pill('Needs review', 'warn') : '', e.user_corrected ? pill('Corrected by you', 'brand') : '', stage].join('');
   const actions = (e.action_items || []).map(a => `<li>${esc(a.action)}${a.deadline ? ` <span class="muted">· due ${esc(inboxDate(a.deadline))}</span>` : ''}</li>`).join('');
@@ -24,7 +26,7 @@ function inboxEventRow(e, { showCompany = true, gmail = true } = {}) {
   const buttons = [
     e.stage_decision === 'SUGGESTED' && e.review_status === 'OPEN' ? btn('Accept stage', 'inbox-review', { id: e.id, action: 'accept_stage' }, 'sm primary') : '',
     e.review_status === 'OPEN' && (e.needs_review || e.requires_action || e.stage_decision === 'SUGGESTED') ? btn('Mark reviewed', 'inbox-review', { id: e.id, action: 'mark_reviewed' }, 'sm') : '',
-    btn('Correct', 'inbox-correct-open', { id: e.id }, 'sm ghost'),
+    btn('Correct', 'inbox-correct-open', { key }, 'sm ghost'),
     e.review_status === 'OPEN' ? btn('Dismiss', 'inbox-review', { id: e.id, action: 'dismiss' }, 'sm ghost') : '',
     gmail && e.gmail_url ? `<a class="btn sm ghost" href="${attr(e.gmail_url)}" target="_blank" rel="noopener noreferrer">Open in Gmail ↗</a>` : '',
   ].join('');
@@ -39,23 +41,26 @@ function inboxEventRow(e, { showCompany = true, gmail = true } = {}) {
     ${e.stage_reason && e.stage_decision === 'SUGGESTED' ? `<div class="xs muted mt4">Not applied automatically: ${esc(e.stage_reason)}</div>` : ''}
     ${flags ? `<div class="row gap6 wrap mt8">${flags}</div>` : ''}
     <div class="row gap6 wrap mt8">${buttons}</div>
-    ${S.inboxEdit === e.id ? inboxCorrectionForm(e) : ''}</div>`;
+    ${S.inboxEdit === key ? inboxCorrectionForm(e, key) : ''}</div>`;
 }
 
-function inboxCorrectionForm(e) {
+function inboxCorrectionForm(e, key) {
   const apps = (D.tracker?.applications || []);
-  const types = (D.inbox?.event_types || []).length ? D.inbox.event_types : [...new Set([e.event_type])].map(id => ({ id, label: inboxLabel(id) }));
+  // Every type an email can be corrected to: from the insights, else the tracker payload (always loaded with it).
+  const types = [D.inbox?.event_types, D.tracker?.email_event_types].find(list => list?.length)
+    || [{ id: e.event_type, label: inboxLabel(e.event_type) }];
+  const uid = key.replace(/[^a-z0-9]/gi, '-');
   const stages = D.tracker?.stages || [];
   return `<div class="box mt10" style="padding:12px"><div class="caps mb8">CORRECT THIS EMAIL</div><div class="col gap8">
-    <label class="xs muted" for="inbox-fix-app">Application</label>
-    <select class="select" id="inbox-fix-app"><option value="" ${e.application_id ? '' : 'selected'}>${e.application_id ? 'Not about any of my applications' : 'Choose an application…'}</option>
+    <label class="xs muted" for="inbox-fix-app-${uid}">Application</label>
+    <select class="select" id="inbox-fix-app-${uid}" data-fix="app"><option value="" ${e.application_id ? '' : 'selected'}>${e.application_id ? 'Not about any of my applications' : 'Choose an application…'}</option>
       ${apps.map(a => `<option value="${a.id}" ${a.id === e.application_id ? 'selected' : ''}>${esc(a.company)} · ${esc(a.title)}</option>`).join('')}</select>
-    <label class="xs muted" for="inbox-fix-type">What the email is</label>
-    <select class="select" id="inbox-fix-type">${types.map(t => `<option value="${attr(t.id)}" ${t.id === e.event_type ? 'selected' : ''}>${esc(t.label)}</option>`).join('')}</select>
-    <label class="xs muted" for="inbox-fix-stage">Stage</label>
-    <select class="select" id="inbox-fix-stage"><option value="">Leave the stage as it is</option>${stages.map(s => `<option value="${attr(s.id)}">${esc(s.label)}</option>`).join('')}</select>
-    <label class="xs muted" for="inbox-fix-deadline">Deadline</label>
-    <input class="input" style="margin:0" type="date" id="inbox-fix-deadline" value="${attr(e.deadline ? e.deadline.slice(0, 10) : '')}"></div>
+    <label class="xs muted" for="inbox-fix-type-${uid}">What the email is</label>
+    <select class="select" id="inbox-fix-type-${uid}" data-fix="type">${types.map(t => `<option value="${attr(t.id)}" ${t.id === e.event_type ? 'selected' : ''}>${esc(t.label)}</option>`).join('')}</select>
+    <label class="xs muted" for="inbox-fix-stage-${uid}">Stage</label>
+    <select class="select" id="inbox-fix-stage-${uid}" data-fix="stage"><option value="">Leave the stage as it is</option>${stages.map(s => `<option value="${attr(s.id)}">${esc(s.label)}</option>`).join('')}</select>
+    <label class="xs muted" for="inbox-fix-deadline-${uid}">Deadline</label>
+    <input class="input" style="margin:0" type="date" id="inbox-fix-deadline-${uid}" data-fix="deadline" value="${attr(e.deadline ? e.deadline.slice(0, 10) : '')}"></div>
     <div class="row gap8 mt10">${btn('Cancel', 'inbox-correct-cancel', {}, 'sm')}${btn(label('inbox-fix', 'Save correction', 'Saving…'), 'inbox-correct-save', { id: e.id }, 'sm primary', isBusy('inbox-fix'))}</div></div>`;
 }
 
@@ -93,8 +98,10 @@ async function inboxPoll() {
   const outcome = conn.progress?.status;
   if (finished && outcome) {
     const run = status.last_run || {};
-    toast(outcome === 'succeeded' ? `Gmail synced · ${run.messages_new || 0} new, ${run.messages_matched || 0} matched`
-      : `Gmail sync ${outcome.replace(/_/g, ' ')}${conn.last_error ? `: ${conn.last_error}` : ''}`, outcome !== 'succeeded');
+    const counts = `${run.messages_new || 0} new, ${run.messages_matched || 0} matched`;
+    toast(outcome === 'succeeded' ? `Gmail synced · ${counts}`
+      : outcome === 'partial' ? `Gmail synced · ${counts} · more mail waiting, the next sync carries on`
+      : `Gmail sync ${outcome.replace(/_/g, ' ')}${conn.last_error ? `: ${conn.last_error}` : ''}`, !['succeeded', 'partial'].includes(outcome));
   }
   D.inbox = undefined;
   if (S.screen === 'tracker') await load().catch(() => {});
@@ -137,7 +144,7 @@ function renderInboxInsights() {
     if (id === 'waiting') rows = items.map(w => `<div class="inbox-event"><div class="small b">${esc(w.company)} · ${esc(w.role)}</div><div class="xs muted mt4">${esc(w.text)}</div></div>`).join('');
     else if (id === 'upcoming') rows = items.map(u => `<div class="inbox-event"><div class="small b">${esc(u.company || '')}${u.role ? ' · ' + esc(u.role) : ''}</div><div class="small mt4">${esc(u.what)}</div></div>`).join('');
     else if (id === 'stage_changes') rows = items.map(c => `<div class="inbox-event"><div class="small b">${esc(c.company || '')}</div><div class="small mt4">${esc(c.change)}</div><div class="xs muted mt4">${esc(c.summary || '')}</div></div>`).join('');
-    else rows = items.map(e => inboxEventRow(e)).join('');
+    else rows = items.map(e => inboxEventRow(e, { where: id })).join('');
     return `<section class="card pad18" data-inbox-section="${id}"><div class="row between"><div class="base b">${title} <span class="mono xs muted">${items.length}</span></div></div>${hint ? `<div class="xs muted mt4">${hint}</div>` : ''}
       <div class="col mt10">${rows || `<div class="small muted">${id === 'new_updates' ? 'No new application-related email detected.' : 'Nothing here.'}</div>`}</div></section>`;
   }).join('');
@@ -189,13 +196,13 @@ const INBOX_ACTIONS = {
     await api(`/api/application-email-events/${el.dataset.id}/review`, { method: 'POST', body: { action: el.dataset.action } });
     D.inbox = undefined; await load();
   }, el.dataset.action === 'accept_stage' ? 'Stage updated' : el.dataset.action === 'dismiss' ? 'Dismissed' : 'Marked reviewed'),
-  'inbox-correct-open': el => { const id = Number(el.dataset.id); S.inboxEdit = S.inboxEdit === id ? null : id; render(); },
+  'inbox-correct-open': el => { S.inboxEdit = S.inboxEdit === el.dataset.key ? null : el.dataset.key; render(); },
   'inbox-correct-cancel': () => { S.inboxEdit = null; render(); },
   'inbox-correct-save': el => {
     const all = [...(D.inbox?.sections ? Object.values(D.inbox.sections).flat() : []), ...(D.tracker?.applications || []).flatMap(a => a.email_activity || [])];
     const current = all.find(e => e.id === Number(el.dataset.id)) || {};
-    const appValue = document.getElementById('inbox-fix-app').value, type = document.getElementById('inbox-fix-type').value;
-    const stage = document.getElementById('inbox-fix-stage').value, deadline = document.getElementById('inbox-fix-deadline').value;
+    const form = el.closest('[data-inbox-event]'), field = name => form.querySelector(`[data-fix="${name}"]`).value;
+    const appValue = field('app'), type = field('type'), stage = field('stage'), deadline = field('deadline');
     const body = {};
     const appId = appValue ? Number(appValue) : null;
     if (appId !== (current.application_id ?? null) && (appId !== null || current.application_id)) body.application_id = appId;

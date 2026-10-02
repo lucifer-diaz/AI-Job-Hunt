@@ -9,7 +9,7 @@ confirm, app.services.application_inbox.sync); below the review threshold it is 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from typing import Any
 
@@ -177,6 +177,18 @@ def _other_company_named(best: TrackedApplication, email: EmailMeta, apps: list[
                                        for d in other.company_domains):
             return other.company
     return None
+
+
+def headers_point_at_application(email: EmailMeta, apps: list[TrackedApplication]) -> bool:
+    """Whether an email may be opened: decided from its headers alone (sender, subject, thread), never from the
+    body-derived snippet. A recruiting system (ATS, job board, assessment platform) as sender counts: its subject
+    and sender name rarely carry the company, the body does."""
+    if is_job_alert(email):
+        return False
+    if is_ats(email.sender_domain):
+        return True
+    headers_only = replace(email, snippet="")
+    return any(score(app, headers_only, "", apps)[1] for app in apps)
 
 
 def match(email: EmailMeta, body: str, apps: list[TrackedApplication]) -> MatchResult:

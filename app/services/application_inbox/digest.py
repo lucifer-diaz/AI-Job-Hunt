@@ -16,6 +16,7 @@ from app.models import (
     Application,
     ApplicationCommunicationEvent,
     ApplicationEmailMessage,
+    ApplicationEvent,
     ApplicationInboxDigest,
 )
 from app.services.application_inbox import classify
@@ -97,7 +98,11 @@ def sections(db: Session, now: datetime | None = None) -> dict[str, Any]:
             upcoming.append({**card, "when": event.deadline.isoformat(),
                              "what": f"{card['label']} due {relative(event.deadline, now)}"})
     upcoming.sort(key=lambda c: c["when"])
-    stage_changes = [c for c in cards if c["stage_decision"] == "APPLIED" and by_id[c["id"]].updated_at >= day_ago]
+    # When the stage moved, from the timeline entry the move wrote — not from the event's own updated_at, which a
+    # later correction or review also changes.
+    moved = {(e.meta or {}).get("email_event_id") for e in db.scalars(
+        select(ApplicationEvent).where(ApplicationEvent.kind == "stage", ApplicationEvent.created_at >= day_ago)).all()}
+    stage_changes = [c for c in cards if c["stage_decision"] == "APPLIED" and c["id"] in moved]
     return {
         "needs_attention": [c for c in cards if open_item(c)][:MAX_ITEMS],
         "upcoming": upcoming[:MAX_ITEMS],

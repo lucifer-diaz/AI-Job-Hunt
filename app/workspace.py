@@ -1657,7 +1657,9 @@ def stages(db: Session) -> list[dict]:
 def app_payload(db: Session, app: Application) -> dict:
     job = app.job
     now = utcnow()
-    draft = db.scalar(select(FollowUp).where(FollowUp.application_id == app.id).order_by(desc(FollowUp.id)).limit(1))
+    # A draft the Application Inbox cancelled (the employer replied) is no longer offered.
+    draft = db.scalar(select(FollowUp).where(FollowUp.application_id == app.id, FollowUp.status != "cancelled")
+                      .order_by(desc(FollowUp.id)).limit(1))
     resume = db.get(ResumeVariant, app.approved_resume_id) if app.approved_resume_id else None
     stage = app.stage or "applied"
     tag, tone = "", "muted"
@@ -1709,6 +1711,8 @@ def tracker(db: Session = Depends(get_user_db)):
     extras = prefs(db).get("extra_stages") or []
     return {"stages": stages(db), "available_stages": [s for s in EXTRA_STAGES if s["id"] not in extras],
             "extra_stages": extras, "applications": payload,
+            # What an email can be corrected to, wherever its Email activity is shown.
+            "email_event_types": inbox_service.event_types(),
             "stats": {"live": len(live), "replies": len(replies), "due": len(due),
                       "response_rate": _pct(len(replies), len(payload)) if payload else "—"}}
 

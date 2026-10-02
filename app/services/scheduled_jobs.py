@@ -405,7 +405,7 @@ async def inbox(ctx: JobContext) -> dict[str, Any]:
         statuses[result.get("status", "unknown")] += 1
         totals.update({k: v for k, v in result.items() if isinstance(v, int) and k not in ("user_id", "limit",
                                                                                           "duration_ms")})
-        if result.get("status") not in ("succeeded", "skipped"):
+        if result.get("status") not in ("succeeded", "partial", "skipped"):
             errors.append({"user_id": user_id, "status": result.get("status"), "error": result.get("error")})
     return {"accounts": len(users), "statuses": dict(statuses), **dict(totals), "errors": errors}
 
