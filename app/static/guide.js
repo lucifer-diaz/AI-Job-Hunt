@@ -31,7 +31,7 @@ async function guideBoot() {
   const fresh = GUIDE.data.quests.filter(q => q.done && !GUIDE.data.celebrated.includes(q.id)).map(q => q.id);
   if (fresh.length) guideSave({ celebrated: fresh });  // done before the guide existed: no confetti for those
   if (!GUIDE.data.welcomed && !GUIDE.data.complete) Object.assign(GUIDE, { open: true, entering: true, view: 'welcome' });
-  guideSchedule(); guideRender(); render();
+  guideSchedule(); guideRender(); guideNavRefresh();
 }
 // Later loads: anything newly done is celebrated once (per account, on any device).
 async function guideRefresh(force = false) {
@@ -49,7 +49,7 @@ async function guideRefresh(force = false) {
       if (GUIDE.active && fresh.some(q => q.id === GUIDE.active)) GUIDE.active = null;
       guideNextCelebration();
     }
-    guideSchedule(); guideRender(); render();
+    guideSchedule(); guideRender(); guideNavRefresh();
   } catch { /* the guide is optional: never let it break the workspace */ }
   finally { GUIDE.loading = false; }
 }
@@ -182,6 +182,15 @@ function guideRender() {
   if (GUIDE.open) GUIDE.shownXp = g.xp;
 }
 function guideFocus() { requestAnimationFrame(() => document.getElementById('gq-title')?.focus({ preventScroll: true })); }
+// Only the sidebar badge changes when the guide's progress does. Never re-render the workspace from here: that
+// replaces the screen under the person (a file input whose picker is open, a half-typed field), and the guide
+// refreshes on a timer and on window focus.
+function guideNavRefresh() {
+  const item = document.querySelector('#nav .gq-nav'); if (!item) return;
+  const focused = document.activeElement === item;
+  item.outerHTML = guideNavItem();
+  if (focused) document.querySelector('#nav .gq-nav')?.focus({ preventScroll: true });
+}
 // The sidebar entry, rendered by renderNav() in app.js.
 function guideNavItem() {
   const g = GUIDE.data;
@@ -226,7 +235,7 @@ const GUIDE_ACTIONS = {
   },
   'guide-check': () => busy('guide-check', () => guideRefresh(true)),
   'guide-copy': el => { const q = guideQuest(el.dataset.id); if (q?.snippet) copyText(q.snippet); },
-  'guide-hide': () => { GUIDE.data.dismissed = true; guideSave({ dismissed: true }); guideRender(); render(); toast('Setup quest hidden — reopen it from the sidebar any time.'); },
+  'guide-hide': () => { GUIDE.data.dismissed = true; guideSave({ dismissed: true }); guideRender(); guideNavRefresh(); toast('Setup quest hidden — reopen it from the sidebar any time.'); },
   'guide-go': el => {
     const q = guideQuest(el.dataset.id); if (!q) return;
     GUIDE.active = q.done ? null : q.id; GUIDE.open = false;

@@ -55,6 +55,7 @@ beforeEach(() => {
   Object.assign(ui.GUIDE, { data: null, open: false, view: 'map', sel: null, active: null, booted: false, shownXp: 0, timer: null, loading: false, lastFetch: 0, queue: [] });
   Object.assign(ui.S, { screen: 'overview', busy: {}, forms: {} });
   ui.D.summary = { counts: {}, profile: {} };
+  ui.render();  // the workspace (and its sidebar) is on screen before the guide boots, as in app.js
 });
 
 describe('setup quest', () => {
@@ -199,5 +200,17 @@ describe('setup quest', () => {
     expect(document.documentElement.classList.contains('gq-lock')).toBe(true);
     ui.A['guide-close']();
     expect(document.documentElement.classList.contains('gq-lock')).toBe(false);
+  });
+
+  it('refreshing never re-renders the workspace under the person (an open file picker keeps its input)', async () => {
+    await ui.guideBoot();
+    ui.render();
+    const input = document.createElement('input'); input.type = 'file'; input.id = 'resume-file';
+    document.getElementById('view').appendChild(input);
+    guide = progress({ done: ['profile'], celebrated: [] });
+    await ui.guideRefresh(true);
+    window.dispatchEvent(new window.Event('focus')); await flush();
+    expect(input.isConnected).toBe(true);
+    expect(document.querySelector('#nav .gq-nav').textContent).toContain('1/6');
   });
 });
