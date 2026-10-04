@@ -202,6 +202,42 @@ Inbox Agent). The rules a change has to keep:
   status (`failed`, `connection_required`, `rate_limited`); a model failure leaves the message PENDING for retry and
   never loses it.
 
+## AI Orchestration
+
+`app/services/orchestration.py` (runtime) and `app/services/orchestration_topology.py` (the stage registry) back the
+AI Orchestration workspace (README §9a). It is a read-only projection; the rules a change has to keep:
+
+* **Orchestration owns no state.** It reads business tables, Monitoring telemetry and the active AI configuration. Do
+  not add a packet, workflow-event or orchestration table while those sources can answer the question; if one truly
+  cannot, add the fact at the shared layer that owns it (a transition in `work_queue.transition`, a task column), not
+  a parallel log.
+* **Every endpoint is a GET, and nothing it does changes configuration.** "Edit model assignment" navigates to
+  Settings → AI Models; model changes keep going through draft → preview → apply → version.
+* **Deterministic and never inferred.** Node health follows `HealthPolicy` (thresholds in one place, shown in the UI).
+  The actual model comes only from `llm_request_logs.model`; unknown stays unknown. Edge timing is shown only when
+  both timestamps live on the same row. No model is ever called to render or describe anything.
+* **Metadata only.** No prompt or response text, resume, cover letter, email subject/sender/body, application answer
+  or credential in any orchestration payload; error text goes through `redaction.redact_text`. The every-account view
+  (admin) returns aggregates only — titles, packets and traces stay the viewer's own.
+* **Bounded.** Every query has a limit; the graph is cached briefly; the live poll reads active task rows only;
+  history and node detail load lazily.
+
+**Any new AI workflow stage must:**
+
+1. declare a stable worker identifier (`app/services/ai_workers.py`) and stage identifier (a `Node.id` in
+   `orchestration_topology.NODES`; never rename one),
+2. call models only through the centralized LLM gateway (`LLMClient.generate_prompt`), so its requests are recorded
+   with their worker, stage and models,
+3. move or record workflow state through the shared layer (`work_queue.transition`, its task table, the tracker) so
+   orchestration can place a job there,
+4. be registered with the topology: its `types` (honestly — a deterministic step is not `AI`), `workers`,
+   `llm_stages`, `external` matches, `states`, and the edges it takes part in, each with the stored fact it counts
+   (`measure`); `orchestration_topology.validate()` must stay empty,
+5. never expose secrets or prompt bodies through orchestration APIs.
+
+The frontend (`app/static/orchestration.js`) renders whatever the registry returns; do not hard-code stage names in
+other static files.
+
 ## Traces
 
 `app/services/tracing.py` holds an ambient correlation ID. Scheduler jobs and HTTP requests open one; nested

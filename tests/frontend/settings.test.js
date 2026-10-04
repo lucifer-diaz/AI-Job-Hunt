@@ -33,6 +33,7 @@ beforeEach(() => {
   if (!ui) {
     context = createContext({ document, window, location, history, navigator, URLSearchParams, FormData, File, setTimeout, clearTimeout, setInterval, clearInterval, console });
     runInContext(readFileSync('app/static/monitoring.js', 'utf8'), context, { filename: 'monitoring.js' });
+    runInContext(readFileSync('app/static/orchestration.js', 'utf8'), context, { filename: 'orchestration.js' });
     runInContext(settingsSource, context, { filename: resolve('app/static/settings.js') });
     runInContext(resumeDataSource, context, { filename: resolve('app/static/resume_data.js') });
     runInContext(jobDataSource, context, { filename: resolve('app/static/job_data.js') });

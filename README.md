@@ -22,6 +22,7 @@ The dashboard is a single-page workspace served from `app/static/app.js`; every 
 | Approvals | Pre-submit checklist, resume preview, reusable answers, notes; approve opens the apply kit, send a packet back for another tailoring pass, or reject the job outright with an optional reason | `GET /api/approvals/{job_id}`, `POST /api/jobs/{id}/revision`, `POST /api/jobs/{id}/reject` |
 | Apply kit | Files to upload, answers to paste, link to the posting, confirm "mark applied" | `GET /api/jobs/{id}/apply-kit` |
 | Tracker | Kanban by post-submission stage (drag or "move to"), optional extra stages, timeline, recruiter, interview scheduling, AI follow-up draft | `GET /api/tracker`, `POST /api/applications/{id}/stage`, `POST /api/applications/{id}/events` |
+| AI Orchestration | The pipeline as an interactive graph: every stage, what kind of work it is (AI, deterministic, external, human gate, browser, async), the model each AI worker is assigned and the one that actually answered, live packets, one job's path and trace, model history per worker. Observational only — model changes open Settings → AI Models | `GET /api/orchestration/graph`, `GET /api/orchestration/live`, `GET /api/orchestration/jobs/{id}`, `GET /api/orchestration/jobs/{id}/trace`, `GET /api/orchestration/nodes/{id}`, `GET /api/orchestration/nodes/{id}/history`, `GET /api/orchestration/edges/{from}/{to}` |
 | Monitoring | Seven sections — Overview, LLM usage, External APIs, Apify, JD recovery, Logs and AI optimization. Every LLM request and every third-party call: volume, success rate, latency (avg/p50/p95/p99), failures by type, retries, rate limits, tokens, context utilisation and cost, with filters, detail views, trace lookup and the AI Optimization Advisor | `GET /api/monitoring/dashboard`, `GET /api/monitoring/external/dashboard`, `GET /api/monitoring/apify/summary`, `GET /api/monitoring/jd-recovery`, `GET /api/monitoring/logs`, `POST /api/monitoring/analyze` |
 | Knowledge bank | Searchable Answer library and Evidence bank, focused editors, verification filters, copy and removal | `/api/knowledge`, `/api/evidence` |
 | Settings & profile | Candidate details and chip fields, resume variants, re-parse resume into (unverified) evidence, provider/model, your own API keys (stored encrypted), approval mode, cadence | `/api/profile`, `/api/settings`, `PUT /api/settings/keys`, `/api/preferences` |
@@ -1459,6 +1460,105 @@ into ranking.
 
 Rejecting is not deleting: the tailored resume is kept. A job whose application has already been submitted
 cannot be rejected — the tracker owns that outcome, and nothing may rewrite the fact that you applied.
+
+## 9a. AI Orchestration
+
+**AI Orchestration** (sidebar → SYSTEM) is a workspace of its own, next to Monitoring and separate from it:
+
+| | Answers | Shows |
+| --- | --- | --- |
+| AI Orchestration | What is running? Where is this job? Which model handles this stage, and which handled it before? How did the job get here, and what happens next? | The pipeline topology, node health, live packets, one job's path and trace, model assignment history |
+| Monitoring | How did each call go, in detail? | Every LLM and third-party request, costs, latency distributions, logs, the AI Optimization Advisor |
+
+Orchestration is a **projection** of state other parts of the system already own; it adds no table and no source of
+truth, never calls a model to draw itself, and never changes anything (every endpoint is a `GET`).
+
+| Data it reads | For |
+| --- | --- |
+| `jobs`, `workflow_transitions`, the task tables (`job_description_fetch_tasks`, `job_description_parse_tasks`, `job_ranking_tasks`, `tailor_tasks`), `resume_variants`, `applications`, `application_events`, `followups`, `application_communication_events` (classification only) | Where a job is, how it moved, queues, edge throughput |
+| `llm_request_logs`, `external_api_request_logs`, `system_logs` | Node metrics, routing, the model that actually answered, traces |
+| `ai_config_versions` + the active configuration (`model_resolution`, or the Settings stage models in direct mode) | The model each worker is assigned, and how that changed over time |
+| `ai_optimization_reports` | Recommendation badges (advice only) |
+
+### The graph
+
+Stages come from one backend registry, `app/services/orchestration_topology.py`; the frontend draws whatever it
+returns. Each node says what kind of work it is — ● AI worker, ◆ deterministic, ■ external service,
+◇ human/policy gate, ▣ browser automation, ↻ async worker, ○ outcome — so a deterministic step (the domain filter,
+resume match, compensation) never looks like a model. Intake runs left to right (Discovery → Domain filter → Resume
+match → JD recovery → JD parser → Ranker → Archived), the packet right to left (Tailor → Reviewer → Approval →
+Application → Application inbox → Follow-up), outcomes below (Interview, Offer / rejected), and supporting workers
+above (Compensation, Resume parser, AI Optimization Advisor). Company and interview insights are reserved prompts:
+listed in the legend, never drawn as if they ran.
+
+Three modes: **System** (architecture, health, assignments), **Live job** (one job's path highlighted: completed,
+current, waiting, failed, retrying, skipped, blocked — always as a symbol and a word, never colour alone) and
+**History** (edge widths and labels show how many items took each transition in the range, with a median time only
+where both timestamps are stored on the same row). Pan by dragging, zoom with the wheel or `+`/`−`, `0` fits; nodes
+and edges are keyboard-focusable; clicking either opens a drawer.
+
+**Node status** is deterministic (`HealthPolicy` in `app/services/orchestration.py`, shown in the legend):
+DISABLED (every AI worker of an AI-first stage is off) → ERROR (the last 3 calls or finished tasks within 24 h all
+failed) → DEGRADED (≥10% failures or schema failures over at least 5 samples in 24 h, no model resolvable, or the
+model failed its health check) → BUSY (running or queued now) → HEALTHY (activity in range) → NO_DATA. One historic
+failure never makes a node ERROR.
+
+### Configured, requested and actual model
+
+A node shows the **assignment** from the active configuration: in gateway mode the worker's mode (FIXED / TIER /
+AUTO_ROUTER), what it is configured to (a model, a tier, the router) and what requests go to; in direct-provider mode
+the Settings stage model. What **actually answered** comes only from telemetry (`llm_request_logs.model`, with the
+requested model, LiteLLM's model group, router tier, fallback and escalation beside it). A request that recorded no
+model is counted as unknown — it is never filled in from the configuration. Router tiers are shown only when the
+requests recorded them ("No historical routing metadata" otherwise). A live packet's model is labelled *recorded*
+(telemetry since the stage started) or *assigned, not yet recorded*.
+
+### Model history
+
+The History tab of an AI node walks the account's applied `ai_config_versions` and starts a new period whenever that
+worker's mode, assignment, resolved model, fallback or enabled flag changed (a change to another worker does not).
+For each period it shows the requests made while it was active, success rate, p95 latency and tokens, and a second
+table groups by the model that actually answered. Sample sizes are always shown and fewer than 20 requests are marked;
+the page says these are observations, not proof that one model is better. Raw telemetry is kept
+`LLM_TELEMETRY_RETENTION_DAYS` (90), so older periods show no requests.
+
+### Live packets and polling
+
+A packet is a visualization of a job, not a stored entity: the live list is built from active task rows (recovery,
+parsing, ranking and tailoring tasks; a tailoring task's stage says whether the Tailor or the Reviewer holds it).
+The screen loads the graph once, then polls `GET /api/orchestration/live` (and the selected job) every 4 s while
+something runs, every 30 s when idle, and not at all in a hidden tab, on another screen, or for a finished job. The
+graph's historical aggregates are refreshed at most once a minute and cached server-side for 15 s; node drawers and
+model history load only when opened.
+
+### Traces
+
+`GET /api/orchestration/jobs/{id}/trace` merges, in timestamp order, the job's workflow transitions, task lifecycle
+(queued / started / finished), packet milestones (tailored, reviewed, approved, submitted, tracker moves, follow-ups),
+inbox classifications, LLM calls (requested vs actual model, mode, tier, latency, tokens, schema, fallback), external
+calls with the job's id, and the log lines that share their trace IDs. Each trace ID links to Monitoring → Logs.
+Monitoring links back: an LLM request or a log line about a job has **View job orchestration**.
+
+### Privacy and accounts
+
+Payloads are metadata only: no prompt or response text (even when capture is on), no resume, cover letter, email
+subject, sender or body, no application answers, no credentials. Error text passes through `redaction.py` and is
+capped. You see your own jobs and telemetry. The admin may tick **All accounts**: node and edge numbers then cover
+every account, but packets, job titles and traces remain the admin's own. The browser never talks to LiteLLM.
+
+### Endpoints
+
+| Endpoint | Returns |
+| --- | --- |
+| `GET /api/orchestration/topology` | Node kinds, nodes, edges (static) |
+| `GET /api/orchestration/graph?range=7d` | Topology, gateway mode, per-node status, assignment, metrics, live counts, edge throughput, the health rules |
+| `GET /api/orchestration/live` · `/summary` | Queue counts per node and active packets (`/summary`: counts only) |
+| `GET /api/orchestration/jobs?q=` | Job selector: your jobs by id, title or company |
+| `GET /api/orchestration/jobs/{id}` · `/live` · `/trace` | One job's packet and path · the packet only (polling) · its trace |
+| `GET /api/orchestration/nodes/{id}` · `/history` | Node drawer: assignment, performance, routing, recent activity, recommendations · model history |
+| `GET /api/orchestration/edges/{from}/{to}` | One transition: count, split with its siblings, timing where stored, recent jobs |
+
+All take `range` (`today`, `7d`, `30d`, `90d`) where it applies and `all_accounts=true` for the admin.
 
 ## Application Inbox Agent
 

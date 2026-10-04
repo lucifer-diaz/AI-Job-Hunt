@@ -23,7 +23,7 @@ const S = {
   polling: null, busy: {}, forms: {}, apifyImport: false, importPick: new Set(), autoRefreshed: false,
 };
 const D = {};
-const SCREENS = ['overview', 'today', 'discovery', 'tailor', 'approvals', 'tracker', 'monitoring', 'knowledge', 'settings'];
+const SCREENS = ['overview', 'today', 'discovery', 'tailor', 'approvals', 'tracker', 'orchestration', 'monitoring', 'knowledge', 'settings'];
 
 /* ───────────── helpers ───────────── */
 async function api(url, { method = 'GET', body, form } = {}) {
@@ -226,6 +226,7 @@ const LOADERS = {
   },
   knowledge: loadKnowledge,
   async monitoring() { await loadMonitoring(); },
+  async orchestration() { await loadOrchestration(); },
   async settings() {
     D.settingsLoadError = '';
     try {
@@ -329,12 +330,16 @@ async function load() {
 }
 
 /* ───────────── shell ───────────── */
-const NAV = [['overview', 'Overview', null], ['today', 'Today', 'today'], ['discovery', 'Discovery', 'discovery'], ['tailor', 'Tailor', 'tailor'], ['approvals', 'Approvals', 'approvals'], ['tracker', 'Tracker', 'tracker'], ['monitoring', 'Monitoring', null]];
+const NAV = [['overview', 'Overview', null], ['today', 'Today', 'today'], ['discovery', 'Discovery', 'discovery'], ['tailor', 'Tailor', 'tailor'], ['approvals', 'Approvals', 'approvals'], ['tracker', 'Tracker', 'tracker']];
+// How the system runs, separate from the work itself: AI Orchestration (topology and live packets) and Monitoring
+// (detailed telemetry) are two workspaces of their own.
+const NAV_SYSTEM = [['orchestration', 'AI Orchestration', null], ['monitoring', 'Monitoring', null]];
 const NAV2 = [['knowledge', 'Knowledge bank'], ['settings', 'Settings & profile']];
 function renderNav() {
   const c = D.summary?.counts || {};
   const item = ([id, text, key]) => `<a class="nav-btn ${S.screen === id ? 'on' : ''}" href="#${id}" data-act="go" data-screen="${id}"><span>${text}</span>${key ? `<span class="nav-count">${c[key] ?? '·'}</span>` : `<span class="nav-count">—</span>`}</a>`;
   return `<div class="nav-group"><div class="nav-caps">WORKSPACE</div>${NAV.map(item).join('')}</div>
+    <div class="nav-group"><div class="nav-caps">SYSTEM</div>${NAV_SYSTEM.map(item).join('')}</div>
     <div class="nav-group"><div class="nav-caps">SETUP</div>${guideNavItem()}${NAV2.map(([id, text]) => `<a class="nav-btn ${S.screen === id ? 'on' : ''}" href="#${id}" data-act="go" data-screen="${id}"><span>${text}</span></a>`).join('')}</div>`;
 }
 function renderSideFoot() {
@@ -357,6 +362,7 @@ function screenMeta() {
     tailor: ['Tailor & review', 'AI drafts, you approve every claim'],
     approvals: ['Approvals', 'Nothing leaves this queue without your sign-off'],
     tracker: ['Tracker', D.tracker ? `${D.tracker.stats.live} live applications · ${D.tracker.stats.due} follow-ups due` : 'Every submitted application'],
+    orchestration: ['AI Orchestration', 'Live system topology, models and packet execution · what is running, where each job is and which model handles it'],
     monitoring: ['Monitoring', 'Every LLM request: tokens, context, latency, cost and failures · recommendations never change anything automatically'],
     knowledge: ['Knowledge bank', 'Answer once, reuse in every ATS form'],
     settings: ['Settings', 'A workspace that works your way'],
@@ -1479,7 +1485,7 @@ function renderPalette() {
 }
 
 /* ───────────── render ───────────── */
-const RENDER = { overview: renderOverview, today: renderToday, discovery: renderDiscovery, tailor: renderTailor, approvals: renderApprovals, tracker: renderTracker, monitoring: renderMonitoring, knowledge: renderKnowledge, settings: renderSettings };
+const RENDER = { overview: renderOverview, today: renderToday, discovery: renderDiscovery, tailor: renderTailor, approvals: renderApprovals, tracker: renderTracker, orchestration: renderOrchestration, monitoring: renderMonitoring, knowledge: renderKnowledge, settings: renderSettings };
 // Re-rendering replaces the markup, so a scrolled box would snap back to the top on every refresh (the ranking
 // tracker polls every few seconds). A box with data-scroll-key keeps its position across renders.
 function keptScroll() {
@@ -2241,6 +2247,7 @@ const A = {
   ...RESUME_DATA_ACTIONS,
   ...JOB_DATA_ACTIONS,
   ...MONITORING_ACTIONS,
+  ...ORCHESTRATION_ACTIONS,
   ...INBOX_ACTIONS,
   ...GUIDE_ACTIONS,
 };

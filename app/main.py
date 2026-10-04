@@ -54,6 +54,7 @@ from app.models import (
     SearchRun,
 )
 from app.monitoring_api import router as monitoring_router
+from app.orchestration_api import router as orchestration_router
 from app.resume_api import router as resume_router
 from app.scheduler import build_scheduler
 from app.scheduler_hooks import run_soon
@@ -167,6 +168,7 @@ app.include_router(auth_router)
 app.include_router(workspace_router)
 app.include_router(hunter_router)
 app.include_router(monitoring_router)
+app.include_router(orchestration_router)
 app.include_router(resume_router)
 app.include_router(job_description_router)
 app.include_router(discovery_router)

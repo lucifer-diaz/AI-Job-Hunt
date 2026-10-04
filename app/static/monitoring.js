@@ -653,7 +653,7 @@ function renderMonRequestModal() {
         ${x.trace_log_count ? btn('View logs', 'mon-logs-trace', { id: x.trace_id }, 'sm') : ''}</div>` : ''}
       ${monPayloads(x)}
     </div>
-    <div class="card-foot row gap8" style="justify-content:flex-end">${x.entity?.job_id ? btn('Open job', 'mon-open-job', { id: x.entity.job_id }) : ''}${btn('Close', 'mon-close')}</div></div></div>`;
+    <div class="card-foot row gap8" style="justify-content:flex-end">${x.entity?.job_id ? btn('View job orchestration', 'orch-view-job', { id: x.entity.job_id }) : ''}${x.entity?.job_id ? btn('Open job', 'mon-open-job', { id: x.entity.job_id }) : ''}${btn('Close', 'mon-close')}</div></div></div>`;
 }
 
 /* Detail views. Both show metadata only: no headers, credentials, cookies or bodies are ever stored. */
@@ -715,7 +715,7 @@ function renderMonLogModal() {
       ${x.related?.length ? `<div><div class="caps-sm mb8">Same trace</div>${x.related.map(r => `<div class="row between gap10 small" style="padding:3px 0"><span class="ellipsis">${esc(r.message)}</span><span class="xs faint none">${esc(fmtDateTime(r.created_at))}</span></div>`).join('')}</div>` : ''}
       <div class="xs faint">Messages and details are redacted before they are stored: no credentials or headers. Prompts and responses are kept only while capture is on.</div>
     </div>
-    <div class="card-foot row gap8" style="justify-content:flex-end">${btn('Close', 'mon-close')}</div></div></div>`;
+    <div class="card-foot row gap8" style="justify-content:flex-end">${x.entity_type === 'job' && x.entity_id ? btn('View job orchestration', 'orch-view-job', { id: x.entity_id }) : ''}${btn('Close', 'mon-close')}</div></div></div>`;
 }
 
 const MONITORING_ACTIONS = {
