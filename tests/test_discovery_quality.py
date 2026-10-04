@@ -550,10 +550,46 @@ def test_runs_without_a_recorded_scope_import_as_before(user):
     assert _by_title(user, run_id)["Data Analyst"].domain_match == "MATCH"
 
 
-def test_the_import_stops_at_the_setups_limit(user):
+def test_the_import_stops_at_the_setups_limit_even_when_pulled_again(user):
     run_id = _scoped_run(user, max_jobs=2)
-    stats = _import(user, run_id, [_item(f"Backend Engineer {n}", "Bengaluru, India") for n in range(5)])
+    items = [_item(f"Backend Engineer {n}", "Bengaluru, India") for n in range(5)]
+    stats = _import(user, run_id, items)
     assert stats["created"] == 2 and stats["over_limit"] == 3 and len(_by_title(user, run_id)) == 2
+    again = _import(user, run_id, items)
+    assert again["created"] == 0 and len(_by_title(user, run_id)) == 2
+
+
+def test_reapplying_the_domain_lists_keeps_scope_hidden_jobs_hidden(user, client):
+    run_id = _scoped_run(user)
+    _import(user, run_id, [_item("Data Analyst", "Bengaluru, India")])
+    hidden = _by_title(user, run_id)["Data Analyst"]
+    assert client.post("/api/jobs/domain/reapply").status_code == 200
+    job = job_of(hidden.id)
+    assert job.domain_match == "NOT_MATCHING" and job.domain_reason.startswith("Not one of this search's roles")
+    assert rows(JobDescriptionParseTask, hidden.id) == [] and rows(JobRankingTask, hidden.id) == []
+
+
+def test_a_recovered_description_is_checked_against_the_searchs_skills(user):
+    from types import SimpleNamespace
+
+    from app.services import jd_recovery
+
+    run_id = _scoped_run(user)
+    _import(user, run_id, [_item("Backend Engineer", "Bengaluru, India", description="")])
+    job_id = _by_title(user, run_id)["Backend Engineer"].id
+    assert job_of(job_id).domain_match == "MATCH", "no description yet: kept"
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        job = db.get(Job, job_id)
+        task = JobDescriptionFetchTask(user_id=user, job_id=job_id, status="PROCESSING")
+        db.add(task)
+        db.flush()
+        outcome = SimpleNamespace(text=POSTING.replace("Python", "Java"), method="HTTP", final_url=job.url)
+        assert jd_recovery.apply_recovered(db, job, task, outcome, jd_recovery.utcnow()) == "recovered"
+        db.commit()
+    job = job_of(job_id)
+    assert job.domain_match == "NOT_MATCHING" and job.domain_reason == "Does not mention Python"
+    assert rows(JobDescriptionParseTask, job_id) == [] and rows(JobRankingTask, job_id) == []
 
 
 def test_a_setups_primary_skill_is_never_a_foreign_skill(user):
@@ -563,3 +599,13 @@ def test_a_setups_primary_skill_is_never_a_foreign_skill(user):
                                                                       "primary_skills": ["Java"]}, weekdays=[]))
         db.commit()
     assert job_of(add(user, "Senior Java Developer")).domain_match == "MATCH"
+
+
+def test_a_compound_primary_skill_protects_the_skill_it_names(user):
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        db.add(SavedSearch(user_id=user, name="Spring roles", settings={"roles": ["Backend Engineer"],
+                                                                        "primary_skills": ["Java 17"]}, weekdays=[]))
+        db.commit()
+    assert job_of(add(user, "Java Backend Engineer")).domain_match == "MATCH"
+    assert job_of(add(user, "Senior PHP Developer")).domain_match == "NOT_MATCHING", "other exclusions still apply"

@@ -48,6 +48,17 @@ def test_multi_board_country_comes_from_the_location():
     assert runs[0]["input"]["countryIndeed"] == "india" and runs[0]["input"]["location"] == "Bengaluru, India"
 
 
+def test_multi_board_prefers_the_named_country_over_a_city_alias():
+    runs, _ = inputs_for("openclawai/job-board-scraper", locations=["London, Ontario, Canada"], country_indeed="usa")
+    assert runs[0]["input"]["countryIndeed"] == "canada"
+
+
+def test_runs_covering_several_places_record_each_one():
+    runs, _ = inputs_for("fantastic-jobs/advanced-linkedin-job-search-api",
+                         locations=["Bengaluru, Karnataka, India", "London, UK"])
+    assert runs[0]["search_params"]["locations"] == ["Bengaluru, Karnataka, India", "London, UK"]
+
+
 def test_multi_board_splits_the_limit_and_warns_when_it_cannot():
     runs, warnings = inputs_for("openclawai/job-board-scraper", roles=["Backend Engineer"], locations=[],
                                 sites=["linkedin", "indeed", "glassdoor"], max_results=30)

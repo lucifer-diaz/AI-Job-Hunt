@@ -24,8 +24,6 @@ from dataclasses import dataclass, field
 from itertools import product
 from typing import Any, Callable
 
-from app.services.apify_adapters import resolve_country
-
 MAX_RUNS = 30
 DEFAULT_ACTORS = ["openclawai/job-board-scraper"]
 OPENCLAW_BOARDS = ["linkedin", "indeed", "glassdoor", "naukri", "bayt", "zip_recruiter"]
@@ -107,7 +105,9 @@ def build_openclaw(sp: dict, roles: list[str], locations: list[str]) -> tuple[di
                         f"{len(terms)} roles, so each asks for {per_board}; the import stops at {total}.")
     # Indeed and Glassdoor search one country: the run's location names it, else the setup's country.
     setting = (sp.get("country_indeed") or "usa").strip().lower()
-    found = resolve_country("", location)
+    from app.services.search_scope import location_country
+
+    found = location_country(location)
     country = found.indeed_name if found else setting
     if found and found.indeed_name != setting and {"indeed", "glassdoor"} & set(sites):
         warnings.append(f"Multi Job Board: Indeed and Glassdoor search {found.indeed_name} for '{location}', "
@@ -639,7 +639,8 @@ def plan_runs(sp: dict) -> tuple[list[dict], list[str]]:
         for group_roles, group_locations in groups:
             data, notes = spec.build(sp, group_roles, group_locations)
             warnings.extend(notes)
-            params = {**scope, **({"max_jobs": int(sp.get("max_results") or 20)} if spec.caps_total else {})}
+            params = {**scope, "locations": group_locations,
+                      **({"max_jobs": int(sp.get("max_results") or 20)} if spec.caps_total else {})}
             runs.append({"actor_id": actor_id, "actor_name": spec.name, "input": data,
                          "location": ", ".join(group_locations), "roles": group_roles, "search_params": params})
     if len(runs) > MAX_RUNS:

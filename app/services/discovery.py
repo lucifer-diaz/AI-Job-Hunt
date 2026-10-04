@@ -54,7 +54,7 @@ def admit(db: Session, job: Job, *, search_run_id: int | None = None,
         job.domain_match, job.domain_reason = domain_match.KEPT, "Added by you"
     elif not domain_match.screen(db, job, rules_cache, actor="discovery"):
         return "not_matching"
-    elif not search_scope.screen(db, job, search_run_id or job.search_run_id, actor="discovery"):
+    elif not search_scope.screen(db, job, search_run_id, actor="discovery"):
         return "not_matching"  # a role, skill or place its own search did not ask for
     choose_resume(db, job, search_run_id)
     if not jd_recovery.on_new_job(db, job):

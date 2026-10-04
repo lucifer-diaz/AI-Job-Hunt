@@ -263,13 +263,16 @@ def import_apify_items(db: Session, items: list[dict[str, Any]], search_run_id: 
     run = db.get(SearchRun, search_run_id) if search_run_id else None
     # A setup's "Results per search" is the most jobs one run brings in (actors.ActorSpec.caps_total).
     max_jobs = ((run.search_params or {}).get("max_jobs") if run is not None else None) or None
+    # A pulled-again run counts the jobs it already brought in, so repeated pulls never pass the limit.
+    imported = (db.scalar(select(func.count(Job.id)).where(Job.user_id == owner, Job.search_run_id == run.id)) or 0
+                if max_jobs else 0)
     known = {dedupe_key(t, c, loc) for t, c, loc in
              db.execute(select(Job.title, Job.company, Job.location).where(Job.user_id == owner)).all()}
     for item in items:
         if not isinstance(item, dict):
             skipped += 1
             continue
-        if max_jobs and created >= max_jobs:
+        if max_jobs and imported + created >= max_jobs:
             over_limit += 1
             continue
         job_data = normalize_apify_job(adapt(item) if adapt else item, default_site)

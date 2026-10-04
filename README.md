@@ -185,18 +185,22 @@ Descriptions differ by board: Multi Job Board returns full descriptions for **Li
 
 * **Primary skills** (optional, up to 3: Python, Java…). Multi Job Board adds the first skill to each role's search
   term ("Backend Engineer Python"). For every actor, an imported job has to mention one of the skills in its title or
-  description. A job with no description yet is not held against the skill check.
+  description (the whole description is searched). A job with no description yet is not held against the skill
+  check; it is checked again when description recovery fills the text in, before parsing or ranking.
 * **Scope check on import** (`app/services/search_scope.py`, deterministic). Every setup run records its roles,
   location and skills on `search_runs`. When an imported job's title names none of the roles (or skills), its
   description names none of the skills, or its location is in another country, the job is hidden like the domain
   filter: it moves to **Not matching** with the reason, gets no recovery, parsing or ranking, and **Keep this job**
-  brings it back. With a search radius of 0, the job also has to be in the same city (Bengaluru and Bangalore count
-  as one). A run without a recorded scope, or a job without a location, is never hidden.
+  brings it back. A run covering several places (Advanced LinkedIn, per-role actors) accepts a job that fits any of
+  them. With a search radius of 0, the job also has to be in the same city (Bengaluru and Bangalore count as one). A
+  remote-only search hides a job only when the posting says it is on-site. Reapplying the domain lists never restores
+  a job this check hid. A run without a recorded scope, or a job without a location, is never hidden.
 * **Country.** Multi Job Board's `countryIndeed` (which Indeed and Glassdoor search) comes from the run's location
-  when that names a country ("Bengaluru, India" → india). The setup's country setting is used only when it doesn't.
+  when that names a country ("Bengaluru, India" → india; the last part counts first, so "London, Ontario, Canada" is
+  canada). The setup's country setting is used only when it doesn't.
 * **Results per search is a total.** The actor's `maxResults` counts per board and per search term. Multi Job
   Board sends `ceil(limit ÷ (boards × roles))`, and the import stops at the limit (counted as `over_limit` in the
-  run's stats).
+  run's stats), counting jobs the run already brought in when it is pulled again.
 
 | Actor | Runs | Filters it receives |
 | --- | --- | --- |

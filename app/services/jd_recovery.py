@@ -760,6 +760,10 @@ def apply_recovered(db: Session, job: Job, task: JobDescriptionFetchTask, outcom
     job_description.normalize_job(db, job)
     _finish(task, COMPLETED, now, "RECOVERED")
     db.flush()
+    from app.services import search_scope
+
+    if not search_scope.screen(db, job, actor="jd_recovery"):
+        return "recovered"  # the text shows the search did not ask for it (a primary skill it never mentions)
     job_description.queue_parse(db, job, reason="description_changed", now=now)
     # Ranking waits for the parse (job_description.waiting_reason); queueing is all this worker does.
     if ranker.removed_by_user(db, job):
