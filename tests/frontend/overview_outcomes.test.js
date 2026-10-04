@@ -53,6 +53,8 @@ describe('overview outcome cards', () => {
     expect(text).toContain('42% heard back from the company — 5 of 12');
     expect(root.querySelectorAll('.stackbar i')).toHaveLength(2);
     expect(text).toContain('1 email needs a reply or action');
+    // It opens the tracker's Inbox insights, where those emails are, not the kanban.
+    expect(root.querySelector('[data-view="inbox"]')?.dataset.screen).toBe('tracker');
     expect(text).toContain('Pay too low');
   });
 

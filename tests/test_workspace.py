@@ -492,11 +492,13 @@ def test_discovery_filters_by_found_or_posted_date_and_hides_applied_jobs():
     assert [r["id"] for r in newest["items"]][:3] == [fresh, applied, old], "newest posting first, undated last"
 
 
-def _sent(stage="applied", location="Remote", title="Lead AI Engineer", fit=80.0, days_ago=5, history=()):
-    """An in-memory application for the Overview outcome helpers: `history` lists earlier stages it passed through."""
-    events = [SimpleNamespace(kind="stage", detail=past) for past in history]
+def _sent(stage="applied", location="Remote", title="Lead AI Engineer", fit=80.0, days_ago=5, history=(), app_id=None):
+    """An in-memory application for the Overview outcome helpers: `history` lists earlier stages it passed through,
+    as a stage name or (stage, meta)."""
+    events = [SimpleNamespace(kind="stage", detail=past, meta=None) if isinstance(past, str)
+              else SimpleNamespace(kind="stage", detail=past[0], meta=past[1]) for past in history]
     job = SimpleNamespace(location=location, title=title, fit_score=fit)
-    return SimpleNamespace(stage=stage, events=events, job=job,
+    return SimpleNamespace(id=app_id or uuid.uuid4().int, stage=stage, events=events, job=job,
                            applied_at=datetime(2026, 9, 30) - timedelta(days=days_ago))
 
 
@@ -510,20 +512,20 @@ def test_overview_outcomes_by_location_role_and_fit():
         _sent("applied", "Remote", fit=None),
         _sent("offer", "Pune", history=["screening", "interviewing"]),
     ]
-    by_location = {r["label"]: r for r in _outcome_rows(apps, lambda a: location_key(a.job.location))}
+    by_location = {r["label"]: r for r in _outcome_rows(apps, lambda a: location_key(a.job.location), {})}
     assert by_location["Bengaluru"] == {"label": "Bengaluru", "applied": 2, "replies": 2, "interviews": 1,
                                         "rejected": 1, "rate": "100%"}
     assert by_location["Remote"]["applied"] == 2 and by_location["Remote"]["rate"] == "0%"
 
     roles = ["Lead AI Engineer", "Data Scientist"]
-    by_role = {r["label"]: r["applied"] for r in _outcome_rows(apps, lambda a: _role_bucket(a.job.title, roles))}
+    by_role = {r["label"]: r["applied"] for r in _outcome_rows(apps, lambda a: _role_bucket(a.job.title, roles), {})}
     assert by_role == {"Lead AI Engineer": 4, "Data Scientist": 1}
 
-    bands = _outcome_rows(apps, lambda a: _fit_band(a.job.fit_score), order=["90+", "75–89", "60–74", "Under 60",
+    bands = _outcome_rows(apps, lambda a: _fit_band(a.job.fit_score), {}, order=["90+", "75–89", "60–74", "Under 60",
                                                                              "Unscored"])
     assert [r["label"] for r in bands] == ["90+", "75–89", "Under 60", "Unscored"]
 
-    out = _outcomes(apps, datetime(2026, 9, 30))
+    out = _outcomes(apps, datetime(2026, 9, 30), {})
     counts = {b["id"]: b["n"] for b in out["buckets"]}
     assert counts == {"rejected": 1, "interviewing": 1, "no_response": 1, "awaiting": 1, "offer": 1}
     assert out["answered"] == 3 and out["response_rate"] == "60%"
@@ -533,7 +535,7 @@ def test_outcome_rows_fold_the_long_tail_into_other():
     from app.workspace import _outcome_rows
 
     apps = [_sent(location=f"City {i}") for i in range(8)]
-    rows = _outcome_rows(apps, lambda a: a.job.location, limit=4)
+    rows = _outcome_rows(apps, lambda a: a.job.location, {}, limit=4)
     assert [r["label"] for r in rows][-1] == "Other" and len(rows) == 4
     assert sum(r["applied"] for r in rows) == 8
 
@@ -569,3 +571,41 @@ def test_role_bucket_groups_titles_by_target_role_then_role_type(title, expected
     from app.workspace import _role_bucket
 
     assert _role_bucket(title, ["Product Manager", "Associate Product Manager"]) == expected
+
+
+
+def test_outcomes_count_inbox_replies_and_past_rejections_but_not_undone_inbox_moves():
+    from app.workspace import _outcome_rows, _outcomes
+
+    by_inbox = {"source": "application_inbox", "email_event_id": 7}
+    undone = {"source": "application_inbox_correction", "email_event_id": 7}
+    apps = [
+        # An Inbox email moved it to screening, then a correction moved it back: no reply after all.
+        _sent("applied", days_ago=30, history=[("screening", by_inbox), ("applied", undone)], app_id=1),
+        # The employer asked for documents by email; the stage never moved.
+        _sent("applied", days_ago=30, app_id=2),
+        # Rejected, then closed: the rejection still counts as an answer.
+        _sent("closed", days_ago=30, history=["rejected"], app_id=3),
+    ]
+    emails = {2: {"DOCUMENT_REQUEST"}}
+    row = _outcome_rows(apps, lambda a: "all", emails)[0]
+    assert (row["replies"], row["rejected"]) == (1, 1)
+    out = _outcomes(apps, datetime(2026, 9, 30), emails)
+    assert {b["id"]: b["n"] for b in out["buckets"]} == {"no_response": 1, "in_process": 1, "closed": 1}
+    assert out["answered"] == 2
+
+
+def test_overview_inbox_counts_need_a_connected_gmail_account():
+    from app.models import GmailConnection, User
+    from app.workspace import _inbox_counts
+
+    since = datetime(2026, 1, 1)
+    with SessionLocal() as db:
+        db.query(GmailConnection).delete()
+        user_id = db.scalar(select(User.id).limit(1))
+        db.add(GmailConnection(user_id=user_id, email_address="t@example.com", status="REVOKED"))
+        db.flush()
+        assert _inbox_counts(db, since) is None
+        db.query(GmailConnection).update({"status": "CONNECTED"})
+        assert _inbox_counts(db, since) is not None
+        db.rollback()

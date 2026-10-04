@@ -61,6 +61,7 @@ from app.services.ai_config import STAGES as AI_STAGES
 from app.services.ai_config import is_free_model
 from app.services.ai_config import resolve as resolve_ai_config
 from app.services.application_inbox import service as inbox_service
+from app.services.application_inbox.classify import HUMAN_REPLY_TYPES
 from app.services.contacts import (
     MAX_RECRUITERS,
     ContactIn,
@@ -304,10 +305,51 @@ INBOX_GROUPS = [
 ]
 
 
+# Emails a person marked as an answer to an application without moving its stage. Rejections and on-hold notices
+# answer, but are not a reply that moves the application on.
+NOT_A_REPLY = {"APPLICATION_REJECTION", "APPLICATION_ON_HOLD"}
+
+
 def _reached(app: Application, stages: set[str]) -> bool:
     """Whether an application is in, or ever was in, one of these stages: a rejection after a screening call still
-    counts as a reply."""
-    return (app.stage or "applied") in stages or any(e.kind == "stage" and e.detail in stages for e in app.events)
+    counts as a reply. A stage move an Inbox email made and a correction later undid (application_inbox.service.
+    _withdraw keeps it as history) never counts: the email was about another application."""
+    if (app.stage or "applied") in stages:
+        return True
+    undone = {(e.meta or {}).get("email_event_id") for e in app.events
+              if (e.meta or {}).get("source") == "application_inbox_correction"}
+    return any(e.kind == "stage" and e.detail in stages
+               and not ((e.meta or {}).get("email_event_id") in undone
+                        and (e.meta or {}).get("source") != "application_inbox_correction")
+               for e in app.events)
+
+
+def _reply_emails(db: Session, apps: list[Application]) -> dict[int, set[str]]:
+    """application id -> the employer's reply types the Application Inbox matched to it since it was sent (the same
+    rule as application_inbox.service.reply_received). Stored events only; never Gmail."""
+    sent = {a.id: a.applied_at for a in apps}
+    if not sent:
+        return {}
+    rows = db.execute(select(ApplicationCommunicationEvent.application_id, ApplicationCommunicationEvent.event_type,
+                             ApplicationCommunicationEvent.received_at)
+                      .where(ApplicationCommunicationEvent.application_id.in_(sent),
+                             ApplicationCommunicationEvent.event_type.in_(HUMAN_REPLY_TYPES),
+                             ApplicationCommunicationEvent.review_status != "DISMISSED")).all()
+    emails: dict[int, set[str]] = defaultdict(set)
+    for row in rows:
+        if row.received_at is None or row.received_at >= sent[row.application_id]:
+            emails[row.application_id].add(row.event_type)
+    return emails
+
+
+def _replied(app: Application, emails: dict[int, set[str]]) -> bool:
+    """The employer replied: the application reached a reply stage, or the Inbox saw a reply that moves it on."""
+    return _reached(app, REPLY_STAGES) or bool(emails.get(app.id, set()) - NOT_A_REPLY)
+
+
+def _answered(app: Application, emails: dict[int, set[str]]) -> bool:
+    """The employer answered at all, rejections included (a rejection later closed still counts)."""
+    return _replied(app, emails) or _reached(app, {"rejected"}) or bool(emails.get(app.id))
 
 
 # Level words a role is grouped without: "Staff Software Engineer" and "Software Engineer II" are both Software Engineer.
@@ -316,21 +358,21 @@ LEVEL_WORDS = frozenset({"senior", "sr", "staff", "lead", "principal", "junior",
 # Role types for titles that match none of the person's target roles, checked in order (the first match wins, so
 # "AI Forward Deployed Engineer" is Forward Deployed / Solutions and "ML Engineering Manager" is Engineering Manager).
 ROLE_TYPES = [
-    ("Engineering Manager", r"\b(engineering|software|development) manager\b|\bhead of (engineering|ai|ml|data)\b"
-                            r"|\bdirector of engineering\b|\bvp,? engineering\b"),
+    ("Engineering Manager", (r"\b(engineering|software|development) manager\b|\bhead of (engineering|ai|ml|data)\b"
+                             r"|\bdirector of engineering\b|\bvp,? engineering\b")),
     ("Product Manager", r"\bproduct (manager|owner|lead|management)\b|\bapm\b"),
     ("Program Manager", r"\b(program|project|delivery) manager\b|\btpm\b"),
-    ("Forward Deployed / Solutions", r"\bforward[- ]deployed\b|\bsolutions? (engineer|architect)\b"
-                                     r"|\b(sales|customer|field) engineer\b"),
-    ("AI/ML Engineer", r"\b(ai|ml|machine learning|llm|genai|gen ai|generative ai|deep learning|nlp|computer vision"
-                       r"|mlops)\b.*\b(engineer|developer|architect|specialist|lead|engineering)\b"
-                       r"|\b(engineer|developer)\b.*\b(ai|ml|machine learning|llm|genai|generative ai)\b"),
+    ("Forward Deployed / Solutions", (r"\bforward[- ]deployed\b|\bsolutions? (engineer|architect)\b"
+                                      r"|\b(sales|customer|field) engineer\b")),
+    ("AI/ML Engineer", (r"\b(ai|ml|machine learning|llm|genai|gen ai|generative ai|deep learning|nlp|computer vision"
+                        r"|mlops)\b.*\b(engineer|developer|architect|specialist|lead|engineering)\b"
+                        r"|\b(engineer|developer)\b.*\b(ai|ml|machine learning|llm|genai|generative ai)\b")),
     ("Data Scientist", r"\b(data|research|applied|ai|ml) scientist\b|\bdata science\b|\bscientist\b"),
     ("Data Engineer", r"\b(data|analytics|etl|big data) (engineer|platform|architect)\b"),
     ("Platform / DevOps / SRE", r"\b(devops|sre|site reliability|platform|infrastructure|cloud|reliability)\b"),
-    ("Software Engineer", r"\b(software|backend|back end|full ?stack|frontend|front end|python|java|golang|web|mobile"
-                          r"|ios|android|application) (engineer|developer|development|engineering)\b"
-                          r"|\b(developer|programmer|sde|swe)\b"),
+    ("Software Engineer", (r"\b(software|backend|back end|full ?stack|frontend|front end|python|java|golang|web|mobile"
+                           r"|ios|android|application) (engineer|developer|development|engineering)\b"
+                           r"|\b(developer|programmer|sde|swe)\b")),
     ("Architect", r"\barchitect\b"),
     ("Analyst", r"\banalyst\b"),
 ]
@@ -368,7 +410,8 @@ def _fit_band(score: float | None) -> str:
     return next(label for floor, label in FIT_BANDS if score >= floor)
 
 
-def _outcome_rows(apps: list[Application], key, limit: int = 6, order: list[str] | None = None) -> list[dict]:
+def _outcome_rows(apps: list[Application], key, emails: dict[int, set[str]], limit: int = 6,
+                  order: list[str] | None = None) -> list[dict]:
     """Applications grouped by key(app): how many were sent, answered, interviewed and rejected in each group.
 
     Sorted by applications sent (or by `order`); groups past `limit` are folded into "Other"."""
@@ -385,15 +428,15 @@ def _outcome_rows(apps: list[Application], key, limit: int = 6, order: list[str]
     rows = []
     for label in labels:
         members = groups[label]
-        replies = sum(1 for a in members if _reached(a, REPLY_STAGES))
+        replies = sum(1 for a in members if _replied(a, emails))
         rows.append({"label": label, "applied": len(members), "replies": replies,
                      "interviews": sum(1 for a in members if _reached(a, INTERVIEW_STAGES)),
-                     "rejected": sum(1 for a in members if a.stage == "rejected"),
+                     "rejected": sum(1 for a in members if _reached(a, {"rejected"})),
                      "rate": _pct(replies, len(members)) if members else "—"})
     return rows
 
 
-def _outcomes(apps: list[Application], now: datetime) -> dict:
+def _outcomes(apps: list[Application], now: datetime, emails: dict[int, set[str]]) -> dict:
     """Where each application sent in the outcome window stands now. Every application lands in exactly one bucket."""
     counts = Counter()
     for app in apps:
@@ -406,13 +449,13 @@ def _outcomes(apps: list[Application], now: datetime) -> dict:
             counts["interviewing"] += 1
         elif stage in ("closed", "onhold"):
             counts["closed"] += 1
-        elif _reached(app, REPLY_STAGES):
+        elif _answered(app, emails):
             counts["in_process"] += 1
         elif app.applied_at < now - timedelta(days=GHOSTED_DAYS):
             counts["no_response"] += 1
         else:
             counts["awaiting"] += 1
-    answered = sum(1 for a in apps if a.stage == "rejected" or _reached(a, REPLY_STAGES))
+    answered = sum(1 for a in apps if _answered(a, emails))
     buckets = [("awaiting", "Awaiting reply", "#c6cad8"), ("no_response", f"No reply after {GHOSTED_DAYS} days", "#9aa1b2"),
                ("in_process", "Replied", "#a79bf0"), ("interviewing", "Interviewing", "#0f9c86"),
                ("offer", "Offer", "#0e7a68"), ("rejected", "Rejected", "#c22f4e"), ("closed", "Closed or on hold", "#e0a136")]
@@ -424,7 +467,7 @@ def _outcomes(apps: list[Application], now: datetime) -> dict:
 def _inbox_counts(db: Session, since: datetime) -> dict | None:
     """Company emails the Application Inbox matched to applications since `since`; None when Gmail is not connected.
     Reads stored events only — never Gmail."""
-    if db.scalar(select(GmailConnection.id).limit(1)) is None:
+    if db.scalar(select(GmailConnection.id).where(GmailConnection.status == "CONNECTED").limit(1)) is None:
         return None
     rows = db.execute(select(ApplicationCommunicationEvent.event_type, ApplicationCommunicationEvent.requires_action,
                              ApplicationCommunicationEvent.review_status)
@@ -444,6 +487,7 @@ def overview(db: Session = Depends(get_user_db)):
     since = utcnow() - timedelta(days=30)
     jobs = db.scalars(select(Job).where(Job.discovered_at >= since)).all()
     total = len(jobs)
+    emails = _reply_emails(db, live_apps(db))
     shortlisted = [j for j in jobs if j.status not in ("discovered", "archived", "dismissed", "maybe")]
     tailored = [j for j in jobs if j.resumes]
     approved = [j for j in jobs if j.application and j.application.approved_at]
@@ -464,7 +508,7 @@ def overview(db: Session = Depends(get_user_db)):
         row["found"] += 1
         if job.application and job.application.applied_at:
             row["applied"] += 1
-            if _reached(job.application, REPLY_STAGES):
+            if _replied(job.application, emails):
                 row["replies"] += 1
     source_perf = sorted(({"board": k, **v, "rate": _pct(v["replies"], v["applied"]) if v["applied"] else "—"}
                           for k, v in by_board.items()), key=lambda r: -r["found"])
@@ -523,11 +567,12 @@ def overview(db: Session = Depends(get_user_db)):
         "role_mix": role_mix, "median_fit": round(median(fits)) if fits else None,
         "time_in_stage": {"triage": avg_days(triage_pairs), "apply": avg_days(apply_pairs), "reply": avg_days(reply_pairs)},
         "stale_approved": len(stale), "approvals": len(approval_jobs(db)),
-        "outcome_days": OUTCOME_DAYS, "by_location": _outcome_rows(sent, lambda a: location_key(a.job.location)),
-        "by_role": _outcome_rows(sent, lambda a: _role_bucket(a.job.title, roles)),
-        "fit_vs_outcome": _outcome_rows(sent, lambda a: _fit_band(a.job.fit_score),
+        "outcome_days": OUTCOME_DAYS,
+        "by_location": _outcome_rows(sent, lambda a: location_key(a.job.location), emails),
+        "by_role": _outcome_rows(sent, lambda a: _role_bucket(a.job.title, roles), emails),
+        "fit_vs_outcome": _outcome_rows(sent, lambda a: _fit_band(a.job.fit_score), emails,
                                         order=[label for _, label in FIT_BANDS] + ["Unscored"]),
-        "outcomes": _outcomes(sent, now), "inbox": _inbox_counts(db, since), "pass_reasons": pass_reasons,
+        "outcomes": _outcomes(sent, now, emails), "inbox": _inbox_counts(db, since), "pass_reasons": pass_reasons,
     }
 
 

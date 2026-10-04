@@ -470,7 +470,7 @@ function renderOutcomes(o) {
   const inbox = o.inbox
     ? `<section class="card" style="flex:1 1 280px;min-width:0"><div class="row base between wrap"><div class="card-title mb4">Company emails</div><span class="small muted">last 30 days</span></div><div class="card-sub mb14">${o.inbox.total} email${o.inbox.total === 1 ? '' : 's'} matched to your applications by the Application Inbox.</div>
       <div class="statgrid">${o.inbox.groups.map(g => `<div class="box"><div class="mono bb" style="font-size:19px">${g.n}</div><div class="tiny muted">${esc(g.label)}</div></div>`).join('')}</div>
-      ${o.inbox.needs_action ? `<button class="btn block mt12" data-act="go" data-screen="tracker">${o.inbox.needs_action} email${o.inbox.needs_action === 1 ? ' needs' : 's need'} a reply or action</button>` : ''}</section>`
+      ${o.inbox.needs_action ? `<button class="btn block mt12" data-act="go" data-screen="tracker" data-view="inbox">${o.inbox.needs_action} email${o.inbox.needs_action === 1 ? ' needs' : 's need'} a reply or action</button>` : ''}</section>`
     : `<section class="card" style="flex:1 1 280px;min-width:0"><div class="card-title mb4">Company emails</div><div class="small muted">Connect Gmail in Settings → Application Inbox to count interview invites, assessments and rejections here.</div></section>`;
   const passed = o.pass_reasons.length ? `<section class="card" style="flex:1 1 280px;min-width:0"><div class="card-title mb4">Why you pass on jobs</div><div class="card-sub mb14">Reasons given when turning jobs down, last 30 days. Tighten the search setup for the top one.</div>
       <div class="col gap12">${o.pass_reasons.map((r, i) => `<div><div class="row between small mb4"><span style="font-weight:500">${esc(r.label)}</span><span class="mono muted">${r.n}</span></div>${bar(r.pct, ['#c22f4e', '#e0a136', '#a79bf0', '#c6cad8'][i], 'thick')}</div>`).join('')}</div></section>` : '';
@@ -1785,6 +1785,8 @@ const A = {
   go: el => go(el.dataset.screen, {
     ...(el.dataset.mode ? { discMode: el.dataset.mode } : {}), ...(el.dataset.job ? { tailorJob: Number(el.dataset.job), tailorMode: 'single', tailorTab: 'diff' } : {}),
     ...(el.dataset.approval ? { approvalJob: Number(el.dataset.approval) } : {}), ...(el.dataset.app ? { selApp: Number(el.dataset.app), trackerView: 'board' } : {}),
+    // The tracker's Inbox insights view, reloaded so it shows the emails the button counted.
+    ...(el.dataset.view === 'inbox' ? (D.inbox = undefined, { trackerView: 'inbox', selApp: null }) : {}),
     jobOpen: null, kitJob: null, paletteOpen: false,
   }),
   variant: el => {
