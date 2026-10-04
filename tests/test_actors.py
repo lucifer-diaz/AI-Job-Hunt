@@ -31,11 +31,63 @@ def test_multi_board_sends_every_filter_with_schema_names():
     assert data["searchTerm"] == "Lead AI Engineer"
     assert data["searchTerms"] == ["Lead AI Engineer", "Engineering Manager"]
     assert data["location"] == "New York, NY" and data["sites"] == ["linkedin", "indeed"]
-    assert data["maxResults"] == 25 and data["hoursOld"] == 72 and data["jobType"] == "fulltime"
-    assert data["countryIndeed"] == "india" and data["distance"] == 25
+    # "Results per search" is the run's total: 25 over 2 boards × 2 roles asks each for 7.
+    assert data["maxResults"] == 7 and data["hoursOld"] == 72 and data["jobType"] == "fulltime"
+    assert runs[0]["search_params"]["max_jobs"] == 25
+    # The location names the country Indeed searches; the setting covers a location without one.
+    assert data["countryIndeed"] == "usa" and runs[1]["input"]["countryIndeed"] == "india"
+    assert any("Indeed and Glassdoor search usa for 'New York, NY'" in w for w in warnings)
+    assert data["distance"] == 25
     assert data["linkedinFetchDescription"] is True and data["enforceAnnualSalary"] is True
     assert data["proxyConfiguration"] == {"useApifyProxy": True, "apifyProxyGroups": []}
     assert any("Indeed ignores job type" in w for w in warnings)
+
+
+def test_multi_board_country_comes_from_the_location():
+    runs, _ = inputs_for("openclawai/job-board-scraper", locations=["Bengaluru, India"], country_indeed="usa")
+    assert runs[0]["input"]["countryIndeed"] == "india" and runs[0]["input"]["location"] == "Bengaluru, India"
+
+
+def test_multi_board_prefers_the_named_country_over_a_city_alias():
+    runs, _ = inputs_for("openclawai/job-board-scraper", locations=["London, Ontario, Canada"], country_indeed="usa")
+    assert runs[0]["input"]["countryIndeed"] == "canada"
+
+
+def test_runs_covering_several_places_record_each_one():
+    runs, _ = inputs_for("fantastic-jobs/advanced-linkedin-job-search-api",
+                         locations=["Bengaluru, Karnataka, India", "London, UK"])
+    assert runs[0]["search_params"]["locations"] == ["Bengaluru, Karnataka, India", "London, UK"]
+
+
+def test_multi_board_splits_the_limit_and_warns_when_it_cannot():
+    runs, warnings = inputs_for("openclawai/job-board-scraper", roles=["Backend Engineer"], locations=[],
+                                sites=["linkedin", "indeed", "glassdoor"], max_results=30)
+    assert runs[0]["input"]["maxResults"] == 10 and not any("split evenly" in w for w in warnings)
+    runs, warnings = inputs_for("openclawai/job-board-scraper", roles=["Backend Engineer"], locations=[],
+                                sites=["linkedin", "indeed", "glassdoor"], max_results=5)
+    assert runs[0]["input"]["maxResults"] == 2 and any("the import stops at 5" in w for w in warnings)
+
+
+def test_multi_board_adds_the_primary_skill_to_each_search_term():
+    runs, _ = inputs_for("openclawai/job-board-scraper", roles=["Backend Engineer", "Python Developer"],
+                         primary_skills=[" Python ", "Django", "python"], locations=["Bengaluru, India"])
+    data = runs[0]["input"]
+    assert data["searchTerm"] == "Backend Engineer Python"
+    assert data["searchTerms"] == ["Backend Engineer Python", "Python Developer"]  # never "Python Developer Python"
+    assert runs[0]["search_params"]["primary_skills"] == ["Python", "Django"]
+    assert runs[0]["roles"] == ["Backend Engineer", "Python Developer"]  # the scope keeps the plain roles
+
+
+def test_other_actors_carry_scope_but_no_import_cap():
+    runs, _ = inputs_for("crawlerbros/naukri-scraper", primary_skills=["Java"])
+    assert runs[0]["search_params"]["primary_skills"] == ["Java"] and "max_jobs" not in runs[0]["search_params"]
+
+
+def test_custom_actor_skill_placeholders():
+    custom = {"id": "me/board", "fan_out": "role", "input_template": {"q": "{{role}} {{skill}}", "tags": "{{skills}}"}}
+    runs, warnings = plan_runs({**BASE, "actors": ["me/board"], "custom_actors": [custom],
+                                "primary_skills": ["Go", "Rust"]})
+    assert runs[0]["input"] == {"q": "Lead AI Engineer Go", "tags": ["Go", "Rust"]} and not warnings
 
 
 def test_multi_board_drops_hours_when_easy_apply():

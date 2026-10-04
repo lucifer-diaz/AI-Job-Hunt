@@ -108,7 +108,7 @@ def preferences(db: Session, user_id: int) -> dict[str, Any]:
 
 
 def derived(db: Session, user_id: int) -> dict[str, list[str]]:
-    """Roles and skills the account's own data names: profile, active resume, saved searches."""
+    """Roles and skills the account's own data names: profile, active resume, saved searches (roles, primary skills)."""
     from app.models import CandidateProfile, Resume, SavedSearch
 
     profile = db.scalar(select(CandidateProfile).where(CandidateProfile.user_id == user_id))
@@ -128,6 +128,7 @@ def derived(db: Session, user_id: int) -> dict[str, list[str]]:
         skills += facts.get("primary_skills") or []
     for setup in db.scalars(select(SavedSearch).where(SavedSearch.user_id == user_id)).all():
         roles += [r for r in ((setup.settings or {}).get("roles") or []) if isinstance(r, str)]
+        skills += [s for s in ((setup.settings or {}).get("primary_skills") or []) if isinstance(s, str)]
     clean = lambda values: list(dict.fromkeys(_norm(v) for v in values if isinstance(v, str) and v.strip()))
     return {"roles": clean(roles), "skills": clean(skills)}
 
@@ -139,7 +140,9 @@ def rules_for(db: Session, user_id: int) -> Rules:
     # A term the candidate's own roles or skills use is never an exclusion ("sales engineer", "Java" on the resume).
     domain = [t for t in map(_norm, prefs["exclude_terms"])
               if t and not any(contains(role, t) for role in own["roles"])]
-    skill = [t for t in map(_norm, prefs["skill_excludes"]) if t and t not in own_skills and t not in words]
+    # "java" is the candidate's own when a skill names it, as in "Java 17" or "Java Spring".
+    skill = [t for t in map(_norm, prefs["skill_excludes"])
+             if t and t not in words and not any(contains(own, t) for own in own_skills)]
     learned = [e for e in prefs["learned"] if e.get("status") == "active"] if prefs["learn_from_feedback"] else []
     return Rules(enabled=bool(prefs["enabled"]) and get_settings().domain_filter_enabled, domain_excludes=domain,
                  skill_excludes=skill, includes=[t for t in map(_norm, prefs["include_terms"]) if t],
@@ -259,6 +262,8 @@ def keep(db: Session, job: Job, *, actor: str, now: datetime | None = None) -> s
 def reapply(db: Session, user_id: int, *, actor: str) -> dict[str, int]:
     """Assess the account's unranked jobs again after its lists changed. Kept jobs are never touched; a job that now
     matches is put back in the queue. Does not commit."""
+    from app.services import search_scope
+
     rules = rules_for(db, user_id)
     hidden = restored = 0
     jobs = db.scalars(select(Job).where(Job.user_id == user_id, Job.domain_match.is_distinct_from(KEPT),
@@ -269,6 +274,11 @@ def reapply(db: Session, user_id: int, *, actor: str) -> dict[str, int]:
         if job.state is S.SKIPPED and not was_hidden:
             continue  # skipped for another reason
         verdict = assess(job, rules)
+        if verdict.match and was_hidden and search_scope.hidden_by_scope(job):
+            scoped = search_scope.verdict_for(db, job)
+            if scoped is not None and not scoped.match:
+                mark(job, scoped)  # hidden by its own search's scope, which these lists do not decide
+                continue
         if verdict.match and was_hidden:
             keep(db, job, actor=actor)
             job.domain_match, job.domain_reason = MATCH, None

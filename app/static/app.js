@@ -832,6 +832,9 @@ function renderSetup() {
       <div><div class="small b mb8">Roles <span class="faint" style="font-weight:400">· up to 5</span></div>
         <div class="tagbox" data-tag-input="roles" data-act="focus-tag" data-target="sp-roles">${chips(F, 'roles', p.roles)}<input id="sp-roles" data-tag="roles" data-form="sp" data-max="5" autocomplete="off" placeholder="Type a role, then press Enter"></div>
         <div class="helper">Press Enter to add each role · Backspace removes the last one${suggestions.length ? ` · Suggested from your profile: ${suggestions.map(s => `<a href="#" data-act="suggest-role" data-role="${attr(s)}">${esc(s)}</a>`).join(' · ')}` : ''}</div></div>
+      <div><div class="small b mb8">Primary skills <span class="faint" style="font-weight:400">· optional, up to 3</span></div>
+        ${tagBox(F, 'primary_skills', p.primary_skills || [], 'Python, Java… then press Enter', 3)}
+        <div class="helper">The first skill is added to each role's search (Backend Engineer Python) · jobs that mention none of them are hidden as Not matching</div></div>
       <div><div class="small b mb8">Locations <span class="faint" style="font-weight:400">· up to 5, one search each</span></div>
         <div class="tagbox" data-tag-input="locations" data-act="focus-tag" data-target="sp-locations">${chips(F, 'locations', p.locations)}<input id="sp-locations" data-tag="locations" data-form="sp" data-max="5" data-split="newline" autocomplete="off" placeholder="Type a city or Remote, then press Enter"></div>
         <div class="helper">Press Enter to add each location — commas stay part of it (New York, NY) · leave empty to search anywhere</div></div>
@@ -863,7 +866,7 @@ function renderSetup() {
       <section aria-labelledby="filters-heading"><h3 class="small b mb8" id="filters-heading" style="margin-top:0">Filters <span class="faint" style="font-weight:400">· each actor receives the filters it supports</span></h3><div class="grid-auto">
         <label class="field">Posted within${selectF(F, 'hours_old', p.hours_old, [[1, 'Past hour'], [24, 'Past 24 hours'], [72, 'Past 3 days'], [168, 'Past 7 days'], [720, 'Past 30 days'], [0, 'Any time']], 'aria-describedby="use-hours"')}${filterNote(catalogList, on, 'hours')}</label>
         <label class="field">Job type${selectF(F, 'job_type', p.job_type, [['', 'Any job type'], ['fulltime', 'Full-time'], ['parttime', 'Part-time'], ['contract', 'Contract'], ['internship', 'Internship'], ['temporary', 'Temporary']], 'aria-describedby="use-job_type"')}${filterNote(catalogList, on, 'job_type')}</label>
-        <label class="field">Results per search${inputF(F, 'max_results', p.max_results, 'type="number" min="1" max="100" aria-describedby="max-results-help"')}<span class="helper" id="max-results-help">Used by every actor, for each run it starts.</span></label>
+        <label class="field">Results per search${inputF(F, 'max_results', p.max_results, 'type="number" min="1" max="100" aria-describedby="max-results-help"')}<span class="helper" id="max-results-help">The most jobs one run brings in — Multi Job Board splits it across boards and roles. Other actors use it for each run they start.</span></label>
         </div>
         <div class="mt12" role="group" aria-labelledby="seniority-label" aria-describedby="use-seniority"><div class="xs muted mb4" id="seniority-label">Seniority</div><div class="row gap6 wrap">${(D.actors?.seniority || []).map(s => `<button type="button" class="btn sm ${seniority.includes(s) ? 'soft' : ''}" data-act="toggle-list" data-key="seniority" data-value="${s}" aria-pressed="${seniority.includes(s) ? 'true' : 'false'}">${seniority.includes(s) ? '✓ ' : ''}${s}</button>`).join('')}</div>${filterNote(catalogList, on, 'seniority')}</div>
         <div class="mt12"><label class="xs muted mb4" for="sp-exclude_keywords" style="display:block">Exclude titles or keywords</label>${tagBox(F, 'exclude_keywords', p.exclude_keywords || [], 'e.g. intern, then Enter', 20)}${filterNote(catalogList, on, 'exclude_keywords')}</div>
@@ -1690,7 +1693,7 @@ const setupResume = value => ['auto', 'active'].includes(String(value)) ? { resu
 function searchPayload() {
   const p = D.searchProfile.profile, F = 'sp', v = (k, d) => fv(F, k, p[k] ?? d);
   return {
-    roles: v('roles', []), locations: v('locations', []), actors: v('actors', []), custom_actors: v('custom_actors', []),
+    roles: v('roles', []), primary_skills: v('primary_skills', []), locations: v('locations', []), actors: v('actors', []), custom_actors: v('custom_actors', []),
     sites: v('sites', []), remote_platforms: v('remote_platforms', []), remoteok_url: v('remoteok_url', ''),
     hours_old: Number(v('hours_old', 168)) || 0, max_results: Number(v('max_results', 20)) || 20, offset: Number(v('offset', 0)) || 0,
     job_type: v('job_type', ''), seniority: v('seniority', []), country_indeed: v('country_indeed', 'usa'),
@@ -1749,9 +1752,9 @@ function setupPayload() {
 }
 // Text still sitting in a tag input counts as typed — save it rather than dropping it.
 function flushTagDrafts() {
-  for (const key of ['roles', 'locations']) {
+  for (const key of ['roles', 'primary_skills', 'locations']) {
     const pending = document.getElementById(`sp-${key}`)?.value.trim();
-    if (pending) addTags('sp', key, pending, 5, D.searchProfile.profile[key]);
+    if (pending) addTags('sp', key, pending, key === 'primary_skills' ? 3 : 5, D.searchProfile.profile[key]);
   }
 }
 function adoptSetup(setup) {

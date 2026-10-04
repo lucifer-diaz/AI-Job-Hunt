@@ -105,6 +105,7 @@ def test_running_a_setup_ties_its_runs_back_to_it(monkeypatch):
 
     def fake_start(_db, payload):
         started.append(payload["location"])
+        assert payload["roles"] == ["AI Engineer"] and payload["search_params"]["max_jobs"] == 20
         run = SearchRun(external_run_id=uuid.uuid4().hex, actor_id="openclawai/job-board-scraper",
                         input_json={"location": payload["location"]}, status="READY")
         _db.add(run)

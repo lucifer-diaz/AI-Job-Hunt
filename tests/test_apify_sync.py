@@ -101,7 +101,7 @@ def test_import_remote_runs_with_input_dedupe_and_pull_again(apify):
     result = out["results"][0]
     assert result["ok"] and result["completed"]
     assert result["import"] == {"seen": 4, "normalized": 3, "created": 2, "skipped": 1, "duplicates": 1,
-                                "not_matching": 0, "previously_removed": 0}
+                                "not_matching": 0, "previously_removed": 0, "over_limit": 0}
 
     detail = client.get(f"/api/search/apify/runs/{result['id']}/detail").json()
     assert ["Role", "Staff AI Engineer"] in detail["context"] and ["Location", "Pune"] in detail["context"]
