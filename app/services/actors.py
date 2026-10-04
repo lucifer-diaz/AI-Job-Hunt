@@ -24,6 +24,8 @@ from dataclasses import dataclass, field
 from itertools import product
 from typing import Any, Callable
 
+from app.services.apify_adapters import resolve_country
+
 MAX_RUNS = 30
 DEFAULT_ACTORS = ["openclawai/job-board-scraper"]
 OPENCLAW_BOARDS = ["linkedin", "indeed", "glassdoor", "naukri", "bayt", "zip_recruiter"]
@@ -35,7 +37,7 @@ ACTOR_GROUPS = ("Job boards", "LinkedIn", "Remote boards", "Startups", "Your act
 HN_MONTH_RE = re.compile(r"^(current|\d{4}-(0[1-9]|1[0-2]))$")
 YC_BATCH_RE = re.compile(r"^[WSFX]\d{2}$", re.IGNORECASE)
 PLACEHOLDERS = ("role", "roles", "location", "locations", "max_results", "hours_old", "days_old",
-                "is_remote", "job_type", "sites", "country")
+                "is_remote", "job_type", "sites", "country", "skill", "skills")
 REMOTE_WORDS = {"remote", "anywhere", "worldwide", "global"}
 
 
@@ -59,6 +61,8 @@ class ActorSpec:
     group: str = "Job boards"
     # Maps one dataset item onto the common job fields; None when the item already uses them.
     normalize: Callable[[dict], dict] | None = None
+    # The import stops at the setup's "Results per search": the builder sizes the run to bring in about that many.
+    caps_total: bool = False
 
     def public(self) -> dict:
         return {"id": self.id, "name": self.name, "summary": self.summary, "cost": self.cost,
@@ -70,18 +74,52 @@ def _days(hours: int | None) -> int:
     return max(1, math.ceil((hours or 0) / 24)) if hours else 0
 
 
+def primary_skills(sp: dict) -> list[str]:
+    """The setup's primary skills (Python, Java…), trimmed, at most three."""
+    out: list[str] = []
+    for skill in sp.get("primary_skills") or []:
+        text = re.sub(r"\s+", " ", str(skill or "")).strip()[:40]
+        if text and text.lower() not in {s.lower() for s in out}:
+            out.append(text)
+    return out[:3]
+
+
+def with_skill(role: str, skills: list[str]) -> str:
+    """The role's search term with the first primary skill added, unless the role already names it."""
+    if not skills:
+        return role
+    from app.services.domain_match import contains
+
+    return role if contains(role, skills[0]) else f"{role} {skills[0]}"
+
+
 # ───────────── openclawai/job-board-scraper ─────────────
 def build_openclaw(sp: dict, roles: list[str], locations: list[str]) -> tuple[dict, list[str]]:
     warnings: list[str] = []
     sites = [s for s in sp.get("sites") or [] if s in OPENCLAW_BOARDS] or ["linkedin", "indeed"]
+    location = locations[0] if locations else ""
+    terms = [with_skill(role, primary_skills(sp)) for role in roles[:5]]
+    # The actor's maxResults counts per board and per search term; the setup's number is the run's total.
+    total = int(sp.get("max_results") or 20)
+    per_board = max(1, math.ceil(total / (len(sites) * len(terms))))
+    if per_board * len(sites) * len(terms) > total:
+        warnings.append(f"Multi Job Board: {total} results cannot be split evenly across {len(sites)} boards and "
+                        f"{len(terms)} roles, so each asks for {per_board}; the import stops at {total}.")
+    # Indeed and Glassdoor search one country: the run's location names it, else the setup's country.
+    setting = (sp.get("country_indeed") or "usa").strip().lower()
+    found = resolve_country("", location)
+    country = found.indeed_name if found else setting
+    if found and found.indeed_name != setting and {"indeed", "glassdoor"} & set(sites):
+        warnings.append(f"Multi Job Board: Indeed and Glassdoor search {found.indeed_name} for '{location}', "
+                        f"not the country setting ({setting}).")
     data: dict[str, Any] = {
-        "searchTerm": roles[0],
-        "location": locations[0] if locations else "",
+        "searchTerm": terms[0],
+        "location": location,
         "sites": sites,
-        "maxResults": int(sp.get("max_results") or 20),
+        "maxResults": per_board,
         "isRemote": bool(sp.get("is_remote")),
         "distance": int(sp.get("distance") if sp.get("distance") is not None else 50),
-        "countryIndeed": (sp.get("country_indeed") or "usa").strip().lower(),
+        "countryIndeed": country,
         "easyApply": bool(sp.get("easy_apply")),
         "linkedinFetchDescription": bool(sp.get("fetch_description", True)),
         "descriptionFormat": "markdown",
@@ -89,8 +127,8 @@ def build_openclaw(sp: dict, roles: list[str], locations: list[str]) -> tuple[di
         "proxyConfiguration": {"useApifyProxy": True,
                                "apifyProxyGroups": ["RESIDENTIAL"] if sp.get("residential_proxy", True) else []},
     }
-    if len(roles) > 1:
-        data["searchTerms"] = roles[:5]
+    if len(terms) > 1:
+        data["searchTerms"] = terms
     if sp.get("job_type"):
         data["jobType"] = sp["job_type"]
     if sp.get("hours_old"):
@@ -472,7 +510,8 @@ BUILTIN: dict[str, ActorSpec] = {spec.id: spec for spec in [
               "arrive without them.", "$0.005 per job",
               "location", "unknown",
               ["boards", "location", "distance", "country", "remote", "job_type", "hours", "easy_apply",
-               "fetch_description", "annual_salary", "proxy", "linkedin_company_ids"], build_openclaw),
+               "fetch_description", "annual_salary", "proxy", "linkedin_company_ids"], build_openclaw,
+              caps_total=True),
     ActorSpec("crawlerbros/naukri-scraper", "Naukri",
               "Naukri.com jobs with their descriptions (the Multi Job Board actor returns Naukri without them). One "
               "run per role × city.", "Free actor · Apify usage only", "role_location", "naukri",
@@ -551,6 +590,7 @@ def custom_spec(entry: dict) -> ActorSpec:
             "days_old": _days(sp.get("hours_old")), "is_remote": bool(sp.get("is_remote")),
             "job_type": sp.get("job_type") or "", "sites": sp.get("sites") or [],
             "country": sp.get("country_indeed") or "",
+            "skill": (primary_skills(sp) or [""])[0], "skills": primary_skills(sp),
         }
         bad = unknown_placeholders(template)
         warnings = [f"{entry.get('name') or entry['id']}: unknown placeholders {', '.join(bad)} were sent as text."] if bad else []
@@ -583,6 +623,9 @@ def plan_runs(sp: dict) -> tuple[list[dict], list[str]]:
     if not selected:
         raise ValueError("Choose at least one Apify actor")
     runs, warnings = [], []
+    # What each run was for, stored on its SearchRun: imported jobs are checked against it (app.services.search_scope).
+    scope = {"primary_skills": primary_skills(sp), "is_remote": bool(sp.get("is_remote")),
+             "distance": int(sp.get("distance") if sp.get("distance") is not None else 50)}
     for actor_id in selected:
         spec = specs[actor_id]
         if spec.fan_out == "role_location":
@@ -596,8 +639,9 @@ def plan_runs(sp: dict) -> tuple[list[dict], list[str]]:
         for group_roles, group_locations in groups:
             data, notes = spec.build(sp, group_roles, group_locations)
             warnings.extend(notes)
+            params = {**scope, **({"max_jobs": int(sp.get("max_results") or 20)} if spec.caps_total else {})}
             runs.append({"actor_id": actor_id, "actor_name": spec.name, "input": data,
-                         "location": ", ".join(group_locations), "roles": group_roles})
+                         "location": ", ".join(group_locations), "roles": group_roles, "search_params": params})
     if len(runs) > MAX_RUNS:
         raise ValueError(f"This profile would start {len(runs)} runs; the limit is {MAX_RUNS}. Remove roles, locations or actors.")
     boards = set(sp.get("sites") or [])

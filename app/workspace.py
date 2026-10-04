@@ -843,6 +843,8 @@ class CustomActorIn(BaseModel):
 class SearchProfileIn(BaseModel):
     roles: list[str] = Field(default_factory=list, max_length=5)
     locations: list[str] = Field(default_factory=list, max_length=5)
+    # Python, Java…: the first is added to each role's search, and imported jobs must mention one of them.
+    primary_skills: list[str] = Field(default_factory=list, max_length=3)
     actors: list[str] = Field(default_factory=lambda: list(DEFAULT_ACTORS), max_length=10)
     custom_actors: list[CustomActorIn] = Field(default_factory=list, max_length=10)
     sites: list[str] = Field(default_factory=lambda: ["linkedin", "indeed", "glassdoor"])
@@ -892,6 +894,8 @@ def get_search_profile(db: Session) -> dict:
 
 def validate_search_profile(payload: SearchProfileIn) -> None:
     problems = []
+    if any(len(skill.strip()) > 40 for skill in payload.primary_skills):
+        problems.append("Primary skills are at most 40 characters each")
     if payload.schedule not in ("manual", "daily"):
         problems.append("Schedule must be manual or daily")
     if payload.job_type not in JOB_TYPES:
@@ -1033,7 +1037,8 @@ def run_search_profile(db: Session, sp: dict) -> list[SearchRun]:
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     return [start_apify_search(db, {"actor_id": item["actor_id"], "actor_input": item["input"],
-                                    "location": item["location"]}) for item in plan]
+                                    "location": item["location"], "roles": item["roles"],
+                                    "search_params": item["search_params"]}) for item in plan]
 
 
 @router.post("/api/search/profile/run")

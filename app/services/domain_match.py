@@ -108,7 +108,7 @@ def preferences(db: Session, user_id: int) -> dict[str, Any]:
 
 
 def derived(db: Session, user_id: int) -> dict[str, list[str]]:
-    """Roles and skills the account's own data names: profile, active resume, saved searches."""
+    """Roles and skills the account's own data names: profile, active resume, saved searches (roles, primary skills)."""
     from app.models import CandidateProfile, Resume, SavedSearch
 
     profile = db.scalar(select(CandidateProfile).where(CandidateProfile.user_id == user_id))
@@ -128,6 +128,7 @@ def derived(db: Session, user_id: int) -> dict[str, list[str]]:
         skills += facts.get("primary_skills") or []
     for setup in db.scalars(select(SavedSearch).where(SavedSearch.user_id == user_id)).all():
         roles += [r for r in ((setup.settings or {}).get("roles") or []) if isinstance(r, str)]
+        skills += [s for s in ((setup.settings or {}).get("primary_skills") or []) if isinstance(s, str)]
     clean = lambda values: list(dict.fromkeys(_norm(v) for v in values if isinstance(v, str) and v.strip()))
     return {"roles": clean(roles), "skills": clean(skills)}
 

@@ -259,12 +259,18 @@ def import_apify_items(db: Session, items: list[dict[str, Any]], search_run_id: 
     owner = user_id if user_id is not None else require_user_id(db)
     from app.services import job_removal
 
-    created = normalized = skipped = duplicates = not_matching = previously_removed = 0
+    created = normalized = skipped = duplicates = not_matching = previously_removed = over_limit = 0
+    run = db.get(SearchRun, search_run_id) if search_run_id else None
+    # A setup's "Results per search" is the most jobs one run brings in (actors.ActorSpec.caps_total).
+    max_jobs = ((run.search_params or {}).get("max_jobs") if run is not None else None) or None
     known = {dedupe_key(t, c, loc) for t, c, loc in
              db.execute(select(Job.title, Job.company, Job.location).where(Job.user_id == owner)).all()}
     for item in items:
         if not isinstance(item, dict):
             skipped += 1
+            continue
+        if max_jobs and created >= max_jobs:
+            over_limit += 1
             continue
         job_data = normalize_apify_job(adapt(item) if adapt else item, default_site)
         if not job_data:
@@ -290,7 +296,8 @@ def import_apify_items(db: Session, items: list[dict[str, Any]], search_run_id: 
         created += 1
         not_matching += int(job.domain_match == "NOT_MATCHING")
     return {"seen": len(items), "normalized": normalized, "created": created, "skipped": skipped,
-            "duplicates": duplicates, "not_matching": not_matching, "previously_removed": previously_removed}
+            "duplicates": duplicates, "not_matching": not_matching, "previously_removed": previously_removed,
+            "over_limit": over_limit}
 
 
 def build_apify_input(payload: dict[str, Any]) -> dict[str, Any]:
@@ -410,6 +417,10 @@ def start_apify_search(db: Session, payload: dict[str, Any]) -> SearchRun:
         external_run_id=external_id,
         actor_id=actor_id,
         input_json=actor_input,
+        # The run's scope: imported jobs outside these roles or this location are hidden (app.services.search_scope).
+        roles=list(payload.get("roles") or []) or None,
+        location=payload.get("location") or None,
+        search_params=payload.get("search_params") or None,
         status=str(run.get("status") or "READY"),
         dataset_id=str(run.get("defaultDatasetId") or ""),
     )

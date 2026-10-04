@@ -2,6 +2,7 @@
 
     new job (Apify/Hunter sync, Lever/Greenhouse import)
       → domain filter (app.services.domain_match): not matching → hidden, nothing else happens
+      → search scope (app.services.search_scope): not the run's roles, skills or place → hidden the same way
       → resume: the saved search's pinned resume, else the best-tagged resume (app.services.resume_matching), else
         none (the account's active resume, at use time)
       → description usable? parse it : recover it first (app.services.jd_recovery)
@@ -15,7 +16,7 @@ from __future__ import annotations
 from sqlalchemy.orm import Session
 
 from app.models import Job, Resume, SavedSearch, SearchRun
-from app.services import domain_match, jd_recovery, job_description, resume_matching
+from app.services import domain_match, jd_recovery, job_description, resume_matching, search_scope
 
 
 def setup_resume_choice(db: Session, search_run_id: int | None, owner: int) -> tuple[str, int | None]:
@@ -53,6 +54,8 @@ def admit(db: Session, job: Job, *, search_run_id: int | None = None,
         job.domain_match, job.domain_reason = domain_match.KEPT, "Added by you"
     elif not domain_match.screen(db, job, rules_cache, actor="discovery"):
         return "not_matching"
+    elif not search_scope.screen(db, job, search_run_id or job.search_run_id, actor="discovery"):
+        return "not_matching"  # a role, skill or place its own search did not ask for
     choose_resume(db, job, search_run_id)
     if not jd_recovery.on_new_job(db, job):
         job_description.queue_parse(db, job)

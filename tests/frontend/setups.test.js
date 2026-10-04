@@ -167,6 +167,15 @@ describe('actor picker', () => {
     expect(document.getElementById('use-min_salary').textContent).toBe("Used by HN Who's Hiring");
   });
 
+  it('offers primary skills and sends them with the search', () => {
+    ui.render();
+    expect(document.getElementById('sp-primary_skills').dataset.max).toBe('3');
+    ui.setF('sp', 'primary_skills', ['Python', 'Django']);
+    ui.render();
+    expect([...document.querySelectorAll('[data-tag-box="primary_skills"] .chip')].map(c => c.firstChild.textContent)).toEqual(['Python', 'Django']);
+    expect(ui.searchPayload().primary_skills).toEqual(['Python', 'Django']);
+  });
+
   it('sends the startup settings with the search', () => {
     ui.setF('sp', 'yc_batches', ['W24']);
     ui.setF('sp', 'hn_month', ' 2026-08 ');

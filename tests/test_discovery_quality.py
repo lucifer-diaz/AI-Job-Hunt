@@ -486,3 +486,80 @@ def test_archiving_puts_a_job_away_without_teaching_the_filter(user, client):
     client.post(f"/api/jobs/{job_id}/triage", json={"action": "restore"})
     job = job_of(job_id)
     assert job.status == "discovered" and job.triaged_at is None
+
+
+# ───────────── the search's own scope ─────────────
+
+def _scoped_run(owner: int, **params) -> int:
+    with SessionLocal() as db:
+        db.info["user_id"] = owner
+        run = SearchRun(user_id=owner, provider="apify", external_run_id=uuid.uuid4().hex,
+                        actor_id="openclawai/job-board-scraper", roles=["Backend Engineer"],
+                        location="Bengaluru, India", search_params={"primary_skills": ["Python"], **params})
+        db.add(run)
+        db.commit()
+        return run.id
+
+
+def _item(title: str, location: str, description: str = POSTING) -> dict:
+    return {"title": title, "company": f"Company {uuid.uuid4().hex[:6]}", "location": location, "site": "linkedin",
+            "id": uuid.uuid4().hex, "description": description, "job_url": f"https://example.test/{uuid.uuid4().hex}"}
+
+
+def _import(owner: int, run_id: int, items: list[dict]) -> dict:
+    with SessionLocal() as db:
+        db.info["user_id"] = owner
+        return sources.import_apify_items(db, items, run_id, "linkedin", user_id=owner)
+
+
+def _by_title(owner: int, run_id: int) -> dict[str, Job]:
+    with SessionLocal() as db:
+        return {j.title: j for j in db.scalars(select(Job).where(Job.user_id == owner, Job.search_run_id == run_id))}
+
+
+def test_jobs_outside_the_searchs_roles_skills_or_country_are_hidden(user, client):
+    run_id = _scoped_run(user)
+    stats = _import(user, run_id, [
+        _item("Senior Backend Engineer", "Bengaluru, Karnataka, India"),
+        _item("Data Analyst", "Bengaluru, Karnataka, India"),
+        _item("Backend Engineer", "Austin, TX, United States"),
+        _item("Backend Engineer II", "Pune, India", description=POSTING.replace("Python", "Go")),
+    ])
+    jobs = _by_title(user, run_id)
+    assert stats["created"] == 4 and stats["not_matching"] == 3
+    assert jobs["Senior Backend Engineer"].domain_match == "MATCH"
+    assert jobs["Data Analyst"].domain_reason.startswith("Not one of this search's roles")
+    assert jobs["Backend Engineer"].domain_reason.startswith("Outside this search's location")
+    assert jobs["Backend Engineer II"].domain_reason == "Does not mention Python"
+    for title in ("Data Analyst", "Backend Engineer", "Backend Engineer II"):
+        hidden = jobs[title]
+        assert hidden.state is S.SKIPPED and rows(JobDescriptionParseTask, hidden.id) == []
+        assert rows(JobRankingTask, hidden.id) == [] and rows(JobDescriptionFetchTask, hidden.id) == []
+    assert client.post(f"/api/jobs/{jobs['Data Analyst'].id}/domain-keep").json()["kept"] == [jobs["Data Analyst"].id]
+    assert job_of(jobs["Data Analyst"].id).domain_match == "KEPT"
+
+
+def test_runs_without_a_recorded_scope_import_as_before(user):
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        run = SearchRun(user_id=user, provider="apify", external_run_id=uuid.uuid4().hex)
+        db.add(run)
+        db.commit()
+        run_id = run.id
+    _import(user, run_id, [_item("Data Analyst", "Austin, TX")])
+    assert _by_title(user, run_id)["Data Analyst"].domain_match == "MATCH"
+
+
+def test_the_import_stops_at_the_setups_limit(user):
+    run_id = _scoped_run(user, max_jobs=2)
+    stats = _import(user, run_id, [_item(f"Backend Engineer {n}", "Bengaluru, India") for n in range(5)])
+    assert stats["created"] == 2 and stats["over_limit"] == 3 and len(_by_title(user, run_id)) == 2
+
+
+def test_a_setups_primary_skill_is_never_a_foreign_skill(user):
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        db.add(SavedSearch(user_id=user, name="Java roles", settings={"roles": ["Backend Engineer"],
+                                                                      "primary_skills": ["Java"]}, weekdays=[]))
+        db.commit()
+    assert job_of(add(user, "Senior Java Developer")).domain_match == "MATCH"
