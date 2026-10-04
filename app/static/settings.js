@@ -293,7 +293,7 @@ async function settingsRun(form, action, success) {
   const key = `settings-${form}`;
   if (isBusy(key)) return;
   S.busy[key] = true; delete SETTING_ERRORS[form]; delete SETTINGS_SUCCESS[form]; render();
-  try { await action(); if (success) { SETTINGS_SUCCESS[form] = success; toast(success); } }
+  try { await action(); if (success) { SETTINGS_SUCCESS[form] = success; toast(success); } guideRefresh(true); }  // a save may finish a setup quest
   catch (err) { SETTING_ERRORS[form] = err.message; }
   finally { delete S.busy[key]; render(); if (SETTING_ERRORS[form]) document.getElementById('settings-error')?.scrollIntoView?.({ block: 'nearest' }); }
 }

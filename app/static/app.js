@@ -325,7 +325,7 @@ async function load() {
   try {
     await Promise.all([LOADERS[S.screen](), api('/api/workspace/summary').then(s => { D.summary = s; })]);
   } catch (e) { toast(e.message, true); }
-  if (seq === loadSeq) { render(); focusPacket(); }
+  if (seq === loadSeq) { render(); focusPacket(); guideRefresh(); }
 }
 
 /* ───────────── shell ───────────── */
@@ -335,7 +335,7 @@ function renderNav() {
   const c = D.summary?.counts || {};
   const item = ([id, text, key]) => `<a class="nav-btn ${S.screen === id ? 'on' : ''}" href="#${id}" data-act="go" data-screen="${id}"><span>${text}</span>${key ? `<span class="nav-count">${c[key] ?? '·'}</span>` : `<span class="nav-count">—</span>`}</a>`;
   return `<div class="nav-group"><div class="nav-caps">WORKSPACE</div>${NAV.map(item).join('')}</div>
-    <div class="nav-group"><div class="nav-caps">SETUP</div>${NAV2.map(([id, text]) => `<a class="nav-btn ${S.screen === id ? 'on' : ''}" href="#${id}" data-act="go" data-screen="${id}"><span>${text}</span></a>`).join('')}</div>`;
+    <div class="nav-group"><div class="nav-caps">SETUP</div>${guideNavItem()}${NAV2.map(([id, text]) => `<a class="nav-btn ${S.screen === id ? 'on' : ''}" href="#${id}" data-act="go" data-screen="${id}"><span>${text}</span></a>`).join('')}</div>`;
 }
 function renderSideFoot() {
   const account = BOOT.user ? `<div class="side-card"><div class="side-card-title ellipsis" title="${attr(BOOT.user.email)}">${esc(BOOT.user.email)}</div>
@@ -2242,6 +2242,7 @@ const A = {
   ...JOB_DATA_ACTIONS,
   ...MONITORING_ACTIONS,
   ...INBOX_ACTIONS,
+  ...GUIDE_ACTIONS,
 };
 function tagFallback(form, key) {
   if (form === 'sp') return D.searchProfile?.profile?.[key] || [];
@@ -2397,5 +2398,6 @@ setHash();
 render();
 refreshTasks();
 load().then(async () => {
+  guideBoot();
   try { const prof = await api('/api/profile'); D.profileRoles = prof.target_roles || []; } catch { /* optional */ }
 });

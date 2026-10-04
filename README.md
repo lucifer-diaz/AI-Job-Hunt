@@ -25,6 +25,7 @@ The dashboard is a single-page workspace served from `app/static/app.js`; every 
 | Monitoring | Seven sections — Overview, LLM usage, External APIs, Apify, JD recovery, Logs and AI optimization. Every LLM request and every third-party call: volume, success rate, latency (avg/p50/p95/p99), failures by type, retries, rate limits, tokens, context utilisation and cost, with filters, detail views, trace lookup and the AI Optimization Advisor | `GET /api/monitoring/dashboard`, `GET /api/monitoring/external/dashboard`, `GET /api/monitoring/apify/summary`, `GET /api/monitoring/jd-recovery`, `GET /api/monitoring/logs`, `POST /api/monitoring/analyze` |
 | Knowledge bank | Searchable Answer library and Evidence bank, focused editors, verification filters, copy and removal | `/api/knowledge`, `/api/evidence` |
 | Settings & profile | Candidate details and chip fields, resume variants, re-parse resume into (unverified) evidence, provider/model, your own API keys (stored encrypted), approval mode, cadence | `/api/profile`, `/api/settings`, `PUT /api/settings/keys`, `/api/preferences` |
+| Setup quest | Interactive, gamified setup guide: a welcome screen for new accounts, then a quest map of ten setup tasks (profile, preferences, resume, verified facts, AI model, Apify, search setup, first run, first triage, answer bank) plus an optional Gmail bonus. The AI quest recommends Ollama Cloud's `nemotron-3-nano:30b-cloud` behind a local LiteLLM proxy, with commands to copy. Each quest links to where the work is done; quests tick off by themselves from the account's real data, earn XP and levels (Rookie → Offer Magnet) and are celebrated once. A floating tracker shows the next quest; open the guide from the sidebar or with `?` | `GET /api/setup/guide`, `PUT /api/setup/guide` |
 | Sign-in | Create an account (email, password, confirm password), sign in, sign out | `/signup`, `/login`, `POST /api/auth/signup`, `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/auth/me` |
 
 `⌘K` / `Ctrl+K` opens a command palette that searches every job.
@@ -485,6 +486,41 @@ gateway is off.
 
 PostgreSQL holds the configuration you edit (models, tiers, worker assignments, routing, generation settings and
 LiteLLM sync state). `.env` supplies the bootstrap values and secrets.
+
+### Recommended: one Ollama account behind LiteLLM
+
+For most LLM work, run a LiteLLM proxy on your machine in front of **Ollama Cloud** and give every worker
+**`nemotron-3-nano:30b-cloud`** (NVIDIA Nemotron 3 Nano). The model runs in Ollama Cloud, so no GPU is needed, and
+LiteLLM keeps the model a matter of configuration: change it later in Settings → AI Models. The Setup quest's
+*Connect an AI model* step walks through this.
+
+1. Sign in at [ollama.com](https://ollama.com) and create an API key under
+   [Settings → Keys](https://ollama.com/settings/keys).
+2. Start LiteLLM with the ready-made config in `integrations/litellm/config.ollama-cloud.yaml`:
+
+   ```bash
+   export OLLAMA_API_KEY=...                    # never put it in the YAML: the config reads os.environ/OLLAMA_API_KEY
+   export LITELLM_MASTER_KEY=sk-jobhunt-local     # any secret you choose
+   pip install 'litellm[proxy]'
+   litellm --config integrations/litellm/config.ollama-cloud.yaml --port 4000
+   ```
+
+   The direct Ollama Cloud API names the model without the `-cloud` suffix (`ollama_chat/nemotron-3-nano:30b`
+   at `https://ollama.com`); the config publishes it to Job Hunt OS as `nemotron-3-nano:30b-cloud`. To use a local
+   Ollama that is signed in (`ollama signin`) instead of an API key, use the commented alternative in the same file.
+3. In Job Hunt OS: **Settings → AI Models → LiteLLM**, base URL `http://localhost:4000` and the master key →
+   **Test Connection** → **Sync models from LiteLLM** → **Use LiteLLM gateway**, then assign
+   `nemotron-3-nano:30b-cloud` to the tiers. With `.env` instead:
+
+   ```env
+   LLM_PROVIDER=litellm
+   LITELLM_BASE_URL=http://localhost:4000
+   LITELLM_API_KEY=sk-jobhunt-local
+   LITELLM_SYNC_MODE=disabled          # this minimal proxy has no LiteLLM database
+   LITELLM_TIER_FAST=nemotron-3-nano:30b-cloud
+   LITELLM_TIER_PRIMARY=nemotron-3-nano:30b-cloud
+   LITELLM_TIER_DEEP=nemotron-3-nano:30b-cloud
+   ```
 
 ### LiteLLM setup
 
