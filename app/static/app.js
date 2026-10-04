@@ -437,7 +437,47 @@ function renderOverview() {
         <div><div class="small" style="color:#8a92a8">Applied → first reply</div><div class="mono bb" style="font-size:19px">${days(t.reply)}</div></div></div>
       <div class="small mt16" style="color:#8a92a8;line-height:1.5;padding-top:14px;border-top:1px solid #252c42">${esc(bottleneck)}</div>
       <button class="btn primary block mt12" data-act="go" data-screen="approvals">Clear the approval queue</button></section>
-  </div></div>`;
+  </div>${renderOutcomes(o)}</div>`;
+}
+
+// Applications grouped by location, role or fit band: rows from _outcome_rows in app/workspace.py.
+function outcomeTable(rows, keyLabel) {
+  if (!rows.length) return '<div class="small muted mt12">No applications sent in this window yet.</div>';
+  return `<div class="tgrid outcomes thead"><span>${esc(keyLabel)}</span><span class="tr">APPLIED</span><span class="tr">REPLIES</span><span class="tr">INTERVIEWS</span><span class="tr" title="Reply rate">RATE</span></div>
+    ${rows.map(r => `<div class="tgrid outcomes trow"><span class="b base ellipsis" title="${attr(r.label)}">${esc(r.label)}</span><span class="tr mono small muted">${r.applied}</span><span class="tr mono small muted">${r.replies}</span><span class="tr mono small muted">${r.interviews}</span><span class="tr mono base bb">${esc(r.rate)}</span></div>`).join('')}`;
+}
+// One line on which group answers best and which has gone quiet, once there is enough to say so.
+function outcomeInsight(rows, noun) {
+  const named = rows.filter(r => r.label !== 'Other' && r.label !== 'Other roles' && r.label !== 'Not listed');
+  const best = named.filter(r => r.applied >= 3 && r.replies).sort((a, b) => b.replies / b.applied - a.replies / a.applied)[0];
+  const quiet = named.find(r => r.applied >= 5 && !r.replies);
+  if (!best && !quiet) return rows.length ? `Reply rates by ${noun} firm up after a few applications each.` : '';
+  return [best && `${best.label} replies most (${best.rate} of ${best.applied}).`,
+    quiet && `${quiet.label}: ${quiet.applied} applications, no replies yet.`].filter(Boolean).join(' ');
+}
+function renderOutcomes(o) {
+  const out = o.outcomes, span = `last ${o.outcome_days} days`;
+  const tableCard = (title, sub, rows, key, noun) => `<section class="card" style="flex:1 1 380px;min-width:0"><div class="row base between wrap"><div class="card-title mb4">${esc(title)}</div><span class="small muted">${span}</span></div><div class="card-sub mb14">${esc(sub)}</div>
+      ${outcomeTable(rows, key)}${rows.length ? `<div class="small muted mt12">${esc(outcomeInsight(rows, noun))}</div>` : ''}</section>`;
+  const ended = `<section class="card" style="flex:1 1 380px;min-width:0"><div class="row base between wrap"><div class="card-title mb4">How applications ended</div><span class="small muted">${span}</span></div>
+      <div class="card-sub mb14">${out.total ? `${out.response_rate} heard back from the company — ${out.answered} of ${out.total}, rejections included.` : 'Where every application sent stands now.'}</div>
+      ${out.total ? `<div class="stackbar">${out.buckets.map(b => `<i style="width:${attr(b.pct)};background:${attr(b.color)}" title="${attr(`${b.label}: ${b.n}`)}"></i>`).join('')}</div>
+      <div class="col gap8 mt14">${out.buckets.map(b => `<div class="row between small"><span class="row gap8"><span class="dot" style="background:${attr(b.color)}"></span>${esc(b.label)}</span><span class="mono muted">${b.n} · ${esc(b.pct)}</span></div>`).join('')}</div>`
+      : '<div class="small muted">No applications sent in the last ' + o.outcome_days + ' days.</div>'}</section>`;
+  const fitRows = o.fit_vs_outcome;
+  const fit = `<section class="card" style="flex:1 1 280px;min-width:0"><div class="card-title mb4">Does fit predict replies?</div><div class="card-sub mb14">Reply rate by the ranker's fit score.</div>
+      <div class="col gap12">${fitRows.length ? fitRows.map(r => `<div><div class="row between small mb4"><span style="font-weight:500">${esc(r.label)}</span><span class="mono muted">${r.replies}/${r.applied} · ${esc(r.rate)}</span></div>${bar(r.rate === '—' ? '0%' : r.rate, '#0f9c86', 'thick')}</div>`).join('') : '<div class="small muted">No applications sent yet.</div>'}</div></section>`;
+  const inbox = o.inbox
+    ? `<section class="card" style="flex:1 1 280px;min-width:0"><div class="row base between wrap"><div class="card-title mb4">Company emails</div><span class="small muted">last 30 days</span></div><div class="card-sub mb14">${o.inbox.total} email${o.inbox.total === 1 ? '' : 's'} matched to your applications by the Application Inbox.</div>
+      <div class="statgrid">${o.inbox.groups.map(g => `<div class="box"><div class="mono bb" style="font-size:19px">${g.n}</div><div class="tiny muted">${esc(g.label)}</div></div>`).join('')}</div>
+      ${o.inbox.needs_action ? `<button class="btn block mt12" data-act="go" data-screen="tracker" data-view="inbox">${o.inbox.needs_action} email${o.inbox.needs_action === 1 ? ' needs' : 's need'} a reply or action</button>` : ''}</section>`
+    : `<section class="card" style="flex:1 1 280px;min-width:0"><div class="card-title mb4">Company emails</div><div class="small muted">Connect Gmail in Settings → Application Inbox to count interview invites, assessments and rejections here.</div></section>`;
+  const passed = o.pass_reasons.length ? `<section class="card" style="flex:1 1 280px;min-width:0"><div class="card-title mb4">Why you pass on jobs</div><div class="card-sub mb14">Reasons given when turning jobs down, last 30 days. Tighten the search setup for the top one.</div>
+      <div class="col gap12">${o.pass_reasons.map((r, i) => `<div><div class="row between small mb4"><span style="font-weight:500">${esc(r.label)}</span><span class="mono muted">${r.n}</span></div>${bar(r.pct, ['#c22f4e', '#e0a136', '#a79bf0', '#c6cad8'][i], 'thick')}</div>`).join('')}</div></section>` : '';
+  return `<div class="split gap16">${tableCard('Where companies reply', 'Replies by job location. Remote roles are grouped together.', o.by_location, 'LOCATION', 'location')}
+    ${tableCard('Which roles get replies', 'Replies by your target roles, then by role type (AI/ML Engineer, Software Engineer…) read from the job title. Levels like Senior or Staff are grouped together.', o.by_role, 'ROLE', 'role')}</div>
+  <div class="split gap16">${ended}${fit}</div>
+  <div class="split gap16">${inbox}${passed}</div>`;
 }
 
 /* ───────────── today ───────────── */
@@ -1745,6 +1785,8 @@ const A = {
   go: el => go(el.dataset.screen, {
     ...(el.dataset.mode ? { discMode: el.dataset.mode } : {}), ...(el.dataset.job ? { tailorJob: Number(el.dataset.job), tailorMode: 'single', tailorTab: 'diff' } : {}),
     ...(el.dataset.approval ? { approvalJob: Number(el.dataset.approval) } : {}), ...(el.dataset.app ? { selApp: Number(el.dataset.app), trackerView: 'board' } : {}),
+    // The tracker's Inbox insights view, reloaded so it shows the emails the button counted.
+    ...(el.dataset.view === 'inbox' ? (D.inbox = undefined, { trackerView: 'inbox', selApp: null }) : {}),
     jobOpen: null, kitJob: null, paletteOpen: false,
   }),
   variant: el => {
