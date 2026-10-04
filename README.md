@@ -2292,6 +2292,8 @@ PLAYWRIGHT_NAVIGATION_TIMEOUT_SECONDS=45
 PLAYWRIGHT_PAGE_TIMEOUT_SECONDS=60
 PLAYWRIGHT_MAX_CONCURRENCY=2
 PLAYWRIGHT_KEEP_BROWSER_RUNNING=true
+PLAYWRIGHT_BLOCK_NONESSENTIAL_RESOURCES=false
+PLAYWRIGHT_DEBUG_ARTIFACTS=false
 ```
 
 Turn automatic recovery off with `JD_FETCH_ENABLED=false` (jobs are then parsed as they arrive, as before); turn the
@@ -2323,14 +2325,19 @@ PLAYWRIGHT_HEADLESS=false PLAYWRIGHT_MAX_CONCURRENCY=1 uvicorn app.main:app --re
 A Chromium window opens for each page the recovery worker renders, which is the quickest way to see why a site's
 container is not found. The Docker image only has the headless shell, so headed mode is for local runs.
 
+Set `PLAYWRIGHT_DEBUG_ARTIFACTS=true` to keep failure-only screenshots and limited metadata under
+`data/playwright-debug/`. At most 20 screenshot/metadata pairs are retained; delete that directory when diagnosis is
+complete. Rendered HTML is deliberately not persisted because job pages can contain personal or sensitive data.
+
 ### The shared browser
 
 `app/infrastructure/browser/` is the one way Job Hunt OS drives a browser (`get_browser_service()`), so later
 features (ATS form assistance, confirmation capture) reuse it:
 
 - lazy: nothing starts with the app; the first page starts Playwright and one Chromium process;
-- each task gets an isolated context and page — no cookies, storage, service workers or downloads survive it —
-  closed even when the task fails; images, media and fonts are not downloaded;
+- each task gets an isolated context and page — no cookies or storage survive it — closed even when the task fails;
+  JavaScript, service workers, images, media and fonts work normally. Set
+  `PLAYWRIGHT_BLOCK_NONESSENTIAL_RESOURCES=true` only when the compatibility tradeoff is acceptable;
 - navigation waits for `domcontentloaded`, then a known container and for the text to stop growing, within
   `PLAYWRIGHT_NAVIGATION_TIMEOUT_SECONDS` / `PLAYWRIGHT_PAGE_TIMEOUT_SECONDS` — never `networkidle`;
 - at most `PLAYWRIGHT_MAX_CONCURRENCY` pages at once; a crashed Chromium is started again on next use;
@@ -2340,6 +2347,15 @@ features (ATS form assistance, confirmation capture) reuse it:
 
 Every page load is an External API row (provider `WEB`, service `playwright`), beside the HTTP fetches (`WEB`,
 `job_posting`, operation `jd_recovery_http`).
+
+The recovery path is **HTTP → Python Playwright fallback → deterministic extraction → optional LLM block selection
+→ validation → persistence**. Job Hunt OS launches Chromium lazily and directly through Python Playwright. Playwright
+MCP is not used and no separate browser server or `npx @playwright/mcp` process is required.
+
+A bare HTTP 403 (`ACCESS_DENIED`) gets one ordinary Chromium attempt because it is not necessarily an anti-bot
+challenge. Explicit CAPTCHA/anti-bot content, login walls and HTTP 429 responses are never retried in the browser;
+rendered access-denied or challenge pages are recorded as blocked. Initial URLs, redirects, and browser subrequests
+remain subject to the private/internal-network safety checks.
 
 ### Recovery statuses
 
