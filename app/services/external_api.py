@@ -403,6 +403,8 @@ def hold_off(call: ExternalCall, *, method: str | None = None, url: str | None =
     `skipped_by: cooldown` and no HTTP status, since nothing was sent.
     """
     owner = owner_of(call)
+    if backoff.bypassing():  # a task a person asked to run now (app.services.workers)
+        return
     try:
         backoff.check(owner, call.provider)
         return

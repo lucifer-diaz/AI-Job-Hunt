@@ -8,7 +8,7 @@ const settingsSource = readFileSync('app/static/settings.js', 'utf8');
 const resumeDataSource = readFileSync('app/static/resume_data.js', 'utf8');
 const jobDataSource = readFileSync('app/static/job_data.js', 'utf8');
 const appSource = readFileSync('app/static/app.js', 'utf8').split('/* ───────────── boot ───────────── */')[0];
-const names = ['S', 'D', 'A', 'setF', 'render', 'readHash', 'setHash', 'settingsNavigate', 'settingsChanges', 'settingsPayload', 'settingsDirty', 'settingsCanLeave', 'settingsSave', 'settingsUploadResume', 'settingsUseResume', 'profileCompleteness', 'addTags', 'commitTag', 'SETTING_ERRORS', 'SETTINGS_SECTIONS', 'SETTINGS_ACTIONS', 'RD', 'resumeDataDirty', 'rdReset', 'JD', 'renderJobStructured', 'jobDataInput'];
+const names = ['S', 'D', 'A', 'setF', 'render', 'readHash', 'setHash', 'orchState', 'settingsNavigate', 'settingsChanges', 'settingsPayload', 'settingsDirty', 'settingsCanLeave', 'settingsSave', 'settingsUploadResume', 'settingsUseResume', 'profileCompleteness', 'addTags', 'commitTag', 'SETTING_ERRORS', 'SETTINGS_SECTIONS', 'SETTINGS_ACTIONS', 'RD', 'resumeDataDirty', 'rdReset', 'JD', 'renderJobStructured', 'jobDataInput'];
 let ui, fetchMock, context;
 function response(data, status = 200) { return { ok: status < 400, status, text: async () => JSON.stringify(data) }; }
 function data() {
@@ -33,6 +33,8 @@ beforeEach(() => {
   if (!ui) {
     context = createContext({ document, window, location, history, navigator, URLSearchParams, FormData, File, setTimeout, clearTimeout, setInterval, clearInterval, console });
     runInContext(readFileSync('app/static/monitoring.js', 'utf8'), context, { filename: 'monitoring.js' });
+    runInContext(readFileSync('app/static/orchestration.js', 'utf8'), context, { filename: 'orchestration.js' });
+    runInContext(readFileSync('app/static/workers.js', 'utf8'), context, { filename: 'workers.js' });
     runInContext(settingsSource, context, { filename: resolve('app/static/settings.js') });
     runInContext(resumeDataSource, context, { filename: resolve('app/static/resume_data.js') });
     runInContext(jobDataSource, context, { filename: resolve('app/static/job_data.js') });
@@ -67,7 +69,12 @@ describe('focused settings UI', () => {
     history.replaceState(null, '', '#settings'); ui.readHash(); expect(ui.S.settingsSection).toBe('profile');
     history.replaceState(null, '', '#settings/api-keys'); ui.readHash(); expect(ui.S.settingsSection).toBe('api-keys');
     history.replaceState(null, '', '#settings/unknown'); ui.readHash(); expect(ui.S.settingsSection).toBe('profile');
-    ui.settingsNavigate('ai'); expect(location.hash).toBe('#settings/ai');
+    ui.settingsNavigate('workflow'); expect(location.hash).toBe('#settings/workflow');
+    // AI models moved to AI Orchestration → Models & routing; old links land there.
+    expect([...document.querySelectorAll('.settings-nav a')].map(x => x.getAttribute('href'))).not.toContain('#settings/ai');
+    history.replaceState(null, '', '#settings/ai'); ui.readHash();
+    expect(ui.S.screen).toBe('orchestration'); expect(ui.orchState().workspace).toBe('models');
+    ui.S.screen = 'settings';
   });
   it('retains independent drafts and discards only the selected editor', () => {
     input('profile-name', 'Edited name'); ui.settingsNavigate('preferences');
@@ -117,7 +124,7 @@ describe('focused settings UI', () => {
     ui.setF('profile', 'name', 'Unsaved'); confirm.mockReturnValueOnce(false);
     expect(ui.settingsCanLeave('overview')).toBe(false);
     section('account'); ui.setF('account', 'new_password', 'temporary password');
-    ui.settingsNavigate('ai'); expect(ui.S.forms.account).toBeUndefined(); expect(ui.S.forms.profile.name).toBe('Unsaved');
+    ui.settingsNavigate('workflow'); expect(ui.S.forms.account).toBeUndefined(); expect(ui.S.forms.profile.name).toBe('Unsaved');
     expect(ui.settingsCanLeave('overview')).toBe(true); expect(ui.S.forms.profile).toBeUndefined();
   });
   it('saves one provider without changing or exposing another', async () => {

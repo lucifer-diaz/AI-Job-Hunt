@@ -167,3 +167,8 @@ def validate_transition(current: object, target: object, *, previous_state: obje
                                     f"Only a job archived by ranking can be re-ranked (it was archived from {previous_state})")
         raise InvalidTransition(current_state, target_state)
     return target_state
+
+
+# A task a person stopped from Running workers ends with this note. It is a decision, not a failure: no automatic sweep
+# queues the job again for that worker; Retry or Run now does.
+STOPPED_BY_USER = "Stopped by you"

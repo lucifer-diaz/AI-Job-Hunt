@@ -1,4 +1,4 @@
-"""Settings → AI Models: the HTTP API over the AI configuration service (app.services.ai_model_config).
+"""AI Orchestration → Models: the HTTP API over the AI configuration service (app.services.ai_model_config).
 
 Edits change the draft (desired configuration) only; POST /apply makes the draft the active configuration, and
 workers pick it up on their next request. Every write that changes the draft accepts the `revision` the client

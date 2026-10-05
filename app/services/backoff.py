@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -277,3 +279,41 @@ def active(db: Session, user_id: int, *, now: datetime | None = None) -> list[di
              "consecutive": row.consecutive, "calls_skipped": row.calls_skipped,
              "last_limited_at": row.last_limited_at.isoformat() if row.last_limited_at else None}
             for row in rows if row.until and row.until > moment]
+
+
+def reset(db: Session, user_id: int, provider: str | None = None) -> list[str]:
+    """Clear this account's cooldowns (one provider, or all of them) because a person asked to, from Running workers.
+
+    The ladder starts again from the bottom: the next 429 starts a fresh, short cooldown. Commits."""
+    from sqlalchemy import delete, select
+
+    from app.models import ProviderCooldown
+
+    condition = [ProviderCooldown.user_id == user_id]
+    if provider:
+        condition.append(ProviderCooldown.provider == provider.upper())
+    names = list(db.scalars(select(ProviderCooldown.provider).where(*condition)).all())
+    if names:
+        db.execute(delete(ProviderCooldown).where(*condition).execution_options(synchronize_session=False))
+        db.commit()
+    reset_cache()
+    return sorted(names)
+
+
+# A task a person asked to run now makes its calls even while its provider is cooling down (app.services.workers).
+# Ambient, like the trace: the worker sets it around that one task and every external call underneath inherits it.
+_bypass: ContextVar[bool] = ContextVar("jobhunt_backoff_bypass", default=False)
+
+
+@contextmanager
+def bypass(enabled: bool = True) -> Iterator[None]:
+    """Skip cooldown checks inside the block. A 429 is still recorded, so the cooldown starts again if it recurs."""
+    token = _bypass.set(bool(enabled) or _bypass.get())
+    try:
+        yield
+    finally:
+        _bypass.reset(token)
+
+
+def bypassing() -> bool:
+    return _bypass.get()

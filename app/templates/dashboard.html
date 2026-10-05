@@ -17,9 +17,14 @@
     </div>
     <nav id="nav">
       <div class="nav-group"><div class="nav-caps">WORKSPACE</div>
-        {% for id, label in [('overview','Overview'),('today','Today'),('discovery','Discovery'),('tailor','Tailor'),('approvals','Approvals'),('tracker','Tracker'),('monitoring','Monitoring')] %}
+        {% for id, label in [('overview','Overview'),('today','Today'),('discovery','Discovery'),('tailor','Tailor'),('approvals','Approvals'),('tracker','Tracker')] %}
         <a class="nav-btn" href="#{{ id }}"><span>{{ label }}</span></a>
         {% endfor %}
+      </div>
+      <div class="nav-group"><div class="nav-caps">SYSTEM</div>
+        <a class="nav-btn" href="#orchestration"><span>AI Orchestration</span></a>
+        <a class="nav-btn" href="#workers"><span>Running workers</span></a>
+        <a class="nav-btn" href="#monitoring"><span>Monitoring</span></a>
       </div>
       <div class="nav-group"><div class="nav-caps">SETUP</div>
         <a class="nav-btn" href="#"><span>Setup quest</span></a>
@@ -44,6 +49,8 @@
 <script src="/static/resume_data.js?v={{ version }}"></script>
 <script src="/static/job_data.js?v={{ version }}"></script>
 <script src="/static/monitoring.js?v={{ version }}"></script>
+<script src="/static/orchestration.js?v={{ version }}"></script>
+<script src="/static/workers.js?v={{ version }}"></script>
 <script src="/static/knowledge.js?v={{ version }}"></script>
 <script src="/static/inbox.js?v={{ version }}"></script>
 <script src="/static/guide.js?v={{ version }}"></script>

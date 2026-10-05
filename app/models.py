@@ -657,6 +657,8 @@ class JobDescriptionParseTask(Base):
     locked_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
     lock_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
     lock_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Asked to run now from Running workers (app.services.workers): claimed first, without waiting. Cleared on claim.
+    run_now_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -717,6 +719,8 @@ class JobDescriptionFetchTask(Base):
     locked_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
     lock_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
     lock_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Asked to run now from Running workers (app.services.workers): claimed first, without waiting. Cleared on claim.
+    run_now_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -911,6 +915,8 @@ class TailorTask(Base):
     result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     locked_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
     lock_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Asked to run now from Running workers (app.services.workers): claimed first, without waiting. Cleared on claim.
+    run_now_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -1333,6 +1339,8 @@ class JobRankingTask(Base):
     locked_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
     lock_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
     lock_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Asked to run now from Running workers (app.services.workers): claimed first, without waiting. Cleared on claim.
+    run_now_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -1552,6 +1560,20 @@ class ExternalAPIRequestLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
 
+class ServerSetting(Base):
+    """A server-wide worker setting an admin changed in Running workers → Settings (app.services.server_settings).
+
+    Not owned by an account: it paces the scheduler jobs every account shares. No row means the environment value.
+    """
+
+    __tablename__ = "server_settings"
+
+    name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[int] = mapped_column(Integer)
+    updated_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+
 class ProviderCooldown(Base):
     """How long one account must leave a provider alone after it said 429 (app.services.backoff).
 
@@ -1758,7 +1780,7 @@ class McpToken(Base):
     user: Mapped[User] = relationship(back_populates="mcp_tokens")
 
 
-# ───────────── AI model configuration (Settings → AI Models) ─────────────
+# ───────────── AI model configuration (AI Orchestration → Models) ─────────────
 # PostgreSQL is the source of truth for what an account wants its AI workers to use. The editable rows below are
 # the *desired* (draft) configuration; an Apply validates them, pushes the parts that live inside LiteLLM, and
 # freezes the result as an AIConfigVersion. Workers only ever read the latest version (the *active* one).

@@ -202,6 +202,73 @@ Inbox Agent). The rules a change has to keep:
   status (`failed`, `connection_required`, `rate_limited`); a model failure leaves the message PENDING for retry and
   never loses it.
 
+## AI Orchestration
+
+`app/services/orchestration.py` (runtime) and `app/services/orchestration_topology.py` (the stage registry) back the
+AI Orchestration workspace (README §9a). It is a read-only projection; the rules a change has to keep:
+
+* **Orchestration owns no state.** It reads business tables, Monitoring telemetry and the active AI configuration. Do
+  not add a packet, workflow-event or orchestration table while those sources can answer the question; if one truly
+  cannot, add the fact at the shared layer that owns it (a transition in `work_queue.transition`, a task column), not
+  a parallel log.
+* **Every `/api/orchestration/*` endpoint is a GET, and the graph changes nothing.** Its Models & routing workspace
+  (`app/static/ai_models.js`, `#orchestration/models`) is the one place models are managed, over `/api/settings/ai/*`;
+  model changes keep going through draft → preview → apply → version.
+* **Deterministic and never inferred.** Node health follows `HealthPolicy` (thresholds in one place, shown in the UI).
+  The actual model comes only from `llm_request_logs.model`; unknown stays unknown. Edge timing is shown only when
+  both timestamps live on the same row. No model is ever called to render or describe anything.
+* **Metadata only.** No prompt or response text, resume, cover letter, email subject/sender/body, application answer
+  or credential in any orchestration payload; error text goes through `redaction.redact_text`. The every-account view
+  (admin) returns aggregates only — titles, packets and traces stay the viewer's own.
+* **Bounded.** Every query has a limit; the graph is cached briefly; the live poll reads active task rows only;
+  history and node detail load lazily.
+
+**Any new AI workflow stage must:**
+
+1. declare a stable worker identifier (`app/services/ai_workers.py`) and stage identifier (a `Node.id` in
+   `orchestration_topology.NODES`; never rename one),
+2. call models only through the centralized LLM gateway (`LLMClient.generate_prompt`), so its requests are recorded
+   with their worker, stage and models,
+3. move or record workflow state through the shared layer (`work_queue.transition`, its task table, the tracker) so
+   orchestration can place a job there,
+4. be registered with the topology: its `types` (honestly — a deterministic step is not `AI`), `workers`,
+   `llm_stages`, `external` matches, `states`, and the edges it takes part in, each with the stored fact it counts
+   (`measure`); `orchestration_topology.validate()` must stay empty,
+5. never expose secrets or prompt bodies through orchestration APIs.
+
+The frontend (`app/static/orchestration.js`) renders whatever the registry returns; do not hard-code stage names in
+other static files.
+
+## Running workers
+
+`app/services/workers.py` and `app/workers_api.py` back Running workers (README §9b). The rules a change has to keep:
+
+* **Every queued worker registers a `WorkerKind`** (task model, statuses, max attempts, scheduler job, orchestration
+  node). The screen renders whatever the registry returns.
+* **A worker's claim honours `run_now_at`:** order run-now tasks first, clear the column on claim, carry `run_now` on the
+  claim, and run that task inside `backoff.bypass(claim.run_now)`. Never bypass a cooldown any other way.
+* **Every write a worker makes after its model or network call stays lease-guarded** (a lock token or a per-claim holder
+  name), so a kill is always safe; a run that commits business data from its own session checks its holder inside that
+  same transaction (tailoring: a `before_commit` guard), never only at a checkpoint before it.
+* **Kill stops, it does not requeue.** A stopped task ends with `lifecycle.STOPPED_BY_USER` and every sweep must leave
+  its job alone until a person asks again (Retry, Run now). A new automatic sweep has to honour that.
+* **Kill and run-now only move the account's own task rows** (and, for kill-all, clear its cooldowns). They never
+  change configuration, never delete history, and never move a job past a state the workflow would not.
+* **Worker settings have two scopes.** An account's own (`app/services/worker_settings.py`: run automatically, attempts,
+  retry waits, recovery's fallbacks) are read per task with `worker_settings.get/for_user`, never cached across accounts,
+  and a value never set follows the server. Server-wide ones (scheduler intervals, batch sizes, concurrency) are read
+  through `server_settings.value(name)` — never `get_settings()` directly for an editable name — and only an admin
+  changes them. Adding a setting means adding it to `FIELDS` / `EDITABLE`; the screen renders whatever they describe.
+* **A queued worker's scheduler pass goes through `scheduled_jobs.run_live`**: it claims tasks as slots free up,
+  re-reads its server limits every few seconds and passes a `heartbeat` (`scheduled_jobs.renew`) that renews held
+  leases and lets the pass drop a stopped task. Never claim a whole batch up front behind a fixed semaphore.
+* **Long blocking work runs on `threads.run_work`, scheduler bookkeeping on `threads.run_io`** — never on the default
+  `asyncio.to_thread` pool, which a few slow model calls can fill and stall every scheduled job.
+* **Bulk retry is many single retries** (`workers.retry`): each task goes through `_requeue_finished`, is skipped with a
+  reason rather than failing the batch, and never gets `run_now_at` — a bulk retry never bypasses a provider cooldown.
+* **A paused worker holds its queue, never drops it.** Its claim skips the account's tasks unless `run_now_at` is set
+  (ranking: unless the task is forced).
+
 ## Traces
 
 `app/services/tracing.py` holds an ambient correlation ID. Scheduler jobs and HTTP requests open one; nested

@@ -54,6 +54,8 @@ from app.models import (
     SearchRun,
 )
 from app.monitoring_api import router as monitoring_router
+from app.orchestration_api import router as orchestration_router
+from app.workers_api import router as workers_router
 from app.resume_api import router as resume_router
 from app.scheduler import build_scheduler
 from app.scheduler_hooks import run_soon
@@ -83,6 +85,7 @@ from app.services import (
     mcp_tokens,
     ranker,
     resume_verification,
+    server_settings,
     tailor_tasks,
     tracing,
 )
@@ -167,6 +170,8 @@ app.include_router(auth_router)
 app.include_router(workspace_router)
 app.include_router(hunter_router)
 app.include_router(monitoring_router)
+app.include_router(orchestration_router)
+app.include_router(workers_router)
 app.include_router(resume_router)
 app.include_router(job_description_router)
 app.include_router(discovery_router)
@@ -316,7 +321,7 @@ def settings_get(db: Session = Depends(get_user_db)):
             "rate_limits": backoff.policy_for(db, value.user_id).public(),
             # Whether ranking queues qualified jobs for tailoring by itself (app.services.auto_tailor).
             "auto_tailor": auto_tailor_for(db),
-            "ranking_interval_server_minutes": settings.ranking_interval_minutes,
+            "ranking_interval_server_minutes": server_settings.value("ranking_interval_minutes"),
             "configured": {**configured, "mock": True, "litellm": bool(gateway_settings(db, value.user_id)[0])},
             "keys": keys,
             "secret_storage": bool(settings.secret_key),

@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     session_cookie_secure: bool | None = None
 
     # LLM provider: litellm | openai | anthropic | openrouter | gemini | mock. `litellm` is gateway mode: every
-    # worker's model comes from Settings → AI Models and every request goes through the LiteLLM proxy.
+    # worker's model comes from AI Orchestration → Models and every request goes through the LiteLLM proxy.
     llm_provider: str = "openrouter"
     upload_dir: str = "./data/resumes"
     max_resume_upload_mb: int = 8
@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     llm_request_timeout_seconds: int = 120
     llm_max_retries: int = 1
 
-    # LiteLLM gateway (Settings → AI Models). These are bootstrap values: an account's saved connection wins.
+    # LiteLLM gateway (AI Orchestration → Models). These are bootstrap values: an account's saved connection wins.
     # LITELLM_API_KEY is copied (encrypted) into the FIRST account only, like the provider keys above.
     litellm_base_url: str | None = None
     litellm_api_key: str | None = None

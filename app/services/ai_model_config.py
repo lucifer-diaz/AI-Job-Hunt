@@ -1,6 +1,6 @@
 """The AI configuration service: the one way an account's AI model configuration changes.
 
-    Settings → AI Models: edit ──► draft rows (the desired configuration, PostgreSQL)
+    AI Orchestration → Models: edit ──► draft rows (the desired configuration, PostgreSQL)
                                      │
     Preview ──► diff(active version, draft) + validation + the LiteLLM sync plan
                                      │
@@ -277,7 +277,7 @@ def api_for(db: Session, user_id: int, service: str = "admin") -> LiteLLMAPI:
     url, key = base_url(conn), api_key(db, conn)
     db.commit()
     if not url:
-        raise AIConfigError("Add the LiteLLM base URL first (Settings → AI Models → LiteLLM)")
+        raise AIConfigError("Add the LiteLLM base URL first (AI Orchestration → Models → LiteLLM connection)")
     return LiteLLMAPI(url, key, user_id=user_id, service=service)
 
 
@@ -1430,7 +1430,7 @@ def usage_by_model(db: Session, user_id: int, snapshot: dict[str, Any]) -> dict[
 
 
 def overview(db: Session, user_id: int) -> dict[str, Any]:
-    """Everything Settings → AI Models shows, in one response. Makes no LiteLLM call."""
+    """Everything AI Orchestration → Models shows, in one response. Makes no LiteLLM call."""
     ensure_seeded(db, user_id)
     conn = connection_for(db, user_id)
     active = active_version(db, user_id)

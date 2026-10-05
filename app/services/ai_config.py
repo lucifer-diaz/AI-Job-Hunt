@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-# `litellm` is gateway mode: models come from Settings → AI Models per worker (app.services.model_resolution),
+# `litellm` is gateway mode: models come from AI Orchestration → Models per worker (app.services.model_resolution),
 # so the stage models below only apply to the direct providers.
 PROVIDERS = ("litellm", "openrouter", "openai", "anthropic", "gemini", "mock")
 STAGES = (("rank", "Rank"), ("tailor", "Tailor"), ("review", "Review"), ("followup", "Follow-up"))

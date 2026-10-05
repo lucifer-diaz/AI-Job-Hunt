@@ -37,14 +37,14 @@ beforeEach(() => {
   vi.stubGlobal('fetch', fetchMock);
   if (!ui) {
     context = createContext({ document, window, location, history, navigator, URLSearchParams, FormData, File, Intl, setTimeout, clearTimeout, setInterval, clearInterval, console });
-    for (const file of ['monitoring.js', 'settings.js', 'resume_data.js', 'job_data.js', 'knowledge.js', 'inbox.js', 'guide.js']) {
+    for (const file of ['monitoring.js', 'orchestration.js', 'workers.js', 'settings.js', 'resume_data.js', 'job_data.js', 'knowledge.js', 'inbox.js', 'guide.js']) {
       runInContext(readFileSync(`app/static/${file}`, 'utf8'), context, { filename: resolve(`app/static/${file}`) });
     }
     runInContext(appSource, context, { filename: resolve('app/static/app.js') });
     ui = runInContext(`({${names.join(',')}})`, context);
   }
   context.fetch = fetchMock;
-  ui.S.forms = {}; ui.S.busy = {}; ui.S.screen = 'discovery'; ui.S.discMode = 'ranking'; ui.S.polling = null;
+  ui.S.forms = {}; ui.S.busy = {}; ui.S.screen = 'workers'; ui.S.wk = { tab: 'ranking', range: '7d' }; ui.D.wk = { workers: [{ kind: 'parsing', label: 'JD parsing', counts: { running: 0, queued: 0, retrying: 0, active: 0 } }, { kind: 'recovery', label: 'JD recovery', counts: { running: 0, queued: 0, retrying: 0, active: 0 } }, { kind: 'ranking', label: 'Ranking', description: 'Scores each job', counts: { running: 1, queued: 2, retrying: 0, active: 3 }, scheduler: { enabled: true, interval_minutes: 2 } }, { kind: 'tailoring', label: 'Tailoring', counts: { running: 0, queued: 0, retrying: 0, active: 0 } }], cooldowns: [], active: 3, running: 1 }; ui.S.polling = null;
   Object.assign(ui.D, { ranking: tracker(), setups: [],
     summary: { profile: {}, counts: {}, application_mode: 'manual_approval', model: 'm', total_jobs: 1,
       auto_search: { schedule: 'manual', setups: 0, roles: 0, locations: 0, next_run: null, last_run: null } } });
@@ -91,6 +91,6 @@ describe('ranking queue progress', () => {
   it('says how many rankings run at once and links to the setting', () => {
     expect(view().textContent).toContain('Up to 5 rankings at a time');
     expect(view().textContent).toContain('about 1m each');
-    expect(view().querySelector('a[href="#settings/workflow"]').textContent).toBe('change');
+    expect([...view().querySelectorAll('a[href="#workers/settings"]')].map(a => a.textContent)).toContain('change');
   });
 });

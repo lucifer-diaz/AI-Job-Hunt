@@ -93,7 +93,7 @@ def test_every_quest_fits_in_the_xp_ladder():
 
 def test_the_ai_quest_recommends_ollama_cloud_through_litellm(client):
     ai = quest(client.get("/api/setup/guide").json(), "ai")
-    assert ai["screen"] == "settings" and ai["section"] == "ai"
+    assert ai["screen"] == "orchestration" and ai["section"] == "models"  # AI models live in AI Orchestration
     assert "nemotron-3-nano:30b-cloud" in ai["recommended"] and "LiteLLM" in ai["recommended"]
     assert "integrations/litellm/config.ollama-cloud.yaml" in ai["snippet"]
     assert any(link["url"] == "https://ollama.com/settings/keys" for link in ai["links"])

@@ -214,6 +214,7 @@ const GUIDE_TARGETS = {
   settings: section => ['settings', { settingsSection: section }],
   discovery: section => ['discovery', { discMode: section }],
   knowledge: section => ['knowledge', { knowledgeSection: section }],
+  orchestration: section => { orchState().workspace = section === 'models' ? 'models' : 'pipeline'; return ['orchestration', {}]; },
 };
 const GUIDE_ACTIONS = {
   'guide-open': el => guideOpen(GUIDE.data?.complete ? 'complete' : 'map', el.dataset.id || null),

@@ -25,13 +25,13 @@ beforeEach(() => {
   if (!ui) {
     const context = createContext({ document, window, location, history, navigator, URLSearchParams, FormData, File, Intl,
       setTimeout, clearTimeout, setInterval, clearInterval, console, fetch: vi.fn() });
-    for (const file of ['monitoring.js', 'settings.js', 'resume_data.js', 'job_data.js', 'knowledge.js', 'inbox.js', 'guide.js']) {
+    for (const file of ['monitoring.js', 'orchestration.js', 'workers.js', 'settings.js', 'resume_data.js', 'job_data.js', 'knowledge.js', 'inbox.js', 'guide.js']) {
       runInContext(readFileSync(`app/static/${file}`, 'utf8'), context, { filename: resolve(`app/static/${file}`) });
     }
     runInContext(appSource, context, { filename: resolve('app/static/app.js') });
     ui = runInContext('({ S, D, render, renderTaskStack })', context);
   }
-  ui.S.screen = 'discovery'; ui.S.discMode = 'ranking'; ui.S.jobOpen = null; ui.S.busy = {};
+  ui.S.screen = 'workers'; ui.S.wk = { tab: 'ranking', range: '7d' }; ui.D.wk = { workers: [{ kind: 'parsing', label: 'JD parsing', counts: { running: 0, queued: 0, retrying: 0, active: 0 } }, { kind: 'recovery', label: 'JD recovery', counts: { running: 0, queued: 0, retrying: 0, active: 0 } }, { kind: 'ranking', label: 'Ranking', description: 'Scores each job', counts: { running: 1, queued: 2, retrying: 0, active: 3 }, scheduler: { enabled: true, interval_minutes: 2 } }, { kind: 'tailoring', label: 'Tailoring', counts: { running: 0, queued: 0, retrying: 0, active: 0 } }], cooldowns: [], active: 3, running: 1 }; ui.S.jobOpen = null; ui.S.busy = {};
   ui.D.ranking = ranking();
 });
 
@@ -88,13 +88,14 @@ describe('Ranking tracker · filters and removal', () => {
 describe('Ranking tracker · clearing the finished list', () => {
   const view = () => { ui.render(); return document.getElementById('view'); };
 
-  it('offers Clear list on the finished section, and Show cleared once it has been cleared', () => {
+  it('offers Clear finished in the filter bar, and Show cleared once it has been cleared', () => {
     ui.D.ranking = { ...ranking(), active: [], recent: [{ ...task(4), status: 'FAILED', percent: null }] };
-    expect(view().querySelector('[data-act="ranking-clear"]').textContent).toContain('Clear list');
+    expect(view().querySelector('[data-act="wk-clear"]').textContent).toContain('Clear finished (1)');
     ui.D.ranking = { ...ranking(), active: [], recent: [], finished_cleared_at: '2026-09-27T10:30:00' };
     const root = view();
     expect(root.textContent).toContain('Finished rankings cleared at');
-    expect(root.querySelector('[data-act="ranking-unclear"]')).not.toBeNull();
+    expect(root.querySelector('[data-act="wk-unclear"]')).not.toBeNull();
+    expect(root.querySelector('[data-act="wk-clear"]')).toBeNull();  // nothing finished left to clear
     expect(root.textContent).not.toContain('No ranking activity in the last day');
   });
 });

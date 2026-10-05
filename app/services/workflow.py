@@ -112,6 +112,8 @@ def tailor_job(db: Session, job: Job, progress: Progress = _no_progress) -> Resu
                                            "ranking_version": context.fit_analysis.get("ranking_version")},
                           "allow_unverified_resume_facts": context.policy.get("allow_unverified_resume_facts", False)}
     content["cover_letter"], content["cover_letter_generation"] = write_cover_letter(db, profile, job, llm)
+    # A last check before anything is saved: a run stopped from Running workers ends here, saving nothing.
+    progress("tailoring")
     resume = persist_tailored_resume(db, job, content)
     progress("reviewing")
     review_resume(db, resume)

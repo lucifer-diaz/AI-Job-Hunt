@@ -16,16 +16,25 @@ Every job is safe to run twice, including at the same moment from two app instan
 from __future__ import annotations
 
 import asyncio
+import time
 from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
-from app.models import Application, Job, SearchRun, User
+from app.models import (
+    Application,
+    Job,
+    JobDescriptionFetchTask,
+    JobDescriptionParseTask,
+    JobRankingTask,
+    SearchRun,
+    User,
+)
 from app.services import (
     ai_advisor,
     auto_tailor,
@@ -34,7 +43,9 @@ from app.services import (
     job_description,
     monitoring,
     ranker,
+    server_settings,
     system_log,
+    threads,
 )
 from app.services import work_queue as wq
 from app.services.compensation import enrich_compensation
@@ -172,109 +183,201 @@ def apify_sync(ctx: JobContext) -> dict[str, Any]:
     return summary
 
 
+# ───────────── the queued workers: claim as slots free, with limits read live ─────────────
+
+def utcnow() -> datetime:
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
+LIVE_CHECK_SECONDS = 5.0  # how often a run re-reads "side by side" and "tasks per run" while it waits
+
+
+# Tasks a pass stopped waiting for (stopped from Running workers): their threads finish on their own; a reference keeps
+# the asyncio task alive until then, and their results are discarded by the workers' own lease guards.
+_ABANDONED: set[asyncio.Task] = set()
+
+
+async def run_live(*, concurrency: str, batch: str, claim: Callable[[int], list[Any]],
+                   process: Callable[[Any], Awaitable[str]],
+                   heartbeat: Callable[[list[Any]], set[int]] | None = None) -> tuple[int, Counter]:
+    """Run one scheduler pass of a queued worker. Returns (claimed, outcomes).
+
+    Tasks are claimed as slots free up, not all at once, so a task is only PROCESSING while it really runs, and the
+    two limits an admin can change in Running workers → Settings (app.services.server_settings) apply to the run in
+    progress within seconds: more side by side starts more tasks straight away, fewer lets running ones finish and
+    starts none until the run is under the new limit; tasks per run caps what this pass claims. Nothing needs a
+    restart, and the environment value is only the default.
+
+    Every few seconds `heartbeat` renews the lease of each task still running and returns the ids still held. A
+    model call can outlast a task's lease, which must not make it look abandoned (and be claimed twice); and a task
+    stopped from Running workers lost its lease, so the pass stops waiting for it at once: its slot is free for other
+    work and the pass is not held open by a call nobody wants any more.
+
+    `process` must not raise: each worker's own processing turns a failure into an outcome."""
+    outcomes: Counter = Counter()
+    running: dict[asyncio.Task, Any] = {}
+    missing: dict[asyncio.Task, float] = {}  # tasks no longer held, since when
+    claimed, exhausted = 0, False
+    while True:
+        room = min(max(1, server_settings.value(concurrency)) - len(running),
+                   max(1, server_settings.value(batch)) - claimed)
+        if room > 0 and not exhausted:
+            fresh = await threads.run_io(claim, room)
+            claimed += len(fresh)
+            exhausted = len(fresh) < room  # nothing more is due now: the next pass picks up what arrives later
+            running.update({asyncio.create_task(process(c)): c for c in fresh})
+        if not running:
+            return claimed, outcomes
+        done, _ = await asyncio.wait(running, timeout=LIVE_CHECK_SECONDS, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            running.pop(task)
+            missing.pop(task, None)
+            outcomes[task.result()] += 1
+        if heartbeat and running:
+            held = await threads.run_io(heartbeat, list(running.values()))
+            now = time.monotonic()
+            for task, c in list(running.items()):
+                if c.task_id in held:
+                    missing.pop(task, None)
+                    continue
+                # Not held: either it just finished (its row is final a moment before its thread returns) or it was
+                # stopped. Only a task still not held a whole check later is given up on.
+                first = missing.setdefault(task, now)
+                if now - first >= LIVE_CHECK_SECONDS and not task.done():
+                    running.pop(task)
+                    missing.pop(task, None)
+                    _ABANDONED.add(task)
+                    task.add_done_callback(_ABANDONED.discard)
+                    outcomes["stopped"] += 1
+
+
+def renew(sessions: Callable[[], Session], model: Any, lease_seconds: int, token: str = "lock_token") -> Callable:
+    """A heartbeat for `run_live`: extend each held task's lease, return the ids still held."""
+    def beat(claims: list[Any]) -> set[int]:
+        held: set[int] = set()
+        until = utcnow() + timedelta(seconds=lease_seconds)
+        with sessions() as db:
+            for c in claims:
+                won = db.execute(update(model).where(model.id == c.task_id, model.status == "PROCESSING",
+                                                     model.lock_token == getattr(c, token))
+                                 .values(lock_expires_at=until).execution_options(synchronize_session=False))
+                if won.rowcount:
+                    held.add(c.task_id)
+            db.commit()
+        return held
+    return beat
+
+
 # ───────────── ranking ─────────────
 
-def _prepare_ranking(ctx: JobContext) -> tuple[list[ranker.TaskClaim], dict[str, Any]] | str:
-    """Deterministic sweep (filter, queue, recover, re-rank), then claim a bounded batch of ranking tasks."""
+def _prepare_ranking(ctx: JobContext) -> dict[str, Any] | str:
+    """Deterministic sweep (filter, queue, recover, re-rank) before any ranking task is claimed."""
     with ctx.sessions() as db:
         if not _is_postgres(db):
             return "Ranking workers need PostgreSQL (FOR UPDATE SKIP LOCKED)"
         queue = ranker.sweep(db)
-        ready, auto, waiting = ranker.accounts(db, ctx.now)
-        claims = ranker.claim(db, worker_id=ctx.worker_id, limit=max(1, get_settings().ranking_batch_size),
-                              ready_accounts=ready, auto_rank_accounts=auto)
-    return claims, {"queue": queue, "accounts_waiting": waiting}
+        _, _, waiting = ranker.accounts(db, ctx.now)
+    return {"queue": queue, "accounts_waiting": waiting}
+
+
+def _claim_ranking(ctx: JobContext, limit: int) -> list[ranker.TaskClaim]:
+    # Accounts are looked at again on every claim: a cadence that just started, a pause or a new limit apply at once.
+    with ctx.sessions() as db:
+        ready, auto, _ = ranker.accounts(db)
+        return ranker.claim(db, worker_id=ctx.worker_id, limit=limit, ready_accounts=ready, auto_rank_accounts=auto)
 
 
 async def ranking(ctx: JobContext) -> dict[str, Any]:
-    """Claim a limited batch of ranking tasks and run at most RANKING_CONCURRENCY model calls at a time."""
-    prepared = await asyncio.to_thread(_prepare_ranking, ctx)
-    if isinstance(prepared, str):
-        return skipped(prepared)
-    claims, details = prepared
-    semaphore = asyncio.Semaphore(max(1, get_settings().ranking_concurrency))
-
-    async def run(claimed: ranker.TaskClaim) -> str:
-        async with semaphore:
-            return await asyncio.to_thread(ranker.process, ctx.sessions, claimed)
-
-    outcomes = Counter(await asyncio.gather(*(run(c) for c in claims)))
-    summary = {"claimed": len(claims), **{name: outcomes.get(name, 0) for name in ranker.OUTCOMES}, **details}
-    if not claims and not any(details["queue"].values()):
+    """Rank up to `ranking_batch_size` tasks, at most `ranking_concurrency` model calls at a time (both live)."""
+    details = await threads.run_io(_prepare_ranking, ctx)
+    if isinstance(details, str):
+        return skipped(details)
+    claimed, outcomes = await run_live(
+        concurrency="ranking_concurrency", batch="ranking_batch_size",
+        claim=lambda n: _claim_ranking(ctx, n),
+        process=lambda c: threads.run_work(ranker.process, ctx.sessions, c),
+        heartbeat=renew(ctx.sessions, JobRankingTask, get_settings().ranking_lease_seconds, token="token"))
+    summary = {"claimed": claimed, **{name: outcomes.get(name, 0) for name in ranker.OUTCOMES}, **details}
+    if not claimed and not any(details["queue"].values()):
         return skipped("Nothing to rank", **summary)
     return summary
 
 
-def _prepare_jd_parsing(ctx: JobContext) -> tuple[list[job_description.ParseClaim], dict[str, Any]] | str:
-    """Queue postings that were never parsed, recover crashed workers, then claim a bounded batch."""
+def _prepare_jd_parsing(ctx: JobContext) -> dict[str, Any] | str:
+    """Queue postings that were never parsed and recover crashed workers before anything is claimed."""
     with ctx.sessions() as db:
         if not _is_postgres(db):
             return "Job description parsing needs PostgreSQL (FOR UPDATE SKIP LOCKED)"
         recovered = job_description.recover_expired(db)
         queue = job_description.sweep(db)
-        claims = job_description.claim(db, worker_id=ctx.worker_id,
-                                       limit=max(1, get_settings().jd_parse_batch_size))
-    return claims, {"queue": queue, "recovered": recovered}
+    return {"queue": queue, "recovered": recovered}
+
+
+def _claim_jd_parsing(ctx: JobContext, limit: int) -> list[job_description.ParseClaim]:
+    with ctx.sessions() as db:
+        return job_description.claim(db, worker_id=ctx.worker_id, limit=limit)
 
 
 async def jd_parsing(ctx: JobContext) -> dict[str, Any]:
-    """Parse a bounded batch of job descriptions into structured requirements, a few model calls at a time."""
+    """Parse up to `jd_parse_batch_size` descriptions, `jd_parse_concurrency` model calls at a time (both live)."""
     if not get_settings().jd_parse_enabled:
         return skipped("Job description parsing is off (JD_PARSE_ENABLED)")
-    prepared = await asyncio.to_thread(_prepare_jd_parsing, ctx)
-    if isinstance(prepared, str):
-        return skipped(prepared)
-    claims, details = prepared
-    semaphore = asyncio.Semaphore(max(1, get_settings().jd_parse_concurrency))
-
-    async def run(claim: job_description.ParseClaim) -> str:
-        async with semaphore:
-            return await asyncio.to_thread(job_description.process, ctx.sessions, claim)
-
-    outcomes = Counter(await asyncio.gather(*(run(claim) for claim in claims)))
-    summary = {"claimed": len(claims), **{name: outcomes.get(name, 0) for name in job_description.OUTCOMES}, **details}
-    if not claims and not details["queue"]["queued"]:
+    details = await threads.run_io(_prepare_jd_parsing, ctx)
+    if isinstance(details, str):
+        return skipped(details)
+    claimed, outcomes = await run_live(
+        concurrency="jd_parse_concurrency", batch="jd_parse_batch_size",
+        claim=lambda n: _claim_jd_parsing(ctx, n),
+        process=lambda c: threads.run_work(job_description.process, ctx.sessions, c),
+        heartbeat=renew(ctx.sessions, JobDescriptionParseTask, get_settings().jd_parse_lease_seconds))
+    summary = {"claimed": claimed, **{name: outcomes.get(name, 0) for name in job_description.OUTCOMES}, **details}
+    if not claimed and not details["queue"]["queued"]:
         return skipped("No job descriptions waiting", **summary)
     return summary
 
 
-def _prepare_jd_recovery(ctx: JobContext) -> tuple[list[jd_recovery.FetchClaim], dict[str, Any]]:
-    """Recover crashed workers, assess never-assessed descriptions (queueing recovery), then claim a bounded batch.
+def _prepare_jd_recovery(ctx: JobContext) -> dict[str, Any]:
+    """Recover crashed workers and assess never-assessed descriptions (queueing recovery) before claiming.
 
     Claiming is a guarded UPDATE (plus SKIP LOCKED on PostgreSQL), so it is safe on SQLite local installs too."""
     with ctx.sessions() as db:
         expired = jd_recovery.recover_expired(db, ctx.now)
         queue = jd_recovery.sweep(db, now=ctx.now)
-        claims = jd_recovery.claim(db, worker_id=ctx.worker_id, limit=max(1, get_settings().jd_fetch_batch_size),
-                                   now=ctx.now)
     # "recovered" is an outcome (a description recovered); leases taken back from crashed workers are counted apart.
-    return claims, {"queue": queue, "expired_leases": expired}
+    return {"queue": queue, "expired_leases": expired}
+
+
+def _claim_jd_recovery(ctx: JobContext, limit: int) -> list[jd_recovery.FetchClaim]:
+    with ctx.sessions() as db:
+        # Its own time: a live pass claims for longer than a task's lease, and a lease must start when its claim does.
+        return jd_recovery.claim(db, worker_id=ctx.worker_id, limit=limit)
 
 
 async def jd_recovery_job(ctx: JobContext) -> dict[str, Any]:
-    """Recover a bounded batch of missing job descriptions from their posting URLs, a few at a time.
+    """Recover up to `jd_fetch_batch_size` missing descriptions, `jd_fetch_max_concurrency` at a time (both live).
 
     HTTP first; the shared browser only for pages HTTP could not read, and never more pages at once than
     PLAYWRIGHT_MAX_CONCURRENCY. One task failing never affects another task, or any other scheduled job."""
     from app.infrastructure.browser import get_browser_service
 
-    claims, details = await asyncio.to_thread(_prepare_jd_recovery, ctx)
+    details = await threads.run_io(_prepare_jd_recovery, ctx)
     browser = get_browser_service()
-    semaphore = asyncio.Semaphore(max(1, get_settings().jd_fetch_max_concurrency))
 
     async def run(claim: jd_recovery.FetchClaim) -> str:
-        async with semaphore:
-            try:
-                return await jd_recovery.process(ctx.sessions, claim, browser=browser)
-            except Exception:  # noqa: BLE001  the lease expires and the task is retried (recover_expired)
-                return "lost"
+        try:
+            return await jd_recovery.process(ctx.sessions, claim, browser=browser)
+        except Exception:  # noqa: BLE001  the lease expires and the task is retried (recover_expired)
+            return "lost"
 
     try:
-        outcomes = Counter(await asyncio.gather(*(run(claim) for claim in claims)))
+        claimed, outcomes = await run_live(
+            concurrency="jd_fetch_max_concurrency", batch="jd_fetch_batch_size",
+            claim=lambda n: _claim_jd_recovery(ctx, n), process=run,
+            heartbeat=renew(ctx.sessions, JobDescriptionFetchTask, get_settings().jd_fetch_lease_seconds))
     finally:
         await browser.release_idle()
-    summary = {"claimed": len(claims), **{name: outcomes.get(name, 0) for name in jd_recovery.OUTCOMES}, **details}
-    if not claims and not details["queue"]["queued"] and not details["expired_leases"]:
+    summary = {"claimed": claimed, **{name: outcomes.get(name, 0) for name in jd_recovery.OUTCOMES}, **details}
+    if not claimed and not details["queue"]["queued"] and not details["expired_leases"]:
         return skipped("No job descriptions waiting for recovery", **summary)
     return summary
 
