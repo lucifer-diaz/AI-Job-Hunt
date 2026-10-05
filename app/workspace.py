@@ -157,8 +157,9 @@ def board_label(source: str) -> str:
 EASY_APPLY_FLAGS = ("easyApply", "easy_apply", "isEasyApply", "is_easy_apply", "directApply", "directapply",
                     "direct_apply")
 EASY_APPLY_TYPES = ("applyType", "apply_type", "applicationType", "application_type", "applyMethod", "apply_method")
-# Boards the Multi Job Board actor restricts to Easy Apply when its easyApply input is on.
-EASY_APPLY_BOARDS = {"linkedin", "indeed", "glassdoor"}
+# Boards the Multi Job Board actor (JobSpy) restricts to Easy Apply when its easyApply input is on. Google Jobs and
+# BDJobs ignore the input, so their jobs are not marked by the run alone.
+EASY_APPLY_BOARDS = {"linkedin", "indeed", "glassdoor", "zip_recruiter", "naukri", "bayt"}
 
 
 def easy_apply(job: Job, run_input: dict | None = None) -> bool:

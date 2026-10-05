@@ -623,7 +623,8 @@ def test_easy_apply_reads_explicit_signals_only():
     assert not easy_apply(linkedin())  # no signal is not a guess either way
     # A search that asked the board for Easy Apply jobs only.
     assert easy_apply(linkedin(), {"easyApply": True})
-    assert not easy_apply(Job(source="apify:naukri", raw={}), {"easyApply": True})  # that input never filters Naukri
+    assert easy_apply(Job(source="apify:zip_recruiter", raw={}), {"easyApply": True})
+    assert not easy_apply(Job(source="apify:google", raw={}), {"easyApply": True})  # Google Jobs ignores the input
     assert easy_apply(Job(source="apify:linkedin", raw={}), {"directApply": True})
 
 
