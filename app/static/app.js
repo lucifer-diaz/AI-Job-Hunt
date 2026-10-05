@@ -8,7 +8,7 @@ const attr = esc;
 
 /* ───────────── state ───────────── */
 // Filters on the Tailor and Approvals screens, sent to /api/tailor/queue and /api/approvals.
-function pfDefaults(kind) { return { q: '', min_fit: 0, min_review: 0, board: 'all', location: 'all', status: 'all', sort: kind === 'tailor' ? 'fit' : 'default' }; }
+function pfDefaults(kind) { return { q: '', min_fit: 0, min_review: 0, board: 'all', location: 'all', status: 'all', ...(kind === 'approvals' ? { easy_apply: 'all' } : {}), sort: kind === 'tailor' ? 'fit' : 'default' }; }
 const S = {
   screen: 'overview', knowledgeSection: 'answers', settingsSection: 'profile', todayVariant: 'focus', discMode: 'triage',
   filters: { q: '', min_fit: 0, board: 'all', location: 'all', stage: 'all', description: 'all', domain: 'matching', date_field: 'found', within: '', include_applied: false, sort: 'fit', page: 1, per_page: 25 },
@@ -941,6 +941,7 @@ function renderPacketFilters(kind, facets) {
     ${sel('min_review', [[0, 'Any reviewer score'], [50, 'Reviewer ≥ 50'], [65, 'Reviewer ≥ 65'], [75, 'Reviewer ≥ 75'], [85, 'Reviewer ≥ 85']])}
     ${sel('board', [['all', 'All boards'], ...facets.boards.map(b => [b, b])])}
     ${sel('location', locationOptions(facets.locations))}
+    ${'easy_apply' in f ? sel('easy_apply', [['all', 'Any apply method'], ['only', `Easy Apply only (${facets.easy_apply || 0})`]]) : ''}
     ${sel('status', PF_STATUS[kind])}${sel('sort', PF_SORT[kind])}
     <span class="small muted none">${facets.total === facets.total_all ? `${facets.total_all} job${facets.total_all === 1 ? '' : 's'}` : `${facets.total} of ${facets.total_all}`}</span>
     ${btn('Reset', 'pf-reset', { kind }, 'sm', !pfActive(kind))}
@@ -1136,7 +1137,7 @@ function renderApprovalsBody(list) {
   const a = D.approval;
   const waiting = list.filter(x => x.waiting).length;
   const queue = `<section class="card flush c-narrow"><div class="card-head card-title sm">Queue · ${waiting} waiting</div>
-    ${list.map(q => `<div class="lrow click ${q.id === S.approvalJob ? 'sel' : ''}" data-act="select-approval" data-id="${q.id}"><div class="grow"><div class="base b ellipsis">${esc(q.title)}</div><div class="xs muted">${esc(q.company)} · ${esc(q.age)}</div></div>${q.approval_override ? pill('waived', 'warn') : ''}<span class="mono bb base" style="color:${q.status === 'approved' ? 'var(--faint)' : (q.reviewer_score || 0) >= 75 ? 'var(--good)' : (q.reviewer_score || 0) >= 65 ? 'var(--warn)' : 'var(--bad)'}">${fitTxt(q.reviewer_score)}</span></div>`).join('')}</section>`;
+    ${list.map(q => `<div class="lrow click ${q.id === S.approvalJob ? 'sel' : ''}" data-act="select-approval" data-id="${q.id}"><div class="grow"><div class="base b ellipsis">${esc(q.title)}</div><div class="xs muted">${esc(q.company)} · ${esc(q.age)}</div></div>${q.easy_apply ? pill('Easy Apply', 'brand') : ''}${q.approval_override ? pill('waived', 'warn') : ''}<span class="mono bb base" style="color:${q.status === 'approved' ? 'var(--faint)' : (q.reviewer_score || 0) >= 75 ? 'var(--good)' : (q.reviewer_score || 0) >= 65 ? 'var(--warn)' : 'var(--bad)'}">${fitTxt(q.reviewer_score)}</span></div>`).join('')}</section>`;
   if (!a) return `<div class="split">${queue}<section class="card c-main">${loading()}</section></div>`;
   const r = a.resume, job = a.job;
   const approved = job.status === 'approved';
@@ -1145,7 +1146,7 @@ function renderApprovalsBody(list) {
   const approveAct = below ? 'approve-override-open' : 'approve';
   return `<div class="split">${queue}
   <section class="card flush c-main">
-    <div class="row between wrap gap12" style="padding:18px 22px;border-bottom:1px solid var(--line2)"><div><div style="font-size:17px;font-weight:600">${esc(job.title)} · ${esc(job.company)}</div><div class="small muted mt4">Fit ${fitTxt(job.fit)} · reviewer ${fitTxt(r?.reviewer_score)} · tailored ${esc(r?.generated || '')} · ${statusPill(job.status)}</div></div>
+    <div class="row between wrap gap12" style="padding:18px 22px;border-bottom:1px solid var(--line2)"><div><div style="font-size:17px;font-weight:600">${esc(job.title)} · ${esc(job.company)}</div><div class="small muted mt4">Fit ${fitTxt(job.fit)} · reviewer ${fitTxt(r?.reviewer_score)} · tailored ${esc(r?.generated || '')} · ${statusPill(job.status)}${list.find(x => x.id === job.id)?.easy_apply ? ` ${pill('Easy Apply', 'brand')}` : ''}</div></div>
       <div class="row gap8 wrap">${btn('Job details', 'open-job', { id: job.id })}${job.url ? `<a class="btn" href="${attr(job.url)}" target="_blank" rel="noopener">Open posting ↗</a>` : ''}${btn(label('reject', 'Reject', 'Rejecting…'), 'reject-open', { id: job.id }, 'ghost danger', isBusy('reject'))}${approved ? btn('Open apply kit', 'open-kit', { id: job.id }, 'good') : `${btn(label('revise', 'Needs revision', 'Sending back…'), 'revise', { id: job.id }, '', isBusy('revise'))}${btn(label('approve', below ? 'Approve anyway…' : 'Approve → apply kit', 'Approving…'), approveAct, { id: job.id }, 'good', isBusy('approve') || !r)}`}</div></div>
     ${a.approval?.override ? `<div class="banner warn" style="margin:0 22px;display:block"><b>Approved below your reviewer minimum.</b>${a.approval.note ? ` ${esc(a.approval.note)}` : ''}</div>` : ''}
     ${S.rejecting === job.id ? renderRejectPicker(job, a) : ''}

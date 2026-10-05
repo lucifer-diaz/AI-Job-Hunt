@@ -609,3 +609,41 @@ def test_overview_inbox_counts_need_a_connected_gmail_account():
         db.query(GmailConnection).update({"status": "CONNECTED"})
         assert _inbox_counts(db, since) is not None
         db.rollback()
+
+
+def test_easy_apply_reads_explicit_signals_only():
+    from app.workspace import easy_apply
+
+    def linkedin(raw=None):
+        return Job(source="apify:linkedin", raw=raw or {})
+
+    assert easy_apply(linkedin({"easyApply": True})) and easy_apply(linkedin({"directapply": "true"}))
+    assert easy_apply(linkedin({"applyType": "EASY_APPLY"}))
+    assert not easy_apply(linkedin({"easyApply": False, "applyType": "EXTERNAL"}))
+    assert not easy_apply(linkedin())  # no signal is not a guess either way
+    # A search that asked the board for Easy Apply jobs only.
+    assert easy_apply(linkedin(), {"easyApply": True})
+    assert not easy_apply(Job(source="apify:naukri", raw={}), {"easyApply": True})  # that input never filters Naukri
+    assert easy_apply(Job(source="apify:linkedin", raw={}), {"directApply": True})
+
+
+def test_approvals_filter_to_easy_apply_jobs():
+    plain, easy = make_job(), make_job()
+    with SessionLocal() as db:
+        run = SearchRun(actor_id="openclawai/job-board-scraper", status="SUCCEEDED", external_run_id=uuid.uuid4().hex,
+                        input_json={"easyApply": True}, user_id=db.get(Job, easy["id"]).user_id)
+        db.add(run)
+        db.flush()
+        for job_id in (plain["id"], easy["id"]):
+            db.get(Job, job_id).status = "tailored"
+        job = db.get(Job, easy["id"])
+        job.source, job.search_run_id = "apify:linkedin", run.id
+        db.commit()
+
+    rows = client.get("/api/approvals", params={"easy_apply": "only", "with_facets": True}).json()
+    ids = {r["id"] for r in rows["items"]}
+    assert easy["id"] in ids and plain["id"] not in ids and rows["easy_apply"] >= 1
+    assert all(r["easy_apply"] for r in rows["items"])
+    every = {r["id"]: r["easy_apply"] for r in client.get("/api/approvals").json()}
+    assert every[plain["id"]] is False and every[easy["id"]] is True
+    assert client.get("/api/approvals", params={"easy_apply": "maybe"}).status_code == 422

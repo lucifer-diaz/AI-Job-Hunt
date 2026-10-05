@@ -152,6 +152,38 @@ def board_label(source: str) -> str:
             "greenhouse": "Greenhouse", "unknown": "Other"}.get(key, key.replace("_", " ").title() or "Other")
 
 
+# Easy Apply (apply on the board itself) is read from explicit signals only, never guessed: a flag the board put on
+# the item, or a search that asked the board for Easy Apply jobs only. A job with neither is simply not marked.
+EASY_APPLY_FLAGS = ("easyApply", "easy_apply", "isEasyApply", "is_easy_apply", "directApply", "directapply",
+                    "direct_apply")
+EASY_APPLY_TYPES = ("applyType", "apply_type", "applicationType", "application_type", "applyMethod", "apply_method")
+# Boards the Multi Job Board actor restricts to Easy Apply when its easyApply input is on.
+EASY_APPLY_BOARDS = {"linkedin", "indeed", "glassdoor"}
+
+
+def easy_apply(job: Job, run_input: dict | None = None) -> bool:
+    raw = job.raw if isinstance(job.raw, dict) else {}
+    for key in EASY_APPLY_FLAGS:
+        value = raw.get(key)
+        if value is True or (isinstance(value, str) and value.strip().lower() in ("true", "yes", "1")):
+            return True
+    for key in EASY_APPLY_TYPES:
+        if "easyapply" in re.sub(r"[^a-z]", "", str(raw.get(key) or "").lower()):
+            return True
+    run_input = run_input or {}
+    if run_input.get("directApply") is True:  # Advanced LinkedIn: every item it returns is Easy Apply
+        return True
+    return run_input.get("easyApply") is True and (job.source or "").split(":", 1)[-1] in EASY_APPLY_BOARDS
+
+
+def run_inputs(db: Session, jobs: list[Job]) -> dict[int, dict]:
+    """The actor input of each job's search run, in one query."""
+    ids = {j.search_run_id for j in jobs if j.search_run_id}
+    if not ids:
+        return {}
+    return {run.id: run.input_json or {} for run in db.scalars(select(SearchRun).where(SearchRun.id.in_(ids)))}
+
+
 def is_agency(company: str) -> bool:
     lowered = (company or "").lower()
     return any(hint in lowered for hint in AGENCY_HINTS)
@@ -1514,7 +1546,8 @@ PACKET_SORTS = {
 
 
 def filter_packet_rows(rows: list[dict], *, q: str, min_fit: int, min_review: int, board: str, status: str,
-                       sort: str, status_filters: dict, with_facets: bool, location: str = "all"):
+                       sort: str, status_filters: dict, with_facets: bool, location: str = "all",
+                       easy_apply_only: bool = False):
     """Filter and sort Tailor or Approvals rows. The unfiltered order is kept for sort="" (the screen's default).
 
     Returns the plain list unless `with_facets`, which adds totals and the boards and locations present before
@@ -1531,13 +1564,15 @@ def filter_packet_rows(rows: list[dict], *, q: str, min_fit: int, min_review: in
            and (not min_review or (r["reviewer_score"] or 0) >= min_review)
            and (board in ("all", "") or r["board"] == board)
            and (location in ("all", "") or location_key(r["location"]) == location)
+           and (not easy_apply_only or r.get("easy_apply"))
            and (status in ("all", "") or status_filters[status](r))]
     if sort in PACKET_SORTS:
         out.sort(key=PACKET_SORTS[sort], reverse=sort == "new")
     if not with_facets:
         return out
     return {"items": out, "total": len(out), "total_all": len(rows), "boards": sorted({r["board"] for r in rows}),
-            "locations": location_facets([r["location"] for r in rows])}
+            "locations": location_facets([r["location"] for r in rows]),
+            "easy_apply": sum(1 for r in rows if r.get("easy_apply"))}
 
 
 @router.get("/api/tailor/queue")
@@ -1635,9 +1670,13 @@ def answers_for(db: Session) -> list[KnowledgeAnswer]:
 
 @router.get("/api/approvals")
 def approvals(q: str = "", min_fit: int = 0, min_review: int = 0, board: str = "all", location: str = "all",
-              status: str = "all", sort: str = "default", with_facets: bool = False, db: Session = Depends(get_user_db)):
+              status: str = "all", sort: str = "default", easy_apply_filter: str = Query("all", alias="easy_apply"),
+              with_facets: bool = False, db: Session = Depends(get_user_db)):
+    if easy_apply_filter not in ("all", "", "only"):
+        raise HTTPException(422, f"Unknown easy_apply filter: {easy_apply_filter}")
     jobs = db.scalars(select(Job).where(Job.status.in_(("tailored", "pending_approval", "approved", "rejected")))
                       .order_by(desc(Job.id))).all()
+    inputs = run_inputs(db, jobs)
     rows = []
     for job in jobs:
         resume = latest_resume(db, job.id)
@@ -1646,11 +1685,12 @@ def approvals(q: str = "", min_fit: int = 0, min_review: int = 0, board: str = "
                else "sent back" if job.status in ("pending_approval", "rejected") else f"tailored {ago(resume.created_at) if resume else ''}")
         rows.append({**job_card(job), "reviewer_score": resume.reviewer_score if resume else None, "age": age,
                      "waiting": job.status == "tailored",
+                     "easy_apply": easy_apply(job, inputs.get(job.search_run_id)),
                      "approval_override": bool(app.approval_override) if app else False})
     rows.sort(key=lambda r: (not r["waiting"], r["status"] == "approved"))
     return filter_packet_rows(rows, q=q, min_fit=min_fit, min_review=min_review, board=board, status=status, sort=sort,
                               status_filters=APPROVAL_STATUS_FILTERS, with_facets=with_facets,
-                              location=location)
+                              location=location, easy_apply_only=easy_apply_filter == "only")
 
 
 @router.get("/api/approvals/{job_id}")
