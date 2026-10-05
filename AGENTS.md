@@ -248,7 +248,10 @@ other static files.
 * **A worker's claim honours `run_now_at`:** order run-now tasks first, clear the column on claim, carry `run_now` on the
   claim, and run that task inside `backoff.bypass(claim.run_now)`. Never bypass a cooldown any other way.
 * **Every write a worker makes after its model or network call stays lease-guarded** (a lock token or a per-claim holder
-  name), so a kill is always safe; a long run reports progress through a checkpoint that stops it when the lease is gone.
+  name), so a kill is always safe; a run that commits business data from its own session checks its holder inside that
+  same transaction (tailoring: a `before_commit` guard), never only at a checkpoint before it.
+* **Kill stops, it does not requeue.** A stopped task ends with `lifecycle.STOPPED_BY_USER` and every sweep must leave
+  its job alone until a person asks again (Retry, Run now). A new automatic sweep has to honour that.
 * **Kill and run-now only move the account's own task rows** (and, for kill-all, clear its cooldowns). They never
   change configuration, never delete history, and never move a job past a state the workflow would not.
 * **Worker settings have two scopes.** An account's own (`app/services/worker_settings.py`: run automatically, attempts,
@@ -256,9 +259,11 @@ other static files.
   and a value never set follows the server. Server-wide ones (scheduler intervals, batch sizes, concurrency) are read
   through `server_settings.value(name)` — never `get_settings()` directly for an editable name — and only an admin
   changes them. Adding a setting means adding it to `FIELDS` / `EDITABLE`; the screen renders whatever they describe.
-* **A queued worker's scheduler pass goes through `scheduled_jobs.run_live`**: it claims tasks as slots free up and
-  re-reads its server limits every few seconds, so a changed limit applies to the run in progress. Never claim a whole
-  batch up front behind a fixed semaphore.
+* **A queued worker's scheduler pass goes through `scheduled_jobs.run_live`**: it claims tasks as slots free up,
+  re-reads its server limits every few seconds and passes a `heartbeat` (`scheduled_jobs.renew`) that renews held
+  leases and lets the pass drop a stopped task. Never claim a whole batch up front behind a fixed semaphore.
+* **Long blocking work runs on `threads.run_work`, scheduler bookkeeping on `threads.run_io`** — never on the default
+  `asyncio.to_thread` pool, which a few slow model calls can fill and stall every scheduled job.
 * **Bulk retry is many single retries** (`workers.retry`): each task goes through `_requeue_finished`, is skipped with a
   reason rather than failing the batch, and never gets `run_now_at` — a bulk retry never bypasses a provider cooldown.
 * **A paused worker holds its queue, never drops it.** Its claim skips the account's tasks unless `run_now_at` is set

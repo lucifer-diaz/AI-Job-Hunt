@@ -132,7 +132,20 @@ function settingsClearSecrets() {
   delete S.forms.keys; delete S.forms.account; editingKey = null;
   delete SETTING_ERRORS.keys; delete SETTING_ERRORS.account;
 }
+// Settings forms that live on other screens: Running workers → Settings and AI Orchestration → Models & routing.
+const SCREEN_FORMS = { workers: 'workers', orchestration: 'ai' };
+const screenFormDirty = () => { const f = SCREEN_FORMS[S.screen]; return !!f && !!S.forms[f] && settingsDirty(f); };
 function settingsCanLeave(nextScreen, nextSection) {
+  const own = SCREEN_FORMS[S.screen];
+  if (own) {
+    if (nextScreen === S.screen) return true;  // another tab of the same screen keeps the draft
+    if (isBusy(`settings-${own}`)) { toast('Wait for this change to finish.'); return false; }
+    if (screenFormDirty()) {
+      if (!confirm(`Leave and discard your unsaved ${own === 'ai' ? 'model' : 'worker'} settings?`)) return false;
+      delete S.forms[own]; delete SETTING_ERRORS[own];
+    }
+    return true;
+  }
   if (S.screen !== 'settings') return true;
   if (settingsSaving()) { toast('Wait for this change to finish.'); return false; }
   if (nextScreen !== 'settings' && settingsAnyDirty()) {

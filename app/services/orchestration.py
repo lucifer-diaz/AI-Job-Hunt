@@ -29,7 +29,7 @@ import threading
 import time
 from collections import Counter, defaultdict
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -57,7 +57,7 @@ from app.models import (
     TailorTask,
     WorkflowTransition,
 )
-from app.services import external_monitoring, model_resolution, redaction
+from app.services import external_monitoring, model_resolution, redaction, worker_settings
 from app.services import orchestration_topology as topo
 from app.services.ai_workers import WORKERS, worker_for_prompt
 from app.services.ai_workers import label as worker_label
@@ -564,7 +564,11 @@ def _node_recommendations(node: topo.Node, recs: list[dict[str, Any]]) -> list[d
 
 def graph(db: Session, scope: Scope) -> dict[str, Any]:
     """Topology plus the runtime summary each node and edge shows. Cached for a few seconds per scope."""
-    key = ("graph", scope.viewer_id, scope.user_id, scope.range_name, scope.start.replace(second=0, microsecond=0))
+    # A preset ends "now", so it is keyed by its start minute; an explicit window by its exact start and end, so two
+    # different windows never share a cached graph.
+    window = (_iso(scope.start), _iso(scope.end)) if scope.range_name == "custom" \
+        else (scope.start.replace(second=0, microsecond=0),)
+    key = ("graph", scope.viewer_id, scope.user_id, scope.range_name, *window)
     return _cached(key, GRAPH_CACHE_SECONDS, lambda: _build_graph(db, scope))
 
 
@@ -837,15 +841,13 @@ def llm_card(r: Any) -> dict[str, Any]:
 
 
 def _recent_activity(db: Session, scope: Scope, node: topo.Node, rows: list[Any]) -> dict[str, Any]:
+    if scope.all_accounts:
+        return _activity_aggregate(db, scope, node, rows)
     out: dict[str, Any] = {
         "successes": [llm_card(r) for r in rows if r.status == "SUCCEEDED"][:RECENT_LIMIT],
         "failures": [llm_card(r) for r in rows if r.status == "FAILED"][:RECENT_LIMIT],
         "retries": [llm_card(r) for r in rows if (r.retry_count or 0) > 0 or r.structured_output_retry_count
                     or r.escalated][:RECENT_LIMIT]}
-    if scope.all_accounts:  # aggregates only: no job ids from other accounts
-        for key in ("successes", "failures", "retries"):
-            for card in out[key]:
-                card["job_id"] = card["application_id"] = card["trace_id"] = None
     table = TASK_BY_NODE.get(node.id)
     if table:
         m = table.model
@@ -856,6 +858,28 @@ def _recent_activity(db: Session, scope: Scope, node: topo.Node, rows: list[Any]
         out["failed_tasks"] = [{"task_id": r[0], "job_id": None if scope.all_accounts else r[1], "status": r[2],
                                 "error_category": r[3], "error": _safe_error(r[4]), "attempts": r[5],
                                 "at": _iso(r[6])} for r in failed]
+    return out
+
+
+def _activity_aggregate(db: Session, scope: Scope, node: topo.Node, rows: list[Any]) -> dict[str, Any]:
+    """The every-account view of a node's recent activity: counts and distributions only. No call, request, task or
+    job of another account is ever listed, not even with its ids blanked."""
+    out: dict[str, Any] = {
+        "aggregate_only": True,
+        "calls": {"succeeded": sum(r.status == "SUCCEEDED" for r in rows),
+                  "failed": sum(r.status == "FAILED" for r in rows),
+                  "retried": sum(bool((r.retry_count or 0) > 0 or r.structured_output_retry_count or r.escalated)
+                                 for r in rows)},
+        "failures_by_error": dict(Counter(r.error_type or "UNKNOWN" for r in rows if r.status == "FAILED")),
+        "calls_by_model": dict(Counter(r.model or "unknown" for r in rows))}
+    table = TASK_BY_NODE.get(node.id)
+    if table:
+        m = table.model
+        counts = db.execute(_owned(select(m.error_category, func.count())
+                                   .where(m.status.in_(table.failed + table.blocked), table.finished >= scope.start)
+                                   .group_by(m.error_category), m.user_id, scope.user_id)).all()
+        out["failed_tasks_by_category"] = {(c.value if c is not None and hasattr(c, "value") else c or "UNKNOWN"): n
+                                           for c, n in counts}
     return out
 
 
@@ -913,7 +937,9 @@ def _build_history(db: Session, scope: Scope, node: topo.Node) -> dict[str, Any]
     now = utcnow()
     retention = get_settings().llm_telemetry_retention_days
     since = now - timedelta(days=retention) if retention > 0 else datetime(1970, 1, 1)
-    all_rows = llm_rows(db, Scope(scope.viewer_id, scope.user_id, since, now), node.llm_stages) \
+    # Always the viewer's own calls: the periods come from the viewer's configuration versions, and another account's
+    # calls binned into them would describe assignments that account never had.
+    all_rows = llm_rows(db, Scope(scope.viewer_id, scope.viewer_id, since, now), node.llm_stages) \
         if node.llm_stages else []
     workers = []
     for worker_type in node.workers:
@@ -994,6 +1020,7 @@ class JobFacts:
     inbox_events: int
     transitions: list[WorkflowTransition]
     llm: list[Any]
+    limits: dict[str, int] = field(default_factory=dict)  # the account's own attempt limits per worker
 
 
 def load_facts(db: Session, job: Job, user_id: int) -> JobFacts:
@@ -1029,7 +1056,9 @@ def load_facts(db: Session, job: Job, user_id: int) -> JobFacts:
                     rankings=latest(JobRanking, JobRanking.version, 5),
                     tailor_tasks=latest(TailorTask, TailorTask.id), variants=latest(ResumeVariant, ResumeVariant.version, 10),
                     application=application, stage_events=stage_events, followups=followups, inbox_events=inbox,
-                    transitions=list(reversed(transitions)), llm=llm)
+                    transitions=list(reversed(transitions)), llm=llm,
+                    limits={kind: worker_settings.get(db, user_id, kind, "max_attempts")
+                            for kind in ("parsing", "recovery", "ranking", "tailoring")})
 
 
 @dataclass(frozen=True)
@@ -1044,10 +1073,10 @@ class Position:
     terminal_node: str | None = None
 
 
-def _tailor_attempts() -> int:
+def _tailor_attempts(limits: dict[str, int] | None = None) -> int:
     from app.services.tailor_tasks import MAX_ATTEMPTS
 
-    return MAX_ATTEMPTS
+    return (limits or {}).get("tailoring") or MAX_ATTEMPTS
 
 
 def _active(items: list[Any], statuses: tuple[str, ...]) -> Any | None:
@@ -1066,14 +1095,14 @@ def locate(f: JobFacts) -> Position:
     if tailor is not None:
         if tailor.status == "queued":
             activity = "RETRYING" if (tailor.attempts or 0) > 0 else "QUEUED"
-            return Position("tailor", activity, tailor.created_at, tailor.attempts or 0, _tailor_attempts(),
+            return Position("tailor", activity, tailor.created_at, tailor.attempts or 0, _tailor_attempts(f.limits),
                             reason="Waiting for the tailoring worker")
         node = {"ranking": "ranker", "reviewing": "reviewer"}.get(tailor.stage, "tailor")
         return Position(node, "RUNNING", tailor.started_at or tailor.created_at, tailor.attempts or 1,
-                        _tailor_attempts())
-    for tasks, node, limit in ((f.ranking_tasks, "ranker", s.ranking_max_attempts),
-                               (f.parse, "jd_parser", s.jd_parse_max_attempts),
-                               (f.fetch, "jd_recovery", s.jd_fetch_max_attempts)):
+                        _tailor_attempts(f.limits))
+    for tasks, node, limit in ((f.ranking_tasks, "ranker", f.limits.get("ranking", s.ranking_max_attempts)),
+                               (f.parse, "jd_parser", f.limits.get("parsing", s.jd_parse_max_attempts)),
+                               (f.fetch, "jd_recovery", f.limits.get("recovery", s.jd_fetch_max_attempts))):
         task = _active(tasks, ("PENDING", "PROCESSING"))
         if task is None:
             continue
@@ -1232,7 +1261,8 @@ def _history_steps(f: JobFacts) -> dict[str, dict[str, Any] | None]:
     else:
         steps["tailor"] = None
     reviewed = next((v for v in f.variants if v.reviewer_score is not None), None)
-    steps["reviewer"] = _step("reviewer", "COMPLETED", done_at=reviewed.created_at,
+    # No review timestamp is stored: the packet's creation time is before the reviewer's call, so it stays unknown.
+    steps["reviewer"] = _step("reviewer", "COMPLETED", done_at=None,
                               detail=f"{(reviewed.reviewer_notes or {}).get('decision') or 'Reviewed'} · score "
                                      f"{reviewed.reviewer_score:.0f}",
                               decision=(reviewed.reviewer_notes or {}).get("decision"),
@@ -1375,8 +1405,9 @@ def live(db: Session, scope: Scope) -> dict[str, Any]:
                          "activity": activity, "since": _iso(since), "elapsed_seconds": _seconds(since, now),
                          "attempt": attempt, "max_attempts": limit, "task": task, "task_id": task_id}
 
-    for t, limit in zip(TASK_TABLES, (settings.jd_fetch_max_attempts, settings.jd_parse_max_attempts,
-                                      settings.ranking_max_attempts), strict=True):
+    own = {kind: worker_settings.get(db, owner, kind, "max_attempts") for kind in ("recovery", "parsing", "ranking",
+                                                                                  "tailoring")}
+    for t, limit in zip(TASK_TABLES, (own["recovery"], own["parsing"], own["ranking"]), strict=True):
         m = t.model
         rows = db.execute(select(m.id, m.job_id, m.status, m.attempt_count, m.created_at, t.started)
                           .where(m.user_id == owner, m.status.in_(t.pending + t.running))
@@ -1394,9 +1425,9 @@ def live(db: Session, scope: Scope) -> dict[str, Any]:
         if r[2] == "running":
             node = {"ranking": "ranker", "reviewing": "reviewer"}.get(r[3], "tailor")
             found.pop(r[1], None)  # the tailoring run is the most specific fact about this job
-            add(r[1], node, "RUNNING", r[6] or r[5], r[4] or 1, _tailor_attempts(), "tailor_tasks", r[0])
+            add(r[1], node, "RUNNING", r[6] or r[5], r[4] or 1, _tailor_attempts(own), "tailor_tasks", r[0])
         else:
-            add(r[1], "tailor", "RETRYING" if (r[4] or 0) > 0 else "QUEUED", r[5], r[4] or 0, _tailor_attempts(),
+            add(r[1], "tailor", "RETRYING" if (r[4] or 0) > 0 else "QUEUED", r[5], r[4] or 0, _tailor_attempts(own),
                 "tailor_tasks", r[0])
     items = sorted(found.values(), key=lambda p: (p["activity"] != "RUNNING", p["since"] or ""))[:LIVE_LIMIT]
     labels = _job_labels(db, [p["job_id"] for p in items], owner)
@@ -1469,9 +1500,8 @@ def job_trace(db: Session, job_id: int, user_id: int) -> dict[str, Any] | None:
             task_id=t.id, error=_safe_error(t.error) if t.status == "failed" else None)
     for v in f.variants:
         add(v.created_at, "packet", "TAILORED", f"Tailored version {v.version} saved", node="tailor")
-        if v.reviewer_score is not None:
-            add(v.created_at, "packet", "REVIEWED", f"Reviewed: {(v.reviewer_notes or {}).get('decision') or 'scored'} "
-                f"({v.reviewer_score:.0f})", node="reviewer")
+        # A review has no stored time of its own (the variant's created_at predates the reviewer call), so it is not
+        # placed on the timeline; the reviewer step shows its outcome.
     app = f.application
     if app is not None:
         add(app.approved_at, "packet", "APPROVED", "Approved", node="approval")
@@ -1479,7 +1509,10 @@ def job_trace(db: Session, job_id: int, user_id: int) -> dict[str, Any] | None:
         for e in f.stage_events:
             node = "interview" if e.detail in INTERVIEW_STAGES else "outcome" if e.detail in OFFER_STAGES + CLOSED_STAGES \
                 else "application_inbox"
-            add(e.occurred_at, "tracker", e.kind.upper(), e.title, node=node)
+            # Never the event's own title: inbox events build it from the email's sender. Kind and stage only.
+            label = (f"Stage: {str(e.detail).replace('_', ' ').lower()}" if e.kind == "stage" and e.detail
+                     else str(e.kind or "event").replace("_", " ").capitalize())
+            add(e.occurred_at, "tracker", e.kind.upper(), label, node=node)
         for x in f.followups:
             add(x.created_at, "packet", "FOLLOWUP_DRAFTED", "Follow-up drafted", node="follow_up", status=x.status)
             add(x.sent_at, "packet", "FOLLOWUP_SENT", "Follow-up sent", node="follow_up")

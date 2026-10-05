@@ -539,7 +539,10 @@ def test_admin_every_account_view_is_aggregate_only(user_id, signed_in):
     assert live["counts"]["ranker"]["running"] >= 1
     assert all(p.get("company") != "Hooli" for p in live["packets"])  # packets stay the admin's own
     node = admin.get("/api/orchestration/nodes/ranker?all_accounts=true").json()
-    assert all(c["job_id"] is None for c in node["recent"]["failures"])
+    recent = node["recent"]  # counts only: no call, request, task or job of another account, not even id-less
+    assert recent["aggregate_only"] is True and recent["calls"]["failed"] >= 1
+    assert recent["failures_by_error"].get("TIMEOUT", 0) >= 1
+    assert not {"failures", "successes", "retries", "failed_tasks"} & set(recent)
     assert "Hooli" not in json.dumps(node) and "Secret Role" not in json.dumps(g)
 
 
@@ -581,6 +584,10 @@ def test_orchestration_payloads_never_carry_prompts_or_secrets(user_id, signed_i
         db.flush()
         db.add(ApplicationEvent(application_id=app_row.id, user_id=user_id, kind="stage", title="Moved to Interviewing",
                                 detail="interviewing", occurred_at=utcnow() - timedelta(days=1)))
+        # An inbox event's title is built from the email's sender (application_inbox.analysis._mirror).
+        db.add(ApplicationEvent(application_id=app_row.id, user_id=user_id, kind="email",
+                                title="Interview invitation from Jane Recruiter", detail="",
+                                occurred_at=utcnow() - timedelta(hours=20)))
         db.add(ApplicationCommunicationEvent(user_id=user_id, application_id=app_row.id, gmail_message_id="m1",
                                              event_type="INTERVIEW_INVITATION", subject="Interview at Stripe — secret",
                                              sender="recruiter@stripe.com", summary=PROMPT_TEXT,
@@ -600,7 +607,7 @@ def test_orchestration_payloads_never_carry_prompts_or_secrets(user_id, signed_i
         "/api/orchestration/nodes/reviewer", "/api/orchestration/nodes/application_inbox",
         "/api/orchestration/nodes/ranker/history")]
     text = json.dumps(bodies)
-    for private in (PROMPT_TEXT, SECRET, "recruiter@stripe.com", "Interview at Stripe"):
+    for private in (PROMPT_TEXT, SECRET, "recruiter@stripe.com", "Interview at Stripe", "Jane Recruiter"):
         assert private not in text
     steps = {s["node_id"]: s for s in bodies[2]["path"]}
     assert steps["interview"]["status"] == "CURRENT" and steps["reviewer"]["status"] == "COMPLETED"
@@ -617,6 +624,17 @@ def test_graph_is_cached_briefly_and_bounded(user_id):
         orchestration.clear_cache()
         assert orchestration.graph(db, scope(user_id))["nodes"]["ranker"]["llm"]["requests"] == \
             first["nodes"]["ranker"]["llm"]["requests"] + 1
+
+
+def test_custom_windows_never_share_a_cached_graph(user_id, signed_in):
+    client = signed_in(user_id)
+    with SessionLocal() as db:
+        db.add(llm_row(user_id, created_at=utcnow() - timedelta(hours=1)))
+        db.commit()
+    start = (utcnow() - timedelta(days=1)).replace(microsecond=0).isoformat()
+    wide = client.get(f"/api/orchestration/graph?start={start}").json()
+    narrow = client.get(f"/api/orchestration/graph?start={start}&end={(utcnow() - timedelta(hours=2)).isoformat()}").json()
+    assert wide["nodes"]["ranker"]["llm"]["requests"] >= 1 and narrow["nodes"]["ranker"]["llm"]["requests"] == 0
 
 
 def test_orchestration_never_writes(user_id, signed_in):

@@ -33,8 +33,9 @@ def orchestration_scope(user: CurrentUser = Depends(current_user),
     begin, finish = monitoring.time_range(range, start, end)
     if finish < begin:
         raise HTTPException(422, "end must be after start")
+    # An explicit window is its own range: it must never share a cached graph with a preset or another window.
     return orchestration.Scope(viewer_id=user.id, user_id=None if all_accounts else user.id, start=begin, end=finish,
-                               range_name=range)
+                               range_name="custom" if start or end else range)
 
 
 ScopeDep = Depends(orchestration_scope)

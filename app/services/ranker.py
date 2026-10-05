@@ -60,7 +60,7 @@ from app.prompts.ranking import (
 from app.services import backoff, job_description, user_settings, worker_settings
 from app.services import resume_verification as rv
 from app.services.context_builder import build_ranking_context, latest_ranking_context_hash
-from app.services.lifecycle import ErrorCategory, InvalidTransition
+from app.services.lifecycle import STOPPED_BY_USER, ErrorCategory, InvalidTransition
 from app.services.lifecycle import WorkflowState as S
 from app.services.llm import (
     LLMCall,
@@ -739,7 +739,7 @@ def retry_delay(attempt: int, base_seconds: int | None = None, max_seconds: int 
     base = settings.ranking_retry_base_seconds if base_seconds is None else base_seconds
     longest = settings.ranking_retry_max_seconds if max_seconds is None else max_seconds
     seconds = base * 2 ** max(0, attempt - 1)
-    return timedelta(seconds=min(max(base, longest), seconds))
+    return timedelta(seconds=min(longest, seconds))  # the longest wait is a ceiling, whatever the first wait
 
 
 def _retry_or_fail(db: Session, task: JobRankingTask, job: Job | None, category: ErrorCategory, message: str, *,
@@ -1348,7 +1348,8 @@ def tracker(db: Session, user_id: int, now: datetime | None = None, *, q: str = 
                 "lease_expires_at": _iso(task.lock_expires_at),
                 "retried": task.status == FAILED and latest_task.get(task.job_id, task.id) > task.id,
                 # Taken out of the queue by the user and not asked for since: the tracker offers to rank it again.
-                "removed": task.status == SKIPPED and task.last_error == REMOVED_BY_USER and state is S.SKIPPED
+                "removed": task.status == SKIPPED and task.last_error in (REMOVED_BY_USER, STOPPED_BY_USER)
+                and state is S.SKIPPED
                 and latest_task.get(task.job_id, task.id) == task.id,
                 "ranking": None if ranking is None else {
                     "version": ranking.version, "overall_fit_score": ranking.overall_fit_score,

@@ -56,7 +56,8 @@ beforeEach(() => {
     if (routes.fail && url.startsWith('/api/workers')) return response({ detail: 'Workers are unavailable' }, 503);
     if (opt.method === 'POST' && url.includes('/run-now')) return response(row({ status: 'QUEUED', run_now: true }));
     if (opt.method === 'POST' && url.includes('/cooldowns/reset')) return response({ cleared: ['OPENROUTER'] });
-    if (opt.method === 'POST' && url.includes('kill')) return response({ stopped: 1, requeued: 2, cooldowns_cleared: url.endsWith('kill') ? [] : ['OPENROUTER'] });
+    if (opt.method === 'POST' && url.includes('kill')) return response({ stopped: 2, running: 1, cooldowns_cleared: url.endsWith('kill') ? [] : ['OPENROUTER'] });
+    if (url.endsWith('/clear')) { routes.clears = [...(routes.clears || []), `${opt.method} ${url}`]; return response({ kind: 'parsing', cleared_at: opt.method === 'POST' ? '2026-10-05T10:00:00' : null }); }
     if (opt.method === 'POST' && url.endsWith('/retry')) { routes.retryPost = { url, body: JSON.parse(opt.body) }; return response({ kind: 'parsing', retried: routes.retryPost.body.task_ids.slice(1).map(id => ({ task_id: id, new_task_id: id + 100, job_id: 1 })), skipped: [{ task_id: routes.retryPost.body.task_ids[0], reason: 'Already run again as task #99' }] }); }
     if (opt.method === 'PUT' && url === '/api/workers/settings') { routes.accountPut = JSON.parse(opt.body); return response({ account: routes.workerSettings.account }); }
     if (opt.method === 'PUT' && url === '/api/workers/server-settings') { routes.serverPut = JSON.parse(opt.body); return response({ server: routes.workerSettings.server }); }
@@ -133,7 +134,7 @@ describe('Running workers', () => {
     await open();
     await ui.A['wk-kill']({ dataset: { kind: 'parsing', id: '11' } });
     expect(posts()).toContain('/api/workers/parsing/tasks/11/kill');
-    expect(document.getElementById('toast').textContent).toContain('Requeued 2 tasks fresh');
+    expect(document.getElementById('toast').textContent).toContain('Stopped 2 tasks (1 mid-run; anything they return is discarded). They stay out of the queue until you retry them');
     confirmMock.mockReturnValueOnce(false);
     await ui.A['wk-kill-all']({ dataset: { kind: 'parsing' } });
     expect(posts()).not.toContain('/api/workers/parsing/kill-all');
@@ -215,7 +216,7 @@ describe('Running workers', () => {
     routes.parsing = { ...parsing(), status_counts: { all: 3, active: 2, running: 1, queued: 0, retrying: 1, failed: 1, done: 0 } };
     const v = await open();
     const options = [...v.querySelectorAll('#wk-status-parsing option')].map(o => o.textContent);
-    expect(options).toEqual(['All statuses (3)', 'Active (running, queued, retrying) (2)', 'Running (1)', 'Queued (0)', 'Retrying (1)', 'Failed or blocked (1)', 'Done (0)']);
+    expect(options).toEqual(['All statuses (3)', 'Active (running, queued, retrying) (2)', 'Running (1)', 'Queued (0)', 'Retrying (1)', 'Failed, blocked or stopped (1)', 'Done (0)']);
     const status = v.querySelector('#wk-status-parsing');
     status.value = 'failed';
     status.dispatchEvent(new Event('change', { bubbles: true }));
@@ -424,6 +425,51 @@ describe('Running workers', () => {
     // The ranking tracker's "Waiting to retry" line gets the same ⓘ.
     expect(context.wkRankWhy({ status: 'PENDING', attempt_count: 0, last_error: 'The job description is still being parsed', next_attempt_at: '2099-01-01T00:00:00', reason: 'resume_changed', max_attempts: 3 }))
       .toContain('Why it is waiting\nThe job description is still being parsed');
+  });
+
+  it('clears finished tasks from a tab without deleting them, and shows them again', async () => {
+    routes.parsing = { ...parsing(), rows: [row(), row({ task_id: 13, status: 'FAILED', can_kill: false }), row({ task_id: 14, status: 'COMPLETED', can_kill: false })] };
+    let v = await open();
+    const clear = v.querySelector('[data-act="wk-clear"]');
+    expect(clear.textContent).toContain('Clear finished (2)');
+    await ui.A['wk-clear'](clear);
+    expect(confirmMock.mock.calls.at(-1)[0]).toContain('Nothing is deleted');
+    expect(routes.clears).toEqual(['POST /api/workers/parsing/clear']);
+    routes.summary = summary({ workers: summary().workers.map(w => w.kind === 'parsing' ? { ...w, cleared_at: '2026-10-05T10:00:00' } : w) });
+    routes.parsing = { ...parsing(), rows: [row()], cleared_at: '2026-10-05T10:00:00', cleared_hidden: 2 };
+    v = await open();
+    expect(v.querySelector('[data-act="wk-clear"]')).toBeNull();
+    expect(v.querySelector('[data-act="wk-unclear"]').textContent).toContain('Show 2 cleared');
+    await ui.A['wk-unclear'](v.querySelector('[data-act="wk-unclear"]'));
+    expect(routes.clears.at(-1)).toBe('DELETE /api/workers/parsing/clear');
+  });
+
+  it('hides tailoring tasks finished before the tab was cleared', async () => {
+    routes.summary = summary({ workers: summary().workers.map(w => w.kind === 'tailoring' ? { ...w, cleared_at: '2026-10-05T10:00:00' } : w) });
+    fetchMock.mockImplementation(async url => response(url === '/api/workers' ? routes.summary : url.endsWith('/activity') ? routes.activity
+      : url.startsWith('/api/tailor-tasks') ? [{ id: 41, job_id: 5, title: 'Old', company: 'A', mode: 'tailor', status: 'failed', stage: 'done', progress: 0, finished_at: '2026-10-05T09:00:00' },
+        { id: 42, job_id: 6, title: 'New', company: 'B', mode: 'tailor', status: 'failed', stage: 'done', progress: 0, finished_at: '2026-10-05T11:00:00' },
+        { id: 43, job_id: 7, title: 'Waiting', company: 'C', mode: 'tailor', status: 'queued', stage: 'queued', progress: 0 }] : {}));
+    const v = await open('tailoring');
+    expect(v.textContent).not.toContain('Old'); expect(v.textContent).toContain('New'); expect(v.textContent).toContain('Waiting');
+    expect(v.querySelector('[data-act="wk-clear"]').textContent).toContain('Clear finished (1)');
+    expect(v.querySelector('[data-act="tasks-clear"]')).toBeNull();  // the old button deleted rows
+  });
+
+  it('asks before leaving unsaved worker settings, but not between its own tabs', async () => {
+    window.scrollTo = () => {};
+    const v = await open('settings');
+    const el = v.querySelector('#workers-a__parsing__max_attempts');
+    el.value = '5'; el.dispatchEvent(new Event('input', { bubbles: true }));
+    confirmMock.mockReturnValueOnce(false);
+    ui.go('overview');
+    expect(ui.S.screen).toBe('workers');  // stayed: the draft is kept
+    expect(ui.S.forms.workers.a__parsing__max_attempts).toBe('5');
+    ui.A['wk-tab']({ dataset: { id: 'parsing' } });
+    expect(ui.S.screen).toBe('workers'); expect(ui.S.forms.workers).toBeDefined();  // own tabs: no question
+    confirmMock.mockReturnValueOnce(true);
+    ui.go('overview');
+    expect(ui.S.screen).toBe('overview'); expect(ui.S.forms.workers).toBeUndefined();
   });
 });
 

@@ -573,6 +573,7 @@ function rankTaskPill(t) {
   if (t.status === 'PROCESSING') return pill('ranking…', 'brand');
   if (t.status === 'PENDING') return later(t.next_attempt_at) ? pill(t.attempt_count ? 'retry scheduled' : 'waiting', 'warn') : pill('queued', 'muted');
   if (t.status === 'FAILED') return pill('failed', 'bad');
+  if (wkStoppedRank(t)) return pill('stopped', 'muted');
   if (t.status === 'SKIPPED') return pill('skipped', 'muted');
   return t.ranking?.decision === 'QUALIFIED' ? pill('qualified', 'good') : pill('archived', 'muted');
 }
@@ -622,7 +623,7 @@ function renderRanking(r = D.ranking) {
     const remove = t.status === 'PENDING' ? btn(label('rankRemove' + t.job_id, 'Remove', 'Removing…'), 'ranking-remove', { ids: t.job_id }, 'sm ghost danger', isBusy('rankRemove' + t.job_id)) : '';
     const detail = rankTaskDetail(t), why = RANK_REASON[t.reason] || t.reason;
     return `<div class="lrow ${t.status === 'PROCESSING' ? 'sel' : ''}" style="gap:12px;align-items:flex-start">
-      ${t.status === 'FAILED' && !t.retried && !t.removed ? wkSelectBox('ranking', t.id, t.title) : ''}
+      ${(t.status === 'FAILED' || wkStoppedRank(t)) && !t.retried ? wkSelectBox('ranking', t.id, t.title) : ''}
       <div class="grow" style="min-width:0"><div class="small b ellipsis">${esc(t.title)} <span class="muted" style="font-weight:400">· ${esc(t.company)}</span></div>
         <div class="xs ellipsis ${t.status === 'FAILED' ? '' : 'muted'}" style="${t.status === 'FAILED' ? 'color:var(--bad)' : ''}" title="${attr(detail)}">${esc(why)} · ${esc(detail)}</div>
         ${rankProgress(t, r.in_flight)}</div>
@@ -651,9 +652,8 @@ function renderRanking(r = D.ranking) {
     ${nothing ? `<section class="card">${empty('No ranking activity in the last day', 'Jobs from your searches are filtered and ranked automatically. Rankings you request from a job, the table or the triage queue show up here too.', btn('Go to triage', 'go-triage', {}, 'primary'))}</section>` : ''}
     ${r.active.length ? section('active', 'In progress', `${r.filtered ? `${r.active.length} of ${inFlight}` : inFlight} job${inFlight === 1 ? '' : 's'} waiting, ranking or retrying`, r.active) : ''}
     ${r.recent.length ? section('recent', r.finished_cleared_at ? `Finished since you cleared the list at ${fmtDateTime(r.finished_cleared_at)}` : 'Finished in the last 24 hours',
-      `${c.completed} ranked · ${c.failed} failed${c.skipped ? ` · ${c.skipped} skipped` : ''}`, r.recent,
-      (r.finished_cleared_at ? btn('Show cleared', 'ranking-unclear', {}, 'sm ghost') : '') + btn(label('rankClear', 'Clear list', 'Clearing…'), 'ranking-clear', {}, 'sm', isBusy('rankClear')))
-      : r.finished_cleared_at ? `<section class="card pad16 row between wrap gap10"><span class="small muted">Finished rankings cleared at ${esc(fmtDateTime(r.finished_cleared_at))}. New results show up here as they finish.</span>${btn('Show cleared', 'ranking-unclear', {}, 'sm')}</section>` : ''}
+      `${c.completed} ranked · ${c.failed} failed${c.skipped ? ` · ${c.skipped} skipped` : ''}`, r.recent)
+      : r.finished_cleared_at ? `<section class="card pad16"><span class="small muted">Finished rankings cleared at ${esc(fmtDateTime(r.finished_cleared_at))}. New results show up here as they finish; Show cleared (above) brings the rest back.</span></section>` : ''}
   </div>`;
 }
 function fitSummary(j) {
@@ -930,6 +930,7 @@ function taskPill(t) {
   if (t.status === 'running') return pill(`${STAGE_LABEL[t.stage] || 'Working'}…`, 'brand');
   if (t.status === 'queued') return pill('queued', 'muted');
   if (t.status === 'failed') return pill('failed', 'bad');
+  if (wkStoppedTailor(t)) return pill('stopped', 'muted');
   if (t.status === 'cancelled') return pill('cancelled', 'muted');
   return pill(t.result?.auto_approved ? 'auto-approved' : 'packet ready', 'good');
 }
@@ -952,13 +953,14 @@ function renderTaskStack(tasks = D.tasks || [], all = tasks) {
     const detail = t.status === 'running' ? `${STAGE_LABEL[t.stage]} · ${elapsed(t.started_at)}`
       : t.status === 'queued' ? 'Waiting for a free worker'
       : t.status === 'failed' ? esc(t.error || 'Failed')
+      : wkStoppedTailor(t) ? 'Stopped by you · Retry puts it back in the queue'
       : t.status === 'cancelled' ? 'Cancelled'
       : `Reviewer ${fitTxt(t.result?.reviewer_score)}${t.result?.untailored ? ' · master resume' : ''}`;
     const actions = t.status === 'queued' ? btn('Cancel', 'task-cancel', { id: t.id }, 'sm')
       : t.status === 'succeeded' ? btn('Open', 'task-open', { job: t.job_id }, 'sm')
-      : t.status === 'failed' ? (retried(t) ? btn('Retried', 'task-retry', {}, 'sm', true) : btn(isBusy('retry' + t.id) ? 'Retrying…' : 'Retry', 'task-retry', { id: t.id, job: t.job_id, mode: t.mode }, 'sm', isBusy('retry' + t.id))) : '';
+      : t.status === 'failed' || wkStoppedTailor(t) ? (retried(t) ? btn('Retried', 'task-retry', {}, 'sm', true) : btn(isBusy('retry' + t.id) ? 'Retrying…' : 'Retry', 'task-retry', { id: t.id, job: t.job_id, mode: t.mode }, 'sm', isBusy('retry' + t.id))) : '';
     return `<div class="lrow ${t.status === 'running' ? 'sel' : ''}" style="gap:12px">
-      ${t.status === 'failed' && !retried(t) && S.screen === 'workers' ? wkSelectBox('tailoring', t.id, t.title) : ''}
+      ${(t.status === 'failed' || wkStoppedTailor(t)) && !retried(t) && S.screen === 'workers' ? wkSelectBox('tailoring', t.id, t.title) : ''}
       <div class="grow" style="min-width:0"><div class="small b ellipsis">${esc(t.title)} <span class="muted" style="font-weight:400">· ${esc(t.company)}</span></div>
         <div class="xs ${t.status === 'failed' ? '' : 'muted'} ellipsis" style="${t.status === 'failed' ? 'color:var(--bad)' : ''}">${t.mode === 'skip' ? 'Skip tailoring · ' : ''}${detail}</div>
         ${active ? `<div class="row base gap8 mt6"><span class="grow">${bar(t.progress + '%', t.status === 'running' ? '#5b4ae8' : '#c9cbe0')}</span><span class="xs mono muted none" style="width:34px;text-align:right">${t.progress}%</span></div>` : ''}</div>
@@ -970,7 +972,6 @@ function renderTaskStack(tasks = D.tasks || [], all = tasks) {
         <div class="card-sub">${parts}${running || queued ? ' · runs on the server, safe to leave this page' : ''}</div>
         <div class="row base gap8 mt8"><span class="grow">${bar(overall + '%', '#5b4ae8')}</span><span class="xs mono muted none">${finished}/${total}</span></div></div>
       ${queued ? btn(`Cancel queued (${queued})`, 'tasks-cancel', {}, 'sm') : ''}
-      ${finished ? btn(`Clear finished (${finished})`, 'tasks-clear', {}, 'sm') : ''}
       ${done ? btn('Review in Approvals', 'go', { screen: 'approvals' }, 'sm soft') : ''}
     </div>
     <div style="max-height:420px;overflow:auto" data-scroll-key="tailor-tasks">${rows || '<div class="small muted" style="padding:16px 18px">No tailoring tasks match these filters.</div>'}</div></section>`;
@@ -2101,12 +2102,6 @@ const A = {
   }, rankQueuedMsg),
   'ranking-refresh': () => busy('rankRefresh', () => loadRanking()),
   // Clearing hides finished rankings from this list only: each job keeps its rankings, errors and history.
-  'ranking-clear': () => {
-    const n = D.ranking?.recent.length || 0;
-    if (!confirm(`Clear ${n} finished ranking${n === 1 ? '' : 's'} from this list? Jobs keep their rankings and history, and failed ones can still be ranked again from the job.`)) return;
-    return busy('rankClear', async () => { await api('/api/ranking/finished/clear', { method: 'POST' }); await loadRanking(); }, 'Finished list cleared');
-  },
-  'ranking-unclear': () => busy('rankClear', async () => { await api('/api/ranking/finished/clear', { method: 'DELETE' }); await loadRanking(); }),
   'ranking-reset-filters': () => { S.rf = { q: '', location: 'all' }; wkFilter('ranking').status = 'all'; loadRanking().then(render); },
   'ranking-remove': el => {
     const ids = String(el.dataset.ids).split(',').map(Number);
@@ -2129,7 +2124,6 @@ const A = {
   generate: el => queueTailoring([Number(el.dataset.id)], 'tailor', true, 'queue' + el.dataset.id),
   'task-cancel': el => busy('tasks', async () => { await api('/api/tailor-tasks/cancel', { method: 'POST', body: { ids: [Number(el.dataset.id)] } }); await refreshTasks(); render(); }),
   'tasks-cancel': () => busy('tasks', async () => { await api('/api/tailor-tasks/cancel', { method: 'POST', body: {} }); await refreshTasks(); render(); }, 'Queued jobs cancelled'),
-  'tasks-clear': () => busy('tasks', async () => { await api('/api/tailor-tasks/clear', { method: 'POST' }); await refreshTasks(); render(); }),
   'task-retry': el => {
     const task = (D.tasks || []).find(t => t.id === Number(el.dataset.id));
     if (!task || retried(task)) return;
@@ -2404,7 +2398,7 @@ window.addEventListener('hashchange', () => {
   }
 });
 window.addEventListener('beforeunload', e => {
-  if (S.screen === 'settings' && settingsAnyDirty()) { e.preventDefault(); e.returnValue = ''; }
+  if ((S.screen === 'settings' && settingsAnyDirty()) || screenFormDirty()) { e.preventDefault(); e.returnValue = ''; }
 });
 document.addEventListener('submit', e => {
   if (e.target.id === 'knowledge-editor-form') { e.preventDefault(); knowledgeSave(); }

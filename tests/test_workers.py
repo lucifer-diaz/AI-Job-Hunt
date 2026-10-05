@@ -115,23 +115,31 @@ def test_the_ranking_tab_keeps_the_tracker_facts(user_id, signed_in):
 
 # ───────────── kill ─────────────
 
-def test_killing_a_running_parse_requeues_it_fresh_and_the_old_run_cannot_write(user_id, signed_in):
+def test_killing_a_running_parse_stops_it_for_good_and_the_old_run_cannot_write(user_id, signed_in):
     with SessionLocal() as db:
         job = add_job(db, user_id)
         task = parse_task(db, user_id, job, attempt_count=2)
         db.commit()
-        task_id = task.id
+        task_id, job_id = task.id, job.id
     with SessionLocal() as db:
         [claim] = [c for c in job_description.claim(db, worker_id="w1", limit=50) if c.task_id == task_id]
-    out = signed_in(user_id).post(f"/api/workers/parsing/tasks/{task_id}/kill").json()
-    assert (out["stopped"], out["requeued"], out["cooldowns_cleared"]) == (1, 1, [])
+    client = signed_in(user_id)
+    out = client.post(f"/api/workers/parsing/tasks/{task_id}/kill").json()
+    assert (out["stopped"], out["running"], out["cooldowns_cleared"]) == (1, 1, [])
     with SessionLocal() as db:
         task = db.get(JobDescriptionParseTask, task_id)
-        assert (task.status, task.attempt_count, task.lock_token, task.next_attempt_at) == ("PENDING", 0, None, None)
+        assert (task.status, task.lock_token, task.next_attempt_at, task.last_error) == ("FAILED", None, None,
+                                                                                         "Stopped by you")
         assert job_description._held(db, claim) is None  # whatever the old run finishes is discarded
+        job_description.sweep(db)  # the automatic sweep does not queue it again
+        assert db.query(JobDescriptionParseTask).filter_by(job_id=job_id, status="PENDING").count() == 0
+    row = next(r for r in client.get("/api/workers/parsing").json()["rows"] if r["task_id"] == task_id)
+    assert row["status"] == "STOPPED" and row["can_run_now"] and not row["can_kill"]
+    # Retry brings it back when the person asks.
+    assert client.post("/api/workers/parsing/retry", json={"task_ids": [task_id]}).json()["retried"]
 
 
-def test_killing_a_running_ranking_puts_the_job_back_in_line(user_id, signed_in):
+def test_killing_a_running_ranking_takes_the_job_out_of_the_queue(user_id, signed_in):
     with SessionLocal() as db:
         job = add_job(db, user_id, state="RANKING", previous_state="RANK_PENDING")
         task = JobRankingTask(user_id=user_id, job_id=job.id, status="PROCESSING", attempt_count=2, lock_token="tok",
@@ -143,10 +151,10 @@ def test_killing_a_running_ranking_puts_the_job_back_in_line(user_id, signed_in)
     signed_in(user_id).post(f"/api/workers/ranking/tasks/{task_id}/kill").raise_for_status()
     with SessionLocal() as db:
         job, task = db.get(Job, job_id), db.get(JobRankingTask, task_id)
-        assert job.state.value == "RANK_PENDING" and task.status == "PENDING" and task.attempt_count == 0
-        moved = db.scalar(select(WorkflowTransition).where(WorkflowTransition.job_id == job_id)
-                          .order_by(WorkflowTransition.id.desc()))
-        assert moved.to_state.value == "RANK_PENDING" and moved.actor == f"user:{user_id}"
+        assert job.state.value == "SKIPPED" and task.status == "SKIPPED" and task.last_error == "Stopped by you"
+        moves = [m.to_state.value for m in db.scalars(select(WorkflowTransition).where(
+            WorkflowTransition.job_id == job_id).order_by(WorkflowTransition.id)).all()]
+        assert moves[-2:] == ["RANK_PENDING", "SKIPPED"]  # recorded workflow moves, by the person
         claim = ranker.TaskClaim(task_id, job_id, user_id, "tok", "w1", 2, False, utcnow())
         with pytest.raises(ranker.LeaseLost):
             ranker._owned(db, claim)
@@ -176,14 +184,14 @@ def test_a_task_waiting_its_first_turn_has_nothing_to_kill(user_id, signed_in):
         db.commit()
         task_id, done_id = task.id, done.id
     client = signed_in(user_id)
-    assert client.post(f"/api/workers/parsing/tasks/{task_id}/kill").json()["requeued"] == 0
+    assert client.post(f"/api/workers/parsing/tasks/{task_id}/kill").json()["stopped"] == 0
     assert client.post(f"/api/workers/parsing/tasks/{done_id}/kill").status_code == 409
 
 
-def test_a_killed_tailoring_run_stops_before_saving_anything(user_id, signed_in, monkeypatch):
+def test_a_killed_tailoring_run_stops_for_good_and_can_never_save(user_id, signed_in, monkeypatch):
     with SessionLocal() as db:
         db.execute(delete(TailorTask))  # the claim takes the oldest queued task of any account
-        job = add_job(db, user_id, status="shortlisted")
+        job = add_job(db, user_id, status="shortlisted", title="Original title")
         db.add(TailorTask(user_id=user_id, job_id=job.id, status="queued", stage="queued", attempts=0))
         db.commit()
         job_id = job.id
@@ -195,23 +203,29 @@ def test_a_killed_tailoring_run_stops_before_saving_anything(user_id, signed_in,
     client.post(f"/api/workers/tailoring/tasks/{task_id}/kill").raise_for_status()
     with SessionLocal() as db:
         task = db.get(TailorTask, task_id)
-        assert (task.status, task.stage, task.attempts, task.locked_by) == ("queued", "queued", 0, None)
-    # The same worker claims it again under a new name: the first run can never write over the second.
-    assert tailor_tasks.claim_next(SessionLocal, "worker-1", 900) == task_id
+        assert (task.status, task.error, task.locked_by) == ("cancelled", "Stopped by you", None)
+        assert db.get(Job, job_id).auto_tailor_status == "DECLINED"  # automatic tailoring leaves it alone
+    assert tailor_tasks.claim_next(SessionLocal, "worker-1", 900) is None  # stopped: not picked up again
     assert tailor_tasks._write(SessionLocal, task_id, first_holder, stage="tailoring") is False
 
-    saved = []
+    # Run again on request; then stop it while the model "runs": its save is refused inside the transaction itself,
+    # even without a progress checkpoint in between.
+    fresh = client.post(f"/api/workers/tailoring/tasks/{task_id}/run-now").json()["task_id"]
+    assert tailor_tasks.claim_next(SessionLocal, "worker-1", 900) == fresh
 
-    def tailor(db, job, progress):  # stands in for workflow.tailor_job: a checkpoint, then the save
-        client.post(f"/api/workers/tailoring/tasks/{task_id}/kill").raise_for_status()  # killed mid-run
-        progress("tailoring")
-        saved.append(job.id)
+    def tailor(db, job, progress):  # stands in for workflow.tailor_job: the model call, then the save
+        client.post(f"/api/workers/tailoring/tasks/{fresh}/kill").raise_for_status()  # stopped mid-run
+        job.title = "Changed by a stopped run"
+        db.commit()
     monkeypatch.setattr(tailor_tasks, "tailor_job", tailor)
-    assert tailor_tasks.run_task(SessionLocal, task_id, "worker-1", 900) == "abandoned"
-    assert saved == []
+    assert tailor_tasks.run_task(SessionLocal, fresh, "worker-1", 900) == "abandoned"
     with SessionLocal() as db:
+        assert db.get(Job, job_id).title == "Original title"
         assert db.scalar(select(ResumeVariant).where(ResumeVariant.job_id == job_id)) is None
-        assert db.get(TailorTask, task_id).status == "queued"  # waiting for its fresh run
+        assert db.get(TailorTask, fresh).status == "cancelled"
+        assert db.get(TailorTask, fresh).run_now_at is None  # the run-now marker was used once and cleared
+        db.execute(delete(TailorTask))
+        db.commit()
 
 
 # ───────────── run now ─────────────
@@ -420,3 +434,34 @@ def test_bulk_retry_requeues_failed_tailoring_with_its_mode(user_id, signed_in):
         assert (fresh.status, fresh.mode, fresh.run_now_at) == ("queued", "tailor", None)
         db.execute(delete(TailorTask))
         db.commit()
+
+
+# ───────────── clear finished ─────────────
+
+def test_clear_finished_hides_the_list_only_and_can_be_undone(user_id, signed_in):
+    with SessionLocal() as db:
+        done = parse_task(db, user_id, add_job(db, user_id), status="COMPLETED", completed_at=utcnow() - timedelta(minutes=5))
+        failed = parse_task(db, user_id, add_job(db, user_id), status="FAILED", completed_at=utcnow() - timedelta(minutes=3))
+        waiting = parse_task(db, user_id, add_job(db, user_id))
+        db.commit()
+        ids = done.id, failed.id, waiting.id
+    client = signed_in(user_id)
+    before = client.get("/api/workers/parsing").json()
+    assert {r["task_id"] for r in before["rows"]} >= set(ids) and before["cleared_at"] is None
+    out = client.post("/api/workers/parsing/clear").json()
+    assert out["cleared_at"]
+    after = client.get("/api/workers/parsing").json()
+    shown = {r["task_id"] for r in after["rows"]}
+    assert ids[2] in shown and ids[0] not in shown and ids[1] not in shown  # queued work never hides
+    assert after["cleared_hidden"] >= 2 and after["status_counts"]["failed"] == 0
+    assert next(w for w in client.get("/api/workers").json()["workers"] if w["kind"] == "parsing")["cleared_at"]
+    assert client.get("/api/workers/parsing/activity").json()["done"] >= 1  # history and charts keep them
+    with SessionLocal() as db:
+        assert db.get(JobDescriptionParseTask, ids[0]) is not None  # nothing deleted
+    client.delete("/api/workers/parsing/clear").raise_for_status()
+    assert {r["task_id"] for r in client.get("/api/workers/parsing").json()["rows"]} >= set(ids)
+    # Ranking shares the tracker's own clear.
+    client.post("/api/workers/ranking/clear").raise_for_status()
+    with SessionLocal() as db:
+        assert ranker.finished_cleared_at(db, user_id) is not None
+    assert client.post("/api/workers/nope/clear").status_code == 404

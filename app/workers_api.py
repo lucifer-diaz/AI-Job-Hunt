@@ -142,6 +142,20 @@ def reset_cooldowns(provider: str | None = Query(None, max_length=30), user: Cur
     return {"cleared": backoff.reset(db, user.id, provider)}
 
 
+@router.post("/{kind}/clear")
+def clear_finished(kind: str, user: CurrentUser = Depends(current_user),
+                   db: Session = Depends(get_user_db)) -> dict[str, Any]:
+    """Hide this tab's finished tasks from its list. Nothing is deleted; metrics and history keep them."""
+    return _guard(workers.clear_finished, db, user.id, kind)
+
+
+@router.delete("/{kind}/clear")
+def show_cleared(kind: str, user: CurrentUser = Depends(current_user),
+                 db: Session = Depends(get_user_db)) -> dict[str, Any]:
+    """Show the finished tasks of the last day again."""
+    return _guard(workers.clear_finished, db, user.id, kind, clear=False)
+
+
 @router.post("/{kind}/kill-all")
 def kill_worker(kind: str, user: CurrentUser = Depends(current_user),
                 db: Session = Depends(get_user_db)) -> dict[str, Any]:

@@ -29,6 +29,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.models import (
+    AppSetting,
     Job,
     JobDescriptionFetchTask,
     JobDescriptionParseTask,
@@ -36,13 +37,13 @@ from app.models import (
     TailorTask,
 )
 from app.services import backoff, redaction, worker_settings
-from app.services.lifecycle import WorkflowState
+from app.services.lifecycle import STOPPED_BY_USER, WorkflowState
 from app.settings import get_settings
 
 RECENT = timedelta(hours=24)
 ROW_LIMIT = 200
 ERROR_LIMIT = 300
-KILLED_NOTE = "Stopped by you and requeued"
+KILLED_NOTE = "Stopped by you and requeued"  # older rows; Kill now stops (lifecycle.STOPPED_BY_USER)
 
 
 def utcnow() -> datetime:
@@ -125,6 +126,8 @@ def _display_status(spec: WorkerKind, task: Any, now: datetime) -> str:
     status = task.status
     if status == spec.running:
         return "RUNNING"
+    if status not in spec.active and (task.error if spec.kind == "tailoring" else task.last_error) == STOPPED_BY_USER:
+        return "STOPPED"
     if status == spec.pending:
         waiting = getattr(task, "next_attempt_at", None)
         if (waiting is not None and waiting > now) or ((_attempts(spec, task) or 0) > 0 and spec.kind != "tailoring"):
@@ -158,7 +161,7 @@ def row(spec: WorkerKind, task: Any, job: tuple[str, str] | None, now: datetime,
             "error_category": category, "run_now": task.run_now_at is not None,
             "result_code": getattr(task, "result_code", None),
             "can_kill": status in ("RUNNING", "RETRYING"),
-            "can_run_now": status in ("QUEUED", "RETRYING") or status in ("FAILED", "BLOCKED"),
+            "can_run_now": status in ("QUEUED", "RETRYING") or status in STATUS_FILTERS["failed"],
             "retried_by": None,  # set by rows() when a newer task of the same job exists
             "can_remove": active and status != "RUNNING" and spec.kind in ("ranking", "tailoring")}
 
@@ -166,7 +169,7 @@ def row(spec: WorkerKind, task: Any, job: tuple[str, str] | None, now: datetime,
 # Status filters, the same for every worker: what a task is doing, in the words the screen uses.
 STATUS_FILTERS = {
     "active": ("RUNNING", "QUEUED", "RETRYING"), "running": ("RUNNING",), "queued": ("QUEUED",),
-    "retrying": ("RETRYING",), "failed": ("FAILED", "BLOCKED"),
+    "retrying": ("RETRYING",), "failed": ("FAILED", "BLOCKED", "STOPPED"),
     "done": ("COMPLETED", "SUCCEEDED", "SKIPPED", "CANCELLED"),
 }
 SCAN_LIMIT = 2000  # rows read before filtering, so a match past the first page is still found
@@ -175,6 +178,63 @@ SCAN_LIMIT = 2000  # rows read before filtering, so a match past the first page 
 def bucket(status: str) -> str:
     """Which status filter a displayed status falls under (besides "active")."""
     return next(name for name, members in STATUS_FILTERS.items() if name != "active" and status in members)
+
+
+# ───────────── clearing the finished list ─────────────
+# "Clear finished" hides finished tasks from a tab's list; nothing is deleted. Each tab keeps the time it was cleared
+# (ranking keeps its own, shared with the ranking tracker); finished tasks from before it stay out of the list, while
+# metrics, the activity chart and each job's history still count them.
+CLEARED_PREFERENCES = "workers_cleared"  # AppSetting.preferences[...]: {kind: ISO time}
+
+
+def cleared_at(db: Session, user_id: int, kind: str) -> datetime | None:
+    spec = kind_of(kind)
+    if spec.kind == "ranking":
+        from app.services import ranker
+
+        return ranker.finished_cleared_at(db, user_id)
+    prefs = db.scalar(select(AppSetting.preferences).where(AppSetting.user_id == user_id)) or {}
+    value = (prefs.get(CLEARED_PREFERENCES) or {}).get(spec.kind)
+    try:
+        return datetime.fromisoformat(value) if value else None
+    except (TypeError, ValueError):
+        return None
+
+
+def clear_finished(db: Session, user_id: int, kind: str, *, clear: bool = True,
+                   now: datetime | None = None) -> dict[str, Any]:
+    """Hide (or, with clear=False, show again) a tab's finished tasks. Only the view changes. Commits."""
+    spec, now = kind_of(kind), now or utcnow()
+    if spec.kind == "ranking":
+        from app.services import ranker
+
+        ranker.clear_finished(db, user_id, clear=clear, now=now)
+    else:
+        from sqlalchemy.orm.attributes import flag_modified
+
+        from app.services import user_settings
+
+        row = user_settings.lock_settings_row(db, user_settings.settings_for(db, user_id))
+        prefs = dict(row.preferences or {})
+        cleared = {k: v for k, v in (prefs.get(CLEARED_PREFERENCES) or {}).items() if k != spec.kind}
+        if clear:
+            cleared[spec.kind] = now.isoformat()
+        prefs[CLEARED_PREFERENCES] = cleared
+        row.preferences = prefs
+        flag_modified(row, "preferences")
+        db.commit()
+    return {"kind": spec.kind, "cleared_at": _iso(cleared_at(db, user_id, spec.kind))}
+
+
+def _hidden(db: Session, spec: WorkerKind, user_id: int, since: datetime | None, now: datetime) -> int:
+    """How many finished tasks of the last day a clear is hiding."""
+    if since is None:
+        return 0
+    m = spec.model
+    finished_column = m.finished_at if spec.kind == "tailoring" else m.completed_at
+    return db.scalar(select(func.count()).select_from(m).where(
+        m.user_id == user_id, m.status.not_in(spec.active), finished_column >= now - RECENT,
+        finished_column <= since)) or 0
 
 
 def rows(db: Session, user_id: int, kind: str, now: datetime | None = None, *, q: str = "",
@@ -187,7 +247,10 @@ def rows(db: Session, user_id: int, kind: str, now: datetime | None = None, *, q
         raise WorkerError(f"Unknown status filter '{status}'. Filters: {', '.join(STATUS_FILTERS)}", 422)
     m = spec.model
     finished_column = m.finished_at if spec.kind == "tailoring" else m.completed_at
-    query = select(m).where(m.user_id == user_id, or_(m.status.in_(spec.active), finished_column >= now - RECENT))
+    since = cleared_at(db, user_id, spec.kind)
+    shown_from = max(now - RECENT, since) if since else now - RECENT
+    query = select(m).where(m.user_id == user_id, or_(m.status.in_(spec.active), finished_column > shown_from)
+                            if since else or_(m.status.in_(spec.active), finished_column >= shown_from))
     text = (q or "").strip()
     if text.lstrip("#").isdigit():
         query = query.where(m.job_id == int(text.lstrip("#")))
@@ -208,7 +271,8 @@ def rows(db: Session, user_id: int, kind: str, now: datetime | None = None, *, q
     out.sort(key=lambda r: (order.get(r["status"], 3), not r["run_now"],
                             r["next_attempt_at"] or "", -(r["task_id"]) if r["status"] not in order else r["task_id"]))
     return {"rows": out[:ROW_LIMIT], "total": len(out), "truncated": len(out) > ROW_LIMIT or len(tasks) >= SCAN_LIMIT,
-            "status_counts": counts, "filters": {"q": text, "status": status or "all"}}
+            "status_counts": counts, "filters": {"q": text, "status": status or "all"},
+            "cleared_at": _iso(since), "cleared_hidden": _hidden(db, spec, user_id, since, now)}
 
 
 ACTIVITY_HOURS = 24
@@ -349,10 +413,40 @@ def _requeue_fresh(db: Session, spec: WorkerKind, task: Any, user_id: int, now: 
     return was_running
 
 
+def _stop(db: Session, spec: WorkerKind, task: Any, user_id: int, now: datetime) -> bool:
+    """End a task as stopped by the person and keep its job out of the automatic queue. True if it was running.
+
+    The lease goes with it, so a run still talking to a model can no longer write anything (the same guards as
+    before); its job is not picked up again by any sweep until someone asks (Retry, Run now, or the job's own
+    screen)."""
+    was_running = _requeue_fresh(db, spec, task, user_id, now)  # takes the lease away; ranking: job back to waiting
+    if spec.kind == "tailoring":
+        from app.services.tailor_tasks import DECLINED
+
+        task.status, task.stage, task.error, task.finished_at = "cancelled", "done", STOPPED_BY_USER, now
+        job = db.scalar(select(Job).where(Job.id == task.job_id, Job.user_id == user_id))
+        if job is not None:
+            job.auto_tailor_status = DECLINED  # automatic tailoring never queues it again on its own
+        return was_running
+    task.status = "FAILED" if spec.kind == "parsing" else "SKIPPED"
+    task.completed_at, task.next_attempt_at = now, None
+    task.last_error, task.error_category = STOPPED_BY_USER, None
+    if spec.kind == "recovery":
+        task.result_code = "STOPPED_BY_USER"
+    if spec.kind == "ranking":
+        from app.services.work_queue import transition
+
+        job = db.scalar(_lock(db, select(Job).where(Job.id == task.job_id, Job.user_id == user_id)))
+        if job is not None and job.state is WorkflowState.RANK_PENDING:
+            # SKIPPED, like a job taken out of the ranking queue: no sweep queues it again (ranker.remove_from_ranking).
+            transition(db, job, WorkflowState.SKIPPED, actor=f"user:{user_id}", reason=STOPPED_BY_USER, now=now)
+    return was_running
+
+
 def kill(db: Session, user_id: int, kind: str, task_ids: list[int] | None = None,
          now: datetime | None = None) -> dict[str, Any]:
-    """Stop running and retrying tasks and requeue them fresh. `task_ids` None: every one of this worker's tasks,
-    and the account's provider cooldowns are cleared too. Commits."""
+    """Stop running and retrying tasks and take them out of the queue. `task_ids` None: every one of this worker's
+    tasks, and the account's provider cooldowns are cleared too. Commits."""
     spec, now = kind_of(kind), now or utcnow()
     m = spec.model
     query = select(m).where(m.user_id == user_id, m.status.in_(spec.active))
@@ -361,21 +455,21 @@ def kill(db: Session, user_id: int, kind: str, task_ids: list[int] | None = None
     tasks = list(db.scalars(_lock(db, query.order_by(m.id))).all())
     if task_ids is not None and not tasks:
         raise WorkerError("That task has already finished", 409)
-    stopped = requeued = 0
+    running = stopped = 0
     for task in tasks:
         if task.status != spec.running and _display_status(spec, task, now) != "RETRYING":
-            continue  # a task still waiting its first turn has nothing to stop or reset
-        stopped += _requeue_fresh(db, spec, task, user_id, now)
-        requeued += 1
+            continue  # a task still waiting its first turn is not stopped by Kill (Remove takes it out)
+        running += _stop(db, spec, task, user_id, now)
+        stopped += 1
     db.commit()
     cleared = backoff.reset(db, user_id) if task_ids is None else []
-    return {"kind": spec.kind, "stopped": stopped, "requeued": requeued, "cooldowns_cleared": cleared}
+    return {"kind": spec.kind, "stopped": stopped, "running": running, "cooldowns_cleared": cleared}
 
 
 def kill_all(db: Session, user_id: int, now: datetime | None = None) -> dict[str, Any]:
     results = {kind: kill(db, user_id, kind, None, now) for kind in KINDS}
     return {"workers": results, "stopped": sum(r["stopped"] for r in results.values()),
-            "requeued": sum(r["requeued"] for r in results.values()),
+            "running": sum(r["running"] for r in results.values()),
             "cooldowns_cleared": sorted({p for r in results.values() for p in r["cooldowns_cleared"]})}
 
 
@@ -405,7 +499,8 @@ def _requeue_finished(db: Session, spec: WorkerKind, task: Any, user_id: int) ->
     else:
         from app.services import tailor_tasks
 
-        out = tailor_tasks.enqueue(db, [job.id], task.mode, task.regenerate)
+        # Regenerate: a run that failed in review may already have saved its packet, which a plain enqueue refuses.
+        out = tailor_tasks.enqueue(db, [job.id], task.mode, True)
         if out["skipped"]:
             raise WorkerError(f"Cannot tailor again: {out['skipped'][0]['reason']}")
     fresh = db.scalar(select(spec.model).where(spec.model.job_id == job.id, spec.model.user_id == user_id,
@@ -428,7 +523,6 @@ def retry(db: Session, user_id: int, kind: str, task_ids: list[int], now: dateti
     ids = list(dict.fromkeys(int(i) for i in task_ids))[:RETRY_LIMIT]
     if not ids:
         raise WorkerError("Choose at least one task to retry", 422)
-    failed = {s.lower() for s in STATUS_FILTERS["failed"]}
     tasks = {t.id: t for t in db.scalars(select(spec.model).where(spec.model.user_id == user_id,
                                                                   spec.model.id.in_(ids))).all()}
     retried, skipped = [], []
@@ -437,8 +531,9 @@ def retry(db: Session, user_id: int, kind: str, task_ids: list[int], now: dateti
         if task is None:
             skipped.append({"task_id": task_id, "reason": "Not found"})
             continue
-        if task.status.lower() not in failed:
-            skipped.append({"task_id": task_id, "reason": f"Not failed ({_display_status(spec, task, now).lower()})"})
+        shown = _display_status(spec, task, now)
+        if shown not in STATUS_FILTERS["failed"]:
+            skipped.append({"task_id": task_id, "reason": f"Not failed ({shown.lower()})"})
             continue
         latest = _newer(db, spec, user_id, [task.job_id]).get(task.job_id)
         if latest is not None and latest.id != task.id:
@@ -463,7 +558,7 @@ def run_now(db: Session, user_id: int, kind: str, task_id: int, now: datetime | 
     if task.status == spec.running:
         raise WorkerError("This task is running right now")
     if task.status not in spec.active:
-        if task.status.upper() in ("COMPLETED", "SUCCEEDED", "SKIPPED", "CANCELLED"):
+        if _display_status(spec, task, now) not in STATUS_FILTERS["failed"]:
             raise WorkerError("This task already finished; queue the job again from its screen")
         latest = _newer(db, spec, user_id, [task.job_id]).get(task.job_id)
         if latest is not None and latest.id != task.id:
@@ -504,7 +599,8 @@ def summary(db: Session, user_id: int, scheduler: Any = None, now: datetime | No
     return {"generated_at": _iso(now), "cooldowns": backoff.active(db, user_id, now=now),
             "workers": [{"kind": s.kind, "label": s.label, "description": s.description, "node_id": s.node_id,
                          "counts": per_kind[s.kind], "scheduler": scheduler_facts(scheduler, s.scheduler_job),
-                         "paused": not worker_settings.get(db, user_id, s.kind, "auto")}
+                         "paused": not worker_settings.get(db, user_id, s.kind, "auto"),
+                         "cleared_at": _iso(cleared_at(db, user_id, s.kind))}
                         for s in KINDS.values()],
             "active": sum(c["active"] for c in per_kind.values()),
             "running": sum(c["running"] for c in per_kind.values())}

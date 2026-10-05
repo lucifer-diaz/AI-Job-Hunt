@@ -88,13 +88,14 @@ describe('Ranking tracker · filters and removal', () => {
 describe('Ranking tracker · clearing the finished list', () => {
   const view = () => { ui.render(); return document.getElementById('view'); };
 
-  it('offers Clear list on the finished section, and Show cleared once it has been cleared', () => {
+  it('offers Clear finished in the filter bar, and Show cleared once it has been cleared', () => {
     ui.D.ranking = { ...ranking(), active: [], recent: [{ ...task(4), status: 'FAILED', percent: null }] };
-    expect(view().querySelector('[data-act="ranking-clear"]').textContent).toContain('Clear list');
+    expect(view().querySelector('[data-act="wk-clear"]').textContent).toContain('Clear finished (1)');
     ui.D.ranking = { ...ranking(), active: [], recent: [], finished_cleared_at: '2026-09-27T10:30:00' };
     const root = view();
     expect(root.textContent).toContain('Finished rankings cleared at');
-    expect(root.querySelector('[data-act="ranking-unclear"]')).not.toBeNull();
+    expect(root.querySelector('[data-act="wk-unclear"]')).not.toBeNull();
+    expect(root.querySelector('[data-act="wk-clear"]')).toBeNull();  // nothing finished left to clear
     expect(root.textContent).not.toContain('No ranking activity in the last day');
   });
 });

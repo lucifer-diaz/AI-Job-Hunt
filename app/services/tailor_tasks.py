@@ -20,12 +20,12 @@ from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, event, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import Job, ResumeVariant, TailorTask
-from app.services import backoff, context_builder, user_settings, worker_settings
+from app.services import backoff, context_builder, threads, user_settings, worker_settings
 from app.services.user_settings import execution_mode_for, settings_for
 from app.services.workflow import (
     NEEDS_RETAILOR,
@@ -167,30 +167,37 @@ def claim_next(sessions: SessionFactory, worker_id: str, lease_seconds: int, now
     now = now or utcnow()
     with sessions() as db:
         expired = (TailorTask.status == "running") & (TailorTask.lock_expires_at < now)
-        # Each account decides how often an interrupted run is restarted (Running workers → Settings).
-        for task_id, user_id, attempts in db.execute(select(TailorTask.id, TailorTask.user_id, TailorTask.attempts)
-                                                     .where(expired).limit(200)).all():
-            if (attempts or 0) >= worker_settings.get(db, user_id, "tailoring", "max_attempts"):
+        # Each account decides how often an interrupted run is restarted (Running workers → Settings). Every expired
+        # task is checked against its own account's limit, in bounded batches, before any of it runs again.
+        limits: dict[int, int] = {}
+        last = 0
+        while batch := db.execute(select(TailorTask.id, TailorTask.user_id, TailorTask.attempts)
+                                  .where(expired, TailorTask.id > last).order_by(TailorTask.id).limit(200)).all():
+            for task_id, user_id, attempts in batch:
+                if user_id not in limits:
+                    limits[user_id] = worker_settings.get(db, user_id, "tailoring", "max_attempts")
+                over = (attempts or 0) >= limits[user_id]
                 db.execute(update(TailorTask).where(TailorTask.id == task_id, expired)
-                           .values(status="failed", stage="done", locked_by=None, lock_expires_at=None,
-                                   finished_at=now, error="Interrupted: the server restarted while this job was "
-                                                          "being tailored. Try again.")
+                           .values(**({"status": "failed", "stage": "done", "finished_at": now,
+                                       "error": "Interrupted: the server restarted while this job was being "
+                                                "tailored. Try again."} if over
+                                      else {"status": "queued", "stage": "queued"}),
+                                   locked_by=None, lock_expires_at=None)
                            .execution_options(synchronize_session=False))
-        db.execute(update(TailorTask).where(expired)
-                   .values(status="queued", stage="queued", locked_by=None, lock_expires_at=None)
-                   .execution_options(synchronize_session=False))
+            last = batch[-1][0]
         db.commit()
         # A task asked to run now (Running workers) goes first.
-        queued = db.execute(select(TailorTask.id, TailorTask.user_id, TailorTask.run_now_at)
-                            .where(TailorTask.status == "queued")
-                            .order_by(TailorTask.run_now_at.is_(None), TailorTask.id).limit(20)).all()
-        quota = _account_quota(db, {user_id for _, user_id, _ in queued})
-        stopped = worker_settings.paused(db, "tailoring", {user_id for _, user_id, _ in queued})
-        for task_id, user_id, run_now in queued:
+        # Accounts that paused automatic tailoring are left out before the limit, so their queue can never hide
+        # other accounts' work; Run now still starts one of theirs.
+        candidates = select(TailorTask.id, TailorTask.user_id).where(TailorTask.status == "queued")
+        paused = worker_settings.paused(db, "tailoring")
+        if paused:
+            candidates = candidates.where(or_(TailorTask.user_id.not_in(paused), TailorTask.run_now_at.is_not(None)))
+        queued = db.execute(candidates.order_by(TailorTask.run_now_at.is_(None), TailorTask.id).limit(20)).all()
+        quota = _account_quota(db, {user_id for _, user_id in queued})
+        for task_id, user_id in queued:
             if quota.get(user_id, 1) <= 0:
                 continue  # this account is already tailoring as many packets at once as it allows
-            if user_id in stopped and run_now is None:
-                continue  # automatic tailoring is paused for this account; Run now still starts one
             # Each claim holds the task under its own name, so a run that was stopped from Running workers (and its
             # task claimed again, maybe by this same worker) can never write over the new run.
             holder = f"{worker_id[:180]}#{uuid.uuid4().hex[:8]}"
@@ -243,6 +250,8 @@ def run_task(sessions: SessionFactory, task_id: int, worker_id: str, lease_secon
         user_id, job_id, mode = task.user_id, task.job_id, task.mode
         holder, run_now = task.locked_by, task.run_now_at is not None
     worker_id = holder  # every write below is guarded by this claim's own name
+    if run_now and not _write(sessions, task_id, worker_id, run_now_at=None):  # used once, by this run only
+        return "abandoned"
 
     def progress(stage: str) -> None:
         """Report the stage and renew the lease. Also the stop point: a run that lost its task goes no further."""
@@ -252,6 +261,17 @@ def run_task(sessions: SessionFactory, task_id: int, worker_id: str, lease_secon
 
     with sessions() as db:
         db.info["user_id"] = user_id
+
+        def still_held(session: Session) -> None:
+            """Every commit of this run (the packet, the review, the job's status) checks, inside the same
+            transaction, that this run still holds its task: a run stopped from Running workers can never save."""
+            held = session.execute(select(TailorTask.id).where(TailorTask.id == task_id, TailorTask.status == "running",
+                                                               TailorTask.locked_by == worker_id)
+                                   .with_for_update()).first()
+            if held is None:
+                raise TaskAbandoned(f"Tailoring task {task_id} was stopped")
+
+        event.listen(db, "before_commit", still_held)
         # The account may have moved to Claude Desktop mode after this task was queued: a task that was
         # waiting then must not spend the configured model API now.
         if execution_mode_for(db, user_id) == "claude_desktop":
@@ -271,7 +291,7 @@ def run_task(sessions: SessionFactory, task_id: int, worker_id: str, lease_secon
             status, error = "succeeded", None
         except TaskAbandoned:
             db.rollback()
-            log.info("tailor task %s was stopped; leaving it to its new run", task_id)
+            log.info("tailor task %s was stopped; nothing it made was saved", task_id)
             return "abandoned"
         except Exception as exc:  # one failing job never stops the worker
             db.rollback()
@@ -323,10 +343,10 @@ class TailorWorker:
         while True:
             try:
                 while len(self._inflight) < self.concurrency:
-                    task_id = await asyncio.to_thread(claim_next, self.sessions, self.worker_id, self.lease_seconds)
+                    task_id = await threads.run_io(claim_next, self.sessions, self.worker_id, self.lease_seconds)
                     if task_id is None:
                         break
-                    job = asyncio.create_task(asyncio.to_thread(run_task, self.sessions, task_id, self.worker_id,
+                    job = asyncio.create_task(threads.run_work(run_task, self.sessions, task_id, self.worker_id,
                                                                 self.lease_seconds))
                     self._inflight.add(job)
                     job.add_done_callback(self._inflight.discard)

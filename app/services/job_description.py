@@ -47,7 +47,7 @@ from app.prompts.job_description_parser import (
     build_job_description_parser_prompt,
 )
 from app.services import backoff, worker_settings
-from app.services.lifecycle import ErrorCategory
+from app.services.lifecycle import STOPPED_BY_USER, ErrorCategory
 from app.settings import get_settings
 
 PENDING, PROCESSING, COMPLETED, FAILED = "PENDING", "PROCESSING", "COMPLETED", "FAILED"
@@ -711,11 +711,14 @@ def sweep(db: Session, limit: int | None = None) -> dict[str, int]:
     # A stub being recovered from the posting (app.services.jd_recovery) is parsed once the real text arrives.
     recovering = select(JobDescriptionFetchTask.job_id).where(
         JobDescriptionFetchTask.status.in_(ACTIVE_JD_FETCH_STATUSES))
+    # A parse a person stopped from Running workers stays stopped until they ask again (Retry, Run now, re-parse).
+    stopped = select(JobDescriptionParseTask.job_id).where(JobDescriptionParseTask.status == FAILED,
+                                                          JobDescriptionParseTask.last_error == STOPPED_BY_USER)
     candidates = db.scalars(
         select(Job)
         .where(Job.description.is_not(None), Job.description != "",
                Job.structured_description_status.in_((RAW, NORMALIZED)), Job.id.not_in(active),
-               Job.id.not_in(recovering), Job.domain_match.is_distinct_from("NOT_MATCHING"))
+               Job.id.not_in(recovering), Job.id.not_in(stopped), Job.domain_match.is_distinct_from("NOT_MATCHING"))
         .order_by(Job.id).limit(max(1, limit))).all()
     queued = 0
     for job in candidates:

@@ -164,6 +164,12 @@ def update(db: Session, user_id: int, changes: dict[str, dict[str, Any]]) -> dic
     row = lock_settings_row(db, settings_for(db, user_id))
     prefs = dict(row.preferences or {})
     workers = dict(prefs.get("workers") or {})
+    if "ranking" in clean:  # the first retry wait can never be longer than the longest one
+        merged = _resolve("ranking", {**_saved(prefs, "ranking"),
+                                      **{k: v for k, v in clean["ranking"].items() if v is not None},
+                                      **{k: None for k, v in clean["ranking"].items() if v is None}})
+        if merged["retry_base_seconds"] > merged["retry_max_seconds"]:
+            raise WorkerSettingError("First retry wait: it cannot be longer than the longest retry wait")
     for kind, values in clean.items():
         merged = {**(workers.get(kind) or {}), **values}
         workers[kind] = {k: v for k, v in merged.items() if v is not None}

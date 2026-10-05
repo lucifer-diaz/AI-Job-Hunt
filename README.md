@@ -1604,15 +1604,24 @@ tracker and tailoring filters its own short list.
 
 | Control | What it does |
 | --- | --- |
-| **Kill** (one task) | Stops the task's current attempt and requeues it fresh: attempts back to zero, retry wait cleared. A running ranking's job goes back to RANK_PENDING (recorded as a workflow transition by you). |
+| **Kill** (one task) | Stops the task and takes it out of the queue: it ends as **Stopped** ("Stopped by you"), and no automatic sweep picks its job up again — a stopped ranking's job is SKIPPED like a job removed from ranking, a stopped tailoring job is never auto-tailored again, a stopped parse is not re-queued by the parse sweep (ranking goes ahead on the raw description). **Run now**, **Retry** or bulk **Retry selected** puts it back. |
 | **Kill all** (a worker, or every worker) | The same for every running or retrying task, and the account's provider rate-limit cooldowns are cleared too. Asks first. |
 | **Run now** (one task) | Puts the task first in line on the next pass, skipping its retry wait, the account's ranking cadence and any provider cooldown for that run. A failed or blocked task is queued again first — once: the old row then reads *↻ Run again as task #n* and has no Run now (the server refuses a second one), so a job never gets two retries. If the provider still answers 429 the task simply backs off again. |
 | **Retry selected** (tick failed tasks, or *Select all failed shown*) | Queues each chosen failed or blocked task again through its worker's normal path, in normal order — no cooldown bypass, unlike Run now. Only what the current filters show can be selected; a task whose job was already run again is skipped and said so (`POST /api/workers/{kind}/retry`, up to 500 at once). |
+| **Clear finished** (each tab's filter bar) | Hides that tab's finished tasks (done, failed, blocked, skipped) from its list. Nothing is deleted: metrics, the 24-hour chart and each job's history keep them, and **Show cleared** brings them back. Queued and running work is never hidden (`POST`/`DELETE /api/workers/{kind}/clear`; ranking shares the tracker's own clear). |
 | **Reset backoff** | Clears the account's provider cooldowns (shown as a banner while any is running). |
 
 A running thread cannot be interrupted, so a kill takes the task's lease away instead: every worker re-checks its lease
-before saving, so whatever the old attempt returns is discarded, and a tailoring run stops at its next checkpoint —
-before it saves a version. A model call already in flight still finishes (and is still billed and logged). Run now is
+before saving, so whatever the old attempt returns is discarded, and every commit of a tailoring run checks its holder
+inside the same transaction, so a stopped run can never save a packet, a review or a status. The scheduler pass stops
+waiting for a stopped task within seconds (its lease heartbeat no longer finds it), so its slot goes to other work.
+
+**Why queues no longer stall.** A scheduler pass renews the lease of every task it is running every few seconds, so a
+model call that outlasts a task's lease (`LLM_REQUEST_TIMEOUT_SECONDS` may be far longer than the 10–15 minute leases)
+never looks abandoned or gets claimed twice. Model calls run on their own thread pool (`app/services/threads.py`) and
+the scheduler's bookkeeping on another, so slow or abandoned calls can never stop jobs from claiming or releasing their
+leases. Keep `LLM_REQUEST_TIMEOUT_SECONDS` near what a call really needs (a few minutes): a call hung on a saturated
+LiteLLM or Ollama still holds its slot until it times out. A model call already in flight still finishes (and is still billed and logged). Run now is
 stored as `run_now_at` on the task (migration 0032) and cleared by the claim that takes it; the scheduler job is
 nudged at once when it is free. Every control acts on your own tasks only.
 

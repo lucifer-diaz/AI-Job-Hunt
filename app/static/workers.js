@@ -3,7 +3,8 @@
    and reuses the views each queue already had: the JD parsing and recovery panels (monitoring.js), the ranking tracker
    and the tailoring task list (app.js).
 
-   Kill stops a task's current attempt and requeues it fresh (attempts and retry wait reset); killing all of a worker's
+   Kill stops a task and takes it out of the queue: it ends as Stopped and no sweep picks its job up again until
+   someone retries it (Retry, Run now, bulk Retry); killing all of a worker's
    tasks also clears the account's rate-limit cooldowns. Run now puts one task first in line, past its retry wait, the
    ranking cadence and any provider cooldown. Every number and row comes from /api/workers/* (app.services.workers). */
 'use strict';
@@ -14,13 +15,14 @@ const WK_TABS = [...WK_KINDS, ['settings', 'Settings']];
 // [label, tone, symbol]: a status is always a word and a symbol, never colour alone.
 const WK_STATUS = { RUNNING: ['Running', 'brand', '●'], QUEUED: ['Queued', 'muted', '○'], RETRYING: ['Retrying', 'warn', '↻'],
   COMPLETED: ['Done', 'good', '✓'], SUCCEEDED: ['Done', 'good', '✓'], FAILED: ['Failed', 'bad', '✕'],
-  BLOCKED: ['Blocked', 'bad', '⛔'], SKIPPED: ['Skipped', 'muted', '–'], CANCELLED: ['Cancelled', 'muted', '–'] };
+  BLOCKED: ['Blocked', 'bad', '⛔'], SKIPPED: ['Skipped', 'muted', '–'], CANCELLED: ['Cancelled', 'muted', '–'],
+  STOPPED: ['Stopped', 'muted', '■'] };
 const WK_POLL_ACTIVE = 3000, WK_POLL_IDLE = 20000;
 // Status filters, the same as the server's (app.services.workers.STATUS_FILTERS).
 const WK_FILTERS = [['all', 'All statuses'], ['active', 'Active (running, queued, retrying)'], ['running', 'Running'],
-  ['queued', 'Queued'], ['retrying', 'Retrying'], ['failed', 'Failed or blocked'], ['done', 'Done']];
+  ['queued', 'Queued'], ['retrying', 'Retrying'], ['failed', 'Failed, blocked or stopped'], ['done', 'Done']];
 const WK_FILTER_MEMBERS = { active: ['RUNNING', 'QUEUED', 'RETRYING'], running: ['RUNNING'], queued: ['QUEUED'],
-  retrying: ['RETRYING'], failed: ['FAILED', 'BLOCKED'], done: ['COMPLETED', 'SUCCEEDED', 'SKIPPED', 'CANCELLED'] };
+  retrying: ['RETRYING'], failed: ['FAILED', 'BLOCKED', 'STOPPED'], done: ['COMPLETED', 'SUCCEEDED', 'SKIPPED', 'CANCELLED'] };
 let wkTimer = null, wkSearchTimer = null;
 
 function wkState() {
@@ -41,9 +43,9 @@ const wkCounted = statuses => Object.fromEntries([['all', statuses.length],
 function wkRankStatus(t) {
   if (t.status === 'PROCESSING') return 'RUNNING';
   if (t.status === 'PENDING') return t.attempt_count > 0 || later(t.next_attempt_at) ? 'RETRYING' : 'QUEUED';
-  return t.status;
+  return wkStoppedRank(t) ? 'STOPPED' : t.status;
 }
-const wkTailorStatus = t => ({ running: 'RUNNING', queued: 'QUEUED' })[t.status] || t.status.toUpperCase();
+const wkTailorStatus = t => wkStoppedTailor(t) ? 'STOPPED' : ({ running: 'RUNNING', queued: 'QUEUED' })[t.status] || t.status.toUpperCase();
 const wkText = (t, q) => { const x = (q || '').trim().toLowerCase(); if (!x) return true;
   if (/^#?\d+$/.test(x)) return String(t.job_id) === x.replace('#', '');
   return `${t.title || ''} ${t.company || ''}`.toLowerCase().includes(x); };
@@ -189,7 +191,7 @@ function wkTable(kind, data) {
   return `<section class="card flush"><div class="row between wrap gap10" style="padding:14px 18px;border-bottom:1px solid var(--line2)">
       <div><div class="card-title" style="font-size:16px">Tasks${filtered ? ' matching your filters' : ''}</div><div class="card-sub">${active} waiting, running or retrying · ${rows.length - active} finished in the last day${shown}</div></div></div>
     <div style="max-height:560px;overflow:auto" data-scroll-key="wk-${kind}">${rows.map(r => `<div class="wk-row ${r.status === 'RUNNING' ? 'running' : ''} ${wkSel(kind).has(r.task_id) ? 'picked' : ''}">
-      <div>${['FAILED', 'BLOCKED'].includes(r.status) && !r.retried_by ? wkSelectBox(kind, r.task_id, r.title) : ''}</div><div>${wkChip(r.status)}</div>
+      <div>${['FAILED', 'BLOCKED', 'STOPPED'].includes(r.status) && !r.retried_by ? wkSelectBox(kind, r.task_id, r.title) : ''}</div><div>${wkChip(r.status)}</div>
       <div style="min-width:0"><div class="small b ellipsis">${esc(r.title || `Job #${r.job_id}`)} <span class="muted" style="font-weight:400">· ${esc(r.company || '')}</span> <span class="xs faint mono" style="font-weight:400">#${r.job_id}</span></div>
         <div class="wk-detail xs ${['FAILED', 'BLOCKED'].includes(r.status) ? 'orch-bad' : 'muted'}"><span class="ellipsis" title="${attr(wkDetail(r))}">${wkTries(r)}${esc(wkDetail(r))}</span>${wkRowWhy(r)}</div></div>
       <div class="wk-row-actions">${r.retried_by ? `<span class="orch-chip muted" title="${attr(`A newer task (#${r.retried_by.task_id}) is handling this job`)}">↻ Run again</span>` : ''}${wkButtons(kind, r.task_id, { kill: r.can_kill, runNow: r.can_run_now })}${btn('Job', 'open-job', { id: r.job_id }, 'sm')}</div></div>`).join('')}</div></section>`;
@@ -230,7 +232,7 @@ function wkHero(tab, spec, act) {
       ${kpi('Finished · 24h', finished, act ? `${wkNum(act.done)} done · ${wkNum(act.failed)} failed` : 'loading…', act && act.failed > act.done ? 'bad' : 'good', '✓')}</div>
     <div><div class="caps-sm mb8">QUEUE NOW</div>${queue}</div>
     <details class="wk-help"><summary>How Kill and Run now work</summary><ul>
-      <li><b>Kill</b> stops the current attempt and requeues the task fresh: attempts and retry wait reset.</li>
+      <li><b>Kill</b> stops the task and takes it out of the queue. It ends as <b>Stopped</b>, and nothing picks its job up again until you press Run now or Retry.</li>
       <li>A run already talking to a model is abandoned, not interrupted — whatever it returns is discarded.</li>
       <li><b>Kill all</b> also clears your rate-limit backoff, so waiting tasks can start at once.</li>
       <li><b>Run now</b> puts a task first in line, past its retry wait${tab === 'ranking' ? ', your ranking cadence' : ''} and any provider cooldown.</li></ul></details>
@@ -433,11 +435,13 @@ function wkSel(tab) {
   return w.sel[tab];
 }
 function wkRetriable(tab) {
-  if (tab === 'parsing' || tab === 'recovery') return ((D.wkData || {})[tab]?.rows || []).filter(r => ['FAILED', 'BLOCKED'].includes(r.status) && !r.retried_by).map(r => r.task_id);
-  if (tab === 'ranking') { const v = wkRankingView().view; return v ? [...v.active, ...v.recent].filter(t => t.status === 'FAILED' && !t.retried && !t.removed).map(t => t.id) : []; }
-  if (tab === 'tailoring') return wkTailoringView().tasks.filter(t => t.status === 'failed' && !retried(t)).map(t => t.id);
+  if (tab === 'parsing' || tab === 'recovery') return ((D.wkData || {})[tab]?.rows || []).filter(r => ['FAILED', 'BLOCKED', 'STOPPED'].includes(r.status) && !r.retried_by).map(r => r.task_id);
+  if (tab === 'ranking') { const v = wkRankingView().view; return v ? [...v.active, ...v.recent].filter(t => (t.status === 'FAILED' || wkStoppedRank(t)) && !t.retried).map(t => t.id) : []; }
+  if (tab === 'tailoring') return wkTailoringView().tasks.filter(t => (t.status === 'failed' || wkStoppedTailor(t)) && !retried(t)).map(t => t.id);
   return [];
 }
+const wkStoppedRank = t => t.status === 'SKIPPED' && t.last_error === 'Stopped by you';
+const wkStoppedTailor = t => t.status === 'cancelled' && t.error === 'Stopped by you';
 // Drop what is no longer retriable or no longer shown (finished retrying, filtered out, cleared).
 function wkPrune(tab) {
   const ok = new Set(wkRetriable(tab)), sel = wkSel(tab);
@@ -468,6 +472,21 @@ function wkRetriedMessage(out) {
   return n ? `Queued ${n} task${n === 1 ? '' : 's'} again${why}` : `Nothing was retried${why}`;
 }
 
+/* ───────────── clear finished ───────────── */
+// How many finished tasks the list shows now, and how many a clear is hiding (parsing and recovery say so).
+function wkFinishedShown(tab) {
+  if (tab === 'parsing' || tab === 'recovery') return ((D.wkData || {})[tab]?.rows || []).filter(r => !['RUNNING', 'QUEUED', 'RETRYING'].includes(r.status)).length;
+  if (tab === 'ranking') return (D.ranking?.recent || []).length;
+  if (tab === 'tailoring') return wkTailoringView().all.filter(t => !['queued', 'running'].includes(t.status)).length;
+  return 0;
+}
+function wkClearControl(tab) {
+  const n = wkFinishedShown(tab), cut = wkClearedAt(tab), hidden = (D.wkData || {})[tab]?.cleared_hidden;
+  const show = cut ? btn(label('wkUnclear' + tab, hidden ? `Show ${hidden} cleared` : 'Show cleared', 'Showing…'), 'wk-unclear', { tab }, 'sm ghost', isBusy('wkUnclear' + tab)) : '';
+  const clear = n ? btn(label('wkClear' + tab, `Clear finished (${n})`, 'Clearing…'), 'wk-clear', { tab, n }, 'sm', isBusy('wkClear' + tab)) : '';
+  return show || clear ? `<span class="row gap6 wk-clear" title="${attr(cut ? `Cleared ${fmtDateTime(cut)}: finished tasks from before then are hidden here; nothing was deleted.` : 'Hide finished tasks from this list. Nothing is deleted.')}">${show}${clear}</span>` : '';
+}
+
 /* ───────────── filters ───────────── */
 // One bar for every tab: search (job title, company or #id), status with how many each choice shows, and for
 // ranking the tracker's location. Ranking keeps its tracker inputs (#rf-q, #rf-location) and their handlers.
@@ -482,7 +501,7 @@ function wkFilterBar(tab, counts) {
     `<option value="${attr(v)}" ${String(v) === String(S.rf.location) ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select>` : '';
   const on = (ranking ? S.rf.q || S.rf.location !== 'all' : f.q) || f.status !== 'all';
   return `<section class="card pad12"><div class="row gap8 wrap" style="align-items:center">${search}${status}${location}
-    ${on ? btn('Clear filters', 'wk-clear-filters', { tab }, 'sm ghost') : ''}</div></section>`;
+    ${on ? btn('Clear filters', 'wk-clear-filters', { tab }, 'sm ghost') : ''}${wkClearControl(tab)}</div></section>`;
 }
 // The ranking tracker narrowed by status (the server already narrowed it by search and location).
 function wkRankingView() {
@@ -493,8 +512,11 @@ function wkRankingView() {
   const keep = t => wkMatches(wkRankStatus(t), f.status);
   return { view: { ...r, active: r.active.filter(keep), recent: r.recent.filter(keep), filtered: true }, counts };
 }
+// Finished tasks from before the tab was cleared stay out of the list (nothing is deleted).
+const wkClearedAt = tab => (tab === 'ranking' ? D.ranking?.finished_cleared_at : null) || wkSpec(tab)?.cleared_at || null;
 function wkTailoringView() {
-  const all = D.tasks || [], f = wkFilter('tailoring');
+  const cut = wkClearedAt('tailoring'), f = wkFilter('tailoring');
+  const all = (D.tasks || []).filter(t => ['queued', 'running'].includes(t.status) || !cut || !t.finished_at || toDate(t.finished_at) > toDate(cut));
   const searched = all.filter(t => wkText(t, f.q));
   return { tasks: searched.filter(t => wkMatches(wkTailorStatus(t), f.status)), all,
            counts: wkCounted(searched.map(wkTailorStatus)) };
@@ -535,9 +557,8 @@ function renderWorkers() {
 /* ───────────── actions ───────────── */
 function wkKilledMessage(out) {
   const cleared = out.cooldowns_cleared?.length ? ` · backoff cleared for ${out.cooldowns_cleared.map(p => p.toLowerCase()).join(', ')}` : '';
-  if (!out.requeued) return `Nothing was running or retrying${cleared}`;
-  const running = out.stopped ? `stopped ${out.stopped} running, ` : '';
-  return `Requeued ${out.requeued} task${out.requeued === 1 ? '' : 's'} fresh (${running}attempts and retry wait reset)${cleared}`;
+  if (!out.stopped) return `Nothing was running or retrying${cleared}`;
+  return `Stopped ${out.stopped} task${out.stopped === 1 ? '' : 's'}${out.running ? ` (${out.running} mid-run; anything they return is discarded)` : ''}. They stay out of the queue until you retry them${cleared}`;
 }
 async function wkReload() { await loadWorkers(); }
 // Search waits for a pause in typing; the status list applies at once. Ranking's own inputs keep their handlers.
@@ -566,6 +587,19 @@ const WORKERS_ACTIONS = {
     wkApplyFilters(tab);
   },
   'wk-tab': el => { wkState().tab = el.dataset.id; go('workers'); },
+  'wk-clear': el => {
+    const tab = el.dataset.tab, n = Number(el.dataset.n) || 0, name = wkSpec(tab)?.label || tab;
+    if (!confirm(`Clear ${n} finished ${name} task${n === 1 ? '' : 's'} from this list? Nothing is deleted: job history, metrics and the 24-hour chart keep them, and Show cleared brings them back.`)) return;
+    return busy('wkClear' + tab, async () => {
+      await api(`/api/workers/${tab}/clear`, { method: 'POST' });
+      wkSel(tab).clear();
+      await wkReload();
+    }, `Finished ${name} tasks cleared from the list`);
+  },
+  'wk-unclear': el => busy('wkUnclear' + el.dataset.tab, async () => {
+    await api(`/api/workers/${el.dataset.tab}/clear`, { method: 'DELETE' });
+    await wkReload();
+  }),
   'wk-sel-clear': el => { wkSel(el.dataset.tab).clear(); render(); },
   'wk-retry-selected': el => {
     const tab = el.dataset.tab, ids = [...wkSel(tab)];
@@ -595,7 +629,7 @@ const WORKERS_ACTIONS = {
   }, wkKilledMessage),
   'wk-kill-all': el => {
     const name = wkSpec(el.dataset.kind)?.label || el.dataset.kind;
-    if (!confirm(`Kill every running or retrying ${name} task? Each is stopped and requeued fresh, and your rate-limit backoff is cleared.`)) return;
+    if (!confirm(`Kill every running or retrying ${name} task? Each is stopped and taken out of the queue (Retry brings it back), and your rate-limit backoff is cleared.`)) return;
     return busy('wkKillAll' + el.dataset.kind, async () => {
       const out = await api(`/api/workers/${el.dataset.kind}/kill-all`, { method: 'POST' });
       await wkReload();
@@ -603,7 +637,7 @@ const WORKERS_ACTIONS = {
     }, wkKilledMessage);
   },
   'wk-kill-everything': () => {
-    if (!confirm('Kill every running or retrying task of every worker? Each is stopped and requeued fresh, and your rate-limit backoff is cleared.')) return;
+    if (!confirm('Kill every running or retrying task of every worker? Each is stopped and taken out of the queue (Retry brings it back), and your rate-limit backoff is cleared.')) return;
     return busy('wkKillEverything', async () => {
       const out = await api('/api/workers/kill-all', { method: 'POST' });
       await wkReload();

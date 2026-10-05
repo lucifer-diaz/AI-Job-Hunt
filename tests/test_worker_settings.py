@@ -159,6 +159,9 @@ def test_ranking_retries_follow_the_account(user_id):
     configure(user_id, ranking={"max_attempts": 5, "retry_base_seconds": 20, "retry_max_seconds": 60})
     assert ranker.retry_delay(1, 20, 60) == timedelta(seconds=20)
     assert ranker.retry_delay(4, 20, 60) == timedelta(seconds=60)
+    assert ranker.retry_delay(1, 3600, 60) == timedelta(seconds=60)  # the longest wait is always the ceiling
+    with SessionLocal() as db, pytest.raises(worker_settings.WorkerSettingError):
+        worker_settings.update(db, user_id, {"ranking": {"retry_base_seconds": 3600}})  # longer than the longest
     now = utcnow()
     with SessionLocal() as db:
         task = JobRankingTask(user_id=user_id, job_id=add_job(db, user_id).id, status="PROCESSING", attempt_count=3,
@@ -252,3 +255,44 @@ def test_a_running_pass_follows_changed_limits_without_a_restart(monkeypatch):
     assert claimed == 6 and outcomes == {"parsed": 6}  # tasks per run caps the pass; the rest wait for the next
     assert peaks[0] == 1 and max(peaks) == 3  # the new limit applied mid-run
     assert queue == [6, 7, 8, 9]  # never claimed early: they are not shown as running while they wait
+
+
+def test_a_pass_never_waits_for_a_stopped_task_and_keeps_running_ones_leased(monkeypatch, user_id):
+    import asyncio
+    import time
+
+    from app.services import scheduled_jobs
+
+    monkeypatch.setattr(server_settings, "value", lambda name: {"c": 3, "b": 3}[name])
+    monkeypatch.setattr(scheduled_jobs, "LIVE_CHECK_SECONDS", 0.01)
+    queue = [0, 1]
+
+    def claim(n):
+        taken, queue[:] = queue[:n], queue[n:]
+        return [type("Claim", (), {"task_id": t})() for t in taken]
+
+    async def process(c):
+        await asyncio.sleep(5 if c.task_id == 0 else 0.02)  # 0: a model call that is still going when it is stopped
+        return "parsed"
+
+    started = time.monotonic()
+    claimed, outcomes = asyncio.run(scheduled_jobs.run_live(concurrency="c", batch="b", claim=claim, process=process,
+                                                            heartbeat=lambda claims: {c.task_id for c in claims} - {0}))
+    assert time.monotonic() - started < 2  # the pass did not wait for the stopped call
+    assert claimed == 2 and outcomes == {"parsed": 1, "stopped": 1}
+
+    # The real heartbeat renews a running task's lease (a long model call never looks abandoned) and drops others.
+    with SessionLocal() as db:
+        mine = JobDescriptionParseTask(user_id=user_id, job_id=add_job(db, user_id).id, description_hash="h",
+                                       status="PROCESSING", attempt_count=1, lock_token="t",
+                                       lock_expires_at=utcnow() - timedelta(minutes=1))
+        lost = JobDescriptionParseTask(user_id=user_id, job_id=add_job(db, user_id).id, description_hash="h",
+                                       status="PROCESSING", attempt_count=1, lock_token="other")
+        db.add_all([mine, lost])
+        db.commit()
+        ids = mine.id, lost.id
+    beat = scheduled_jobs.renew(SessionLocal, JobDescriptionParseTask, 600)
+    claims = [job_description.ParseClaim(ids[0], "t", "w"), job_description.ParseClaim(ids[1], "t", "w")]
+    assert beat(claims) == {ids[0]}
+    with SessionLocal() as db:
+        assert db.get(JobDescriptionParseTask, ids[0]).lock_expires_at > utcnow() + timedelta(minutes=9)

@@ -428,6 +428,13 @@ function orchNodeHistory(g, n, d) {
 }
 function orchNodeActivity(g, n, d) {
   const r = d.recent || {};
+  if (r.aggregate_only) {  // every account: counts only, never another account's calls or tasks
+    const list = (title, obj) => Object.keys(obj || {}).length ? `<div class="caps-sm mt12 mb6">${title}</div>${Object.entries(obj).sort((a, b) => b[1] - a[1]).map(([k, v]) => `<div class="orch-call"><span class="small ellipsis">${esc(k.toLowerCase().replace(/_/g, ' '))}</span><span class="small mono">${v}</span></div>`).join('')}` : '';
+    const c = r.calls || {};
+    return `<div class="small">${c.succeeded || 0} succeeded · ${c.failed || 0} failed · ${c.retried || 0} retried, fell back or escalated</div>
+      ${list('Failures by error', r.failures_by_error)}${list('Calls by model', r.calls_by_model)}${list('Failed tasks by category', r.failed_tasks_by_category)}
+      <div class="xs muted mt8">All accounts: totals only. Individual calls and tasks are listed in each account's own view.</div>`;
+  }
   const call = c => `<div class="orch-call"><span class="xs mono muted">${esc(fmtDateTime(c.at))}</span><span class="small ellipsis">${esc(c.actual_model || 'model unknown')}${c.requested_model && c.requested_model !== c.actual_model ? ` <span class="xs muted">(asked ${esc(c.requested_model)})</span>` : ''}</span>
     <span class="xs muted">${esc([monMs(c.latency_ms), c.error_type, c.fallback_used ? 'fallback' : null, c.escalated ? `escalated: ${c.escalation_reason || ''}` : null, c.retry_count ? `retry ${c.retry_count}` : null].filter(Boolean).join(' · '))}</span>
     ${c.job_id ? btn(`Job #${c.job_id}`, 'orch-pick-job', { id: c.job_id }, 'sm ghost') : ''}</div>`;
