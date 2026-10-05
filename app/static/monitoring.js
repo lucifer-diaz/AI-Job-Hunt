@@ -8,13 +8,13 @@ const MON_ERRORS = { TIMEOUT: 'Timeouts', RATE_LIMIT: 'Rate limits', INVALID_JSO
 const MON_RANGES = [['today', 'Today'], ['7d', '7 days'], ['30d', '30 days']];
 const MON_SERIES = { input: '#5b4ae8', output: '#eb6834' };
 const MON_FILTER_KEYS = ['provider', 'model', 'stage', 'prompt_version', 'status', 'job_id', 'worker_type'];
-// Worker labels as Settings → AI Models names them; unknown workers fall back to their type.
+// Worker labels as AI Orchestration → Models names them; unknown workers fall back to their type.
 const monWorker = w => w ? w.replace(/_/g, ' ').toLowerCase().replace(/^./, c => c.toUpperCase()) : '—';
 let monTimer = null;
 
 // Monitoring is one screen with seven sections; each loads only what it shows (loadMonitoring).
 const MON_TABS = [['overview', 'Overview'], ['llm', 'LLM usage'], ['external', 'External APIs'],
-                  ['apify', 'Apify'], ['jd_parsing', 'JD parsing'], ['jd_recovery', 'JD recovery'], ['inbox', 'Application inbox'], ['logs', 'Logs'], ['advisor', 'AI optimization']];
+                  ['apify', 'Apify'], ['inbox', 'Application inbox'], ['logs', 'Logs'], ['advisor', 'AI optimization']];
 const MON_CATEGORY_TONE = { EXTERNAL_API: 'brand', APIFY: 'brand', LLM: 'muted', SCHEDULER: 'muted',
                             WORKFLOW: 'muted', APPLICATION: 'muted', EMAIL: 'muted', SYSTEM: 'muted' };
 const MON_LEVEL_TONE = { ERROR: 'bad', WARNING: 'warn', INFO: 'muted', DEBUG: 'muted' };
@@ -62,7 +62,7 @@ async function loadMonitoring() {
   // Each section asks only for what it draws, so opening Logs does not aggregate every LLM request.
   const wantsLlm = ['overview', 'llm', 'advisor'].includes(m.tab);
   const wantsExternal = ['overview', 'external', 'apify'].includes(m.tab);
-  const [dash, reqs, capture, rec, ext, extReqs, logs, jdr, inbox, jdp] = await Promise.all([
+  const [dash, reqs, capture, rec, ext, extReqs, logs, inbox] = await Promise.all([
     wantsLlm ? api('/api/monitoring/dashboard?' + monQuery()) : Promise.resolve(D.mon),
     m.tab === 'llm' ? api('/api/monitoring/requests?' + monQuery({ page: m.page, per_page: 20 })) : Promise.resolve(D.monRequests),
     ['llm', 'logs'].includes(m.tab) ? api('/api/monitoring/capture').catch(() => D.monCapture) : Promise.resolve(D.monCapture),
@@ -70,12 +70,10 @@ async function loadMonitoring() {
     wantsExternal ? api('/api/monitoring/external/dashboard?' + monExtQuery()) : Promise.resolve(D.monExt),
     m.tab === 'external' ? api('/api/monitoring/external/requests?' + monExtQuery({ page: m.ext.page, per_page: 25 })) : Promise.resolve(D.monExtRequests),
     m.tab === 'logs' ? api('/api/monitoring/logs?' + monLogQuery({ page: m.logs.page, per_page: 50 })) : Promise.resolve(D.monLogs),
-    m.tab === 'jd_recovery' ? api('/api/monitoring/jd-recovery?' + monQuery()) : Promise.resolve(D.monJdr),
     m.tab === 'inbox' ? api('/api/monitoring/application-inbox?' + monQuery()) : Promise.resolve(D.monInbox),
-    m.tab === 'jd_parsing' ? api('/api/monitoring/jd-parsing?' + monQuery()) : Promise.resolve(D.monJdp),
   ]);
   const wasActive = D.monRec?.active;
-  Object.assign(D, { mon: dash, monRequests: reqs, monCapture: capture, monRec: rec, monExt: ext, monExtRequests: extReqs, monLogs: logs, monJdr: jdr, monInbox: inbox, monJdp: jdp });
+  Object.assign(D, { mon: dash, monRequests: reqs, monCapture: capture, monRec: rec, monExt: ext, monExtRequests: extReqs, monLogs: logs, monInbox: inbox });
   if (wasActive && !rec.active) {
     const task = rec.tasks[0];
     toast(task?.status === 'FAILED' ? `AI usage analysis failed: ${task.error || 'unknown error'}` : 'AI usage analysis finished: recommendations updated', task?.status === 'FAILED');
@@ -152,7 +150,7 @@ function renderMonitoring() {
     <div class="seg">${MON_TABS.map(([id, t]) => `<button class="${m.tab === id ? 'on' : ''}" data-act="mon-tab" data-id="${id}">${t}</button>`).join('')}</div>
     <div class="seg">${MON_RANGES.map(([id, t]) => `<button class="${m.range === id ? 'on' : ''}" data-act="mon-range" data-id="${id}">${t}</button>`).join('')}</div></div></section>`;
   const body = m.tab === 'llm' ? renderMonLlm() : m.tab === 'external' ? renderMonExternal()
-    : m.tab === 'apify' ? renderMonApify() : m.tab === 'jd_parsing' ? renderMonJdParsing() : m.tab === 'jd_recovery' ? renderMonJdRecovery() : m.tab === 'inbox' ? renderMonInbox() : m.tab === 'logs' ? renderMonLogs()
+    : m.tab === 'apify' ? renderMonApify() : m.tab === 'inbox' ? renderMonInbox() : m.tab === 'logs' ? renderMonLogs()
     : m.tab === 'advisor' ? renderAdvisor() : renderMonOverview();
   return `<div class="stack">${tabs}${body}</div>`;
 }
@@ -332,7 +330,7 @@ function renderMonExternal() {
   // A provider that rate limited this account is being left alone; say so, because its calls are being held.
   const cooling = (e.cooldowns || []).length ? `<section class="card pad16"><div class="row gap10 wrap" style="align-items:center">
     <span class="grow small"><b>Backing off</b> · ${e.cooldowns.map(c => `${esc(c.provider)} for ${monMs(c.seconds_left * 1000)}${c.calls_skipped ? ` (${c.calls_skipped} call${c.calls_skipped === 1 ? '' : 's'} held)` : ''}`).join(' · ')}</span>
-    <a class="small" href="#settings/workflow">Change the backoff</a></div>
+    <a class="small" href="#workers/settings">Change the backoff</a></div>
     <div class="xs muted mt6">Calls to these providers are not being made until the wait passes; queued work retries afterwards.</div></section>` : '';
   const tiles = `<section class="mon-tiles">
     ${monTile(m.range === 'today' ? 'External API calls today' : `External API calls · ${rangeLabel}`, s.requests.toLocaleString(), `${s.operations} operation${s.operations === 1 ? '' : 's'}`)}
@@ -407,66 +405,7 @@ function renderMonExtRequests() {
 }
 
 /* ───────────── Apify ───────────── */
-/* JD parsing: postings turned into structured requirements, the queue, the parser's model calls and its job. */
-function renderMonJdParsing() {
-  const data = D.monJdp;
-  if (!data) return loading();
-  const x = data.metrics, llm = x.llm, job = x.scheduler;
-  const cost = llm.estimated_cost == null ? '—' : `$${llm.estimated_cost.toFixed(4)}`;
-  const tiles = `<section class="mon-tiles">
-    ${monTile('Parse tasks', (x.tasks_created || 0).toLocaleString(), 'created in range')}
-    ${monTile('Parsed', (x.completed || 0).toLocaleString(), `${x.jobs_parsed || 0} jobs got structured requirements`)}
-    ${monTile('Success rate', monPct(x.success_rate), `${x.failed || 0} failed`, x.success_rate != null && x.success_rate < 0.8 ? 'warn' : '')}
-    ${monTile('Queue now', `${x.queue.pending} · ${x.queue.processing}`, `waiting · running${x.queue.oldest_pending_at ? ` · oldest ${fmtDateTime(x.queue.oldest_pending_at)}` : ''}`, x.queue.pending > 50 ? 'warn' : '')}
-    ${monTile('Retrying', (x.retrying || 0).toLocaleString(), 'waiting for another attempt', x.retrying ? 'warn' : '')}
-    ${monTile('Average time', monMs(x.average_duration_ms), 'per parse')}
-    ${monTile('Model calls', (llm.requests || 0).toLocaleString(), `${llm.failed || 0} failed`, llm.failed ? 'warn' : '')}
-    ${monTile('Tokens', `${(llm.input_tokens || 0).toLocaleString()} · ${(llm.output_tokens || 0).toLocaleString()}`, 'in · out')}
-    ${monTile('Cost', cost, llm.estimated_cost == null ? 'not reported' : 'estimated')}
-    ${monTile('Model latency', monMs(llm.average_latency_ms), 'average per call')}
-  </section>`;
-  const sched = job ? `<section class="card mon-card"><div class="card-title mb12">Scheduler job</div><div class="col gap8 small">
-    <div class="row gap8 wrap">${pill(job.enabled ? (job.last_status || 'not run yet') : 'off (JD_PARSE_ENABLED=false)', job.last_status === 'failed' ? 'bad' : job.last_status === 'succeeded' ? 'good' : 'muted')}
-      ${job.last_finished_at ? `<span class="xs muted">last run ${esc(fmtDateTime(job.last_finished_at))}</span>` : ''}${job.next_run_at ? `<span class="xs muted">· next ${esc(fmtDateTime(job.next_run_at))}</span>` : ''}</div>
-    ${job.last_error ? `<div class="xs" style="color:var(--bad)">${esc(job.last_error)}</div>` : ''}
-    <div class="xs muted">Models: ${Object.entries(llm.models || {}).map(([k, n]) => `${esc(k)} (${n})`).join(', ') || 'none in range'}. Each call is in LLM usage under the JD parser stage.</div></div></section>` : '';
-  const errors = monCard('jdp-errors', 'Failures', 'Why parse tasks failed in this range',
-    x.top_errors.length ? `<div class="col gap8">${x.top_errors.map(e => `<div class="small"><span class="mono b">${e.tasks}</span> <span class="ink2">${esc(e.error)}</span></div>`).join('')}</div>` : '<div class="small muted">No failed parse tasks in this range.</div>',
-    monTable(['Category', 'Tasks'], Object.entries(x.failures_by_category || {})));
-  return `${tiles}<div class="mon-grid">${sched}${errors}</div>`;
-}
-
-/* JD recovery: how often a missing job description was read back from its posting, and by which route. */
-const JDR_STATUS_TONE = { AVAILABLE: 'good', UNAVAILABLE: 'bad', UNKNOWN: 'muted' };
-function renderMonJdRecovery() {
-  const data = D.monJdr;
-  if (!data) return loading();
-  const x = data.metrics, diag = data.diagnostics;
-  const tiles = `<section class="mon-tiles">
-    ${monTile('Missing descriptions', (x.missing_descriptions || 0).toLocaleString(), 'jobs whose description is unusable now')}
-    ${monTile('Recovery tasks', (x.tasks_created || 0).toLocaleString(), x.active ? `${x.active} queued or running` : 'in range')}
-    ${monTile('Success rate', monPct(x.success_rate), `${x.recovered || 0} recovered`, x.success_rate != null && x.success_rate < 0.5 ? 'warn' : '')}
-    ${monTile('HTTP only', monPct(x.http_only_success_rate), 'recovered without a browser')}
-    ${monTile('Browser fallback', monPct(x.playwright_fallback_rate), x.playwright_success_rate == null ? 'never needed' : `${monPct(x.playwright_success_rate)} of those recovered`)}
-    ${monTile('Model fallback', monPct(x.llm_fallback_rate), x.llm_success_rate == null ? 'never needed' : `${monPct(x.llm_success_rate)} of those recovered`)}
-    ${monTile('Average latency', monMs(x.average_latency_ms), 'per recovery')}
-    ${monTile('Average length', x.average_recovered_length == null ? '—' : `${x.average_recovered_length.toLocaleString()} chars`, 'of recovered descriptions')}
-    ${monTile('Blocked', (x.blocked || 0).toLocaleString(), 'login walls and anti-bot checks — never bypassed', x.blocked ? 'warn' : '')}
-    ${monTile('Failed', (x.failed || 0).toLocaleString(), '', x.failed ? 'bad' : '')}
-    ${monTile('Postings removed', (x.jobs_removed || 0).toLocaleString(), 'closed or gone')}
-    ${monTile('Parsed · ranked after', `${x.subsequently_parsed || 0} · ${x.subsequently_ranked || 0}`, 'recovered jobs that went on')}
-  </section>`;
-  const status = (name, d) => `<div class="row gap8 wrap" style="align-items:center"><span class="small b" style="width:150px">${esc(name)}</span>${pill(d.status, JDR_STATUS_TONE[d.status] || 'muted')}${d.reason ? `<span class="xs muted">${esc(d.reason)}</span>` : ''}</div>`;
-  const pw = diag.playwright || {};
-  const capabilities = `<section class="card mon-card"><div class="card-title mb12">What recovery can use</div><div class="col gap8">
-    ${status('HTTP extraction', diag.http)}${status('Browser (Playwright)', pw)}${status('Model extraction', diag.llm)}
-    <div class="xs faint mt4">Automatic recovery ${diag.enabled ? 'on' : 'off (JD_FETCH_ENABLED=false) — manual recovery still works'} · browser ${esc(pw.browser || 'chromium')}${pw.headless === false ? ' (headed, for debugging)' : ''}${pw.running ? ' · running' : ''} · batch ${diag.settings.batch_size}, ${diag.settings.max_concurrency} at a time, ${diag.settings.max_attempts} attempts</div></div></section>`;
-  const results = Object.entries(x.by_result || {});
-  const outcomes = monCard('jdr-results', 'Outcomes', 'How finished recoveries ended',
-    results.length ? monBars(results.map(([code, n]) => ({ _label: code, n })), r => r.n, r => String(r.n), r => r._label, { labelWidth: 170 }) : '<div class="small muted">No finished recoveries in this range.</div>',
-    monTable(['Result', 'Tasks'], results.map(([code, n]) => [code, n])));
-  return `${tiles}<div class="mon-grid">${capabilities}${outcomes}</div>`;
-}
+/* JD parsing and JD recovery moved to Running workers (app/static/workers.js: wkParsingInsights, wkRecoveryInsights). */
 
 /* Application inbox: Gmail syncs, matching, classification and stage changes. Model calls are under LLM requests. */
 function renderMonInbox() {
@@ -809,4 +748,14 @@ const MONITORING_ACTIONS = {
     if (el) place(e, el.dataset.tip); else if (tip) tip.hidden = true;
   });
   document.addEventListener('scroll', () => { if (tip) tip.hidden = true; }, true);
+  // Keyboard: a focused [data-tip] control (e.g. a Running workers ⓘ) shows its tip beside it.
+  document.addEventListener('focusin', e => {
+    const el = e.target.closest?.('[data-tip]');
+    let keyboard = true;
+    try { keyboard = el?.matches(':focus-visible'); } catch { /* older engines: show it */ }
+    if (!el || !keyboard) return;
+    const box = el.getBoundingClientRect();
+    place({ clientX: box.right, clientY: box.top }, el.dataset.tip);
+  });
+  document.addEventListener('focusout', () => { if (tip) tip.hidden = true; });
 })();

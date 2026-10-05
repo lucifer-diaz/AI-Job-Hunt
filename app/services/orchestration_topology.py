@@ -66,6 +66,8 @@ class Node:
     # Where to look deeper: a Monitoring tab and a workspace screen.
     monitoring_tab: str | None = None
     screen: str | None = None
+    # Its queue in Running workers (app.services.workers kind), when it has one.
+    workers_tab: str | None = None
     implemented: bool = True
 
     @property
@@ -122,18 +124,20 @@ NODES: tuple[Node, ...] = (
     Node("jd_recovery", "JD recovery", (ASYNC, EXT, BROWSER, AI), "Reads a posting's description from its URL when "
          "the board sent none: HTTP first, the shared browser second, a model only to pick blocks on an ambiguous "
          "page.", "pipeline", (3, 0), workers=("JD_RECOVERY",), llm_stages=("JD_RECOVERY",),
-         external=(ExternalMatch("WEB", "jd_recovery"),), optional_ai=True, monitoring_tab="jd_recovery",
+         external=(ExternalMatch("WEB", "jd_recovery"),), optional_ai=True, monitoring_tab="external", workers_tab="recovery",
          screen="discovery"),
     Node("jd_parser", "JD parser", (AI, ASYNC), "Parses the posting into structured requirements with evidence "
          "sentences.", "pipeline", (4, 0), workers=("JD_PARSER",), llm_stages=("JD_PARSER",),
-         monitoring_tab="jd_parsing", screen="discovery"),
+         monitoring_tab="llm", workers_tab="parsing", screen="discovery"),
     Node("ranker", "Ranker", (AI, ASYNC), "Scores fit against verified evidence; Python, not the model, decides "
          "QUALIFIED or ARCHIVED.", "pipeline", (5, 0), workers=("RANKER",), llm_stages=("RANKER",),
-         states=("FILTERED", "RANK_PENDING", "RANKING", "RANKED"), monitoring_tab="llm", screen="discovery"),
+         states=("FILTERED", "RANK_PENDING", "RANKING", "RANKED"), monitoring_tab="llm", screen="discovery",
+         workers_tab="ranking"),
     # ── packet: row 1, right to left ──
     Node("tailor", "Tailor", (AI, ASYNC), "Presents verified experience for the job as a resume patch, and writes "
          "the cover letter. Never scores or fills gaps.", "pipeline", (5, 1), workers=("TAILOR",),
-         llm_stages=("TAILOR",), states=("QUALIFIED", "TAILORING", "TAILORED"), monitoring_tab="llm", screen="tailor"),
+         llm_stages=("TAILOR",), states=("QUALIFIED", "TAILORING", "TAILORED"), monitoring_tab="llm", screen="tailor",
+         workers_tab="tailoring"),
     Node("reviewer", "Reviewer", (AI,), "Independently checks the tailored packet and recommends PASS, RETAILOR or "
          "SKIP; code decides.", "pipeline", (4, 1), workers=("REVIEWER",), llm_stages=("REVIEWER",),
          states=("REVIEWED",), monitoring_tab="llm", screen="tailor"),

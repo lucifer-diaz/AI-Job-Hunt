@@ -338,7 +338,7 @@ def detect_routing_findings(routing: dict[str, Any]) -> list[dict[str, Any]]:
                 "MODEL", "HIGH" if escalation >= 0.6 else "MEDIUM", stage,
                 f"{_pct(escalation)} of {name} requests escalate from {configured}.",
                 f"{w['escalations']} escalations over {w['requests']} {name} requests.",
-                f"Assign {name} its escalation model (or PRIMARY_REASONING) directly in Settings → AI Models.",
+                f"Assign {name} its escalation model (or PRIMARY_REASONING) directly in AI Orchestration → Models.",
                 "One request instead of two for most calls: lower latency and less inference time.",
                 "unknown", "Low: the escalation model already answers these requests today."))
         elif escalation is not None and escalation <= ESCALATION_KEEP and (w.get("schema_failure_rate") or 0) \
@@ -365,7 +365,7 @@ def detect_routing_findings(routing: dict[str, Any]) -> list[dict[str, Any]]:
                 "RELIABILITY", "MEDIUM", stage,
                 f"{_pct(fallback)} of {name} requests were answered by the fallback model.",
                 f"LiteLLM reported a fallback on {_pct(fallback)} of {name} requests.",
-                f"Check the health of {name}'s primary model (Settings → AI Models → Test) before changing it.",
+                f"Check the health of {name}'s primary model (AI Orchestration → Models → Test) before changing it.",
                 "Predictable quality: the configured model answers, not its fallback.", "unknown", "Low."))
     for x in routing.get("worker_models") or []:
         rate = x.get("schema_failure_rate")

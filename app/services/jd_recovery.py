@@ -38,7 +38,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import ACTIVE_JD_FETCH_STATUSES, Job, JobDescriptionFetchTask, JobRanking
-from app.services import jd_extractors, jd_quality, system_log, tracing
+from app.services import backoff, jd_extractors, jd_quality, server_settings, system_log, tracing, worker_settings
 from app.services.lifecycle import ErrorCategory
 from app.services.lifecycle import WorkflowState as S
 from app.settings import get_settings
@@ -251,6 +251,7 @@ class FetchClaim:
     worker_id: str
     user_id: int
     job_id: int
+    run_now: bool = False  # asked to run now from Running workers: skips the provider cooldown
 
 
 def claim(db: Session, *, worker_id: str, limit: int, now: datetime | None = None,
@@ -265,8 +266,14 @@ def claim(db: Session, *, worker_id: str, limit: int, now: datetime | None = Non
     query = (select(JobDescriptionFetchTask.id)
              .where(JobDescriptionFetchTask.status == PENDING,
                     or_(JobDescriptionFetchTask.next_attempt_at.is_(None), JobDescriptionFetchTask.next_attempt_at <= now))
-             .order_by(JobDescriptionFetchTask.next_attempt_at.asc().nulls_first(), JobDescriptionFetchTask.id)
+             .order_by(JobDescriptionFetchTask.run_now_at.is_(None),
+                       JobDescriptionFetchTask.next_attempt_at.asc().nulls_first(), JobDescriptionFetchTask.id)
              .limit(max(1, limit)))
+    # An account that switched automatic recovery off keeps its tasks queued; Run now still takes one.
+    stopped = worker_settings.paused(db, "recovery")
+    if stopped:
+        query = query.where(or_(JobDescriptionFetchTask.user_id.not_in(stopped),
+                                JobDescriptionFetchTask.run_now_at.is_not(None)))
     if db.get_bind().dialect.name == "postgresql":
         query = query.with_for_update(skip_locked=True, of=JobDescriptionFetchTask)
     ids = list(db.scalars(query).all())
@@ -280,9 +287,13 @@ def claim(db: Session, *, worker_id: str, limit: int, now: datetime | None = Non
                                  started_at=now, next_attempt_at=None, updated_at=now)
                          .execution_options(synchronize_session=False)).rowcount
         if won == 1:
-            owner, job_id = db.execute(select(JobDescriptionFetchTask.user_id, JobDescriptionFetchTask.job_id)
-                                       .where(JobDescriptionFetchTask.id == task_id)).one()
-            claimed.append(FetchClaim(task_id, token, worker_id[:200], owner, job_id))
+            owner, job_id, run_now = db.execute(select(JobDescriptionFetchTask.user_id, JobDescriptionFetchTask.job_id,
+                                                       JobDescriptionFetchTask.run_now_at)
+                                                .where(JobDescriptionFetchTask.id == task_id)).one()
+            if run_now is not None:
+                db.execute(update(JobDescriptionFetchTask).where(JobDescriptionFetchTask.id == task_id)
+                           .values(run_now_at=None).execution_options(synchronize_session=False))
+            claimed.append(FetchClaim(task_id, token, worker_id[:200], owner, job_id, run_now is not None))
     db.commit()
     return claimed
 
@@ -293,7 +304,7 @@ def recover_expired(db: Session, now: datetime | None = None) -> int:
     rows = db.scalars(select(JobDescriptionFetchTask).where(
         JobDescriptionFetchTask.status == PROCESSING, JobDescriptionFetchTask.lock_expires_at < now)).all()
     for task in rows:
-        if task.attempt_count >= get_settings().jd_fetch_max_attempts:
+        if task.attempt_count >= worker_settings.get(db, task.user_id, "recovery", "max_attempts"):
             _finish(task, FAILED, now, "LEASE_EXPIRED")
         else:
             _release(task, now, "LEASE_EXPIRED", retry_in=0)
@@ -319,11 +330,11 @@ def _finish(task: JobDescriptionFetchTask, status: str, now: datetime, code: str
 
 
 def _release(task: JobDescriptionFetchTask, now: datetime, code: str, *, retry_in: float | None = None,
-             detail: str | None = None) -> None:
-    """Back in the queue for a later attempt."""
+             detail: str | None = None, retry_seconds: int | None = None) -> None:
+    """Back in the queue for a later attempt. `retry_seconds` is the account's first retry wait."""
     _clear_lease(task)
-    delay = get_settings().jd_fetch_retry_seconds * (2 ** max(0, task.attempt_count - 1)) if retry_in is None \
-        else retry_in
+    base = retry_seconds if retry_seconds is not None else get_settings().jd_fetch_retry_seconds
+    delay = base * (2 ** max(0, task.attempt_count - 1)) if retry_in is None else retry_in
     task.status, task.result_code, task.updated_at = PENDING, code, now
     task.next_attempt_at = now + timedelta(seconds=delay)
     task.last_error = (detail or message_for(code))[:MAX_ERROR_LENGTH]
@@ -349,6 +360,8 @@ class Snapshot:
     title: str
     company: str
     attempt: int
+    use_browser: bool = True  # the account's own switches (Running workers → Settings)
+    use_model: bool = True
 
 
 @dataclass
@@ -594,6 +607,7 @@ async def recover(sessions: Callable[[], Session], snapshot: Snapshot, *, browse
 
     outcome = Outcome(status=FAILED, code="EXTRACTION_FAILED")
     llm_enabled = get_settings().jd_fetch_llm_enabled if llm_enabled is None else llm_enabled
+    llm_enabled = llm_enabled and snapshot.use_model
     try:
         await asyncio.to_thread(check_public_url, snapshot.url, allow_private=get_settings().jd_fetch_allow_private_hosts)
     except UnsafeURL as exc:
@@ -616,7 +630,10 @@ async def recover(sessions: Callable[[], Session], snapshot: Snapshot, *, browse
     best = http if http.kind == "ambiguous" else None
     candidates_from = http if http.extraction and http.extraction.candidates else None
     last_problem = http
-    if best is None and try_browser:
+    if best is None and try_browser and not snapshot.use_browser:
+        outcome.diagnostics["playwright"] = {"attempted": False, "kind": "skipped",
+                                             "reason": "The browser fallback is turned off for your account"}
+    elif best is None and try_browser:
         if browser is None or not browser.is_available():
             outcome.diagnostics["playwright"] = {"attempted": False, "kind": "unavailable",
                                                  "code": "PLAYWRIGHT_UNAVAILABLE",
@@ -670,8 +687,9 @@ def _load(sessions: Callable[[], Session], claim_: FetchClaim) -> Snapshot | str
             db.commit()
             return "skipped"
         if not jd_quality.is_job_description_usable(job) or task.reason == "user_request":
+            own = worker_settings.for_user(db, task.user_id, "recovery")
             return Snapshot(job.id, task.user_id, task.source_url or job.url or "", job.title or "",
-                            job.company or "", task.attempt_count)
+                            job.company or "", task.attempt_count, own["use_browser"], own["use_model"])
         # A usable description arrived after this task was queued: nothing to recover.
         _finish(task, SKIPPED, now, "DESCRIPTION_ARRIVED")
         db.commit()
@@ -685,7 +703,8 @@ async def process(sessions: Callable[[], Session], claim_: FetchClaim, *, browse
     if isinstance(snapshot, str):
         return snapshot
     try:
-        outcome = await recover(sessions, snapshot, browser=browser)
+        with backoff.bypass(claim_.run_now):
+            outcome = await recover(sessions, snapshot, browser=browser)
     except Exception as exc:  # noqa: BLE001  an unexpected failure is one task's problem, retried later
         outcome = Outcome(status="RETRY", code="BROWSER_ERROR" if "playwright" in repr(exc).lower()
                           else "NETWORK_ERROR", detail=f"{type(exc).__name__}")
@@ -724,8 +743,9 @@ def _settle(sessions: Callable[[], Session], claim_: FetchClaim, snapshot: Snaps
                 label = "skipped"
             else:
                 label = apply_recovered(db, job, task, outcome, now)
-        elif outcome.status == "RETRY" and task.attempt_count < get_settings().jd_fetch_max_attempts:
-            _release(task, now, outcome.code, detail=message_for(outcome.code))
+        elif outcome.status == "RETRY" and task.attempt_count < (own := worker_settings.for_user(
+                db, task.user_id, "recovery"))["max_attempts"]:
+            _release(task, now, outcome.code, detail=message_for(outcome.code), retry_seconds=own["retry_seconds"])
             label = "retrying"
         else:
             status = FAILED if outcome.status == "RETRY" else outcome.status
@@ -950,7 +970,7 @@ def diagnostics(db: Session | None = None, user_id: int | None = None) -> dict[s
                 "last_error")},
             "llm": llm,
             "settings": {"min_characters": settings.jd_description_min_characters,
-                         "batch_size": settings.jd_fetch_batch_size,
-                         "max_concurrency": settings.jd_fetch_max_concurrency,
+                         "batch_size": server_settings.value("jd_fetch_batch_size"),
+                         "max_concurrency": server_settings.value("jd_fetch_max_concurrency"),
                          "max_attempts": settings.jd_fetch_max_attempts,
-                         "interval_minutes": settings.jd_recovery_interval_minutes}}
+                         "interval_minutes": server_settings.value("jd_recovery_interval_minutes")}}

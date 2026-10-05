@@ -68,10 +68,13 @@ def _iso(value: datetime | None) -> str | None:
 class Scheduler:
     def __init__(self, specs: list[JobSpec], sessions: Callable[[], Session], *, intervals: dict[str, int],
                  enabled: bool = True, tick_seconds: float = 30, lease_seconds: int = 1800,
-                 instance_id: str | None = None, clock: Callable[[], datetime] = utcnow):
+                 instance_id: str | None = None, clock: Callable[[], datetime] = utcnow, live_intervals: bool = False):
         self.specs = {spec.name: spec for spec in specs}
         self.sessions = sessions
         self.intervals = dict(intervals)
+        # An admin may change an interval in Running workers → Settings (app.services.server_settings); the app's own
+        # scheduler follows it without a restart. A scheduler built with explicit intervals (tests) keeps them.
+        self.live_intervals = live_intervals
         self.enabled = enabled
         self.tick_seconds = tick_seconds
         self.lease_seconds = lease_seconds
@@ -86,6 +89,12 @@ class Scheduler:
         return self._loop_task is not None and not self._loop_task.done()
 
     def interval(self, name: str) -> int:
+        if self.live_intervals and name in self.specs:
+            from app.services import server_settings
+
+            saved = server_settings.interval_override(self.specs[name].interval_setting)
+            if saved is not None:
+                return max(0, saved)
         return max(0, int(self.intervals.get(name) or 0))
 
     # ───────────── lifecycle ─────────────
@@ -274,6 +283,7 @@ def build_scheduler(sessions: Callable[[], Session] | None = None, **overrides: 
         "enabled": settings.scheduler_enabled,
         "tick_seconds": settings.scheduler_tick_seconds,
         "lease_seconds": settings.scheduler_lease_minutes * 60,
+        "live_intervals": "intervals" not in overrides,
     }
     options.update(overrides)
     return Scheduler(JOBS, sessions or SessionLocal, **options)

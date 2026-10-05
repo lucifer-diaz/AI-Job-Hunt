@@ -57,7 +57,7 @@ from app.prompts.ranking import (
     posting_facts,
     ranking_profile_facts,
 )
-from app.services import backoff, job_description, user_settings
+from app.services import backoff, job_description, user_settings, worker_settings
 from app.services import resume_verification as rv
 from app.services.context_builder import build_ranking_context, latest_ranking_context_hash
 from app.services.lifecycle import ErrorCategory, InvalidTransition
@@ -449,9 +449,10 @@ def accounts(db: Session, now: datetime | None = None) -> tuple[list[int], list[
     """Accounts with waiting tasks: those that can be ranked at all (`ready`: their user-requested tasks run now),
     those whose automatic ranking may run now (`auto`: auto-ranking on and their cadence due), and why others wait.
 
-    The cadence (Settings → Workflow & cadence) paces automatic ranking only. A ranking the user asked for is never
+    The cadence (Running workers → Settings) paces automatic ranking only. A ranking the user asked for is never
     held back by it: claim() takes forced tasks from every ready account."""
     owners = db.scalars(select(JobRankingTask.user_id).where(JobRankingTask.status == PENDING).distinct()).all()
+    stopped = worker_settings.paused(db, "ranking", owners)
     ready, auto, waiting = [], [], Counter()
     for user_id in sorted(owners):
         problem = readiness(db, user_id)
@@ -459,7 +460,9 @@ def accounts(db: Session, now: datetime | None = None) -> tuple[list[int], list[
             waiting[problem] += 1
             continue
         ready.append(user_id)
-        if not auto_rank_on(db, user_id):
+        if user_id in stopped:
+            waiting["Automatic ranking is paused (Running workers → Settings)"] += 1
+        elif not auto_rank_on(db, user_id):
             waiting["Auto-ranking is off (only rankings you request run)"] += 1
         elif next_run_at(db, user_id, now=now) is not None:
             waiting["Waiting for this account's next ranking run"] += 1
@@ -479,7 +482,7 @@ def next_run_at(db: Session, user_id: int, now: datetime | None = None) -> datet
     """When this account may rank again, or None when it may rank now.
 
     The server looks every RANKING_INTERVAL_MINUTES; an account can ask to be looked at less often than that
-    (Settings → Workflow & cadence), which spreads the same queue over a longer stretch.
+    (Running workers → Settings), which spreads the same queue over a longer stretch.
     """
     minutes = user_settings.ranking_interval_minutes(db, user_id)
     if minutes <= 0:
@@ -609,6 +612,8 @@ class TaskClaim:
     attempt: int
     force: bool
     lease_expires_at: datetime
+    # Asked to run now from Running workers: its calls skip the provider cooldown (app.services.backoff.bypass).
+    run_now: bool = False
 
 
 def _require_postgres(db: Session) -> None:
@@ -633,7 +638,7 @@ def claim(db: Session, *, worker_id: str, limit: int, ready_accounts: Iterable[i
     lease written to the task keeps other workers away afterwards. User-requested (forced) tasks go first and run
     even when auto-ranking is off.
 
-    Each account also has its own concurrency limit (Settings → Workflow & cadence). Tasks past an account's
+    Each account also has its own concurrency limit (Running workers → Settings). Tasks past an account's
     limit are left PENDING — untouched and first in line next run — so one account with hundreds of queued jobs
     cannot take the whole batch.
     """
@@ -652,7 +657,8 @@ def claim(db: Session, *, worker_id: str, limit: int, ready_accounts: Iterable[i
                or_(JobRankingTask.next_attempt_at.is_(None), JobRankingTask.next_attempt_at <= now),
                JobRankingTask.user_id.in_(ready),
                or_(JobRankingTask.force.is_(True), JobRankingTask.user_id.in_(auto)))
-        .order_by(JobRankingTask.force.desc(), JobRankingTask.next_attempt_at.asc().nulls_first(), JobRankingTask.id)
+        .order_by(JobRankingTask.run_now_at.is_(None), JobRankingTask.force.desc(),
+                  JobRankingTask.next_attempt_at.asc().nulls_first(), JobRankingTask.id)
         .limit(limit)
         .with_for_update(skip_locked=True, of=JobRankingTask)
         .execution_options(populate_existing=True)
@@ -674,9 +680,10 @@ def claim(db: Session, *, worker_id: str, limit: int, ready_accounts: Iterable[i
         task.lock_token, task.lock_expires_at = uuid.uuid4().hex, now + lease
         task.attempt_count += 1
         task.last_attempt_at, task.started_at, task.next_attempt_at = now, now, None
+        run_now, task.run_now_at = task.run_now_at is not None, None
         quota[task.user_id] -= 1
         claims.append(TaskClaim(task.id, task.job_id, task.user_id, task.lock_token, task.locked_by, task.attempt_count,
-                                task.force, task.lock_expires_at))
+                                task.force, task.lock_expires_at, run_now))
     db.commit()
     return claims
 
@@ -726,10 +733,13 @@ def llm_provider_for(db: Session, user_id: int | None) -> str:
     return (user_settings.ai_overrides(db, user_id).get("llm_provider") or get_settings().llm_provider or "").upper()
 
 
-def retry_delay(attempt: int) -> timedelta:
+def retry_delay(attempt: int, base_seconds: int | None = None, max_seconds: int | None = None) -> timedelta:
+    """Doubling waits between attempts: the account's own (Running workers → Settings), else the server's."""
     settings = get_settings()
-    seconds = settings.ranking_retry_base_seconds * 2 ** max(0, attempt - 1)
-    return timedelta(seconds=min(settings.ranking_retry_max_seconds, seconds))
+    base = settings.ranking_retry_base_seconds if base_seconds is None else base_seconds
+    longest = settings.ranking_retry_max_seconds if max_seconds is None else max_seconds
+    seconds = base * 2 ** max(0, attempt - 1)
+    return timedelta(seconds=min(max(base, longest), seconds))
 
 
 def _retry_or_fail(db: Session, task: JobRankingTask, job: Job | None, category: ErrorCategory, message: str, *,
@@ -740,8 +750,10 @@ def _retry_or_fail(db: Session, task: JobRankingTask, job: Job | None, category:
     task.last_error, task.error_category = message, category
     if job is not None:
         job.last_error, job.error_category = message, category
-    if retryable and task.attempt_count < get_settings().ranking_max_attempts:
-        task.status, task.next_attempt_at = PENDING, now + retry_delay(task.attempt_count)
+    own = worker_settings.for_user(db, task.user_id, "ranking")
+    if retryable and task.attempt_count < own["max_attempts"]:
+        task.status = PENDING
+        task.next_attempt_at = now + retry_delay(task.attempt_count, own["retry_base_seconds"], own["retry_max_seconds"])
         if category is ErrorCategory.RATE_LIMITED:
             # No point trying again before the provider will serve this account at all (app.services.backoff).
             cooling = backoff.cooling_until(task.user_id, llm_provider_for(db, task.user_id), now=now)
@@ -975,7 +987,8 @@ def process(sessions: SessionFactory, claimed: TaskClaim, clock: Callable[[], da
     with sessions() as db:
         db.info["user_id"] = claimed.user_id
         try:
-            outcome = _process(db, claimed, clock)
+            with backoff.bypass(claimed.run_now):
+                outcome = _process(db, claimed, clock)
         except LeaseLost:
             db.rollback()
             return "lost"
@@ -1325,11 +1338,13 @@ def tracker(db: Session, user_id: int, now: datetime | None = None, *, q: str = 
                                          JobRankingTask.job_id.in_({row[0].job_id for row in rows}))
                                   .group_by(JobRankingTask.job_id)).all()) if rows else {}
 
+    max_attempts = worker_settings.get(db, user_id, "ranking", "max_attempts")
+
     def row_dict(task: JobRankingTask, title: str, company: str, state: S, ranking: JobRanking | None,
                  where: str | None) -> dict[str, Any]:
         return {**task_dict(task), "title": title, "company": company, "location": where or "",
                 "job_state": state.value,
-                "max_attempts": get_settings().ranking_max_attempts,
+                "max_attempts": max_attempts,
                 "lease_expires_at": _iso(task.lock_expires_at),
                 "retried": task.status == FAILED and latest_task.get(task.job_id, task.id) > task.id,
                 # Taken out of the queue by the user and not asked for since: the tracker offers to rank it again.

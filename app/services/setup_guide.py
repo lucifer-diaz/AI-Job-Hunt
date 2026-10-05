@@ -164,16 +164,16 @@ QUESTS: tuple[Quest, ...] = (
           "Recommended: Ollama Cloud through a local LiteLLM gateway.",
           "Ranking, tailoring and review need a real model. One Ollama account behind LiteLLM covers most of them: "
           "nemotron-3-nano:30b-cloud runs in Ollama Cloud, so you need no GPU, and LiteLLM lets you change models "
-          "later in Settings without touching code.",
+          "later in AI Orchestration → Models without touching code.",
           ("Sign in at ollama.com and create an API key under Settings → Keys.",
            "Install LiteLLM and start it with this repository's Ollama Cloud config (commands below).",
-           "In Settings → AI models → LiteLLM, enter http://localhost:4000 and your LiteLLM master key, then press "
-           "Test Connection.",
+           "In AI Orchestration → Models & routing → LiteLLM connection, enter http://localhost:4000 and your LiteLLM "
+           "master key, then press Test Connection.",
            "Press Sync models from LiteLLM, switch on Use LiteLLM gateway, and assign nemotron-3-nano:30b-cloud to "
            "every tier.",
            "Prefer a direct key? An OpenRouter, OpenAI, Anthropic or Gemini key in Settings → API keys also "
            "completes this quest."),
-          100, "settings", "ai", check=_check_ai,
+          100, "orchestration", "models", check=_check_ai,
           recommended="Ollama account + LiteLLM · nemotron-3-nano:30b-cloud",
           snippet=("export OLLAMA_API_KEY=...  # ollama.com/settings/keys\n"
                    "export LITELLM_MASTER_KEY=sk-jobhunt-local\n"

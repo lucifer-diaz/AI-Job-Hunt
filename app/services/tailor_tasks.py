@@ -25,7 +25,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import Job, ResumeVariant, TailorTask
-from app.services import context_builder, user_settings
+from app.services import backoff, context_builder, user_settings, worker_settings
 from app.services.user_settings import execution_mode_for, settings_for
 from app.services.workflow import (
     NEEDS_RETAILOR,
@@ -167,22 +167,35 @@ def claim_next(sessions: SessionFactory, worker_id: str, lease_seconds: int, now
     now = now or utcnow()
     with sessions() as db:
         expired = (TailorTask.status == "running") & (TailorTask.lock_expires_at < now)
-        db.execute(update(TailorTask).where(expired, TailorTask.attempts >= MAX_ATTEMPTS)
-                   .values(status="failed", stage="done", locked_by=None, lock_expires_at=None, finished_at=now,
-                           error="Interrupted: the server restarted while this job was being tailored. Try again.")
-                   .execution_options(synchronize_session=False))
+        # Each account decides how often an interrupted run is restarted (Running workers → Settings).
+        for task_id, user_id, attempts in db.execute(select(TailorTask.id, TailorTask.user_id, TailorTask.attempts)
+                                                     .where(expired).limit(200)).all():
+            if (attempts or 0) >= worker_settings.get(db, user_id, "tailoring", "max_attempts"):
+                db.execute(update(TailorTask).where(TailorTask.id == task_id, expired)
+                           .values(status="failed", stage="done", locked_by=None, lock_expires_at=None,
+                                   finished_at=now, error="Interrupted: the server restarted while this job was "
+                                                          "being tailored. Try again.")
+                           .execution_options(synchronize_session=False))
         db.execute(update(TailorTask).where(expired)
                    .values(status="queued", stage="queued", locked_by=None, lock_expires_at=None)
                    .execution_options(synchronize_session=False))
         db.commit()
-        queued = db.execute(select(TailorTask.id, TailorTask.user_id).where(TailorTask.status == "queued")
-                            .order_by(TailorTask.id).limit(20)).all()
-        quota = _account_quota(db, {user_id for _, user_id in queued})
-        for task_id, user_id in queued:
+        # A task asked to run now (Running workers) goes first.
+        queued = db.execute(select(TailorTask.id, TailorTask.user_id, TailorTask.run_now_at)
+                            .where(TailorTask.status == "queued")
+                            .order_by(TailorTask.run_now_at.is_(None), TailorTask.id).limit(20)).all()
+        quota = _account_quota(db, {user_id for _, user_id, _ in queued})
+        stopped = worker_settings.paused(db, "tailoring", {user_id for _, user_id, _ in queued})
+        for task_id, user_id, run_now in queued:
             if quota.get(user_id, 1) <= 0:
                 continue  # this account is already tailoring as many packets at once as it allows
+            if user_id in stopped and run_now is None:
+                continue  # automatic tailoring is paused for this account; Run now still starts one
+            # Each claim holds the task under its own name, so a run that was stopped from Running workers (and its
+            # task claimed again, maybe by this same worker) can never write over the new run.
+            holder = f"{worker_id[:180]}#{uuid.uuid4().hex[:8]}"
             claimed = db.execute(update(TailorTask).where(TailorTask.id == task_id, TailorTask.status == "queued")
-                                 .values(status="running", locked_by=worker_id, started_at=now,
+                                 .values(status="running", locked_by=holder, started_at=now,
                                          lock_expires_at=now + timedelta(seconds=lease_seconds),
                                          attempts=TailorTask.attempts + 1)
                                  .execution_options(synchronize_session=False))
@@ -217,16 +230,25 @@ def _write(sessions: SessionFactory, task_id: int, worker_id: str, **values: Any
         return bool(result.rowcount)
 
 
+class TaskAbandoned(RuntimeError):
+    """This run no longer holds its task: it was stopped from Running workers (or its lease was taken over)."""
+
+
 def run_task(sessions: SessionFactory, task_id: int, worker_id: str, lease_seconds: int) -> str:
     """Run one claimed task in a session bound to its owner. Returns the final status."""
     with sessions() as db:
         task = db.get(TailorTask, task_id)
-        if task is None:
+        if task is None or task.status != "running" or not (task.locked_by or "").startswith(worker_id[:180]):
             return "missing"
         user_id, job_id, mode = task.user_id, task.job_id, task.mode
+        holder, run_now = task.locked_by, task.run_now_at is not None
+    worker_id = holder  # every write below is guarded by this claim's own name
 
     def progress(stage: str) -> None:
-        _write(sessions, task_id, worker_id, stage=stage, lock_expires_at=utcnow() + timedelta(seconds=lease_seconds))
+        """Report the stage and renew the lease. Also the stop point: a run that lost its task goes no further."""
+        if not _write(sessions, task_id, worker_id, stage=stage,
+                      lock_expires_at=utcnow() + timedelta(seconds=lease_seconds)):
+            raise TaskAbandoned(f"Tailoring task {task_id} was stopped")
 
     with sessions() as db:
         db.info["user_id"] = user_id
@@ -243,9 +265,14 @@ def run_task(sessions: SessionFactory, task_id: int, worker_id: str, lease_secon
             if job.status not in SKIP_TAILORING_STATUSES:
                 raise ValueError(f"This job is {job.status.replace('_', ' ')} and can no longer be tailored")
             run = skip_tailoring if mode == "skip" else tailor_job
-            out = packet_outcome(db, job, run(db, job, progress=progress))
+            with backoff.bypass(run_now):
+                out = packet_outcome(db, job, run(db, job, progress=progress))
             result = {key: out[key] for key in ("resume_id", "version", "reviewer_score", "auto_approved", "untailored")}
             status, error = "succeeded", None
+        except TaskAbandoned:
+            db.rollback()
+            log.info("tailor task %s was stopped; leaving it to its new run", task_id)
+            return "abandoned"
         except Exception as exc:  # one failing job never stops the worker
             db.rollback()
             log.info("tailor task %s failed: %s", task_id, exc)

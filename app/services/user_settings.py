@@ -106,8 +106,10 @@ def auto_tailor_for(db: Session, user_id: int | None = None) -> dict[str, Any]:
 
 def processing_maximums() -> dict[str, int]:
     """The server's ceilings — the most an account is allowed to ask for."""
+    from app.services import server_settings
+
     settings = get_settings()
-    return {"ranking_concurrency": max(1, settings.ranking_concurrency),
+    return {"ranking_concurrency": max(1, server_settings.value("ranking_concurrency")),
             "tailoring_concurrency": max(1, settings.tailor_concurrency)}
 
 
@@ -173,7 +175,7 @@ def ai_ready(db: Session, user_id: int) -> tuple[bool, str]:
 
         if gateway_settings(db, user_id)[0]:
             return True, ""
-        return False, "No LiteLLM base URL saved in Settings → AI Models"
+        return False, "No LiteLLM base URL saved in AI Orchestration → Models"
     if provider == "mock" or user_keys(db, user_id).get(provider):
         return True, ""
     return False, f"No {KEY_LABELS.get(provider, provider)} API key saved in Settings"

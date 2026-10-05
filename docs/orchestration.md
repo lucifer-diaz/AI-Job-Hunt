@@ -21,7 +21,7 @@ yet, and how to add a stage. The rules a change has to keep are in AGENTS.md ("A
 | `external_api_request_logs` | Per-call provider, operation, status, latency, retries, job/application, trace id | External node health (Apify, job boards, WEB `jd_recovery_*`, Gmail), trace external events |
 | `system_logs` | Failures, scheduler runs, milestones, by trace id and entity | Trace log events |
 | `ai_config_versions` + `model_resolution.active_snapshot` / `resolve` | The applied configuration per account and its history | Current assignment (FIXED / TIER / AUTO_ROUTER, fallback, escalation, router tiers), model history periods and changes |
-| `ai_config.resolve` + `user_settings.ai_overrides` | Direct-provider mode and Settings stage models | Assignment in direct mode (`DIRECT`) |
+| `ai_config.resolve` + `user_settings.ai_overrides` | Direct-provider mode and its stage models (Models & routing) | Assignment in direct mode (`DIRECT`) |
 | `ai_models.health_status` | The last health check of each model | DEGRADED when a worker's model failed its check |
 | `ai_optimization_reports.recommendations[].affected_stage` | Advisor recommendations | Recommendation badges and the drawer list (advice only) |
 | `monitoring.percentile`, `external_monitoring.health` | Shared aggregate helpers | Reused for every latency percentile and external health block |
@@ -68,3 +68,13 @@ or leaves the metric out rather than guessing.
 
 Designed-but-not-built stages are registered with `implemented=False`: they are listed in the legend as planned and
 never drawn as if they ran.
+
+## Models & routing
+
+AI Orchestration has two workspaces: **Pipeline** (the graph above) and **Models & routing** (`#orchestration/models`,
+`app/static/ai_models.js`), which moved here from Settings. It shows the route (LiteLLM gateway or direct provider), how
+a request finds its model (worker → fixed model, tier or auto router → model → fallback), each worker's assignment as a
+card, the model catalog, tiers and the auto router, the LiteLLM connection and the version history and audit trail.
+Every edit goes to the draft; **Preview → Apply** makes it a new version. A node's **Change model** button opens its
+worker's editor there. Old `#settings/ai` links redirect.
+

@@ -46,6 +46,7 @@ from app.prompts.job_description_parser import (
     JOB_DESCRIPTION_PARSER_PROMPT_VERSION,
     build_job_description_parser_prompt,
 )
+from app.services import backoff, worker_settings
 from app.services.lifecycle import ErrorCategory
 from app.settings import get_settings
 
@@ -735,6 +736,7 @@ class ParseClaim:
     task_id: int
     lock_token: str
     worker_id: str
+    run_now: bool = False  # asked to run now from Running workers: skips the provider cooldown
 
 
 def claim(db: Session, *, worker_id: str, limit: int, now: datetime | None = None,
@@ -749,8 +751,15 @@ def claim(db: Session, *, worker_id: str, limit: int, now: datetime | None = Non
              .where(JobDescriptionParseTask.status == PENDING,
                     or_(JobDescriptionParseTask.next_attempt_at.is_(None),
                         JobDescriptionParseTask.next_attempt_at <= now))
-             .order_by(JobDescriptionParseTask.next_attempt_at.asc().nulls_first(), JobDescriptionParseTask.id)
+             .order_by(JobDescriptionParseTask.run_now_at.is_(None),
+                       JobDescriptionParseTask.next_attempt_at.asc().nulls_first(), JobDescriptionParseTask.id)
              .limit(max(1, limit)))
+    # An account that switched automatic parsing off (Running workers → Settings) keeps its tasks queued; Run now
+    # still takes one.
+    stopped = worker_settings.paused(db, "parsing")
+    if stopped:
+        query = query.where(or_(JobDescriptionParseTask.user_id.not_in(stopped),
+                                JobDescriptionParseTask.run_now_at.is_not(None)))
     if db.get_bind().dialect.name == "postgresql":  # two workers never receive the same task
         query = query.with_for_update(skip_locked=True, of=JobDescriptionParseTask)
     tasks = db.scalars(query.execution_options(populate_existing=True)).all()
@@ -760,7 +769,8 @@ def claim(db: Session, *, worker_id: str, limit: int, now: datetime | None = Non
         task.lock_token, task.lock_expires_at = uuid.uuid4().hex, now + lease
         task.attempt_count += 1
         task.started_at, task.next_attempt_at = now, None
-        claimed.append(ParseClaim(task.id, task.lock_token, worker_id[:200]))
+        run_now, task.run_now_at = task.run_now_at is not None, None
+        claimed.append(ParseClaim(task.id, task.lock_token, worker_id[:200], run_now))
     db.commit()
     return claimed
 
@@ -772,7 +782,7 @@ def recover_expired(db: Session, now: datetime | None = None) -> int:
         JobDescriptionParseTask.status == PROCESSING, JobDescriptionParseTask.lock_expires_at < now)).all()
     message = "Interrupted: the worker stopped while parsing this description"
     for task in rows:
-        if task.attempt_count >= get_settings().jd_parse_max_attempts:
+        if task.attempt_count >= worker_settings.get(db, task.user_id, "parsing", "max_attempts"):
             _finish(task, FAILED, now, message, ErrorCategory.LEASE_EXPIRED)
             _mark_unparsed(db.get(Job, task.job_id))
             continue
@@ -838,7 +848,8 @@ def process(sessions: Any, claim: ParseClaim) -> str:
             return outcome
         job_id, parsed_hash = job.id, description_hash(job.description or "")
         try:
-            parsed = parse_job_description(db, job, user_id=task.user_id)
+            with backoff.bypass(claim.run_now):
+                parsed = parse_job_description(db, job, user_id=task.user_id)
         except Exception as exc:  # noqa: BLE001  one bad posting never stops the worker
             db.rollback()
             return _failed(db, claim, exc, now, config=isinstance(exc, LLMConfigError),
@@ -874,14 +885,14 @@ def _failed(db: Session, claim: ParseClaim, exc: Exception, now: datetime, *, co
     message = f"{type(exc).__name__}: {exc}"
     if config:
         outcome = _wait(task, message, now)
-    elif task.attempt_count >= get_settings().jd_parse_max_attempts:
+    elif task.attempt_count >= (own := worker_settings.for_user(db, task.user_id, "parsing"))["max_attempts"]:
         _finish(task, FAILED, now, message, category)
         _mark_unparsed(db.get(Job, task.job_id))
         outcome = "failed"
     else:
         task.status, task.locked_by, task.lock_token, task.lock_expires_at = PENDING, None, None, None
         task.last_error, task.error_category = message[:MAX_ERROR_LENGTH], category
-        task.next_attempt_at = now + timedelta(seconds=get_settings().jd_parse_retry_seconds * task.attempt_count)
+        task.next_attempt_at = now + timedelta(seconds=own["retry_seconds"] * task.attempt_count)
         outcome = "retrying"
     db.commit()
     return outcome

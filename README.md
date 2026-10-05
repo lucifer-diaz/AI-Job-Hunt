@@ -16,14 +16,14 @@ The dashboard is a single-page workspace served from `app/static/app.js`; every 
 | Today | "Do this next" (approve → tailor → follow up), follow-ups due, weekly pace; run-sheet variant | `GET /api/workspace/today` |
 | Discovery · triage | One job at a time with fit reasons; keys `S` shortlist, `M` maybe, `X` skip, `⏎` shortlist & tailor | `GET /api/jobs/search?queue=true`, `POST /api/jobs/{id}/triage` |
 | Discovery · table | Filter, sort, paginate and bulk-shortlist the whole pipeline. The stage filter includes "Unranked" (`stage=unranked`: jobs without a fit score) | `GET /api/jobs/search`, `POST /api/jobs/bulk-triage` |
-| Discovery · ranking tracker | The asynchronous ranker's progress for your account: jobs being filtered, queued, ranking now, retrying or waiting (with the reason and when it retries), and rankings finished in the last 24 hours with fit, candidate and resume scores and the qualify/archive decision. Retry failed rankings, queue unranked jobs; refreshes itself while work is in flight | `GET /api/ranking/tracker`, `POST /api/jobs/{id}/rank`, `POST /api/jobs/rank-batch` |
+| Running workers | Every background queue of your account in one place, a tab each: JD parsing, JD recovery, Ranking (the ranking tracker that used to be in Discovery: filtering, queue position and ETA, retry waits, finished rankings, Queue unranked jobs, Remove) and Tailoring (the background task list that used to be on the Tailor screen), each with a 24-hour activity chart, plus a Settings tab for processing limits and rate-limit backoff. Kill stops a task and requeues it fresh; Run now puts one first in line past its retry wait, the ranking cadence and any rate-limit backoff; the rate-limit backoff can be reset | `GET /api/workers`, `GET /api/workers/{kind}`, `GET /api/workers/{kind}/activity`, `POST /api/workers/{kind}/tasks/{id}/kill`, `POST /api/workers/{kind}/tasks/{id}/run-now`, `POST /api/workers/{kind}/kill-all`, `POST /api/workers/kill-all`, `POST /api/workers/cooldowns/reset` |
 | Discovery · setup | Saved search setups (named roles × locations × boards, each with its own schedule), run history with what each run searched and pulled, add a job from a URL | `GET/POST /api/search/setups`, `PUT/DELETE /api/search/setups/{id}`, `POST /api/search/setups/{id}/run`, `POST /api/search/setups/{id}/duplicate`, `GET /api/search/apify/runs/{id}/detail`, `POST /api/jobs/from-url` |
 | Tailor | Before → after edits with the evidence each one cites; edit, accept or revert; cover letter; keyword coverage; PDF/DOCX/TXT exports. "Skip tailoring" sends the master resume unchanged (still reviewed) for postings that need no tailoring. The "Bulk tailor" view tailors or skips tailoring for many queued jobs one at a time, with progress and stop | `GET /api/tailor/{job_id}`, `PATCH /api/resumes/{id}/edits/{n}`, `POST /api/jobs/{id}/tailor`, `POST /api/jobs/{id}/skip-tailoring`, `POST /api/jobs/bulk-tailor` |
 | Approvals | Pre-submit checklist, resume preview, reusable answers, notes; approve opens the apply kit, send a packet back for another tailoring pass, or reject the job outright with an optional reason | `GET /api/approvals/{job_id}`, `POST /api/jobs/{id}/revision`, `POST /api/jobs/{id}/reject` |
 | Apply kit | Files to upload, answers to paste, link to the posting, confirm "mark applied" | `GET /api/jobs/{id}/apply-kit` |
 | Tracker | Kanban by post-submission stage (drag or "move to"), optional extra stages, timeline, recruiter, interview scheduling, AI follow-up draft | `GET /api/tracker`, `POST /api/applications/{id}/stage`, `POST /api/applications/{id}/events` |
-| AI Orchestration | The pipeline as an interactive graph: every stage, what kind of work it is (AI, deterministic, external, human gate, browser, async), the model each AI worker is assigned and the one that actually answered, live packets, one job's path and trace, model history per worker. Observational only — model changes open Settings → AI Models | `GET /api/orchestration/graph`, `GET /api/orchestration/live`, `GET /api/orchestration/jobs/{id}`, `GET /api/orchestration/jobs/{id}/trace`, `GET /api/orchestration/nodes/{id}`, `GET /api/orchestration/nodes/{id}/history`, `GET /api/orchestration/edges/{from}/{to}` |
-| Monitoring | Seven sections — Overview, LLM usage, External APIs, Apify, JD recovery, Logs and AI optimization. Every LLM request and every third-party call: volume, success rate, latency (avg/p50/p95/p99), failures by type, retries, rate limits, tokens, context utilisation and cost, with filters, detail views, trace lookup and the AI Optimization Advisor | `GET /api/monitoring/dashboard`, `GET /api/monitoring/external/dashboard`, `GET /api/monitoring/apify/summary`, `GET /api/monitoring/jd-recovery`, `GET /api/monitoring/logs`, `POST /api/monitoring/analyze` |
+| AI Orchestration | The pipeline as an interactive graph: every stage, what kind of work it is (AI, deterministic, external, human gate, browser, async), the model each AI worker is assigned and the one that actually answered, live packets, one job's path and trace, model history per worker. The graph is observational; its **Models & routing** workspace is where models are managed (moved from Settings): the route (LiteLLM or direct), each worker's model, the model catalog, tiers and the auto router, the LiteLLM connection and version history, all through draft → preview → apply → version | `GET /api/orchestration/graph`, `GET /api/orchestration/live`, `GET /api/orchestration/jobs/{id}`, `GET /api/orchestration/jobs/{id}/trace`, `GET /api/orchestration/nodes/{id}`, `GET /api/orchestration/nodes/{id}/history`, `GET /api/orchestration/edges/{from}/{to}` |
+| Monitoring | Seven sections — Overview, LLM usage, External APIs, Apify, Application inbox, Logs and AI optimization (JD parsing and JD recovery metrics are in Running workers). Every LLM request and every third-party call: volume, success rate, latency (avg/p50/p95/p99), failures by type, retries, rate limits, tokens, context utilisation and cost, with filters, detail views, trace lookup and the AI Optimization Advisor | `GET /api/monitoring/dashboard`, `GET /api/monitoring/external/dashboard`, `GET /api/monitoring/apify/summary`, `GET /api/monitoring/logs`, `POST /api/monitoring/analyze` |
 | Knowledge bank | Searchable Answer library and Evidence bank, focused editors, verification filters, copy and removal | `/api/knowledge`, `/api/evidence` |
 | Settings & profile | Candidate details and chip fields, resume variants, re-parse resume into (unverified) evidence, provider/model, your own API keys (stored encrypted), approval mode, cadence | `/api/profile`, `/api/settings`, `PUT /api/settings/keys`, `/api/preferences` |
 | Setup quest | Interactive, gamified setup guide: a welcome screen for new accounts, then a quest map of ten setup tasks (profile, preferences, resume, verified facts, AI model, Apify, search setup, first run, first triage, answer bank) plus an optional Gmail bonus. The AI quest recommends Ollama Cloud's `nemotron-3-nano:30b-cloud` behind a local LiteLLM proxy, with commands to copy. Each quest links to where the work is done; quests tick off by themselves from the account's real data, earn XP and levels (Rookie → Offer Magnet) and are celebrated once. A floating tracker shows the next quest; open the guide from the sidebar or with `?` | `GET /api/setup/guide`, `PUT /api/setup/guide` |
@@ -58,7 +58,7 @@ Auto-submit is intentionally not offered: approved packets always become an appl
 - Prompt-injection hardening for untrusted job descriptions
 - **Application Inbox Agent**: read-only Gmail checks for replies about the applications you submitted — targeted searches, confidence-scored matching, rule-then-model classification, a tracker timeline, safe stage updates and a daily digest — see [Application Inbox Agent](#application-inbox-agent)
 - **Job description recovery**: postings that arrive without a usable description are read from their URL in the background (HTTP, then headless Chromium, then AI-assisted block selection), validated and parsed — see [13. Job Description Recovery](#13-job-description-recovery)
-- **LiteLLM gateway**: per-worker model assignments, tiers, auto router, preview/apply, version history and rollback (Settings → AI Models)
+- **LiteLLM gateway**: per-worker model assignments, tiers, auto router, preview/apply, version history and rollback (AI Orchestration → Models)
 - OpenAI, Anthropic, Gemini, **OpenRouter**, or no-cost mock provider
 - LLM monitoring (tokens, context size, latency, estimated cost, failures) and a recommend-only AI Optimization Advisor
 - Claude Desktop + MCP: bulk tailoring and review with your Claude subscription, validated by the backend
@@ -294,7 +294,7 @@ Use smaller `maxResults` values while testing. Apify Actor pricing is Actor-spec
 
 ## 3. LLM configuration
 
-The preferred setup is the **LiteLLM gateway** (section 3a): every worker's model is chosen in Settings → AI Models
+The preferred setup is the **LiteLLM gateway** (section 3a): every worker's model is chosen in AI Orchestration → Models
 and every request goes through a LiteLLM proxy. This section covers the direct providers, used when the gateway is
 off.
 
@@ -463,7 +463,7 @@ prompt versions, and `scripts/audit_sensitive_logs.py` checks stored logs for cr
 | `application_inbox.py` | `build_application_inbox_prompt`, `build_application_email_match_prompt` | `ApplicationEmailAnalysis`, `ApplicationEmailMatchResult` | the Application Inbox Agent (`app.services.application_inbox`) |
 | `inbox.py` | `build_inbox_classification_prompt` | `InboxClassificationResult` | superseded by `application_inbox.py`; kept for its golden fixture |
 | `ai_optimization.py` | `build_ai_optimization_prompt` | `OptimizationReport` | the AI Optimization Advisor (advice only) |
-| `model_tests.py` | `build_model_health_prompt`, `build_worker_test_prompt` | per fixture | Settings → AI Models tests (fictional data) |
+| `model_tests.py` | `build_model_health_prompt`, `build_worker_test_prompt` | per fixture | AI Orchestration → Models tests (fictional data) |
 | `agents.py`, `mcp_*.py` | instructions and rules | validated on save | the ADK agents; Claude Desktop over MCP |
 
 Company Insights and Interview Insights are reserved worker names with no prompt yet.
@@ -475,7 +475,7 @@ each AI worker uses, and a [LiteLLM proxy](https://docs.litellm.ai/) is the one 
 
 ```
 Job Hunt OS worker (Ranker, Tailor, Reviewer, …)
-  → LLM layer (app/services/llm.py) — resolves the worker's model from Settings → AI Models
+  → LLM layer (app/services/llm.py) — resolves the worker's model from AI Orchestration → Models
   → LiteLLM proxy (/v1/chat/completions)
   → Ollama (local) / OpenRouter / OpenAI / Anthropic / any provider LiteLLM supports
 ```
@@ -492,7 +492,7 @@ LiteLLM sync state). `.env` supplies the bootstrap values and secrets.
 
 For most LLM work, run a LiteLLM proxy on your machine in front of **Ollama Cloud** and give every worker
 **`nemotron-3-nano:30b-cloud`** (NVIDIA Nemotron 3 Nano). The model runs in Ollama Cloud, so no GPU is needed, and
-LiteLLM keeps the model a matter of configuration: change it later in Settings → AI Models. The Setup quest's
+LiteLLM keeps the model a matter of configuration: change it later in AI Orchestration → Models. The Setup quest's
 *Connect an AI model* step walks through this.
 
 1. Sign in at [ollama.com](https://ollama.com) and create an API key under
@@ -509,7 +509,7 @@ LiteLLM keeps the model a matter of configuration: change it later in Settings �
    The direct Ollama Cloud API names the model without the `-cloud` suffix (`ollama_chat/nemotron-3-nano:30b`
    at `https://ollama.com`); the config publishes it to Job Hunt OS as `nemotron-3-nano:30b-cloud`. To use a local
    Ollama that is signed in (`ollama signin`) instead of an API key, use the commented alternative in the same file.
-3. In Job Hunt OS: **Settings → AI Models → LiteLLM**, base URL `http://localhost:4000` and the master key →
+3. In Job Hunt OS: **AI Orchestration → Models → LiteLLM connection**, base URL `http://localhost:4000` and the master key →
    **Test Connection** → **Sync models from LiteLLM** → **Use LiteLLM gateway**, then assign
    `nemotron-3-nano:30b-cloud` to the tiers. With `.env` instead:
 
@@ -548,7 +548,7 @@ LITELLM_API_KEY=sk-...            # copied (encrypted) into the first account on
 LITELLM_SYNC_MODE=admin_api       # admin_api | config_file | disabled
 ```
 
-or open **Settings → AI Models → LiteLLM**, enter the base URL and key, and use **Test Connection**. The test checks
+or open **AI Orchestration → Models → LiteLLM connection**, enter the base URL and key, and use **Test Connection**. The test checks
 that LiteLLM is reachable, that the key is accepted, that model discovery works, and measures latency. It reports
 **Connected**, **Disconnected**, **Authentication failed** or **LiteLLM unavailable**, and makes no model call.
 **Use LiteLLM gateway** on the Overview tab switches the account's workers to the gateway (and back).
@@ -1031,7 +1031,7 @@ every later call → refused locally, nothing is sent
 first normal answer → cooldown cleared, the ladder starts again
 ```
 
-Each rate limit in a row waits longer. **Settings → Workflow & cadence → Rate limits** sets the shape per
+Each rate limit in a row waits longer. **Running workers → Settings → Rate limits** sets the shape per
 account: whether to back off at all, the first wait, what to multiply by, and the longest wait. The defaults
 give 30s → 1m → 2m → 4m … capped at 15 minutes. A provider's own `Retry-After` wins whenever it asks for
 longer (up to `RATE_LIMIT_RETRY_AFTER_MAX_SECONDS`), because it knows when it will serve again.
@@ -1057,7 +1057,7 @@ scheduled before the cooldown ends.
 ### Processing limits
 
 `RANKING_CONCURRENCY` (5) and `TAILOR_CONCURRENCY` (2) are the server's ceilings. Each account also chooses its
-own limits in **Settings → Workflow & cadence → Processing limits**: how many of its jobs may be ranked at once,
+own limits in **Running workers → Settings → Processing limits**: how many of its jobs may be ranked at once,
 and how many packets may be tailored at once. An account can only set a limit at or below the server ceiling, so
 one account with hundreds of queued jobs cannot take the whole machine.
 
@@ -1559,6 +1559,62 @@ every account, but packets, job titles and traces remain the admin's own. The br
 | `GET /api/orchestration/edges/{from}/{to}` | One transition: count, split with its siblings, timing where stored, recent jobs |
 
 All take `range` (`today`, `7d`, `30d`, `90d`) where it applies and `all_accounts=true` for the admin.
+
+## 9b. Running workers
+
+**Running workers** (sidebar → SYSTEM) lists the account's background queues, one tab each, with what each queue
+already showed elsewhere: the JD parsing and JD recovery metrics (formerly Monitoring tabs), the ranking tracker
+(formerly Discovery → Ranking tracker) and the tailoring task list (formerly on the Tailor screen, which now links
+here while work runs). Each task shows its status (running, queued, retrying, done, failed, blocked — a word and a
+symbol), attempt *n of max* (as dots), when it retries and its last error (redacted).
+
+Each worker tab opens with an overview: whether it is working, waiting or idle, its schedule and limits, four tiles
+(running, queued, retrying, finished in the last 24 hours), a bar of the queue right now, and a **Last 24 hours** chart —
+tasks finished done and failed each hour, with what was queued behind them — next to the success rate, throughput,
+median run time and median wait before a task starts (`GET /api/workers/{kind}/activity`, read from the task rows).
+JD parsing and JD recovery add their performance for a chosen range (today, 7, 30 or 90 days): parser model calls,
+latency, tokens and cost, the models used and why tasks failed; recovery's route (HTTP, browser, model), outcomes and
+what the server can use.
+
+The **Settings** tab holds every worker setting, one card per worker, saved together:
+
+| Scope | Settings | Stored in |
+| --- | --- | --- |
+| Your account, every worker | **Run automatically** (off = the queue waits; Run now still runs one task), attempts per task, wait before a retry | `AppSetting.preferences["workers"]` (`app/services/worker_settings.py`), `GET/PUT /api/workers/settings` |
+| Your account, JD recovery | Use the browser when HTTP finds nothing; ask a model on ambiguous pages | same |
+| Your account, ranking and tailoring | Jobs ranked at once, *rank at most every N minutes*, packets tailored at once (moved from Workflow & cadence); ranking's first and longest retry wait | `PATCH /api/settings` and the table above |
+| Your account, rate limits | Back off after a 429: first wait, multiplier, longest wait (moved from Workflow & cadence) | `PATCH /api/settings` |
+| The server (admins edit; others see them read-only) | Per scheduler job: run every N minutes (0 = off), tasks per run, side by side; ranking's most-per-account ceiling | `server_settings` table (migration 0033, `app/services/server_settings.py`), `PUT /api/workers/server-settings` |
+
+A value you never change follows the server, so an account that never opens the tab behaves as before; saving the server
+default again stores "follow the server". A server override applies without a restart, even to a run already in progress: each
+pass claims tasks only as slots free up and re-reads *side by side* and *tasks per run* every few seconds
+(`scheduled_jobs.run_live`), so raising side by side starts more tasks at once and lowering it lets running ones finish
+first; a changed interval starts counting from now. `.env` only supplies the default, and saving the environment's
+value removes the override. A model call can still be limited further down the line: a worker's *maximum concurrency*
+in AI Orchestration → Models, or LiteLLM / Ollama's own limits.
+Pausing a worker only holds its queue: a ranking you ask for yourself (and any Run now) still runs. Automatic tailoring
+and approvals stay in Workflow & cadence.
+
+Every tab has a filter bar: search by job title, company or `#job id`, and a status filter (all, active, running, queued,
+retrying, failed or blocked, done) that says how many tasks each choice would show; the Ranking tab adds the tracker's
+location filter. Filters narrow the task list only, never the metrics. JD parsing and JD recovery filter on the server
+(`GET /api/workers/{kind}?q=&status=`, so nothing past the first 200 rows is missed); ranking searches through the
+tracker and tailoring filters its own short list.
+
+| Control | What it does |
+| --- | --- |
+| **Kill** (one task) | Stops the task's current attempt and requeues it fresh: attempts back to zero, retry wait cleared. A running ranking's job goes back to RANK_PENDING (recorded as a workflow transition by you). |
+| **Kill all** (a worker, or every worker) | The same for every running or retrying task, and the account's provider rate-limit cooldowns are cleared too. Asks first. |
+| **Run now** (one task) | Puts the task first in line on the next pass, skipping its retry wait, the account's ranking cadence and any provider cooldown for that run. A failed or blocked task is queued again first — once: the old row then reads *↻ Run again as task #n* and has no Run now (the server refuses a second one), so a job never gets two retries. If the provider still answers 429 the task simply backs off again. |
+| **Retry selected** (tick failed tasks, or *Select all failed shown*) | Queues each chosen failed or blocked task again through its worker's normal path, in normal order — no cooldown bypass, unlike Run now. Only what the current filters show can be selected; a task whose job was already run again is skipped and said so (`POST /api/workers/{kind}/retry`, up to 500 at once). |
+| **Reset backoff** | Clears the account's provider cooldowns (shown as a banner while any is running). |
+
+A running thread cannot be interrupted, so a kill takes the task's lease away instead: every worker re-checks its lease
+before saving, so whatever the old attempt returns is discarded, and a tailoring run stops at its next checkpoint —
+before it saves a version. A model call already in flight still finishes (and is still billed and logged). Run now is
+stored as `run_now_at` on the task (migration 0032) and cleared by the claim that takes it; the scheduler job is
+nudged at once when it is free. Every control acts on your own tasks only.
 
 ## Application Inbox Agent
 
@@ -2665,7 +2721,7 @@ and operational checks.
 ### Focused settings
 
 Settings now has separate Profile, Job preferences, Resumes, Account & security,
-API keys, AI models, and Workflow & cadence sections, with independent saves and
+API keys and Workflow & cadence sections (AI models live in AI Orchestration → Models), with independent saves and
 mobile navigation. Account & security supports password changes that keep this
 browser signed in and revoke other sessions. See [settings contracts, testing,
 and rollback notes](docs/settings.md).

@@ -2,7 +2,7 @@
 and the no-cost mock.
 
 LiteLLM gateway mode (LLM_PROVIDER / Settings provider `litellm`) is the preferred mode: every request goes to the
-LiteLLM proxy, and the worker's model and generation settings come from Settings → AI Models
+LiteLLM proxy, and the worker's model and generation settings come from AI Orchestration → Models
 (app.services.model_resolution) rather than from any name in code. In that mode nothing here calls Ollama, OpenAI,
 Anthropic, OpenRouter or Gemini directly. The direct-provider modes remain for installs without a gateway.
 
@@ -247,7 +247,7 @@ def _gateway_error(model: str, exc: Exception) -> LLMError:
     status = getattr(exc, "http_status", None)
     text = str(exc)
     if isinstance(exc, LiteLLMAuthError):
-        return LLMConfigError(f"LiteLLM refused the API key saved in Settings → AI Models: {text}")
+        return LLMConfigError(f"LiteLLM refused the API key saved in AI Orchestration → Models: {text}")
     if status == 429:
         return LLMRateLimitError(detail)
     if status in (408, 504) or "did not answer in time" in text or "Timeout" in text:
@@ -513,12 +513,12 @@ class LLMClient:
         base, key = self.gateway or (None, None)
         if not base:
             raise LLMConfigError("LiteLLM gateway mode is on but no LiteLLM base URL is configured: add it in "
-                                 "Settings → AI Models → LiteLLM")
+                                 "AI Orchestration → Models → LiteLLM connection")
         if not resolved.enabled:
-            raise LLMConfigError(f"{worker_label(resolved.worker_type)} is disabled in Settings → AI Models")
+            raise LLMConfigError(f"{worker_label(resolved.worker_type)} is disabled in AI Orchestration → Models")
         if not model:
             raise LLMConfigError(f"{worker_label(resolved.worker_type)} has no model: "
-                                 f"{resolved.note or 'nothing is assigned'} (Settings → AI Models)")
+                                 f"{resolved.note or 'nothing is assigned'} (AI Orchestration → Models)")
         budget = resolved.context_window
         estimated = llm_telemetry.estimate_tokens(system) + llm_telemetry.estimate_tokens(user)
         if budget and estimated > budget:

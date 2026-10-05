@@ -1,0 +1,618 @@
+/* Running workers: the account's background queues — JD parsing, JD recovery, ranking and tailoring — in one screen,
+   with the controls to unstick them. Loaded before app.js; uses the workspace helpers (api, esc, btn, pill, render, go)
+   and reuses the views each queue already had: the JD parsing and recovery panels (monitoring.js), the ranking tracker
+   and the tailoring task list (app.js).
+
+   Kill stops a task's current attempt and requeues it fresh (attempts and retry wait reset); killing all of a worker's
+   tasks also clears the account's rate-limit cooldowns. Run now puts one task first in line, past its retry wait, the
+   ranking cadence and any provider cooldown. Every number and row comes from /api/workers/* (app.services.workers). */
+'use strict';
+
+const WK_KINDS = [['parsing', 'JD parsing'], ['recovery', 'JD recovery'], ['ranking', 'Ranking'], ['tailoring', 'Tailoring']];
+// The worker tabs, then the account's worker settings (processing limits and rate-limit backoff).
+const WK_TABS = [...WK_KINDS, ['settings', 'Settings']];
+// [label, tone, symbol]: a status is always a word and a symbol, never colour alone.
+const WK_STATUS = { RUNNING: ['Running', 'brand', '●'], QUEUED: ['Queued', 'muted', '○'], RETRYING: ['Retrying', 'warn', '↻'],
+  COMPLETED: ['Done', 'good', '✓'], SUCCEEDED: ['Done', 'good', '✓'], FAILED: ['Failed', 'bad', '✕'],
+  BLOCKED: ['Blocked', 'bad', '⛔'], SKIPPED: ['Skipped', 'muted', '–'], CANCELLED: ['Cancelled', 'muted', '–'] };
+const WK_POLL_ACTIVE = 3000, WK_POLL_IDLE = 20000;
+// Status filters, the same as the server's (app.services.workers.STATUS_FILTERS).
+const WK_FILTERS = [['all', 'All statuses'], ['active', 'Active (running, queued, retrying)'], ['running', 'Running'],
+  ['queued', 'Queued'], ['retrying', 'Retrying'], ['failed', 'Failed or blocked'], ['done', 'Done']];
+const WK_FILTER_MEMBERS = { active: ['RUNNING', 'QUEUED', 'RETRYING'], running: ['RUNNING'], queued: ['QUEUED'],
+  retrying: ['RETRYING'], failed: ['FAILED', 'BLOCKED'], done: ['COMPLETED', 'SUCCEEDED', 'SKIPPED', 'CANCELLED'] };
+let wkTimer = null, wkSearchTimer = null;
+
+function wkState() {
+  if (!S.wk) S.wk = { tab: 'parsing', range: '7d' };
+  if (!S.wk.f) S.wk.f = {};
+  return S.wk;
+}
+// Each tab keeps its own search and status. Ranking searches through the tracker's own filter (S.rf).
+function wkFilter(tab = wkState().tab) {
+  const f = wkState().f;
+  if (!f[tab]) f[tab] = { q: '', status: 'all' };
+  return f[tab];
+}
+const wkMatches = (status, filter) => filter === 'all' || (WK_FILTER_MEMBERS[filter] || []).includes(status);
+const wkCounted = statuses => Object.fromEntries([['all', statuses.length],
+  ...Object.entries(WK_FILTER_MEMBERS).map(([name, members]) => [name, statuses.filter(s => members.includes(s)).length])]);
+// The same words for the ranking tracker's and the tailoring list's own task fields.
+function wkRankStatus(t) {
+  if (t.status === 'PROCESSING') return 'RUNNING';
+  if (t.status === 'PENDING') return t.attempt_count > 0 || later(t.next_attempt_at) ? 'RETRYING' : 'QUEUED';
+  return t.status;
+}
+const wkTailorStatus = t => ({ running: 'RUNNING', queued: 'QUEUED' })[t.status] || t.status.toUpperCase();
+const wkText = (t, q) => { const x = (q || '').trim().toLowerCase(); if (!x) return true;
+  if (/^#?\d+$/.test(x)) return String(t.job_id) === x.replace('#', '');
+  return `${t.title || ''} ${t.company || ''}`.toLowerCase().includes(x); };
+const wkSpec = kind => (D.wk?.workers || []).find(w => w.kind === kind);
+
+/* ───────────── loading and polling ───────────── */
+async function loadWorkers() {
+  const w = wkState(), tab = w.tab, worker = WK_KINDS.some(([id]) => id === tab);
+  // Ranking and tailoring keep the views they always had (the ranking tracker, the tailoring task list).
+  const f = wkFilter(tab);
+  const detail = ['parsing', 'recovery'].includes(tab)
+    ? api(`/api/workers/${tab}?` + qs({ range: w.range, q: f.q.trim(), status: f.status === 'all' ? '' : f.status })) : null;
+  const [summary, data, act] = await Promise.all([api('/api/workers'), detail,
+    worker ? api(`/api/workers/${tab}/activity`).catch(() => null) : null,
+    tab === 'ranking' ? loadRanking() : null, tab === 'tailoring' ? refreshTasks() : null,
+    tab === 'settings' ? Promise.all([D.settings ? null : api('/api/settings').then(x => { D.settings = x; }),
+      api('/api/workers/settings').then(x => { D.wkSettings = x; })]) : null]);
+  D.wk = summary;
+  if (data) D.wkData = { ...(D.wkData || {}), [tab]: data };
+  if (act) D.wkAct = { ...(D.wkAct || {}), [tab]: act };
+  scheduleWkPoll();
+}
+// Every few seconds while anything runs, slowly when idle, never on another screen or in a hidden tab.
+function wkPollDelay() {
+  if (S.screen !== 'workers' || document.hidden || wkState().tab === 'settings') return null;
+  return D.wk?.active ? WK_POLL_ACTIVE : WK_POLL_IDLE;
+}
+function stopWkPoll() { clearTimeout(wkTimer); wkTimer = null; }
+function scheduleWkPoll() {
+  stopWkPoll();
+  const delay = wkPollDelay();
+  if (delay != null) wkTimer = setTimeout(wkPoll, delay);
+}
+async function wkPoll() {
+  if (S.screen !== 'workers') return stopWkPoll();
+  try { await loadWorkers(); } catch { scheduleWkPoll(); return; }
+  if (S.screen === 'workers') wkPollRender();
+}
+// A background refresh must never redraw a dropdown the person has open: replacing a <select> closes its list (the
+// status filter could not be picked while tasks were running). Hold the redraw until they leave the control.
+let wkRenderHeld = false;
+const wkPicking = () => document.activeElement?.tagName === 'SELECT' && !!document.activeElement.closest?.('#view');
+function wkPollRender() {
+  if (wkPicking()) { wkRenderHeld = true; return; }
+  wkRenderHeld = false;
+  render();
+}
+document.addEventListener('focusout', () => setTimeout(() => {
+  if (wkRenderHeld && !wkPicking() && S.screen === 'workers') wkPollRender();
+}, 0));
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) stopWkPoll();
+  else if (S.screen === 'workers' && D.wk) wkPoll();
+});
+
+/* ───────────── pieces ───────────── */
+const wkPill = (text, tone, sym) => `<span class="orch-chip ${tone}"><span aria-hidden="true">${sym}</span> ${esc(text)}</span>`;
+const wkChip = status => wkPill(...(WK_STATUS[status] || [status, 'muted', '•']));
+const wkCount = c => (c?.running || 0) + (c?.queued || 0) + (c?.retrying || 0);
+const WK_COLORS = { running: 'var(--brand)', queued: '#b9bfd3', retrying: 'var(--amber)', done: 'var(--good-btn)', failed: 'var(--bad)' };
+const wkNum = n => (n || 0).toLocaleString();
+const wkDur = s => s == null ? '—' : s < 60 ? `${Math.round(s)}s` : s < 3600 ? `${Math.floor(s / 60)}m ${Math.round(s % 60)}s` : `${Math.floor(s / 3600)}h ${Math.round((s % 3600) / 60)}m`;
+const wkPct = r => r == null ? '—' : `${Math.round(r * 1000) / 10}%`;
+const wkTone = r => r == null ? '' : r >= 0.9 ? 'good' : r >= 0.7 ? 'warn' : 'bad';
+const wkMeter = (ratio, color) => `<div class="wk-meter" role="presentation"><i style="width:${Math.max(0, Math.min(100, (ratio || 0) * 100))}%;background:${color}"></i></div>`;
+const wkHumanize = code => String(code || '').toLowerCase().replace(/_/g, ' ').replace(/^./, c => c.toUpperCase());
+function wkScheduleFacts(s, kind) {
+  if (!s) return ['Scheduler not running on this server'];
+  if (kind === 'tailoring') return s.enabled ? [`⏱ checks every ${s.poll_seconds}s`, `⇉ up to ${s.concurrency} at a time`] : ['The tailoring worker is turned off on this server'];
+  if (!s.enabled || !s.interval_minutes) return ['This worker is turned off on this server'];
+  return [`⏱ every ${s.interval_minutes} min`, s.running ? '▶ running now' : s.next_run_at ? `▶ next run ${until(s.next_run_at)}` : null,
+    s.last_finished_at ? `✓ last finished ${fmtDateTime(s.last_finished_at)}` : null].filter(Boolean);
+}
+// Kept for anything that wants the schedule as one line.
+const wkScheduleText = (s, kind) => wkScheduleFacts(s, kind).map(x => x.replace(/^[⏱▶✓⇉] /, '')).join(' · ');
+function wkCooldowns(list) {
+  if (!list?.length) return '';
+  return `<div class="banner warn" role="status"><span class="grow">Rate-limited: ${list.map(c => `<b>${esc(c.provider.toLowerCase())}</b> ${c.seconds_left}s left${c.calls_skipped ? ` (${c.calls_skipped} calls held back)` : ''}`).join(' · ')}. Waiting tasks resume when it ends.</span>
+    ${btn(label('wkCooldown', 'Reset backoff', 'Resetting…'), 'wk-reset-cooldowns', {}, 'sm', isBusy('wkCooldown'))}</div>`;
+}
+function wkDetail(r) {
+  const of = r.max_attempts ? ` of ${r.max_attempts}` : '';
+  const error = r.last_error ? ` · ${r.last_error}` : '';
+  if (r.run_now && ['QUEUED', 'RETRYING'].includes(r.status)) return `First in line: runs on the next pass, without waiting${r.attempt ? ` · attempt ${r.attempt}${of} so far${error}` : ''}`;
+  if (r.status === 'RUNNING') return `Attempt ${r.attempt}${of} · running ${r.started_at ? wkDur(Math.max(0, (Date.now() - toDate(r.started_at)) / 1000)) : ''}${r.stage && r.stage !== 'running' ? ` · ${r.stage}` : ''}`;
+  if (r.status === 'RETRYING') return `${r.next_attempt_at && later(r.next_attempt_at) ? `Retries ${until(r.next_attempt_at)}` : 'Retries on the next run'} · attempt ${r.attempt}${of}${r.error_category ? ` (${r.error_category.toLowerCase().replace(/_/g, ' ')})` : ''}${error}`;
+  if (r.status === 'QUEUED') return r.run_now ? 'First in line: runs on the next pass' : `Waiting its turn${r.queue_position ? ` · #${r.queue_position}` : ''}${r.created_at ? ` · queued ${fmtDateTime(r.created_at)}` : ''}`;
+  const again = r.retried_by ? ` · run again as task #${r.retried_by.task_id} (${(WK_STATUS[r.retried_by.status] || [r.retried_by.status])[0].toLowerCase()})` : '';
+  return `${(WK_STATUS[r.status] || [r.status])[0]}${r.finished_at ? ` ${fmtDateTime(r.finished_at)}` : ''}${again}${r.result_code ? ` · ${r.result_code.toLowerCase().replace(/_/g, ' ')}` : ''}${error}`;
+}
+// Why a task is waiting or retrying, in full: rows cut the message to one line, the ⓘ beside them shows all of it.
+function wkWhyText({ waiting, error, category, attempt, max, next, reason }) {
+  return [waiting ? 'Why it is waiting' : 'Why it is retrying', error,
+    category ? `Kind: ${wkHumanize(category)}` : null,
+    !waiting && attempt ? `Attempt ${attempt}${max ? ` of ${max}` : ''} used` : null,
+    next ? (later(next) ? `Next try ${until(next)} · ${fmtDateTime(next)}` : 'Next try on the next run') : null,
+    reason ? `Queued because: ${reason}` : null].filter(Boolean).join('\n');
+}
+const wkInfo = text => text ? `<button type="button" class="wk-info" data-tip="${attr(text)}" aria-label="${attr(text)}">i</button>` : '';
+// A row of the Running workers table (parsing, recovery) that is retrying, or waiting with a reason.
+function wkRowWhy(r) {
+  if (!(r.status === 'RETRYING' || (r.status === 'QUEUED' && r.last_error))) return '';
+  return wkInfo(wkWhyText({ waiting: r.status === 'QUEUED', error: r.last_error, category: r.error_category, attempt: r.attempt,
+    max: r.max_attempts, next: r.next_attempt_at, reason: r.reason ? wkHumanize(r.reason) : null }));
+}
+// A ranking tracker task (app.js renderRanking) waiting for its retry or for the account to be ready.
+function wkRankWhy(t) {
+  if (t.status !== 'PENDING' || !(t.last_error || later(t.next_attempt_at))) return '';
+  return wkInfo(wkWhyText({ waiting: !t.attempt_count, error: t.last_error, category: t.error_category, attempt: t.attempt_count,
+    max: t.max_attempts, next: t.next_attempt_at, reason: RANK_REASON[t.reason] || t.reason }));
+}
+// Attempts as dots: used ones amber, the one running now brand.
+function wkTries(r) {
+  const max = Math.min(r.max_attempts || 0, 8);
+  if (!max || !['RUNNING', 'RETRYING', 'QUEUED'].includes(r.status) || (!r.attempt && r.status === 'QUEUED')) return '';
+  const used = Math.min(r.attempt || 0, max);
+  return `<span class="wk-tries" title="Attempt ${r.attempt || 0} of ${r.max_attempts}" aria-label="Attempt ${r.attempt || 0} of ${r.max_attempts}">${[...Array(max)].map((_, i) =>
+    `<i class="${i < used ? (r.status === 'RUNNING' && i === used - 1 ? 'now' : 'used') : ''}"></i>`).join('')}</span>`;
+}
+// The two controls, the same on every worker's rows. `id` is the task id.
+function wkButtons(kind, id, { kill, runNow }) {
+  return (runNow ? btn(label(`wkRun${kind}${id}`, 'Run now', 'Starting…'), 'wk-run-now', { kind, id }, 'sm soft', isBusy(`wkRun${kind}${id}`)) : '')
+    + (kill ? btn(label(`wkKill${kind}${id}`, 'Kill', 'Stopping…'), 'wk-kill', { kind, id }, 'sm danger', isBusy(`wkKill${kind}${id}`)) : '');
+}
+// Controls on the ranking tracker's rows (app.js renderRanking), from the tracker's own task fields.
+function wkRankActions(t) {
+  const retrying = t.status === 'PENDING' && (t.attempt_count > 0 || later(t.next_attempt_at));
+  return wkButtons('ranking', t.id, { kill: t.status === 'PROCESSING' || retrying, runNow: t.status === 'PENDING' });
+}
+// Controls on the tailoring task list (app.js renderTaskStack).
+function wkTailorActions(t) {
+  return wkButtons('tailoring', t.id, { kill: t.status === 'running', runNow: t.status === 'queued' });
+}
+function wkTable(kind, data) {
+  const rows = data?.rows || [], f = wkFilter(kind), filtered = f.q.trim() || f.status !== 'all';
+  if (!rows.length) {
+    return `<section class="card">${filtered
+      ? empty('No tasks match these filters', 'Try another status or search, or clear the filters.', btn('Clear filters', 'wk-clear-filters', { tab: kind }, 'primary'))
+      : empty('Nothing in this queue', 'Tasks show up here while they wait or run, and for a day after they finish.')}</section>`;
+  }
+  const active = rows.filter(r => ['RUNNING', 'QUEUED', 'RETRYING'].includes(r.status)).length;
+  const shown = data.total > rows.length ? ` · showing the first ${rows.length} of ${data.total}` : '';
+  return `<section class="card flush"><div class="row between wrap gap10" style="padding:14px 18px;border-bottom:1px solid var(--line2)">
+      <div><div class="card-title" style="font-size:16px">Tasks${filtered ? ' matching your filters' : ''}</div><div class="card-sub">${active} waiting, running or retrying · ${rows.length - active} finished in the last day${shown}</div></div></div>
+    <div style="max-height:560px;overflow:auto" data-scroll-key="wk-${kind}">${rows.map(r => `<div class="wk-row ${r.status === 'RUNNING' ? 'running' : ''} ${wkSel(kind).has(r.task_id) ? 'picked' : ''}">
+      <div>${['FAILED', 'BLOCKED'].includes(r.status) && !r.retried_by ? wkSelectBox(kind, r.task_id, r.title) : ''}</div><div>${wkChip(r.status)}</div>
+      <div style="min-width:0"><div class="small b ellipsis">${esc(r.title || `Job #${r.job_id}`)} <span class="muted" style="font-weight:400">· ${esc(r.company || '')}</span> <span class="xs faint mono" style="font-weight:400">#${r.job_id}</span></div>
+        <div class="wk-detail xs ${['FAILED', 'BLOCKED'].includes(r.status) ? 'orch-bad' : 'muted'}"><span class="ellipsis" title="${attr(wkDetail(r))}">${wkTries(r)}${esc(wkDetail(r))}</span>${wkRowWhy(r)}</div></div>
+      <div class="wk-row-actions">${r.retried_by ? `<span class="orch-chip muted" title="${attr(`A newer task (#${r.retried_by.task_id}) is handling this job`)}">↻ Run again</span>` : ''}${wkButtons(kind, r.task_id, { kill: r.can_kill, runNow: r.can_run_now })}${btn('Job', 'open-job', { id: r.job_id }, 'sm')}</div></div>`).join('')}</div></section>`;
+}
+
+/* ───────────── overview: hero, queue and the last 24 hours ───────────── */
+// What paces this worker, beside its schedule: concurrency and cadence, with a link to change the ones you own.
+function wkLimits(tab) {
+  if (tab === 'ranking' && D.ranking) return [`⇉ up to ${D.ranking.concurrency} at a time`, D.ranking.interval_minutes ? `↻ your cadence: every ${D.ranking.interval_minutes} min` : null].filter(Boolean);
+  if (tab === 'recovery') { const x = D.wkData?.recovery?.diagnostics?.settings; return x ? [`⇉ ${x.max_concurrency} at a time · batches of ${x.batch_size}`] : []; }
+  return [];
+}
+function wkHero(tab, spec, act) {
+  const c = spec.counts || {}, s = spec.scheduler, live = c.running > 0;
+  const stoppable = (c.running || 0) + (c.retrying || 0);
+  const finished = act ? act.done + act.failed : null;
+  const meta = [...wkScheduleFacts(s, tab), ...wkLimits(tab)].map(x => `<span>${esc(x)}</span>`).join('')
+    + `<span><a href="#workers/settings">Settings</a></span>`
+    + (s?.last_status === 'failed' ? '<span class="bad">✕ last run failed</span>' : '');
+  const kpi = (name, value, sub, tone, sym) => `<div class="wk-kpi" data-tone="${value ? tone : ''}"><div class="wk-kpi-label"><span aria-hidden="true">${sym}</span>${esc(name)}</div>
+    <div class="wk-kpi-value ${value ? '' : 'zero'}">${value == null ? '—' : wkNum(value)}</div><div class="wk-kpi-sub">${esc(sub)}</div></div>`;
+  const active = wkCount(c);
+  const parts = [['running', 'Running', c.running], ['queued', 'Queued', c.queued], ['retrying', 'Retrying', c.retrying]];
+  const queue = active
+    ? `<div class="wk-stack" role="img" aria-label="${attr(parts.map(([, n, v]) => `${v || 0} ${n.toLowerCase()}`).join(', '))}">${parts.filter(([, , v]) => v).map(([k, n, v]) =>
+        `<i style="flex:${v};background:${WK_COLORS[k]}" data-tip="${attr(`${n}: ${v}`)}"></i>`).join('')}</div>
+      <div class="wk-legend">${parts.map(([k, n, v]) => `<span><i style="background:${WK_COLORS[k]}"></i>${n} ${v || 0} · ${Math.round(100 * (v || 0) / active)}%</span>`).join('')}</div>`
+    : '<div class="wk-stack"></div><div class="wk-legend"><span>Queue is empty: nothing waiting or running.</span></div>';
+  return `<section class="card wk-hero">
+    <div class="wk-hero-head"><div style="min-width:0;flex:1">
+        <div class="wk-hero-title"><span class="wk-pulse ${live ? 'on' : ''}" aria-hidden="true"></span>${esc(spec.label || '')}${live ? ' <span class="orch-chip brand">● working</span>' : active ? ' <span class="orch-chip muted">○ waiting</span>' : ' <span class="orch-chip good">✓ idle</span>'}${spec.paused ? ' <a class="orch-chip warn" href="#workers/settings">⏸ paused for your account</a>' : ''}</div>
+        <div class="card-sub mt4">${esc(spec.description || '')}</div></div>
+      <div class="row gap8 wrap">${btn(label('wkKillAll' + tab, `Kill all ${spec.label || ''}`.trim(), 'Stopping…'), 'wk-kill-all', { kind: tab }, 'sm danger', !stoppable || isBusy('wkKillAll' + tab))}
+        ${btn(label('wkRefresh', 'Refresh', 'Refreshing…'), 'wk-refresh', {}, 'sm', isBusy('wkRefresh'))}</div></div>
+    <div class="wk-meta">${meta}</div>
+    <div class="wk-kpis">${kpi('Running', c.running || 0, 'right now', 'brand', '●')}${kpi('Queued', c.queued || 0, 'waiting their turn', 'muted', '○')}
+      ${kpi('Retrying', c.retrying || 0, 'backing off after an error', 'warn', '↻')}
+      ${kpi('Finished · 24h', finished, act ? `${wkNum(act.done)} done · ${wkNum(act.failed)} failed` : 'loading…', act && act.failed > act.done ? 'bad' : 'good', '✓')}</div>
+    <div><div class="caps-sm mb8">QUEUE NOW</div>${queue}</div>
+    <details class="wk-help"><summary>How Kill and Run now work</summary><ul>
+      <li><b>Kill</b> stops the current attempt and requeues the task fresh: attempts and retry wait reset.</li>
+      <li>A run already talking to a model is abandoned, not interrupted — whatever it returns is discarded.</li>
+      <li><b>Kill all</b> also clears your rate-limit backoff, so waiting tasks can start at once.</li>
+      <li><b>Run now</b> puts a task first in line, past its retry wait${tab === 'ranking' ? ', your ranking cadence' : ''} and any provider cooldown.</li></ul></details>
+  </section>`;
+}
+// Hour-by-hour columns: finished done and failed stacked, what was queued as a dashed column behind them.
+function wkActivity(act) {
+  if (!act) return `<section class="card">${loading()}</section>`;
+  const hours = act.hours || [];
+  const max = Math.max(1, ...hours.map(h => Math.max(h.queued, h.done + h.failed)));
+  const cols = hours.map((h, i) => {
+    const at = toDate(h.hour), hourText = at.toLocaleTimeString(undefined, { hour: 'numeric' });
+    const seg = (v, color) => v ? `<i style="height:${Math.max(3, 132 * v / max)}px;background:${color}"></i>` : '';
+    return `<div class="wk-col" data-tip="${attr(`${hourText}: ${h.done} done · ${h.failed} failed · ${h.queued} queued`)}">
+      ${h.queued ? `<span class="q" style="height:${Math.max(3, 132 * h.queued / max)}px"></span>` : ''}
+      <div class="s">${seg(h.done, WK_COLORS.done)}${seg(h.failed, WK_COLORS.failed)}</div>
+      ${i % 6 === 0 || i === hours.length - 1 ? `<span class="x">${i === hours.length - 1 ? 'now' : esc(hourText)}</span>` : ''}</div>`;
+  }).join('');
+  const total = act.done + act.failed;
+  const fact = (name, value, extra = '') => `<div><div class="wk-fact"><span>${esc(name)}</span><b>${value}</b></div>${extra}</div>`;
+  return `<section class="card"><div class="row between wrap gap10 mb12"><div><div class="card-title">Last 24 hours</div><div class="card-sub">Tasks finished each hour, and how many were queued</div></div>
+      <div class="wk-legend" style="margin:0"><span><i style="background:${WK_COLORS.done}"></i>Done</span><span><i style="background:${WK_COLORS.failed}"></i>Failed</span><span><i style="background:var(--brand-soft);border:1px dashed var(--brand-line)"></i>Queued</span></div></div>
+    <div class="wk-split"><div>${total || act.queued ? `<div class="wk-chart"><span class="wk-axis">${max}</span>${cols}</div>` : `<div class="wk-chart" style="align-items:center;justify-content:center"><span class="small muted">Nothing queued or finished in the last 24 hours.</span></div>`}</div>
+      <div class="wk-facts">${fact('Success rate', wkPct(act.success_rate), act.success_rate == null ? '' : wkMeter(act.success_rate, act.success_rate >= 0.9 ? WK_COLORS.done : act.success_rate >= 0.7 ? 'var(--amber)' : WK_COLORS.failed))}
+        ${fact('Finished', `${wkNum(total)}`, `<div class="xs faint">${wkNum(act.done)} done · ${wkNum(act.failed)} failed · ${total ? (total / 24).toFixed(1) : 0}/hour</div>`)}
+        ${fact('Queued', wkNum(act.queued))}${fact('Median run time', wkDur(act.median_run_seconds))}${fact('Median wait to start', wkDur(act.median_wait_seconds))}</div></div></section>`;
+}
+
+/* ───────────── insights: the metrics each queue already had, laid out for this screen ───────────── */
+const WK_RANGES = [['today', 'Today'], ['7d', '7 days'], ['30d', '30 days'], ['90d', '90 days']];
+const wkTile = (name, value, sub = '', tone = '', extra = '') => `<div class="wk-tile"><div class="wk-tile-label">${esc(name)}</div><div class="wk-tile-value ${tone}" title="${attr(value)}">${esc(value)}</div>${extra}${sub ? `<div class="wk-tile-sub">${esc(sub)}</div>` : ''}</div>`;
+function wkRangeSeg() {
+  const w = wkState();
+  return `<div class="seg" role="tablist" aria-label="Range">${WK_RANGES.map(([id, text]) => `<button role="tab" aria-selected="${w.range === id}" class="${w.range === id ? 'on' : ''}" data-act="wk-range" data-id="${id}">${text}</button>`).join('')}</div>`;
+}
+// Ranked rows with a bar under each label: long labels (error messages, model names) wrap instead of being cut.
+function wkRanked(items, color = 'var(--brand)', emptyText = 'Nothing in this range.') {
+  if (!items.length) return `<div class="small muted">${esc(emptyText)}</div>`;
+  const max = Math.max(1, ...items.map(([, n]) => n)), sum = items.reduce((a, [, n]) => a + n, 0);
+  return `<div class="wk-rank">${items.map(([text, n]) => `<div class="wk-rank-row" data-tip="${attr(`${text}: ${n}`)}"><span class="t">${esc(text)}</span><b>${wkNum(n)} <span class="xs faint" style="font-weight:400">${Math.round(100 * n / sum)}%</span></b>${wkMeter(n / max, color)}</div>`).join('')}</div>`;
+}
+const wkCard = (title, sub, body, extra = '') => `<section class="card"><div class="row between wrap gap10 mb14"><div><div class="card-title">${esc(title)}</div>${sub ? `<div class="card-sub">${esc(sub)}</div>` : ''}</div>${extra}</div>${body}</section>`;
+function wkParsingInsights(data) {
+  const x = data.metrics, llm = x.llm || {}, job = x.scheduler;
+  const tokens = `${monTokens(llm.input_tokens || 0)} · ${monTokens(llm.output_tokens || 0)}`;
+  const tiles = `<div class="wk-tiles">
+    ${wkTile('Parse tasks', wkNum(x.tasks_created), 'created in range')}
+    ${wkTile('Parsed', wkNum(x.completed), `${wkNum(x.jobs_parsed)} jobs got structured requirements`)}
+    ${wkTile('Success rate', wkPct(x.success_rate), `${wkNum(x.failed)} failed`, wkTone(x.success_rate), x.success_rate == null ? '' : wkMeter(x.success_rate, x.success_rate >= 0.9 ? WK_COLORS.done : x.success_rate >= 0.7 ? 'var(--amber)' : WK_COLORS.failed))}
+    ${wkTile('Average time', monMs(x.average_duration_ms), 'per parse, end to end')}
+    ${wkTile('Model calls', wkNum(llm.requests), `${wkNum(llm.failed)} failed${llm.requests ? ` · ${wkPct((llm.failed || 0) / llm.requests)}` : ''}`, llm.failed ? 'warn' : '')}
+    ${wkTile('Model latency', monMs(llm.average_latency_ms), 'average per call')}
+    ${wkTile('Tokens in · out', tokens, `${(llm.input_tokens || 0).toLocaleString()} in · ${(llm.output_tokens || 0).toLocaleString()} out`)}
+    ${wkTile('Cost', llm.estimated_cost == null ? '—' : monUSD(llm.estimated_cost), llm.estimated_cost == null ? 'not reported' : 'estimated by the provider')}</div>`;
+  const models = Object.entries(llm.models || {}).sort((a, b) => b[1] - a[1]);
+  const errors = (x.top_errors || []).map(e => [e.error, e.tasks]);
+  const categories = Object.entries(x.failures_by_category || {}).sort((a, b) => b[1] - a[1]);
+  return `${wkCard('Performance', 'JD parser results and its model calls in the selected range', tiles, wkRangeSeg())}
+    ${job?.last_error ? `<div class="banner warn"><span class="grow">The last scheduler run failed: ${esc(job.last_error)}</span></div>` : ''}
+    <div class="wk-grid">${wkCard('Models used', 'Calls per model, from LLM usage (JD parser stage)', wkRanked(models, 'var(--brand)', 'No model calls in this range.'))}
+      ${wkCard('Why tasks failed', categories.length ? categories.map(([k, n]) => `${wkHumanize(k)} ${n}`).join(' · ') : 'Most common errors in the selected range', wkRanked(errors, WK_COLORS.failed, 'No failed parse tasks in this range.'))}</div>`;
+}
+function wkRecoveryInsights(data) {
+  const x = data.metrics, diag = data.diagnostics || {}, pw = diag.playwright || {};
+  const tiles = `<div class="wk-tiles">
+    ${wkTile('Missing descriptions', wkNum(x.missing_descriptions), 'jobs whose description is unusable now', x.missing_descriptions ? 'warn' : '')}
+    ${wkTile('Recovery tasks', wkNum(x.tasks_created), 'created in range')}
+    ${wkTile('Success rate', wkPct(x.success_rate), `${wkNum(x.recovered)} recovered`, wkTone(x.success_rate), x.success_rate == null ? '' : wkMeter(x.success_rate, x.success_rate >= 0.5 ? WK_COLORS.done : WK_COLORS.failed))}
+    ${wkTile('Average latency', monMs(x.average_latency_ms), 'per recovery')}
+    ${wkTile('Average length', x.average_recovered_length == null ? '—' : `${x.average_recovered_length.toLocaleString()} chars`, 'of recovered descriptions')}
+    ${wkTile('Blocked', wkNum(x.blocked), 'login walls and anti-bot checks, never bypassed', x.blocked ? 'warn' : '')}
+    ${wkTile('Failed', wkNum(x.failed), 'gave up after every attempt', x.failed ? 'bad' : '')}
+    ${wkTile('Went on', `${wkNum(x.subsequently_parsed)} · ${wkNum(x.subsequently_ranked)}`, 'recovered jobs parsed · ranked after')}</div>`;
+  const route = [['HTTP only', x.http_only_success_rate, 'recovered without a browser'], ['Browser fallback', x.playwright_fallback_rate, x.playwright_success_rate == null ? 'never needed' : `${wkPct(x.playwright_success_rate)} of those recovered`],
+    ['Model fallback', x.llm_fallback_rate, x.llm_success_rate == null ? 'never needed' : `${wkPct(x.llm_success_rate)} of those recovered`]];
+  const routes = `<div class="wk-rank">${route.map(([name, r, sub]) => `<div class="wk-rank-row"><span class="t">${esc(name)} <span class="xs faint">· ${esc(sub)}</span></span><b>${wkPct(r)}</b>${wkMeter(r || 0, 'var(--brand)')}</div>`).join('')}</div>`;
+  const cap = (name, d = {}) => `<div class="wk-cap"><span class="b">${esc(name)}</span><span>${wkPill(...({ AVAILABLE: ['Available', 'good', '✓'], UNAVAILABLE: ['Unavailable', 'bad', '✕'] }[d.status] || ['Unknown', 'muted', '?']))}</span><span class="xs muted">${esc(d.reason || '')}</span></div>`;
+  const capabilities = `${cap('HTTP extraction', diag.http)}${cap('Browser (Playwright)', pw)}${cap('Model extraction', diag.llm)}
+    <div class="xs faint mt8">Automatic recovery ${diag.enabled ? 'on' : 'off (JD_FETCH_ENABLED=false); manual recovery still works'} · browser ${esc(pw.browser || 'chromium')}${pw.headless === false ? ' (headed, for debugging)' : ''}${pw.running ? ' · running' : ''}${diag.settings ? ` · ${diag.settings.max_attempts} attempts each` : ''}</div>`;
+  const outcomes = Object.entries(x.by_result || {}).sort((a, b) => b[1] - a[1]).map(([code, n]) => [wkHumanize(code), n]);
+  return `${wkCard('Performance', 'Descriptions read back from posting pages in the selected range', tiles, wkRangeSeg())}
+    <div class="wk-grid">${wkCard('Route taken', 'HTTP first; the browser and a model only when needed', routes)}
+      ${wkCard('Outcomes', 'How finished recoveries ended', wkRanked(outcomes, 'var(--brand)', 'No finished recoveries in this range.'))}
+      ${wkCard('What recovery can use', 'Checked on this server', capabilities)}</div>`;
+}
+
+/* ───────────── settings ───────────── */
+/* One form ('workers') over three sources, saved together:
+   · your processing limits and backoff  → PATCH /api/settings (WORKER_SETTING_FIELDS, settings.js)
+   · your per-worker settings            → PUT /api/workers/settings      keys a__<kind>__<field>
+   · the server's settings (admin only)  → PUT /api/workers/server-settings keys s__<name>              */
+const wkAKey = (kind, name) => `a__${kind}__${name}`;
+const wkSKey = name => `s__${name}`;
+function wkSettingsBaseline() {
+  const w = D.wkSettings, out = {};
+  if (!w) return out;
+  for (const [kind, x] of Object.entries(w.account)) for (const f of x.fields) out[wkAKey(kind, f.name)] = x.values[f.name];
+  for (const [name, x] of Object.entries(w.server)) out[wkSKey(name)] = x.value;
+  return out;
+}
+// Save the per-worker and server parts of the form; settings.js saves the processing limits and backoff.
+async function wkSaveExtra(changes) {
+  const w = D.wkSettings, account = {}, server = {};
+  for (const [key, value] of Object.entries(changes)) {
+    const [scope, kind, name] = key.split('__');
+    if (scope === 'a') {
+      const f = w.account[kind]?.fields.find(x => x.name === name);
+      (account[kind] = account[kind] || {})[name] = f?.type === 'bool' ? !!value : Number(value);
+    } else if (scope === 's') server[kind] = Number(value);
+  }
+  if (Object.keys(account).length) D.wkSettings.account = (await api('/api/workers/settings', { method: 'PUT', body: { workers: account } })).account;
+  if (Object.keys(server).length) D.wkSettings.server = (await api('/api/workers/server-settings', { method: 'PUT', body: { values: server } })).server;
+}
+const wkSecs = s => s < 60 ? `${s}s` : s < 3600 ? `${Math.round(s / 6) / 10}m`.replace('.0m', 'm') : `${Math.round(s / 360) / 10}h`.replace('.0h', 'h');
+const WK_SET_ICONS = { parsing: '▤', recovery: '⟲', ranking: '★', tailoring: '✎', backoff: '⏱' };
+// The unit beside a number, and how its default reads, from the setting's name.
+function wkUnit(name) {
+  if (/seconds/.test(name)) return ['sec', v => wkSecs(Number(v))];
+  if (/minutes/.test(name)) return ['min', v => Number(v) ? `${v} min` : 'off'];
+  if (/attempts/.test(name)) return ['tries', v => `${v}`];
+  if (/batch_size/.test(name)) return ['tasks', v => `${v}`];
+  if (/concurrency/.test(name)) return ['at once', v => `${v}`];
+  if (/multiplier/.test(name)) return ['×', v => `×${v}`];
+  return ['', v => `${v}`];
+}
+// One setting: what it is on the left, a small control on the right, and its default with a reset when it differs.
+function wkRow(key, label, help, control, def = null, unit = '') {
+  const cur = fv('workers', key, settingsBaseline('workers')[key]);
+  const custom = def != null && String(cur) !== String(def.value);
+  return `<div class="wk-srow ${custom ? 'custom' : ''}"><div class="wk-srow-text"><label for="workers-${key}">${label}</label>${help ? `<p>${help}</p>` : ''}</div>
+    <div class="wk-srow-ctl">${control}${def != null ? `<div class="wk-srow-meta">${custom ? `<span class="wk-dot" aria-hidden="true"></span>Custom · <button type="button" class="wk-link" data-act="wk-set-reset" data-key="${attr(key)}" data-value="${attr(def.value)}">reset to ${esc(def.text)}</button>` : `Default${def.text ? ` · ${esc(def.text)}` : ''}`}</div>` : ''}</div></div>`;
+}
+const wkNumber = (key, min, max, unit, extra = '') => `<div class="wk-num">${inputF('workers', key, settingsBaseline('workers')[key], `type="number" min="${min}" max="${max}" required ${extra}`)}${unit ? `<span>${esc(unit)}</span>` : ''}</div>`;
+const wkToggle = (key, on, extra = '') => `<label class="wk-switch sm"><input type="checkbox" id="workers-${key}" data-form="workers" data-field="${key}" ${on ? 'checked' : ''} ${extra}><span aria-hidden="true"></span><b>${on ? 'On' : 'Off'}</b></label>`;
+function wkAccountRows(kind) {
+  const x = D.wkSettings.account[kind];
+  return x.fields.filter(f => f.name !== 'auto').map(f => {
+    const key = wkAKey(kind, f.name);
+    if (f.type === 'bool') return wkRow(key, esc(f.label), esc(f.help), wkToggle(key, !!fv('workers', key, x.values[f.name]), 'data-rerender'), { value: f.default, text: f.default ? 'on' : 'off' });
+    const [unit, fmt] = wkUnit(f.name);
+    return wkRow(key, esc(f.label), esc(f.help), wkNumber(key, f.min, f.max, unit), { value: f.default, text: fmt(f.default) });
+  }).join('');
+}
+function wkServerRows(kind) {
+  const w = D.wkSettings, items = Object.entries(w.server).filter(([, x]) => x.worker === kind);
+  if (!items.length) return '';
+  const rows = items.map(([name, x]) => {
+    const [unit, fmt] = wkUnit(name), key = wkSKey(name);
+    if (!w.server_editable) return `<div class="wk-srow"><div class="wk-srow-text"><label>${esc(x.label)}</label><p>${esc(x.help)}</p></div><div class="wk-srow-ctl"><span class="wk-ro-val">${esc(fmt(x.value))}${unit && !/min|sec/.test(unit) ? ` <small>${esc(unit)}</small>` : ''}</span></div></div>`;
+    return wkRow(key, esc(x.label), esc(x.help), wkNumber(key, x.min, x.max, unit), { value: x.default, text: fmt(x.default) });
+  }).join('');
+  return `<div class="wk-scol server"><div class="wk-scol-head"><span class="wk-scol-icon" aria-hidden="true">${w.server_editable ? '⚙' : '🔒'}</span><div><b>Server · every account</b><small>${w.server_editable ? 'You are an admin: changes pace every account’s scheduler jobs and apply within seconds.' : 'Set by your admin; shown for reference.'}</small></div></div>${rows}</div>`;
+}
+function wkSettingsCard(kind, title, extra = '') {
+  const x = D.wkSettings.account[kind], key = wkAKey(kind, 'auto'), on = !!fv('workers', key, x.values.auto);
+  const spec = wkSpec(kind) || {}, active = wkCount(spec.counts);
+  const facts = wkScheduleFacts(spec.scheduler, kind).map(f => `<span>${esc(f)}</span>`).join('') + (active ? `<span>● ${active} active</span>` : '');
+  const server = wkServerRows(kind);
+  return `<section class="card flush wk-set-card ${on ? '' : 'paused'}" id="wk-set-${kind}">
+    <header class="wk-set-head"><span class="wk-set-icon" aria-hidden="true">${WK_SET_ICONS[kind]}</span>
+      <div class="grow" style="min-width:0"><div class="row gap8 wrap" style="align-items:center"><h3>${esc(title)}</h3>${on ? '<span class="orch-chip good">✓ Runs automatically</span>' : '<span class="orch-chip warn">⏸ Paused</span>'}</div><div class="wk-meta mt6">${facts}</div></div>
+      <label class="wk-switch" title="Run ${attr(title)} automatically"><input type="checkbox" id="workers-${key}" data-form="workers" data-field="${key}" data-rerender ${on ? 'checked' : ''}><span aria-hidden="true"></span><b>${on ? 'Automatic' : 'Paused'}</b></label></header>
+    ${on ? '' : `<div class="wk-paused-note">Queued ${esc(title)} tasks wait for your account until you turn this back on. Run now still starts one.</div>`}
+    <div class="wk-scols ${server ? '' : 'single'}"><div class="wk-scol"><div class="wk-scol-head"><span class="wk-scol-icon" aria-hidden="true">👤</span><div><b>Your account</b><small>Only your tasks follow these.</small></div></div>${extra}${wkAccountRows(kind)}</div>${server}</div></section>`;
+}
+function wkSettings() {
+  if (!D.settings || !D.wkSettings) return loading();
+  const form = 'workers', b = settingsBaseline(form), max = D.settings.processing_maximums || { ranking_concurrency: 5, tailoring_concurrency: 2 };
+  const backoffOn = !!fv(form, 'rate_limit_backoff', b.rate_limit_backoff);
+  const cadence = Number(fv(form, 'ranking_interval_minutes', b.ranking_interval_minutes)) || 0;
+  const serverMinutes = D.settings.ranking_interval_server_minutes || 2;
+  const ranking = wkRow('ranking_concurrency', 'Jobs ranked at once', `Up to ${max.ranking_concurrency} on this server.`, wkNumber('ranking_concurrency', 1, max.ranking_concurrency, 'at once'), { value: max.ranking_concurrency, text: String(max.ranking_concurrency) })
+    + wkRow('ranking_interval_minutes', 'Rank at most every', cadence > 0 ? `Bursts of up to ${esc(fv(form, 'ranking_concurrency', b.ranking_concurrency))} every ${cadence} min. Run now skips it for one task.` : `0 follows the server, which looks every ${serverMinutes} min.`, wkNumber('ranking_interval_minutes', 0, 1440, 'min'), { value: 0, text: 'server pace' });
+  const tailoring = wkRow('tailoring_concurrency', 'Packets tailored at once', `Up to ${max.tailoring_concurrency} on this server.`, wkNumber('tailoring_concurrency', 1, max.tailoring_concurrency, 'at once'), { value: max.tailoring_concurrency, text: String(max.tailoring_concurrency) });
+  const ladder = `<div class="wk-ladder" aria-label="Waits after rate limits in a row">${backoffLadder(b, 5, form).map((x, i) => `<span><small>${i + 1}${i === 4 ? '+' : ''}</small>${esc(x)}</span>`).join('<i aria-hidden="true">→</i>')}</div>`;
+  const backoff = `<section class="card flush wk-set-card" id="wk-set-backoff"><header class="wk-set-head"><span class="wk-set-icon" aria-hidden="true">${WK_SET_ICONS.backoff}</span>
+      <div class="grow"><h3>Rate-limit backoff</h3><div class="xs muted mt4">What every worker does after a provider answers 429. Applies to your account.</div></div>
+      <label class="wk-switch"><input type="checkbox" id="workers-rate_limit_backoff" data-form="workers" data-field="rate_limit_backoff" data-rerender ${backoffOn ? 'checked' : ''}><span aria-hidden="true"></span><b>${backoffOn ? 'Back off' : 'Off'}</b></label></header>
+    ${backoffOn ? `<div class="wk-scols"><div class="wk-scol">${wkRow('rate_limit_base_seconds', 'First wait', 'After the first 429.', wkNumber('rate_limit_base_seconds', 1, 600, 'sec'), { value: 30, text: '30s' })}${wkRow('rate_limit_multiplier', 'Multiply each time by', 'Each 429 in a row waits longer.', wkNumber('rate_limit_multiplier', 1, 10, '×', 'step="0.5"'), { value: 2, text: '×2' })}${wkRow('rate_limit_max_seconds', 'Longest wait', 'The waits stop growing here.', wkNumber('rate_limit_max_seconds', 5, 86400, 'sec'), { value: 900, text: '15m' })}</div>
+      <div class="wk-scol server"><div class="wk-scol-head"><span class="wk-scol-icon" aria-hidden="true">↗</span><div><b>Waits after 429s in a row</b><small>Worked out from the values on the left.</small></div></div><div class="wk-pad">${ladder}<p class="settings-help mt12">A provider's own <code>Retry-After</code> wins when it asks for longer. Model calls and Apify calls back off separately; the first normal answer resets it. Kill all and Reset backoff clear a wait that is running now.</p></div></div></div>`
+    : '<div class="wk-paused-note">Off: every queued task calls the provider again straight away, even while it is refusing them.</div>'}</section>`;
+  const auto = id => !!fv('workers', wkAKey(id, 'auto'), D.wkSettings.account[id].values.auto);
+  const nav = [['parsing', 'JD parsing'], ['recovery', 'JD recovery'], ['ranking', 'Ranking'], ['tailoring', 'Tailoring'], ['backoff', 'Rate limits']]
+    .map(([id, t]) => `<a href="#wk-set-${id}" data-act="wk-set-jump" data-id="${id}"><span class="wk-set-icon sm" aria-hidden="true">${WK_SET_ICONS[id]}</span><span class="grow">${t}</span>${id === 'backoff' ? (backoffOn ? '<i class="wk-state on">On</i>' : '<i class="wk-state">Off</i>') : auto(id) ? '<i class="wk-state on">Auto</i>' : '<i class="wk-state paused">Paused</i>'}</a>`).join('');
+  return `<form id="settings-editor" class="wk-settings" data-form="workers" novalidate><fieldset ${isBusy('settings-workers') ? 'disabled' : ''}>
+    <div class="wk-set-layout"><nav class="wk-set-nav card" aria-label="Worker settings"><div class="caps-sm mb8">WORKER SETTINGS</div>${nav}
+        <div class="wk-legend-box mt12"><div><span aria-hidden="true">👤</span> <b>Your account</b> only your tasks</div><div><span aria-hidden="true">${D.wkSettings.server_editable ? '⚙' : '🔒'}</span> <b>Server</b> ${D.wkSettings.server_editable ? 'every account (admin)' : 'set by your admin'}</div><div><span class="wk-dot" aria-hidden="true"></span> <b>Custom</b> differs from the default</div></div>
+        <p class="xs faint mt12">Automatic tailoring and approvals: <a href="#settings/workflow">Workflow &amp; cadence</a>.</p></nav>
+      <div class="stack" style="min-width:0"><div id="settings-error" class="settings-error" role="alert" ${SETTING_ERRORS.workers ? '' : 'hidden'}>${esc(SETTING_ERRORS.workers || '')}</div>
+        ${wkSettingsCard('parsing', 'JD parsing')}${wkSettingsCard('recovery', 'JD recovery')}${wkSettingsCard('ranking', 'Ranking', ranking)}${wkSettingsCard('tailoring', 'Tailoring', tailoring)}${backoff}
+        <div class="wk-set-footer">${settingsFooter('workers')}</div></div></div></fieldset></form>`;
+}
+
+/* ───────────── multi-select and bulk retry ───────────── */
+// What can be retried is what is shown now (after the filters) and failed without being run again since.
+function wkSel(tab) {
+  const w = wkState();
+  if (!w.sel) w.sel = {};
+  if (!w.sel[tab]) w.sel[tab] = new Set();
+  return w.sel[tab];
+}
+function wkRetriable(tab) {
+  if (tab === 'parsing' || tab === 'recovery') return ((D.wkData || {})[tab]?.rows || []).filter(r => ['FAILED', 'BLOCKED'].includes(r.status) && !r.retried_by).map(r => r.task_id);
+  if (tab === 'ranking') { const v = wkRankingView().view; return v ? [...v.active, ...v.recent].filter(t => t.status === 'FAILED' && !t.retried && !t.removed).map(t => t.id) : []; }
+  if (tab === 'tailoring') return wkTailoringView().tasks.filter(t => t.status === 'failed' && !retried(t)).map(t => t.id);
+  return [];
+}
+// Drop what is no longer retriable or no longer shown (finished retrying, filtered out, cleared).
+function wkPrune(tab) {
+  const ok = new Set(wkRetriable(tab)), sel = wkSel(tab);
+  for (const id of [...sel]) if (!ok.has(id)) sel.delete(id);
+  return ok;
+}
+const wkSelectBox = (tab, id, name) => `<label class="wk-check"><input type="checkbox" data-wk-select="${tab}" data-id="${id}" ${wkSel(tab).has(Number(id)) ? 'checked' : ''} aria-label="Select ${attr(name || `task ${id}`)} for retry"><span aria-hidden="true"></span></label>`;
+function wkBulkBar(tab) {
+  const ids = [...wkPrune(tab)];
+  if (!ids.length) return '';
+  const n = wkSel(tab).size, all = n === ids.length, key = 'wkRetry' + tab;
+  return `<section class="card wk-bulk ${n ? 'on' : ''}"><label class="wk-bulk-all"><span class="wk-check ${n && !all ? 'partial' : ''}"><input type="checkbox" data-wk-select-all="${tab}" ${all ? 'checked' : ''} aria-label="Select all ${ids.length} failed tasks shown"><span aria-hidden="true"></span></span>
+      <span>${n ? `<b>${n} selected</b> of ${ids.length} failed shown` : `Select all ${ids.length} failed task${ids.length === 1 ? '' : 's'} shown`}</span></label>
+    <span class="xs muted grow">${n ? 'Retried tasks are queued again with fresh attempts and run in normal order.' : 'Tick failed tasks to retry several at once.'}</span>
+    <div class="row gap8">${n ? btn('Clear selection', 'wk-sel-clear', { tab }, 'sm ghost') : ''}${btn(label(key, n ? `↻ Retry ${n}` : '↻ Retry selected', 'Retrying…'), 'wk-retry-selected', { tab }, 'sm primary', !n || isBusy(key))}</div></section>`;
+}
+document.addEventListener('change', e => {
+  const one = e.target.dataset?.wkSelect, every = e.target.dataset?.wkSelectAll;
+  if (!one && !every) return;
+  const tab = one || every, sel = wkSel(tab);
+  if (one) { const id = Number(e.target.dataset.id); if (e.target.checked) sel.add(id); else sel.delete(id); }
+  else { sel.clear(); if (e.target.checked) wkRetriable(tab).forEach(id => sel.add(id)); }
+  render();
+});
+function wkRetriedMessage(out) {
+  const n = out.retried.length, skipped = out.skipped.length;
+  const why = skipped ? ` · ${skipped} skipped: ${[...new Set(out.skipped.map(x => x.reason.replace(/ as task #\d+/, '').toLowerCase()))].join(', ')}` : '';
+  return n ? `Queued ${n} task${n === 1 ? '' : 's'} again${why}` : `Nothing was retried${why}`;
+}
+
+/* ───────────── filters ───────────── */
+// One bar for every tab: search (job title, company or #id), status with how many each choice shows, and for
+// ranking the tracker's location. Ranking keeps its tracker inputs (#rf-q, #rf-location) and their handlers.
+function wkFilterBar(tab, counts) {
+  const f = wkFilter(tab), ranking = tab === 'ranking';
+  const search = ranking
+    ? `<input class="input grow" style="min-width:200px;margin-top:0" id="rf-q" data-rf="q" value="${attr(S.rf.q)}" placeholder="Search title, company or location…" aria-label="Search ranking tasks">`
+    : `<input class="input grow" style="min-width:200px;margin-top:0" id="wk-q-${tab}" data-wk-search="${tab}" value="${attr(f.q)}" placeholder="Search job title, company or #job id…" aria-label="Search tasks">`;
+  const status = `<select class="select" style="width:auto;margin-top:0" id="wk-status-${tab}" data-wk-status="${tab}" aria-label="Status">${WK_FILTERS.map(([id, text]) =>
+    `<option value="${id}" ${f.status === id ? 'selected' : ''}>${esc(text)}${counts && counts[id] != null ? ` (${counts[id]})` : ''}</option>`).join('')}</select>`;
+  const location = ranking && D.ranking ? `<select class="select" style="width:auto;margin-top:0" id="rf-location" data-rf="location" aria-label="Location">${locationOptions(D.ranking.locations).map(([v, t]) =>
+    `<option value="${attr(v)}" ${String(v) === String(S.rf.location) ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select>` : '';
+  const on = (ranking ? S.rf.q || S.rf.location !== 'all' : f.q) || f.status !== 'all';
+  return `<section class="card pad12"><div class="row gap8 wrap" style="align-items:center">${search}${status}${location}
+    ${on ? btn('Clear filters', 'wk-clear-filters', { tab }, 'sm ghost') : ''}</div></section>`;
+}
+// The ranking tracker narrowed by status (the server already narrowed it by search and location).
+function wkRankingView() {
+  const r = D.ranking, f = wkFilter('ranking');
+  if (!r) return { view: null, counts: null };
+  const counts = wkCounted([...r.active, ...r.recent].map(wkRankStatus));
+  if (f.status === 'all') return { view: r, counts };
+  const keep = t => wkMatches(wkRankStatus(t), f.status);
+  return { view: { ...r, active: r.active.filter(keep), recent: r.recent.filter(keep), filtered: true }, counts };
+}
+function wkTailoringView() {
+  const all = D.tasks || [], f = wkFilter('tailoring');
+  const searched = all.filter(t => wkText(t, f.q));
+  return { tasks: searched.filter(t => wkMatches(wkTailorStatus(t), f.status)), all,
+           counts: wkCounted(searched.map(wkTailorStatus)) };
+}
+
+/* ───────────── screen ───────────── */
+function renderWorkers() {
+  const w = wkState(), s = D.wk;
+  if (!s) return loading();
+  const tabs = `<div class="seg" role="tablist" aria-label="Workers">${WK_TABS.map(([id, text]) => {
+    const n = wkCount(wkSpec(id)?.counts);
+    return `<button role="tab" aria-selected="${w.tab === id}" class="${w.tab === id ? 'on' : ''}" data-act="wk-tab" data-id="${id}">${id === 'settings' ? '<span aria-hidden="true">⚙</span> ' : ''}${text}${n ? ` <span class="wk-badge">${n}</span>` : ''}</button>`;
+  }).join('')}</div>`;
+  const top = `<section class="card pad12 wk-top">${tabs}
+    <div class="row gap8 wrap">${s.active ? `<span class="xs muted">${s.running} running · ${s.active} active across all workers</span>` : '<span class="xs muted">All workers idle</span>'}
+      ${btn(label('wkKillEverything', 'Kill all workers', 'Stopping…'), 'wk-kill-everything', {}, 'sm', !s.running && !Object.values(s.workers).some(x => x.counts.retrying) || isBusy('wkKillEverything'))}</div></section>`;
+  if (w.tab === 'settings') return `<div class="stack">${top}${wkCooldowns(s.cooldowns)}${wkSettings()}</div>`;
+  const spec = wkSpec(w.tab) || {};
+  const act = (D.wkAct || {})[w.tab];
+  const data = (D.wkData || {})[w.tab];
+  let body, filterCounts = null;
+  if (w.tab === 'ranking') {
+    const ranking = wkRankingView();
+    filterCounts = ranking.counts;
+    body = wkFilterBar(w.tab, filterCounts) + wkBulkBar(w.tab) + renderRanking(ranking.view);
+  } else if (w.tab === 'tailoring') {
+    const tailoring = wkTailoringView();
+    filterCounts = tailoring.counts;
+    body = wkFilterBar(w.tab, filterCounts) + wkBulkBar(w.tab) + (renderTaskStack(tailoring.tasks, tailoring.all) || `<section class="card">${empty('No tailoring tasks', 'Tasks you queue from the Tailor screen run here in the background.', btn('Open Tailor', 'go', { screen: 'tailor' }, 'primary'))}</section>`);
+  } else {
+    filterCounts = data?.status_counts || null;
+    // The filters narrow the task list, not the metrics, so they sit right above the list.
+    body = !data ? loading() : `${w.tab === 'parsing' ? wkParsingInsights(data) : wkRecoveryInsights(data)}${wkFilterBar(w.tab, filterCounts)}${wkBulkBar(w.tab)}${wkTable(w.tab, data)}`;
+  }
+  return `<div class="stack">${top}${wkCooldowns(s.cooldowns)}${wkHero(w.tab, spec, act)}${wkActivity(act)}${body}</div>`;
+}
+
+/* ───────────── actions ───────────── */
+function wkKilledMessage(out) {
+  const cleared = out.cooldowns_cleared?.length ? ` · backoff cleared for ${out.cooldowns_cleared.map(p => p.toLowerCase()).join(', ')}` : '';
+  if (!out.requeued) return `Nothing was running or retrying${cleared}`;
+  const running = out.stopped ? `stopped ${out.stopped} running, ` : '';
+  return `Requeued ${out.requeued} task${out.requeued === 1 ? '' : 's'} fresh (${running}attempts and retry wait reset)${cleared}`;
+}
+async function wkReload() { await loadWorkers(); }
+// Search waits for a pause in typing; the status list applies at once. Ranking's own inputs keep their handlers.
+document.addEventListener('input', e => {
+  const tab = e.target.dataset?.wkSearch;
+  if (!tab) return;
+  wkFilter(tab).q = e.target.value;
+  clearTimeout(wkSearchTimer);
+  wkSearchTimer = setTimeout(() => wkApplyFilters(tab), tab === 'tailoring' ? 0 : 250);
+});
+document.addEventListener('change', e => {
+  const tab = e.target.dataset?.wkStatus;
+  if (!tab) return;
+  wkFilter(tab).status = e.target.value;
+  wkApplyFilters(tab);
+});
+async function wkApplyFilters(tab) {
+  if (['parsing', 'recovery'].includes(tab)) { try { await loadWorkers(); } catch (err) { toast(err.message, true); } }
+  if (S.screen === 'workers') render();
+}
+const WORKERS_ACTIONS = {
+  'wk-clear-filters': el => {
+    const tab = el.dataset.tab;
+    Object.assign(wkFilter(tab), { q: '', status: 'all' });
+    if (tab === 'ranking') { S.rf = { q: '', location: 'all' }; loadRanking().then(render); return; }
+    wkApplyFilters(tab);
+  },
+  'wk-tab': el => { wkState().tab = el.dataset.id; go('workers'); },
+  'wk-sel-clear': el => { wkSel(el.dataset.tab).clear(); render(); },
+  'wk-retry-selected': el => {
+    const tab = el.dataset.tab, ids = [...wkSel(tab)];
+    if (!ids.length) return;
+    if (ids.length > 1 && !confirm(`Retry ${ids.length} failed tasks? Each is queued again with fresh attempts; they run in normal order.`)) return;
+    return busy('wkRetry' + tab, async () => {
+      const out = await api(`/api/workers/${tab}/retry`, { method: 'POST', body: { task_ids: ids } });
+      wkSel(tab).clear();
+      await wkReload();
+      return out;
+    }, wkRetriedMessage);
+  },
+  'wk-set-reset': el => { setF('workers', el.dataset.key, el.dataset.value === 'true' ? true : el.dataset.value === 'false' ? false : el.dataset.value); render(); },
+  'wk-set-jump': (el, e) => { e?.preventDefault?.(); document.getElementById(`wk-set-${el.dataset.id}`)?.scrollIntoView?.({ behavior: 'smooth', block: 'start' }); },
+  'wk-range': el => { wkState().range = el.dataset.id; wkApplyFilters(wkState().tab); },
+  'wk-open': el => { wkState().tab = el.dataset.tab || wkState().tab; if (S.orch) Object.assign(S.orch, { node: null, edge: null }); go('workers'); },
+  'wk-refresh': () => busy('wkRefresh', wkReload),
+  'wk-run-now': el => busy(`wkRun${el.dataset.kind}${el.dataset.id}`, async () => {
+    const out = await api(`/api/workers/${el.dataset.kind}/tasks/${el.dataset.id}/run-now`, { method: 'POST' });
+    await wkReload();
+    return out;
+  }, out => `${out.title || 'The task'} runs next`),
+  'wk-kill': el => busy(`wkKill${el.dataset.kind}${el.dataset.id}`, async () => {
+    const out = await api(`/api/workers/${el.dataset.kind}/tasks/${el.dataset.id}/kill`, { method: 'POST' });
+    await wkReload();
+    return out;
+  }, wkKilledMessage),
+  'wk-kill-all': el => {
+    const name = wkSpec(el.dataset.kind)?.label || el.dataset.kind;
+    if (!confirm(`Kill every running or retrying ${name} task? Each is stopped and requeued fresh, and your rate-limit backoff is cleared.`)) return;
+    return busy('wkKillAll' + el.dataset.kind, async () => {
+      const out = await api(`/api/workers/${el.dataset.kind}/kill-all`, { method: 'POST' });
+      await wkReload();
+      return out;
+    }, wkKilledMessage);
+  },
+  'wk-kill-everything': () => {
+    if (!confirm('Kill every running or retrying task of every worker? Each is stopped and requeued fresh, and your rate-limit backoff is cleared.')) return;
+    return busy('wkKillEverything', async () => {
+      const out = await api('/api/workers/kill-all', { method: 'POST' });
+      await wkReload();
+      return out;
+    }, wkKilledMessage);
+  },
+  'wk-reset-cooldowns': () => busy('wkCooldown', async () => {
+    const out = await api('/api/workers/cooldowns/reset', { method: 'POST' });
+    await wkReload();
+    return out;
+  }, out => out.cleared.length ? `Backoff cleared for ${out.cleared.map(p => p.toLowerCase()).join(', ')}` : 'No backoff was running'),
+};

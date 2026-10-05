@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 // The production scripts, in page order, without app.js's automatic network boot.
 const appSource = readFileSync('app/static/app.js', 'utf8').split('/* ───────────── boot ───────────── */')[0];
-const names = ['S', 'D', 'A', 'AIM', 'render', 'setF', 'renderAIModels', 'aimWorkerPayload', 'aimRoutingPayload', 'renderMonRouting'];
+const names = ['S', 'D', 'A', 'AIM', 'render', 'setF', 'orchState', 'readHash', 'renderAIModels', 'aimWorkerPayload', 'aimRoutingPayload', 'renderMonRouting'];
 let ui, context, fetchMock, routes;
 const response = (data, status = 200) => ({ ok: status < 400, status, text: async () => JSON.stringify(data) });
 
@@ -27,7 +27,7 @@ function overview() {
 }
 const flush = () => new Promise(r => setTimeout(r, 0));
 async function open(tab = 'overview') {
-  ui.S.screen = 'settings'; ui.S.settingsSection = 'ai'; ui.AIM.tab = tab; ui.AIM.data = undefined; ui.render();
+  ui.S.screen = 'orchestration'; ui.orchState().workspace = 'models'; ui.AIM.tab = tab; ui.AIM.data = undefined; ui.render();
   await flush(); await flush();
 }
 const text = () => document.getElementById('view').textContent;
@@ -46,7 +46,7 @@ beforeEach(() => {
   });
   if (!ui) {
     context = createContext({ document, window, location, history, navigator, URLSearchParams, FormData, File, setTimeout, clearTimeout, setInterval, clearInterval, console });
-    for (const file of ['monitoring.js', 'orchestration.js', 'settings.js', 'ai_models.js', 'resume_data.js', 'job_data.js', 'knowledge.js', 'inbox.js', 'guide.js']) {
+    for (const file of ['monitoring.js', 'orchestration.js', 'workers.js', 'settings.js', 'ai_models.js', 'resume_data.js', 'job_data.js', 'knowledge.js', 'inbox.js', 'guide.js']) {
       runInContext(readFileSync(`app/static/${file}`, 'utf8'), context, { filename: resolve(`app/static/${file}`) });
     }
     runInContext(appSource, context, { filename: resolve('app/static/app.js') });
@@ -58,7 +58,7 @@ beforeEach(() => {
   Object.assign(ui.D, { profile: { name: 'A', search_preferences: {} }, prefs: {}, settings: { ai: { saved: { stage_models: {} }, env: { llm_provider: 'openrouter', models: {}, stage_models: {} }, effective: {} }, configured: {}, keys: {} }, summary: { model: 'local-reasoning', application_mode: 'manual_approval', counts: {} } });
 });
 
-describe('Settings → AI Models', () => {
+describe('AI Orchestration → Models & routing', () => {
   it('shows model selection for the route in use: LiteLLM workers, or the direct provider’s models', async () => {
     await open();
     expect(text()).toContain('Models · LiteLLM workers');
@@ -409,5 +409,23 @@ describe('Settings → AI Models actions', () => {
     confirm.mockReturnValueOnce(false);
     ui.A['aim-restore']({ dataset: { id: 1, version: 1 } });
     expect(call('POST', '/api/settings/ai/versions/1/restore').length).toBe(0);
+  });
+
+  it('lives in AI Orchestration: a node opens its worker’s editor and the workspace switch keeps the URL', async () => {
+    window.scrollTo = () => {};
+    ui.A['orch-settings-ai']({ dataset: { worker: 'RANKER' } });
+    await flush(); await flush();
+    expect(location.hash).toBe('#orchestration/models');
+    expect(ui.AIM.tab).toBe('workers'); expect(ui.AIM.drawer).toBe('RANKER');
+    expect(document.querySelector('#view .aim-drawer h3').textContent).toBe('Ranker');
+    expect(document.querySelector('#view .aim-ws-nav [aria-selected="true"]').textContent).toContain('Worker assignments');
+    expect([...document.querySelectorAll('#view .aim-worker-card .aim-worker-model')].map(x => x.textContent)).toContain('USESlocal-reasoning');
+    ui.A['orch-settings-ai']({ dataset: {} });
+    await flush(); await flush();
+    expect(ui.AIM.tab).toBe('advanced');
+    ui.A['orch-workspace']({ dataset: { id: 'pipeline' } });
+    expect(location.hash).toBe('#orchestration');
+    history.replaceState(null, '', '#orchestration/models'); ui.readHash();
+    expect(ui.orchState().workspace).toBe('models');
   });
 });

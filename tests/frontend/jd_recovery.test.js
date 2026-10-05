@@ -6,7 +6,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 // Job description recovery in the UI: the job modal says where recovery stands and offers Recover / Retry, and
 // Monitoring → JD recovery shows its metrics and what it can use. Never a stack trace.
 const appSource = readFileSync('app/static/app.js', 'utf8').split('/* ───────────── boot ───────────── */')[0];
-const names = ['S', 'D', 'render', 'A', 'recoveryStrip', 'monState', 'MON_TABS', 'renderMonJdRecovery', 'renderMonJdParsing', 'MON_STAGES'];
+const names = ['S', 'D', 'render', 'A', 'recoveryStrip', 'monState', 'MON_TABS', 'wkRecoveryInsights', 'wkParsingInsights', 'MON_STAGES', 'WK_KINDS'];
 let ui, context, fetchMock;
 
 const response = (data, status = 200) => ({ ok: status < 400, status, text: async () => JSON.stringify(data) });
@@ -29,7 +29,7 @@ beforeEach(() => {
   vi.stubGlobal('fetch', fetchMock);
   if (!ui) {
     context = createContext({ document, window, location, history, navigator, URLSearchParams, FormData, File, Intl, setTimeout, clearTimeout, setInterval, clearInterval, console });
-    for (const file of ['monitoring.js', 'orchestration.js', 'settings.js', 'resume_data.js', 'job_data.js', 'knowledge.js', 'inbox.js', 'guide.js']) {
+    for (const file of ['monitoring.js', 'orchestration.js', 'workers.js', 'settings.js', 'resume_data.js', 'job_data.js', 'knowledge.js', 'inbox.js', 'guide.js']) {
       runInContext(readFileSync(`app/static/${file}`, 'utf8'), context, { filename: resolve(`app/static/${file}`) });
     }
     runInContext(appSource, context, { filename: resolve('app/static/app.js') });
@@ -98,10 +98,11 @@ describe('job modal recovery strip', () => {
   });
 });
 
-describe('Monitoring → JD recovery', () => {
-  it('is a monitoring section with metrics and diagnostics', () => {
-    expect(ui.MON_TABS.map(([id]) => id)).toContain('jd_recovery');
-    ui.D.monJdr = {
+describe('Running workers → JD recovery', () => {
+  it('moved from Monitoring to Running workers, with its metrics and diagnostics', () => {
+    expect(ui.MON_TABS.map(([id]) => id)).not.toContain('jd_recovery');
+    expect(ui.WK_KINDS.map(([id]) => id)).toContain('recovery');
+    const data = {
       metrics: { missing_descriptions: 12, tasks_created: 20, active: 2, finished: 18, recovered: 14, success_rate: 0.78,
         http_only_success_rate: 0.6, playwright_fallback_rate: 0.3, playwright_success_rate: 0.5, llm_fallback_rate: 0.1,
         llm_success_rate: 1, average_latency_ms: 2400, blocked: 3, failed: 1, jobs_removed: 2,
@@ -112,22 +113,23 @@ describe('Monitoring → JD recovery', () => {
         llm: { status: 'AVAILABLE', reason: null },
         settings: { batch_size: 10, max_concurrency: 2, max_attempts: 3, min_characters: 500, interval_minutes: 2 } } };
     const div = document.createElement('div');
-    div.innerHTML = ui.renderMonJdRecovery();
+    div.innerHTML = ui.wkRecoveryInsights(data);
     const text = div.textContent;
-    expect(text).toContain('78.0%');
+    expect(text).toContain('78%');
     expect(text).toContain('Browser fallback');
     expect(text).toContain('Chromium executable missing');
     expect(text).toContain('HTTP extraction');
-    expect(text).toContain('LOGIN_REQUIRED');
+    expect(text).toContain('Login required');
     expect(text).toContain('13 · 9');
   });
 });
 
-describe('Monitoring → JD parsing', () => {
-  it('shows parse outcomes, the queue, the scheduler job and the parser model calls', () => {
-    expect(ui.MON_TABS.map(([id]) => id)).toContain('jd_parsing');
+describe('Running workers → JD parsing', () => {
+  it('shows parse outcomes, the failed scheduler run, the models used and why tasks failed', () => {
+    expect(ui.MON_TABS.map(([id]) => id)).not.toContain('jd_parsing');
+    expect(ui.WK_KINDS.map(([id]) => id)).toContain('parsing');
     expect(ui.MON_STAGES.JD_PARSER).toBe('JD parser');
-    ui.D.monJdp = { metrics: {
+    const data = { metrics: {
       tasks_created: 40, completed: 30, failed: 8, retrying: 2, success_rate: 0.789, average_duration_ms: 4200, jobs_parsed: 30,
       failures_by_category: { RATE_LIMITED: 7, LEASE_EXPIRED: 1 },
       top_errors: [{ error: 'LLMRateLimitError: OpenRouter rate limit exceeded', tasks: 7 }],
@@ -137,10 +139,10 @@ describe('Monitoring → JD parsing', () => {
       scheduler: { enabled: true, last_status: 'failed', last_finished_at: '2026-10-01T12:00:00', next_run_at: null,
         last_error: 'ProgrammingError: column jobs.auto_tailor_status does not exist', last_result: null } } };
     const div = document.createElement('div');
-    div.innerHTML = ui.renderMonJdParsing();
+    div.innerHTML = ui.wkParsingInsights(data);
     const text = div.textContent;
-    for (const bit of ['Parse tasks', '78.9%', '3 · 1', 'Model calls', '120,000 · 30,000', 'not reported',
-      'column jobs.auto_tailor_status does not exist', 'openrouter/free (41)', 'LLMRateLimitError']) {
+    for (const bit of ['Parse tasks', '78.9%', 'Model calls', '120K · 30K', '120,000 in · 30,000 out', 'not reported',
+      'column jobs.auto_tailor_status does not exist', 'openrouter/free', 'Models used', 'Rate limited 7', 'LLMRateLimitError']) {
       expect(text).toContain(bit);
     }
   });

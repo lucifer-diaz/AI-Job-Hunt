@@ -1,7 +1,7 @@
 """AI Orchestration API: the system topology, live packets and one job's path, as a read-only projection.
 
 Every endpoint is observational. Nothing here changes a job, a model assignment or a route: editing a worker's model
-stays in Settings → AI Models (draft → preview → apply → version). The browser never talks to LiteLLM; these
+stays in AI Orchestration → Models (draft → preview → apply → version). The browser never talks to LiteLLM; these
 endpoints read the Job Hunt OS database (business tables and Monitoring telemetry) and return metadata only.
 
 Accounts: a person sees their own jobs and telemetry. The admin may pass all_accounts=true for aggregate node and edge

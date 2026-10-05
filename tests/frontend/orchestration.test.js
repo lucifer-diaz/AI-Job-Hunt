@@ -103,7 +103,7 @@ beforeEach(() => {
   vi.stubGlobal('fetch', fetchMock);
   if (!ui) {
     context = createContext({ document, window, location, history: window.history, navigator, URLSearchParams, FormData, File, Intl, setTimeout, clearTimeout, setInterval, clearInterval, console });
-    for (const file of ['monitoring.js', 'orchestration.js', 'settings.js', 'resume_data.js', 'job_data.js', 'knowledge.js', 'inbox.js', 'guide.js']) {
+    for (const file of ['monitoring.js', 'orchestration.js', 'workers.js', 'settings.js', 'resume_data.js', 'job_data.js', 'knowledge.js', 'inbox.js', 'guide.js']) {
       runInContext(readFileSync(`app/static/${file}`, 'utf8'), context, { filename: resolve(`app/static/${file}`) });
     }
     runInContext(appSource, context, { filename: resolve('app/static/app.js') });
@@ -127,7 +127,7 @@ describe('AI Orchestration workspace', () => {
     ui.render();
     const groups = [...document.querySelectorAll('#nav .nav-group')].map(g => [g.querySelector('.nav-caps').textContent, [...g.querySelectorAll('.nav-btn')].map(a => a.textContent.trim())]);
     const system = groups.find(([caps]) => caps === 'SYSTEM');
-    expect(system[1].map(t => t.replace(/—$/, ''))).toEqual(['AI Orchestration', 'Monitoring']);
+    expect(system[1].map(t => t.replace(/—$/, ''))).toEqual(['AI Orchestration', 'Running workers', 'Monitoring']);
     expect(groups.find(([caps]) => caps === 'WORKSPACE')[1].join(' ')).not.toMatch(/Monitoring|Orchestration/);
     expect(document.getElementById('top').textContent).toContain('AI Orchestration');
   });

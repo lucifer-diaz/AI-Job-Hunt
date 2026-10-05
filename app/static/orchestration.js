@@ -2,7 +2,8 @@
    Loaded before app.js; uses the workspace's shared helpers (api, esc, attr, btn, pill, render, go) and Monitoring's
    formatters (monMs, monPct, monTokens, monUSD). Every stage, kind and transition comes from
    /api/orchestration/* — the backend registry (app.services.orchestration_topology) — so adding a worker there needs
-   no change here. Nothing on this screen changes configuration: model edits open Settings → AI Models. */
+   no change here. The graph changes nothing; the Models workspace (ai_models.js) edits model configuration through
+   draft → preview → apply → version. */
 'use strict';
 
 const ORCH_MODES = [['system', 'System'], ['live', 'Live job'], ['history', 'History']];
@@ -20,8 +21,8 @@ const ORCH_POLL_ACTIVE = 4000, ORCH_POLL_IDLE = 30000, ORCH_GRAPH_REFRESH = 6000
 let orchTimer = null, orchSearchTimer = null;
 
 function orchState() {
-  if (!S.orch) S.orch = { mode: 'system', range: '7d', all: false, node: null, edge: null, tab: 'overview', jobId: null,
-    jobQuery: '', traceOpen: false, view: null, legend: false };
+  if (!S.orch) S.orch = { workspace: 'pipeline', mode: 'system', range: '7d', all: false, node: null, edge: null, tab: 'overview',
+    jobId: null, jobQuery: '', traceOpen: false, view: null, legend: false };
   return S.orch;
 }
 const orchQuery = (extra = {}) => qs({ range: orchState().range, all_accounts: orchState().all ? 'true' : '', ...extra });
@@ -29,6 +30,11 @@ const orchQuery = (extra = {}) => qs({ range: orchState().range, all_accounts: o
 /* ───────────── loading and polling ───────────── */
 async function loadOrchestration() {
   const o = orchState();
+  if (o.workspace === 'models') {  // the model configuration: no graph, no polling
+    stopOrchPoll();
+    await Promise.all([aimLoadQuiet(), D.settings ? null : api('/api/settings').then(x => { D.settings = x; }).catch(() => null)]);
+    return;
+  }
   try {
     const [graph, live] = await Promise.all([api('/api/orchestration/graph?' + orchQuery()), api('/api/orchestration/live?' + orchQuery())]);
     Object.assign(D, { orchGraph: graph, orchLive: live, orchError: null, orchGraphAt: Date.now() });
@@ -62,7 +68,7 @@ async function orchLoadEdge() {
 // another screen is open. The graph's historical aggregates are refreshed at most once a minute; the poll itself only
 // asks for what changes (queue counts, packets, the selected job).
 function orchPollDelay() {
-  if (S.screen !== 'orchestration' || document.hidden) return null;
+  if (S.screen !== 'orchestration' || document.hidden || orchState().workspace === 'models') return null;
   return D.orchLive?.active || D.orchJob?.packet?.active ? ORCH_POLL_ACTIVE : ORCH_POLL_IDLE;
 }
 function scheduleOrchPoll() {
@@ -235,8 +241,15 @@ function orchNode(g, n, p, path) {
 }
 
 /* ───────────── screen ───────────── */
+// Pipeline (the live graph) or Models (which model each worker uses, and how requests are routed).
+function orchWorkspaceSwitch() {
+  const o = orchState();
+  return `<div class="seg orch-workspace" role="tablist" aria-label="AI Orchestration">${[['pipeline', 'Pipeline', '◇'], ['models', 'Models & routing', '⇢']].map(([id, t, sym]) =>
+    `<button role="tab" aria-selected="${o.workspace === id}" class="${o.workspace === id ? 'on' : ''}" data-act="orch-workspace" data-id="${id}"><span aria-hidden="true">${sym}</span> ${t}</button>`).join('')}</div>`;
+}
 function renderOrchestration() {
   const o = orchState(), g = D.orchGraph;
+  if (o.workspace === 'models') return `<div class="orch"><section class="card pad12 orch-toolbar">${orchWorkspaceSwitch()}</section>${renderAIModels()}</div>`;
   if (!g) return D.orchError ? `<div class="card">${empty('AI Orchestration could not load', D.orchError, btn('Try again', 'orch-retry', {}, 'primary'))}</div>` : loading();
   if (!o.view) setTimeout(orchAutoFit, 0);
   return `<div class="orch">${orchToolbar(g)}
@@ -253,7 +266,7 @@ function orchToolbar(g) {
   const o = orchState(), sys = g.system;
   const gw = g.gateway?.mode === 'litellm' ? `LiteLLM gateway${g.gateway.config_version ? ` · config v${g.gateway.config_version}` : ''}` : `Direct · ${g.gateway?.provider || '—'}`;
   return `<section class="card orch-toolbar"><div class="row between wrap gap12">
-    <div class="row gap10 wrap"><div class="seg" role="group" aria-label="View">${ORCH_MODES.map(([id, t]) => `<button class="${o.mode === id ? 'on' : ''}" data-act="orch-mode" data-id="${id}" aria-pressed="${o.mode === id}">${t}</button>`).join('')}</div>
+    <div class="row gap10 wrap">${orchWorkspaceSwitch()}<div class="seg" role="group" aria-label="View">${ORCH_MODES.map(([id, t]) => `<button class="${o.mode === id ? 'on' : ''}" data-act="orch-mode" data-id="${id}" aria-pressed="${o.mode === id}">${t}</button>`).join('')}</div>
       <span class="small muted">System ${orchStatusChip(sys.status)} · ${esc(gw)}</span></div>
     <div class="row gap10 wrap"><div class="seg" role="group" aria-label="Range">${ORCH_RANGES.map(([id, t]) => `<button class="${o.range === id ? 'on' : ''}" data-act="orch-range" data-id="${id}" aria-pressed="${o.range === id}">${t}</button>`).join('')}</div>
       ${BOOT.user?.is_admin ? `<label class="check"><input type="checkbox" data-act="orch-all" ${o.all ? 'checked' : ''}>All accounts</label>` : ''}
@@ -361,9 +374,10 @@ function orchNodeOverview(g, n, d) {
       <div class="small mb12"><b>Actually answered (telemetry):</b> ${d.observed_models?.length ? d.observed_models.map(m => `<span class="mono">${esc(m)}</span>`).join(', ') : '<span class="muted">nothing recorded in this range</span>'}</div>` : ''}
     ${recs.length ? `<div class="caps-sm mb8">AI Optimization recommendations</div>${recs.map(r => `<div class="box soft mb8"><div class="small b">${esc(r.title || r.finding || 'Recommendation')}</div><div class="xs muted">${esc([r.priority, r.category].filter(Boolean).join(' · '))}</div>${r.recommended_change ? `<div class="small mt4">${esc(r.recommended_change)}</div>` : ''}</div>`).join('')}<div class="xs muted mb12">Recommendations only: nothing is changed automatically.</div>` : ''}
     <div class="row gap8 wrap">${n.monitoring_tab ? btn('View detailed monitoring', 'orch-monitoring', { tab: n.monitoring_tab, stage: n.llm_stages?.[0] || '' }, 'sm') : ''}
+      ${n.workers_tab ? btn('Running workers', 'wk-open', { tab: n.workers_tab }, 'sm') : ''}
       ${n.screen ? btn(`Open ${n.screen}`, 'orch-screen', { screen: n.screen }, 'sm') : ''}
-      ${n.types.includes('AI') ? btn('Edit model assignment', 'orch-settings-ai', {}, 'sm soft') : ''}</div>
-    ${n.types.includes('AI') ? '<div class="xs muted mt8">Model changes go through Settings → AI Models: draft, preview, apply, version.</div>' : ''}`;
+      ${n.types.includes('AI') ? btn('Change model', 'orch-settings-ai', { worker: n.workers?.[0] || '' }, 'sm soft') : ''}</div>
+    ${n.types.includes('AI') ? '<div class="xs muted mt8">Model changes go through Models &amp; routing: draft, preview, apply, version.</div>' : ''}`;
 }
 function orchNodePerformance(g, n, d) {
   const l = d.llm, t = d.tasks, x = d.external;
@@ -586,7 +600,15 @@ const ORCHESTRATION_ACTIONS = {
   'orch-trace-close': (el, e) => { if (e && el.classList?.contains('overlay') && e.target !== el) return; orchState().traceOpen = false; render(); },
   'orch-open-job': el => openJob(el.dataset.id),
   'orch-screen': el => go(el.dataset.screen),
-  'orch-settings-ai': () => go('settings', { settingsSection: 'ai' }),
+  // Opens Models & routing, on the worker's own editor when the node has one.
+  'orch-settings-ai': el => {
+    const worker = el?.dataset?.worker || '';
+    Object.assign(orchState(), { workspace: 'models', node: null, edge: null });
+    Object.assign(AIM, worker ? { tab: 'workers', drawer: worker } : { tab: 'advanced', drawer: null });
+    delete S.forms.aiw;
+    go('orchestration');
+  },
+  'orch-workspace': el => { orchState().workspace = el.dataset.id; go('orchestration'); },
   'orch-monitoring': el => {
     const m = monState();
     Object.assign(m, { tab: el.dataset.tab || 'overview', stage: el.dataset.stage || '', page: 1, all: orchState().all });

@@ -25,13 +25,13 @@ beforeEach(() => {
   if (!ui) {
     const context = createContext({ document, window, location, history, navigator, URLSearchParams, FormData, File, Intl,
       setTimeout, clearTimeout, setInterval, clearInterval, console, fetch: vi.fn() });
-    for (const file of ['monitoring.js', 'orchestration.js', 'settings.js', 'resume_data.js', 'job_data.js', 'knowledge.js', 'inbox.js', 'guide.js']) {
+    for (const file of ['monitoring.js', 'orchestration.js', 'workers.js', 'settings.js', 'resume_data.js', 'job_data.js', 'knowledge.js', 'inbox.js', 'guide.js']) {
       runInContext(readFileSync(`app/static/${file}`, 'utf8'), context, { filename: resolve(`app/static/${file}`) });
     }
     runInContext(appSource, context, { filename: resolve('app/static/app.js') });
     ui = runInContext('({ S, D, render, renderTaskStack })', context);
   }
-  ui.S.screen = 'discovery'; ui.S.discMode = 'ranking'; ui.S.jobOpen = null; ui.S.busy = {};
+  ui.S.screen = 'workers'; ui.S.wk = { tab: 'ranking', range: '7d' }; ui.D.wk = { workers: [{ kind: 'parsing', label: 'JD parsing', counts: { running: 0, queued: 0, retrying: 0, active: 0 } }, { kind: 'recovery', label: 'JD recovery', counts: { running: 0, queued: 0, retrying: 0, active: 0 } }, { kind: 'ranking', label: 'Ranking', description: 'Scores each job', counts: { running: 1, queued: 2, retrying: 0, active: 3 }, scheduler: { enabled: true, interval_minutes: 2 } }, { kind: 'tailoring', label: 'Tailoring', counts: { running: 0, queued: 0, retrying: 0, active: 0 } }], cooldowns: [], active: 3, running: 1 }; ui.S.jobOpen = null; ui.S.busy = {};
   ui.D.ranking = ranking();
 });
 
