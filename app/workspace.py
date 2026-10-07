@@ -16,7 +16,7 @@ from typing import Literal
 
 import httpx
 from bs4 import BeautifulSoup
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import and_, desc, func, or_, select, update
@@ -1010,6 +1010,103 @@ def job_from_url(payload: JobUrlIn, db: Session = Depends(get_user_db)):
     job, created = upsert_job(db, source="manual", source_ref=ref, title=data["title"], company=data["company"],
                               location=data["location"], url=payload.url, description=data["description"])
     return {"created": created, "job": job_card(job)}
+
+
+class JobTextIn(BaseModel):
+    title: str = Field(min_length=1, max_length=300)
+    company: str = Field(min_length=1, max_length=300)
+    location: str = Field(default="", max_length=300)
+    url: str = Field(default="", max_length=1200)
+    description: str = Field(max_length=MAX_DESCRIPTION_CHARS)
+
+
+@router.post("/api/jobs/from-text")
+def job_from_text(payload: JobTextIn, db: Session = Depends(get_user_db)):
+    """Add a job from a description the person pasted or uploaded. The text is theirs (description_source USER), so
+    recovery never replaces it. With a URL it shares the link path's identity, so adding both ways is one job."""
+    from app.services import jd_recovery
+
+    title, company, url = payload.title.strip(), payload.company.strip(), payload.url.strip()
+    text = payload.description.strip()
+    if not (title and company):
+        raise HTTPException(422, "Enter the job title and company")
+    floor = get_settings().ranking_min_description_chars
+    if len(text) < floor:
+        raise HTTPException(422, f"That is too short to rank against — paste the full description (at least {floor} "
+                                 "characters)")
+    if url and not re.match(r"^https?://\S+$", url, re.I):
+        raise HTTPException(422, "The posting link must start with http:// or https://")
+    key = url or f"text:{company.casefold()}|{title.casefold()}|{payload.location.strip().casefold()}"
+    ref = hashlib.sha256(key.encode()).hexdigest()[:40]
+    job, created = upsert_job(db, source="manual", source_ref=ref, title=title, company=company,
+                              location=payload.location.strip(), url=url, description=text)
+    if created or job.description == text:
+        jd_recovery.on_description_changed(db, job, by_user=True)
+        db.commit()
+    return {"created": created, "job": job_card(job)}
+
+
+MAX_JD_FILE_BYTES = 10 * 1024 * 1024
+JD_FILE_TYPES = {".pdf": "application/pdf", ".txt": "text/plain",
+                 ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"}
+_JD_LABELS = {
+    "title": re.compile(r"^\s*(?:job\s+title|position|role|title)\s*[:\-–]\s*(.{2,150})$", re.I),
+    "company": re.compile(r"^\s*(?:company(?:\s+name)?|employer|organi[sz]ation)\s*[:\-–]\s*(.{2,150})$", re.I),
+    "location": re.compile(r"^\s*(?:job\s+)?location\s*[:\-–]\s*(.{2,150})$", re.I),
+}
+
+
+def read_job_file(filename: str, content_type: str, data: bytes) -> str:
+    """The text of an uploaded job description (PDF, DOCX or TXT). Raises HTTPException for an unusable file."""
+    from io import BytesIO
+
+    from app.services.structured_resume import clean_raw_text
+
+    suffix = Path(filename or "").suffix.lower()
+    kind = JD_FILE_TYPES.get(suffix) or (content_type if content_type in JD_FILE_TYPES.values() else "")
+    if not kind:
+        raise HTTPException(415, "Upload the job description as a PDF, DOCX or TXT file")
+    if not data:
+        raise HTTPException(400, "The file is empty")
+    try:
+        if kind == "application/pdf":
+            from pypdf import PdfReader
+            text = "\n".join(page.extract_text() or "" for page in PdfReader(BytesIO(data)).pages)
+        elif kind == "text/plain":
+            text = data.decode("utf-8", errors="replace")
+        else:
+            from docx import Document
+            text = "\n".join(p.text for p in Document(BytesIO(data)).paragraphs)
+    except Exception as exc:
+        raise HTTPException(422, f"Could not read the file ({exc.__class__.__name__})") from exc
+    text = clean_raw_text(text)
+    if not text:
+        raise HTTPException(422, "No readable text was found in the file — a scanned PDF has none, so paste the "
+                                 "description instead")
+    return text[:MAX_DESCRIPTION_CHARS]
+
+
+def guess_job_fields(text: str) -> dict:
+    """Title, company and location only where the text labels them ("Job title: …"); never inferred otherwise. The
+    result is a draft the person checks before anything is saved."""
+    found = {"title": "", "company": "", "location": ""}
+    for line in text.splitlines()[:60]:
+        for key, pattern in _JD_LABELS.items():
+            match = pattern.match(line)
+            if match and not found[key]:
+                found[key] = match.group(1).strip()
+    return found
+
+
+@router.post("/api/jobs/read-file")
+async def job_read_file(file: UploadFile = File(...)):
+    """Read an uploaded job description into a draft. Nothing is saved: the person checks the title, company and
+    text, then adds it with /api/jobs/from-text. The file itself is not kept."""
+    data = await file.read(MAX_JD_FILE_BYTES + 1)
+    if len(data) > MAX_JD_FILE_BYTES:
+        raise HTTPException(413, f"The file is larger than {MAX_JD_FILE_BYTES // (1024 * 1024)} MB")
+    text = read_job_file(file.filename or "", file.content_type or "", data)
+    return {**guess_job_fields(text), "description": text}
 
 
 @router.post("/api/jobs/{job_id}/description/fetch")

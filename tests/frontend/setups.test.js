@@ -184,3 +184,43 @@ describe('actor picker', () => {
     expect([body.yc_batches, body.hn_month, body.min_salary, body.startup_details]).toEqual([['W24'], '2026-08', 150000, true]);
   });
 });
+
+describe('add one manually', () => {
+  const click = el => el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  const mode = id => click(buttonFor('manual-mode').find(b => b.dataset.id === id));
+  const flush = () => new Promise(r => setTimeout(r, 0));
+
+  it('offers a link, a file or pasted text', () => {
+    expect(buttonFor('manual-mode').map(b => b.textContent)).toEqual(['Link', 'PDF file', 'Paste text']);
+    expect(document.getElementById('manual-url')).not.toBeNull();
+    mode('text');
+    expect(document.getElementById('manual-description')).not.toBeNull();
+    expect(buttonFor('add-manual-text')).toHaveLength(1);
+  });
+
+  it('adds pasted text through the text endpoint', async () => {
+    mode('text');
+    for (const [k, v] of [['title', 'Lead Engineer'], ['company', 'Acme'], ['description', 'We are hiring']]) ui.setF('manual', k, v);
+    fetchMock.mockImplementation(async () => response({ created: true, job: { id: 7 } }));
+    click(buttonFor('add-manual-text')[0]);
+    await flush();
+    const [url, opt] = fetchMock.mock.calls[0];
+    expect(url).toBe('/api/jobs/from-text');
+    expect(JSON.parse(opt.body)).toMatchObject({ title: 'Lead Engineer', company: 'Acme', description: 'We are hiring', url: '' });
+  });
+
+  it('reads an uploaded file into a draft the person checks before adding', async () => {
+    mode('file');
+    expect(buttonFor('add-manual-text')).toHaveLength(0);
+    fetchMock.mockImplementation(async () => response({ title: 'Staff Engineer', company: '', location: '', description: 'Build things' }));
+    const input = document.getElementById('manual-jd-file');
+    Object.defineProperty(input, 'files', { value: [new File(['%PDF'], 'jd.pdf', { type: 'application/pdf' })] });
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    await flush(); await flush();
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/jobs/read-file');
+    expect(document.getElementById('manual-title').value).toBe('Staff Engineer');
+    expect(document.getElementById('manual-description').value).toBe('Build things');
+    expect(buttonFor('add-manual-text')).toHaveLength(1);
+  });
+});
+

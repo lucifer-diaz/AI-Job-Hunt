@@ -924,15 +924,39 @@ function renderSetup() {
           ${run.results.slice(0, 6).map(r => `<div class="row gap9" style="padding:9px 12px;border-bottom:1px solid #f8f9fd;cursor:pointer" data-act="open-job" data-id="${r.id}"><span class="mono bb small ${fitCls(r.fit)}" style="width:22px">${fitTxt(r.fit)}</span><div class="grow"><div class="small b ellipsis">${esc(r.title)}</div><div class="tiny muted ellipsis">${esc(r.company)} · ${esc(r.board)}</div></div>${pill(r.verdict, r.verdict === 'new' ? 'good' : 'warn')}</div>`).join('') || '<div class="small muted" style="padding:12px">No new jobs were imported by this run.</div>'}
           <button class="linkbtn" data-act="go" data-screen="discovery" data-mode="table">See every job in the table →</button></div></div>` : ''}
     </section>
-    <section class="card pad16"><div class="card-title sm mb4">Add one manually</div><div class="small muted mb12">Paste any job URL — we'll pull the title, company and description.</div>
-      ${inputF('manual', 'url', '', 'placeholder="https://…"')}
-      ${S.manualMissing ? `<div class="col gap8 mt8"><div class="xs" style="color:var(--warn)">${esc(S.manualMissing)}</div>${inputF('manual', 'title', '', 'placeholder="Job title"')}${inputF('manual', 'company', '', 'placeholder="Company"')}${inputF('manual', 'location', '', 'placeholder="Location (optional)"')}${textareaF('manual', 'description', '', 'placeholder="Paste the description"')}</div>` : ''}
-      ${btn(label('manual', 'Add to pipeline', 'Reading posting…'), 'add-manual', {}, 'block mt8', isBusy('manual'))}</section>
+    ${renderManualAdd()}
     <section class="card pad16"><div class="card-title sm mb4">Import a company board</div><div class="small muted mb12">Pull every open role from a company's Greenhouse or Lever board. No Apify token needed.</div>
       <div class="row gap8">${selectF('board', 'kind', 'greenhouse', [['greenhouse', 'Greenhouse'], ['lever', 'Lever']], 'style="width:auto"')}${inputF('board', 'token', '', 'placeholder="Board token, e.g. stripe"')}</div>
       <div class="helper">The token is the company slug in boards.greenhouse.io/<b>stripe</b> or jobs.lever.co/<b>stripe</b>.</div>
       ${btn(label('board', 'Import board', 'Importing…'), 'import-board', {}, 'block mt8', isBusy('board'))}</section>
   </div></div>`;
+}
+
+// Discovery → Search setup: add one job by its link, an uploaded description (PDF, DOCX, TXT) or pasted text. A file
+// is only read into a draft (/api/jobs/read-file); the person checks the fields, then the text path adds it.
+const MANUAL_MODES = [['link', 'Link'], ['file', 'PDF file'], ['text', 'Paste text']];
+function renderManualAdd() {
+  const mode = S.manualMode || 'link';
+  const seg = `<div class="seg mb12" role="group" aria-label="Add a job by">${MANUAL_MODES.map(([id, t]) => `<button type="button" class="${mode === id ? 'on' : ''}" data-act="manual-mode" data-id="${id}" aria-pressed="${mode === id}">${t}</button>`).join('')}</div>`;
+  const fields = (urlLabel) => `<div class="col gap8">${inputF('manual', 'title', '', 'placeholder="Job title" aria-label="Job title"')}${inputF('manual', 'company', '', 'placeholder="Company" aria-label="Company"')}${inputF('manual', 'location', '', 'placeholder="Location (optional)" aria-label="Location"')}${urlLabel ? inputF('manual', 'url', '', `placeholder="${urlLabel}" aria-label="Posting link"`) : ''}</div>`;
+  const sub = { link: 'Paste any job URL — we\'ll pull the title, company and description.',
+    file: 'Upload the job description as a PDF (or DOCX / TXT). Check the details, then add it.',
+    text: 'Paste the job description and fill in the title and company.' }[mode];
+  let body;
+  if (mode === 'link') {
+    body = `${inputF('manual', 'url', '', 'placeholder="https://…" aria-label="Job URL"')}
+      ${S.manualMissing ? `<div class="col gap8 mt8"><div class="xs" style="color:var(--warn)">${esc(S.manualMissing)}</div>${inputF('manual', 'title', '', 'placeholder="Job title"')}${inputF('manual', 'company', '', 'placeholder="Company"')}${inputF('manual', 'location', '', 'placeholder="Location (optional)"')}${textareaF('manual', 'description', '', 'placeholder="Paste the description"')}</div>` : ''}
+      ${btn(label('manual', 'Add to pipeline', 'Reading posting…'), 'add-manual', {}, 'block mt8', isBusy('manual'))}`;
+  } else if (mode === 'file') {
+    const name = fv('manual', 'file_name', '');
+    body = `<label class="settings-upload" style="margin-top:0" for="manual-jd-file"><strong>${isBusy('manualFile') ? 'Reading file…' : name ? `＋ Replace ${esc(name)}` : '＋ Choose a job description'}</strong><span>PDF, DOCX or TXT · up to 10 MB</span><input type="file" id="manual-jd-file" accept=".pdf,.docx,.txt" aria-label="Upload job description" data-act-change="manual-file"${isBusy('manualFile') ? ' disabled' : ''}></label>
+      ${name ? `<div class="mt12">${fields('Posting link (optional)')}<div class="mt8">${textareaF('manual', 'description', '', 'rows="8" aria-label="Job description"')}</div><div class="helper">Text read from ${esc(name)} — edit anything it got wrong.</div></div>
+      ${btn(label('manual', 'Add to pipeline', 'Adding…'), 'add-manual-text', {}, 'block mt8', isBusy('manual'))}` : ''}`;
+  } else {
+    body = `${fields('Posting link (optional)')}<div class="mt8">${textareaF('manual', 'description', '', 'rows="8" placeholder="Paste the full job description" aria-label="Job description"')}</div>
+      ${btn(label('manual', 'Add to pipeline', 'Adding…'), 'add-manual-text', {}, 'block mt8', isBusy('manual'))}`;
+  }
+  return `<section class="card pad16"><div class="card-title sm mb4">Add one manually</div><div class="small muted mb12">${sub}</div>${seg}${body}</section>`;
 }
 
 /* ───────────── packet filters (Tailor, Approvals) ───────────── */
@@ -2138,6 +2162,25 @@ const A = {
       }
       throw e;
     }
+  }),
+  'manual-mode': el => { S.manualMode = el.dataset.id; S.manualMissing = null; render(); },
+  'manual-file': el => {
+    const file = el.files && el.files[0]; el.value = '';
+    if (!file) return;
+    return busy('manualFile', async () => {
+      const form = new FormData(); form.append('file', file);
+      const out = await api('/api/jobs/read-file', { method: 'POST', form });
+      const m = S.forms.manual || {};
+      for (const k of ['title', 'company', 'location']) if (out[k] && !m[k]) setF('manual', k, out[k]);
+      setF('manual', 'description', out.description); setF('manual', 'file_name', file.name);
+    }, () => 'File read — check the title and company, then add it');
+  },
+  'add-manual-text': () => busy('manual', async () => {
+    const m = S.forms.manual || {};
+    const out = await api('/api/jobs/from-text', { method: 'POST', body: { title: (m.title || '').trim(), company: (m.company || '').trim(), location: (m.location || '').trim(), url: (m.url || '').trim(), description: m.description || '' } });
+    delete S.forms.manual;
+    toast(out.created ? 'Added to your triage queue' : 'That job was already in the pipeline — details refreshed');
+    openJob(out.job.id);
   }),
   'import-board': () => busy('board', async () => {
     const kind = fv('board', 'kind', 'greenhouse'), token = (fv('board', 'token', '') || '').trim();
