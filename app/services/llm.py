@@ -812,7 +812,76 @@ class LLMClient:
                     "needs_review": True}
         if "MATCH_APPLICATION_EMAIL" in user.split("\n", 1)[0]:
             return {"matched_application_id": None, "confidence": 0.0, "reason": "Mock: no explicit match."}
+        if "SYNTHESIZE_COMPANY_INSIGHTS" in user.split("\n", 1)[0]:
+            return self._mock_company_insights(user)
+        if "PREPARE_INTERVIEW_INSIGHTS" in user.split("\n", 1)[0]:
+            return self._mock_interview_insights(user)
         return {"summary": "Mock answer."}
+
+    @staticmethod
+    def _mock_company_insights(user: str) -> dict[str, Any]:
+        """Organises the research it is given and cites it; adds nothing the observations do not say."""
+        raw = user.split("<untrusted_research>", 1)[-1].rsplit("</untrusted_research>", 1)[0].strip()
+        observations = json.loads(raw) if raw.startswith("[") else []
+        def of(category: str, *sources: str) -> list[dict[str, Any]]:
+            return [o for o in observations if o.get("category") == category
+                    and (not sources or o.get("source_type") in sources)]
+        described = [o for o in of("COMPANY", "OFFICIAL_COMPANY", "JOB_DESCRIPTION")
+                     if (o.get("data") or {}).get("field") in ("description", "posting_company_context", "mission")]
+        culture = of("CULTURE")
+        return {
+            "company_summary": (described[0]["data"].get("text") or "")[:600] if described else "",
+            "summary_source_ids": [described[0]["id"]] if described else [],
+            "profile_facts": [],
+            "official_values": [{"value": (o["data"].get("value") or "")[:120], "supporting_source_ids": [o["id"]]}
+                                for o in of("VALUES", "OFFICIAL_COMPANY") if o["data"].get("value")][:10],
+            "culture_themes": [{"theme": (o["data"].get("headline") or o["data"].get("pros") or "")[:120],
+                                "sentiment": "MIXED", "supporting_source_ids": [o["id"]]}
+                               for o in culture if o["data"].get("headline") or o["data"].get("pros")][:5],
+            "interview_stages": [{"name": "Interview", "order": i + 1, "origin": "REPORTED",
+                                  "supporting_source_ids": [o["id"]], "rationale": ""}
+                                 for i, o in enumerate(of("INTERVIEW_PROCESS")[:1])],
+            "reported_questions": [{"question": o["data"]["question"][:300], "category": "OTHER", "stage": "UNKNOWN",
+                                    "supporting_source_ids": [o["id"]]}
+                                   for o in of("INTERVIEW_QUESTION") if len(o["data"].get("question") or "") >= 8][:20],
+            "risks_and_unknowns": [] if of("INTERVIEW_QUESTION") else [
+                {"kind": "UNKNOWN", "text": "No interview reports were found for this company.",
+                 "supporting_source_ids": []}],
+            "research_confidence": 0.6 if observations else 0.1,
+        }
+
+    @staticmethod
+    def _mock_interview_insights(user: str) -> dict[str, Any]:
+        """Questions from the posting's own requirement ids; candidate questions only from evidence it was given."""
+        found = re.search(r"^JOB REQUIREMENTS:\n(.*)$", user, re.MULTILINE)
+        requirements = json.loads(found.group(1)) if found else {}
+        required = [r for r in requirements.get("required") or [] if r.get("id")][:3]
+        evidence = re.search(r"^VERIFIED EVIDENCE:\n(.*)$", user, re.MULTILINE)
+        evidence_ids = [e["id"] for e in json.loads(evidence.group(1))[:2]] if evidence else []
+        questions = [{"question": f"Walk us through how you have applied {r.get('normalized_value') or 'this skill'} "
+                                  "in production.", "origin": "ROLE_DERIVED", "category": "TECHNICAL",
+                      "stage": "TECHNICAL", "difficulty": "MEDIUM",
+                      "rationale": "The posting lists it as a requirement.", "requirement_ids": [r["id"]],
+                      "evidence_ids": [], "gap_requirement_ids": [], "preparation": ""} for r in required]
+        if evidence_ids:
+            questions.append({"question": "Tell me about the project you are proudest of and your part in it.",
+                              "origin": "CANDIDATE_SPECIFIC", "category": "BEHAVIORAL", "stage": "HIRING_MANAGER",
+                              "difficulty": "MEDIUM", "rationale": "Your strongest evidence will be probed.",
+                              "requirement_ids": [], "evidence_ids": evidence_ids, "gap_requirement_ids": [],
+                              "preparation": "Use the cited evidence only."})
+        return {"focus_areas": [{"area": (r.get("normalized_value") or "Requirement")[:80],
+                                 "why": "Stated as required in the posting.", "requirement_ids": [r["id"]]}
+                                for r in required],
+                "generated_questions": questions,
+                "questions_to_ask": [{"stage": "RECRUITER", "question": ("What is the approved base salary and "
+                                                                         "total-compensation band for this level?"),
+                                      "context": "Compensation"},
+                                     {"stage": "HIRING_MANAGER", "question": ("What would success look like in the "
+                                                                              "first six months in this role?"),
+                                      "context": "Role scope"}],
+                "value_prep": [],
+                "compensation_questions": [("Could you share the approved base salary and total-compensation band "
+                                            "for this level?")]}
 
     @staticmethod
     def _mock_tailoring(user: str) -> dict[str, Any]:

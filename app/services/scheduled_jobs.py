@@ -31,6 +31,7 @@ from app.models import (
     Job,
     JobDescriptionFetchTask,
     JobDescriptionParseTask,
+    JobInsightTask,
     JobRankingTask,
     SearchRun,
     User,
@@ -397,6 +398,43 @@ async def listing_check(ctx: JobContext) -> dict[str, Any]:
     return summary
 
 
+def _prepare_job_insights(ctx: JobContext) -> dict[str, Any]:
+    from app.services.job_insights import tasks as insight_tasks
+
+    with ctx.sessions() as db:
+        expired = insight_tasks.recover_expired(db, ctx.now)
+        queue = insight_tasks.sweep(db, now=ctx.now)
+    return {"queue": queue, "expired_leases": expired}
+
+
+def _claim_job_insights(ctx: JobContext, limit: int) -> list[Any]:
+    from app.services.job_insights import tasks as insight_tasks
+
+    with ctx.sessions() as db:
+        return insight_tasks.claim(db, worker_id=ctx.worker_id, limit=limit)
+
+
+async def job_insights(ctx: JobContext) -> dict[str, Any]:
+    """Research up to `job_insights_batch_size` approved jobs, `job_insights_max_concurrency` at a time (both live).
+
+    Each run reads the posting, the recruiter's notes, the company's site and the configured Apify actors side by
+    side, then the model organises what was found. A source failing never fails the run or another job."""
+    from app.services.job_insights import service as insight_service
+
+    if not get_settings().job_insights_enabled:
+        return skipped("Job insights are off (JOB_INSIGHTS_ENABLED=false)")
+    details = await threads.run_io(_prepare_job_insights, ctx)
+    claimed, outcomes = await run_live(
+        concurrency="job_insights_max_concurrency", batch="job_insights_batch_size",
+        claim=lambda n: _claim_job_insights(ctx, n),
+        process=lambda c: threads.run_work(insight_service.process, ctx.sessions, c),
+        heartbeat=renew(ctx.sessions, JobInsightTask, get_settings().job_insights_lease_seconds))
+    summary = {"claimed": claimed, **{name: outcomes.get(name, 0) for name in insight_service.OUTCOMES}, **details}
+    if not claimed and not details["queue"]["queued"] and not details["expired_leases"]:
+        return skipped("No approved jobs waiting for insights", **summary)
+    return summary
+
+
 # ───────────── enrichment, applications, follow-ups, inbox ─────────────
 
 def compensation(ctx: JobContext) -> dict[str, Any]:
@@ -596,6 +634,8 @@ JOBS: list[JobSpec] = [
             "Re-reads postings over HTTP and deletes the ones that no longer exist (applied jobs are kept)."),
     JobSpec("compensation", "Salary enrichment", "compensation_interval_minutes", compensation,
             "Records the salary stated in each posting."),
+    JobSpec("job_insights", "Job insights", "job_insights_interval_minutes", job_insights,
+            "Researches approved jobs: salary, company, values and interviews, each fact with its source."),
     JobSpec("auto_tailor", "Automatic tailoring", "auto_tailor_interval_minutes", auto_tailor_job,
             "Queues newly qualified jobs for tailoring in accounts that turned it on; the tailor worker runs them "
             "within each account's tailoring limit."),

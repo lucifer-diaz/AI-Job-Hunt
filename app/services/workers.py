@@ -3,6 +3,7 @@
     JD parsing   job_description_parse_tasks    scheduler job jd_parsing
     JD recovery  job_description_fetch_tasks    scheduler job jd_recovery
     Ranking      job_ranking_tasks              scheduler job ranking
+    Job insights job_insight_tasks              scheduler job job_insights
     Tailoring    tailor_tasks (tailor → review)  the in-process tailor worker
 
 Two controls, both acting on the signed-in account's own tasks only:
@@ -33,6 +34,7 @@ from app.models import (
     Job,
     JobDescriptionFetchTask,
     JobDescriptionParseTask,
+    JobInsightTask,
     JobRankingTask,
     TailorTask,
 )
@@ -103,6 +105,10 @@ KINDS: dict[str, WorkerKind] = {k.kind: k for k in (
     WorkerKind("ranking", "Ranking", "Scores each job's fit; code decides qualified or archived.", JobRankingTask,
                "ranking", "PENDING", "PROCESSING", ("COMPLETED", "FAILED", "SKIPPED"),
                lambda: get_settings().ranking_max_attempts, "ranker"),
+    WorkerKind("insights", "Job insights", "Researches approved jobs (posting, company site, Glassdoor and PayScale "
+               "when configured), then a model organises what was found.", JobInsightTask, "job_insights", "PENDING",
+               "PROCESSING", ("COMPLETED", "PARTIAL", "FAILED", "SKIPPED"),
+               lambda: get_settings().job_insights_max_attempts, "company_insights"),
     WorkerKind("tailoring", "Tailoring", "Tailors the resume and cover letter, then the reviewer checks the packet.",
                TailorTask, None, "queued", "running", ("succeeded", "failed", "cancelled"), _tailor_max, "tailor"),
 )}
@@ -170,7 +176,7 @@ def row(spec: WorkerKind, task: Any, job: tuple[str, str] | None, now: datetime,
 STATUS_FILTERS = {
     "active": ("RUNNING", "QUEUED", "RETRYING"), "running": ("RUNNING",), "queued": ("QUEUED",),
     "retrying": ("RETRYING",), "failed": ("FAILED", "BLOCKED", "STOPPED"),
-    "done": ("COMPLETED", "SUCCEEDED", "SKIPPED", "CANCELLED"),
+    "done": ("COMPLETED", "PARTIAL", "SUCCEEDED", "SKIPPED", "CANCELLED"),
 }
 SCAN_LIMIT = 2000  # rows read before filtering, so a match past the first page is still found
 
@@ -495,6 +501,11 @@ def _requeue_finished(db: Session, spec: WorkerKind, task: Any, user_id: int) ->
 
         if jd_recovery.enqueue(db, job, reason="user_request", force=True) is None:
             raise WorkerError("This job has no posting URL to recover from")
+        db.commit()
+    elif spec.kind == "insights":
+        from app.services.job_insights import tasks as insight_tasks
+
+        insight_tasks.enqueue(db, job, reason=insight_tasks.USER_REQUEST, force=True)
         db.commit()
     else:
         from app.services import tailor_tasks

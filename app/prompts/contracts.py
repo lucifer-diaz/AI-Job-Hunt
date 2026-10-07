@@ -544,6 +544,149 @@ class JobDescriptionRecoveryResult(Contract):
         return self
 
 
+# ───────────── Job Insights: company research synthesis and interview preparation ─────────────
+# The model never browses: it reads observations Job Hunt OS already fetched, each with an integer id, and every
+# factual item it returns cites those ids (app.services.job_insights.synthesis rejects any id it was not shown).
+# Salaries are never part of a model's output: compensation is computed in code (app.services.compensation).
+
+SourceIds = Annotated[list[int], BeforeValidator(_ids), Field(default_factory=list, max_length=12)]
+RequirementIds = Annotated[list[str], BeforeValidator(lambda v: [_text_id(i) for i in v] if isinstance(v, list) else v),
+                           Field(default_factory=list, max_length=12)]
+INSIGHT_ORIGINS = ("REPORTED", "INFERRED")
+QUESTION_ORIGINS = ("ROLE_DERIVED", "CANDIDATE_SPECIFIC")
+QUESTION_CATEGORIES = ("TECHNICAL", "SYSTEM_DESIGN", "CODING", "ARCHITECTURE", "AI_LLM", "LEADERSHIP", "BEHAVIORAL",
+                       "PRODUCT_STAKEHOLDER", "DOMAIN", "HIRING_MANAGER", "COMPENSATION", "MOTIVATION", "OTHER")
+INTERVIEW_STAGES = ("RECRUITER_SCREEN", "HIRING_MANAGER", "TECHNICAL", "CODING", "SYSTEM_DESIGN", "BEHAVIORAL",
+                    "FINAL", "HR_OFFER", "UNKNOWN")
+ASK_STAGES = ("RECRUITER", "HIRING_MANAGER", "TECHNICAL_INTERVIEWER", "ENGINEERING_LEADER", "FINAL_HR")
+PROFILE_FIELDS = ("industry", "products_services", "company_size", "headquarters", "ownership", "founded",
+                  "remote_policy", "growth_signal")
+
+
+def _choice(options: tuple[str, ...], fallback: str) -> Any:
+    def pick(value: Any) -> Any:
+        value = _upper(value)
+        if isinstance(value, str):
+            value = value.replace("/", "_")
+            return value if value in options else fallback
+        return value
+    return BeforeValidator(pick)
+
+
+class SourcedValue(Contract):
+    value: str = Field(min_length=1, max_length=120, description="the value as the company's own page names it")
+    supporting_source_ids: SourceIds = Field(description="ids of the OFFICIAL_COMPANY VALUES observations stating it")
+
+
+class CultureTheme(Contract):
+    theme: str = Field(min_length=1, max_length=120, description="a short theme employees report, e.g. 'fast pace'")
+    sentiment: Annotated[Literal["POSITIVE", "MIXED", "NEGATIVE"], _choice(("POSITIVE", "MIXED", "NEGATIVE"),
+                                                                           "MIXED")] = "MIXED"
+    supporting_source_ids: SourceIds = Field(description="ids of the employee-review observations behind it")
+
+
+class ProfileFact(Contract):
+    field: Annotated[str, _choice(PROFILE_FIELDS, "")] = Field(description=f"one of {', '.join(PROFILE_FIELDS)}")
+    value: str = Field(min_length=1, max_length=300)
+    supporting_source_ids: SourceIds = Field(description="ids of the observations that state it")
+
+
+class InterviewStage(Contract):
+    name: str = Field(min_length=1, max_length=80, description="e.g. 'Recruiter screen', 'System design'")
+    order: int = Field(ge=1, le=12)
+    origin: Annotated[Literal["REPORTED", "INFERRED"], _choice(INSIGHT_ORIGINS, "INFERRED")] = Field(
+        description="REPORTED: a source describes this stage (cite it); INFERRED: you expect it from the role")
+    supporting_source_ids: SourceIds = Field(description="required for REPORTED; empty for INFERRED")
+    rationale: Annotated[str, BeforeValidator(_phrase)] = Field(
+        default="", max_length=300, description="for INFERRED: why the role makes this stage likely")
+
+
+class ReportedQuestion(Contract):
+    question: str = Field(min_length=8, max_length=300,
+                          description="the question as a source reports it (shorten, never invent wording)")
+    category: Annotated[str, _choice(QUESTION_CATEGORIES, "OTHER")] = "OTHER"
+    stage: Annotated[str, _choice(INTERVIEW_STAGES, "UNKNOWN")] = "UNKNOWN"
+    supporting_source_ids: SourceIds = Field(description="ids of the INTERVIEW_QUESTION observations reporting it "
+                                                         "(several when duplicates were merged)")
+
+
+class RiskOrUnknown(Contract):
+    kind: Annotated[Literal["RISK", "UNKNOWN"], _choice(("RISK", "UNKNOWN"), "UNKNOWN")]
+    text: str = Field(min_length=1, max_length=300)
+    supporting_source_ids: SourceIds = Field(description="ids behind a RISK; empty for an UNKNOWN")
+
+
+class CompanyInsightSynthesis(Contract):
+    """What the research observations say about the company and its interviews. Facts cite observation ids;
+    official values and employee-reported culture are separate lists and never mix."""
+
+    worker: ClassVar[str] = "COMPANY_INSIGHTS"
+
+    company_summary: Annotated[str, BeforeValidator(_phrase)] = Field(
+        default="", max_length=700, description="two or three sentences from the observations; empty if none say")
+    summary_source_ids: SourceIds = Field(description="ids behind company_summary")
+    profile_facts: list[ProfileFact] = Field(default_factory=list, max_length=12)
+    official_values: list[SourcedValue] = Field(default_factory=list, max_length=15,
+                                                description="only from OFFICIAL_COMPANY VALUES observations")
+    culture_themes: list[CultureTheme] = Field(default_factory=list, max_length=10,
+                                               description="only from employee-review observations (CULTURE, "
+                                                           "SENTIMENT); never from the company's own pages")
+    interview_stages: list[InterviewStage] = Field(default_factory=list, max_length=10)
+    reported_questions: list[ReportedQuestion] = Field(default_factory=list, max_length=40)
+    risks_and_unknowns: list[RiskOrUnknown] = Field(default_factory=list, max_length=10)
+    research_confidence: Confidence = Field(description="how complete and consistent the observations are")
+
+
+class FocusArea(Contract):
+    area: str = Field(min_length=1, max_length=80)
+    why: str = Field(min_length=1, max_length=300, description="what in the posting or research makes it likely")
+    requirement_ids: RequirementIds
+
+
+class GeneratedQuestion(Contract):
+    question: str = Field(min_length=8, max_length=300)
+    origin: Annotated[Literal["ROLE_DERIVED", "CANDIDATE_SPECIFIC"], _choice(QUESTION_ORIGINS, "ROLE_DERIVED")] = Field(
+        default="ROLE_DERIVED", description="ROLE_DERIVED: from the posting's requirements; CANDIDATE_SPECIFIC: probes this candidate's "
+                    "matches or gaps")
+    category: Annotated[str, _choice(QUESTION_CATEGORIES, "OTHER")] = "OTHER"
+    stage: Annotated[str, _choice(INTERVIEW_STAGES, "UNKNOWN")] = "UNKNOWN"
+    difficulty: Annotated[Literal["EASY", "MEDIUM", "HARD"], _choice(("EASY", "MEDIUM", "HARD"), "MEDIUM")] = "MEDIUM"
+    rationale: str = Field(min_length=1, max_length=300, description="why it is likely; never a source attribution")
+    requirement_ids: RequirementIds = Field(description="JOB REQUIREMENTS ids it tests")
+    evidence_ids: EvidenceIds = Field(description="VERIFIED EVIDENCE ids the candidate could draw on")
+    gap_requirement_ids: RequirementIds = Field(description="requirement ids the FIT ANALYSIS marks missing or "
+                                                            "partial that this question would probe")
+    preparation: Annotated[str, BeforeValidator(_phrase)] = Field(
+        default="", max_length=400, description="how to prepare using only the supplied evidence; for a gap, how to "
+                                                "connect adjacent experience without claiming the missing one")
+
+
+class QuestionToAsk(Contract):
+    stage: Annotated[str, _choice(ASK_STAGES, "HIRING_MANAGER")] = Field(description=f"one of {', '.join(ASK_STAGES)}")
+    question: str = Field(min_length=8, max_length=300)
+    context: Annotated[str, BeforeValidator(_phrase)] = Field(
+        default="", max_length=200, description="the posting or research detail it builds on")
+
+
+class ValuePrep(Contract):
+    value_source_id: int = Field(description="the id of an OFFICIAL VALUES observation")
+    question: str = Field(min_length=8, max_length=300, description="a behavioral question this value suggests")
+    evidence_ids: EvidenceIds = Field(description="VERIFIED EVIDENCE ids that show this value")
+
+
+class InterviewPrepResult(Contract):
+    """Interview preparation for one candidate and one job. Everything here is generated preparation; none of it is
+    presented as something the company asked or said."""
+
+    worker: ClassVar[str] = "INTERVIEW_INSIGHTS"
+
+    focus_areas: list[FocusArea] = Field(default_factory=list, max_length=10)
+    generated_questions: list[GeneratedQuestion] = Field(default_factory=list, max_length=30)
+    questions_to_ask: list[QuestionToAsk] = Field(default_factory=list, max_length=25)
+    value_prep: list[ValuePrep] = Field(default_factory=list, max_length=10)
+    compensation_questions: Phrases = Field(description="questions to ask the recruiter about pay; never figures")
+
+
 # ───────────── AI Optimization Advisor ─────────────
 
 class Recommendation(BaseModel):
@@ -593,7 +736,8 @@ class OptimizationReport(Contract):
 CONTRACTS: tuple[type[Contract], ...] = (
     RankingResult, TailoringResult, ReviewResult, CoverLetterResult, FollowUpResult, ApplicationAnswerResult,
     InboxClassificationResult, ApplicationEmailAnalysis, ApplicationEmailMatchResult, ResumeParserOutput,
-    EvidenceExtractionResult, JobDescriptionParserOutput, JobDescriptionRecoveryResult, OptimizationReport)
+    EvidenceExtractionResult, JobDescriptionParserOutput, JobDescriptionRecoveryResult, OptimizationReport,
+    CompanyInsightSynthesis, InterviewPrepResult)
 # Field names older prompts (or a confused model) use for another worker's output, beyond the contracts' own fields.
 LEGACY_FIELDS = {
     "RANKER": {"score", "fit_score", "gaps", "must_have_missing", "keywords", "application_strategy", "matches"},

@@ -62,10 +62,14 @@ WORKERS: dict[str, Worker] = {w.worker_type: w for w in (
            4096, "AUTO_ROUTER", FAST, description="Classifies recruiter and application email"),
     Worker("FOLLOWUP", "Follow-Up", ("followup",), False, 4096, "AUTO_ROUTER", FAST, "followup",
            description="Drafts follow-up messages"),
-    Worker("COMPANY_INSIGHTS", "Company Insights", ("company_insights",), False, 8192, "AUTO_ROUTER",
-           PRIMARY_REASONING, description="Summarises company research"),
-    Worker("INTERVIEW_INSIGHTS", "Interview Insights", ("interview_insights",), False, 8192, "AUTO_ROUTER",
-           PRIMARY_REASONING, description="Prepares interview notes"),
+    # Job Insights (app.services.job_insights): synthesis and classification over research already fetched, so a
+    # balanced model is enough; neither worker browses, and neither ever produces a salary.
+    Worker("COMPANY_INSIGHTS", "Company Insights", ("company_insights",), True, 16384, "TIER", PRIMARY_REASONING,
+           description="Organises fetched company research: official values, employee-reported themes, reported "
+                       "interview stages and questions, each citing its sources"),
+    Worker("INTERVIEW_INSIGHTS", "Interview Insights", ("interview_insights",), True, 16384, "TIER",
+           PRIMARY_REASONING, description="Writes interview preparation from the posting, the fit analysis and "
+                                          "verified evidence (labelled as generated)"),
     Worker("AI_OPTIMIZATION", "AI Optimization", ("ai_optimization",), True, 16384, "TIER", DEEP_REVIEW,
            description="The AI Optimization Advisor's analysis (advice only)"),
     Worker("JOB_NORMALIZATION", "Job Normalization", (), True, 4096, "AUTO_ROUTER", FAST,
@@ -79,6 +83,7 @@ MONITORING_STAGE = {"RESUME_PARSER": "RESUME_PARSER", "EVIDENCE_EXTRACTION": "RE
                     "JD_PARSER": "JD_PARSER", "JD_RECOVERY": "JD_RECOVERY",
                     "TAILOR": "TAILOR", "REVIEWER": "REVIEWER", "APPLICATION_ANSWER": "APPLICATION",
                     "FOLLOWUP": "FOLLOW_UP", "INBOX_CLASSIFIER": "INBOX", "COMPANY_INSIGHTS": "COMPANY_INSIGHTS",
+                    "INTERVIEW_INSIGHTS": "COMPANY_INSIGHTS",
                     "AI_OPTIMIZATION": "ADVISOR"}
 
 # Quality-escalation conditions a worker policy may use (app.services.model_resolution.escalation_reason).
