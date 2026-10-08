@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class ProfileIn(BaseModel):
@@ -77,6 +77,8 @@ class TailorTasksIn(BaseModel):
     ids: list[int] = Field(min_length=1, max_length=500)
     mode: Literal["tailor", "skip"] = "tailor"  # skip = send the master resume unchanged
     regenerate: bool = False  # also redo jobs that already have a packet
+    # The page target for these jobs (1, 2 or 3; app.services.resume_length). None = the default in Settings.
+    pages: Literal[1, 2, 3] | None = None
 
 
 class TailorTasksCancelIn(BaseModel):
@@ -87,6 +89,23 @@ class RecruiterIn(BaseModel):
     recruiter_name: str = ""
     recruiter_email: str = ""
     notes: str = ""
+
+
+class TailoringLengthIn(BaseModel):
+    """The default length of tailored resumes (app.services.resume_length). Omitted values keep what is saved."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    pages: Literal[1, 2, 3] | None = None
+    # Bullets per role, most recent role first, for a page target ("1", "2", "3"); [] restores the preset.
+    budgets: dict[Literal["1", "2", "3"], list[Annotated[int, Field(ge=0, le=8)]]] | None = None
+
+    @field_validator("budgets")
+    @classmethod
+    def _positions(cls, value):
+        if value and any(len(budget) > 12 for budget in value.values()):
+            raise ValueError("At most 12 roles can have their own bullet budget")
+        return value
 
 
 class SettingsIn(BaseModel):
@@ -115,6 +134,7 @@ class SettingsIn(BaseModel):
     # saved; a minimum fit score of 0 means every qualified job.
     auto_tailor: bool | None = None
     auto_tailor_min_fit_score: int | None = Field(default=None, ge=0, le=100)
+    tailoring_length: TailoringLengthIn | None = None
 
 
 class ProfilePatch(ProfileIn):

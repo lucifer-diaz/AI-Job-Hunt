@@ -116,6 +116,7 @@ from app.services.user_settings import (
     processing_maximums,
     set_user_keys,
     settings_for,
+    tailoring_length_for,
 )
 from app.services.workflow import (
     SKIP_TAILORING_STATUSES,
@@ -321,6 +322,8 @@ def settings_get(db: Session = Depends(get_user_db)):
             "rate_limits": backoff.policy_for(db, value.user_id).public(),
             # Whether ranking queues qualified jobs for tailoring by itself (app.services.auto_tailor).
             "auto_tailor": auto_tailor_for(db),
+            # The default length of tailored resumes (app.services.resume_length): pages, budgets and presets.
+            "tailoring_length": tailoring_length_for(db),
             "ranking_interval_server_minutes": server_settings.value("ranking_interval_minutes"),
             "configured": {**configured, "mock": True, "litellm": bool(gateway_settings(db, value.user_id)[0])},
             "keys": keys,
@@ -383,8 +386,17 @@ def settings_put(payload: SettingsIn, db: Session = Depends(get_user_db)):
         auto_tailor["enabled_at"] = datetime.now(UTC).replace(tzinfo=None).isoformat()
     elif not auto_tailor.get("enabled"):
         auto_tailor.pop("enabled_at", None)
+    # The default length of tailored resumes: a page target and edited budgets ([] restores a preset).
+    tailoring = {**((value.preferences or {}).get("tailoring") or {})}
+    if payload.tailoring_length is not None:
+        if payload.tailoring_length.pages is not None:
+            tailoring["pages"] = payload.tailoring_length.pages
+        for pages, budget in (payload.tailoring_length.budgets or {}).items():
+            tailoring["budgets"] = {**(tailoring.get("budgets") or {}), pages: budget}
+            if not budget:
+                tailoring["budgets"].pop(pages)
     value.preferences = {**(value.preferences or {}), "ai": ai, "execution_mode": execution_mode,
-                         "processing": limits, "auto_tailor": auto_tailor,
+                         "processing": limits, "auto_tailor": auto_tailor, "tailoring": tailoring,
                          "rate_limits": {k: v for k, v in rate_limits.public().items() if k != "ladder"}}
     effective = resolve_ai_config(settings, ai)
     value.llm_provider, value.model = effective["llm_provider"], effective["model"][:300]
@@ -612,12 +624,13 @@ def job_rankings(job_id: int, db: Session = Depends(get_user_db)):
 
 
 @app.post("/api/jobs/{job_id}/tailor")
-def tailor(job_id: int, db: Session = Depends(get_user_db)):
+def tailor(job_id: int, pages: int | None = Query(None, ge=1, le=3), db: Session = Depends(get_user_db)):
+    """Tailor one job now. `pages` is its page target (1, 2 or 3); omitted, the default in Settings."""
     job = db.get(Job, job_id)
     if not job:
         raise HTTPException(404, "Job not found")
     try:
-        return _packet_response(db, job, tailor_job(db, job))
+        return _packet_response(db, job, tailor_job(db, job, pages=pages))
     except Exception as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -674,7 +687,7 @@ def _packet_response(db: Session, job: Job, resume: ResumeVariant) -> dict:
 @app.post("/api/tailor-tasks")
 def queue_tailor_tasks(payload: TailorTasksIn, db: Session = Depends(get_user_db)):
     """Queue tailoring (or skip tailoring) for jobs; a background worker runs them, so the page can be left."""
-    return tailor_tasks.enqueue(db, payload.ids, payload.mode, payload.regenerate)
+    return tailor_tasks.enqueue(db, payload.ids, payload.mode, payload.regenerate, pages=payload.pages)
 
 
 @app.get("/api/tailor-tasks")

@@ -134,10 +134,10 @@ def test_bulk_tailor_processes_the_queue_in_batches(monkeypatch):
 
     real_tailor = main.tailor_job
 
-    def flaky_tailor(db, job):
+    def flaky_tailor(db, job, pages=None):
         if job.id == broken:
             raise RuntimeError("model timed out")
-        return real_tailor(db, job)
+        return real_tailor(db, job, pages=pages)
 
     monkeypatch.setattr(main, "tailor_job", flaky_tailor)
     ids = [first, second, broken, has_packet, not_shortlisted, 999999]

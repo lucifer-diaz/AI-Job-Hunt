@@ -53,7 +53,7 @@ def test_tasks_queue_run_in_the_background_and_report_progress(monkeypatch):
     stages = []
     real_tailor = tailor_tasks.tailor_job
 
-    def flaky_tailor(db, job, progress):
+    def flaky_tailor(db, job, progress, pages=None):
         if job.id == broken:
             raise RuntimeError("model timed out")
 
@@ -61,7 +61,7 @@ def test_tasks_queue_run_in_the_background_and_report_progress(monkeypatch):
             progress(stage)
             with SessionLocal() as s:
                 stages.append(s.get(TailorTask, next(t["id"] for t in tasks_by_job().values() if t["job_id"] == job.id)).stage)
-        return real_tailor(db, job, progress=spy)
+        return real_tailor(db, job, progress=spy, pages=pages)
 
     monkeypatch.setattr(tailor_tasks, "tailor_job", flaky_tailor)
     assert tailor_tasks.run_pending(SessionLocal) == 4

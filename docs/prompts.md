@@ -57,6 +57,10 @@ context builder → prompt builder → LLM gateway → output contract → evide
 - Validate input consistency first (`validate_tailoring_context`): ids unique and valid, the FitAnalysis belongs to
   this job, the resume version exists.
 - Record what was selected: `TaskContext.call_stats()` travels in `LLMCall(context_stats=...)`.
+- Length is configuration, not wording: the Tailor's LENGTH PLAN (page target, `max_bullets` per role_index, summary
+  sentences) comes from `app/services/resume_length.py` through the context, and code enforces it after the model
+  (`tailoring_results.enforce_length`, the renderer's `role_caps`). The prompt tells the Tailor to select from the
+  source resume, not reproduce it; never rely on the prompt alone to keep a resume short.
 
 ## Generated facts
 

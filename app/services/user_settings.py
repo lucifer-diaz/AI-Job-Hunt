@@ -104,6 +104,14 @@ def auto_tailor_for(db: Session, user_id: int | None = None) -> dict[str, Any]:
             "enabled_at": saved.get("enabled_at") if enabled else None}
 
 
+def tailoring_length_for(db: Session, user_id: int | None = None) -> dict[str, Any]:
+    """How long tailored resumes are by default (app.services.resume_length): the page target, the bullet budget per
+    page target (newest role first; edited, else the preset) and the presets."""
+    from app.services.resume_length import settings_value
+
+    return settings_value((settings_for(db, user_id).preferences or {}).get("tailoring"))
+
+
 def processing_maximums() -> dict[str, int]:
     """The server's ceilings — the most an account is allowed to ask for."""
     from app.services import server_settings

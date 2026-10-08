@@ -303,9 +303,14 @@ def order_skills(lines: list[str], top_skills: list[str]) -> list[str]:
 
 def render_resume(parsed: ParsedResume, *, name: str = "", headline: str = "", summary: str | None = None,
                   top_skills: list[str] | None = None, role_bullets: dict[int, list[str]] | None = None,
-                  highlights: list[str] | None = None, role_headings: dict[int, dict[str, str]] | None = None) -> str:
+                  highlights: list[str] | None = None, role_headings: dict[int, dict[str, str]] | None = None,
+                  role_caps: dict[int, int] | None = None, fallback_bullets: dict[int, list[str]] | None = None) -> str:
     """`role_headings` replaces a role's title and employer (the user's verified corrections); its location and
-    dates stay as the master resume wrote them."""
+    dates stay as the master resume wrote them.
+
+    `role_caps` (a tailored resume's length plan, app.services.resume_length) caps each role's bullets: a role the
+    tailoring left alone shows its first `cap` bullets (`fallback_bullets`, most relevant first, else as written),
+    and a cap of 0 keeps the heading only. Without caps every role shows all its bullets, as before."""
     role_bullets, role_headings = role_bullets or {}, role_headings or {}
     out = [f"# {parsed.name or name or 'Candidate'}"]
     out.extend(parsed.header_lines or ([headline] if headline else []))
@@ -325,7 +330,12 @@ def render_resume(parsed: ParsedResume, *, name: str = "", headline: str = "", s
         if section.kind == "experience":
             out.extend(section.lines)
             for index, role in enumerate(section.roles):
-                bullets = [b for b in role_bullets.get(index, []) if b and b.strip()] or role.bullets
+                bullets = [b for b in role_bullets.get(index, []) if b and b.strip()]
+                if role_caps is None:
+                    bullets = bullets or role.bullets
+                else:
+                    cap = role_caps.get(index, len(role.bullets))
+                    bullets = (bullets or (fallback_bullets or {}).get(index) or role.bullets)[:cap]
                 fix = role_headings.get(index)
                 header = (" | ".join(p for p in (fix["title"], fix["company"], role.location, role.dates) if p)
                           if fix else role.full_header)

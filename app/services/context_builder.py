@@ -84,6 +84,8 @@ THEMES = {
 }
 BULLETS_PER_ROLE = 4
 BULLETS_RECENT_ROLE = 6
+# Tailoring: candidates sent per role beyond its bullet budget (app.services.resume_length), so the Tailor chooses.
+CANDIDATE_SLACK = 3
 EXTRA_SKILLS = 10
 TAILOR_EVIDENCE = 20
 REVIEW_EVIDENCE = 30
@@ -147,6 +149,9 @@ class TaskContext:
     policy: dict[str, bool] = field(default_factory=dict)
     # Tailoring only: roles of the master resume as rendered, with the verified bullets tailoring may use.
     roles: list[dict[str, Any]] = field(default_factory=list)
+    # Tailoring only: the page target and each role's bullet budget (app.services.resume_length), as the prompt
+    # states it: {"pages", "budgets", "role_caps": {role_index: max bullets}}.
+    length_plan: dict[str, Any] = field(default_factory=dict)
     # Tailoring only: the one canonical copy of the source resume the prompt receives (summary, skills, roles with
     # bullets and the evidence ids behind each).
     source_resume: dict[str, Any] = field(default_factory=dict)
@@ -222,16 +227,21 @@ def _dates(role: dict[str, Any]) -> str:
     return f"{start} - {end}".strip(" -")
 
 
-def _select_experience(data: dict[str, Any], terms: JobTerms, allowed: tuple[str, ...]
-                       ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _select_experience(data: dict[str, Any], terms: JobTerms, allowed: tuple[str, ...],
+                       caps: dict[str, int] | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """(roles with their selected trusted bullets, selected unverified bullets). Headers of every non-rejected
-    role are kept; a role header whose facts are unverified is marked."""
+    role are kept; a role header whose facts are unverified is marked.
+
+    `caps` (tailoring) is each role's bullet budget by role id: up to budget + CANDIDATE_SLACK candidates are sent,
+    most relevant first, and a role whose budget is 0 keeps its heading with no bullets."""
     roles, unverified = [], []
     for index, role in enumerate(data.get("experience") or []):
         role_status = _status(role)
         if role_status == "REJECTED":
             continue
-        cap = BULLETS_RECENT_ROLE if index == 0 else BULLETS_PER_ROLE
+        budget = caps.get(role.get("id")) if caps is not None else None
+        cap = budget + CANDIDATE_SLACK if budget else 0 if budget == 0 else (
+            BULLETS_RECENT_ROLE if index == 0 else BULLETS_PER_ROLE)
         candidates = []
         for kind in ("achievements", "responsibilities"):
             for bullet in role.get(kind) or []:
@@ -242,7 +252,9 @@ def _select_experience(data: dict[str, Any], terms: JobTerms, allowed: tuple[str
                 score = terms.score(bullet["text"]) + (1 if kind == "achievements" else 0)
                 candidates.append((score, trusted, bullet, kind))
         candidates.sort(key=lambda c: -c[0])
-        chosen = [c for c in candidates if c[0] > 0][:cap] or candidates[:1 if index else 2]
+        chosen = [] if budget == 0 else [c for c in candidates if c[0] > 0][:cap] or candidates[:1 if index else 2]
+        if budget:  # a budgeted role offers its full budget, relevant bullets first, so the Tailor has a choice
+            chosen = (chosen + [c for c in candidates if c not in chosen])[:cap]
         order = {id(c[2]): i for i, c in enumerate(candidates)}
         chosen.sort(key=lambda c: order[id(c[2])])
         bullets = []
@@ -393,14 +405,15 @@ GENERATION_TASKS = ("tailoring", "cover_letter", "followup", "application_answer
 
 
 def _base(db: Session, profile: CandidateProfile, job: Job, task: str, allowed: tuple[str, ...],
-          evidence_limit: int) -> tuple[TaskContext, dict[str, Any], list[dict[str, Any]], Resume | None]:
+          evidence_limit: int, caps: dict[str, int] | None = None
+          ) -> tuple[TaskContext, dict[str, Any], list[dict[str, Any]], Resume | None]:
     from app.services.evidence_provenance import excluded_ids
 
     resume = rv.resume_for(db, profile)
     data = resume.structured_data if resume is not None else {}
     terms = job_terms(job)
     policy = candidate_policy(db, profile.user_id)
-    experience, unverified = _select_experience(data or {}, terms, allowed)
+    experience, unverified = _select_experience(data or {}, terms, allowed, caps)
     candidate, unverified_summary = _candidate(profile, data or {}, allowed)
     held_back = excluded_ids(db, profile.user_id) if task in GENERATION_TASKS else {}
     resume_items = {unit.item_id for unit in sr.iter_units(data or {})}
@@ -561,8 +574,11 @@ def source_resume(context: TaskContext, item_evidence: dict[str, list[int]],
         cited = role.get("bullet_evidence_ids") or [None] * len(role["bullets"])
         bullets = [{"text": text, "evidence_ids": evidence or item_evidence.get(item_id or "", [])}
                    for text, item_id, evidence in zip(role["bullets"], ids, cited, strict=False)]
-        roles.append({"role_index": role["role_index"], "title": role["title"], "company": role["company"],
-                      "dates": role["dates"], "bullets": bullet_facts(bullets)})
+        entry = {"role_index": role["role_index"], "title": role["title"], "company": role["company"],
+                 "dates": role["dates"], "bullets": bullet_facts(bullets)}
+        if context.length_plan:
+            entry["max_bullets"] = context.length_plan["role_caps"].get(str(role["role_index"]), 0)
+        roles.append(entry)
     out: dict[str, Any] = {"summary": context.candidate.get("summary") or "", "skills": context.relevant_skills,
                            "roles": roles, "projects": project_facts(context),
                            "highlights": [] if roles else (highlights or [])}
@@ -585,9 +601,38 @@ def validate_tailoring_context(context: TaskContext, master_role_count: int) -> 
         raise ContextError("TAILOR_CONTEXT_INCOMPLETE", "the resume has no verified content to tailor")
 
 
-def build_tailoring_context(db: Session, profile: CandidateProfile, job: Job) -> TaskContext:
+def _caps_by_id(plan: Any, data: dict[str, Any]) -> dict[str, int]:
+    """Each structured role's bullet budget by id, ranked by recency (app.services.resume_length)."""
+    from app.services import resume_length
+
+    roles = [r for r in data.get("experience") or [] if r.get("id") and _status(r) != "REJECTED"]
+    order = sorted(range(len(roles)), key=lambda i: resume_length.recency_key(_dates(roles[i]), i))
+    return {roles[index]["id"]: plan.cap(rank) for rank, index in enumerate(order)}
+
+
+def _apply_plan(context: TaskContext, profile: Any, plan: Any) -> None:
+    """The page target and each rendered role's budget (by role_index) on the context, and a text-source role's
+    candidates cut to its budget plus CANDIDATE_SLACK."""
+    from app.services import resume_length
+
+    caps = resume_length.role_caps(plan, parse_resume(profile.master_resume or "").roles)
+    context.length_plan = {**plan.as_dict(), "target": resume_length.PAGE_LABELS[plan.pages],
+                           "summary_sentences": resume_length.SUMMARY_SENTENCES[plan.pages],
+                           "role_caps": {str(index): cap for index, cap in caps.items()}}
+    for role in context.roles:
+        cap = caps.get(role["role_index"], 0)
+        limit = cap + CANDIDATE_SLACK if cap else 0
+        for key in ("bullets", "bullet_ids", "bullet_evidence_ids"):
+            if role.get(key):
+                role[key] = role[key][:limit]
+
+
+def build_tailoring_context(db: Session, profile: CandidateProfile, job: Job, plan: Any = None) -> TaskContext:
     """The Tailor's canonical context: the source resume (verified facts the policy allows, each bullet with its
     evidence ids), the relevant verified evidence, the job's requirements and the Ranker's completed FitAnalysis.
+
+    `plan` (app.services.resume_length.LengthPlan; the account's default when omitted) sets each role's bullet
+    budget, newest role first: the source resume is what the Tailor chooses from, not what it must reproduce.
 
     Raises ContextError(RANKING_REQUIRED) without a completed FitAnalysis, UnverifiedResumeError without verified
     facts, and ContextError for inconsistent input — all before a prompt exists."""
@@ -596,12 +641,18 @@ def build_tailoring_context(db: Session, profile: CandidateProfile, job: Job) ->
     from_text = policy["resume_source"] == "master_text"
     allowed = WITH_UNVERIFIED if policy["allow_unverified_resume_facts"] else VERIFIED_ONLY
     analysis = completed_fit_analysis(db, job)
-    context, data, every, _resume = _base(db, profile, job, "tailoring", allowed, TAILOR_EVIDENCE)
+    from app.services import resume_length
+
+    plan = plan or resume_length.plan_for(db, profile.user_id)
+    resume = rv.resume_for(db, profile)
+    caps = _caps_by_id(plan, (resume.structured_data if resume is not None else None) or {})
+    context, data, every, _resume = _base(db, profile, job, "tailoring", allowed, TAILOR_EVIDENCE, caps)
     if from_text:
         # The candidate chose the master resume text as the source: its roles and bullets, used as written.
         context.fit_analysis = analysis
         context = _with_job(context, jc.build_tailoring_job_context(db, job))
         context.roles = master_text_roles(profile)
+        _apply_plan(context, profile, plan)
         context.resume_text = _render(context)
         context.source_resume = source_resume(context, {}, None if context.roles else _plain_lines(profile))
         validate_tailoring_context(context, len(parse_resume(profile.master_resume or "").roles))
@@ -622,6 +673,7 @@ def build_tailoring_context(db: Session, profile: CandidateProfile, job: Job) ->
     # The FitAnalysis already says where the candidate matches; the Tailor gets requirements, not a second analysis.
     context = _with_job(context, jc.build_tailoring_job_context(db, job))
     context.roles = master_roles(profile, data, context.relevant_experience)
+    _apply_plan(context, profile, plan)
     context.resume_text = _render(context)
     unstructured = not context.roles and policy["allow_unverified_resume_facts"]
     context.source_resume = source_resume(context, _item_evidence(db, profile.user_id,

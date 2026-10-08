@@ -8,7 +8,7 @@ const settingsSource = readFileSync('app/static/settings.js', 'utf8');
 const resumeDataSource = readFileSync('app/static/resume_data.js', 'utf8');
 const jobDataSource = readFileSync('app/static/job_data.js', 'utf8');
 const appSource = readFileSync('app/static/app.js', 'utf8').split('/* ───────────── boot ───────────── */')[0];
-const names = ['S', 'D', 'A', 'setF', 'render', 'readHash', 'setHash', 'orchState', 'settingsNavigate', 'settingsChanges', 'settingsPayload', 'settingsDirty', 'settingsCanLeave', 'settingsSave', 'settingsUploadResume', 'profileCompleteness', 'addTags', 'commitTag', 'SETTING_ERRORS', 'SETTINGS_SUCCESS', 'SETTINGS_SECTIONS', 'SETTINGS_ACTIONS', 'RD', 'resumeDataDirty', 'rdReset', 'JD', 'renderJobStructured', 'jobDataInput'];
+const names = ['S', 'D', 'A', 'setF', 'render', 'readHash', 'setHash', 'orchState', 'settingsNavigate', 'settingsChanges', 'settingsPayload', 'settingsDirty', 'settingsCanLeave', 'settingsSave', 'settingsUploadResume', 'profileCompleteness', 'addTags', 'commitTag', 'SETTING_ERRORS', 'SETTINGS_SUCCESS', 'SETTINGS_SECTIONS', 'SETTINGS_ACTIONS', 'RD', 'resumeDataDirty', 'rdReset', 'JD', 'renderJobStructured', 'jobDataInput', 'packetLength'];
 let ui, fetchMock, context;
 function response(data, status = 200) { return { ok: status < 400, status, text: async () => JSON.stringify(data) }; }
 function data() {
@@ -168,6 +168,47 @@ describe('focused settings UI', () => {
     expect(ui.SETTING_ERRORS.workflow).toContain('Approval settings saved');
     expect(ui.settingsChanges('workflow')).toEqual({ weekly_target: '20' });
     expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({ weekly_target: 20 });
+  });
+  it('chooses the tailored resume length and edits its bullet budget', async () => {
+    ui.D.settings.tailoring_length = { pages: 2, budgets: { 1: [4, 3, 2, 1, 0], 2: [6, 5, 4, 3, 2, 1], 3: [7, 6, 5, 4, 3, 2] }, presets: { 1: [4, 3, 2, 1, 0], 2: [6, 5, 4, 3, 2, 1], 3: [7, 6, 5, 4, 3, 2] } };
+    section('workflow');
+    const view = () => document.getElementById('view');
+    expect(view().textContent).toContain('Tailored resume length');
+    expect(view().textContent).toContain('Not recommended');
+    expect(document.querySelector('[data-field="tailor_pages"][value="2"]').checked).toBe(true);
+    expect(document.querySelector('[data-tailor-budget]').textContent).toContain('Most recent role: 6 bullets');
+    const one = document.querySelector('[data-field="tailor_pages"][value="1"]'); one.checked = true;
+    one.dispatchEvent(new Event('change', { bubbles: true }));
+    expect(document.querySelector('[data-tailor-budget]').textContent).toContain('5th role and older: heading only');
+    ui.setF('workflow', 'tailor_budget_1', '5, 2'); ui.render();
+    expect(document.querySelector('[data-tailor-budget]').textContent).toContain('2nd role and older: 2 bullets');
+    fetchMock.mockResolvedValueOnce(response(ui.D.settings));
+    await ui.settingsSave('workflow');
+    const [url, options] = fetchMock.mock.calls[0];
+    expect([url, JSON.parse(options.body)]).toEqual(['/api/settings', { tailoring_length: { pages: 1, budgets: { 1: [5, 2] } } }]);
+    ui.setF('workflow', 'tailor_budget_1', '5, nine'); fetchMock.mockClear();
+    await ui.settingsSave('workflow');
+    expect(fetchMock).not.toHaveBeenCalled(); expect(ui.SETTING_ERRORS.workflow).toContain('whole numbers from 0 to 8');
+    ui.A['tailor-budget-reset']({ dataset: { pages: '1' } });
+    expect(ui.S.forms.workflow.tailor_budget_1).toBe('4, 3, 2, 1, 0');
+  });
+  it('sends the length chosen for one job, and nothing when it is the default', async () => {
+    fetchMock.mockResolvedValue(response({ queued: [{ id: 1, job_id: 7 }], skipped: [] }));
+    ui.S.tailorPages = '1'; await ui.A.generate({ dataset: { id: '7' } });
+    const first = fetchMock.mock.calls.find(([url, opt]) => url === '/api/tailor-tasks' && opt?.method === 'POST');
+    expect(JSON.parse(first[1].body)).toEqual({ ids: [7], mode: 'tailor', regenerate: true, pages: 1 });
+    fetchMock.mockClear(); ui.S.tailorPages = '';
+    await ui.A.generate({ dataset: { id: '7' } });
+    const second = fetchMock.mock.calls.find(([url, opt]) => url === '/api/tailor-tasks' && opt?.method === 'POST');
+    expect(JSON.parse(second[1].body)).toEqual({ ids: [7], mode: 'tailor', regenerate: true });
+    fetchMock.mockClear(); ui.S.tailorPages = '3';
+    await ui.A['skip-tailor']({ dataset: { id: '7' } });
+    const skip = fetchMock.mock.calls.find(([url, opt]) => url === '/api/tailor-tasks' && opt?.method === 'POST');
+    expect(JSON.parse(skip[1].body).pages).toBeUndefined();  // skipping keeps the resume as it is
+    ui.S.tailorPages = '';
+    expect(ui.packetLength({ length: { target_pages: 1, estimated_pages: 0.9 } })).toContain('target 1 page · <span data-packet-length>≈0.9 pages');
+    expect(ui.packetLength({ length: { target_pages: 1, estimated_pages: 1.6 } })).toContain('over target');
+    expect(ui.packetLength({ untailored: true, length: { estimated_pages: 2 } })).toBe('');
   });
   it('turns on automatic tailoring with its own fit score', async () => {
     section('workflow');

@@ -41,7 +41,7 @@ from app.models import (
 )
 from app.prompts import build_evidence_extraction_prompt
 from app.scheduler_hooks import run_soon
-from app.services import feedback_learning, ranker, resume_verification
+from app.services import feedback_learning, ranker, resume_length, resume_verification
 from app.services.actors import (
     ACTOR_GROUPS,
     BUILTIN,
@@ -1738,6 +1738,9 @@ def packet(db: Session, job: Job) -> dict:
         "cover_letter": strip_citations(resume.cover_letter), "cover_words": len(resume.cover_letter.split()),
         "edits": edits, "review": review, "keywords": coverage,
         "ats_pct": round(100 * covered / len(coverage)) if coverage else None,
+        # The page target it was tailored for (app.services.resume_length) and a rough estimate of its length.
+        "length": {"target_pages": ((resume.content or {}).get("length_plan") or {}).get("pages"),
+                   "estimated_pages": resume_length.estimate_pages(resume.markdown or "")},
     }}
 
 

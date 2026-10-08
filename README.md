@@ -1092,6 +1092,35 @@ worker's bookkeeping, so they hold across restarts and across several workers. A
 left PENDING, untouched and first in line next run; a tailoring task over the limit stays queued. Nothing is
 dropped — the queue just moves at the pace you chose.
 
+### Tailored resume length
+
+Your resume data is the **foundation** a tailored resume is built from, not a checklist. For each job, tailoring
+picks the bullets that serve that posting and leaves the rest out. **Settings → Workflow & cadence → Tailored
+resume length** sets the page target: **1 page**, **2 pages** (the default) or **3 pages** (not recommended).
+
+Each length has a bullet budget per role, newest role first. The last number repeats for every older role:
+
+| Role, newest first | 1 page | 2 pages | 3 pages |
+|---|---|---|---|
+| 1st (most recent) | 4 | 6 | 7 |
+| 2nd | 3 | 5 | 6 |
+| 3rd | 2 | 4 | 5 |
+| 4th | 1 | 3 | 4 |
+| 5th | 0 | 2 | 3 |
+| 6th and older | 0 | 1 | 2 |
+
+- **How budgets work.** A budget of 0 keeps the role's title, employer and dates with no bullets, so the work history
+  never has a gap. Roles are ranked by recency (current role first, then the latest dates), not by where the resume
+  lists them. You can edit the budgets ("5, 4, 2") or reset them to the preset.
+- **One job can differ.** The length picker beside **Generate tailored packet** and **Regenerate** (and in **Bulk
+  tailor**) tailors that run to another length. Automatic and bulk tailoring use the default. The packet header shows
+  the target and a rough estimate ("target 1 page · ≈1.2 pages").
+- **Code enforces the budget, not the model** (`app/services/resume_length.py`). The Tailor gets each role's
+  `max_bullets` plus a few spare candidates to choose from. Bullets beyond a budget are dropped and recorded as
+  `LENGTH` issues. A role the Tailor left alone shows only its most relevant bullets, up to its budget. Packets made
+  before length plans render exactly as before, and **Skip tailoring** sends the resume unchanged. Claude Desktop gets
+  the same `length_plan` over MCP; its saves are trimmed to the budgets and the trimming is reported, never rejected.
+
 ### Automatic tailoring
 
 **Settings → Workflow & cadence → Automatic tailoring** (off by default) queues a job for tailoring as soon as the

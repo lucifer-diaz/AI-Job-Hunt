@@ -13,7 +13,6 @@ import logging
 import re
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from typing import Any
 
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
@@ -85,15 +84,19 @@ def generation_provenance(prompt_version: str, result: LLMResult) -> dict:
             "config_version": routing.get("config_version"), "escalated": bool(routing.get("escalated"))}
 
 
-def tailor_job(db: Session, job: Job, progress: Progress = _no_progress) -> ResumeVariant:
+def tailor_job(db: Session, job: Job, progress: Progress = _no_progress, pages: int | None = None) -> ResumeVariant:
     """Tailor from verified facts and the Ranker's completed fit analysis. Ranking never runs here: it is the
     asynchronous ranker's job (app.services.ranker). Without a completed analysis the context builder raises
-    ContextError(RANKING_REQUIRED) and no model is called."""
+    ContextError(RANKING_REQUIRED) and no model is called.
+
+    `pages` (1, 2 or 3) is this job's page target; omitted, the account's default (app.services.resume_length)."""
+    from app.services import resume_length
     from app.services.tailoring_results import apply_tailoring_patch
 
     profile = rv.for_job(db, get_profile(db), job)  # the job's chosen resume, else the active one
+    plan = resume_length.plan_for(db, job.user_id, pages)
     # Verified facts relevant to this job only; raises UnverifiedResumeError / ContextError before any model call.
-    context = build_tailoring_context(db, profile, job)
+    context = build_tailoring_context(db, profile, job, plan)
     progress("tailoring")
     llm = LLMClient.for_user(db)
     prompt = build_tailoring_prompt(candidate_profile=profile, job=job, context=context)
@@ -103,8 +106,11 @@ def tailor_job(db: Session, job: Job, progress: Progress = _no_progress) -> Resu
     allowed = context.evidence_ids | {bullet["id"] for part in ("roles", "projects")
                                       for unit in context.source_resume.get(part) or []
                                       for bullet in unit["bullets"] if "id" in bullet}
-    content = apply_tailoring_patch(db, profile, job, result.validated, allowed_evidence=allowed)
+    content = apply_tailoring_patch(db, profile, job, result.validated, allowed_evidence=allowed,
+                                    length_plan=context.length_plan)
     content.update(generation_provenance(prompt.version, result))
+    # A role the Tailor left alone shows its first bullets in this order (most relevant first) up to its budget.
+    content["fallback_bullets"] = {str(role["role_index"]): list(role["bullets"]) for role in context.roles}
     content["context"] = {**context.resume, **context.stats.as_dict(), "evidence_ids": sorted(context.evidence_ids),
                           "context_builder_version": context.call_stats()["context_builder_version"],
                           "excluded_evidence": context.excluded_evidence,
@@ -329,8 +335,22 @@ def build_resume_markdown(profile: CandidateProfile, content: dict) -> str:
         bucket = role_bullets.setdefault(slot["role_index"], [])
         if value and value not in bucket:
             bucket.append(value)
+    caps, fallback = length_caps(content)
     return render_resume(parsed, name=profile.name, headline=profile.headline, summary=summary or None,
-                         top_skills=relevant_skills(parsed, skill_list), role_bullets=role_bullets, highlights=highlights)
+                         top_skills=relevant_skills(parsed, skill_list), role_bullets=role_bullets, highlights=highlights,
+                         role_caps=caps, fallback_bullets=fallback)
+
+
+def length_caps(content: dict) -> tuple[dict[int, int] | None, dict[int, list[str]] | None]:
+    """A tailored resume's bullet budget per role_index and the bullets a role it left alone falls back to (most
+    relevant first), from content["length_plan"] (app.services.resume_length). (None, None) for packets made
+    before length plans: they render exactly as they always did."""
+    plan = content.get("length_plan") or {}
+    if not plan.get("role_caps"):
+        return None, None
+    caps = {int(k): int(v) for k, v in plan["role_caps"].items()}
+    fallback = {int(k): list(v) for k, v in (content.get("fallback_bullets") or {}).items()}
+    return caps, fallback
 
 
 def update_resume_edit(db: Session, resume: ResumeVariant, index: int, status: str | None, text: str | None) -> None:
