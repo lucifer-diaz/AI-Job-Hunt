@@ -432,8 +432,8 @@ def live_counts(db: Session, user_id: int | None, now: datetime | None = None) -
                              .group_by(TailorTask.status, TailorTask.stage, TailorTask.attempts),
                              TailorTask.user_id, user_id)).all()
     for status, stage, attempts, n in rows:
-        if status == "failed":
-            counts["tailor"]["failed_recent"] += n
+        if status == "failed":  # a finished run keeps the stage it ended in
+            counts["reviewer" if stage == "reviewing" else "tailor"]["failed_recent"] += n
         elif status == "queued":
             counts["tailor"]["retrying" if (attempts or 0) > 0 else "queued"] += n
         else:

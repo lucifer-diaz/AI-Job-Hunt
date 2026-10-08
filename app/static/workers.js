@@ -1,4 +1,4 @@
-/* Running workers: the account's background queues — JD parsing, JD recovery, ranking and tailoring — in one screen,
+/* Running workers: the account's background queues — JD parsing, JD recovery, ranking, tailoring and its review step — in one screen,
    with the controls to unstick them. Loaded before app.js; uses the workspace helpers (api, esc, btn, pill, render, go)
    and reuses the views each queue already had: the JD parsing and recovery panels (monitoring.js), the ranking tracker
    and the tailoring task list (app.js).
@@ -9,9 +9,9 @@
    ranking cadence and any provider cooldown. Every number and row comes from /api/workers/* (app.services.workers). */
 'use strict';
 
-const WK_KINDS = [['parsing', 'JD parsing'], ['recovery', 'JD recovery'], ['ranking', 'Ranking'], ['insights', 'Job insights'], ['tailoring', 'Tailoring']];
-// Workers whose screen is the generic task table (app.services.workers.rows); ranking and tailoring keep their own views.
-const WK_TABLE_KINDS = ['parsing', 'recovery', 'insights'];
+const WK_KINDS = [['parsing', 'JD parsing'], ['recovery', 'JD recovery'], ['ranking', 'Ranking'], ['insights', 'Job insights'], ['tailoring', 'Tailoring'], ['reviewing', 'Reviewing']];
+// Tabs drawn from the generic task list (/api/workers/{kind}); ranking and tailoring keep their own views.
+const WK_GENERIC = ['parsing', 'recovery', 'insights', 'reviewing'];
 // The worker tabs, then the account's worker settings (processing limits and rate-limit backoff).
 const WK_TABS = [...WK_KINDS, ['settings', 'Settings']];
 // [label, tone, symbol]: a status is always a word and a symbol, never colour alone.
@@ -58,7 +58,7 @@ async function loadWorkers() {
   const w = wkState(), tab = w.tab, worker = WK_KINDS.some(([id]) => id === tab);
   // Ranking and tailoring keep the views they always had (the ranking tracker, the tailoring task list).
   const f = wkFilter(tab);
-  const detail = WK_TABLE_KINDS.includes(tab)
+  const detail = WK_GENERIC.includes(tab)
     ? api(`/api/workers/${tab}?` + qs({ range: w.range, q: f.q.trim(), status: f.status === 'all' ? '' : f.status })) : null;
   const [summary, data, act] = await Promise.all([api('/api/workers'), detail,
     worker ? api(`/api/workers/${tab}/activity`).catch(() => null) : null,
@@ -116,6 +116,7 @@ const wkMeter = (ratio, color) => `<div class="wk-meter" role="presentation"><i 
 const wkHumanize = code => String(code || '').toLowerCase().replace(/_/g, ' ').replace(/^./, c => c.toUpperCase());
 function wkScheduleFacts(s, kind) {
   if (!s) return ['Scheduler not running on this server'];
+  if (kind === 'reviewing') return s.enabled ? ['✎ runs as the last step of each Tailoring task', `⇉ up to ${s.concurrency} at a time`] : ['The tailoring worker is turned off on this server'];
   if (kind === 'tailoring') return s.enabled ? [`⏱ checks every ${s.poll_seconds}s`, `⇉ up to ${s.concurrency} at a time`] : ['The tailoring worker is turned off on this server'];
   if (!s.enabled || !s.interval_minutes) return ['This worker is turned off on this server'];
   return [`⏱ every ${s.interval_minutes} min`, s.running ? '▶ running now' : s.next_run_at ? `▶ next run ${until(s.next_run_at)}` : null,
@@ -135,8 +136,9 @@ function wkDetail(r) {
   if (r.status === 'RUNNING') return `Attempt ${r.attempt}${of} · running ${r.started_at ? wkDur(Math.max(0, (Date.now() - toDate(r.started_at)) / 1000)) : ''}${r.stage && r.stage !== 'running' ? ` · ${r.stage}` : ''}`;
   if (r.status === 'RETRYING') return `${r.next_attempt_at && later(r.next_attempt_at) ? `Retries ${until(r.next_attempt_at)}` : 'Retries on the next run'} · attempt ${r.attempt}${of}${r.error_category ? ` (${r.error_category.toLowerCase().replace(/_/g, ' ')})` : ''}${error}`;
   if (r.status === 'QUEUED') return r.run_now ? 'First in line: runs on the next pass' : `Waiting its turn${r.queue_position ? ` · #${r.queue_position}` : ''}${r.created_at ? ` · queued ${fmtDateTime(r.created_at)}` : ''}`;
+  const score = r.reviewer_score != null ? ` · reviewer score ${r.reviewer_score}` : '';
   const again = r.retried_by ? ` · run again as task #${r.retried_by.task_id} (${(WK_STATUS[r.retried_by.status] || [r.retried_by.status])[0].toLowerCase()})` : '';
-  return `${(WK_STATUS[r.status] || [r.status])[0]}${r.finished_at ? ` ${fmtDateTime(r.finished_at)}` : ''}${again}${r.result_code ? ` · ${r.result_code.toLowerCase().replace(/_/g, ' ')}` : ''}${error}`;
+  return `${(WK_STATUS[r.status] || [r.status])[0]}${r.finished_at ? ` ${fmtDateTime(r.finished_at)}` : ''}${again}${score}${r.result_code ? ` · ${r.result_code.toLowerCase().replace(/_/g, ' ')}` : ''}${error}`;
 }
 // Why a task is waiting or retrying, in full: rows cut the message to one line, the ⓘ beside them shows all of it.
 function wkWhyText({ waiting, error, category, attempt, max, next, reason }) {
@@ -277,6 +279,14 @@ function wkRanked(items, color = 'var(--brand)', emptyText = 'Nothing in this ra
   return `<div class="wk-rank">${items.map(([text, n]) => `<div class="wk-rank-row" data-tip="${attr(`${text}: ${n}`)}"><span class="t">${esc(text)}</span><b>${wkNum(n)} <span class="xs faint" style="font-weight:400">${Math.round(100 * n / sum)}%</span></b>${wkMeter(n / max, color)}</div>`).join('')}</div>`;
 }
 const wkCard = (title, sub, body, extra = '') => `<section class="card"><div class="row between wrap gap10 mb14"><div><div class="card-title">${esc(title)}</div>${sub ? `<div class="card-sub">${esc(sub)}</div>` : ''}</div>${extra}</div>${body}</section>`;
+// Reviewing is the last step of a Tailoring task: the scores of the reviews the list shows (the last day).
+function wkReviewingInsights(data) {
+  const scores = (data.rows || []).map(r => r.reviewer_score).filter(v => v != null).sort((a, b) => a - b);
+  const mid = scores.length >> 1, median = !scores.length ? null : scores.length % 2 ? scores[mid] : Math.round((scores[mid - 1] + scores[mid]) / 2);
+  return `<section class="card"><div class="wk-tiles">${wkTile('Reviewed', wkNum(scores.length), 'scored packets in this list')}
+    ${wkTile('Median score', median == null ? '—' : String(median), scores.length ? `range ${scores[0]}–${scores[scores.length - 1]}` : 'no scores yet')}
+    ${wkTile('Runs inside Tailoring', 'Same task', 'Kill, Run now and settings act on its Tailoring task')}</div></section>`;
+}
 function wkParsingInsights(data) {
   const x = data.metrics, llm = x.llm || {}, job = x.scheduler;
   const tokens = `${monTokens(llm.input_tokens || 0)} · ${monTokens(llm.output_tokens || 0)}`;
@@ -409,7 +419,7 @@ function wkSettings() {
   const serverMinutes = D.settings.ranking_interval_server_minutes || 2;
   const ranking = wkRow('ranking_concurrency', 'Jobs ranked at once', `Up to ${max.ranking_concurrency} on this server.`, wkNumber('ranking_concurrency', 1, max.ranking_concurrency, 'at once'), { value: max.ranking_concurrency, text: String(max.ranking_concurrency) })
     + wkRow('ranking_interval_minutes', 'Rank at most every', cadence > 0 ? `Bursts of up to ${esc(fv(form, 'ranking_concurrency', b.ranking_concurrency))} every ${cadence} min. Run now skips it for one task.` : `0 follows the server, which looks every ${serverMinutes} min.`, wkNumber('ranking_interval_minutes', 0, 1440, 'min'), { value: 0, text: 'server pace' });
-  const tailoring = wkRow('tailoring_concurrency', 'Packets tailored at once', `Up to ${max.tailoring_concurrency} on this server.`, wkNumber('tailoring_concurrency', 1, max.tailoring_concurrency, 'at once'), { value: max.tailoring_concurrency, text: String(max.tailoring_concurrency) });
+  const tailoring = wkRow('tailoring_concurrency', 'Packets tailored at once', `Up to ${max.tailoring_concurrency} on this server. Reviewing runs inside each packet and follows these settings.`, wkNumber('tailoring_concurrency', 1, max.tailoring_concurrency, 'at once'), { value: max.tailoring_concurrency, text: String(max.tailoring_concurrency) });
   const ladder = `<div class="wk-ladder" aria-label="Waits after rate limits in a row">${backoffLadder(b, 5, form).map((x, i) => `<span><small>${i + 1}${i === 4 ? '+' : ''}</small>${esc(x)}</span>`).join('<i aria-hidden="true">→</i>')}</div>`;
   const backoff = `<section class="card flush wk-set-card" id="wk-set-backoff"><header class="wk-set-head"><span class="wk-set-icon" aria-hidden="true">${WK_SET_ICONS.backoff}</span>
       <div class="grow"><h3>Rate-limit backoff</h3><div class="xs muted mt4">What every worker does after a provider answers 429. Applies to your account.</div></div>
@@ -439,7 +449,7 @@ function wkSel(tab) {
   return w.sel[tab];
 }
 function wkRetriable(tab) {
-  if (WK_TABLE_KINDS.includes(tab)) return ((D.wkData || {})[tab]?.rows || []).filter(r => ['FAILED', 'BLOCKED', 'STOPPED'].includes(r.status) && !r.retried_by).map(r => r.task_id);
+  if (WK_GENERIC.includes(tab)) return ((D.wkData || {})[tab]?.rows || []).filter(r => ['FAILED', 'BLOCKED', 'STOPPED'].includes(r.status) && !r.retried_by).map(r => r.task_id);
   if (tab === 'ranking') { const v = wkRankingView().view; return v ? [...v.active, ...v.recent].filter(t => (t.status === 'FAILED' || wkStoppedRank(t)) && !t.retried).map(t => t.id) : []; }
   if (tab === 'tailoring') return wkTailoringView().tasks.filter(t => (t.status === 'failed' || wkStoppedTailor(t)) && !retried(t)).map(t => t.id);
   return [];
@@ -479,7 +489,7 @@ function wkRetriedMessage(out) {
 /* ───────────── clear finished ───────────── */
 // How many finished tasks the list shows now, and how many a clear is hiding (parsing and recovery say so).
 function wkFinishedShown(tab) {
-  if (WK_TABLE_KINDS.includes(tab)) return ((D.wkData || {})[tab]?.rows || []).filter(r => !['RUNNING', 'QUEUED', 'RETRYING'].includes(r.status)).length;
+  if (WK_GENERIC.includes(tab)) return ((D.wkData || {})[tab]?.rows || []).filter(r => !['RUNNING', 'QUEUED', 'RETRYING'].includes(r.status)).length;
   if (tab === 'ranking') return (D.ranking?.recent || []).length;
   if (tab === 'tailoring') return wkTailoringView().all.filter(t => !['queued', 'running'].includes(t.status)).length;
   return 0;
@@ -553,7 +563,8 @@ function renderWorkers() {
   } else {
     filterCounts = data?.status_counts || null;
     // The filters narrow the task list, not the metrics, so they sit right above the list.
-    body = !data ? loading() : `${w.tab === 'parsing' ? wkParsingInsights(data) : w.tab === 'recovery' ? wkRecoveryInsights(data) : ''}${wkFilterBar(w.tab, filterCounts)}${wkBulkBar(w.tab)}${wkTable(w.tab, data)}`;
+    const insights = { parsing: wkParsingInsights, recovery: wkRecoveryInsights, reviewing: wkReviewingInsights }[w.tab];
+    body = !data ? loading() : `${insights ? insights(data) : ''}${wkFilterBar(w.tab, filterCounts)}${wkBulkBar(w.tab)}${wkTable(w.tab, data)}`;
   }
   return `<div class="stack">${top}${wkCooldowns(s.cooldowns)}${wkHero(w.tab, spec, act)}${wkActivity(act)}${body}</div>`;
 }
@@ -580,7 +591,7 @@ document.addEventListener('change', e => {
   wkApplyFilters(tab);
 });
 async function wkApplyFilters(tab) {
-  if (WK_TABLE_KINDS.includes(tab)) { try { await loadWorkers(); } catch (err) { toast(err.message, true); } }
+  if (WK_GENERIC.includes(tab)) { try { await loadWorkers(); } catch (err) { toast(err.message, true); } }
   if (S.screen === 'workers') render();
 }
 const WORKERS_ACTIONS = {

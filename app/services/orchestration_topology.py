@@ -140,7 +140,7 @@ NODES: tuple[Node, ...] = (
          workers_tab="tailoring"),
     Node("reviewer", "Reviewer", (AI,), "Independently checks the tailored packet and recommends PASS, RETAILOR or "
          "SKIP; code decides.", "pipeline", (4, 1), workers=("REVIEWER",), llm_stages=("REVIEWER",),
-         states=("REVIEWED",), monitoring_tab="llm", screen="tailor"),
+         states=("REVIEWED",), monitoring_tab="llm", screen="tailor", workers_tab="reviewing"),
     Node("approval", "Approval", (HUMAN,), "Nothing is submitted without your sign-off; the reviewer minimum is a "
          "policy you can override with a reason.", "pipeline", (3, 1), states=("READY_TO_APPLY",),
          screen="approvals"),

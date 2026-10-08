@@ -349,7 +349,7 @@ function orchDrawer(g) {
         <h2 class="orch-drawer-title">${esc(n.label)}</h2><div class="small muted ellipsis">${esc([model, how].filter(Boolean).join(' · '))} · ${orchStatusChip(orchDisplayStatus(n.id))}</div></div>
         <button class="btn sm" data-act="orch-close" aria-label="Close details">✕</button></div>
       <div class="orch-tabs" role="tablist">${tabs.map(([id, t]) => `<button role="tab" aria-selected="${o.tab === id}" class="${o.tab === id ? 'on' : ''}" data-act="orch-tab" data-id="${id}">${t}${id === 'overview' && rt.recommendations ? ` <span class="orch-rec inline">${rt.recommendations}</span>` : ''}</button>`).join('')}</div></div>
-    <div class="orch-drawer-body">${body}</div></aside>`;
+    <div class="orch-drawer-body" data-scroll-key="orch-node-${esc(o.node)}">${body}</div></aside>`;
 }
 const orchKV = (k, v) => `<div class="orch-kv"><span class="xs muted">${esc(k)}</span><span class="small">${v}</span></div>`;
 const orchTile = (k, v, sub = '') => `<div class="orch-tile"><div class="xs muted">${esc(k)}</div><div class="orch-tile-v">${v}</div>${sub ? `<div class="xs faint">${esc(sub)}</div>` : ''}</div>`;
@@ -454,7 +454,7 @@ function orchEdgeDrawer() {
       ${e.recent?.length ? `<div class="caps-sm mt14 mb6">Recent</div>${e.recent.map(r => `<button class="orch-result" data-act="orch-pick-job" data-id="${r.job_id}"><span class="ellipsis small">${esc(r.title || `Job #${r.job_id}`)} · ${esc(r.company || '')}</span><span class="xs muted">${esc(fmtDateTime(r.at))}</span></button>`).join('')}` : ''}`}`;
   return `<aside class="orch-drawer" role="dialog" aria-label="Transition details"><div class="orch-drawer-head"><div class="row between gap10"><div><div class="caps-sm">Transition</div>
     <h2 class="orch-drawer-title">${esc(from?.label || o.edge.source)} → ${esc(to?.label || o.edge.target)}</h2><div class="small muted">${esc(e?.label || '')}</div></div>
-    <button class="btn sm" data-act="orch-close" aria-label="Close details">✕</button></div></div><div class="orch-drawer-body">${body}</div></aside>`;
+    <button class="btn sm" data-act="orch-close" aria-label="Close details">✕</button></div></div><div class="orch-drawer-body" data-scroll-key="orch-edge-${esc(o.edge.source)}-${esc(o.edge.target)}">${body}</div></aside>`;
 }
 function orchTraceDrawer() {
   const o = orchState(); if (!o.traceOpen) return '';
@@ -467,7 +467,7 @@ function orchTraceDrawer() {
         ${orchKV('Latency', monMs(e.llm.latency_ms))}${orchKV('Tokens', `${monTokens(e.llm.input_tokens)} → ${monTokens(e.llm.output_tokens)}`)}${orchKV('Schema', e.llm.schema_valid == null ? '—' : e.llm.schema_valid ? 'pass' : `fail${e.llm.validation_failure_reason ? ` (${esc(e.llm.validation_failure_reason)})` : ''}`)}
         ${orchKV('Fallback / escalation', `${e.llm.fallback_used == null ? 'unknown' : e.llm.fallback_used ? 'fallback answered' : 'primary'}${e.llm.escalated ? ` · escalated (${esc(e.llm.escalation_reason || '')})` : ''}`)}</div>` : ''}
       ${e.external ? `<div class="xs muted mt4">${esc([e.external.host, e.external.http_status_code, monMs(e.external.latency_ms), e.external.error_type, e.external.retry_count ? `${e.external.retry_count} retries` : null].filter(Boolean).join(' · '))}</div>` : ''}</li>`).join('')}</ol>`;
-  return `<div class="overlay" data-act="orch-trace-close"><div class="modal white" role="dialog" aria-label="Job trace"><div class="modal-head row between"><div><div class="caps-sm">Trace</div><div class="b">${esc(t?.title || '')} · ${esc(t?.company || '')}</div></div>${btn('Close', 'orch-trace-close')}</div><div style="padding:18px 22px">${body}</div></div></div>`;
+  return `<div class="overlay" data-act="orch-trace-close"><div class="modal white" role="dialog" aria-label="Job trace" data-scroll-key="orch-trace-${o.jobId}"><div class="modal-head row between"><div><div class="caps-sm">Trace</div><div class="b">${esc(t?.title || '')} · ${esc(t?.company || '')}</div></div>${btn('Close', 'orch-trace-close')}</div><div style="padding:18px 22px">${body}</div></div></div>`;
 }
 
 /* ───────────── pan and zoom ───────────── */
