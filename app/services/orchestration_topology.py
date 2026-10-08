@@ -172,16 +172,17 @@ NODES: tuple[Node, ...] = (
     Node("ai_advisor", "AI Optimization Advisor", (AI, ASYNC), "Analyses LLM telemetry and recommends; it never "
          "changes a model, a route or a setting.", "support", (6, -1), workers=("AI_OPTIMIZATION",),
          llm_stages=("ADVISOR",), monitoring_tab="advisor"),
-    # Job Insights (app.services.job_insights): researched in the background once a job is approved.
+    # Job Insights (app.services.job_insights): researched in the background once a job is approved, so the nodes sit
+    # right under Approval.
     Node("company_insights", "Job insights research", (ASYNC, EXT, AI), "Researches an approved job: the posting, "
          "the company's own site, and Glassdoor and PayScale through Apify when an admin configured them; a model "
-         "then organises what was found, citing every source. Salary is computed in code.", "support", (8, -1),
+         "then organises what was found, citing every source. Salary is computed in code.", "support", (3, 2),
          workers=("COMPANY_INSIGHTS",), llm_stages=("COMPANY_INSIGHTS",),
          external=(ExternalMatch("APIFY", "job_insights"), ExternalMatch("WEB", "job_insights")),
          monitoring_tab="external", workers_tab="insights", screen="approvals"),
     Node("interview_insights", "Interview preparation", (AI,), "Writes interview preparation from the posting, the "
          "fit analysis and verified evidence, always labelled as generated (never as questions the company asks).",
-         "support", (9, -1), workers=("INTERVIEW_INSIGHTS",), llm_stages=("COMPANY_INSIGHTS",),
+         "support", (4, 2), workers=("INTERVIEW_INSIGHTS",), llm_stages=("COMPANY_INSIGHTS",),
          monitoring_tab="llm", screen="approvals"),
 )
 
