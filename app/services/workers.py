@@ -4,6 +4,7 @@
     JD recovery  job_description_fetch_tasks    scheduler job jd_recovery
     Ranking      job_ranking_tasks              scheduler job ranking
     Tailoring    tailor_tasks (tailor → review)  the in-process tailor worker
+    Reviewing    tailor_tasks at the review step  a view of Tailoring: the same rows, settings and controls
 
 Two controls, both acting on the signed-in account's own tasks only:
 
@@ -25,7 +26,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -76,20 +77,42 @@ class WorkerKind:
     finished: tuple[str, ...]
     max_attempts: Callable[[], int]
     node_id: str  # the AI Orchestration stage it feeds
+    # A view of another worker's queue (Reviewing is the review step of Tailoring): the rows `scope` selects, that
+    # worker's settings, and left out of totals and Kill all so no task is counted or stopped twice.
+    scope: Callable[[Any], Any] | None = None
+    view_of: str | None = None
 
     @property
     def active(self) -> tuple[str, str]:
         return (self.pending, self.running)
 
     @property
+    def tailor(self) -> bool:
+        return self.model is TailorTask
+
+    @property
+    def settings_kind(self) -> str:
+        return self.view_of or self.kind
+
+    @property
     def attempts(self) -> Any:
-        return self.model.attempts if self.model is TailorTask else self.model.attempt_count
+        return self.model.attempts if self.tailor else self.model.attempt_count
+
+    def where(self, query: Any) -> Any:
+        return query.where(self.scope(self.model)) if self.scope is not None else query
 
 
 def _tailor_max() -> int:
     from app.services.tailor_tasks import MAX_ATTEMPTS
 
     return MAX_ATTEMPTS
+
+
+def _reviewing(m: Any) -> Any:
+    """The tailor tasks at the review step: reviewing now, a review-only run waiting, or finished while reviewing
+    (tailor_tasks keeps a finished run's last stage)."""
+    return or_(and_(m.status == "running", m.stage == "reviewing"), and_(m.status == "queued", m.mode == "skip"),
+               and_(m.status.in_(("succeeded", "failed", "cancelled")), m.stage == "reviewing"))
 
 
 KINDS: dict[str, WorkerKind] = {k.kind: k for k in (
@@ -105,6 +128,10 @@ KINDS: dict[str, WorkerKind] = {k.kind: k for k in (
                lambda: get_settings().ranking_max_attempts, "ranker"),
     WorkerKind("tailoring", "Tailoring", "Tailors the resume and cover letter, then the reviewer checks the packet.",
                TailorTask, None, "queued", "running", ("succeeded", "failed", "cancelled"), _tailor_max, "tailor"),
+    WorkerKind("reviewing", "Reviewing", "The reviewer checks each tailored packet and recommends PASS, RETAILOR or "
+               "SKIP; code decides. It runs as the last step of a Tailoring task: Kill and Run now act on that task, "
+               "and a retry tailors the job again.", TailorTask, None, "queued", "running",
+               ("succeeded", "failed", "cancelled"), _tailor_max, "reviewer", scope=_reviewing, view_of="tailoring"),
 )}
 
 
@@ -126,24 +153,24 @@ def _display_status(spec: WorkerKind, task: Any, now: datetime) -> str:
     status = task.status
     if status == spec.running:
         return "RUNNING"
-    if status not in spec.active and (task.error if spec.kind == "tailoring" else task.last_error) == STOPPED_BY_USER:
+    if status not in spec.active and (task.error if spec.tailor else task.last_error) == STOPPED_BY_USER:
         return "STOPPED"
     if status == spec.pending:
         waiting = getattr(task, "next_attempt_at", None)
-        if (waiting is not None and waiting > now) or ((_attempts(spec, task) or 0) > 0 and spec.kind != "tailoring"):
+        if (waiting is not None and waiting > now) or ((_attempts(spec, task) or 0) > 0 and not spec.tailor):
             return "RETRYING"
         return "QUEUED"
     return status.upper()
 
 
 def _attempts(spec: WorkerKind, task: Any) -> int:
-    return (task.attempts if spec.kind == "tailoring" else task.attempt_count) or 0
+    return (task.attempts if spec.tailor else task.attempt_count) or 0
 
 
 def row(spec: WorkerKind, task: Any, job: tuple[str, str] | None, now: datetime,
         max_attempts: int | None = None) -> dict[str, Any]:
     """One task as Running workers shows it. Metadata only. `max_attempts` is the account's own limit."""
-    tailoring = spec.kind == "tailoring"
+    tailoring = spec.tailor
     status = _display_status(spec, task, now)
     error = task.error if tailoring else task.last_error
     category = None if tailoring else (task.error_category.value if task.error_category else None)
@@ -152,7 +179,7 @@ def row(spec: WorkerKind, task: Any, job: tuple[str, str] | None, now: datetime,
     active = task.status in spec.active
     return {"task_id": task.id, "job_id": task.job_id, "title": job[0] if job else None,
             "company": job[1] if job else None, "kind": spec.kind, "status": status, "raw_status": task.status,
-            "stage": task.stage if tailoring else ("running" if status == "RUNNING" else status.lower()),
+            "stage": (task.stage if active else "done") if tailoring else ("running" if status == "RUNNING" else status.lower()),
             "mode": task.mode if tailoring else None, "reason": getattr(task, "reason", None),
             "attempt": _attempts(spec, task), "max_attempts": max_attempts or spec.max_attempts(),
             "created_at": _iso(task.created_at), "started_at": _iso(task.started_at), "finished_at": _iso(finished_at),
@@ -163,7 +190,8 @@ def row(spec: WorkerKind, task: Any, job: tuple[str, str] | None, now: datetime,
             "can_kill": status in ("RUNNING", "RETRYING"),
             "can_run_now": status in ("QUEUED", "RETRYING") or status in STATUS_FILTERS["failed"],
             "retried_by": None,  # set by rows() when a newer task of the same job exists
-            "can_remove": active and status != "RUNNING" and spec.kind in ("ranking", "tailoring")}
+            "can_remove": active and status != "RUNNING" and spec.kind in ("ranking", "tailoring"),
+            **({"reviewer_score": (task.result or {}).get("reviewer_score")} if spec.kind == "reviewing" else {})}
 
 
 # Status filters, the same for every worker: what a task is doing, in the words the screen uses.
@@ -231,10 +259,10 @@ def _hidden(db: Session, spec: WorkerKind, user_id: int, since: datetime | None,
     if since is None:
         return 0
     m = spec.model
-    finished_column = m.finished_at if spec.kind == "tailoring" else m.completed_at
-    return db.scalar(select(func.count()).select_from(m).where(
+    finished_column = m.finished_at if spec.tailor else m.completed_at
+    return db.scalar(spec.where(select(func.count()).select_from(m).where(
         m.user_id == user_id, m.status.not_in(spec.active), finished_column >= now - RECENT,
-        finished_column <= since)) or 0
+        finished_column <= since))) or 0
 
 
 def rows(db: Session, user_id: int, kind: str, now: datetime | None = None, *, q: str = "",
@@ -246,11 +274,11 @@ def rows(db: Session, user_id: int, kind: str, now: datetime | None = None, *, q
     if status and status not in STATUS_FILTERS:
         raise WorkerError(f"Unknown status filter '{status}'. Filters: {', '.join(STATUS_FILTERS)}", 422)
     m = spec.model
-    finished_column = m.finished_at if spec.kind == "tailoring" else m.completed_at
+    finished_column = m.finished_at if spec.tailor else m.completed_at
     since = cleared_at(db, user_id, spec.kind)
     shown_from = max(now - RECENT, since) if since else now - RECENT
-    query = select(m).where(m.user_id == user_id, or_(m.status.in_(spec.active), finished_column > shown_from)
-                            if since else or_(m.status.in_(spec.active), finished_column >= shown_from))
+    query = spec.where(select(m).where(m.user_id == user_id, or_(m.status.in_(spec.active), finished_column > shown_from)
+                                       if since else or_(m.status.in_(spec.active), finished_column >= shown_from)))
     text = (q or "").strip()
     if text.lstrip("#").isdigit():
         query = query.where(m.job_id == int(text.lstrip("#")))
@@ -261,7 +289,7 @@ def rows(db: Session, user_id: int, kind: str, now: datetime | None = None, *, q
     tasks = list(db.scalars(query.order_by((m.status != spec.running), (m.status != spec.pending),
                                            m.run_now_at.is_(None), m.id).limit(SCAN_LIMIT)).all())
     labels = _labels(db, [t.job_id for t in tasks], user_id)
-    limit = worker_settings.get(db, user_id, spec.kind, "max_attempts")
+    limit = worker_settings.get(db, user_id, spec.settings_kind, "max_attempts")
     found = [row(spec, t, labels.get(t.job_id), now, limit) for t in tasks]
     _mark_retried(db, spec, user_id, found, now)
     counts = {name: sum(r["status"] in members for r in found) for name, members in STATUS_FILTERS.items()}
@@ -285,7 +313,7 @@ def activity(db: Session, user_id: int, kind: str, now: datetime | None = None,
     time and wait. Read from the task rows themselves; bounded."""
     spec, now = kind_of(kind), now or utcnow()
     m = spec.model
-    finished_column = m.finished_at if spec.kind == "tailoring" else m.completed_at
+    finished_column = m.finished_at if spec.tailor else m.completed_at
     start = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=hours - 1)
     buckets = [{"hour": _iso(start + timedelta(hours=i)), "queued": 0, "done": 0, "failed": 0} for i in range(hours)]
 
@@ -295,13 +323,13 @@ def activity(db: Session, user_id: int, kind: str, now: datetime | None = None,
         i = int((at - start).total_seconds() // 3600)
         return buckets[i] if 0 <= i < hours else None
 
-    for (created,) in db.execute(select(m.created_at).where(m.user_id == user_id, m.created_at >= start)
+    for (created,) in db.execute(spec.where(select(m.created_at).where(m.user_id == user_id, m.created_at >= start))
                                  .limit(ACTIVITY_LIMIT)).all():
         if (b := slot(created)) is not None:
             b["queued"] += 1
     runs, waits = [], []
-    finished = db.execute(select(m.status, m.created_at, m.started_at, finished_column)
-                          .where(m.user_id == user_id, finished_column >= start).limit(ACTIVITY_LIMIT)).all()
+    finished = db.execute(spec.where(select(m.status, m.created_at, m.started_at, finished_column)
+                                     .where(m.user_id == user_id, finished_column >= start)).limit(ACTIVITY_LIMIT)).all()
     for status, created, started, ended in finished:
         b = slot(ended)
         if b is None:
@@ -363,14 +391,14 @@ def counts(db: Session, user_id: int, now: datetime | None = None) -> dict[str, 
     out = {}
     for spec in KINDS.values():
         m = spec.model
-        waiting = m.created_at if spec.kind == "tailoring" else m.next_attempt_at  # tailoring has no retry wait
-        tasks = db.execute(select(m.status, waiting, spec.attempts)
-                           .where(m.user_id == user_id, m.status.in_(spec.active)).limit(5000)).all()
+        waiting = m.created_at if spec.tailor else m.next_attempt_at  # tailoring has no retry wait
+        tasks = db.execute(spec.where(select(m.status, waiting, spec.attempts)
+                                      .where(m.user_id == user_id, m.status.in_(spec.active))).limit(5000)).all()
         c = {"running": 0, "queued": 0, "retrying": 0}
         for status, wait_until, attempts in tasks:
             if status == spec.running:
                 c["running"] += 1
-            elif spec.kind != "tailoring" and ((wait_until is not None and wait_until > now) or (attempts or 0) > 0):
+            elif not spec.tailor and ((wait_until is not None and wait_until > now) or (attempts or 0) > 0):
                 c["retrying"] += 1
             else:
                 c["queued"] += 1
@@ -382,7 +410,8 @@ def counts(db: Session, user_id: int, now: datetime | None = None) -> dict[str, 
 # ───────────── controls ─────────────
 
 def _task(db: Session, spec: WorkerKind, user_id: int, task_id: int) -> Any:
-    task = db.scalar(_lock(db, select(spec.model).where(spec.model.id == task_id, spec.model.user_id == user_id)))
+    task = db.scalar(_lock(db, spec.where(select(spec.model).where(spec.model.id == task_id,
+                                                                   spec.model.user_id == user_id))))
     if task is None:
         raise WorkerError("Task not found", 404)
     return task
@@ -391,7 +420,7 @@ def _task(db: Session, spec: WorkerKind, user_id: int, task_id: int) -> Any:
 def _requeue_fresh(db: Session, spec: WorkerKind, task: Any, user_id: int, now: datetime) -> bool:
     """Take the task away from whatever run holds it and put it back at the start of the queue. True if it ran."""
     was_running = task.status == spec.running
-    if spec.kind == "tailoring":
+    if spec.tailor:
         task.status, task.stage, task.attempts = spec.pending, "queued", 0
         task.locked_by = task.lock_expires_at = task.started_at = None
         task.error = None
@@ -419,11 +448,14 @@ def _stop(db: Session, spec: WorkerKind, task: Any, user_id: int, now: datetime)
     The lease goes with it, so a run still talking to a model can no longer write anything (the same guards as
     before); its job is not picked up again by any sweep until someone asks (Retry, Run now, or the job's own
     screen)."""
+    stage = getattr(task, "stage", None)
     was_running = _requeue_fresh(db, spec, task, user_id, now)  # takes the lease away; ranking: job back to waiting
-    if spec.kind == "tailoring":
+    if spec.tailor:
         from app.services.tailor_tasks import DECLINED
 
-        task.status, task.stage, task.error, task.finished_at = "cancelled", "done", STOPPED_BY_USER, now
+        # A run stopped while reviewing keeps that stage, so Reviewing still lists it.
+        task.status, task.error, task.finished_at = "cancelled", STOPPED_BY_USER, now
+        task.stage = "reviewing" if was_running and stage == "reviewing" else "done"
         job = db.scalar(select(Job).where(Job.id == task.job_id, Job.user_id == user_id))
         if job is not None:
             job.auto_tailor_status = DECLINED  # automatic tailoring never queues it again on its own
@@ -449,7 +481,7 @@ def kill(db: Session, user_id: int, kind: str, task_ids: list[int] | None = None
     tasks, and the account's provider cooldowns are cleared too. Commits."""
     spec, now = kind_of(kind), now or utcnow()
     m = spec.model
-    query = select(m).where(m.user_id == user_id, m.status.in_(spec.active))
+    query = spec.where(select(m).where(m.user_id == user_id, m.status.in_(spec.active)))
     if task_ids is not None:
         query = query.where(m.id.in_(task_ids))
     tasks = list(db.scalars(_lock(db, query.order_by(m.id))).all())
@@ -467,7 +499,7 @@ def kill(db: Session, user_id: int, kind: str, task_ids: list[int] | None = None
 
 
 def kill_all(db: Session, user_id: int, now: datetime | None = None) -> dict[str, Any]:
-    results = {kind: kill(db, user_id, kind, None, now) for kind in KINDS}
+    results = {kind: kill(db, user_id, kind, None, now) for kind, spec in KINDS.items() if spec.view_of is None}
     return {"workers": results, "stopped": sum(r["stopped"] for r in results.values()),
             "running": sum(r["running"] for r in results.values()),
             "cooldowns_cleared": sorted({p for r in results.values() for p in r["cooldowns_cleared"]})}
@@ -523,8 +555,8 @@ def retry(db: Session, user_id: int, kind: str, task_ids: list[int], now: dateti
     ids = list(dict.fromkeys(int(i) for i in task_ids))[:RETRY_LIMIT]
     if not ids:
         raise WorkerError("Choose at least one task to retry", 422)
-    tasks = {t.id: t for t in db.scalars(select(spec.model).where(spec.model.user_id == user_id,
-                                                                  spec.model.id.in_(ids))).all()}
+    tasks = {t.id: t for t in db.scalars(spec.where(select(spec.model).where(spec.model.user_id == user_id,
+                                                                             spec.model.id.in_(ids)))).all()}
     retried, skipped = [], []
     for task_id in ids:
         task = tasks.get(task_id)
@@ -566,13 +598,13 @@ def run_now(db: Session, user_id: int, kind: str, task_id: int, now: datetime | 
                               f"({_display_status(spec, latest, now).lower()}); use Run now on that one")
         task = _requeue_finished(db, spec, task, user_id)
     task.run_now_at = now
-    if spec.kind != "tailoring":
+    if not spec.tailor:
         task.next_attempt_at = None
     if spec.kind == "ranking":
         task.force = True  # a ranking the person asked for: the cadence never holds it back
     db.commit()
     labels = _labels(db, [task.job_id], user_id)
-    return row(spec, task, labels.get(task.job_id), now, worker_settings.get(db, user_id, spec.kind, "max_attempts"))
+    return row(spec, task, labels.get(task.job_id), now, worker_settings.get(db, user_id, spec.settings_kind, "max_attempts"))
 
 
 # ───────────── the screen ─────────────
@@ -599,8 +631,8 @@ def summary(db: Session, user_id: int, scheduler: Any = None, now: datetime | No
     return {"generated_at": _iso(now), "cooldowns": backoff.active(db, user_id, now=now),
             "workers": [{"kind": s.kind, "label": s.label, "description": s.description, "node_id": s.node_id,
                          "counts": per_kind[s.kind], "scheduler": scheduler_facts(scheduler, s.scheduler_job),
-                         "paused": not worker_settings.get(db, user_id, s.kind, "auto"),
+                         "paused": not worker_settings.get(db, user_id, s.settings_kind, "auto"), "view_of": s.view_of,
                          "cleared_at": _iso(cleared_at(db, user_id, s.kind))}
                         for s in KINDS.values()],
-            "active": sum(c["active"] for c in per_kind.values()),
-            "running": sum(c["running"] for c in per_kind.values())}
+            "active": sum(per_kind[k]["active"] for k, s in KINDS.items() if s.view_of is None),
+            "running": sum(per_kind[k]["running"] for k, s in KINDS.items() if s.view_of is None)}
