@@ -2005,7 +2005,7 @@ The tools cover jobs **waiting for tailoring**, **waiting for review** and **app
 - **Tailor:** `Tailor the top 5 jobs waiting for tailoring.`
 - **Review:** `Review all tailored applications from today.` (each listed job includes `tailored_at`)
 - **Inspect:** `Why did the Grab job score 78?` (Claude explains from the fit analysis in the context. Jobs outside the two queues are on the Discovery screen.)
-- **Re-rank:** `Re-rank this job using my AI-focused resume.` Re-ranking is not an MCP tool. Make that resume your primary resume in Settings → Resumes, then select the job in the Discovery table and choose **Rank**, or call `POST /api/jobs/{id}/rank`.
+- **Re-rank:** `Re-rank this job using my AI-focused resume.` Re-ranking is not an MCP tool. Make that resume active in Settings → Resumes, then select the job in the Discovery table and choose **Rank**, or call `POST /api/jobs/{id}/rank`.
 - **Failed reviews:** `Show me applications rejected during review because of unsupported claims.` (uses `get_bulk_operation_status` decisions and reasons)
 - **Status:** `Show me the status of my latest bulk tailoring operation.`
 
@@ -2104,7 +2104,7 @@ it is what AI workflows read; only the facts you verify are trusted when generat
         │  deterministic parser (or optional AI re-parse → comparison)
         ▼
  Structured resume ── stable ids, every item UNVERIFIED
-        │  you review, edit and verify in Settings → Resume Data
+        │  you review, edit and verify in Settings → Resumes
         ▼
  Verified facts ──► Evidence Bank (Evidence, source = resume, with provenance)
         │
@@ -2129,11 +2129,17 @@ Generated resume text (tailored variants) is output, never a source of truth.
 
 ### Uploading and reviewing
 
-1. **Settings → Resumes**: upload a PDF, DOCX or TXT. Each upload is a new resume version; uploading the exact same
-   file again reactivates its existing version instead of duplicating it.
-2. **Settings → Resume Data** shows the active version, how much of it is reviewed (verified, needing review, edited,
-   rejected), a per-section and per-role overview, and four tabs: **Structured Data**, **Raw Text**,
-   **Original Resume** and **Change History**.
+1. **Settings → Resumes** is one screen for every resume. Upload a PDF, DOCX or TXT, or add one from pasted text;
+   each becomes a resume of its own, with its file, its structured data and the **target roles** it is for (uploading
+   the exact same file again reuses its resume instead of duplicating it). Each resume in the list shows its file, how
+   much of its data is reviewed, its target roles and the search setups that use it.
+   **One resume is active**, and it is what ranking, tailoring and review use, unless a job's title matches another
+   resume's target roles, or its search setup or you chose another one. Uploading, adding text, editing data or deleting
+   a file never changes the active resume. Only **Make active** does. The one exception is your very first resume,
+   which becomes active on its own.
+2. **Review data** on a resume opens its data below the list, without activating it: how much of it is reviewed
+   (verified, needing review, edited, rejected), a per-section and per-role overview, and four tabs: **Structured
+   Data**, **Raw Text**, **Original Resume** and **Change History**.
 3. Each section (personal information, summary, skills, work experience, projects, education, certifications,
    awards, languages) is a card. Every item — including each achievement or responsibility bullet — shows its status:
    `✓ Verified`, `? Unverified`, `! Edited · needs review` or `✕ Rejected`.
@@ -2190,7 +2196,7 @@ subject. A letter, like a tailored resume, is blocked when nothing is verified (
 
 | Setting | Default | Effect |
 |---|---|---|
-| `allow_unverified_resume_facts` | off | Tailoring, review and follow-ups use verified facts only. With nothing verified, tailoring stops with "Verify your resume in Settings → Resume Data". |
+| `allow_unverified_resume_facts` | off | Tailoring, review and follow-ups use verified facts only. With nothing verified, tailoring stops with "Verify your resume in Settings → Resumes". |
 | `ranking_uses_unverified` | on | Ranking may read unverified parsed facts, sent in a separate `UNVERIFIED RESUME FACTS` section and treated as lower-confidence. |
 
 Rejected facts are never used for generation; the reviewer receives them to flag any reuse.
@@ -2227,7 +2233,7 @@ posting) and `selected_context_tokens` (what it selected), and the LLM call reco
 
 | Route | Purpose |
 |---|---|
-| `GET /api/settings/resume` | active version with structured data and progress, all versions, candidate policy |
+| `GET /api/settings/resume?resume_id=` | the active version, the one being viewed (`current`) with structured data and progress, all versions with the setups that pin them, candidate policy |
 | `PUT /api/settings/resume/policy` | update the candidate policy |
 | `GET /api/resumes/{id}/structured` | structured data, progress, pending re-parse comparison |
 | `PUT /api/resumes/{id}/structured` | save typed structured data: `{revision, data}` (verification fields are ignored) |
@@ -2239,7 +2245,7 @@ posting) and `selected_context_tokens` (what it selected), and the LLM call reco
 | `GET /api/resumes/{id}/raw`, `GET /api/resumes/{id}/original` | raw text, original file |
 | `POST /api/resumes/{id}/reparse` | `{use_ai}`: build a comparison |
 | `POST /api/resumes/{id}/reparse/resolve` | `{decisions: {change_id: keep \| use_new}}` |
-| `POST /api/resumes/{id}/activate`, `POST /api/resumes/{id}/default` | choose the active / default version |
+| `POST /api/resumes/{id}/activate` | make this version the active resume (the only way the selection changes) |
 
 ### Migration
 
@@ -2660,8 +2666,8 @@ LEARN_MIN_DISMISSALS=3
 ### Resume per search and per job, matched by tags
 
 Tag each resume with a **domain** and the **roles** it targets — "Backend: Lead Engineer, Engineering Manager",
-"Product: Associate Product Manager, Product Manager" — in Settings → Resumes (library files) or Settings → Resume Data
-→ Versions. A file and the version it became share one set of tags. The editor suggests roles per domain (Backend,
+"Product: Associate Product Manager, Product Manager" — in Settings → Resumes, on each
+resume (its file and its data share one set of tags). The editor suggests roles per domain (Backend,
 Product, AI / ML, Data, Frontend, Full Stack, DevOps / SRE, Engineering Leadership); anything can be typed.
 
 Every new job gets its resume (`jobs.resume_id`, `jobs.resume_choice`), deterministically and without a model

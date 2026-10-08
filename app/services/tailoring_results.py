@@ -153,6 +153,9 @@ def validate_tailored_resume(db: Session, profile: CandidateProfile, job: Job, d
     `legacy` re-checks content the backend worker produced before bullets carried evidence IDs: citation and
     metric checks are skipped for it because that content never recorded which evidence each bullet used.
     """
+    from app.services import resume_verification as rv
+
+    profile = rv.for_job(db, profile, job)  # checked against the resume this job uses, in the policy's form
     issues: list[dict[str, str]] = []
     master = profile.master_resume or ""
     parsed = parse_resume(master)

@@ -13,10 +13,17 @@ paths check that before creating anything.
 """
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import Any
+
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.models import Job, Resume, SavedSearch, SearchRun
 from app.services import domain_match, jd_recovery, job_description, resume_matching, search_scope
+
+# Jobs whose resume never moves again: what was sent stays what was sent.
+SETTLED_STATUSES = ("approved", "applied")
 
 
 def setup_resume_choice(db: Session, search_run_id: int | None, owner: int) -> tuple[str, int | None]:
@@ -60,3 +67,56 @@ def admit(db: Session, job: Job, *, search_run_id: int | None = None,
     if not jd_recovery.on_new_job(db, job):
         job_description.queue_parse(db, job)
     return "created"
+
+
+def setup_choice(setup: SavedSearch) -> tuple[str, int | None]:
+    """A setup's resume as stored: ("auto" | "active" | "fixed", resume id)."""
+    settings = setup.settings or {}
+    chosen = settings.get("resume_id")
+    mode = settings.get("resume_mode") or ("fixed" if isinstance(chosen, int) else "auto")
+    return mode, chosen if mode == "fixed" and isinstance(chosen, int) else None
+
+
+def setup_jobs(db: Session, setup: SavedSearch) -> list[Job]:
+    """The jobs this setup found whose resume follows the setup: not pinned by the person (USER, ACTIVE), not
+    approved or applied, not hidden."""
+    runs = select(SearchRun.id).where(SearchRun.saved_search_id == setup.id)
+    return list(db.scalars(select(Job).where(
+        Job.search_run_id.in_(runs),
+        or_(Job.resume_choice.is_(None), Job.resume_choice.in_((resume_matching.AUTO, resume_matching.SETUP))),
+        Job.status.not_in(SETTLED_STATUSES),
+        Job.domain_match.is_distinct_from(domain_match.NOT_MATCHING))).all())
+
+
+def repoint_jobs(db: Session, jobs: list[Job], assign: Callable[[Job], None], actor: str) -> dict[str, Any]:
+    """Apply a resume choice to jobs (`assign` sets resume_id / resume_choice). A job whose resume changed is ranked
+    again with it, and a tailored packet needs re-tailoring. Does not commit."""
+    from app.services import ranker
+    from app.services.workflow import NEEDS_RETAILOR
+
+    changed, requeued, skipped = [], [], []
+    policy = None
+    for job in jobs:
+        before = job.resume_id
+        assign(job)
+        if job.resume_id == before:
+            continue
+        changed.append(job.id)
+        if job.status in ("tailored", "pending_approval"):
+            job.status = NEEDS_RETAILOR
+        if job.fit_score is not None or job.state in (ranker.S.RANKED, ranker.S.QUALIFIED, ranker.S.RANK_PENDING):
+            policy = policy or ranker.policy_for(db, job.user_id)
+            why = ranker.queue_job(db, job, policy=policy, actor=actor, reason="resume_changed", force=True)
+            (skipped.append({"id": job.id, "reason": why}) if why else requeued.append(job.id))
+    return {"changed": changed, "ranking_queued": requeued, "ranking_skipped": skipped}
+
+
+def follow_setup(db: Session, setup: SavedSearch, actor: str) -> dict[str, Any]:
+    """After a setup's resume changed: its jobs (setup_jobs) take the setup's choice again — the pinned resume, the
+    active one, or the best-tagged. A job the person pinned themselves keeps its resume. Does not commit."""
+    def assign(job: Job) -> None:
+        job.resume_id, job.resume_choice = None, None
+        choose_resume(db, job, job.search_run_id)
+
+    jobs = setup_jobs(db, setup)
+    return {"jobs": len(jobs), **repoint_jobs(db, jobs, assign, actor)}

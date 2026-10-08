@@ -176,6 +176,9 @@ def skip_tailoring(db: Session, job: Job, progress: Progress = _no_progress) -> 
     """Use the master resume unchanged for a job that needs no tailoring. No AI edits; the reviewer still scores it."""
     profile = rv.for_job(db, get_profile(db), job)
     if not (profile.master_resume or "").strip():
+        if isinstance(profile, rv.JobProfile) and profile.resume_source == "structured":
+            raise ValueError("This resume's structured data is empty: review it in Settings → Resumes, or switch "
+                             "the resume source to the resume text")
         raise ValueError("Add a master resume in Settings before skipping tailoring")
     markdown = render_resume(parse_resume(profile.master_resume), name=profile.name, headline=profile.headline)
     resume = persist_tailored_resume(db, job, {"untailored": True, "summary": "", "skills": [], "experience": [],
@@ -218,8 +221,20 @@ def _role_bullets(parsed: ParsedResume, content: dict) -> dict[int, list[str]]:
     return out
 
 
+def _resume_view(profile: CandidateProfile | rv.JobProfile) -> CandidateProfile | rv.JobProfile:
+    """A profile passed without its view (no job at hand) reads the active resume in the policy's form."""
+    from sqlalchemy.orm import object_session
+
+    if isinstance(profile, rv.JobProfile):
+        return profile
+    db = object_session(profile)
+    return rv.selected(db, profile) if db is not None else profile
+
+
 def edit_slots(profile: CandidateProfile, content: dict) -> tuple[ParsedResume, list[dict]]:
-    """The reviewable units of a tailored resume. Edits and the rebuilt Markdown share this order."""
+    """The reviewable units of a tailored resume. Edits and the rebuilt Markdown share this order. "Before" is the
+    selected resume's document (its structured data, or its text as written: resume_verification.selected)."""
+    profile = _resume_view(profile)
     parsed = parse_resume(profile.master_resume or "")
     primary = (profile.search_preferences or {}).get("primary_skills") or []
     slots = [
@@ -315,25 +330,7 @@ def build_resume_markdown(profile: CandidateProfile, content: dict) -> str:
         if value and value not in bucket:
             bucket.append(value)
     return render_resume(parsed, name=profile.name, headline=profile.headline, summary=summary or None,
-                         top_skills=relevant_skills(parsed, skill_list), role_bullets=role_bullets, highlights=highlights,
-                         role_headings=_role_headings(profile, parsed))
-
-
-def _role_headings(profile: CandidateProfile, parsed: Any) -> dict[int, dict[str, str]]:
-    """The user's verified heading corrections (per the candidate policy's resume source). Best effort: without a
-    session, or on any error, the master resume's own headings are used."""
-    from sqlalchemy.orm import object_session
-
-    from app.services.context_builder import role_headings
-
-    db = object_session(profile)
-    if db is None:
-        return {}
-    try:
-        return role_headings(db, profile, parsed)
-    except Exception:  # noqa: BLE001  a heading correction must never stop a resume from rendering
-        log.warning("could not apply verified role headings", exc_info=True)
-        return {}
+                         top_skills=relevant_skills(parsed, skill_list), role_bullets=role_bullets, highlights=highlights)
 
 
 def update_resume_edit(db: Session, resume: ResumeVariant, index: int, status: str | None, text: str | None) -> None:

@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 from app.auth import get_user_db
 from app.models import Job, Resume
 from app.scheduler_hooks import run_soon
-from app.services import domain_match, feedback_learning, ranker, resume_matching
+from app.services import discovery, domain_match, feedback_learning, resume_matching
 from app.services.user_settings import lock_settings_row, settings_for
 
 router = APIRouter()
@@ -209,28 +209,11 @@ def _apply_choice(db: Session, job: Job, mode: ResumeMode, resume: Resume | None
 
 def _set_resume(db: Session, jobs: list[Job], mode: ResumeMode, resume: Resume | None) -> dict:
     """Point jobs at a resume. A ranked job is ranked again with it; a tailored packet needs re-tailoring."""
-    from app.services.workflow import NEEDS_RETAILOR
-
     if mode == "fixed" and resume is None:
         raise HTTPException(422, "Choose a resume")
-    changed, requeued, skipped = [], [], []
-    policy = None
-    for job in jobs:
-        before = job.resume_id
-        _apply_choice(db, job, mode, resume)
-        if job.resume_id == before:
-            continue
-        changed.append(job.id)
-        if job.status in ("tailored", "pending_approval"):
-            job.status = NEEDS_RETAILOR
-        if job.fit_score is not None or job.state in (ranker.S.RANKED, ranker.S.QUALIFIED, ranker.S.RANK_PENDING):
-            policy = policy or ranker.policy_for(db, job.user_id)
-            why = ranker.queue_job(db, job, policy=policy, actor=f"user:{_user(db)}", reason="resume_changed",
-                                   force=True)
-            (skipped.append({"id": job.id, "reason": why}) if why else requeued.append(job.id))
+    out = discovery.repoint_jobs(db, jobs, lambda job: _apply_choice(db, job, mode, resume), actor=f"user:{_user(db)}")
     db.commit()
-    return {"changed": changed, "ranking_queued": requeued, "ranking_skipped": skipped, "mode": mode,
-            "resume_id": resume.id if resume is not None else None}
+    return {**out, "mode": mode, "resume_id": resume.id if resume is not None else None}
 
 
 @router.put("/api/jobs/{job_id}/resume")

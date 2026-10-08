@@ -4,7 +4,12 @@
 
 Rules this module enforces:
 * Resume versions are never overwritten. An upload or new master text is a new version; re-uploading the same
-  file reactivates its version.
+  file reuses its version.
+* One selection: the active version (Resume.is_active). Only set_active changes it, and only because the person
+  asked; uploads and edits never do (a profile's very first resume is the one exception). The profile's master
+  text and the library's active file are mirrors of it that set_active keeps in step.
+* Every workflow resolves its resume through selected / for_job: the job's own resume, else the active one, in
+  the form the candidate policy's resume source names (structured data, or the raw text as written).
 * Only the user verifies. Every unit starts UNVERIFIED; editing a VERIFIED or REJECTED unit makes it EDITED and
   a VERIFIED resume NEEDS_REVIEW until it is verified again.
 * A parser never overwrites data: re-parsing produces a comparison that the user resolves value by value.
@@ -92,35 +97,36 @@ def ensure_structured(db: Session, resume: Resume) -> dict[str, Any]:
 
 
 def set_active(db: Session, resume: Resume) -> Resume:
-    """Make this version the one AI workflows use. The profile's master text follows it."""
+    """Make this version the active resume: the one selection every AI workflow uses unless a job has its own.
+
+    This is the only function that changes the selection. Its mirrors follow it here and nowhere else: the
+    profile's master text is the active version's raw text, and the library marks the version's file as active.
+    Uploads, text edits and structured edits never call it on their own."""
     for other in db.scalars(select(Resume).where(Resume.candidate_profile_id == resume.candidate_profile_id,
                                                  Resume.is_active.is_(True), Resume.id != resume.id)).all():
         other.is_active = False
     db.flush()
     resume.is_active = True
-    if not db.scalar(select(func.count(Resume.id)).where(Resume.candidate_profile_id == resume.candidate_profile_id,
-                                                         Resume.is_default.is_(True))):
-        resume.is_default = True
     profile = db.get(CandidateProfile, resume.candidate_profile_id)
     if profile is not None and (profile.master_resume or "") != (resume.raw_text or ""):
         profile.master_resume = resume.raw_text or ""
+    for document in db.scalars(select(ResumeDocument).where(ResumeDocument.user_id == resume.user_id)).all():
+        document.active = document.id == resume.resume_document_id
     db.flush()
     return resume
 
 
-def set_default(db: Session, resume: Resume) -> Resume:
-    for other in db.scalars(select(Resume).where(Resume.candidate_profile_id == resume.candidate_profile_id,
-                                                 Resume.is_default.is_(True), Resume.id != resume.id)).all():
-        other.is_default = False
-    db.flush()
-    resume.is_default = True
-    db.flush()
-    return resume
+def has_active(db: Session, profile: CandidateProfile) -> bool:
+    return db.scalar(select(func.count(Resume.id)).where(Resume.candidate_profile_id == profile.id,
+                                                         Resume.is_active.is_(True))) > 0
 
 
 def record_version(db: Session, profile: CandidateProfile, raw_text: str, *, document: ResumeDocument | None = None,
-                   source: str = "upload", name: str | None = None, activate: bool = True) -> Resume:
-    """The version for this text (and file). An identical file or text reuses its version; nothing is overwritten."""
+                   source: str = "upload", name: str | None = None, activate: bool = False) -> Resume:
+    """The version for this text (and file). An identical file or text reuses its version; nothing is overwritten.
+
+    A new version never becomes active by itself (`activate` is for an explicit choice): the person's selection
+    stays as it is. The one exception is a profile with no active resume yet, whose first resume is used."""
     digest = sr.text_hash(raw_text)
     query = select(Resume).where(Resume.candidate_profile_id == profile.id)
     existing = None
@@ -132,59 +138,99 @@ def record_version(db: Session, profile: CandidateProfile, raw_text: str, *, doc
         if document is not None and existing.resume_document_id is None:
             existing.resume_document_id = document.id
             existing.source_storage_path = existing.source_storage_path or document.storage_path
+            existing.source_filename = existing.source_filename or document.original_filename
+            existing.source_media_type = existing.source_media_type or document.media_type
+            existing.source_file_hash = existing.source_file_hash or document.checksum
         ensure_structured(db, existing)
-        return set_active(db, existing) if activate else existing
-    version = (db.scalar(select(func.max(Resume.version)).where(Resume.candidate_profile_id == profile.id)) or 0) + 1
-    resume = Resume(user_id=profile.user_id, candidate_profile_id=profile.id, version=version, source=source,
-                    name=(name or (document.original_filename if document else "Master resume text"))[:300],
-                    resume_document_id=document.id if document else None,
-                    source_filename=document.original_filename if document else None,
-                    source_media_type=document.media_type if document else None,
-                    source_file_hash=document.checksum if document else None,
-                    source_storage_path=document.storage_path if document else None,
-                    raw_text=raw_text, raw_text_hash=digest, revision=0, is_active=False, is_default=False,
-                    verification_status="UNVERIFIED", created_at=utcnow(), updated_at=utcnow())
-    db.add(resume)
-    db.flush()
-    ensure_structured(db, resume)
-    return set_active(db, resume) if activate else resume
+        resume = existing
+    else:
+        version = (db.scalar(select(func.max(Resume.version)).where(Resume.candidate_profile_id == profile.id)) or 0) + 1
+        resume = Resume(user_id=profile.user_id, candidate_profile_id=profile.id, version=version, source=source,
+                        name=(name or (document.original_filename if document else "Master resume text"))[:300],
+                        resume_document_id=document.id if document else None,
+                        source_filename=document.original_filename if document else None,
+                        source_media_type=document.media_type if document else None,
+                        source_file_hash=document.checksum if document else None,
+                        source_storage_path=document.storage_path if document else None,
+                        raw_text=raw_text, raw_text_hash=digest, revision=0, is_active=False, is_default=False,
+                        verification_status="UNVERIFIED", created_at=utcnow(), updated_at=utcnow())
+        db.add(resume)
+        db.flush()
+        ensure_structured(db, resume)
+    if activate or not has_active(db, profile):
+        return set_active(db, resume)
+    if resume.is_active:
+        return resume
+    if document is not None:  # an inactive version's file is not the active one in the library either
+        document.active = False
+        db.flush()
+    return resume
 
 
 def active_resume(db: Session, profile: CandidateProfile, create: bool = True) -> Resume | None:
-    """The active version, parsed. Legacy profiles with master text but no version get one on first use."""
+    """The active version, parsed.
+
+    Only a legacy profile that has master text but no version at all gets one here. A profile with versions keeps
+    the one the person made active, whatever its master text says: the text is a mirror, never a selection."""
     resume = db.scalar(select(Resume).where(Resume.candidate_profile_id == profile.id, Resume.is_active.is_(True)))
-    text = profile.master_resume or ""
-    # No version yet, or the master text was changed outside this module: that text is a version of its own.
-    if create and text.strip() and (resume is None or (resume.raw_text or "") != text):
-        resume = _record_text_version(db, profile, text)
+    if resume is None and create:
+        newest = db.scalar(select(Resume).where(Resume.candidate_profile_id == profile.id)
+                           .order_by(desc(Resume.version)).limit(1))
+        if newest is not None:
+            resume = set_active(db, newest)  # versions but none active (an old delete): the newest is used
+        elif (profile.master_resume or "").strip():
+            # The uploaded file this text came from, when there is one: the version keeps it as its original.
+            text = profile.master_resume.strip()
+            documents = db.scalars(select(ResumeDocument).where(ResumeDocument.user_id == profile.user_id)
+                                   .order_by(desc(ResumeDocument.active), desc(ResumeDocument.id))).all()
+            document = next((d for d in documents if (d.extracted_text or "").strip() == text), None)
+            resume = _record_text_version(db, profile, profile.master_resume, document=document)
     if resume is not None:
         ensure_structured(db, resume)
     return resume
 
 
 class JobProfile:
-    """The candidate profile as one job sees it: `master_resume` is the text of the resume chosen for that job
-    (Job.resume_id, set from its saved search or by the person), everything else is the real profile.
+    """The candidate profile as one workflow sees it.
 
-    Workflows wrap the profile once (for_job) and pass the view on, so a chosen resume reaches every place that reads
-    the master text or the active version, without a second code path. The view never changes which resume is
-    active, and it cannot rewrite the master text."""
+    `chosen_resume` is the resume version the workflow uses: the job's own (Job.resume_id, pinned by its search
+    setup or by the person, or matched by tags), else the active one. `master_resume` is that version's document as
+    the candidate policy's resume source says: its structured data rendered as a resume ("structured", the
+    default) or its raw text as written ("master_text"). Everything else is the real profile.
 
-    def __init__(self, profile: CandidateProfile, resume: Resume):
+    Workflows resolve the view once (selected / for_job) and pass it on, so every place that reads the master text
+    or the version reads the same resume in the same form, without a second code path. The view never changes which
+    resume is active, and it cannot rewrite the master text."""
+
+    def __init__(self, profile: CandidateProfile, resume: Resume, source: str = "structured"):
         object.__setattr__(self, "_profile", profile)
         object.__setattr__(self, "chosen_resume", resume)
+        object.__setattr__(self, "resume_source", source)
+        object.__setattr__(self, "_document", None)
+
+    @property
+    def raw_text(self) -> str:
+        """The chosen version's text as written: what identifies the resume (ranking hashes it)."""
+        return self.chosen_resume.raw_text or ""
 
     @property
     def master_resume(self) -> str:
-        return self.chosen_resume.raw_text or ""
+        if self.resume_source == "master_text":
+            return self.raw_text
+        if self._document is None:
+            object.__setattr__(self, "_document", sr.render_document(self.chosen_resume.structured_data))
+        return self._document
 
     def __getattr__(self, name: str):
         return getattr(self._profile, name)
 
     def __setattr__(self, name: str, value) -> None:
         if name == "master_resume":
-            raise AttributeError("A job's view of the profile cannot change the master resume")
+            raise AttributeError("A workflow's view of the profile cannot change the master resume")
         setattr(self._profile, name, value)
+
+
+ResumeView = JobProfile
 
 
 def chosen_resume(db: Session, profile: CandidateProfile, job) -> Resume | None:
@@ -196,20 +242,40 @@ def chosen_resume(db: Session, profile: CandidateProfile, job) -> Resume | None:
     return resume if resume is not None and resume.candidate_profile_id == getattr(profile, "id", None) else None
 
 
-def for_job(db: Session, profile: CandidateProfile | None, job) -> CandidateProfile | JobProfile | None:
-    """The profile to use for this job's ranking, tailoring or review. Unchanged unless the job chose a resume other
-    than the active one."""
-    if profile is None or job is None or isinstance(profile, JobProfile):
+def selected(db: Session, profile: CandidateProfile | JobProfile | None, job=None) -> CandidateProfile | JobProfile | None:
+    """The one resolver for which resume a workflow uses, and in what form.
+
+        the job's own resume (Job.resume_id)  →  else the active version
+        resume source "structured"            →  its structured data, rendered    (JobProfile.master_resume)
+        resume source "master_text"           →  its raw text as written
+
+    Returns the profile unchanged only when it has no resume at all."""
+    from app.services.user_settings import candidate_policy
+
+    if profile is None or isinstance(profile, JobProfile):
         return profile
-    resume = chosen_resume(db, profile, job)
-    if resume is None or resume.is_active:
+    resume = chosen_resume(db, profile, job) if job is not None else None
+    resume = resume or active_resume(db, profile)
+    if resume is None:
         return profile
     ensure_structured(db, resume)
-    return JobProfile(profile, resume)
+    return JobProfile(profile, resume, candidate_policy(db, profile.user_id)["resume_source"])
+
+
+def for_job(db: Session, profile: CandidateProfile | JobProfile | None, job) -> CandidateProfile | JobProfile | None:
+    """The profile to use for this job's ranking, tailoring or review (see selected)."""
+    if job is None:
+        return selected(db, profile)
+    return selected(db, profile, job)
+
+
+def raw_text(profile: CandidateProfile | JobProfile) -> str:
+    """The selected resume's text as written, whatever the resume source."""
+    return profile.raw_text if isinstance(profile, JobProfile) else profile.master_resume or ""
 
 
 def resume_for(db: Session, profile: CandidateProfile | JobProfile, create: bool = True) -> Resume | None:
-    """The resume version a workflow reads: the job's chosen one through a JobProfile, otherwise the active one."""
+    """The resume version a workflow reads: the view's chosen one, otherwise the active one."""
     if isinstance(profile, JobProfile):
         return profile.chosen_resume
     return active_resume(db, profile, create=create)
@@ -278,11 +344,22 @@ def version_of_document(db: Session, profile: CandidateProfile, document: Resume
     return record_version(db, profile, document.extracted_text or "", document=document, activate=False)
 
 
-def _record_text_version(db: Session, profile: CandidateProfile, text: str) -> Resume:
+def save_text_version(db: Session, profile: CandidateProfile, text: str) -> Resume | None:
+    """Resume text typed or pasted in Settings: its own version (or the existing one with the same text). It does
+    not become active and does not change the master text; the person makes it active when they want it used."""
+    text = sr.clean_raw_text(text or "")
+    if not text.strip():
+        return None
+    return _record_text_version(db, profile, text)
+
+
+def _record_text_version(db: Session, profile: CandidateProfile, text: str,
+                         document: ResumeDocument | None = None) -> Resume:
     """record_version that tolerates another worker creating the same version at the same moment."""
     try:
         with db.begin_nested():
-            return record_version(db, profile, text, source="manual_text")
+            return record_version(db, profile, text, document=document,
+                                  source="upload" if document is not None else "manual_text")
     except IntegrityError:
         found = db.scalar(select(Resume).where(Resume.candidate_profile_id == profile.id,
                                                Resume.raw_text_hash == sr.text_hash(text))

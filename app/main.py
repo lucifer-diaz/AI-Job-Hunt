@@ -813,13 +813,23 @@ def profile_get(db: Session = Depends(get_user_db)):
 def profile_put(payload: ProfileIn, db: Session = Depends(get_user_db)):
     p = get_profile(db)
     values = payload.model_dump(exclude_none=True)
+    text = values.pop("master_resume", None)
     for key, value in values.items():
         setattr(p, key, value)
-    if "master_resume" in values:
-        db.flush()
-        resume_verification.active_resume(db, p)  # edited master text becomes its own resume version
+    created = _save_resume_text(db, p, text)
     db.commit()
-    return {"ok": True}
+    return {"ok": True, **created}
+
+
+def _save_resume_text(db: Session, profile: CandidateProfile, text: str | None) -> dict:
+    """Edited resume text is a new version of its own. It is never made active here and never written over the
+    master text, which mirrors the active version (resume_verification.set_active)."""
+    if text is None or text.strip() == (profile.master_resume or "").strip():
+        return {}
+    db.flush()
+    version = resume_verification.save_text_version(db, profile, text)
+    return {"created_resume_id": version.id, "created_resume_version": version.version,
+            "created_resume_active": version.is_active} if version is not None else {}
 
 
 @app.patch("/api/profile")
@@ -830,13 +840,12 @@ def profile_patch(payload: ProfilePatch, db: Session = Depends(get_user_db)):
     changes = payload.model_dump(exclude_unset=True)
     if "search_preferences" in changes:
         changes["search_preferences"] = {**(row.search_preferences or {}), **changes["search_preferences"]}
+    text = changes.pop("master_resume", None)
     for key, value in changes.items():
         setattr(row, key, value)
-    if "master_resume" in changes:
-        db.flush()
-        resume_verification.active_resume(db, row)  # edited master text becomes its own resume version
+    created = _save_resume_text(db, row, text)
     db.commit()
-    return profile_get(db)
+    return {**profile_get(db), **created}
 
 
 @app.post("/api/profile/resume")
@@ -869,26 +878,24 @@ async def resume_upload(file: UploadFile = File(...), db: Session = Depends(get_
     root.mkdir(parents=True, exist_ok=True)
     path = root / digest
     path.write_bytes(data)
-    for old in db.scalars(select(ResumeDocument).where(ResumeDocument.active.is_(True))).all():
-        old.active = False
     document = ResumeDocument(original_filename=Path(file.filename or "resume").name,
                               media_type=file.content_type, storage_path=str(path), checksum=digest,
-                              size=len(data), extracted_text=extracted, active=True)
+                              size=len(data), extracted_text=extracted, active=False)
     existing = db.scalar(select(ResumeDocument).where(ResumeDocument.checksum == digest))
     if existing:
-        existing.active, existing.extracted_text, existing.storage_path = True, extracted, str(path)
+        existing.extracted_text, existing.storage_path = extracted, str(path)
         document = existing
     else:
         db.add(document)
     profile = get_profile(db)
-    profile.master_resume = extracted
     db.flush()
-    # A new resume version (or the existing one for this exact file), parsed and unverified until reviewed.
+    # A new resume version (or the existing one for this exact file), parsed and unverified until reviewed. It does
+    # not replace the active resume: only the account's first resume becomes active by itself.
     version = resume_verification.record_version(db, profile, extracted, document=document, source="upload")
     db.commit()
     db.refresh(document)
     return {"id": document.id, "filename": document.original_filename, "size": document.size,
-            "resume_id": version.id, "resume_version": version.version}
+            "resume_id": version.id, "resume_version": version.version, "is_active": version.is_active}
 
 
 @app.get("/api/profile/resume")

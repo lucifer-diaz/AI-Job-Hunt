@@ -26,7 +26,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validat
 
 from app.services.resume_format import BULLET_RE, parse_resume, to_plain
 
-PARSER_VERSION = "d1"
+PARSER_VERSION = "d2"  # d2: a bracket that belongs to an employer ("Zendrive (India)") is kept
 ITEM_STATUSES = ("UNVERIFIED", "VERIFIED", "REJECTED", "EDITED")
 REVIEWED = ("VERIFIED", "REJECTED")
 SECTIONS = ("personal_information", "summary", "skills", "experience", "projects", "education", "certifications",
@@ -319,6 +319,17 @@ def _section_kind(title: str, kind: str) -> str:
     return next((name for name, words in EXTRA_KINDS if any(w in lowered for w in words)), "other")
 
 
+def _trim_part(part: str) -> str:
+    """A heading part without separators and the brackets a removed date left behind ("(Jan 2020 - 2022)"). A
+    bracket that belongs to the value ("Zendrive (India)") stays."""
+    part = re.sub(r"\(\s*\)", "", part).strip(" ,-–—")
+    while part.startswith("(") and part.count("(") > part.count(")"):
+        part = part[1:].strip(" ,-–—")
+    while part.endswith(")") and part.count(")") > part.count("("):
+        part = part[:-1].strip(" ,-–—")
+    return part
+
+
 def _role_fields(header: str) -> dict[str, Any]:
     dates = DATE_RANGE_RE.search(header)
     raw_start = dates.group("start") if dates else None
@@ -330,7 +341,7 @@ def _role_fields(header: str) -> dict[str, Any]:
         rest = header[:dates.start()] + header[dates.end():]
     elif raw_start:
         rest = header.replace(raw_start, "")
-    parts = [p.strip(" ,-–—()") for p in rest.split("|")]
+    parts = [_trim_part(p) for p in rest.split("|")]
     parts = [p for p in parts if p]
     if len(parts) == 1:
         single_part = parts[0]
@@ -733,6 +744,113 @@ def from_parser_output(structured: dict[str, Any]) -> dict[str, Any]:
         "certifications": data.get("certifications") or [], "awards": awards, "languages": languages,
         "additional_information": [a if isinstance(a, (str, dict)) else str(a)
                                    for a in data.get("additional_information") or []]})
+
+
+MONTH_NAMES = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def _display_date(value: str | None, raw: str | None) -> str:
+    """A date as the resume shows it: the text as written while it still says the same thing, else the corrected
+    YYYY-MM as "Mon YYYY"."""
+    raw = (raw or "").strip()
+    if not value:
+        return raw
+    if raw and normalize_date(raw)[0] == value:
+        return raw
+    match = re.fullmatch(r"(\d{4})-(\d{2})", value)
+    return f"{MONTH_NAMES[int(match.group(2)) - 1]} {match.group(1)}" if match and 1 <= int(match.group(2)) <= 12 \
+        else value
+
+
+def display_dates(item: dict[str, Any]) -> str:
+    start = _display_date(item.get("start_date"), item.get("raw_start_date"))
+    end = "Present" if item.get("is_current") else _display_date(item.get("end_date"), item.get("raw_end_date"))
+    return " - ".join(part for part in (start, end) if part)
+
+
+def _ordered_bullets(role: dict[str, Any], keep) -> list[str]:
+    """A role's bullets in the order the resume wrote them (raw_bullets); bullets added later come last."""
+    bullets = [b for b in (role.get("achievements") or []) + (role.get("responsibilities") or [])
+               if isinstance(b, dict) and (b.get("text") or "").strip() and keep(b)]
+    written = {text: index for index, text in enumerate(role.get("raw_bullets") or [])}
+    return [b["text"].strip() for b in sorted(bullets, key=lambda b: written.get(b["text"], len(written)))]
+
+
+def render_document(data: dict[str, Any] | None) -> str:
+    """The structured data as a resume document in the dialect resume_format.parse_resume reads.
+
+    Used when the candidate policy's resume source is "structured": tailoring, review and every rendered resume
+    then show the data as the person corrected it (titles, employers, dates, education), never the raw text. Only
+    REJECTED units are left out; what the Tailor may *claim* is governed separately by the candidate policy.
+    Roles keep their stored order, so a role's index here is its index in data["experience"] minus rejected roles.
+    """
+    if not data:
+        return ""
+
+    def keep(node: dict[str, Any]) -> bool:
+        return ((node.get("verification") or {}).get("status") or "UNVERIFIED") != "REJECTED"
+
+    out: list[str] = []
+    personal = data.get("personal_information") or {}
+    if keep(personal):
+        if personal.get("full_name"):
+            out.append(f"# {personal['full_name']}")
+        if personal.get("headline"):
+            out.append(personal["headline"])
+        contact = [personal.get(k) for k in ("location", "email", "phone", "linkedin", "github", "portfolio")]
+        contact += list(personal.get("other_links") or [])
+        if any(contact):
+            out.append(" | ".join(str(c) for c in contact if c))
+    summary = data.get("summary") or {}
+    if summary.get("text") and keep(summary):
+        out += ["", "## Summary", summary["text"].strip()]
+    skills = [s for s in data.get("skills") or [] if keep(s) and s.get("name")]
+    if skills:
+        groups: dict[str, list[str]] = {}
+        for skill in skills:
+            groups.setdefault((skill.get("category") or "").strip(), []).append(skill["name"])
+        out += ["", "## Skills", *[f"- {label}: {', '.join(names)}" if label else f"- {', '.join(names)}"
+                                   for label, names in groups.items()]]
+    roles = [r for r in data.get("experience") or [] if keep(r)]
+    if roles:
+        out += ["", "## Experience"]
+        for role in roles:
+            title = (role.get("job_title") or "").strip() or (role.get("company") or "").strip() or "Role"
+            company = (role.get("company") or "").strip() if role.get("job_title") else ""
+            location, dates = (role.get("location") or "").strip(), display_dates(role)
+            if company and dates:  # "Title | Company | [Location |] Dates": the layout parse_resume reads by position
+                out += ["", f"### {' | '.join(p for p in (title, company, location, dates) if p)}"]
+            else:  # without an employer or dates, the rest goes under the heading so no part lands in the wrong place
+                out += ["", f"### {' | '.join(p for p in (title, company) if p)}"]
+                if dates:
+                    out.append(dates)
+            out += [f"- {text}" for text in _ordered_bullets(role, keep)]
+    projects = [p for p in data.get("projects") or [] if keep(p) and (p.get("name") or p.get("description"))]
+    if projects:
+        out += ["", "## Projects"]
+        for project in projects:
+            head = ": ".join(part for part in ((project.get("name") or "").strip(),
+                                                (project.get("description") or "").strip()) if part)
+            out.append(head)
+            out += [f"- {b['text'].strip()}" for b in project.get("achievements") or []
+                    if isinstance(b, dict) and (b.get("text") or "").strip() and keep(b)]
+    education = [e for e in data.get("education") or [] if keep(e)]
+    if education:
+        out += ["", "## Education"]
+        for entry in education:
+            degree = ", ".join(p for p in (entry.get("degree"), entry.get("field_of_study")) if p)
+            out.append(" | ".join(p for p in (degree, entry.get("institution"), entry.get("university"),
+                                              entry.get("location"), display_dates(entry), entry.get("grade")) if p))
+    for label, section, fields in (("Certifications", "certifications", ("name", "issuer", "issue_date")),
+                                   ("Awards", "awards", ("title", "issuer", "date")),
+                                   ("Languages", "languages", ("name", "proficiency"))):
+        items = [i for i in data.get(section) or [] if keep(i)]
+        if items:
+            out += ["", f"## {label}", *[" | ".join(str(i[f]) for f in fields if i.get(f)) for i in items]]
+    extra = [i.get("text") for i in data.get("additional_information") or [] if keep(i) and i.get("text")]
+    if extra:
+        out += ["", "## Additional Information", *extra]
+    return "\n".join(out).strip() + "\n" if out else ""
 
 
 def render_text(data: dict[str, Any], *, statuses: tuple[str, ...] = REVIEWED[:1]) -> str:

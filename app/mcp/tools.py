@@ -164,8 +164,9 @@ def list_jobs_for_tailoring(db: Session, minimum_fit_score: float | None = None,
 def get_tailoring_context(db: Session, job_ids: list[int]) -> dict[str, Any]:
     ids = _job_ids(job_ids, tailor_limit(), "MCP_BULK_TAILOR_LIMIT")
     profile, facts = _profile_payload(db)
-    _require_resume(profile)
-    parsed = parse_resume(profile.master_resume)
+    active = rv.selected(db, profile)  # the active resume, in the form the candidate policy's resume source names
+    _require_resume(active)
+    parsed = parse_resume(active.master_resume)
     jobs = []
     for job_id in ids:
         job = db.get(Job, job_id)
@@ -197,7 +198,9 @@ def get_tailoring_context(db: Session, job_ids: list[int]) -> dict[str, Any]:
     # resume (chosen for its search, or by the person) carries its own `resume`, which replaces active_resume for it.
     return {"ok": True, "prompt_version": MCP_TAILORING_PROMPT_VERSION, "rules": list(TAILORING_RULES),
             "candidate_profile": facts,
-            "active_resume": {"text": profile.master_resume,
+            "active_resume": {"text": active.master_resume,
+                              "resume_id": getattr(getattr(active, "chosen_resume", None), "id", None),
+                              "source": getattr(active, "resume_source", "master_text"),
                               "roles": [{"role_index": i, "title": r.title, "company": r.company, "dates": r.dates,
                                          "bullets": r.bullets} for i, r in enumerate(parsed.roles)]},
             "jobs": jobs}
@@ -205,10 +208,10 @@ def get_tailoring_context(db: Session, job_ids: list[int]) -> dict[str, Any]:
 
 def _job_resume(db: Session, profile: Any, job: Job) -> dict[str, Any]:
     view = rv.for_job(db, profile, job)
-    if view is profile:
-        return {}
+    chosen = getattr(view, "chosen_resume", None)
+    if chosen is None or chosen.is_active:
+        return {}  # the job uses the active resume, sent once as active_resume
     parsed = parse_resume(view.master_resume)
-    chosen = view.chosen_resume
     return {"resume": {"resume_id": chosen.id, "name": chosen.name or f"Version {chosen.version}",
                        "note": "Tailor this job from this resume, not active_resume",
                        "text": view.master_resume,

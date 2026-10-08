@@ -10,6 +10,7 @@ from app.main import app
 from app.models import TailorTask
 from app.services import tailor_tasks
 from app.settings import get_settings
+from tests.resume_support import use_resume_text
 
 client = TestClient(app)
 
@@ -36,8 +37,7 @@ def tasks_by_job():
 
 
 def test_tasks_queue_run_in_the_background_and_report_progress(monkeypatch):
-    assert client.put("/api/profile", json={"name": "Test Candidate", "headline": "Engineer",
-                                            "master_resume": "Built Python FastAPI services at 10k rps"}).status_code == 200
+    use_resume_text(client, "Built Python FastAPI services at 10k rps", name="Test Candidate", headline="Engineer")
     first, second, broken, skip = (shortlisted_job() for _ in range(4))
     not_shortlisted = client.post("/api/jobs/from-url", json={
         "url": f"https://example.com/jobs/{uuid.uuid4().hex}", "title": "Engineer", "company": "Other",

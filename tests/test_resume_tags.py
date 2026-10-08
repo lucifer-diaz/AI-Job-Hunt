@@ -208,7 +208,8 @@ def test_deleting_a_version_undoes_everything_that_pointed_at_it(user, tagged_re
                                                                        "claim": "Built Python services"}}
                         if (data or {}).get("marker") == "backend" else {})
     out = client.delete(f"/api/resumes/{product}").json()
-    assert out == {"deleted": product, "jobs": 1, "saved_searches": 1, "evidence_relinked": 1, "evidence_retired": 1}
+    assert out == {"deleted": product, "file_deleted": False, "jobs": 1, "saved_searches": 1, "evidence_relinked": 1,
+                   "evidence_retired": 1}, "a resume made from text has no file to remove"
     job = job_of(job_id)
     assert (job.resume_id, job.resume_choice) == (None, None), "back to matching by tags"
     with SessionLocal() as db:

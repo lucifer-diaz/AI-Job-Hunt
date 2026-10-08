@@ -395,6 +395,11 @@ p.settings-help{margin:10px 0}
 .settings-resume .grow{min-width:0}
 .settings-resume strong{display:block;font-size:13px;font-weight:500;overflow-wrap:anywhere}
 .settings-resume p{font-size:11px;color:var(--muted);line-height:1.5;margin:5px 0 0}
+.rd-resume .grow strong{display:inline}
+.rd-roles{margin-top:10px}
+.rd-resume{align-items:flex-start}
+.rd-resume.is-viewing{background:var(--brand-softer);box-shadow:inset 3px 0 0 var(--brand);padding-left:12px;padding-right:12px;border-radius:10px}
+.rd-header .settings-eyebrow{display:block;margin-bottom:4px}
 .settings-file-icon{background:var(--brand-softer);border:1px solid var(--brand-line);width:42px;height:48px;display:grid;place-items:center;flex-shrink:0;border-radius:8px;font-family:var(--mono);font-size:10px;color:var(--brand-ink)}
 .settings-upload{position:relative;display:flex;flex-direction:column;align-items:center;gap:7px;border:1px dashed var(--brand-line);background:var(--brand-softer);padding:24px 16px;border-radius:10px;margin-top:20px;cursor:pointer;color:var(--brand-ink);text-align:center}
 .settings-upload strong{font-size:13px;font-weight:500}

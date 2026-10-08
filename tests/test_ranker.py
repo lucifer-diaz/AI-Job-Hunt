@@ -22,6 +22,7 @@ from app.main import app
 from app.models import (AppSetting, CandidateProfile, Evidence, Job, JobRanking, JobRankingTask, ResumeDocument,
                         ResumeVersion, WorkflowTransition)
 from app.prompts.ranking import RANKING_PROMPT_VERSION
+from app.services import resume_verification as rv
 from app.services import ranker
 from app.services import scheduled_jobs as sj
 from app.services.lifecycle import ErrorCategory
@@ -631,8 +632,9 @@ def test_resume_profile_and_prompt_changes_create_new_versions_and_keep_history(
     rank(pg_sessions)
     assert rank(pg_sessions)["skipped"] == "Nothing to rank"  # nothing changed
 
-    with pg_sessions() as db:
-        db.scalar(select(CandidateProfile).where(CandidateProfile.user_id == owner)).master_resume = RESUME + " Go too."
+    with pg_sessions() as db:  # a new resume, made active (writing the master text is not a selection)
+        profile = db.scalar(select(CandidateProfile).where(CandidateProfile.user_id == owner))
+        rv.set_active(db, rv.record_version(db, profile, RESUME + " Go too.", source="manual_text"))
         db.commit()
     model.answer(job_id, {"resume_fit_score": 81})
     result = rank(pg_sessions)

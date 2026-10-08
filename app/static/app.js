@@ -236,8 +236,7 @@ const LOADERS = {
   async settings() {
     D.settingsLoadError = '';
     try {
-      [D.profile, D.settings, D.prefs, D.resumes] = await Promise.all([
-        api('/api/profile'), api('/api/settings'), api('/api/preferences'), api('/api/profile/resumes')]);
+      [D.profile, D.settings, D.prefs] = await Promise.all([api('/api/profile'), api('/api/settings'), api('/api/preferences')]);
     } catch (err) { D.settingsLoadError = err.message; throw err; }
   },
 };
@@ -1792,6 +1791,9 @@ async function saveSetup() {
   if (!setup) return createSetup();
   flushTagDrafts();
   const out = await api(`/api/search/setups/${setup.id}`, { method: 'PUT', body: setupPayload() });
+  // A changed resume: the jobs this setup found follow it (not the ones you pinned yourself, approved or applied).
+  const moved = out.resume_jobs?.changed?.length || 0;
+  if (moved) toast(`${moved} job${moved === 1 ? '' : 's'} from this setup now use${moved === 1 ? 's' : ''} its resume${out.resume_jobs.ranking_queued?.length ? ` · ${out.resume_jobs.ranking_queued.length} queued for ranking again` : ''}`);
   return adoptSetup(out.setup);
 }
 async function createSetup(body) {
@@ -1917,7 +1919,7 @@ const A = {
     const url = el.dataset.kind === 'file' ? `/api/profile/resumes/${el.dataset.id}/tags` : `/api/resumes/${el.dataset.id}/tags`;
     const out = await api(url, { method: 'PUT', body });
     S.tagEdit = null; delete S.forms.rtag; D.resumeChoices = null;
-    [D.resumes, D.resumeData] = await Promise.all([api('/api/profile/resumes').catch(() => D.resumes), api('/api/settings/resume').catch(() => D.resumeData)]);
+    D.resumeData = await api(rdResumeUrl()).catch(() => D.resumeData);  // the resume being reviewed stays open
     return out;
   }, 'Tags saved — new jobs are matched with them'),
   'resume-rematch': () => busy('resumeRematch', async () => {

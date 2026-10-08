@@ -183,7 +183,7 @@ def ai_ready(db: Session, user_id: int) -> tuple[bool, str]:
 
 # CandidatePolicy: how AI workflows may use resume facts the user has not verified.
 # Where AI workflows take the candidate's resume from (CandidatePolicy.resume_source):
-#   structured   the facts in Settings → Resume Data. Verified corrections win, headings included.
+#   structured   the facts in Settings → Resumes. Verified corrections win, headings included.
 #   master_text  the master resume text as written: its role headings and bullets, used as-is.
 RESUME_SOURCES = ("structured", "master_text")
 CANDIDATE_POLICY_DEFAULTS = {

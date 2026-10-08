@@ -44,7 +44,9 @@ def test_profile_patch_preserves_other_sections(account):
     assert result['target_roles'] == ['Lead']
     assert result['search_preferences'] == {**initial['search_preferences'], 'notice_period': '0'}
     cleared = client.patch('/api/profile', json={'target_roles': [], 'master_resume': ''}).json()
-    assert cleared['target_roles'] == [] and cleared['master_resume'] == ''
+    # Blank text is not a resume: the active one stays (the master text mirrors it) and no version is created.
+    assert cleared['target_roles'] == [] and cleared['master_resume'] == 'Newest resume'
+    assert 'created_resume_id' not in cleared
 
 
 @pytest.mark.parametrize('body', [{'name': None}, {'master_resume': None},
@@ -335,14 +337,18 @@ def test_login_session_failure_rolls_back_last_login_update(account, monkeypatch
         assert len(db.scalars(select(UserSession).where(UserSession.user_id == user_id)).all()) == 1
 
 
-def test_deleting_the_only_resume_preserves_saved_master_text(account):
+def test_deleting_the_only_file_keeps_the_active_resume_and_the_saved_text(account):
     client, _, _ = account
     uploaded = client.post('/api/profile/resume', files={
         'file': ('only.txt', b'Uploaded text', 'text/plain')})
-    assert uploaded.status_code == 200
-    client.patch('/api/profile', json={'master_resume': 'Edited saved text'})
+    assert uploaded.status_code == 200 and uploaded.json()['is_active'] is True, 'the first resume is used'
+    edited = client.patch('/api/profile', json={'master_resume': 'Edited saved text'}).json()
+    assert edited['created_resume_active'] is False and edited['master_resume'] == 'Uploaded text'
     deleted = client.delete(f"/api/profile/resumes/{uploaded.json()['id']}")
     assert deleted.status_code == 200
     assert deleted.json()['promoted'] is None
     assert deleted.json()['resumes'] == []
-    assert client.get('/api/profile').json()['master_resume'] == 'Edited saved text'
+    # The file is gone; its resume version (still the active one) and the edited text's version are not.
+    assert client.get('/api/profile').json()['master_resume'] == 'Uploaded text'
+    versions = client.get('/api/settings/resume').json()['versions']
+    assert [(v['source'], v['is_active']) for v in versions] == [('manual_text', False), ('upload', True)]

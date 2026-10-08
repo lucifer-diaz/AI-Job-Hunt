@@ -1,5 +1,5 @@
-"""The candidate policy picks where AI takes the resume from: the structured data (the user's verified corrections
-win, role headings included) or the master resume text as written."""
+"""The candidate policy picks where AI takes the resume from: the structured data (the resume document is rendered
+from it, so the user's corrections win everywhere) or the selected resume's text as written."""
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.models import Resume
@@ -51,26 +51,32 @@ def test_structured_source_puts_verified_corrections_in_the_headings(user):
     verify("experience", "skills", "summary")
     correct_title(user)
     assert headings(user)[0].startswith("### Principal Engineer | Zendrive India | Bengaluru"), \
-        "the correction wins; location and dates stay as written"
+        "the correction wins; location and dates are the data's"
     assert headings(user)[1].startswith("### Frontend Developer | Pixel Co"), "uncorrected roles are unchanged"
 
     policy(resume_source="master_text")
     assert headings(user)[0].startswith("### Lead Engineer | Zendrive |"), "master text is used as written"
 
 
-def test_an_unverified_or_punctuation_only_difference_does_not_change_a_heading(user):
+def test_structured_source_renders_the_data_as_corrected_and_leaves_out_rejected_roles(user):
+    """With the structured source the resume document *is* the structured data: whatever the person corrected in
+    Resume Data shows, verified or not; only what they rejected is left out. Never the raw text's own version."""
     with session(user) as db:
         resume = db.get(Resume, resume_id())
         data = dict(resume.structured_data)
         data["experience"] = [dict(role) for role in data["experience"]]
-        data["experience"][0].update(job_title="Principal Engineer", verification={"status": "UNVERIFIED"})
-        data["experience"][1].update(company="PIXEL CO.", verification={"status": "VERIFIED"})
+        data["experience"][0].update(job_title="Principal Engineer", verification={"status": "EDITED"})
+        data["experience"][1].update(verification={"status": "REJECTED"})
         resume.structured_data = data
         flag_modified(resume, "structured_data")
         db.commit()
     lines = headings(user)
-    assert lines[0].startswith("### Lead Engineer | Zendrive |"), "an unverified value never replaces the text"
-    assert lines[1].startswith("### Frontend Developer | Pixel Co |")
+    assert lines[0].startswith("### Principal Engineer | Zendrive | Bengaluru"), "the edited title, not the text's"
+    assert not any("Pixel Co" in line for line in lines), "a rejected role is not in the resume"
+
+    policy(resume_source="master_text")
+    assert [line.split(" | ")[0] for line in headings(user)] == ["### Lead Engineer", "### Frontend Developer"], \
+        "the text as written ignores Resume Data entirely"
 
 
 def test_roles_are_matched_by_position_when_the_title_changed_completely():
