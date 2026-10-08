@@ -90,7 +90,7 @@ def test_every_worker_lists_its_own_tasks_with_counts(user_id, signed_in):
     client = signed_in(user_id)
     summary = client.get("/api/workers").json()
     kinds = {w["kind"]: w for w in summary["workers"]}
-    assert list(kinds) == ["parsing", "recovery", "ranking", "tailoring"]
+    assert list(kinds) == ["parsing", "recovery", "ranking", "tailoring", "reviewing"]
     assert kinds["parsing"]["counts"] == {"running": 1, "queued": 0, "retrying": 1, "active": 2}
     assert kinds["tailoring"]["counts"]["queued"] == 1 and summary["active"] == 3
     parsing = client.get("/api/workers/parsing").json()
@@ -310,9 +310,59 @@ def test_reset_cooldowns_endpoint(user_id, signed_in):
 
 
 def test_kinds_registry_is_complete():
-    assert set(workers.KINDS) == {"parsing", "recovery", "ranking", "tailoring"}
+    assert set(workers.KINDS) == {"parsing", "recovery", "ranking", "tailoring", "reviewing"}
     for spec in workers.KINDS.values():
         assert hasattr(spec.model, "run_now_at") and spec.max_attempts() >= 1
+
+
+# ───────────── reviewing: the review step of a tailoring task ─────────────
+
+def test_reviewing_shows_the_tailor_tasks_at_the_review_step(user_id, signed_in):
+    with SessionLocal() as db:
+        tailoring, reviewing, review_only, reviewed, failed_early = (add_job(db, user_id) for _ in range(5))
+        lease = dict(locked_by="w", lock_expires_at=utcnow() + timedelta(minutes=5), started_at=utcnow())
+        db.add(TailorTask(user_id=user_id, job_id=tailoring.id, status="running", stage="tailoring", attempts=1, **lease))
+        review = TailorTask(user_id=user_id, job_id=reviewing.id, status="running", stage="reviewing", attempts=1, **lease)
+        db.add(review)
+        db.add(TailorTask(user_id=user_id, job_id=review_only.id, mode="skip", status="queued", stage="queued", attempts=0))
+        db.add(TailorTask(user_id=user_id, job_id=reviewed.id, status="succeeded", stage="reviewing", attempts=1,
+                          finished_at=utcnow(), result={"reviewer_score": 82}))
+        early = TailorTask(user_id=user_id, job_id=failed_early.id, status="failed", stage="tailoring", attempts=1,
+                           finished_at=utcnow(), error="boom")
+        db.add(early)
+        db.commit()
+        review_id, early_id, job_ids = review.id, early.id, {reviewing.id, review_only.id, reviewed.id}
+    client = signed_in(user_id)
+    summary = client.get("/api/workers").json()
+    kinds = {w["kind"]: w for w in summary["workers"]}
+    assert kinds["reviewing"]["counts"] == {"running": 1, "queued": 1, "retrying": 0, "active": 2}
+    assert kinds["reviewing"]["view_of"] == "tailoring"
+    # The review step is part of a tailoring task: counted once in the totals.
+    assert kinds["tailoring"]["counts"]["active"] == 3 and summary["active"] == 3 and summary["running"] == 2
+    rows = client.get("/api/workers/reviewing").json()["rows"]
+    assert {r["job_id"] for r in rows} == job_ids
+    done = next(r for r in rows if r["status"] == "SUCCEEDED")
+    assert done["reviewer_score"] == 82 and done["stage"] == "done"
+    # A task outside the review step is not Reviewing's to touch.
+    assert client.post(f"/api/workers/reviewing/tasks/{early_id}/run-now").status_code == 404
+    out = client.post(f"/api/workers/reviewing/tasks/{review_id}/kill").json()
+    assert (out["stopped"], out["running"]) == (1, 1)
+    with SessionLocal() as db:
+        task = db.get(TailorTask, review_id)
+        assert (task.status, task.stage, task.locked_by) == ("cancelled", "reviewing", None)
+    stopped = next(r for r in client.get("/api/workers/reviewing").json()["rows"] if r["task_id"] == review_id)
+    assert stopped["status"] == "STOPPED"
+
+
+def test_kill_all_workers_does_not_stop_the_review_step_twice(user_id, signed_in):
+    with SessionLocal() as db:
+        job = add_job(db, user_id)
+        db.add(TailorTask(user_id=user_id, job_id=job.id, status="running", stage="reviewing", attempts=1,
+                          locked_by="w", lock_expires_at=utcnow() + timedelta(minutes=5), started_at=utcnow()))
+        db.commit()
+    with SessionLocal() as db:
+        out = workers.kill_all(db, user_id)
+    assert "reviewing" not in out["workers"] and out["stopped"] == 1
 
 
 # ───────────── filters ─────────────

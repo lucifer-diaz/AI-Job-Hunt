@@ -178,7 +178,7 @@ def claim_next(sessions: SessionFactory, worker_id: str, lease_seconds: int, now
                     limits[user_id] = worker_settings.get(db, user_id, "tailoring", "max_attempts")
                 over = (attempts or 0) >= limits[user_id]
                 db.execute(update(TailorTask).where(TailorTask.id == task_id, expired)
-                           .values(**({"status": "failed", "stage": "done", "finished_at": now,
+                           .values(**({"status": "failed", "finished_at": now,  # keeps its stage, like run_task
                                        "error": "Interrupted: the server restarted while this job was being "
                                                 "tailored. Try again."} if over
                                       else {"status": "queued", "stage": "queued"}),
@@ -297,7 +297,9 @@ def run_task(sessions: SessionFactory, task_id: int, worker_id: str, lease_secon
             db.rollback()
             log.info("tailor task %s failed: %s", task_id, exc)
             status, error, result = "failed", str(exc)[:500] or exc.__class__.__name__, None
-    _write(sessions, task_id, worker_id, status=status, stage="done", error=error, result=result,
+    # The stage is kept: a finished run records the step it ended in (Running workers → Reviewing lists the runs
+    # that reached review). task_dict shows every finished task as "done".
+    _write(sessions, task_id, worker_id, status=status, error=error, result=result,
            locked_by=None, lock_expires_at=None, finished_at=utcnow())
     return status
 
