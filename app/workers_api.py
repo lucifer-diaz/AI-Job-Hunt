@@ -185,11 +185,17 @@ def retry_tasks(kind: str, payload: RetryIn, request: Request, background: Backg
     return out
 
 
+class NudgeIn(BaseModel):
+    job_ids: list[int] | None = Field(default=None, max_length=500)
+
+
 @router.post("/{kind}/nudge")
-def nudge_forward(kind: str, user: CurrentUser = Depends(current_user), db: Session = Depends(get_user_db)) -> dict[str, Any]:
-    """Move this worker's finished jobs that never reached the next stage on to it (each through its normal path)."""
+def nudge_forward(kind: str, payload: NudgeIn | None = None, user: CurrentUser = Depends(current_user),
+                  db: Session = Depends(get_user_db)) -> dict[str, Any]:
+    """Move this worker's finished jobs that never reached the next stage on to it (each through its normal path).
+    `job_ids` limits it to those jobs: one row's button, or the rows shown."""
     _guard(workers.kind_of, kind)
-    return worker_handoff.nudge_forward(db, user.id, kind)
+    return worker_handoff.nudge_forward(db, user.id, kind, payload.job_ids if payload else None)
 
 
 @router.post("/{kind}/tasks/{task_id}/run-now")

@@ -193,12 +193,12 @@ function wkTable(kind, data) {
   const active = rows.filter(r => ['RUNNING', 'QUEUED', 'RETRYING'].includes(r.status)).length;
   const shown = data.total > rows.length ? ` · showing the first ${rows.length} of ${data.total}` : '';
   return `<section class="card flush"><div class="row between wrap gap10" style="padding:14px 18px;border-bottom:1px solid var(--line2)">
-      <div><div class="card-title" style="font-size:16px">Tasks${filtered ? ' matching your filters' : ''}</div><div class="card-sub">${active} waiting, running or retrying · ${rows.length - active} finished in the last day${shown}</div></div></div>
+      <div><div class="card-title" style="font-size:16px">Tasks${filtered ? ' matching your filters' : ''}</div><div class="card-sub">${active} waiting, running or retrying · ${rows.length - active} finished in the last day${shown}</div></div>${wkShownNudge(kind, rows)}</div>
     <div style="max-height:560px;overflow:auto" data-scroll-key="wk-${kind}">${rows.map(r => `<div class="wk-row ${r.status === 'RUNNING' ? 'running' : ''} ${wkSel(kind).has(r.task_id) ? 'picked' : ''}">
       <div>${['FAILED', 'BLOCKED', 'STOPPED'].includes(r.status) && !r.retried_by ? wkSelectBox(kind, r.task_id, r.title) : ''}</div><div>${wkChip(r.status)}</div>
       <div style="min-width:0"><div class="small b ellipsis">${esc(r.title || `Job #${r.job_id}`)} <span class="muted" style="font-weight:400">· ${esc(r.company || '')}</span> <span class="xs faint mono" style="font-weight:400">#${r.job_id}</span></div>
         <div class="wk-detail xs ${['FAILED', 'BLOCKED'].includes(r.status) ? 'orch-bad' : 'muted'}"><span class="ellipsis" title="${attr(wkDetail(r))}">${wkTries(r)}${esc(wkDetail(r))}</span>${wkRowWhy(r)}</div></div>
-      <div class="wk-row-actions">${r.retried_by ? `<span class="orch-chip muted" title="${attr(`A newer task (#${r.retried_by.task_id}) is handling this job`)}">↻ Run again</span>` : ''}${wkButtons(kind, r.task_id, { kill: r.can_kill, runNow: r.can_run_now })}${btn('Job', 'open-job', { id: r.job_id }, 'sm')}</div></div>`).join('')}</div></section>`;
+      <div class="wk-row-actions">${r.retried_by ? `<span class="orch-chip muted" title="${attr(`A newer task (#${r.retried_by.task_id}) is handling this job`)}">↻ Run again</span>` : ''}${wkButtons(kind, r.task_id, { kill: r.can_kill, runNow: r.can_run_now })}${wkRowNudge(kind, r.job_id, r.status)}${btn('Job', 'open-job', { id: r.job_id }, 'sm')}</div></div>`).join('')}</div></section>`;
 }
 
 /* ───────────── overview: hero, queue and the last 24 hours ───────────── */
@@ -207,6 +207,22 @@ function wkLimits(tab) {
   if (tab === 'ranking' && D.ranking) return [`⇉ up to ${D.ranking.concurrency} at a time`, D.ranking.interval_minutes ? `↻ your cadence: every ${D.ranking.interval_minutes} min` : null].filter(Boolean);
   if (tab === 'recovery') { const x = D.wkData?.recovery?.diagnostics?.settings; return x ? [`⇉ ${x.max_concurrency} at a time · batches of ${x.batch_size}`] : []; }
   return [];
+}
+// A finished task's own Nudge: enabled while its job is waiting for the next stage, otherwise it says why it is not.
+const WK_OK = ['COMPLETED', 'SUCCEEDED', 'PARTIAL'];
+function wkRowNudge(kind, jobId, status) {
+  const next = wkSpec(kind)?.next_stage;
+  if (!next || !WK_OK.includes(status)) return '';
+  if ((next.job_ids || []).includes(jobId)) return btn(label('wkNudge' + kind + jobId, `→ ${next.to}`, 'Nudging…'), 'wk-nudge', { kind, job: jobId }, 'sm primary', isBusy('wkNudge' + kind + jobId));
+  return `<span class="orch-chip muted" title="${attr(`Already in ${next.to}, or not eligible for it`)}">✓ moved on</span>`;
+}
+// One button for every finished task the list shows whose job is waiting for the next stage.
+function wkShownNudge(kind, rows) {
+  const next = wkSpec(kind)?.next_stage;
+  if (!next) return '';
+  const ids = [...new Set(rows.filter(r => WK_OK.includes(r.status) && (next.job_ids || []).includes(r.job_id)).map(r => r.job_id))];
+  if (!ids.length) return '';
+  return btn(label('wkNudgeShown' + kind, `Nudge ${ids.length} shown to ${next.to}`, 'Nudging…'), 'wk-nudge', { kind, jobs: ids.join(',') }, 'sm primary', isBusy('wkNudgeShown' + kind));
 }
 // Nudge forward: move this worker's finished jobs that never reached the next stage on to it (insights has none).
 function wkNudgeButton(tab, spec) {
@@ -658,8 +674,9 @@ const WORKERS_ACTIONS = {
   'wk-refresh': () => busy('wkRefresh', wkReload),
   // A browser setting, not an account one: it applies at once and needs a click for the browser's permission prompt.
   'wk-notify': async el => { await setNotifyApproved(el.checked); render(); },
-  'wk-nudge': el => busy('wkNudge' + el.dataset.kind, async () => {
-    const out = await api(`/api/workers/${el.dataset.kind}/nudge`, { method: 'POST' });
+  'wk-nudge': el => busy(el.dataset.job ? `wkNudge${el.dataset.kind}${el.dataset.job}` : el.dataset.jobs ? 'wkNudgeShown' + el.dataset.kind : 'wkNudge' + el.dataset.kind, async () => {
+    const jobs = el.dataset.job ? [Number(el.dataset.job)] : el.dataset.jobs ? el.dataset.jobs.split(',').map(Number) : null;
+    const out = await api(`/api/workers/${el.dataset.kind}/nudge`, { method: 'POST', ...(jobs ? { body: { job_ids: jobs } } : {}) });
     await wkReload();
     return out;
   }, out => out.message || `Moved ${out.moved.length} job${out.moved.length === 1 ? '' : 's'} to ${out.to}${out.skipped.length ? ` · ${out.skipped.length} skipped: ${out.skipped[0].reason}` : ''}`),

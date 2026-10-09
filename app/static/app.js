@@ -669,7 +669,7 @@ function renderRanking(r = D.ranking) {
       <div class="grow" style="min-width:0"><div class="small b ellipsis">${esc(t.title)} <span class="muted" style="font-weight:400">· ${esc(t.company)}</span></div>
         <div class="xs ellipsis ${t.status === 'FAILED' ? '' : 'muted'}" style="${t.status === 'FAILED' ? 'color:var(--bad)' : ''}" title="${attr(detail)}">${esc(why)} · ${esc(detail)}</div>
         ${rankProgress(t, r.in_flight)}</div>
-      ${wkRankActions(t)}${retry}${remove}${btn('Job', 'open-job', { id: t.job_id }, 'sm')}${rankTaskPill(t)}</div>`;
+      ${wkRankActions(t)}${retry}${remove}${wkRowNudge('ranking', t.job_id, t.status)}${btn('Job', 'open-job', { id: t.job_id }, 'sm')}${rankTaskPill(t)}</div>`;
   };
   const section = (key, title, sub, items, actions = '') => `<section class="card flush">
     <div class="row between wrap gap10" style="padding:14px 18px;border-bottom:1px solid var(--line2)"><div><div class="card-title" style="font-size:16px">${esc(title)}</div><div class="card-sub">${esc(sub)}</div></div>${actions ? `<div class="row gap8">${actions}</div>` : ''}</div>
@@ -1037,7 +1037,7 @@ function renderTaskStack(tasks = D.tasks || [], all = tasks) {
       <div class="grow" style="min-width:0"><div class="small b ellipsis">${esc(t.title)} <span class="muted" style="font-weight:400">· ${esc(t.company)}</span></div>
         <div class="xs ${t.status === 'failed' ? '' : 'muted'} ellipsis" style="${t.status === 'failed' ? 'color:var(--bad)' : ''}">${t.mode === 'skip' ? 'Skip tailoring · ' : ''}${detail}</div>
         ${active ? `<div class="row base gap8 mt6"><span class="grow">${bar(t.progress + '%', t.status === 'running' ? '#5b4ae8' : '#c9cbe0')}</span><span class="xs mono muted none" style="width:34px;text-align:right">${t.progress}%</span></div>` : ''}</div>
-      ${wkTailorActions(t)}${actions}${taskPill(t)}</div>`;
+      ${wkTailorActions(t)}${S.screen === 'workers' ? wkRowNudge('tailoring', t.job_id, t.status.toUpperCase()) : ''}${actions}${taskPill(t)}</div>`;
   }).join('');
   return `<section class="card flush">
     <div class="row wrap gap10" style="padding:14px 18px;border-bottom:1px solid var(--line2)">

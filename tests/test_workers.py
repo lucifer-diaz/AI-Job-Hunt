@@ -535,7 +535,7 @@ def test_nudge_moves_a_recovered_description_into_parsing_once(user_id, signed_i
         db.commit()
         job_id = job.id
     client = signed_in(user_id)
-    assert _next(client, "recovery") == {"to": "Parsing", "waiting": 1}
+    assert _next(client, "recovery") == {"to": "Parsing", "waiting": 1, "job_ids": [job_id]}
     out = client.post("/api/workers/recovery/nudge").json()
     assert (out["to"], out["moved"], out["skipped"]) == ("Parsing", [job_id], [])
     with SessionLocal() as db:
@@ -576,7 +576,7 @@ def test_nudge_queues_qualified_jobs_for_tailoring_only_when_automatic_tailoring
         db.commit()
         job_id = job.id
     client = signed_in(user_id)
-    assert _next(client, "ranking") == {"to": "Tailoring", "waiting": 0}  # auto-tailor is off
+    assert _next(client, "ranking") == {"to": "Tailoring", "waiting": 0, "job_ids": []}  # auto-tailor is off
     with SessionLocal() as db:
         row = db.scalar(select(AppSetting).where(AppSetting.user_id == user_id)) or AppSetting(user_id=user_id)
         row.preferences = {**(row.preferences or {}), "auto_tailor": {"enabled": True, "enabled_at": "2020-01-01T00:00:00"}}
@@ -608,11 +608,29 @@ def test_nudge_approves_a_reviewed_packet_only_where_the_accounts_policy_would(u
     with SessionLocal() as db:
         db.scalar(select(AppSetting).where(AppSetting.user_id == user_id)).application_mode = "automatic"
         db.commit()
-    assert _next(client, "reviewing") == {"to": "Approval", "waiting": 1}
+    assert _next(client, "reviewing") == {"to": "Approval", "waiting": 1, "job_ids": [high_id]}
     assert client.post("/api/workers/reviewing/nudge").json()["moved"] == [high_id]
     with SessionLocal() as db:
         assert db.get(Job, high_id).status == "approved" and db.get(Job, low_id).status == "tailored"
         assert db.get(Job, high_id).application.status == "approved"
+
+
+def test_nudge_can_be_limited_to_chosen_jobs_and_says_why_one_was_not_moved(user_id, signed_in, monkeypatch):
+    monkeypatch.setattr(get_settings(), "jd_parse_enabled", True)
+    with SessionLocal() as db:
+        first, second, parsed = add_job(db, user_id), add_job(db, user_id), add_job(db, user_id)
+        for job in (first, second):
+            db.add(JobDescriptionFetchTask(user_id=user_id, job_id=job.id, status="COMPLETED", result_code="RECOVERED"))
+        parse_task(db, user_id, parsed, status="COMPLETED")
+        db.commit()
+        first_id, second_id, parsed_id = first.id, second.id, parsed.id
+    client = signed_in(user_id)
+    assert set(_next(client, "recovery")["job_ids"]) == {first_id, second_id}
+    out = client.post("/api/workers/recovery/nudge", json={"job_ids": [first_id, parsed_id]}).json()
+    assert out["moved"] == [first_id]
+    assert [s["job_id"] for s in out["skipped"]] == [parsed_id] and "Not waiting for Parsing" in out["skipped"][0]["reason"]
+    with SessionLocal() as db:  # the second job was not asked for, so it stays where it was
+        assert db.scalars(select(JobDescriptionParseTask).where(JobDescriptionParseTask.job_id == second_id)).all() == []
 
 
 def test_nudge_never_touches_another_account_and_insights_has_no_next_stage(user_id, signed_in, monkeypatch):

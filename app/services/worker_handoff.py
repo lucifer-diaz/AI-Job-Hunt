@@ -201,21 +201,33 @@ def next_stage(db: Session, user_id: int, kind: str) -> dict[str, Any] | None:
     if stage is None:
         return None
     try:
-        return {"to": stage.to, "waiting": len(stage.find(db, user_id))}
+        ids = stage.find(db, user_id)
+        return {"to": stage.to, "waiting": len(ids), "job_ids": ids}  # the jobs a row's own Nudge button may move
     except Exception:  # noqa: BLE001  a button's count must never break the screen
         db.rollback()
-        return {"to": stage.to, "waiting": 0}
+        return {"to": stage.to, "waiting": 0, "job_ids": []}
 
 
-def nudge_forward(db: Session, user_id: int, kind: str) -> dict[str, Any]:
-    """Move this worker's finished-but-stuck jobs into the next stage. Commits. Never raises for one job."""
+def nudge_forward(db: Session, user_id: int, kind: str, job_ids: list[int] | None = None) -> dict[str, Any]:
+    """Move this worker's finished-but-stuck jobs into the next stage. Commits. Never raises for one job.
+
+    `job_ids` narrows it to those jobs (a row's own button, or the rows a filter shows); one that is not waiting for
+    the next stage is skipped with that reason instead of being forced on."""
     stage = STAGES.get(kind)
     if stage is None:
         return {"kind": kind, "to": None, "moved": [], "skipped": [], "message": "This worker has no next stage"}
     ids = stage.find(db, user_id)
+    declined: list[dict[str, Any]] = []
+    if job_ids is not None:
+        wanted = list(dict.fromkeys(job_ids))[:LIMIT]
+        declined = [{"job_id": i, "reason": f"Not waiting for {stage.to}: already there, or not eligible"}
+                    for i in wanted if i not in ids]
+        ids = [i for i in ids if i in set(wanted)]
     if not ids:
-        return {"kind": kind, "to": stage.to, "moved": [], "skipped": [], "message": stage.why_none}
+        return {"kind": kind, "to": stage.to, "moved": [], "skipped": declined,
+                "message": None if declined else stage.why_none}
     moved, skipped = stage.move(db, user_id, ids)
+    skipped = [*skipped, *declined]
     db.commit()
     if moved:
         for name in stage.wake:

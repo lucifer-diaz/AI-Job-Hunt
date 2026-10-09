@@ -55,7 +55,7 @@ beforeEach(() => {
   routes = { summary: summary(), parsing: parsing(), activity: activity(), settings: settings(), workerSettings: workerSettings(), fail: false };
   fetchMock = vi.fn(async (url, opt = {}) => {
     if (routes.fail && url.startsWith('/api/workers')) return response({ detail: 'Workers are unavailable' }, 503);
-    if (opt.method === 'POST' && url.endsWith('/nudge')) { routes.nudged = url; return response({ kind: 'parsing', to: 'Ranking', moved: [4, 5], skipped: [{ job_id: 6, reason: 'Dismissed in triage' }], message: null }); }
+    if (opt.method === 'POST' && url.endsWith('/nudge')) { routes.nudged = url; routes.nudgeBody = opt.body ? JSON.parse(opt.body) : null; return response({ kind: 'parsing', to: 'Ranking', moved: [4, 5], skipped: [{ job_id: 6, reason: 'Dismissed in triage' }], message: null }); }
     if (opt.method === 'POST' && url.includes('/run-now')) return response(row({ status: 'QUEUED', run_now: true }));
     if (opt.method === 'POST' && url.includes('/cooldowns/reset')) return response({ cleared: ['OPENROUTER'] });
     if (opt.method === 'POST' && url.includes('kill')) return response({ stopped: 2, running: 1, cooldowns_cleared: url.endsWith('kill') ? [] : ['OPENROUTER'] });
@@ -187,6 +187,26 @@ describe('Running workers', () => {
     expect(v.querySelector('[data-act="wk-nudge"]').disabled).toBe(true);  // nothing between recovery and parsing
     v = await open('insights');
     expect(v.querySelector('[data-act="wk-nudge"]')).toBeNull();  // the last stage has no next one
+  });
+
+  it('nudges one finished task, or every finished task shown, when its job is waiting for the next stage', async () => {
+    routes.summary.workers.find(w => w.kind === 'parsing').next_stage = { to: 'Ranking', waiting: 2, job_ids: [4, 5] };
+    routes.parsing = { ...parsing(), rows: [row({ task_id: 21, job_id: 4, status: 'COMPLETED', can_kill: false }),
+      row({ task_id: 22, job_id: 5, status: 'COMPLETED', can_kill: false }), row({ task_id: 23, job_id: 6, status: 'COMPLETED', can_kill: false }),
+      row({ task_id: 24, job_id: 7, status: 'FAILED', can_kill: false })] };
+    const v = await open();
+    const rows = [...v.querySelectorAll('.wk-row')];
+    expect(rows[0].querySelector('[data-act="wk-nudge"]').textContent.trim()).toBe('→ Ranking');
+    expect(rows[2].querySelector('[data-act="wk-nudge"]')).toBeNull();  // job 6 is already past it
+    expect(rows[2].textContent).toContain('moved on');
+    expect(rows[3].querySelector('[data-act="wk-nudge"]')).toBeNull();  // a failed task is retried, not nudged
+    expect(v.textContent).toContain('Nudge 2 shown to Ranking');
+    await ui.A['wk-nudge']({ dataset: { kind: 'parsing', job: '4' } });
+    expect(routes.nudgeBody).toEqual({ job_ids: [4] });
+    await ui.A['wk-nudge']({ dataset: { kind: 'parsing', jobs: '4,5' } });
+    expect(routes.nudgeBody).toEqual({ job_ids: [4, 5] });
+    await ui.A['wk-nudge']({ dataset: { kind: 'parsing' } });
+    expect(routes.nudgeBody).toBeNull();
   });
 
   it('shows the rate-limit backoff and resets it', async () => {
