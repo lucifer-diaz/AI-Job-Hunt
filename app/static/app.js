@@ -1698,7 +1698,7 @@ function actorCard(a, on) {
       <span class="xs muted" style="display:block" id="${id}-about">${esc(a.summary)} <span class="sr-only">Cost ${esc(a.cost)}, ${esc(FANOUT[a.fan_out] || a.fan_out)}.</span></span>
       <span class="tiny faint" style="display:block;margin-top:4px" aria-hidden="true"><span class="mono">${esc(a.id)}</span> · ${esc(a.cost)} · ${esc(FANOUT[a.fan_out] || a.fan_out)}</span>
       ${uses.length ? `<span class="actor-uses" aria-label="Settings it uses: ${attr(uses.join(', '))}">${uses.map(u => `<span>${esc(u)}</span>`).join('')}</span>` : ''}</span>
-    ${a.custom ? `<button type="button" class="btn ghost sm danger none" data-act="remove-actor" data-actor="${attr(a.id)}" aria-label="Remove ${attr(a.name)}">Remove</button>` : ''}</label>`;
+    ${a.custom ? `<span class="row gap6"><button type="button" class="btn ghost sm" data-act="edit-actor" data-actor="${attr(a.id)}" aria-label="Edit ${attr(a.name)}">Edit</button><button type="button" class="btn ghost sm danger none" data-act="remove-actor" data-actor="${attr(a.id)}" aria-label="Remove ${attr(a.name)}">Remove</button></span>` : ''}</label>`;
 }
 function actorPicker(list, on) {
   const groups = [...new Set([...(D.actors?.groups || []), ...list.map(a => a.group)])];
@@ -1725,15 +1725,17 @@ function usedCheck(list, on, key, field, value, text) {
 const COUNTRIES = ['usa', 'uk', 'canada', 'australia', 'india', 'singapore', 'uae', 'germany', 'france', 'netherlands', 'ireland', 'spain', 'italy', 'japan', 'brazil', 'mexico', 'south africa', 'new zealand'];
 const DEFAULT_TEMPLATE = JSON.stringify({ searchTerm: '{{role}}', location: '{{location}}', maxItems: '{{max_results}}' }, null, 2);
 function addActorForm() {
-  return `<div class="box brand mt10" style="padding:14px"><div class="small b mb4">Add an Apify actor</div>
-    <div class="xs muted mb8">Any Store actor that returns job listings. Items are normalized automatically — title, company, location, URL and description.</div>
-    <div class="row gap8 wrap">${inputF('ca', 'id', '', 'placeholder="username/actor-name" style="flex:1 1 220px;margin-top:0"')}${btn(label('lookup', 'Look up on Apify', 'Looking up…'), 'lookup-actor', {}, 'sm', isBusy('lookup'))}</div>
+  const editing = S.editActor, f = S.forms.ca || {};
+  return `<div class="box brand mt10" style="padding:14px"><div class="small b mb4">${editing ? `Edit ${esc(f.name || editing)}` : 'Add an Apify actor'}</div>
+    <div class="xs muted mb8">${editing ? 'Change how this actor is called: its name, how many runs it starts and the input it receives.' : 'Any Store actor that returns job listings. Items are normalized automatically — title, company, location, URL and description.'}</div>
+    <div class="row gap8 wrap">${inputF('ca', 'id', '', `placeholder="username/actor-name" style="flex:1 1 220px;margin-top:0" ${editing ? 'readonly aria-readonly="true"' : ''}`)}${btn(label('lookup', editing ? 'Load input schema' : 'Look up on Apify', 'Looking up…'), 'lookup-actor', {}, 'sm', isBusy('lookup'))}</div>
     ${inputF('ca', 'name', '', 'placeholder="Display name"')}
     <label class="field mt8">Runs${selectF('ca', 'fan_out', 'role_location', Object.entries(FANOUT).map(([k, v]) => [k, v[0].toUpperCase() + v.slice(1)]))}</label>
     <label class="field mt8">Input template (JSON)${textareaF('ca', 'input_template', DEFAULT_TEMPLATE, 'style="font-family:var(--mono);font-size:11.5px;min-height:130px"')}</label>
     <div class="helper">Placeholders: ${(D.actors?.placeholders || []).map(x => `<span class="mono">{{${x}}}</span>`).join(' ')}. A value that is only a placeholder keeps its type (number, list, true/false).</div>
-    ${S.caFields ? `<div class="xs muted mt8">This actor accepts: ${S.caFields.map(f => `<span class="mono">${esc(f.name)}${f.required ? '*' : ''}</span>`).join(', ') || 'no documented inputs'}</div>` : ''}
-    ${btn('Add actor', 'add-actor', {}, 'primary sm mt10')}</div>`;
+    ${S.caFields ? `<div class="xs muted mt8" role="group" aria-label="Input schema">This actor accepts — click a field to add it to the template:
+      <div class="row gap6 wrap mt4">${S.caFields.map(x => `<button type="button" class="btn sm" data-act="insert-actor-field" data-name="${attr(x.name)}" title="${attr([x.type, x.title].filter(Boolean).join(' · '))}"><span class="mono">${esc(x.name)}${x.required ? '*' : ''}</span>${x.type ? ` <span class="tiny faint">${esc(x.type)}</span>` : ''}</button>`).join('') || 'no documented inputs'}</div></div>` : ''}
+    <div class="row gap8 mt10">${btn(editing ? 'Save changes' : 'Add actor', 'add-actor', {}, 'primary sm')}${editing ? btn('Cancel', 'toggle-add-actor', {}, 'ghost sm') : ''}</div></div>`;
 }
 const setupResumeValue = p => p.resume_mode === 'fixed' || (!p.resume_mode && p.resume_id) ? String(p.resume_id) : (p.resume_mode || 'auto');
 const setupResume = value => ['auto', 'active'].includes(String(value)) ? { resume_mode: String(value), resume_id: null } : { resume_mode: 'fixed', resume_id: Number(value) };
@@ -2045,7 +2047,28 @@ const A = {
   'toggle-actor': el => toggleIn('actors', el.dataset.actor),
   'toggle-list': el => toggleIn(el.dataset.key, el.dataset.value),
   'toggle-inputs': () => { S.showInputs = !S.showInputs; render(); },
-  'toggle-add-actor': (el, e) => { e.preventDefault(); S.addActor = !S.addActor; S.caFields = null; render(); },
+  'toggle-add-actor': (el, e) => { e.preventDefault(); S.addActor = !S.addActor; S.editActor = null; S.caFields = null; delete S.forms.ca; render(); },
+  'edit-actor': (el, e) => {
+    e.preventDefault(); e.stopPropagation();
+    const p = D.searchProfile.profile, id = el.dataset.actor;
+    const entry = fv('sp', 'custom_actors', p.custom_actors || []).find(c => c.id === id);
+    if (!entry) return;
+    S.forms.ca = { id, name: entry.name || id, fan_out: entry.fan_out || 'role_location', input_template: JSON.stringify(entry.input_template || {}, null, 2) };
+    S.addActor = true; S.editActor = id; S.caFields = null;
+    render();
+    document.getElementById('ca-input_template')?.scrollIntoView?.({ block: 'center' });
+  },
+  'insert-actor-field': el => {
+    const f = S.forms.ca || {}, name = el.dataset.name;
+    let template;
+    try { template = JSON.parse(f.input_template ?? DEFAULT_TEMPLATE); } catch { return toast('Fix the JSON before adding a field', true); }
+    if (!template || typeof template !== 'object' || Array.isArray(template)) return toast('The input template must be a JSON object', true);
+    if (name in template) return toast(`${name} is already in the template`);
+    const field = (S.caFields || []).find(x => x.name === name) || {};
+    template[name] = field.default ?? field.prefill ?? (field.type === 'integer' || field.type === 'number' ? 0 : field.type === 'boolean' ? false : field.type === 'array' ? [] : field.type === 'object' ? {} : '');
+    setF('ca', 'input_template', JSON.stringify(template, null, 2));
+    render();
+  },
   'remove-actor': (el, e) => {
     e.preventDefault(); e.stopPropagation();
     const p = D.searchProfile.profile, id = el.dataset.actor;
@@ -2057,25 +2080,30 @@ const A = {
     const id = (fv('ca', 'id', '') || '').trim();
     if (!/^[\w.-]+[/~][\w.-]+$/.test(id)) throw new Error('Enter the actor as username/actor-name');
     const out = await api('/api/search/actors/lookup', { method: 'POST', body: { id } });
-    setF('ca', 'id', out.id); setF('ca', 'name', out.name);
-    if (Object.keys(out.input_template).length) setF('ca', 'input_template', JSON.stringify(out.input_template, null, 2));
+    if (!S.editActor) {
+      setF('ca', 'id', out.id); setF('ca', 'name', out.name);
+      if (Object.keys(out.input_template).length) setF('ca', 'input_template', JSON.stringify(out.input_template, null, 2));
+    }
     S.caFields = out.fields;
     return out;
   }, out => `Found ${out.name} · ${out.fields.length} documented inputs`),
   'add-actor': () => {
     const f = S.forms.ca || {}, p = D.searchProfile.profile, id = (f.id || '').trim();
     if (!/^[\w.-]+[/~][\w.-]+$/.test(id)) return toast('Enter the actor as username/actor-name', true);
-    if ((D.actors?.actors || []).some(a => !a.custom && a.id === id)) return toast('That actor is already built in — just tick it', true);
+    if (!S.editActor && (D.actors?.actors || []).some(a => !a.custom && a.id === id)) return toast('That actor is already built in — just tick it', true);
     let template;
     try { template = JSON.parse(f.input_template ?? DEFAULT_TEMPLATE); } catch { return toast('The input template is not valid JSON', true); }
     if (!template || typeof template !== 'object' || Array.isArray(template)) return toast('The input template must be a JSON object', true);
-    const customs = fv('sp', 'custom_actors', p.custom_actors || []).filter(c => c.id !== id);
-    customs.push({ id, name: (f.name || '').trim() || id, fan_out: f.fan_out || 'role_location', input_template: template });
+    const entry = { id, name: (f.name || '').trim() || id, fan_out: f.fan_out || 'role_location', input_template: template };
+    const existing = fv('sp', 'custom_actors', p.custom_actors || []);
+    // Editing keeps the actor where it was in the list; adding appends (replacing a same-id entry).
+    const customs = existing.some(c => c.id === id) ? existing.map(c => c.id === id ? entry : c) : [...existing, entry];
     setF('sp', 'custom_actors', customs);
     const selected = fv('sp', 'actors', p.actors || []);
     if (!selected.includes(id)) setF('sp', 'actors', [...selected, id]);
-    delete S.forms.ca; S.addActor = false; S.caFields = null;
-    render(); toast('Actor added — save the profile to keep it');
+    const edited = !!S.editActor;
+    delete S.forms.ca; S.addActor = false; S.editActor = null; S.caFields = null;
+    render(); toast(edited ? 'Actor updated — save the profile to keep it' : 'Actor added — save the profile to keep it');
   },
   'save-search': () => busy('saveSp', saveSetup, setup => `“${setup.name}” saved`),
   'save-as-new': () => busy('saveAsNew', () => createSetup(), setup => `Saved as “${setup.name}”`),

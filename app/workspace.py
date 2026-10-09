@@ -1317,7 +1317,8 @@ def lookup_actor(payload: ActorLookupIn, db: Session = Depends(get_user_db)):
     return {"id": f"{info.get('username', payload.id.split('/')[0])}/{info.get('name', payload.id.split('/')[-1])}",
             "name": info.get("title") or info.get("name") or payload.id,
             "summary": (info.get("description") or "")[:300],
-            "fields": [{"name": n, "type": p.get("type", ""), "title": p.get("title", ""), "required": n in (schema.get("required") or [])}
+            "fields": [{"name": n, "type": p.get("type", ""), "title": p.get("title", ""), "required": n in (schema.get("required") or []),
+                        **{k: p[k] for k in ("default", "prefill") if k in p}}
                        for n, p in properties.items()],
             "input_template": template}
 

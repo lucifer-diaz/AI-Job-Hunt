@@ -176,6 +176,25 @@ describe('actor picker', () => {
     expect(ui.searchPayload().primary_skills).toEqual(['Python', 'Django']);
   });
 
+  it('edits a user-added actor in place, keeping its id and position', () => {
+    const mine = { id: 'me/jobs', name: 'Mine', fan_out: 'role', input_template: { q: '{{role}}' } };
+    const other = { id: 'me/other', name: 'Other', fan_out: 'role_location', input_template: {} };
+    ui.setF('sp', 'custom_actors', [mine, other]);
+    ui.setF('sp', 'actors', ['me/jobs']);
+    ui.D.actors.actors = [...catalog, ...[mine, other].map(c => ({ ...c, summary: 'Added by you', cost: '', custom: true, group: 'Your actors' }))];
+    ui.render();
+    document.querySelector('[data-act="edit-actor"][data-actor="me/jobs"]').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    expect(document.getElementById('ca-id').readOnly).toBe(true);
+    expect(JSON.parse(document.getElementById('ca-input_template').value)).toEqual({ q: '{{role}}' });
+    ui.setF('ca', 'name', 'Renamed');
+    ui.setF('ca', 'input_template', JSON.stringify({ q: '{{role}}', limit: '{{max_results}}' }));
+    ui.A['add-actor']();
+    const saved = ui.S.forms.sp.custom_actors;
+    expect(saved.map(c => c.id)).toEqual(['me/jobs', 'me/other']);
+    expect(saved[0]).toMatchObject({ name: 'Renamed', fan_out: 'role', input_template: { q: '{{role}}', limit: '{{max_results}}' } });
+    expect(ui.S.editActor).toBeNull();
+  });
+
   it('sends the startup settings with the search', () => {
     ui.setF('sp', 'yc_batches', ['W24']);
     ui.setF('sp', 'hn_month', ' 2026-08 ');
