@@ -99,13 +99,63 @@ def upsert_job(
     return job, True
 
 
-def import_lever(db: Session, site: str) -> dict[str, int]:
-    url = f"https://api.lever.co/v0/postings/{site}?mode=json"
+def _fetch_lever(site: str) -> list[dict]:
     with external_client("JOB_BOARD", service="lever", operation="board_fetch", timeout=30,
                          metadata={"board": site}) as client:
-        resp = client.get(url)
+        resp = client.get(f"https://api.lever.co/v0/postings/{site}?mode=json")
         resp.raise_for_status()
-        data = resp.json()
+        return resp.json()
+
+
+def _fetch_greenhouse(board_token: str) -> list[dict]:
+    with external_client("JOB_BOARD", service="greenhouse", operation="board_fetch", timeout=30,
+                         metadata={"board": board_token}) as client:
+        resp = client.get(f"https://boards-api.greenhouse.io/v1/boards/{board_token}/jobs?content=true")
+        resp.raise_for_status()
+        return resp.json().get("jobs", [])
+
+
+def _lever_teams(item: dict) -> list[str]:
+    categories = item.get("categories") or {}
+    return [t for t in (categories.get("team"), categories.get("department")) if t]
+
+
+def _greenhouse_teams(item: dict) -> list[str]:
+    return [d.get("name") for d in item.get("departments") or [] if d.get("name")]
+
+
+def _board_filter(items: list[dict], teams_of, title_of, teams: list[str] | None, roles: list[str] | None) -> list[dict]:
+    """Keep the postings in one of the chosen teams (name equals or contains it) whose title has a role keyword.
+
+    No teams and no roles keeps everything, exactly as before. Both set means both must match.
+    """
+    wanted_teams = [t.strip().lower() for t in teams or [] if t.strip()]
+    wanted_roles = [r.strip().lower() for r in roles or [] if r.strip()]
+    kept = []
+    for item in items:
+        if wanted_teams and not any(w in t.lower() for t in teams_of(item) for w in wanted_teams):
+            continue
+        if wanted_roles and not any(w in (title_of(item) or "").lower() for w in wanted_roles):
+            continue
+        kept.append(item)
+    return kept
+
+
+def board_teams(kind: str, token: str) -> list[dict[str, Any]]:
+    """The teams (departments) a company's board has open roles in, with counts, so a person can pick some."""
+    fetch, teams_of = (_fetch_lever, _lever_teams) if kind == "lever" else (_fetch_greenhouse, _greenhouse_teams)
+    counts: dict[str, int] = {}
+    items = fetch(token)
+    for item in items:
+        for team in dict.fromkeys(teams_of(item)):
+            counts[team] = counts.get(team, 0) + 1
+    teams = [{"name": name, "count": count} for name, count in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+    return teams
+
+
+def import_lever(db: Session, site: str, teams: list[str] | None = None, roles: list[str] | None = None) -> dict[str, int]:
+    everything = _fetch_lever(site)
+    data = _board_filter(everything, _lever_teams, lambda i: i.get("text"), teams, roles)
     created = 0
     for item in data:
         categories = item.get("categories") or {}
@@ -138,16 +188,13 @@ def import_lever(db: Session, site: str) -> dict[str, int]:
             raw=item,
         )
         created += int(is_new)
-    return {"seen": len(data), "created": created}
+    return {"seen": len(data), "created": created, "total": len(everything)}
 
 
-def import_greenhouse(db: Session, board_token: str) -> dict[str, int]:
-    url = f"https://boards-api.greenhouse.io/v1/boards/{board_token}/jobs?content=true"
-    with external_client("JOB_BOARD", service="greenhouse", operation="board_fetch", timeout=30,
-                         metadata={"board": board_token}) as client:
-        resp = client.get(url)
-        resp.raise_for_status()
-        data = resp.json().get("jobs", [])
+def import_greenhouse(db: Session, board_token: str, teams: list[str] | None = None,
+                      roles: list[str] | None = None) -> dict[str, int]:
+    everything = _fetch_greenhouse(board_token)
+    data = _board_filter(everything, _greenhouse_teams, lambda i: i.get("title"), teams, roles)
     created = 0
     for item in data:
         description = BeautifulSoup(item.get("content", ""), "html.parser").get_text("\n", strip=True)
@@ -163,7 +210,7 @@ def import_greenhouse(db: Session, board_token: str) -> dict[str, int]:
             raw=item,
         )
         created += int(is_new)
-    return {"seen": len(data), "created": created}
+    return {"seen": len(data), "created": created, "total": len(everything)}
 
 
 def fetch_job_page(url: str) -> str:

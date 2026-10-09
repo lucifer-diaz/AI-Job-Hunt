@@ -924,9 +924,12 @@ function renderSetup() {
           <button class="linkbtn" data-act="go" data-screen="discovery" data-mode="table">See every job in the table →</button></div></div>` : ''}
     </section>
     ${renderManualAdd()}
-    <section class="card pad16"><div class="card-title sm mb4">Import a company board</div><div class="small muted mb12">Pull every open role from a company's Greenhouse or Lever board. No Apify token needed.</div>
+    <section class="card pad16"><div class="card-title sm mb4">Import a company board</div><div class="small muted mb12">Pull the open roles from a company's Greenhouse or Lever board — all of them, or only the teams and roles you pick. No Apify token needed.</div>
       <div class="row gap8">${selectF('board', 'kind', 'greenhouse', [['greenhouse', 'Greenhouse'], ['lever', 'Lever']], 'style="width:auto"')}${inputF('board', 'token', '', 'placeholder="Board token, e.g. stripe"')}</div>
       <div class="helper">The token is the company slug in boards.greenhouse.io/<b>stripe</b> or jobs.lever.co/<b>stripe</b>.</div>
+      <label class="field mt8">Role keywords <span class="faint">(optional)</span>${inputF('board', 'roles', '', 'placeholder="e.g. engineer, data scientist" aria-describedby="board-roles-help"')}<span class="helper" id="board-roles-help">Only roles whose title has one of these words. Separate several with commas.</span></label>
+      <div class="mt8"><div class="row base between"><span class="xs muted">Teams <span class="faint">(optional)</span></span>${btn(label('boardTeams', S.boardTeams ? 'Refresh teams' : 'Find teams', 'Looking…'), 'board-teams', {}, 'ghost sm', isBusy('boardTeams'))}</div>
+        ${S.boardTeams ? (S.boardTeams.length ? `<div class="row gap6 wrap mt6" role="group" aria-label="Teams">${S.boardTeams.map(t => { const on = (fv('board', 'teams', []) || []).includes(t.name); return `<button type="button" class="btn sm ${on ? 'soft' : ''}" data-act="toggle-board-team" data-team="${attr(t.name)}" aria-pressed="${on ? 'true' : 'false'}">${on ? '✓ ' : ''}${esc(t.name)} <span class="tiny faint">${t.count}</span></button>`; }).join('')}</div>` : '<div class="helper">This board does not list teams — use role keywords instead.</div>') : '<div class="helper">Look up the board to choose from its teams. Nothing picked imports every open role.</div>'}</div>
       ${btn(label('board', 'Import board', 'Importing…'), 'import-board', {}, 'block mt8', isBusy('board'))}</section>
   </div></div>`;
 }
@@ -2241,12 +2244,24 @@ const A = {
     toast(out.created ? 'Added to your triage queue' : 'That job was already in the pipeline — details refreshed');
     openJob(out.job.id);
   }),
+  'board-teams': () => busy('boardTeams', async () => {
+    const kind = fv('board', 'kind', 'greenhouse'), token = (fv('board', 'token', '') || '').trim();
+    if (!/^[\w.-]+$/.test(token)) throw new Error('Enter the board token — letters, numbers, dots or dashes');
+    const out = await api(`/api/import/${kind}/${encodeURIComponent(token)}/teams`);
+    S.boardTeams = out.teams; setF('board', 'teams', []);
+    return out;
+  }, out => out.teams.length ? `${out.teams.length} teams found` : 'This board does not list teams'),
+  'toggle-board-team': el => {
+    const team = el.dataset.team, chosen = fv('board', 'teams', []) || [];
+    setF('board', 'teams', chosen.includes(team) ? chosen.filter(t => t !== team) : [...chosen, team]); render();
+  },
   'import-board': () => busy('board', async () => {
     const kind = fv('board', 'kind', 'greenhouse'), token = (fv('board', 'token', '') || '').trim();
     if (!/^[\w.-]+$/.test(token)) throw new Error('Enter the board token — letters, numbers, dots or dashes');
-    const out = await api(`/api/import/${kind}/${encodeURIComponent(token)}`, { method: 'POST' });
-    delete S.forms.board; await load(); return out;
-  }, out => `Imported ${out.created} new of ${out.seen} open roles — they are in your triage queue`),
+    const body = { teams: fv('board', 'teams', []) || [], roles: String(fv('board', 'roles', '') || '').split(',').map(r => r.trim()).filter(Boolean) };
+    const out = await api(`/api/import/${kind}/${encodeURIComponent(token)}`, { method: 'POST', body });
+    delete S.forms.board; S.boardTeams = null; await load(); return out;
+  }, out => `Imported ${out.created} new of ${out.seen} ${out.seen === out.total ? 'open' : 'matching'} roles — they are in your triage queue`),
   'ranking-retry': el => busy('rankRetry' + el.dataset.job, async () => {
     const out = await api(`/api/jobs/${el.dataset.job}/rank`, { method: 'POST' });
     await loadRanking();

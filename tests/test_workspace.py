@@ -278,7 +278,7 @@ def test_knowledge_edit_and_url_guards():
 def test_board_import_errors_are_readable(monkeypatch):
     import httpx
 
-    def missing_board(_db, token):
+    def missing_board(_db, token, **_filters):
         request = httpx.Request("GET", f"https://boards-api.greenhouse.io/v1/boards/{token}/jobs")
         raise httpx.HTTPStatusError("404", request=request, response=httpx.Response(404, request=request))
 
@@ -286,6 +286,24 @@ def test_board_import_errors_are_readable(monkeypatch):
     response = client.post("/api/import/greenhouse/nope")
     assert response.status_code == 404
     assert response.json()["detail"] == "No public Greenhouse board named 'nope'"
+
+
+def test_board_import_can_be_limited_to_teams_and_roles(monkeypatch):
+    posting = lambda i, title, team: {"id": i, "title": title, "content": "<p>Build things</p>", "absolute_url": f"https://x.test/{i}",
+                                      "location": {"name": "Remote"}, "departments": [{"name": team}]}
+    board = [posting(9101, "Backend Engineer", "Engineering"), posting(9102, "Data Engineer", "Data"),
+             posting(9103, "Account Executive", "Sales"), posting(9104, "Staff Engineer", "Engineering")]
+    monkeypatch.setattr("app.services.sources._fetch_greenhouse", lambda token: board)
+
+    teams = client.get("/api/import/greenhouse/acme/teams").json()["teams"]
+    assert teams == [{"name": "Engineering", "count": 2}, {"name": "Data", "count": 1}, {"name": "Sales", "count": 1}]
+
+    only_team = client.post("/api/import/greenhouse/acme", json={"teams": ["engineering"]}).json()
+    assert (only_team["seen"], only_team["total"]) == (2, 4)
+    both = client.post("/api/import/greenhouse/acme", json={"teams": ["Data", "Sales"], "roles": ["engineer"]}).json()
+    assert (both["seen"], both["created"]) == (1, 1)  # Data Engineer only: in a chosen team and a matching title
+    everything = client.post("/api/import/greenhouse/acme").json()
+    assert (everything["seen"], everything["total"]) == (4, 4)
 
 
 def test_rank_batch_queues_unranked_jobs_without_ranking_them():

@@ -218,6 +218,26 @@ describe('actor picker', () => {
   });
 });
 
+describe('import a company board', () => {
+  it('imports only the chosen teams and role keywords', async () => {
+    const calls = [];
+    fetchMock.mockImplementation(async (url, opts) => {
+      calls.push([opts?.method || 'GET', String(url), opts?.body]);
+      if (opts?.method === 'POST') return response({ seen: 2, created: 2, total: 9 });
+      return response(String(url).endsWith('/teams') ? { teams: [{ name: 'Data', count: 3 }] } : []);
+    });
+    ui.setF('board', 'token', 'acme');
+    ui.setF('board', 'roles', ' engineer, scientist ,');
+    await ui.A['board-teams']();
+    expect(ui.S.boardTeams).toEqual([{ name: 'Data', count: 3 }]);
+    ui.A['toggle-board-team']({ dataset: { team: 'Data' } });
+    await ui.A['import-board']();
+    const post = calls.find(c => c[0] === 'POST');
+    expect(post[1]).toBe('/api/import/greenhouse/acme');
+    expect(JSON.parse(post[2])).toEqual({ teams: ['Data'], roles: ['engineer', 'scientist'] });
+  });
+});
+
 describe('add one manually', () => {
   const click = el => el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
   const mode = id => click(buttonFor('manual-mode').find(b => b.dataset.id === id));
