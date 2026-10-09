@@ -370,8 +370,11 @@ async def jd_recovery_job(ctx: JobContext) -> dict[str, Any]:
             outcome = await jd_recovery.process(ctx.sessions, claim, browser=browser)
         except Exception:  # noqa: BLE001  the lease expires and the task is retried (recover_expired)
             return "lost"
-        if outcome == "recovered":  # a description arrived: parse it now, and rank a job that needs no parse
-            scheduler_hooks.nudge("jd_parsing")
+        if outcome != "lost":
+            # Ranking skips a job while its recovery is active, so any end of recovery (recovered, failed, blocked,
+            # skipped, unchanged…) may have made a queued ranking ready. Only new text needs a parse.
+            if outcome == "recovered":
+                scheduler_hooks.nudge("jd_parsing")
             scheduler_hooks.nudge("ranking")
         return outcome
 

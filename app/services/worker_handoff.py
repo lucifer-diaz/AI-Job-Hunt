@@ -35,6 +35,7 @@ from app.models import (
     JobDescriptionParseTask,
     JobRankingTask,
     ResumeVariant,
+    TailorTask,
 )
 from app.services import auto_tailor, job_description, ranker
 from app.services.lifecycle import STOPPED_BY_USER
@@ -142,16 +143,20 @@ def _queue_tailoring(db: Session, user_id: int, ids: list[int]):
 # ───────────── Tailoring / Reviewing → Approval ─────────────
 
 def _reviewed_unapproved(db: Session, user_id: int) -> list[int]:
-    """Reviewed packets the account's own policy would approve (automatic mode, minimum score met) that were not."""
+    """Reviewed packets the account's own policy would approve (automatic mode, a stored PASS, minimum score met) that were not."""
     setting = settings_for(db, user_id)
     if setting.application_mode != "automatic":
         return []
     latest = select(func.max(ResumeVariant.version)).where(ResumeVariant.job_id == Job.id).correlate(Job).scalar_subquery()
     approved = exists().where(Application.job_id == Job.id, Application.status.in_(("approved", "applied")))
+    stopped = exists().where(TailorTask.job_id == Job.id, TailorTask.error == STOPPED_BY_USER)
     rows = db.execute(
         select(Job.id, ResumeVariant.reviewer_score)
         .join(ResumeVariant, (ResumeVariant.job_id == Job.id) & (ResumeVariant.version == latest))
-        .where(_owned(user_id), Job.status.in_(("tailored", "pending_approval")), ~approved,
+        # Only a stored PASS ("tailored"): a packet held for a person ("pending_approval": the reviewer asked for a human,
+        # confidence was low or a candidate-policy filter failed) is never approved by a nudge, and neither is one whose
+        # tailoring the person stopped.
+        .where(_owned(user_id), Job.status == "tailored", ~approved, ~stopped,
                ResumeVariant.reviewer_score.is_not(None), ResumeVariant.reviewer_score >= setting.min_review_score)
         .order_by(desc(ResumeVariant.reviewer_score), Job.id).limit(LIMIT)).all()
     return [row[0] for row in rows]

@@ -2585,8 +2585,10 @@ document.addEventListener('toggle', e => {
 // The server says when the newest approval happened (summary.approved.latest_at); the browser remembers the last one it
 // announced, so each approval raises one notification, a reload repeats none and history is never replayed.
 const NOTIFY_KEYS = { on: 'jobhunt.notify.approved', seen: 'jobhunt.notify.approved.seen' };
-const lsGet = key => { try { return localStorage.getItem(key); } catch { return null; } };
-const lsSet = (key, value) => { try { localStorage.setItem(key, value); } catch { /* private window: announce once per page */ } };
+// Where localStorage is blocked (some private or embedded contexts) the values live in memory for this page instead.
+const lsMemory = new Map();
+const lsGet = key => { try { const v = localStorage.getItem(key); if (v !== null) return v; } catch { /* use memory */ } return lsMemory.has(key) ? lsMemory.get(key) : null; };
+const lsSet = (key, value) => { lsMemory.set(key, String(value)); try { localStorage.setItem(key, value); } catch { /* memory only */ } };
 const notifySupported = () => typeof Notification !== 'undefined';
 // On unless the person turned it off here; the browser's own permission still has the last word.
 const notifyWanted = () => lsGet(NOTIFY_KEYS.on) !== 'off';
@@ -2597,10 +2599,12 @@ async function setNotifyApproved(on) {
   return notifyPermission();
 }
 function announceApprovals(summary) {
-  const latest = summary?.approved?.latest_at;
+  if (!summary?.approved) return false;
+  const latest = summary.approved.latest_at, seen = lsGet(NOTIFY_KEYS.seen);
+  // First visit: what is already approved is not news. With no approval yet the baseline is empty (''), so the first
+  // approval that ever happens is announced.
+  if (seen === null) { lsSet(NOTIFY_KEYS.seen, latest || ''); return false; }
   if (!latest) return false;
-  const seen = lsGet(NOTIFY_KEYS.seen);
-  if (seen === null) { lsSet(NOTIFY_KEYS.seen, latest); return false; }  // first visit: what is already approved is not news
   if (latest <= seen) return false;
   lsSet(NOTIFY_KEYS.seen, latest);
   if (!notifyWanted()) return false;

@@ -668,3 +668,23 @@ def test_run_queued_now_releases_every_waiting_task_without_skipping_cooldowns(u
         assert all(t.run_now_at is None for t in task.values())  # a provider cooldown still applies
         assert not task["stopped"].force and not task["theirs"].force and task["theirs"].next_attempt_at is not None
     assert signed_in(user_id).post("/api/workers/tailoring/run-queued").status_code == 409
+
+
+def test_approval_nudge_leaves_held_and_stopped_packets_alone(user_id, signed_in):
+    from app.models import AppSetting
+
+    with SessionLocal() as db:
+        passed, held, stopped = (add_job(db, user_id, status=st) for st in ("tailored", "pending_approval", "tailored"))
+        for job in (passed, held, stopped):
+            db.add(ResumeVariant(user_id=user_id, job_id=job.id, version=1, reviewer_score=95, markdown="x"))
+        db.add(TailorTask(user_id=user_id, job_id=stopped.id, status="cancelled", stage="done", attempts=1,
+                          error="Stopped by you"))
+        row = db.scalar(select(AppSetting).where(AppSetting.user_id == user_id)) or AppSetting(user_id=user_id)
+        row.application_mode, row.min_review_score = "automatic", 70
+        db.add(row)
+        db.commit()
+        passed_id, held_id, stopped_id = passed.id, held.id, stopped.id
+    out = signed_in(user_id).post("/api/workers/reviewing/nudge").json()
+    assert out["moved"] == [passed_id]  # a reviewer's hold for a person, and a stopped run, stay as they are
+    with SessionLocal() as db:
+        assert db.get(Job, held_id).status == "pending_approval" and db.get(Job, stopped_id).status == "tailored"

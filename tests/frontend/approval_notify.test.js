@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const appSource = readFileSync('app/static/app.js', 'utf8').split('/* ───────────── boot ───────────── */')[0];
 const names = ['S', 'D', 'announceApprovals', 'setNotifyApproved', 'refreshApprovals', 'notifyWanted', 'NOTIFY_KEYS'];
-let ui, store, shown, permission;
+let ui, context, store, shown, permission;
 
 class FakeNotification {
   constructor(title, options) { this.title = title; this.options = options; shown.push(this); }
@@ -19,7 +19,7 @@ beforeEach(() => {
   document.body.innerHTML = '<script id="boot" type="application/json">{"user":{"email":"a@b.c"}}</script><div id="nav"></div><div id="side-foot"></div><div id="side-meta"></div><div id="brand-sub"></div><div id="top"></div><div id="view"></div><div id="overlays"></div><div id="toast"></div>';
   store = new Map(); shown = []; permission = 'granted';
   const localStorage = { getItem: k => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, String(v)) };
-  const context = createContext({ document, window, location, history, navigator, URLSearchParams, FormData, File, Intl, setTimeout, clearTimeout, setInterval, clearInterval, console, localStorage, Notification: FakeNotification });
+  context = createContext({ document, window, location, history, navigator, URLSearchParams, FormData, File, Intl, setTimeout, clearTimeout, setInterval, clearInterval, console, localStorage, Notification: FakeNotification });
   for (const file of ['monitoring.js', 'orchestration.js', 'workers.js', 'settings.js', 'resume_data.js', 'job_data.js', 'knowledge.js', 'inbox.js', 'guide.js', 'job_insights.js']) {
     runInContext(readFileSync(`app/static/${file}`, 'utf8'), context, { filename: resolve(`app/static/${file}`) });
   }
@@ -40,10 +40,21 @@ describe('desktop notification for approvals', () => {
     expect(shown).toHaveLength(1);
   });
 
-  it('does nothing without any approval', () => {
+  it('does nothing without any approval, and announces the very first one', () => {
     expect(ui.announceApprovals(summary(null, 0))).toBe(false);
     expect(ui.announceApprovals(undefined)).toBe(false);
-    expect(store.size).toBe(0);
+    expect(ui.announceApprovals(summary(null, 0))).toBe(false);
+    expect(ui.announceApprovals(summary('2026-10-09T10:00:00'))).toBe(true);  // an empty account's first approval is news
+    expect(shown).toHaveLength(1);
+  });
+
+  it('keeps its state in memory when localStorage cannot be used', () => {
+    const broken = { getItem() { throw new Error('blocked'); }, setItem() { throw new Error('blocked'); } };
+    context.localStorage = broken;
+    expect(ui.announceApprovals(summary('2026-10-09T10:00:00'))).toBe(false);
+    expect(ui.announceApprovals(summary('2026-10-09T11:00:00'))).toBe(true);
+    expect(ui.announceApprovals(summary('2026-10-09T11:00:00'))).toBe(false);
+    expect(shown).toHaveLength(1);
   });
 
   it('respects the switch and the browser permission, falling back to a toast', () => {
