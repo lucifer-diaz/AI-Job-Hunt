@@ -55,6 +55,7 @@ beforeEach(() => {
   routes = { summary: summary(), parsing: parsing(), activity: activity(), settings: settings(), workerSettings: workerSettings(), fail: false };
   fetchMock = vi.fn(async (url, opt = {}) => {
     if (routes.fail && url.startsWith('/api/workers')) return response({ detail: 'Workers are unavailable' }, 503);
+    if (opt.method === 'POST' && url.endsWith('/run-queued')) { routes.runQueued = url; return response({ kind: 'ranking', released: 3, task_ids: [1, 2, 3] }); }
     if (opt.method === 'POST' && url.endsWith('/nudge')) { routes.nudged = url; routes.nudgeBody = opt.body ? JSON.parse(opt.body) : null; return response({ kind: 'parsing', to: 'Ranking', moved: [4, 5], skipped: [{ job_id: 6, reason: 'Dismissed in triage' }], message: null }); }
     if (opt.method === 'POST' && url.includes('/run-now')) return response(row({ status: 'QUEUED', run_now: true }));
     if (opt.method === 'POST' && url.includes('/cooldowns/reset')) return response({ cleared: ['OPENROUTER'] });
@@ -207,6 +208,21 @@ describe('Running workers', () => {
     expect(routes.nudgeBody).toEqual({ job_ids: [4, 5] });
     await ui.A['wk-nudge']({ dataset: { kind: 'parsing' } });
     expect(routes.nudgeBody).toBeNull();
+  });
+
+  it('ranks everything that is queued now, in bulk, after asking', async () => {
+    let v = await open('ranking');
+    const button = v.querySelector('[data-act="wk-run-queued"]');
+    expect(button.textContent.trim()).toBe('Rank 1 queued now');
+    confirmMock.mockClear();
+    await ui.A['wk-run-queued']({ dataset: { kind: 'ranking', n: '1' } });
+    expect(confirmMock).not.toHaveBeenCalled();  // one task needs no question
+    expect(routes.runQueued).toBe('/api/workers/ranking/run-queued');
+    await ui.A['wk-run-queued']({ dataset: { kind: 'ranking', n: '3' } });
+    expect(confirmMock).toHaveBeenCalledTimes(1);
+    expect(document.getElementById('toast').textContent).toBe('3 queued tasks released to run now');
+    v = await open('tailoring');
+    expect(v.querySelector('[data-act="wk-run-queued"]')).toBeNull();  // tailoring has no wait to skip
   });
 
   it('shows the rate-limit backoff and resets it', async () => {

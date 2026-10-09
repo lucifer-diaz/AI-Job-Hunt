@@ -648,3 +648,23 @@ def test_nudge_never_touches_another_account_and_insights_has_no_next_stage(user
     assert _next(client, "insights") is None
     assert client.post("/api/workers/insights/nudge").json()["message"] == "This worker has no next stage"
     assert client.post("/api/workers/nonsense/nudge").status_code == 404
+
+
+def test_run_queued_now_releases_every_waiting_task_without_skipping_cooldowns(user_id, signed_in):
+    other = make_user(SessionLocal)
+    with SessionLocal() as db:
+        queued, waiting, stopped, theirs = (add_job(db, uid) for uid in (user_id, user_id, user_id, other))
+        later = utcnow() + timedelta(minutes=15)
+        for job, uid, extra in ((queued, user_id, {}), (waiting, user_id, {"next_attempt_at": later, "attempt_count": 1}),
+                                (stopped, user_id, {"last_error": "Stopped by you"}), (theirs, other, {"next_attempt_at": later})):
+            db.add(JobRankingTask(user_id=uid, job_id=job.id, status="PENDING", **{"attempt_count": 0, **extra}))
+        db.commit()
+        ids = {"queued": queued.id, "waiting": waiting.id, "stopped": stopped.id, "theirs": theirs.id}
+    out = signed_in(user_id).post("/api/workers/ranking/run-queued").json()
+    assert out["released"] == 2
+    with SessionLocal() as db:
+        task = {name: db.scalar(select(JobRankingTask).where(JobRankingTask.job_id == job_id)) for name, job_id in ids.items()}
+        assert task["queued"].force and task["waiting"].force and task["waiting"].next_attempt_at is None
+        assert all(t.run_now_at is None for t in task.values())  # a provider cooldown still applies
+        assert not task["stopped"].force and not task["theirs"].force and task["theirs"].next_attempt_at is not None
+    assert signed_in(user_id).post("/api/workers/tailoring/run-queued").status_code == 409

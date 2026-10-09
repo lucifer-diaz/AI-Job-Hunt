@@ -185,6 +185,17 @@ def retry_tasks(kind: str, payload: RetryIn, request: Request, background: Backg
     return out
 
 
+@router.post("/{kind}/run-queued")
+def run_queued(kind: str, request: Request, background: BackgroundTasks, user: CurrentUser = Depends(current_user),
+               db: Session = Depends(get_user_db)) -> dict[str, Any]:
+    """Run every queued or waiting task of this worker now, in bulk (see workers.run_queued_now)."""
+    out = _guard(workers.run_queued_now, db, user.id, kind)
+    job = workers.KINDS[kind].scheduler_job
+    if job and out["released"]:
+        run_soon(background, request.app, job)
+    return out
+
+
 class NudgeIn(BaseModel):
     job_ids: list[int] | None = Field(default=None, max_length=500)
 

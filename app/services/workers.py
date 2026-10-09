@@ -618,6 +618,29 @@ def run_now(db: Session, user_id: int, kind: str, task_id: int, now: datetime | 
     return row(spec, task, labels.get(task.job_id), now, worker_settings.get(db, user_id, spec.settings_kind, "max_attempts"))
 
 
+def run_queued_now(db: Session, user_id: int, kind: str, now: datetime | None = None) -> dict[str, Any]:
+    """Rank (or parse, recover, research) everything that is waiting, now: every queued or waiting task of the account
+    loses its retry wait, and ranking tasks become the person's own request, so the account's cadence, a paused queue
+    or auto-ranking being off no longer hold them back.
+
+    Unlike one task's Run now this does not set run_now_at: a provider cooldown still applies, because many tasks at
+    once are exactly what makes a provider refuse (the same rule as bulk Retry). Tasks a person stopped stay stopped;
+    tasks whose description is still being read wait for it (the ranking claim skips them). Commits; the caller wakes
+    the worker (run_soon)."""
+    spec, now = kind_of(kind), now or utcnow()
+    if spec.tailor:
+        raise WorkerError("Tailoring starts as soon as a slot is free: there is no wait to skip")
+    tasks = db.scalars(select(spec.model).where(spec.model.user_id == user_id, spec.model.status == spec.pending,
+                                                or_(spec.model.last_error.is_(None), spec.model.last_error != STOPPED_BY_USER))
+                       .order_by(spec.model.id).limit(RETRY_LIMIT)).all()
+    for task in tasks:
+        task.next_attempt_at = None
+        if spec.kind == "ranking":
+            task.force = True
+    db.commit()
+    return {"kind": spec.kind, "released": len(tasks), "task_ids": [t.id for t in tasks]}
+
+
 # ───────────── the screen ─────────────
 
 def scheduler_facts(scheduler: Any, job: str | None) -> dict[str, Any] | None:

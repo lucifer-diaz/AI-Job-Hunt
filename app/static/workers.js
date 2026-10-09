@@ -208,6 +208,13 @@ function wkLimits(tab) {
   if (tab === 'recovery') { const x = D.wkData?.recovery?.diagnostics?.settings; return x ? [`⇉ ${x.max_concurrency} at a time · batches of ${x.batch_size}`] : []; }
   return [];
 }
+// Rank / run everything that is waiting, now, in bulk (not for tailoring, which has no wait).
+function wkRunQueuedButton(tab, spec) {
+  if (!['parsing', 'recovery', 'ranking', 'insights'].includes(tab)) return '';
+  const c = spec.counts || {}, n = (c.queued || 0) + (c.retrying || 0), key = 'wkRunQueued' + tab;
+  const verb = tab === 'ranking' ? 'Rank' : 'Run';
+  return `<span title="${attr(n ? `${verb} the ${n} queued or waiting task${n === 1 ? '' : 's'} now: no retry wait${tab === 'ranking' ? ', no cadence' : ''}. A provider cooldown still applies.` : 'Nothing is queued')}">${btn(label(key, `${verb} ${n || ''} queued now`.replace('  ', ' '), 'Starting…'), 'wk-run-queued', { kind: tab, n }, 'sm', !n || isBusy(key))}</span>`;
+}
 // A finished task's own Nudge: enabled while its job is waiting for the next stage, otherwise it says why it is not.
 const WK_OK = ['COMPLETED', 'SUCCEEDED', 'PARTIAL'];
 function wkRowNudge(kind, jobId, status) {
@@ -252,7 +259,7 @@ function wkHero(tab, spec, act) {
     <div class="wk-hero-head"><div style="min-width:0;flex:1">
         <div class="wk-hero-title"><span class="wk-pulse ${live ? 'on' : ''}" aria-hidden="true"></span>${esc(spec.label || '')}${live ? ' <span class="orch-chip brand">● working</span>' : active ? ' <span class="orch-chip muted">○ waiting</span>' : ' <span class="orch-chip good">✓ idle</span>'}${spec.paused ? ' <a class="orch-chip warn" href="#workers/settings">⏸ paused for your account</a>' : ''}</div>
         <div class="card-sub mt4">${esc(spec.description || '')}</div></div>
-      <div class="row gap8 wrap">${wkNudgeButton(tab, spec)}${btn(label('wkKillAll' + tab, `Kill all ${spec.label || ''}`.trim(), 'Stopping…'), 'wk-kill-all', { kind: tab }, 'sm danger', !stoppable || isBusy('wkKillAll' + tab))}
+      <div class="row gap8 wrap">${wkRunQueuedButton(tab, spec)}${wkNudgeButton(tab, spec)}${btn(label('wkKillAll' + tab, `Kill all ${spec.label || ''}`.trim(), 'Stopping…'), 'wk-kill-all', { kind: tab }, 'sm danger', !stoppable || isBusy('wkKillAll' + tab))}
         ${btn(label('wkRefresh', 'Refresh', 'Refreshing…'), 'wk-refresh', {}, 'sm', isBusy('wkRefresh'))}</div></div>
     <div class="wk-meta">${meta}</div>
     <div class="wk-kpis">${kpi('Running', c.running || 0, 'right now', 'brand', '●')}${kpi('Queued', c.queued || 0, 'waiting their turn', 'muted', '○')}
@@ -674,6 +681,12 @@ const WORKERS_ACTIONS = {
   'wk-refresh': () => busy('wkRefresh', wkReload),
   // A browser setting, not an account one: it applies at once and needs a click for the browser's permission prompt.
   'wk-notify': async el => { await setNotifyApproved(el.checked); render(); },
+  'wk-run-queued': el => {
+    const kind = el.dataset.kind, n = Number(el.dataset.n) || 0;
+    if (n > 1 && !confirm(`${kind === 'ranking' ? 'Rank' : 'Run'} ${n} queued tasks now? They start as fast as your limits allow; a provider cooldown still applies.`)) return;
+    return busy('wkRunQueued' + kind, async () => { const out = await api(`/api/workers/${kind}/run-queued`, { method: 'POST' }); await wkReload(); return out; },
+      out => out.released ? `${out.released} queued task${out.released === 1 ? '' : 's'} released to run now` : 'Nothing was waiting');
+  },
   'wk-nudge': el => busy(el.dataset.job ? `wkNudge${el.dataset.kind}${el.dataset.job}` : el.dataset.jobs ? 'wkNudgeShown' + el.dataset.kind : 'wkNudge' + el.dataset.kind, async () => {
     const jobs = el.dataset.job ? [Number(el.dataset.job)] : el.dataset.jobs ? el.dataset.jobs.split(',').map(Number) : null;
     const out = await api(`/api/workers/${el.dataset.kind}/nudge`, { method: 'POST', ...(jobs ? { body: { job_ids: jobs } } : {}) });
