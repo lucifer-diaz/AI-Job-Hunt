@@ -195,6 +195,20 @@ describe('actor picker', () => {
     expect(ui.S.editActor).toBeNull();
   });
 
+  it('inserts a clicked placeholder over the selected value, and fills a schema field with its suggestion', () => {
+    ui.D.actors.placeholders = ['role', 'is_remote', 'seniority'];
+    ui.S.addActor = true;
+    ui.setF('ca', 'input_template', '{\n  "remote": false\n}');
+    ui.S.caFields = [{ name: 'seniority', type: 'array', suggested: '{{seniority}}' }, { name: 'note', type: 'string', suggested: '' }];
+    ui.render();
+    const box = document.getElementById('ca-input_template');
+    box.selectionStart = box.value.indexOf('false'); box.selectionEnd = box.selectionStart + 5;
+    document.querySelector('[data-act="insert-placeholder"][data-name="is_remote"]').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    expect(JSON.parse(document.getElementById('ca-input_template').value)).toEqual({ remote: '{{is_remote}}' });
+    document.querySelector('[data-act="insert-actor-field"][data-name="seniority"]').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    expect(JSON.parse(document.getElementById('ca-input_template').value)).toEqual({ remote: '{{is_remote}}', seniority: '{{seniority}}' });
+  });
+
   it('sends the startup settings with the search', () => {
     ui.setF('sp', 'yc_batches', ['W24']);
     ui.setF('sp', 'hn_month', ' 2026-08 ');

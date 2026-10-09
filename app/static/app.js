@@ -1688,7 +1688,10 @@ const FANOUT = { role_location: 'one run per role × location', location: 'one r
 const ACTOR_USES = { boards: 'Boards', location: 'Location', distance: 'Radius', country: 'Country', remote: 'Remote only', job_type: 'Job type', hours: 'Posted within', easy_apply: 'Easy Apply', fetch_description: 'Full descriptions', annual_salary: 'Annual salary', linkedin_company_ids: 'Company IDs', seniority: 'Seniority', salary_only: 'Salary listed', visa_sponsorship: 'Visa sponsorship', exclude_keywords: 'Exclude', skip_agencies: 'Skip agencies', remote_platforms: 'Boards', remoteok_url: 'Start page', yc_batches: 'YC batches', startup_details: 'Company details', hn_month: 'Thread month', min_salary: 'Min salary' };
 const STARTUP_ACTORS = { waas: 'antishock/workatastartup-jobs-scraper', yc: 'automation-lab/ycombinator-jobs-scraper', hn: 'parseforge/hn-whoishiring-scraper', wellfound: 'blackfalcondata/wellfound-scraper' };
 // A user-added actor reads whichever filters its input template names.
-const TEMPLATE_USES = { hours_old: 'hours', days_old: 'hours', is_remote: 'remote', job_type: 'job_type', location: 'location', locations: 'location', sites: 'boards', country: 'country' };
+const TEMPLATE_USES = { hours_old: 'hours', days_old: 'hours', is_remote: 'remote', job_type: 'job_type', location: 'location', locations: 'location', sites: 'boards', country: 'country',
+  seniority: 'seniority', distance: 'distance', easy_apply: 'easy_apply', fetch_description: 'fetch_description', enforce_annual_salary: 'annual_salary', salary_only: 'salary_only',
+  visa_sponsorship: 'visa_sponsorship', exclude_keywords: 'exclude_keywords', linkedin_company_ids: 'linkedin_company_ids', skip_agencies: 'skip_agencies', min_salary: 'min_salary',
+  yc_batches: 'yc_batches', hn_month: 'hn_month', startup_details: 'startup_details', remote_platforms: 'remote_platforms', remoteok_url: 'remoteok_url' };
 function actorUses(a) {
   if (!a.custom) return a.supports || [];
   const text = JSON.stringify(a.input_template || {});
@@ -1736,9 +1739,9 @@ function addActorForm() {
     ${inputF('ca', 'name', '', 'placeholder="Display name"')}
     <label class="field mt8">Runs${selectF('ca', 'fan_out', 'role_location', Object.entries(FANOUT).map(([k, v]) => [k, v[0].toUpperCase() + v.slice(1)]))}</label>
     <label class="field mt8">Input template (JSON)${textareaF('ca', 'input_template', DEFAULT_TEMPLATE, 'style="font-family:var(--mono);font-size:11.5px;min-height:130px"')}</label>
-    <div class="helper">Placeholders: ${(D.actors?.placeholders || []).map(x => `<span class="mono">{{${x}}}</span>`).join(' ')}. A value that is only a placeholder keeps its type (number, list, true/false).</div>
-    ${S.caFields ? `<div class="xs muted mt8" role="group" aria-label="Input schema">This actor accepts — click a field to add it to the template:
-      <div class="row gap6 wrap mt4">${S.caFields.map(x => `<button type="button" class="btn sm" data-act="insert-actor-field" data-name="${attr(x.name)}" title="${attr([x.type, x.title].filter(Boolean).join(' · '))}"><span class="mono">${esc(x.name)}${x.required ? '*' : ''}</span>${x.type ? ` <span class="tiny faint">${esc(x.type)}</span>` : ''}</button>`).join('') || 'no documented inputs'}</div></div>` : ''}
+    <div class="helper" role="group" aria-label="Placeholders">Placeholders — select a value in the template (or place the cursor) and click one to insert it: <span class="row gap6 wrap mt4">${(D.actors?.placeholders || []).map(x => `<button type="button" class="btn sm" data-act="insert-placeholder" data-name="${attr(x)}"><span class="mono">{{${x}}}</span></button>`).join('')}</span> A value that is only a placeholder keeps its type (number, list, true/false).</div>
+    ${S.caFields ? `<div class="xs muted mt8" role="group" aria-label="Input schema">This actor accepts — click a field to add it with the matching placeholder:
+      <div class="row gap6 wrap mt4">${S.caFields.map(x => `<button type="button" class="btn sm" data-act="insert-actor-field" data-name="${attr(x.name)}" title="${attr([x.type, x.title, x.suggested && `fills with ${x.suggested}`].filter(Boolean).join(' · '))}"><span class="mono">${esc(x.name)}${x.required ? '*' : ''}</span>${x.suggested ? ` <span class="tiny mono" style="color:var(--brand)">${esc(x.suggested)}</span>` : x.type ? ` <span class="tiny faint">${esc(x.type)}</span>` : ''}</button>`).join('') || 'no documented inputs'}</div></div>` : ''}
     <div class="row gap8 mt10">${btn(editing ? 'Save changes' : 'Add actor', 'add-actor', {}, 'primary sm')}${editing ? btn('Cancel', 'toggle-add-actor', {}, 'ghost sm') : ''}</div></div>`;
 }
 const setupResumeValue = p => p.resume_mode === 'fixed' || (!p.resume_mode && p.resume_id) ? String(p.resume_id) : (p.resume_mode || 'auto');
@@ -2062,6 +2065,19 @@ const A = {
     render();
     document.getElementById('ca-input_template')?.scrollIntoView?.({ block: 'center' });
   },
+  'insert-placeholder': el => {
+    const box = document.getElementById('ca-input_template'), f = S.forms.ca || {};
+    const text = box ? box.value : (f.input_template ?? DEFAULT_TEMPLATE);
+    const start = box ? box.selectionStart : text.length, end = box ? box.selectionEnd : text.length;
+    const token = `{{${el.dataset.name}}}`;
+    // Inside a string the placeholder goes in as is; over a bare value (false, 20…) it replaces it as a quoted string.
+    const inString = (text.slice(0, start).match(/(?<!\\)"/g) || []).length % 2 === 1;
+    const insert = inString ? token : `"${token}"`;
+    setF('ca', 'input_template', text.slice(0, start) + insert + text.slice(end));
+    render();
+    const next = document.getElementById('ca-input_template');
+    if (next) { next.focus(); next.selectionStart = next.selectionEnd = start + insert.length; }
+  },
   'insert-actor-field': el => {
     const f = S.forms.ca || {}, name = el.dataset.name;
     let template;
@@ -2069,7 +2085,7 @@ const A = {
     if (!template || typeof template !== 'object' || Array.isArray(template)) return toast('The input template must be a JSON object', true);
     if (name in template) return toast(`${name} is already in the template`);
     const field = (S.caFields || []).find(x => x.name === name) || {};
-    template[name] = field.default ?? field.prefill ?? (field.type === 'integer' || field.type === 'number' ? 0 : field.type === 'boolean' ? false : field.type === 'array' ? [] : field.type === 'object' ? {} : '');
+    template[name] = field.suggested || (field.default ?? field.prefill ?? (field.type === 'integer' || field.type === 'number' ? 0 : field.type === 'boolean' ? false : field.type === 'array' ? [] : field.type === 'object' ? {} : ''));
     setF('ca', 'input_template', JSON.stringify(template, null, 2));
     render();
   },

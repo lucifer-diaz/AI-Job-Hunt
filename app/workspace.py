@@ -1279,7 +1279,19 @@ GUESSES = [(re.compile(r"^(search_?term|keywords?|query|search|search_?keywords?
            (re.compile(r"^(max_?(items|results|jobs)|limit|results_?wanted|rows|count)$", re.I), "{{max_results}}"),
            (re.compile(r"^(hours_?old|posted_?within_?hours)$", re.I), "{{hours_old}}"),
            (re.compile(r"^(days_?old|posted_?within_?days|date_?posted)$", re.I), "{{days_old}}"),
-           (re.compile(r"^(is_?remote|remote(_?only)?)$", re.I), "{{is_remote}}")]
+           (re.compile(r"^(is_?remote|remote(_?only)?)$", re.I), "{{is_remote}}"),
+           (re.compile(r"^(job_?types?|employment_?types?)$", re.I), "{{job_type}}"),
+           (re.compile(r"^(sites|boards|platforms)$", re.I), "{{sites}}"),
+           (re.compile(r"^(country|country_?indeed)$", re.I), "{{country}}"),
+           (re.compile(r"^(seniority|seniority_?(filter|levels?)|experience_?levels?)$", re.I), "{{seniority}}"),
+           (re.compile(r"^(distance|radius)$", re.I), "{{distance}}"),
+           (re.compile(r"^(easy_?apply|direct_?apply)$", re.I), "{{easy_apply}}"),
+           (re.compile(r"^(exclude_?keywords|title_?exclusion_?search|excluded?_?terms)$", re.I), "{{exclude_keywords}}"),
+           (re.compile(r"^(min_?salary|salary_?min)$", re.I), "{{min_salary}}"),
+           (re.compile(r"^(visa_?sponsorship|sponsorship)$", re.I), "{{visa_sponsorship}}"),
+           (re.compile(r"^(remove_?agency|skip_?agencies)$", re.I), "{{skip_agencies}}"),
+           (re.compile(r"^(has_?salary|salary_?only)$", re.I), "{{salary_only}}"),
+           (re.compile(r"^(skills?_?terms)$", re.I), "{{skills}}")]
 
 
 @router.post("/api/search/actors/lookup")
@@ -1314,10 +1326,13 @@ def lookup_actor(payload: ActorLookupIn, db: Session = Depends(get_user_db)):
             template[name] = guess
         elif name in (schema.get("required") or []) and "prefill" in prop:
             template[name] = prop["prefill"]
+    def suggest(name: str) -> str:
+        return next((value for pattern, value in GUESSES if pattern.match(name)), "")
+
     return {"id": f"{info.get('username', payload.id.split('/')[0])}/{info.get('name', payload.id.split('/')[-1])}",
             "name": info.get("title") or info.get("name") or payload.id,
             "summary": (info.get("description") or "")[:300],
-            "fields": [{"name": n, "type": p.get("type", ""), "title": p.get("title", ""), "required": n in (schema.get("required") or []),
+            "fields": [{"name": n, "type": p.get("type", ""), "title": p.get("title", ""), "required": n in (schema.get("required") or []), "suggested": suggest(n),
                         **{k: p[k] for k in ("default", "prefill") if k in p}}
                        for n, p in properties.items()],
             "input_template": template}

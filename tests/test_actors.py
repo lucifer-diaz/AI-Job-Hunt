@@ -90,6 +90,15 @@ def test_custom_actor_skill_placeholders():
     assert runs[0]["input"] == {"q": "Lead AI Engineer Go", "tags": ["Go", "Rust"]} and not warnings
 
 
+def test_custom_actor_reads_every_setup_form_placeholder():
+    template = {"seniorityFilter": "{{seniority}}", "radius": "{{distance}}", "exclude": "{{exclude_keywords}}",
+                "visa": "{{visa_sponsorship}}", "minSalary": "{{min_salary}}", "agencies": "{{skip_agencies}}"}
+    custom = {"id": "me/board", "fan_out": "role", "input_template": template}
+    runs, warnings = plan_runs({**BASE, "actors": ["me/board"], "custom_actors": [custom], "min_salary": 90000})
+    assert runs[0]["input"] == {"seniorityFilter": ["senior", "director"], "radius": 25, "exclude": ["intern"],
+                                "visa": False, "minSalary": 90000, "agencies": True} and not warnings
+
+
 def test_multi_board_drops_hours_when_easy_apply():
     runs, warnings = inputs_for("openclawai/job-board-scraper", easy_apply=True, locations=[])
     assert len(runs) == 1 and "hoursOld" not in runs[0]["input"] and runs[0]["input"]["easyApply"] is True
