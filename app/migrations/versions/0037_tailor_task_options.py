@@ -2,8 +2,8 @@
 
 NULL means the account's default length, read when the task runs, exactly as tasks behaved before.
 
-Revision ID: 0035
-Revises: 0034
+Revision ID: 0037
+Revises: 0036
 Create Date: 2026-10-08 14:00:00
 """
 from collections.abc import Sequence
@@ -11,8 +11,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = '0035'
-down_revision: str | None = '0034'
+revision: str = '0037'
+down_revision: str | None = '0036'
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
