@@ -3,13 +3,13 @@
 const SETTINGS_SECTIONS = [
   ['profile', 'Profile', 'Your professional identity', '01'],
   ['preferences', 'Job preferences', 'What your next role looks like', '02'],
-  ['resumes', 'Resumes', 'The experience behind your applications', '03'],
-  ['resume-data', 'Resume Data', 'Review and verify the facts AI may use', '04'],
-  ['account', 'Account & security', 'Manage access to your workspace', '05'],
-  ['api-keys', 'API keys', 'Connect your own providers', '06'],
-  ['workflow', 'Workflow & cadence', 'Set a pace that works for you', '07'],
-  ['domain', 'Domain filter', 'Which discovered jobs are kept, and what it learned from you', '08'],
-  ['gmail', 'Gmail inbox', 'Read-only updates on the applications you submitted', '09'],
+  // One screen for resumes: each resume with its file, its structured data and the roles it is for.
+  ['resumes', 'Resumes', 'Each resume, its data and the roles it is for', '03'],
+  ['account', 'Account & security', 'Manage access to your workspace', '04'],
+  ['api-keys', 'API keys', 'Connect your own providers', '05'],
+  ['workflow', 'Workflow & cadence', 'Set a pace that works for you', '06'],
+  ['domain', 'Domain filter', 'Which discovered jobs are kept, and what it learned from you', '07'],
+  ['gmail', 'Gmail inbox', 'Read-only updates on the applications you submitted', '08'],
 ];
 // AI models moved to AI Orchestration → Models (ai_models.js); its direct-provider form ('ai') is still saved here.
 const SETTINGS_FORMS = ['profile', 'preferences', 'resumes', 'resume-data', 'account', 'keys', 'workflow', 'domain'];
@@ -74,7 +74,9 @@ function authorizationEditor(value) {
   return `<div class="authorization-editor"><p class="settings-help">Add one entry for each country or market. This helps match roles to your actual right to work.</p><div class="authorization-rows">${rows.map((row, index) => `<div class="authorization-row" data-auth-row><label class="field" for="preferences-auth-country-${index}"><span>Country / market</span><select class="select" id="preferences-auth-country-${index}" data-auth-country data-auth-entry="1" data-auth-index="${index}"><option value="">Select a country</option>${authorizationOptions(AUTH_COUNTRIES, row.country)}</select></label><label class="field" for="preferences-auth-status-${index}"><span>Authorization</span><select class="select" id="preferences-auth-status-${index}" data-auth-status data-auth-entry="1" data-auth-index="${index}"><option value="">Select status</option>${authorizationOptions(AUTH_STATUSES, row.status)}</select></label>${rows.length > 1 ? btn('Remove', 'auth-remove', { index }, 'sm') : ''}</div>`).join('')}</div>${btn('+ Add country', 'auth-add', {}, 'sm')}<label class="field authorization-notes" for="preferences-authorization-notes"><span>Visa notes (optional)</span><textarea class="textarea" id="preferences-authorization-notes" data-auth-notes placeholder="e.g. Need sponsorship after EP expiry">${esc(notes)}</textarea></label></div>`;
 }
 
-function settingsSection(value) { return SETTINGS_SECTIONS.some(([id]) => id === value) ? value : 'profile'; }
+// Resume Data was its own section; old links (#settings/resume-data) open the merged Resumes screen.
+const SETTINGS_ALIASES = { 'resume-data': 'resumes' };
+function settingsSection(value) { value = SETTINGS_ALIASES[value] || value; return SETTINGS_SECTIONS.some(([id]) => id === value) ? value : 'profile'; }
 function settingsForm() { return S.settingsSection === 'api-keys' ? 'keys' : S.settingsSection; }
 function settingsBaseline(form) {
   const p = D.profile || {}, sp = p.search_preferences || {}, st = D.settings || {}, ai = st.ai?.saved || {};
@@ -83,6 +85,7 @@ function settingsBaseline(form) {
   if (form === 'preferences') return { ...Object.fromEntries(PREFERENCE_TOP.map(k => [k, p[k] ?? (k === 'target_roles' || k === 'preferred_locations' ? [] : '')])), ...Object.fromEntries(PREFERENCE_NESTED.map(k => [k, sp[k] ?? (k.startsWith('open_') ? false : ['total_experience', 'notice_period'].includes(k) ? '' : [])])) };
   if (form === 'ai') return { llm_provider: ai.llm_provider || '', model: ai.model || '', require_free: ai.require_free == null ? '' : String(ai.require_free), ...Object.fromEntries(['rank', 'tailor', 'review', 'followup'].map(k => [`stage_${k}`, ai.stage_models?.[k] || ''])) };
   if (form === 'workflow') return { application_mode: st.application_mode, min_review_score: st.min_review_score, execution_mode: st.execution_mode || 'backend', ranking_concurrency: st.ranking_concurrency ?? st.processing_maximums?.ranking_concurrency, tailoring_concurrency: st.tailoring_concurrency ?? st.processing_maximums?.tailoring_concurrency,
+    ...tailorLengthBaseline(st.tailoring_length),
     ranking_interval_minutes: st.ranking_interval_minutes ?? 0, rate_limit_backoff: st.rate_limits?.enabled ?? true, rate_limit_base_seconds: st.rate_limits?.base_seconds ?? 30, rate_limit_multiplier: st.rate_limits?.multiplier ?? 2, rate_limit_max_seconds: st.rate_limits?.max_seconds ?? 900, auto_tailor: !!st.auto_tailor?.enabled, auto_tailor_min_fit_score: st.auto_tailor?.min_fit_score ?? 0, weekly_target: D.prefs?.weekly_target, followup_days: D.prefs?.followup_days };
   if (form === 'workers') { const w = settingsBaseline('workflow'); return { ...Object.fromEntries(WORKER_SETTING_FIELDS.map(k => [k, w[k]])), ...wkSettingsBaseline() }; }
   if (form === 'domain') return Object.fromEntries(DOMAIN_FIELDS.map(k => [k, D.domain?.[k] ?? (k === 'enabled' || k === 'learn_from_feedback' ? true : [])]));
@@ -200,14 +203,11 @@ function renderPreferenceSettings() {
     settingsGroup('Availability & expectations', '', `<div class="settings-grid">${settingsField('preferences', 'total_experience', 'Experience (years)', 'type="number" min="0" step="0.5"')}${settingsField('preferences', 'notice_period', 'Notice period (days)', 'type="number" min="0" step="1"', 'Use 0 if you are available immediately.')}${settingsField('preferences', 'compensation_notes', 'Expected compensation', 'placeholder="e.g. INR 75 lakh / year"', 'Include currency and pay period.')}</div>`) +
     settingsGroup('Work arrangements', '', `<div class="field"><span>Work authorization by country</span>${authorizationEditor(sp.work_authorization)}</div><div class="settings-checks">${checkF('preferences', 'open_to_relocation', sp.open_to_relocation, 'Open to relocation')}${checkF('preferences', 'open_to_hybrid', sp.open_to_hybrid, 'Open to hybrid')}${checkF('preferences', 'open_to_contract', sp.open_to_contract, 'Open to contract')}</div>`) + settingsFooter('preferences');
 }
-function renderResumeSettings() {
-  const docs = D.resumes || [], stale = docs.find(d => d.active && !d.in_use);
-  return settingsGroup('Resume library', 'Your primary resume is the starting point for tailored applications.',
-    `${stale ? `<div class="settings-notice"><strong>Your edited text is being used for tailoring</strong><p>It differs from ${esc(stale.filename)}. Keep your edits or restore the file’s text.</p>${btn('Use file text', 'resume-use', { id: stale.id }, 'sm')}</div>` : ''}
-    <div class="settings-resume-list">${docs.map(d => `<article class="settings-resume"><div class="settings-file-icon" aria-hidden="true">${esc(d.filename.split('.').pop().toUpperCase().slice(0, 4))}</div><div class="grow"><strong>${esc(d.filename)}</strong><p>${Math.max(1, Math.round(d.size / 1024))} KB · ${d.words} words${d.active ? ' · Primary' : ''}${d.in_use ? ' · Used for tailoring' : ''}</p>${resumeTags('file', d.id, d.domain, d.roles || [])}</div><div class="row gap8 wrap">${d.active ? '<a class="btn sm" href="/api/profile/resume">Download</a>' : btn('Set primary', 'resume-primary', { id: d.id }, 'sm')}${btn('Delete', 'resume-delete', { id: d.id, name: d.filename }, 'sm')}</div></article>`).join('') || '<div class="settings-empty"><strong>Your experience starts here</strong><p>Upload a resume to make your applications more personal.</p></div>'}</div>
-    <label class="settings-upload" for="resume-file"><strong>＋ Upload ${docs.length ? 'another resume' : 'your resume'}</strong><span>PDF, DOCX or TXT · up to ${BOOT.max_upload_mb} MB</span><input type="file" id="resume-file" accept=".txt,.pdf,.docx" aria-label="Upload resume"></label>`) +
-    settingsDetails('resume-text', 'Edit master resume text', `<p class="settings-help">Saving new text creates a new resume version. To correct parsed facts, edit them in <a href="#settings/resume-data">Resume Data</a> instead.</p><label class="field" for="resumes-master_resume">Master resume text${textareaF('resumes', 'master_resume', D.profile.master_resume)}</label>${settingsDetails('resume-format', 'Formatting tips', '<p>Use Summary, Skills, and Experience headings, a role heading for each position, and short bullet points. Include title, company, location and dates for each role.</p>')}`) +
-    settingsGroup('Evidence for your applications', 'Extract claims from your saved resume, then verify them in the Knowledge bank.', btn('Re-parse resume into evidence', 'parse-evidence', {}, '', isBusy('settings-resumes'))) + settingsFooter('resumes', 'Save resume text');
+function renderResumeSettings() { return renderResumesScreen(); }
+// Below the resumes: a resume added by pasting its text, and evidence extraction. Rendered by renderResumesScreen.
+function resumeTextTools() {
+  return settingsDetails('resume-text', 'Add a resume from text', `<p class="settings-help">Saving creates a new resume from this text. It does not change the active resume: make it active when you want it used. To correct a resume’s facts, edit its data above instead. The text starts as the active resume’s.</p><label class="field" for="resumes-master_resume">Resume text${textareaF('resumes', 'master_resume', D.profile.master_resume)}</label>${settingsDetails('resume-format', 'Formatting tips', '<p>Use Summary, Skills, and Experience headings, a role heading for each position, and short bullet points. Include title, company, location and dates for each role.</p>')}${settingsFooter('resumes', 'Save as new resume')}`) +
+    settingsGroup('Evidence for your applications', 'Extract claims from the active resume, then verify them in the Knowledge bank.', btn('Re-parse resume into evidence', 'parse-evidence', {}, '', isBusy('settings-resumes')));
 }
 function renderAccountSettings() {
   return settingsGroup('Signed-in account', 'Your login is separate from the contact email on your profile.', `<div class="settings-account-row"><div><span class="settings-help">Login email</span><strong>${esc(BOOT.user.email)}</strong></div>${btn('Sign out', 'logout', {}, '')}</div>`) +
@@ -244,9 +244,34 @@ function renderWorkflowSettings() {
   const b = settingsBaseline('workflow'), mode = fv('workflow', 'application_mode', b.application_mode), execution = fv('workflow', 'execution_mode', b.execution_mode);
   return settingsGroup('Approval preferences', 'You stay in control of every application.', `<div class="settings-options">${[['manual_approval', 'Review every packet', 'Approve each tailored packet before it reaches your apply kit.'], ['automatic', 'Auto-approve reviewed packets', 'Packets that meet your minimum score can skip the approval queue.']].map(([id, title, desc]) => `<label class="settings-option ${mode === id ? 'selected' : ''}"><input type="radio" name="settings-mode" data-form="workflow" data-field="application_mode" value="${id}" ${mode === id ? 'checked' : ''}><span><strong>${title}</strong><small>${desc}</small></span></label>`).join('')}</div><p class="settings-help">Submitting applications always stays your action.</p>${settingsField('workflow', 'min_review_score', 'Minimum reviewer score', 'type="number" min="0" max="100" required')}`) +
     settingsGroup('Tailoring & review', 'Choose who does the tailoring and review reasoning.', `<div class="settings-options">${[['backend', 'Job Hunt OS workers', 'Your configured model API tailors and reviews in the background.'], ['claude_desktop', 'Claude Desktop', 'You tailor and review in bulk from Claude Desktop over MCP; the workers make no model calls for it.']].map(([id, title, desc]) => `<label class="settings-option ${execution === id ? 'selected' : ''}"><input type="radio" name="settings-execution" data-form="workflow" data-field="execution_mode" value="${id}" ${execution === id ? 'checked' : ''}><span><strong>${title}</strong><small>${desc}</small></span></label>`).join('')}</div><p class="settings-help">Every saved result is validated by Job Hunt OS in both modes. See the README section "Claude Desktop + MCP" to connect.</p>`) +
+    renderTailorLengthSettings(b) +
     renderAutoTailorSettings(b, execution) +
     settingsGroup('Processing limits and rate limits', 'How much work runs at once, how often ranking runs, and how long to wait after a 429.', `<div class="row between wrap gap10"><p class="settings-help" style="margin:0">These moved to Running workers, next to the queues they pace.</p><a class="btn sm" href="#workers/settings">Open worker settings →</a></div>`) +
     settingsGroup('Your rhythm', 'Set realistic targets and a helpful follow-up cadence.', `<div class="settings-grid">${settingsField('workflow', 'weekly_target', 'Weekly application target', 'type="number" min="1" max="50" required')}${settingsField('workflow', 'followup_days', 'Follow-up after (days)', 'type="number" min="1" max="60" required')}</div><p class="settings-help">Follow-up drafts are never sent automatically.</p>`) + settingsFooter('workflow');
+}
+// Tailored resume length (app.services.resume_length): a page target and bullets per role, newest role first.
+const TAILOR_PAGES = [[1, '1 page', 'The most focused: recent roles only get detail.'], [2, '2 pages', 'Recommended for most experienced candidates.'], [3, '3 pages', 'Only for long careers where every role matters: most recruiters read one or two pages.']];
+const ORDINALS = ['Most recent role', '2nd role', '3rd role', '4th role', '5th role', '6th role', '7th role', '8th role', '9th role', '10th role', '11th role', '12th role'];
+function tailorLengthBaseline(length) {
+  const l = length || { pages: 2, budgets: {} };
+  return { tailor_pages: String(l.pages || 2), ...Object.fromEntries(['1', '2', '3'].map(p => [`tailor_budget_${p}`, (l.budgets?.[p] || []).join(', ')])) };
+}
+function parseBudget(text) {
+  const values = String(text || '').split(/[\s,]+/).filter(Boolean).map(Number);
+  if (!values.length || values.length > 12 || values.some(v => !Number.isInteger(v) || v < 0 || v > 8)) throw new Error('Bullets per role: up to 12 whole numbers from 0 to 8, newest role first (for example 6, 5, 4, 3).');
+  return values;
+}
+function renderTailorLengthSettings(b) {
+  const pages = String(fv('workflow', 'tailor_pages', b.tailor_pages)), presets = D.settings.tailoring_length?.presets || {};
+  const field = `tailor_budget_${pages}`, text = fv('workflow', field, b[field]);
+  let budget = [];
+  try { budget = parseBudget(text); } catch { budget = []; }
+  const rows = budget.map((n, i) => `<span class="pill ${n ? 'plain' : 'muted'}">${i === budget.length - 1 && budget.length < 12 ? `${esc(ORDINALS[i])} and older` : esc(ORDINALS[i])}: ${n ? `${n} bullet${n === 1 ? '' : 's'}` : 'heading only'}</span>`).join('');
+  return settingsGroup('Tailored resume length', 'How long tailored resumes are. Your resume data is the foundation: tailoring picks the bullets that fit each job, up to each role’s budget, with the most detail on your latest roles. You can pick another length for one job when you tailor it.',
+    `<div class="settings-options">${TAILOR_PAGES.map(([id, title, desc]) => `<label class="settings-option ${pages === String(id) ? 'selected' : ''}"><input type="radio" name="settings-tailor-pages" data-form="workflow" data-field="tailor_pages" data-rerender value="${id}" ${pages === String(id) ? 'checked' : ''}><span><strong>${title}${id === 3 ? ' <span class="pill warn">Not recommended</span>' : ''}</strong><small>${desc}</small></span></label>`).join('')}</div>
+    <div class="settings-grid mt12">${settingsField('workflow', field, `Bullets per role for ${pages === '1' ? '1 page' : `${pages} pages`}, newest role first`, `placeholder="${attr((presets[pages] || []).join(', '))}" data-rerender`, 'The last number repeats for every older role. 0 keeps a role’s title, employer and dates with no bullets.')}</div>
+    <div class="row wrap gap6 mt8" data-tailor-budget>${rows}</div>
+    <div class="mt8">${btn('Reset to preset', 'tailor-budget-reset', { pages }, 'sm ghost')}</div>`);
 }
 // Automatic tailoring (app.services.auto_tailor): ranking queues the jobs it qualifies; the tailor worker runs them.
 function renderAutoTailorSettings(b, execution) {
@@ -287,8 +312,9 @@ function renderSettings() {
   if (D.settingsLoadError) return `<div class="settings-content"><div class="settings-error" role="alert">Settings could not be loaded: ${esc(D.settingsLoadError)}</div>${btn('Try again', 'settings-retry', {}, 'mt16')}</div>`;
   if (!D.profile || !D.settings || !D.prefs) return loading();
   const section = settingsSection(S.settingsSection), form = section === 'api-keys' ? 'keys' : section;
+  const forms = section === 'resumes' ? ['resumes', 'resume-data'] : [form], error = forms.map(f => SETTING_ERRORS[f]).find(Boolean);
   const [, title, description] = SETTINGS_SECTIONS.find(([id]) => id === section);
-  return `<div class="settings-shell"><nav class="settings-nav" aria-label="Settings sections"><div class="settings-nav-caption">YOUR WORKSPACE</div>${SETTINGS_SECTIONS.map(([id, name, , number]) => `<a href="#settings/${id}" ${id === section ? 'aria-current="page"' : ''}><span class="settings-nav-number" aria-hidden="true">${number}</span>${name}</a>`).join('')}<p>Fine-tune your next chapter.</p></nav><div class="settings-content"><label class="settings-mobile-nav" for="settings-section">Settings section<select class="select" id="settings-section" data-act-change="settings-section">${SETTINGS_SECTIONS.map(([id, name]) => `<option value="${id}" ${id === section ? 'selected' : ''}>${name}</option>`).join('')}</select></label><header class="settings-section-heading"><span class="settings-eyebrow">SETTINGS / ${esc(title.toUpperCase())}</span><h2 id="settings-heading" tabindex="-1">${title}</h2><p>${description}</p></header><form id="settings-editor" novalidate><fieldset ${isBusy(`settings-${form}`) ? 'disabled' : ''}><div id="settings-error" class="settings-error" role="alert" ${SETTING_ERRORS[form] ? '' : 'hidden'}>${esc(SETTING_ERRORS[form] || '')}</div>${SETTINGS_RENDERERS[section]()}</fieldset></form></div></div>`;
+  return `<div class="settings-shell"><nav class="settings-nav" aria-label="Settings sections"><div class="settings-nav-caption">YOUR WORKSPACE</div>${SETTINGS_SECTIONS.map(([id, name, , number]) => `<a href="#settings/${id}" ${id === section ? 'aria-current="page"' : ''}><span class="settings-nav-number" aria-hidden="true">${number}</span>${name}</a>`).join('')}<p>Fine-tune your next chapter.</p></nav><div class="settings-content"><label class="settings-mobile-nav" for="settings-section">Settings section<select class="select" id="settings-section" data-act-change="settings-section">${SETTINGS_SECTIONS.map(([id, name]) => `<option value="${id}" ${id === section ? 'selected' : ''}>${name}</option>`).join('')}</select></label><header class="settings-section-heading"><span class="settings-eyebrow">SETTINGS / ${esc(title.toUpperCase())}</span><h2 id="settings-heading" tabindex="-1">${title}</h2><p>${description}</p></header><form id="settings-editor" novalidate><fieldset ${forms.some(f => isBusy(`settings-${f}`)) ? 'disabled' : ''}><div id="settings-error" class="settings-error" role="alert" ${error ? '' : 'hidden'}>${esc(error || '')}</div>${SETTINGS_RENDERERS[section]()}</fieldset></form></div></div>`;
 }
 function settingsValidate(form) {
   if (!document.getElementById('settings-editor')?.reportValidity()) return false;
@@ -303,7 +329,7 @@ async function settingsRun(form, action, success) {
   const key = `settings-${form}`;
   if (isBusy(key)) return;
   S.busy[key] = true; delete SETTING_ERRORS[form]; delete SETTINGS_SUCCESS[form]; render();
-  try { await action(); if (success) { SETTINGS_SUCCESS[form] = success; toast(success); } guideRefresh(true); }  // a save may finish a setup quest
+  try { await action(); const text = typeof success === 'function' ? success() : success; if (text) { SETTINGS_SUCCESS[form] = text; toast(text); } guideRefresh(true); }  // a save may finish a setup quest
   catch (err) { SETTING_ERRORS[form] = err.message; }
   finally { delete S.busy[key]; render(); if (SETTING_ERRORS[form]) document.getElementById('settings-error')?.scrollIntoView?.({ block: 'nearest' }); }
 }
@@ -313,12 +339,19 @@ async function refreshSettingsSummary(form) {
 }
 async function settingsSave(form) {
   if (form === 'resume-data') return resumeDataSave();
+  if (form === 'resumes' && !rdLeaveDraft()) return;  // the new resume is shown next: never with the old one's draft
   settingsPendingTags(form).forEach(el => commitTag(el, false));
   try { if (!settingsValidate(form)) return; }
   catch (err) { SETTING_ERRORS[form] = err.message; render(); return; }
   if (form === 'workflow' && fv(form, 'application_mode', D.settings.application_mode) === 'automatic' && D.settings.application_mode !== 'automatic' && !confirm('Auto-approval skips the manual queue once a packet passes review. Submitting stays your action. Continue?')) return;
+  let saved = 'Changes saved';
   await settingsRun(form, async () => {
-    if (['profile', 'preferences', 'resumes'].includes(form)) D.profile = await api('/api/profile', { method: 'PATCH', body: settingsPayload(form) });
+    if (['profile', 'preferences', 'resumes'].includes(form)) {
+      const { created_resume_id: created, created_resume_version: version, created_resume_active: active, ...profile } = await api('/api/profile', { method: 'PATCH', body: settingsPayload(form) });
+      D.profile = profile;
+      // Saved text is a new resume version. It is used only once you make it active: the selection never moves by itself.
+      if (created) { saved = active ? `Saved as resume v${version} and set as active` : `Saved as resume v${version}. It is not used until you make it active`; RD.viewId = created; }
+    }
     if (form === 'ai') D.settings = await api('/api/settings', { method: 'PATCH', body: settingsPayload(form) });
     if (form === 'keys') {
       const value = String(S.forms.keys?.[editingKey] || '').trim();
@@ -331,10 +364,10 @@ async function settingsSave(form) {
     if (form === 'domain') D.domain = await api('/api/settings/domain', { method: 'PUT', body: { ...settingsBaseline('domain'), ...settingsChanges('domain') } });
     delete S.forms[form];
     if (form === 'preferences') authorizationDraft = null;
-    if (form === 'resumes') { D.resumes = await api('/api/profile/resumes'); D.resumeData = undefined; }
+    if (form === 'resumes') D.resumeData = undefined;
     if (['profile', 'preferences', 'ai'].includes(form)) await refreshSettingsSummary(form);
     if (form === 'ai' && typeof aimLoad === 'function') await aimLoad();  // the Route card shows the direct model
-  }, form === 'account' ? 'Password updated. Other sessions are signed out.' : 'Changes saved');
+  }, () => form === 'account' ? 'Password updated. Other sessions are signed out.' : saved);
 }
 async function saveWorkflowSettings(form = 'workflow') {
   const changes = settingsChanges(form);
@@ -342,6 +375,11 @@ async function saveWorkflowSettings(form = 'workflow') {
   const settingsKeys = ['application_mode', 'min_review_score', 'execution_mode', 'ranking_concurrency', 'tailoring_concurrency', 'ranking_interval_minutes', 'rate_limit_backoff', 'auto_tailor', ...numeric.slice(4)];
   const approval = Object.fromEntries(Object.entries(changes).filter(([k]) => settingsKeys.includes(k)).map(([k, v]) => [k, numeric.includes(k) ? Number(v) : v]));
   const cadence = Object.fromEntries(Object.entries(changes).filter(([k]) => ['weekly_target', 'followup_days'].includes(k)).map(([k, v]) => [k, Number(v)]));
+  // The default length of tailored resumes: the page target and any edited budget ("" restores the preset).
+  const length = {};
+  if ('tailor_pages' in changes) length.pages = Number(changes.tailor_pages);
+  for (const p of ['1', '2', '3']) if (`tailor_budget_${p}` in changes) (length.budgets ||= {})[p] = String(changes[`tailor_budget_${p}`]).trim() ? parseBudget(changes[`tailor_budget_${p}`]) : [];
+  if (Object.keys(length).length) approval.tailoring_length = length;
   let saved = false;
   try {
     if (Object.keys(approval).length) { D.settings = await api('/api/settings', { method: 'PATCH', body: approval }); saved = true; }
@@ -356,24 +394,21 @@ async function saveWorkflowSettings(form = 'workflow') {
 function settingsResumeGuard() {
   return !settingsDirty('resumes') || confirm('This action replaces your unsaved resume text. Continue?');
 }
-async function settingsUseResume(id) {
-  if (!settingsResumeGuard()) return;
-  await settingsRun('resumes', async () => {
-    D.resumes = await api(`/api/profile/resumes/${id}/primary`, { method: 'POST' });
-    delete S.forms.resumes; D.profile = await api('/api/profile'); D.resumeData = undefined;
-  }, 'Primary resume updated');
-}
 async function settingsUploadResume(file) {
-  if (!settingsResumeGuard()) return;
+  if (!rdLeaveDraft()) return;  // the uploaded resume is shown next: never with another one's open draft
+  let active = false;
   await settingsRun('resumes', async () => {
     const form = new FormData(); form.append('file', file);
-    await api('/api/profile/resume', { method: 'POST', form });
-    delete S.forms.resumes;
-    [D.profile, D.resumes] = await Promise.all([api('/api/profile'), api('/api/profile/resumes')]);
-    D.resumeData = undefined;
-  }, 'Resume uploaded and set as primary — review its data in Resume Data');
+    const out = await api('/api/profile/resume', { method: 'POST', form });
+    // An upload never changes the active resume (only your first one becomes active), so unsaved text stays.
+    active = !!out.is_active; RD.viewId = out.resume_id ?? null;
+    if (active) D.profile = await api('/api/profile');
+    D.resumeData = await api(rdResumeUrl()); D.resumeChoices = null; RD.changes = null; RD.raw = null;
+  }, () => active ? 'Resume uploaded and set as active. Review its data below'
+    : 'Resume uploaded. Review its data below, and make it active when you want it used');
 }
 const SETTINGS_ACTIONS = {
+  'tailor-budget-reset': el => { setF('workflow', `tailor_budget_${el.dataset.pages}`, (D.settings.tailoring_length?.presets?.[el.dataset.pages] || []).join(', ')); render(); },
   'settings-retry': async () => { D.settingsLoadError = ''; render(); await load(); },
   'settings-section': el => settingsNavigate(el.value),
   'settings-save': el => settingsSave(el.dataset.form),
@@ -384,14 +419,6 @@ const SETTINGS_ACTIONS = {
   'key-remove': el => {
     if (!confirm('Remove this saved key? Work needing it pauses until a replacement is added.')) return;
     return settingsRun('keys', async () => { D.settings = await api('/api/settings/keys', { method: 'PUT', body: { [el.dataset.id]: '' } }); delete S.forms.keys; editingKey = null; }, 'Key removed');
-  },
-  'resume-primary': el => settingsUseResume(el.dataset.id),
-  'resume-use': el => settingsUseResume(el.dataset.id),
-  'resume-delete': el => {
-    if (!confirm(`Delete ${el.dataset.name}? This cannot be undone.`)) return;
-    const replacesText = D.resumes.length > 1 && D.resumes.some(d => d.id === Number(el.dataset.id) && d.active);
-    if (replacesText && !settingsResumeGuard()) return;
-    return settingsRun('resumes', async () => { const out = await api(`/api/profile/resumes/${el.dataset.id}`, { method: 'DELETE' }); D.resumes = out.resumes; if (replacesText && out.promoted != null) delete S.forms.resumes; D.profile = await api('/api/profile'); D.resumeData = undefined; }, 'Resume deleted');
   },
   'parse-evidence': () => {
     if (settingsDirty('resumes')) { SETTING_ERRORS.resumes = 'Save your resume text before extracting evidence.'; render(); return; }

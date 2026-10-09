@@ -1093,6 +1093,8 @@ class TailorTask(Base):
     user_id: Mapped[int] = _owner("tailor_tasks")
     mode: Mapped[str] = mapped_column(String(10), default="tailor")
     regenerate: Mapped[bool] = mapped_column(Boolean, default=False)
+    # How to tailor this job: {"pages": 1 | 2 | 3} (app.services.resume_length). None = the account's default.
+    options: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="queued")
     stage: Mapped[str] = mapped_column(String(20), default="queued")  # queued | ranking | tailoring | reviewing | done
     attempts: Mapped[int] = mapped_column(Integer, default=0)

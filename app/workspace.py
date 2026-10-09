@@ -41,7 +41,7 @@ from app.models import (
 )
 from app.prompts import build_evidence_extraction_prompt
 from app.scheduler_hooks import run_soon
-from app.services import feedback_learning, ranker, resume_verification
+from app.services import ats_keywords, feedback_learning, ranker, resume_length, resume_verification
 from app.services.actors import (
     ACTOR_GROUPS,
     BUILTIN,
@@ -1494,13 +1494,25 @@ def saved_search_create(payload: SavedSearchIn, db: Session = Depends(get_user_d
 
 
 @router.put("/api/search/setups/{setup_id}")
-def saved_search_update(setup_id: int, payload: SavedSearchIn, db: Session = Depends(get_user_db)):
+def saved_search_update(setup_id: int, payload: SavedSearchIn, request: Request, background: BackgroundTasks,
+                        db: Session = Depends(get_user_db)):
+    """Save a setup. When its resume changed, the jobs it already found follow it (discovery.follow_setup), except
+    the ones the person pinned to a resume themselves and the approved or applied ones."""
+    from app.services import discovery
+
     setup = get_setup(db, setup_id)
     validate_saved_search(payload)
     reject_duplicate_name(db, payload.name, keep=setup.id)
+    before = discovery.setup_choice(setup)
     apply_saved_search(setup, payload)
+    moved = None
+    if discovery.setup_choice(setup) != before:
+        db.flush()
+        moved = discovery.follow_setup(db, setup, actor=f"user:{db.info.get('user_id')}")
     db.commit()
-    return {"setup": saved_search_card(setup)}
+    if moved and moved["ranking_queued"]:
+        run_soon(background, request.app, "ranking")
+    return {"setup": saved_search_card(setup), **({"resume_jobs": moved} if moved is not None else {})}
 
 
 @router.delete("/api/search/setups/{setup_id}")
@@ -1608,18 +1620,12 @@ def run_detail(run_id: int, db: Session = Depends(get_user_db)):
 # ───────────────────────────── tailor / approvals / apply kit ─────────────────────────────
 
 def keyword_coverage(job: Job, resume: ResumeVariant | None) -> list[dict]:
+    """The posting's ATS keywords and whether the tailored resume covers each (app.services.ats_keywords)."""
     analysis = job.fit_analysis or {}
-    text = (resume.markdown.split("## Source Resume")[0] if resume else "").lower()
     names = requirement_names(analysis)  # a ranking may list requirements by id ("1", "req_002"): show their text
-    gaps = " ".join(str(g) for g in ranked_list(analysis, "gaps", names)
-                    + ranked_list(analysis, "must_have_missing", names)).lower()
-    words = list(dict.fromkeys(str(w) for w in [*ranked_list(analysis, "keywords", names),
-                                                 *ranked_list(analysis, "strong_matches", names)]))[:14]
-    out = []
-    for word in words:
-        status = "covered" if str(word).lower() in text else "partial" if str(word).lower() in gaps else "missing"
-        out.append({"word": str(word), "status": status})
-    return out
+    gaps = " ".join(str(g) for g in ranked_list(analysis, "gaps", names) + ranked_list(analysis, "must_have_missing", names)
+                    + ranked_list(analysis, "partial_matches", names))
+    return ats_keywords.coverage(job, resume.markdown if resume else "", analysis, names, gaps)
 
 
 # Status filters for the Tailor and Approvals screens: filter name -> test on a row.
@@ -1692,10 +1698,9 @@ def tailor_queue(q: str = "", min_fit: int = 0, min_review: int = 0, board: str 
     for job in jobs:
         resume = latest.get(job.id)
         coverage = keyword_coverage(job, resume) if resume else []
-        covered = sum(1 for word in coverage if word["status"] == "covered")
         rows.append({**job_card(job), "has_resume": resume is not None,
                      "reviewer_score": resume.reviewer_score if resume else None,
-                     "ats_pct": round(100 * covered / len(coverage)) if coverage else None,
+                     "ats_pct": ats_keywords.score(coverage),
                      "untailored": bool((resume.content or {}).get("untailored")) if resume else False,
                      "resume_version": resume.version if resume else None,
                      "review_decision": (resume.reviewer_notes or {}).get("decision") if resume else None,
@@ -1714,7 +1719,6 @@ def packet(db: Session, job: Job) -> dict:
         return base
     edits = resume_edits(db, resume)
     coverage = keyword_coverage(job, resume)
-    covered = sum(1 for k in coverage if k["status"] == "covered")
     notes = resume.reviewer_notes or {}
     review = ([{"tone": "good", "text": s} for s in notes.get("strengths") or []]
               + [{"tone": "warn", "text": s} for s in notes.get("improvements") or []]
@@ -1725,7 +1729,10 @@ def packet(db: Session, job: Job) -> dict:
         "untailored": bool((resume.content or {}).get("untailored")),
         "cover_letter": strip_citations(resume.cover_letter), "cover_words": len(resume.cover_letter.split()),
         "edits": edits, "review": review, "keywords": coverage,
-        "ats_pct": round(100 * covered / len(coverage)) if coverage else None,
+        "ats_pct": ats_keywords.score(coverage),
+        # The page target it was tailored for (app.services.resume_length) and a rough estimate of its length.
+        "length": {"target_pages": ((resume.content or {}).get("length_plan") or {}).get("pages"),
+                   "estimated_pages": resume_length.estimate_pages(resume.markdown or "")},
     }}
 
 
@@ -2239,18 +2246,19 @@ def preferences_put(payload: PreferencesIn, db: Session = Depends(get_user_db)):
 
 @router.get("/api/profile/resumes")
 def resume_list(db: Session = Depends(get_user_db)):
+    """The resume library. A file is `active` exactly when its version is the active resume (the one selection,
+    app.services.resume_verification.set_active); `in_use` says the same for the job search's default."""
     docs = db.scalars(select(ResumeDocument).order_by(desc(ResumeDocument.active), desc(ResumeDocument.id))).all()
-    # in_use says whether tailoring actually uses this file's text: the master resume text can be
-    # edited by hand in Settings, and only the text is sent to the model.
-    master = (get_profile(db).master_resume or "").strip()
     # A file's tags are its resume version's (the newest one it became): the library and Versions always agree.
     versions: dict[int, Resume] = {}
     for version in db.scalars(select(Resume).where(Resume.resume_document_id.is_not(None))
                               .order_by(Resume.version)).all():
         versions[version.resume_document_id] = version
+    active = db.scalar(select(Resume).where(Resume.is_active.is_(True)))
     return [{"id": d.id, "filename": d.original_filename, "size": d.size, "media_type": d.media_type,
-             "active": d.active, "created_at": d.created_at.isoformat(), "words": len(d.extracted_text.split()),
-             "in_use": (d.extracted_text or "").strip() == master,
+             "active": bool(active is not None and active.resume_document_id == d.id),
+             "created_at": d.created_at.isoformat(), "words": len(d.extracted_text.split()),
+             "in_use": bool(active is not None and active.resume_document_id == d.id),
              "version_id": versions[d.id].id if d.id in versions else None,
              "domain": versions[d.id].domain if d.id in versions else None,
              "roles": (versions[d.id].roles or []) if d.id in versions else []} for d in docs]
@@ -2258,45 +2266,33 @@ def resume_list(db: Session = Depends(get_user_db)):
 
 @router.post("/api/profile/resumes/{document_id}/primary")
 def resume_primary(document_id: int, db: Session = Depends(get_user_db)):
+    """Make this file's resume version the active resume (the person's explicit choice)."""
     document = db.get(ResumeDocument, document_id)
     if not document:
         raise HTTPException(404, "Resume not found")
-    for other in db.scalars(select(ResumeDocument).where(ResumeDocument.active.is_(True))).all():
-        other.active = False
-    document.active = True
     profile = get_profile(db)
-    profile.master_resume = document.extracted_text
-    db.flush()
-    resume_verification.record_version(db, profile, document.extracted_text, document=document)
+    version = resume_verification.version_of_document(db, profile, document)
+    resume_verification.set_active(db, version)
     db.commit()
     return resume_list(db)
 
 
 @router.delete("/api/profile/resumes/{document_id}")
 def resume_document_delete(document_id: int, db: Session = Depends(get_user_db)):
-    """Delete an uploaded resume. Deleting the primary one promotes the next newest and uses its text."""
+    """Delete an uploaded file from the library. Its resume version, with its text and structured data, stays, so
+    the active resume never changes because a file was removed."""
     document = db.get(ResumeDocument, document_id)
     if not document:
         raise HTTPException(404, "Resume not found")
-    was_primary, path = document.active, Path(document.storage_path)
+    path = Path(document.storage_path)
     db.delete(document)
-    db.flush()
-    promoted = None
-    if was_primary:
-        promoted = db.scalars(select(ResumeDocument).order_by(desc(ResumeDocument.id)).limit(1)).first()
-        if promoted:
-            promoted.active = True
-            profile = get_profile(db)
-            profile.master_resume = promoted.extracted_text
-            db.flush()
-            resume_verification.record_version(db, profile, promoted.extracted_text, document=promoted)
     db.commit()
     # Uploads of identical files share one stored file, so only remove it when no row still points at it.
     # A resume version keeps its original file: the uploaded original is never lost while a version uses it.
     if (path.is_file() and not db.scalar(select(ResumeDocument.id).where(ResumeDocument.storage_path == str(path)))
             and not resume_verification.storage_in_use(db, str(path))):
         path.unlink(missing_ok=True)
-    return {"deleted": document_id, "promoted": promoted.id if promoted else None, "resumes": resume_list(db)}
+    return {"deleted": document_id, "promoted": None, "resumes": resume_list(db)}
 
 
 @router.post("/api/profile/resume/parse-evidence")

@@ -34,18 +34,20 @@ from app.prompts.common import (
 )
 from app.prompts.contracts import TailoringResult, describe_fields
 
+# v7: a page target and a bullet budget per role (LENGTH PLAN): the source resume is the foundation to select from,
+# not a checklist; every budgeted role is returned with at most its max_bullets, and a role with 0 keeps its heading.
 # v6: evidence a source bullet already states is not repeated in RELEVANT EVIDENCE, and the posting arrives
 # without duplicate paragraphs or legal boilerplate.
 # v5: patch output with evidence ids per claim; completed FitAnalysis as read-only input (no score, no empty fields);
 # one canonical source resume instead of roles + resume text + policy; candidate context is name and headline only.
-TAILOR_PROMPT_VERSION = "v6"
+TAILOR_PROMPT_VERSION = "v7"
 TAILOR_MARKER = "TAILOR_RESUME"
 # The FitAnalysis fields the Tailor reads. Scores are deliberately absent: the Tailor does not work with them.
 FIT_ANALYSIS_FIELDS = ("strong_matches", "partial_matches", "resume_gaps", "recommended_resume_focus")
 # The Ranker's gaps, sent only so the Tailor knows what it must not claim.
 GAP_FIELDS = ("missing_requirements", "fatal_gaps")
 # Section labels in the order they appear; the tests hold the prompt to them.
-SECTIONS = ("CANDIDATE", "SOURCE RESUME", "RELEVANT EVIDENCE", "JOB", "JOB REQUIREMENTS", "FIT ANALYSIS")
+SECTIONS = ("CANDIDATE", "SOURCE RESUME", "RELEVANT EVIDENCE", "JOB", "JOB REQUIREMENTS", "LENGTH PLAN", "FIT ANALYSIS")
 
 TAILOR_SYSTEM = instructions(
     "You are the resume-tailoring component of Job Hunt OS. Your only task is to improve how SOURCE RESUME presents "
@@ -56,11 +58,16 @@ TAILOR_SYSTEM = instructions(
     NO_INVENTION_RULE + " SOURCE RESUME and RELEVANT EVIDENCE are the only facts you may use. Do not change "
     "employers, titles or dates, and do not reclassify job requirements. " + GAPS_STAY_GAPS_RULE
     + " FIT ANALYSIS.gaps_to_preserve lists requirements the candidate's facts do not cover.",
-    """You may: rewrite the summary; order skills_order using only skills in SOURCE RESUME; for a role, select and
-rewrite bullets using that role's own bullets and RELEVANT EVIDENCE from the same employer, one achievement per
-bullet, most relevant first. Transferable experience may be emphasised; it is never renamed as the missing skill.
-Change only what helps this job: a role you leave out of role_updates keeps its source bullets unchanged, and a role
-you include shows exactly the 1-5 bullets you return. Update at most 3 roles.
+    """SOURCE RESUME is the foundation you build this resume from, not a checklist: its bullets are candidates.
+For each role, select only the bullets that best serve this job, rewrite them, and leave the rest out.
+LENGTH PLAN gives the page target and each role's max_bullets, newest role first: the most recent roles carry the
+most detail and older roles less. Return a role_update for every role whose max_bullets is above 0, with at most
+max_bullets bullets, most relevant first. Fewer is fine when a role has little that is relevant; never pad, and
+never repeat one achievement in two bullets. A role with max_bullets 0 keeps its title, employer and dates with no
+bullets: return no bullets for it.
+You may also: rewrite the summary (at most LENGTH PLAN.summary_sentences sentences); order skills_order using only
+skills in SOURCE RESUME. A role's bullets use that role's own bullets and RELEVANT EVIDENCE from the same employer,
+one achievement per bullet. Transferable experience may be emphasised; it is never renamed as the missing skill.
 Every summary and bullet lists in evidence_ids the ids it rests on: the id of a SOURCE RESUME bullet or project
 bullet, or of RELEVANT EVIDENCE (verified facts that are not on the resume),
 and uses only numbers that appear in what it cites.""",
@@ -86,6 +93,14 @@ def fit_analysis_input(analysis: dict[str, Any] | None) -> dict[str, Any]:
     return view
 
 
+def length_plan_input(plan: dict[str, Any] | None) -> dict[str, Any]:
+    """The length plan as the Tailor reads it: the page target, the summary's sentence budget and each role's
+    max_bullets by role_index (computed by app.services.resume_length; this module only renders it)."""
+    plan = plan or {}
+    return {"target": plan.get("target") or "2 pages", "summary_sentences": plan.get("summary_sentences") or 4,
+            "max_bullets_by_role_index": {int(k): v for k, v in (plan.get("role_caps") or {}).items()}}
+
+
 def build_tailoring_prompt(candidate_profile: Any, job: Any, context: Any) -> Prompt:
     """Render a tailoring context (app.services.context_builder.build_tailoring_context). The context has already
     been validated; a context without a source resume or a completed FitAnalysis is refused, never padded."""
@@ -105,6 +120,7 @@ def build_tailoring_prompt(candidate_profile: Any, job: Any, context: Any) -> Pr
                                        "leadership_expectations", "technical_domains")),
         "" if job_structured(context) else untrusted("JOB DESCRIPTION", "untrusted_job_description",
                                                      posting_text(context, job), limit=20000),
+        section("LENGTH PLAN", to_json(length_plan_input(context_value(context, "length_plan")))),
         section("FIT ANALYSIS (completed by the Ranker; read-only)", to_json(fit_analysis_input(analysis))),
     )
     return Prompt("tailoring", TAILOR_PROMPT_VERSION, TAILOR_MARKER, TAILOR_SYSTEM, user, TailoringResult)

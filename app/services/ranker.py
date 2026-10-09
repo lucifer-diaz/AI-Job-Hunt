@@ -432,7 +432,7 @@ def readiness(db: Session, user_id: int) -> str | None:
     profile = _profile(db, user_id)
     if profile is None:
         return "No candidate profile yet: fill in your profile in Settings"
-    problem = resume_problem(profile.master_resume)
+    problem = resume_problem(_active_text(db, profile))
     if problem:
         return problem
     ready, reason = ai_ready(db, user_id)
@@ -495,17 +495,22 @@ def next_run_at(db: Session, user_id: int, now: datetime | None = None) -> datet
 
 
 def resume_snapshot(db: Session, profile: CandidateProfile, now: datetime | None = None) -> ResumeVersion:
-    """The immutable snapshot of the profile's current resume text, created on first use. Commits when created."""
-    content = profile.master_resume or ""
+    """The immutable snapshot of the selected resume's text (the job's own, else the active one), created on first
+    use. The raw text identifies the resume; structured edits reach the ranking through its context. Commits when
+    created."""
+    content = rv.raw_text(profile)
     digest = content_hash(content)
     query = select(ResumeVersion).where(ResumeVersion.candidate_profile_id == profile.id,
                                         ResumeVersion.content_hash == digest)
     found = db.scalar(query)
     if found is not None:
         return found
-    document = db.scalars(select(ResumeDocument).where(ResumeDocument.user_id == profile.user_id,
-                                                       ResumeDocument.active.is_(True))
-                          .order_by(desc(ResumeDocument.id))).first()
+    chosen = getattr(profile, "chosen_resume", None)  # the version's own file first, else the library's active one
+    document = db.get(ResumeDocument, chosen.resume_document_id) if chosen is not None and chosen.resume_document_id \
+        else None
+    document = document or db.scalars(select(ResumeDocument).where(ResumeDocument.user_id == profile.user_id,
+                                                                   ResumeDocument.active.is_(True))
+                                      .order_by(desc(ResumeDocument.id))).first()
     source = document if document is not None and (document.extracted_text or "").strip() == content.strip() else None
     version = (db.scalar(select(func.max(ResumeVersion.version))
                          .where(ResumeVersion.candidate_profile_id == profile.id)) or 0) + 1
@@ -933,7 +938,7 @@ def _process(db: Session, claimed: TaskClaim, clock: Callable[[], datetime]) -> 
     # The job's chosen resume (Job.resume_id), else the active one: resume_verification.for_job.
     profile = rv.for_job(db, _profile(db, claimed.user_id), job)
     problem = "No candidate profile yet: fill in your profile in Settings" if profile is None \
-        else resume_problem(profile.master_resume)
+        else resume_problem(rv.raw_text(profile))
     if problem:
         return _wait(db, claimed, problem, clock())
     if missing_description(job):  # queued before the gate existed, or the text was removed since: never score a title
@@ -1028,9 +1033,16 @@ class CurrentInputs:
 
 def _current_inputs(db: Session, user_id: int) -> CurrentInputs | None:
     profile = _profile(db, user_id)
-    if profile is None or resume_problem(profile.master_resume):
+    text = _active_text(db, profile) if profile is not None else ""
+    if profile is None or resume_problem(text):
         return None
-    return CurrentInputs(profile.id, _hash(ranking_profile_facts(profile)), content_hash(profile.master_resume or ""))
+    return CurrentInputs(profile.id, _hash(ranking_profile_facts(profile)), content_hash(text))
+
+
+def _active_text(db: Session, profile: CandidateProfile) -> str:
+    """The active resume version's text (resume_verification): the selection, not the master text that mirrors it."""
+    resume = rv.active_resume(db, profile, create=False)
+    return resume.raw_text or "" if resume is not None else profile.master_resume or ""
 
 
 def _queue_stale(db: Session, now: datetime, limit: int) -> int:

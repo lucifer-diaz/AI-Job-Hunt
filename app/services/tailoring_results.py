@@ -153,6 +153,9 @@ def validate_tailored_resume(db: Session, profile: CandidateProfile, job: Job, d
     `legacy` re-checks content the backend worker produced before bullets carried evidence IDs: citation and
     metric checks are skipped for it because that content never recorded which evidence each bullet used.
     """
+    from app.services import resume_verification as rv
+
+    profile = rv.for_job(db, profile, job)  # checked against the resume this job uses, in the policy's form
     issues: list[dict[str, str]] = []
     master = profile.master_resume or ""
     parsed = parse_resume(master)
@@ -331,8 +334,30 @@ def _unit_of(location: str) -> tuple[str, ...]:
     return (parts[0],)
 
 
+def enforce_length(sections: list[Any], length_plan: dict[str, Any] | None) -> tuple[list[Any], list[dict[str, str]]]:
+    """Experience sections cut to each role's bullet budget (app.services.resume_length): the most relevant bullets
+    (the first ones) are kept, the rest dropped with a LENGTH issue, and a role whose budget is 0 keeps no bullets.
+    Nothing is padded. Without a plan the sections are returned unchanged."""
+    caps = (length_plan or {}).get("role_caps")
+    if not caps:
+        return sections, []
+    kept, issues = [], []
+    for index, section in enumerate(sections):
+        cap = caps.get(str(section.role_index))
+        if cap is None or len(section.bullets) <= cap:
+            kept.append(section)
+            continue
+        issues.append(_issue("LENGTH", f"experience_sections.{index}",
+                             f"Role {section.role_index} allows {cap} bullet{'' if cap == 1 else 's'} "
+                             f"({len(section.bullets) - cap} dropped)" if cap else
+                             f"Role {section.role_index} shows its heading only in this length plan"))
+        if cap:
+            kept.append(type(section).model_construct(role_index=section.role_index, bullets=section.bullets[:cap]))
+    return kept, issues
+
+
 def apply_tailoring_patch(db: Session, profile: CandidateProfile, job: Job, patch: Any, *,
-                          allowed_evidence: set[int]) -> dict[str, Any]:
+                          allowed_evidence: set[int], length_plan: dict[str, Any] | None = None) -> dict[str, Any]:
     """Source resume + TailoringResult patch → the stored tailored content, deterministically.
 
     The patch is checked unit by unit (validate_tailored_resume, plus the evidence the context supplied). A unit
@@ -367,6 +392,8 @@ def apply_tailoring_patch(db: Session, profile: CandidateProfile, job: Job, patc
         bullets = [b for b_index, b in enumerate(section.bullets) if ("bullet", s_index, b_index) not in dropped]
         if bullets:
             kept_sections.append(ExperienceSectionIn.model_construct(role_index=section.role_index, bullets=bullets))
+    kept_sections, length_issues = enforce_length(kept_sections, length_plan)
+    issues += length_issues
     kept_highlights = [] if ("resume_bullets",) in dropped else [
         h for index, h in enumerate(highlights) if ("highlight", index) not in dropped]
     kept_summary = "" if ("summary",) in dropped else summary
@@ -381,4 +408,6 @@ def apply_tailoring_patch(db: Session, profile: CandidateProfile, job: Job, patc
         content["summary_evidence_ids"] = list(patch.summary.evidence_ids)
         content["selected_evidence_ids"] = sorted(set(content["selected_evidence_ids"]) | set(patch.summary.evidence_ids))
     content["validation"] = {"issues": issues[:30], "dropped_units": len(dropped)}
+    if length_plan:
+        content["length_plan"] = length_plan
     return content

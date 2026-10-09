@@ -19,6 +19,7 @@ from app.security import decrypt_secret
 from app.services.user_settings import user_keys
 from app.settings import get_settings
 from tests.conftest import ensure_test_user
+from tests.resume_support import use_upload
 
 PASSWORD = "correct horse battery"
 
@@ -147,8 +148,8 @@ def test_each_account_only_sees_and_changes_its_own_data():
     evidence_id = alice.post("/api/evidence", json={"claim": "Cut cloud costs by 30%", "company": "Acme"}).json()["id"]
     knowledge_id = alice.post("/api/knowledge", json={"question": "Notice period?", "answer": "30 days"}).json()["id"]
     assert alice.put("/api/profile", json={"name": "Alice", "master_resume": "Built Python services at 10k rps"}).status_code == 200
-    assert alice.post("/api/profile/resume", files={"file": ("cv.txt", io.BytesIO(
-        b"Alice's resume\nBuilt Python services at 10k rps for payments"), "text/plain")}).status_code == 200
+    use_upload(alice, alice.post("/api/profile/resume", files={"file": ("cv.txt", io.BytesIO(
+        b"Alice's resume\nBuilt Python services at 10k rps for payments"), "text/plain")}))
     assert alice.post(f"/api/jobs/{job['id']}/triage", json={"action": "shortlist"}).status_code == 200
     resume_id = alice.post(f"/api/jobs/{job['id']}/tailor").json()["resume_id"]
     assert alice.post(f"/api/jobs/{job['id']}/approve").status_code == 200

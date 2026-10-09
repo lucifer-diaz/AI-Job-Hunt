@@ -417,10 +417,13 @@ def test_workflows_read_the_jobs_resume_and_never_change_the_active_one(user, re
         db.info["user_id"] = user
         job = db.get(Job, job_id)
         profile = db.scalar(select(CandidateProfile).where(CandidateProfile.user_id == user))
-        assert rv.for_job(db, profile, job) is profile, "no choice: exactly the profile as before"
+        plain = rv.for_job(db, profile, job)
+        assert plain.chosen_resume.id == active, "no choice: the active resume"
         job.resume_id = ml
         view = rv.for_job(db, profile, job)
-        assert view.master_resume == RESUME_B and rv.resume_for(db, view).id == ml
+        assert rv.raw_text(view) == RESUME_B and rv.resume_for(db, view).id == ml
+        assert "Trained ranking models in PyTorch" in view.master_resume, "the structured source renders its data"
+        assert view.resume_source == "structured" and view.master_resume != RESUME_B
         assert view.name == "Asha Rao" and view.id == profile.id
         snapshot = ranker.resume_snapshot(db, view)
         assert snapshot.content == RESUME_B
@@ -470,7 +473,8 @@ def test_the_mcp_context_carries_the_jobs_own_resume(user, resumes):
         assert tools._job_resume(db, profile, job) == {}
         job.resume_id = ml
         own = tools._job_resume(db, profile, job)["resume"]
-    assert own["resume_id"] == ml and own["text"] == RESUME_B and own["name"] == "ML resume"
+    assert own["resume_id"] == ml and own["name"] == "ML resume"
+    assert "Trained ranking models in PyTorch" in own["text"], "the job's own resume, in the policy's form"
 
 
 def test_archiving_puts_a_job_away_without_teaching_the_filter(user, client):

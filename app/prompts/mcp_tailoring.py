@@ -12,8 +12,9 @@ from app.prompts.common import (
     instructions,
 )
 
+# v3: a length plan (page target, max_bullets per role); the resume is a foundation to select from.
 # v2: tailoring is told it is not ranking, and that the fit analysis's gaps stay gaps.
-MCP_TAILORING_PROMPT_VERSION = "v2"
+MCP_TAILORING_PROMPT_VERSION = "v3"
 
 TAILORING_RULES = (
     ("You are tailoring, not ranking: fit_analysis was computed by Job Hunt OS's Ranker. Use its strong matches, "
@@ -30,8 +31,14 @@ TAILORING_RULES = (
      "employer and other name in them must already appear in the master resume, the candidate profile or the "
      "verified evidence. Naming this job's company and role is fine."),
     "skills_order only reorders skills that already appear in the master resume, profile skills or evidence.",
-    ("When active_resume.roles is not empty, put bullets in experience_sections under the role_index they belong "
-     "to (1-5 per role); otherwise use resume_bullets."),
+    ("The resume's roles are the foundation to select from, not a checklist: for each role pick only the bullets "
+     "that serve this job, rewrite them and leave the rest out. length_plan gives the page target and each role's "
+     "max_bullets, newest role first."),
+    ("When the roles are not empty, put bullets in experience_sections under the role_index they belong to: every "
+     "role with max_bullets above 0, at most max_bullets bullets each, most relevant first (fewer is fine; never "
+     "pad). A role with max_bullets 0 keeps its heading only: send no bullets for it. Extra bullets are dropped. "
+     "Without roles, use resume_bullets."),
+    "Keep the summary within length_plan.summary_sentences sentences.",
     "The master resume is never modified: each save creates a new tailored version.",
     UNTRUSTED_DATA_RULE,
 )

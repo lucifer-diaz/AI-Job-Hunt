@@ -29,6 +29,7 @@ from app.services.review_results import ReviewIn, apply_review, latest_variant
 from app.services.tailor_tasks import packet_outcome
 from app.services.tailoring_results import (
     TailoredResumeIn,
+    enforce_length,
     schema_errors,
     to_variant_content,
     validate_tailored_resume,
@@ -164,8 +165,9 @@ def list_jobs_for_tailoring(db: Session, minimum_fit_score: float | None = None,
 def get_tailoring_context(db: Session, job_ids: list[int]) -> dict[str, Any]:
     ids = _job_ids(job_ids, tailor_limit(), "MCP_BULK_TAILOR_LIMIT")
     profile, facts = _profile_payload(db)
-    _require_resume(profile)
-    parsed = parse_resume(profile.master_resume)
+    active = rv.selected(db, profile)  # the active resume, in the form the candidate policy's resume source names
+    _require_resume(active)
+    parsed, plan = parse_resume(active.master_resume), _length_plan(db, active)
     jobs = []
     for job_id in ids:
         job = db.get(Job, job_id)
@@ -197,23 +199,39 @@ def get_tailoring_context(db: Session, job_ids: list[int]) -> dict[str, Any]:
     # resume (chosen for its search, or by the person) carries its own `resume`, which replaces active_resume for it.
     return {"ok": True, "prompt_version": MCP_TAILORING_PROMPT_VERSION, "rules": list(TAILORING_RULES),
             "candidate_profile": facts,
-            "active_resume": {"text": profile.master_resume,
-                              "roles": [{"role_index": i, "title": r.title, "company": r.company, "dates": r.dates,
-                                         "bullets": r.bullets} for i, r in enumerate(parsed.roles)]},
+            "active_resume": {"text": active.master_resume,
+                              "resume_id": getattr(getattr(active, "chosen_resume", None), "id", None),
+                              "source": getattr(active, "resume_source", "master_text"),
+                              "length_plan": plan, "roles": _roles(parsed, plan)},
             "jobs": jobs}
+
+
+def _length_plan(db: Session, view: Any) -> dict[str, Any]:
+    """The account's default length plan for this resume's roles (app.services.resume_length), as the Tailor reads
+    it: the page target, the summary's sentence budget and each role's max_bullets by role_index."""
+    from app.services import resume_length
+
+    plan = resume_length.plan_for(db, getattr(view, "user_id", None))
+    caps = resume_length.role_caps(plan, parse_resume(view.master_resume or "").roles)
+    return {**plan.as_dict(), "target": resume_length.PAGE_LABELS[plan.pages],
+            "summary_sentences": resume_length.SUMMARY_SENTENCES[plan.pages],
+            "role_caps": {str(index): cap for index, cap in caps.items()}}
+
+
+def _roles(parsed: Any, plan: dict[str, Any]) -> list[dict[str, Any]]:
+    return [{"role_index": i, "title": r.title, "company": r.company, "dates": r.dates, "bullets": r.bullets,
+             "max_bullets": plan["role_caps"].get(str(i), 0)} for i, r in enumerate(parsed.roles)]
 
 
 def _job_resume(db: Session, profile: Any, job: Job) -> dict[str, Any]:
     view = rv.for_job(db, profile, job)
-    if view is profile:
-        return {}
-    parsed = parse_resume(view.master_resume)
-    chosen = view.chosen_resume
+    chosen = getattr(view, "chosen_resume", None)
+    if chosen is None or chosen.is_active:
+        return {}  # the job uses the active resume, sent once as active_resume
+    parsed, plan = parse_resume(view.master_resume), _length_plan(db, view)
     return {"resume": {"resume_id": chosen.id, "name": chosen.name or f"Version {chosen.version}",
                        "note": "Tailor this job from this resume, not active_resume",
-                       "text": view.master_resume,
-                       "roles": [{"role_index": i, "title": r.title, "company": r.company, "dates": r.dates,
-                                  "bullets": r.bullets} for i, r in enumerate(parsed.roles)]}}
+                       "text": view.master_resume, "length_plan": plan, "roles": _roles(parsed, plan)}}
 
 
 def _retailor_feedback(db: Session, job: Job) -> dict[str, Any]:
@@ -249,13 +267,19 @@ def _save_one_tailored(db: Session, profile: Any, item: Any, seen: set[int]) -> 
     if not _in_tailor_queue(job):
         return {"job_id": job.id, "status": "REJECTED", "errors": [
             {"code": "NOT_IN_QUEUE", "location": "job_id", "message": f"Job is {job.status}, not waiting for tailoring"}]}
-    issues = validate_tailored_resume(db, rv.for_job(db, profile, job), job, data)
+    view = rv.for_job(db, profile, job)
+    issues = validate_tailored_resume(db, view, job, data)
     if issues:
         return {"job_id": job.id, "status": "REJECTED", "errors": issues}
-    content = {**to_variant_content(data, source="claude_desktop"), "prompt_version": MCP_TAILORING_PROMPT_VERSION}
+    # The length plan is enforced, not rejected: bullets beyond a role's budget are dropped and reported.
+    plan = _length_plan(db, view)
+    sections, trimmed = enforce_length(list(data.experience_sections), plan)
+    data = data.model_copy(update={"experience_sections": sections})
+    content = {**to_variant_content(data, source="claude_desktop"), "prompt_version": MCP_TAILORING_PROMPT_VERSION,
+               "length_plan": plan}
     variant = persist_tailored_resume(db, job, content)
     return {"job_id": job.id, "status": "SAVED", "resume_id": variant.id, "version": variant.version,
-            "job_status": job.status, "next": "waiting for review"}
+            "job_status": job.status, "next": "waiting for review", **({"trimmed": trimmed} if trimmed else {})}
 
 
 def save_bulk_tailored_resumes(db: Session, results: list[dict[str, Any]]) -> dict[str, Any]:

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from fastapi.testclient import TestClient
 
 from app.main import app
+from tests.resume_support import use_upload
 
 
 client = TestClient(app)
@@ -65,6 +66,7 @@ def test_resume_upload_failure_cases_and_text_success():
         "file": ("../resume.txt", io.BytesIO(b"Python engineering experience"), "text/plain")})
     assert uploaded.status_code == 200
     assert uploaded.json()["filename"] == "resume.txt"
+    use_upload(client, uploaded)  # an upload is used once it is made the active resume
     assert client.get("/api/profile/resume").content == b"Python engineering experience"
 
 

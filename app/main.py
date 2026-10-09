@@ -117,6 +117,7 @@ from app.services.user_settings import (
     processing_maximums,
     set_user_keys,
     settings_for,
+    tailoring_length_for,
 )
 from app.services.workflow import (
     SKIP_TAILORING_STATUSES,
@@ -323,6 +324,8 @@ def settings_get(db: Session = Depends(get_user_db)):
             "rate_limits": backoff.policy_for(db, value.user_id).public(),
             # Whether ranking queues qualified jobs for tailoring by itself (app.services.auto_tailor).
             "auto_tailor": auto_tailor_for(db),
+            # The default length of tailored resumes (app.services.resume_length): pages, budgets and presets.
+            "tailoring_length": tailoring_length_for(db),
             "ranking_interval_server_minutes": server_settings.value("ranking_interval_minutes"),
             "configured": {**configured, "mock": True, "litellm": bool(gateway_settings(db, value.user_id)[0])},
             "keys": keys,
@@ -385,8 +388,17 @@ def settings_put(payload: SettingsIn, db: Session = Depends(get_user_db)):
         auto_tailor["enabled_at"] = datetime.now(UTC).replace(tzinfo=None).isoformat()
     elif not auto_tailor.get("enabled"):
         auto_tailor.pop("enabled_at", None)
+    # The default length of tailored resumes: a page target and edited budgets ([] restores a preset).
+    tailoring = {**((value.preferences or {}).get("tailoring") or {})}
+    if payload.tailoring_length is not None:
+        if payload.tailoring_length.pages is not None:
+            tailoring["pages"] = payload.tailoring_length.pages
+        for pages, budget in (payload.tailoring_length.budgets or {}).items():
+            tailoring["budgets"] = {**(tailoring.get("budgets") or {}), pages: budget}
+            if not budget:
+                tailoring["budgets"].pop(pages)
     value.preferences = {**(value.preferences or {}), "ai": ai, "execution_mode": execution_mode,
-                         "processing": limits, "auto_tailor": auto_tailor,
+                         "processing": limits, "auto_tailor": auto_tailor, "tailoring": tailoring,
                          "rate_limits": {k: v for k, v in rate_limits.public().items() if k != "ladder"}}
     effective = resolve_ai_config(settings, ai)
     value.llm_provider, value.model = effective["llm_provider"], effective["model"][:300]
@@ -614,12 +626,13 @@ def job_rankings(job_id: int, db: Session = Depends(get_user_db)):
 
 
 @app.post("/api/jobs/{job_id}/tailor")
-def tailor(job_id: int, db: Session = Depends(get_user_db)):
+def tailor(job_id: int, pages: int | None = Query(None, ge=1, le=3), db: Session = Depends(get_user_db)):
+    """Tailor one job now. `pages` is its page target (1, 2 or 3); omitted, the default in Settings."""
     job = db.get(Job, job_id)
     if not job:
         raise HTTPException(404, "Job not found")
     try:
-        return _packet_response(db, job, tailor_job(db, job))
+        return _packet_response(db, job, tailor_job(db, job, pages=pages))
     except Exception as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -676,7 +689,7 @@ def _packet_response(db: Session, job: Job, resume: ResumeVariant) -> dict:
 @app.post("/api/tailor-tasks")
 def queue_tailor_tasks(payload: TailorTasksIn, db: Session = Depends(get_user_db)):
     """Queue tailoring (or skip tailoring) for jobs; a background worker runs them, so the page can be left."""
-    return tailor_tasks.enqueue(db, payload.ids, payload.mode, payload.regenerate)
+    return tailor_tasks.enqueue(db, payload.ids, payload.mode, payload.regenerate, pages=payload.pages)
 
 
 @app.get("/api/tailor-tasks")
@@ -815,13 +828,26 @@ def profile_get(db: Session = Depends(get_user_db)):
 def profile_put(payload: ProfileIn, db: Session = Depends(get_user_db)):
     p = get_profile(db)
     values = payload.model_dump(exclude_none=True)
+    text = values.pop("master_resume", None)
     for key, value in values.items():
         setattr(p, key, value)
-    if "master_resume" in values:
-        db.flush()
-        resume_verification.active_resume(db, p)  # edited master text becomes its own resume version
+    created = _save_resume_text(db, p, text)
     db.commit()
-    return {"ok": True}
+    return {"ok": True, **created}
+
+
+def _save_resume_text(db: Session, profile: CandidateProfile, text: str | None) -> dict:
+    """Edited resume text is a new version of its own. It is never made active here and never written over the
+    master text, which mirrors the active version (resume_verification.set_active)."""
+    if text is not None and not text.strip():
+        # Text never clears a resume (the master text mirrors the active one): delete a resume to remove it.
+        raise HTTPException(422, "Resume text is empty. To remove a resume, delete it in Settings → Resumes.")
+    if text is None or text.strip() == (profile.master_resume or "").strip():
+        return {}
+    db.flush()
+    version = resume_verification.save_text_version(db, profile, text)
+    return {"created_resume_id": version.id, "created_resume_version": version.version,
+            "created_resume_active": version.is_active} if version is not None else {}
 
 
 @app.patch("/api/profile")
@@ -832,13 +858,12 @@ def profile_patch(payload: ProfilePatch, db: Session = Depends(get_user_db)):
     changes = payload.model_dump(exclude_unset=True)
     if "search_preferences" in changes:
         changes["search_preferences"] = {**(row.search_preferences or {}), **changes["search_preferences"]}
+    text = changes.pop("master_resume", None)
     for key, value in changes.items():
         setattr(row, key, value)
-    if "master_resume" in changes:
-        db.flush()
-        resume_verification.active_resume(db, row)  # edited master text becomes its own resume version
+    created = _save_resume_text(db, row, text)
     db.commit()
-    return profile_get(db)
+    return {**profile_get(db), **created}
 
 
 @app.post("/api/profile/resume")
@@ -871,26 +896,24 @@ async def resume_upload(file: UploadFile = File(...), db: Session = Depends(get_
     root.mkdir(parents=True, exist_ok=True)
     path = root / digest
     path.write_bytes(data)
-    for old in db.scalars(select(ResumeDocument).where(ResumeDocument.active.is_(True))).all():
-        old.active = False
     document = ResumeDocument(original_filename=Path(file.filename or "resume").name,
                               media_type=file.content_type, storage_path=str(path), checksum=digest,
-                              size=len(data), extracted_text=extracted, active=True)
+                              size=len(data), extracted_text=extracted, active=False)
     existing = db.scalar(select(ResumeDocument).where(ResumeDocument.checksum == digest))
     if existing:
-        existing.active, existing.extracted_text, existing.storage_path = True, extracted, str(path)
+        existing.extracted_text, existing.storage_path = extracted, str(path)
         document = existing
     else:
         db.add(document)
     profile = get_profile(db)
-    profile.master_resume = extracted
     db.flush()
-    # A new resume version (or the existing one for this exact file), parsed and unverified until reviewed.
+    # A new resume version (or the existing one for this exact file), parsed and unverified until reviewed. It does
+    # not replace the active resume: only the account's first resume becomes active by itself.
     version = resume_verification.record_version(db, profile, extracted, document=document, source="upload")
     db.commit()
     db.refresh(document)
     return {"id": document.id, "filename": document.original_filename, "size": document.size,
-            "resume_id": version.id, "resume_version": version.version}
+            "resume_id": version.id, "resume_version": version.version, "is_active": version.is_active}
 
 
 @app.get("/api/profile/resume")
@@ -900,16 +923,6 @@ def resume_download(db: Session = Depends(get_user_db)):
         raise HTTPException(404, "No uploaded resume")
     return FileResponse(document.storage_path, media_type=document.media_type,
                         filename=document.original_filename)
-
-
-@app.delete("/api/profile/resume")
-def resume_delete(db: Session = Depends(get_user_db)):
-    document = db.scalar(select(ResumeDocument).where(ResumeDocument.active.is_(True)).order_by(desc(ResumeDocument.id)))
-    if not document:
-        raise HTTPException(404, "No uploaded resume")
-    document.active = False
-    db.commit()
-    return {"ok": True}
 
 
 @app.get("/api/evidence")

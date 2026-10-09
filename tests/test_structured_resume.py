@@ -118,13 +118,14 @@ def test_ids_are_stable_across_parses():
     assert [u.item_id for u in sr.iter_units(first)] == [u.item_id for u in sr.iter_units(second)]
 
 
-# ───────────── persistence, versions, active/default ─────────────
+# ───────────── persistence, versions, the active selection ─────────────
 
 def test_upload_persists_raw_text_structured_data_and_original_file(user):
     out = upload("jane.txt", RESUME).json()
     detail = active(user)
     assert detail["id"] == out["resume_id"] and detail["version"] == 1
-    assert detail["is_active"] and detail["is_default"] and detail["verification_status"] == "UNVERIFIED"
+    assert detail["is_active"] and detail["verification_status"] == "UNVERIFIED", "the first resume is used"
+    assert out["is_active"] is True
     assert detail["structured"]["experience"][0]["company"] == "Zendrive"
     assert client.get(f"/api/resumes/{detail['id']}/raw").json()["raw_text"] == RESUME.strip()
     original = client.get(f"/api/resumes/{detail['id']}/original")
@@ -136,26 +137,29 @@ def test_upload_persists_raw_text_structured_data_and_original_file(user):
 
 def test_multiple_versions_are_kept_and_the_same_file_reuses_its_version(user):
     first = upload("v1.txt", RESUME).json()["resume_id"]
-    second = upload("v2.txt", RESUME.replace("Go", "Rust")).json()["resume_id"]
-    assert first != second
+    second_upload = upload("v2.txt", RESUME.replace("Go", "Rust")).json()
+    second = second_upload["resume_id"]
+    assert first != second and second_upload["is_active"] is False, "a later upload never replaces the selection"
     versions = client.get("/api/settings/resume").json()["versions"]
-    assert [(v["version"], v["is_active"], v["is_default"]) for v in versions] == [(2, True, False), (1, False, True)]
+    assert [(v["version"], v["is_active"]) for v in versions] == [(2, False), (1, True)]
+    assert "is_default" not in versions[0], "there is one selection: the active resume"
     assert upload("v1-again.txt", RESUME).json()["resume_id"] == first  # nothing overwritten, nothing duplicated
     assert active(user)["id"] == first
-    assert client.post(f"/api/resumes/{second}/default").json()["is_default"] is True
-    body = client.get("/api/settings/resume").json()
-    assert {v["id"]: (v["is_active"], v["is_default"]) for v in body["versions"]} == {first: (True, False),
-                                                                                       second: (False, True)}
+    assert client.get("/api/profile").json()["master_resume"] == RESUME.strip(), "the master text mirrors the active"
+    assert client.post(f"/api/resumes/{second}/default").status_code in (404, 405)
     assert client.post(f"/api/resumes/{second}/activate").status_code == 200
     assert client.get("/api/profile").json()["master_resume"] == RESUME.replace("Go", "Rust").strip()
 
 
-def test_edited_master_text_becomes_a_new_version(user):
-    upload("jane.txt", RESUME)
-    assert client.patch("/api/profile", json={"master_resume": RESUME + "\n## Awards\n- Hackathon winner"}).status_code == 200
-    detail = active(user)
-    assert detail["version"] == 2 and detail["source"] == "manual_text"
-    assert detail["structured"]["awards"][0]["title"] == "Hackathon winner"
+def test_edited_master_text_becomes_a_new_version_without_changing_the_active_one(user):
+    first = upload("jane.txt", RESUME).json()["resume_id"]
+    out = client.patch("/api/profile", json={"master_resume": RESUME + "\n## Awards\n- Hackathon winner"})
+    assert out.status_code == 200 and out.json()["created_resume_active"] is False
+    assert active(user)["id"] == first, "editing text never changes the active resume"
+    assert out.json()["master_resume"] == RESUME.strip(), "the master text still mirrors the active resume"
+    created = client.get("/api/settings/resume", params={"resume_id": out.json()["created_resume_id"]}).json()["current"]
+    assert created["version"] == 2 and created["source"] == "manual_text" and not created["is_active"]
+    assert created["structured"]["awards"][0]["title"] == "Hackathon winner"
 
 
 def test_deleting_an_upload_never_loses_the_original_a_version_uses(user):

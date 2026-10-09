@@ -191,7 +191,8 @@ class Claim(Contract):
 
 class RoleUpdate(Contract):
     role_index: int = Field(ge=0, description="a role_index from SOURCE RESUME")
-    bullets: list[Claim] = Field(min_length=1, max_length=8, description="1-5 bullets, most relevant first")
+    bullets: list[Claim] = Field(min_length=1, max_length=8,
+                                 description="at most this role's max_bullets (LENGTH PLAN), most relevant first")
 
 
 class TailoringResult(Contract):

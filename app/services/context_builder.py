@@ -84,6 +84,8 @@ THEMES = {
 }
 BULLETS_PER_ROLE = 4
 BULLETS_RECENT_ROLE = 6
+# Tailoring: candidates sent per role beyond its bullet budget (app.services.resume_length), so the Tailor chooses.
+CANDIDATE_SLACK = 3
 EXTRA_SKILLS = 10
 TAILOR_EVIDENCE = 20
 REVIEW_EVIDENCE = 30
@@ -147,6 +149,9 @@ class TaskContext:
     policy: dict[str, bool] = field(default_factory=dict)
     # Tailoring only: roles of the master resume as rendered, with the verified bullets tailoring may use.
     roles: list[dict[str, Any]] = field(default_factory=list)
+    # Tailoring only: the page target and each role's bullet budget (app.services.resume_length), as the prompt
+    # states it: {"pages", "budgets", "role_caps": {role_index: max bullets}}.
+    length_plan: dict[str, Any] = field(default_factory=dict)
     # Tailoring only: the one canonical copy of the source resume the prompt receives (summary, skills, roles with
     # bullets and the evidence ids behind each).
     source_resume: dict[str, Any] = field(default_factory=dict)
@@ -222,16 +227,21 @@ def _dates(role: dict[str, Any]) -> str:
     return f"{start} - {end}".strip(" -")
 
 
-def _select_experience(data: dict[str, Any], terms: JobTerms, allowed: tuple[str, ...]
-                       ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _select_experience(data: dict[str, Any], terms: JobTerms, allowed: tuple[str, ...],
+                       caps: dict[str, int] | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """(roles with their selected trusted bullets, selected unverified bullets). Headers of every non-rejected
-    role are kept; a role header whose facts are unverified is marked."""
+    role are kept; a role header whose facts are unverified is marked.
+
+    `caps` (tailoring) is each role's bullet budget by role id: up to budget + CANDIDATE_SLACK candidates are sent,
+    most relevant first, and a role whose budget is 0 keeps its heading with no bullets."""
     roles, unverified = [], []
     for index, role in enumerate(data.get("experience") or []):
         role_status = _status(role)
         if role_status == "REJECTED":
             continue
-        cap = BULLETS_RECENT_ROLE if index == 0 else BULLETS_PER_ROLE
+        budget = caps.get(role.get("id")) if caps is not None else None
+        cap = budget + CANDIDATE_SLACK if budget else 0 if budget == 0 else (
+            BULLETS_RECENT_ROLE if index == 0 else BULLETS_PER_ROLE)
         candidates = []
         for kind in ("achievements", "responsibilities"):
             for bullet in role.get(kind) or []:
@@ -242,7 +252,9 @@ def _select_experience(data: dict[str, Any], terms: JobTerms, allowed: tuple[str
                 score = terms.score(bullet["text"]) + (1 if kind == "achievements" else 0)
                 candidates.append((score, trusted, bullet, kind))
         candidates.sort(key=lambda c: -c[0])
-        chosen = [c for c in candidates if c[0] > 0][:cap] or candidates[:1 if index else 2]
+        chosen = [] if budget == 0 else [c for c in candidates if c[0] > 0][:cap] or candidates[:1 if index else 2]
+        if budget:  # a budgeted role offers its full budget, relevant bullets first, so the Tailor has a choice
+            chosen = (chosen + [c for c in candidates if c not in chosen])[:cap]
         order = {id(c[2]): i for i, c in enumerate(candidates)}
         chosen.sort(key=lambda c: order[id(c[2])])
         bullets = []
@@ -393,14 +405,15 @@ GENERATION_TASKS = ("tailoring", "cover_letter", "followup", "application_answer
 
 
 def _base(db: Session, profile: CandidateProfile, job: Job, task: str, allowed: tuple[str, ...],
-          evidence_limit: int) -> tuple[TaskContext, dict[str, Any], list[dict[str, Any]], Resume | None]:
+          evidence_limit: int, caps: dict[str, int] | None = None
+          ) -> tuple[TaskContext, dict[str, Any], list[dict[str, Any]], Resume | None]:
     from app.services.evidence_provenance import excluded_ids
 
     resume = rv.resume_for(db, profile)
     data = resume.structured_data if resume is not None else {}
     terms = job_terms(job)
     policy = candidate_policy(db, profile.user_id)
-    experience, unverified = _select_experience(data or {}, terms, allowed)
+    experience, unverified = _select_experience(data or {}, terms, allowed, caps)
     candidate, unverified_summary = _candidate(profile, data or {}, allowed)
     held_back = excluded_ids(db, profile.user_id) if task in GENERATION_TASKS else {}
     resume_items = {unit.item_id for unit in sr.iter_units(data or {})}
@@ -478,12 +491,21 @@ def has_verified_facts(data: dict[str, Any] | None, evidence: list[dict[str, Any
 def build_ranking_context(db: Session, profile: CandidateProfile, job: Job, evidence_limit: int = 40) -> TaskContext:
     """Candidate summary, target roles, relevant experience and skills, relevant verified evidence, the job.
     Unverified parsed facts are included, marked lower-confidence, when the policy allows it."""
+    profile = rv.for_job(db, profile, job)  # the job's resume (else the active one), in the policy's form
     policy = candidate_policy(db, profile.user_id)
     allowed = WITH_UNVERIFIED if policy["ranking_uses_unverified"] else VERIFIED_ONLY
-    context, _data, every, resume = _base(db, profile, job, "ranking", allowed, evidence_limit)
+    context, _data, every, _resume = _base(db, profile, job, "ranking", allowed, evidence_limit)
     context = _with_job(context, jc.build_ranking_job_context(db, job, candidate=context))
-    raw = resume.raw_text if resume is not None else profile.master_resume or ""
-    if not context.relevant_experience:
+    raw = rv.raw_text(profile)
+    if policy["resume_source"] == "master_text":
+        # The candidate chose the resume text as written: ranking reads that text, nothing from the parsed data
+        # (no structured summary or background, education or certifications that could contradict it).
+        context.relevant_experience, context.relevant_projects = [], []
+        context.relevant_skills, context.unverified_facts = [], []
+        context.education, context.certifications = [], []
+        context.candidate = {k: v for k, v in context.candidate.items() if k not in ("summary", "verified_background")}
+        context.resume_text = raw
+    elif not context.relevant_experience:
         context.resume_text = raw  # nothing structured to select from: the resume as written
     else:
         context.resume_text = _render(context)
@@ -555,8 +577,11 @@ def source_resume(context: TaskContext, item_evidence: dict[str, list[int]],
         cited = role.get("bullet_evidence_ids") or [None] * len(role["bullets"])
         bullets = [{"text": text, "evidence_ids": evidence or item_evidence.get(item_id or "", [])}
                    for text, item_id, evidence in zip(role["bullets"], ids, cited, strict=False)]
-        roles.append({"role_index": role["role_index"], "title": role["title"], "company": role["company"],
-                      "dates": role["dates"], "bullets": bullet_facts(bullets)})
+        entry = {"role_index": role["role_index"], "title": role["title"], "company": role["company"],
+                 "dates": role["dates"], "bullets": bullet_facts(bullets)}
+        if context.length_plan:
+            entry["max_bullets"] = context.length_plan["role_caps"].get(str(role["role_index"]), 0)
+        roles.append(entry)
     out: dict[str, Any] = {"summary": context.candidate.get("summary") or "", "skills": context.relevant_skills,
                            "roles": roles, "projects": project_facts(context),
                            "highlights": [] if roles else (highlights or [])}
@@ -579,30 +604,66 @@ def validate_tailoring_context(context: TaskContext, master_role_count: int) -> 
         raise ContextError("TAILOR_CONTEXT_INCOMPLETE", "the resume has no verified content to tailor")
 
 
-def build_tailoring_context(db: Session, profile: CandidateProfile, job: Job) -> TaskContext:
+def _caps_by_id(plan: Any, data: dict[str, Any]) -> dict[str, int]:
+    """Each structured role's bullet budget by id, ranked by recency (app.services.resume_length)."""
+    from app.services import resume_length
+
+    roles = [r for r in data.get("experience") or [] if r.get("id") and _status(r) != "REJECTED"]
+    order = sorted(range(len(roles)), key=lambda i: resume_length.recency_key(_dates(roles[i]), i))
+    return {roles[index]["id"]: plan.cap(rank) for rank, index in enumerate(order)}
+
+
+def _apply_plan(context: TaskContext, profile: Any, plan: Any) -> None:
+    """The page target and each rendered role's budget (by role_index) on the context, and a text-source role's
+    candidates cut to its budget plus CANDIDATE_SLACK."""
+    from app.services import resume_length
+
+    caps = resume_length.role_caps(plan, parse_resume(profile.master_resume or "").roles)
+    context.length_plan = {**plan.as_dict(), "target": resume_length.PAGE_LABELS[plan.pages],
+                           "summary_sentences": resume_length.SUMMARY_SENTENCES[plan.pages],
+                           "role_caps": {str(index): cap for index, cap in caps.items()}}
+    for role in context.roles:
+        cap = caps.get(role["role_index"], 0)
+        limit = cap + CANDIDATE_SLACK if cap else 0
+        for key in ("bullets", "bullet_ids", "bullet_evidence_ids"):
+            if role.get(key):
+                role[key] = role[key][:limit]
+
+
+def build_tailoring_context(db: Session, profile: CandidateProfile, job: Job, plan: Any = None) -> TaskContext:
     """The Tailor's canonical context: the source resume (verified facts the policy allows, each bullet with its
     evidence ids), the relevant verified evidence, the job's requirements and the Ranker's completed FitAnalysis.
 
+    `plan` (app.services.resume_length.LengthPlan; the account's default when omitted) sets each role's bullet
+    budget, newest role first: the source resume is what the Tailor chooses from, not what it must reproduce.
+
     Raises ContextError(RANKING_REQUIRED) without a completed FitAnalysis, UnverifiedResumeError without verified
     facts, and ContextError for inconsistent input — all before a prompt exists."""
+    profile = rv.for_job(db, profile, job)  # the job's resume (else the active one), in the policy's form
     policy = candidate_policy(db, profile.user_id)
     from_text = policy["resume_source"] == "master_text"
     allowed = WITH_UNVERIFIED if policy["allow_unverified_resume_facts"] else VERIFIED_ONLY
     analysis = completed_fit_analysis(db, job)
-    context, data, every, resume = _base(db, profile, job, "tailoring", allowed, TAILOR_EVIDENCE)
+    from app.services import resume_length
+
+    plan = plan or resume_length.plan_for(db, profile.user_id)
+    resume = rv.resume_for(db, profile)
+    caps = _caps_by_id(plan, (resume.structured_data if resume is not None else None) or {})
+    context, data, every, _resume = _base(db, profile, job, "tailoring", allowed, TAILOR_EVIDENCE, caps)
     if from_text:
         # The candidate chose the master resume text as the source: its roles and bullets, used as written.
         context.fit_analysis = analysis
         context = _with_job(context, jc.build_tailoring_job_context(db, job))
         context.roles = master_text_roles(profile)
+        _apply_plan(context, profile, plan)
         context.resume_text = _render(context)
         context.source_resume = source_resume(context, {}, None if context.roles else _plain_lines(profile))
         validate_tailoring_context(context, len(parse_resume(profile.master_resume or "").roles))
-        _measure(context, profile.master_resume or "", every, job)
+        _measure(context, rv.raw_text(profile), every, job)
         return context
     if not policy["allow_unverified_resume_facts"] and not has_verified_facts(data, every):
         raise UnverifiedResumeError(
-            "Tailoring uses verified facts only. Verify your resume in Settings → Resume Data (or allow unverified "
+            "Tailoring uses verified facts only. Verify your resume in Settings → Resumes (or allow unverified "
             "resume facts in your candidate policy) and try again.")
     context.fit_analysis = analysis
     if policy["allow_unverified_resume_facts"]:
@@ -615,22 +676,24 @@ def build_tailoring_context(db: Session, profile: CandidateProfile, job: Job) ->
     # The FitAnalysis already says where the candidate matches; the Tailor gets requirements, not a second analysis.
     context = _with_job(context, jc.build_tailoring_job_context(db, job))
     context.roles = master_roles(profile, data, context.relevant_experience)
+    _apply_plan(context, profile, plan)
     context.resume_text = _render(context)
     unstructured = not context.roles and policy["allow_unverified_resume_facts"]
     context.source_resume = source_resume(context, _item_evidence(db, profile.user_id,
                                                                   {e["id"] for e in context.excluded_evidence}),
                                           _plain_lines(profile) if unstructured else None)
     validate_tailoring_context(context, len(parse_resume(profile.master_resume or "").roles))
-    _measure(context, resume.raw_text if resume is not None else profile.master_resume or "", every, job)
+    _measure(context, rv.raw_text(profile), every, job)
     return context
 
 
 def build_review_context(db: Session, profile: CandidateProfile, job: Job) -> TaskContext:
     """Structured verified truth (roles, dates, bullets, education, certifications), rejected facts, relevant verified
     evidence and CandidatePolicy, so the reviewer can check generated text against them."""
+    profile = rv.for_job(db, profile, job)  # the job's resume (else the active one), in the policy's form
     policy = candidate_policy(db, profile.user_id)
     allowed = WITH_UNVERIFIED if policy["allow_unverified_resume_facts"] else VERIFIED_ONLY
-    context, data, every, resume = _base(db, profile, job, "review", allowed, REVIEW_EVIDENCE)
+    context, data, every, _resume = _base(db, profile, job, "review", allowed, REVIEW_EVIDENCE)
     for role in data.get("experience") or []:  # the reviewer checks every verified role's dates, not only relevant ones
         if _status(role) == "VERIFIED" and role["id"] not in {r["id"] for r in context.relevant_experience}:
             context.relevant_experience.append({"id": role["id"], "job_title": role.get("job_title") or "",
@@ -640,7 +703,7 @@ def build_review_context(db: Session, profile: CandidateProfile, job: Job) -> Ta
     context.rejected_facts = [{"id": u.item_id, "section": u.section, "text": u.node.get("text") or rv._label(u)}
                               for u in sr.iter_units(data) if u.status == "REJECTED"]
     context.resume_text = _render(context)
-    _measure(context, resume.raw_text if resume is not None else profile.master_resume or "", every, job)
+    _measure(context, rv.raw_text(profile), every, job)
     return context
 
 
@@ -667,12 +730,13 @@ def select_knowledge(db: Session, user_id: int, job: Job, terms: JobTerms) -> li
 def build_cover_letter_context(db: Session, profile: CandidateProfile, job: Job) -> TaskContext:
     """What a letter needs: the posting and its company facts, the candidate's verified proof points relevant to
     it, and the verified answers the posting raises. Verified facts only, like every other final application text."""
+    profile = rv.for_job(db, profile, job)  # the job's resume (else the active one), in the policy's form
     policy = candidate_policy(db, profile.user_id)
     allowed = WITH_UNVERIFIED if policy["allow_unverified_resume_facts"] else VERIFIED_ONLY
-    context, data, every, resume = _base(db, profile, job, "cover_letter", allowed, LETTER_EVIDENCE)
+    context, data, every, _resume = _base(db, profile, job, "cover_letter", allowed, LETTER_EVIDENCE)
     if not policy["allow_unverified_resume_facts"] and not has_verified_facts(data, every):
         raise UnverifiedResumeError(
-            "A cover letter uses verified facts only. Verify your resume in Settings → Resume Data (or allow "
+            "A cover letter uses verified facts only. Verify your resume in Settings → Resumes (or allow "
             "unverified resume facts in your candidate policy) and try again.")
     personal = (data or {}).get("personal_information") or {}
     context.candidate = {**context.candidate,
@@ -686,38 +750,40 @@ def build_cover_letter_context(db: Session, profile: CandidateProfile, job: Job)
     context.knowledge = select_knowledge(db, profile.user_id, job, job_terms(job))
     context.fit_analysis = job.fit_analysis or {}
     context.resume_text = _render(context)
-    _measure(context, resume.raw_text if resume is not None else profile.master_resume or "", every, job)
+    _measure(context, rv.raw_text(profile), every, job)
     return context
 
 
 def build_followup_context(db: Session, profile: CandidateProfile, job: Job) -> TaskContext:
     """A follow-up only needs a few verified highlights relevant to the role."""
+    profile = rv.for_job(db, profile, job)  # the job's resume (else the active one), in the policy's form
     policy = candidate_policy(db, profile.user_id)
     allowed = WITH_UNVERIFIED if policy["allow_unverified_resume_facts"] else VERIFIED_ONLY
-    context, _data, every, resume = _base(db, profile, job, "followup", allowed, 5)
+    context, _data, every, _resume = _base(db, profile, job, "followup", allowed, 5)
     context.relevant_experience = context.relevant_experience[:2]
     context.unverified_facts = context.unverified_facts if policy["allow_unverified_resume_facts"] else []
     context.resume_text = _render(context)
-    _measure(context, resume.raw_text if resume is not None else profile.master_resume or "", every, job)
+    _measure(context, rv.raw_text(profile), every, job)
     return context
 
 
 def build_application_answer_context(db: Session, profile: CandidateProfile, question: str) -> TaskContext:
     """What answering one form question needs: the candidate's facts and policy, their verified non-sensitive
     knowledge answers, and the verified resume facts and evidence that share vocabulary with the question."""
+    profile = rv.selected(db, profile)  # the active resume, in the policy's form
     from types import SimpleNamespace
 
     policy = candidate_policy(db, profile.user_id)
     allowed = WITH_UNVERIFIED if policy["allow_unverified_resume_facts"] else VERIFIED_ONLY
     subject = SimpleNamespace(id=None, title="", company="", location="", description=question or "", skills=[])
-    context, _data, every, resume = _base(db, profile, subject, "application_answer", allowed, 8)
+    context, _data, every, _resume = _base(db, profile, subject, "application_answer", allowed, 8)
     context.candidate = {k: v for k, v in context.candidate.items() if k not in ("target_roles", "preferred_locations")}
     context.relevant_experience = context.relevant_experience[:3]
     context.unverified_facts = []
     context.knowledge = select_knowledge(db, profile.user_id, subject, job_terms(subject))
     context.job = {}
     context.resume_text = _render(context)
-    _measure(context, resume.raw_text if resume is not None else profile.master_resume or "", every, subject)
+    _measure(context, rv.raw_text(profile), every, subject)
     return context
 
 
@@ -757,46 +823,9 @@ def map_roles(parsed: Any, experience: list[dict[str, Any]]) -> dict[str, int]:
     return out
 
 
-def _clean(value: Any) -> str:
-    return " ".join(str(value or "").split())
-
-
-def _corrected(verified: Any, written: str) -> str:
-    """The verified value when it really differs from what the master text says; a difference of punctuation or
-    case only ("Zendrive Inc" for "Zendrive Inc.") keeps the text as written."""
-    value = _clean(verified)
-    same = re.sub(r"[^a-z0-9]", "", value.lower()) == re.sub(r"[^a-z0-9]", "", (written or "").lower())
-    return written if not value or same else value
-
-
-def role_headings(db: Session, profile: CandidateProfile, parsed: Any | None = None) -> dict[int, dict[str, str]]:
-    """Verified corrections to role headings, by master resume role index: {"title", "company"}.
-
-    Only with the structured resume source: a title or employer the user verified in Resume Data replaces what the
-    master text says (location and dates stay as written). With resume_source "master_text" the text is used as is.
-    """
-    if candidate_policy(db, profile.user_id)["resume_source"] != "structured":
-        return {}
-    resume = rv.resume_for(db, profile, create=False)
-    data = (resume.structured_data if resume is not None else None) or {}
-    parsed = parsed or parse_resume(profile.master_resume or "")
-    experience = data.get("experience") or []
-    by_id = {entry.get("id"): entry for entry in experience}
-    out: dict[int, dict[str, str]] = {}
-    for role_id, index in map_roles(parsed, experience).items():
-        entry = by_id[role_id]
-        if _status(entry) != "VERIFIED":
-            continue
-        role = parsed.roles[index]
-        title, company = _corrected(entry.get("job_title"), role.title), _corrected(entry.get("company"), role.company)
-        if (title, company) != (role.title, role.company):
-            out[index] = {"title": title, "company": company}
-    return out
-
-
 def master_text_roles(profile: CandidateProfile) -> list[dict[str, Any]]:
-    """resume_source "master_text": every role of the master resume with its own heading and bullets, as written.
-    No bullet cites evidence; tailoring_results accepts a rewrite only when it closely restates a master bullet."""
+    """resume_source "master_text": every role of the selected resume's text with its own heading and bullets, as
+    written. No bullet cites evidence; tailoring_results accepts a rewrite only when it closely restates a bullet."""
     parsed = parse_resume(profile.master_resume or "")
     return [{"role_index": index, "title": role.title, "company": role.company, "dates": role.dates,
              "bullets": [b for b in role.bullets if b.strip()], "bullet_ids": [], "bullet_evidence_ids": [],
@@ -805,10 +834,12 @@ def master_text_roles(profile: CandidateProfile) -> list[dict[str, Any]]:
 
 
 def master_roles(profile: CandidateProfile, data: dict[str, Any], selected: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Map selected structured roles onto the roles of the master resume as tailoring renders it (role_index).
-    Headings carry the user's verified corrections (role_headings)."""
-    parsed = parse_resume(profile.master_resume or "")  # the same parse tailoring renders from
-    by_id = {role["id"]: role for role in data.get("experience") or []}
+    """Map selected structured roles onto the roles of the resume document tailoring renders (role_index).
+
+    With the structured source that document is the structured data itself (structured_resume.render_document),
+    so headings and dates are the person's own corrections. Rejected roles are not in the document."""
+    parsed = parse_resume(profile.master_resume or "")  # the same document tailoring renders from
+    by_id = {role["id"]: role for role in data.get("experience") or [] if role.get("id") and _status(role) != "REJECTED"}
     mapping = map_roles(parsed, list(by_id.values()))
     out, used = [], set()
     for role in selected:
@@ -817,11 +848,8 @@ def master_roles(profile: CandidateProfile, data: dict[str, Any], selected: list
             continue
         used.add(index)
         written = parsed.roles[index]
-        verified = bool(role.get("verified"))
-        out.append({"role_index": index,
-                    "title": _corrected(role.get("job_title"), written.title) if verified else written.title,
-                    "company": _corrected(role.get("company"), written.company) if verified else written.company,
-                    "dates": parsed.roles[index].dates, "bullets": [b["text"] for b in role["bullets"]],
+        out.append({"role_index": index, "title": written.title, "company": written.company,
+                    "dates": written.dates, "bullets": [b["text"] for b in role["bullets"]],
                     "bullet_ids": [b.get("id") for b in role["bullets"]],
                     "bullet_evidence_ids": [b.get("evidence_ids") or [] for b in role["bullets"]],
                     "verified": role["verified"]})
