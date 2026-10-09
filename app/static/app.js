@@ -330,7 +330,7 @@ let loadSeq = 0;
 async function load() {
   const seq = ++loadSeq;
   try {
-    await Promise.all([LOADERS[S.screen](), api('/api/workspace/summary').then(s => { D.summary = s; })]);
+    await Promise.all([LOADERS[S.screen](), api('/api/workspace/summary').then(s => { D.summary = s; announceApprovals(s); })]);
   } catch (e) { toast(e.message, true); }
   if (seq === loadSeq) { render(); focusPacket(); guideRefresh(); }
 }
@@ -1622,6 +1622,7 @@ async function refreshTasks() {
     toast(one ? (one.status === 'succeeded' ? `${one.company}: packet ready · reviewer ${fitTxt(one.result?.reviewer_score)}${one.result?.auto_approved ? ' · auto-approved' : ''}` : one.status === 'failed' ? `${one.company}: ${one.error}` : `${one.company}: cancelled`)
       : `${ok.length} packet${ok.length === 1 ? '' : 's'} ready${bad.length ? ` · ${bad.length} failed` : ''}`, !ok.length && !!bad.length);
   }
+  if (finished.some(t => t.result?.auto_approved)) refreshApprovals();
   scheduleTaskPoll();
   return { finished };
 }
@@ -2578,11 +2579,53 @@ document.addEventListener('toggle', e => {
   if (id && e.target.isConnected) { if (e.target.open) SETTING_DETAILS.add(id); else SETTING_DETAILS.delete(id); }
 }, true);
 
+/* ───────────── desktop notification: a job was approved ───────────── */
+// The server says when the newest approval happened (summary.approved.latest_at); the browser remembers the last one it
+// announced, so each approval raises one notification, a reload repeats none and history is never replayed.
+const NOTIFY_KEYS = { on: 'jobhunt.notify.approved', seen: 'jobhunt.notify.approved.seen' };
+const lsGet = key => { try { return localStorage.getItem(key); } catch { return null; } };
+const lsSet = (key, value) => { try { localStorage.setItem(key, value); } catch { /* private window: announce once per page */ } };
+const notifySupported = () => typeof Notification !== 'undefined';
+// On unless the person turned it off here; the browser's own permission still has the last word.
+const notifyWanted = () => lsGet(NOTIFY_KEYS.on) !== 'off';
+const notifyPermission = () => (notifySupported() ? Notification.permission : 'unsupported');
+async function setNotifyApproved(on) {
+  lsSet(NOTIFY_KEYS.on, on ? 'on' : 'off');
+  if (on && notifySupported() && Notification.permission === 'default') await Notification.requestPermission();  // needs a click
+  return notifyPermission();
+}
+function announceApprovals(summary) {
+  const latest = summary?.approved?.latest_at;
+  if (!latest) return false;
+  const seen = lsGet(NOTIFY_KEYS.seen);
+  if (seen === null) { lsSet(NOTIFY_KEYS.seen, latest); return false; }  // first visit: what is already approved is not news
+  if (latest <= seen) return false;
+  lsSet(NOTIFY_KEYS.seen, latest);
+  if (!notifyWanted()) return false;
+  const count = summary.approved.count, body = `${count} approved packet${count === 1 ? '' : 's'} ready: check them before you apply.`;
+  if (notifySupported() && Notification.permission === 'granted') {
+    const note = new Notification('Job approved', { body, tag: 'jobhunt-approved' });
+    note.onclick = () => { window.focus?.(); go('approvals'); note.close?.(); };
+  } else toast(`Job approved · ${body}`);
+  return true;
+}
+async function refreshApprovals() {
+  try { const s = await api('/api/workspace/summary'); D.summary = s; return announceApprovals(s); } catch { return false; }
+}
+// Slow and quiet: it runs in a hidden tab too (that is when a notification matters) and never redraws the screen.
+const APPROVAL_POLL_MS = 30000;
+let approvalTimer = null;
+function watchApprovals() {
+  clearInterval(approvalTimer);
+  approvalTimer = setInterval(refreshApprovals, APPROVAL_POLL_MS);
+}
+
 /* ───────────── boot ───────────── */
 readHash();
 setHash();
 render();
 refreshTasks();
+watchApprovals();
 load().then(async () => {
   guideBoot();
   try { const prof = await api('/api/profile'); D.profileRoles = prof.target_roles || []; } catch { /* optional */ }

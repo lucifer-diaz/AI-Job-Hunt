@@ -306,7 +306,12 @@ def summary(db: Session = Depends(get_user_db)):
                                                               Job.triaged_at.is_not(None),
                                                               or_(Job.status == NEEDS_RETAILOR, ~Job.resumes.any()))) or 0
     last_run = db.scalar(select(SearchRun).order_by(desc(SearchRun.id)).limit(1))
+    approved_at = db.scalar(select(func.max(Application.approved_at)))
     return {
+        # Approved packets the person has not applied with yet; `latest_at` is when the newest approval happened (the
+        # browser compares it with the one it last announced to raise a desktop notification).
+        "approved": {"count": db.scalar(select(func.count(Application.id)).where(Application.status == "approved")) or 0,
+                     "latest_at": approved_at.isoformat() if approved_at else None},
         "counts": {"today": len(today_actions(db)), "discovery": db.scalar(select(func.count()).select_from(triage_query(db).subquery())) or 0,
                    "tailor": tailor_count, "approvals": len(approval_jobs(db)), "tracker": len(live)},
         "profile": {"name": profile.name, "headline": profile.headline},

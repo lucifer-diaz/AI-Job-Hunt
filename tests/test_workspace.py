@@ -67,7 +67,10 @@ def test_packet_flows_from_triage_to_tracker():
     detail = client.get(f"/api/approvals/{job['id']}").json()
     assert len(detail["checklist"]) == 6
     assert client.get(f"/api/jobs/{job['id']}/apply-kit").status_code == 400
+    before = client.get("/api/workspace/summary").json()["approved"]
     assert client.post(f"/api/jobs/{job['id']}/approve").status_code == 200
+    after = client.get("/api/workspace/summary").json()["approved"]  # what the browser compares to raise a notification
+    assert after["count"] == before["count"] + 1 and after["latest_at"] and after["latest_at"] >= (before["latest_at"] or "")
 
     kit = client.get(f"/api/jobs/{job['id']}/apply-kit").json()
     assert [f["kind"] for f in kit["files"]] == ["PDF", "DOCX", "TXT"]
