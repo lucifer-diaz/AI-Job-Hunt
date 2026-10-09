@@ -172,6 +172,8 @@ function readHash() {
   if (screen === 'discovery' && sub === 'ranking') { S.screen = 'workers'; wkState().tab = 'ranking'; return; }
   // AI models moved from Settings to AI Orchestration → Models.
   if (screen === 'settings' && sub === 'ai') { S.screen = 'orchestration'; orchState().workspace = 'models'; return; }
+  // Workflow & cadence moved to Running workers → Settings (approvals, tailoring, cadence); old links land there.
+  if (screen === 'settings' && sub === 'workflow') { S.screen = 'workers'; wkState().tab = 'settings'; return; }
   if (screen === 'orchestration') orchState().workspace = sub === 'models' ? 'models' : 'pipeline';
   if (SCREENS.includes(screen)) S.screen = screen;
   if (screen === 'workers' && WK_TABS.some(([id]) => id === sub)) wkState().tab = sub;
@@ -1223,7 +1225,7 @@ function renderApprovalOverride(job, a, r) {
       <div class="col gap4">${flagged.map(c => `<div class="xs"><b>${esc(c.label)}</b> · ${esc(c.detail)}</div>`).join('')}</div></div>` : ''}
     ${inputF('override', 'note', '', 'placeholder="Why this one is fine anyway (optional)" maxlength="2000"')}
     <div class="row gap8 wrap mt10">${btn(label('approve', 'Approve anyway → apply kit', 'Approving…'), 'approve', { id: job.id, override: '1' }, 'good', isBusy('approve'))}
-      <a class="btn sm ghost" href="#settings/workflow">Change my minimum</a></div></div>`;
+      <a class="btn sm ghost" href="#workers/settings">Change my minimum</a></div></div>`;
 }
 
 // Turning a job down. The reason is optional on purpose: one click is enough when you just want it gone,

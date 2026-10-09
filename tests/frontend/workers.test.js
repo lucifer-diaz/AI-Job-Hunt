@@ -354,11 +354,18 @@ describe('Running workers', () => {
     window.history.replaceState(null, '', '#workers/settings');
     ui.readHash();
     expect(ui.wkState().tab).toBe('settings');
-    ui.S.screen = 'settings'; ui.S.settingsSection = 'workflow'; ui.D.prefs = { weekly_target: 5, followup_days: 7 };
-    ui.D.profile = {};
-    ui.render();
-    expect(view().querySelector('#workflow-ranking_concurrency')).toBeNull();
-    expect(view().querySelector('a[href="#workers/settings"]')).not.toBeNull();
+    // Approvals, who tailors, the resume length and automatic tailoring moved here from Settings → Workflow & cadence.
+    expect(view().querySelector('#wk-set-approvals [data-field="application_mode"][value="automatic"]')).not.toBeNull();
+    expect(view().querySelector('#workers-min_review_score')).not.toBeNull();
+    expect(view().querySelector('#wk-set-tailoring [data-field="execution_mode"][value="claude_desktop"]')).not.toBeNull();
+    expect(view().querySelector('#wk-set-tailoring [data-field="tailor_pages"][value="2"]')).not.toBeNull();
+    expect(view().querySelector('#wk-set-tailoring [data-field="auto_tailor"]')).not.toBeNull();
+    expect(view().querySelector('#wk-notify')).not.toBeNull();
+    expect(view().textContent).not.toContain('Workflow & cadence');
+    // The old Settings section is gone: its link lands on this tab.
+    window.history.replaceState(null, '', '#settings/workflow');
+    ui.readHash();
+    expect(ui.S.screen).toBe('workers'); expect(ui.wkState().tab).toBe('settings');
   });
 
   it('shows the server settings read-only to an account that is not an admin', async () => {

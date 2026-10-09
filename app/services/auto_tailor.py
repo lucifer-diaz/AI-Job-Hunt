@@ -1,4 +1,4 @@
-"""Automatic tailoring: when ranking qualifies a job, queue it for tailoring (Settings → Workflow & cadence).
+"""Automatic tailoring: when ranking qualifies a job, queue it for tailoring (Running workers → Settings → Tailoring).
 
 Deterministic, no model. This module only writes queued `tailor_tasks` rows through `tailor_tasks.enqueue`; the
 tailor worker claims them within the account's tailoring concurrency, so a task starts at once when a slot is

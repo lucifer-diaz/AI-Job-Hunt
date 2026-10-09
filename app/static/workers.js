@@ -367,7 +367,7 @@ async function wkSaveExtra(changes) {
   if (Object.keys(server).length) D.wkSettings.server = (await api('/api/workers/server-settings', { method: 'PUT', body: { values: server } })).server;
 }
 const wkSecs = s => s < 60 ? `${s}s` : s < 3600 ? `${Math.round(s / 6) / 10}m`.replace('.0m', 'm') : `${Math.round(s / 360) / 10}h`.replace('.0h', 'h');
-const WK_SET_ICONS = { parsing: '▤', recovery: '⟲', ranking: '★', insights: '◈', tailoring: '✎', backoff: '⏱' };
+const WK_SET_ICONS = { parsing: '▤', recovery: '⟲', ranking: '★', insights: '◈', tailoring: '✎', approvals: '✓', backoff: '⏱' };
 // The unit beside a number, and how its default reads, from the setting's name.
 function wkUnit(name) {
   if (/seconds/.test(name)) return ['sec', v => wkSecs(Number(v))];
@@ -419,6 +419,19 @@ function wkSettingsCard(kind, title, extra = '') {
     ${on ? '' : `<div class="wk-paused-note">Queued ${esc(title)} tasks wait for your account until you turn this back on. Run now still starts one.</div>`}
     <div class="wk-scols ${server ? '' : 'single'}"><div class="wk-scol"><div class="wk-scol-head"><span class="wk-scol-icon" aria-hidden="true">👤</span><div><b>Your account</b><small>Only your tasks follow these.</small></div></div>${extra}${wkAccountRows(kind)}</div>${server}</div></section>`;
 }
+// Approvals: when a packet may be approved without you, and whether the browser tells you when a job was approved.
+function wkApprovalsCard(b) {
+  const wanted = notifyWanted(), permission = notifyPermission();
+  const note = permission === 'unsupported' ? 'This browser cannot show desktop notifications; you will see a message in the app instead.'
+    : permission === 'denied' ? 'Notifications are blocked for this site in your browser settings; you will see a message in the app instead.'
+    : wanted && permission === 'default' ? 'Allow notifications when the browser asks.' : wanted ? 'You will get a notification here when a job is approved, even if this tab is in the background.' : 'Off for this browser.';
+  return `<section class="card flush wk-set-card" id="wk-set-approvals"><header class="wk-set-head"><span class="wk-set-icon" aria-hidden="true">${WK_SET_ICONS.approvals}</span>
+      <div class="grow"><h3>Approvals</h3><div class="xs muted mt4">When a reviewed packet is approved, and how you are told.</div></div></header>
+    <div class="wk-scols single"><div class="wk-scol"><div class="wk-scol-head"><span class="wk-scol-icon" aria-hidden="true">👤</span><div><b>Your account</b><small>Only your packets follow these.</small></div></div>
+      ${renderApprovalSettings(b)}
+      <div class="wk-srow"><div class="wk-srow-text"><label for="wk-notify">Desktop notification when a job is approved</label><p>${esc(note)}</p></div>
+        <div class="wk-srow-ctl"><label class="wk-switch"><input type="checkbox" id="wk-notify" data-act="wk-notify" ${wanted ? 'checked' : ''}><span aria-hidden="true"></span><b>${wanted ? 'On' : 'Off'}</b></label></div></div></div></div></section>`;
+}
 function wkSettings() {
   if (!D.settings || !D.wkSettings) return loading();
   const form = 'workers', b = settingsBaseline(form), max = D.settings.processing_maximums || { ranking_concurrency: 5, tailoring_concurrency: 2 };
@@ -428,6 +441,9 @@ function wkSettings() {
   const ranking = wkRow('ranking_concurrency', 'Jobs ranked at once', `Up to ${max.ranking_concurrency} on this server.`, wkNumber('ranking_concurrency', 1, max.ranking_concurrency, 'at once'), { value: max.ranking_concurrency, text: String(max.ranking_concurrency) })
     + wkRow('ranking_interval_minutes', 'Rank at most every', cadence > 0 ? `Bursts of up to ${esc(fv(form, 'ranking_concurrency', b.ranking_concurrency))} every ${cadence} min. Run now skips it for one task.` : `0 follows the server, which looks every ${serverMinutes} min.`, wkNumber('ranking_interval_minutes', 0, 1440, 'min'), { value: 0, text: 'server pace' });
   const tailoring = wkRow('tailoring_concurrency', 'Packets tailored at once', `Up to ${max.tailoring_concurrency} on this server. Reviewing runs inside each packet and follows these settings.`, wkNumber('tailoring_concurrency', 1, max.tailoring_concurrency, 'at once'), { value: max.tailoring_concurrency, text: String(max.tailoring_concurrency) });
+  const execution = fv(form, 'execution_mode', b.execution_mode);
+  const tailoringExtra = tailoring + settingsGroup('Who tailors and reviews', 'Choose who does the tailoring and review reasoning.', renderExecutionSettings(b))
+    + renderTailorLengthSettings(b) + renderAutoTailorSettings(b, execution);
   const ladder = `<div class="wk-ladder" aria-label="Waits after rate limits in a row">${backoffLadder(b, 5, form).map((x, i) => `<span><small>${i + 1}${i === 4 ? '+' : ''}</small>${esc(x)}</span>`).join('<i aria-hidden="true">→</i>')}</div>`;
   const backoff = `<section class="card flush wk-set-card" id="wk-set-backoff"><header class="wk-set-head"><span class="wk-set-icon" aria-hidden="true">${WK_SET_ICONS.backoff}</span>
       <div class="grow"><h3>Rate-limit backoff</h3><div class="xs muted mt4">What every worker does after a provider answers 429. Applies to your account.</div></div>
@@ -436,15 +452,15 @@ function wkSettings() {
       <div class="wk-scol server"><div class="wk-scol-head"><span class="wk-scol-icon" aria-hidden="true">↗</span><div><b>Waits after 429s in a row</b><small>Worked out from the values on the left.</small></div></div><div class="wk-pad">${ladder}<p class="settings-help mt12">A provider's own <code>Retry-After</code> wins when it asks for longer. Model calls and Apify calls back off separately; the first normal answer resets it. Kill all and Reset backoff clear a wait that is running now.</p></div></div></div>`
     : '<div class="wk-paused-note">Off: every queued task calls the provider again straight away, even while it is refusing them.</div>'}</section>`;
   const auto = id => !!fv('workers', wkAKey(id, 'auto'), D.wkSettings.account[id].values.auto);
-  const nav = [['parsing', 'JD parsing'], ['recovery', 'JD recovery'], ['ranking', 'Ranking'], ['insights', 'Job insights'], ['tailoring', 'Tailoring'], ['backoff', 'Rate limits']]
-    .filter(([id]) => id === 'backoff' || D.wkSettings.account[id])
-    .map(([id, t]) => `<a href="#wk-set-${id}" data-act="wk-set-jump" data-id="${id}"><span class="wk-set-icon sm" aria-hidden="true">${WK_SET_ICONS[id]}</span><span class="grow">${t}</span>${id === 'backoff' ? (backoffOn ? '<i class="wk-state on">On</i>' : '<i class="wk-state">Off</i>') : auto(id) ? '<i class="wk-state on">Auto</i>' : '<i class="wk-state paused">Paused</i>'}</a>`).join('');
+  const nav = [['parsing', 'JD parsing'], ['recovery', 'JD recovery'], ['ranking', 'Ranking'], ['insights', 'Job insights'], ['tailoring', 'Tailoring'], ['approvals', 'Approvals'], ['backoff', 'Rate limits']]
+    .filter(([id]) => id === 'backoff' || id === 'approvals' || D.wkSettings.account[id])
+    .map(([id, t]) => `<a href="#wk-set-${id}" data-act="wk-set-jump" data-id="${id}"><span class="wk-set-icon sm" aria-hidden="true">${WK_SET_ICONS[id]}</span><span class="grow">${t}</span>${id === 'backoff' ? (backoffOn ? '<i class="wk-state on">On</i>' : '<i class="wk-state">Off</i>') : id === 'approvals' ? (fv(form, 'application_mode', b.application_mode) === 'automatic' ? '<i class="wk-state on">Auto</i>' : '<i class="wk-state">Manual</i>') : auto(id) ? '<i class="wk-state on">Auto</i>' : '<i class="wk-state paused">Paused</i>'}</a>`).join('');
   return `<form id="settings-editor" class="wk-settings" data-form="workers" novalidate><fieldset ${isBusy('settings-workers') ? 'disabled' : ''}>
     <div class="wk-set-layout"><nav class="wk-set-nav card" aria-label="Worker settings"><div class="caps-sm mb8">WORKER SETTINGS</div>${nav}
         <div class="wk-legend-box mt12"><div><span aria-hidden="true">👤</span> <b>Your account</b> only your tasks</div><div><span aria-hidden="true">${D.wkSettings.server_editable ? '⚙' : '🔒'}</span> <b>Server</b> ${D.wkSettings.server_editable ? 'every account (admin)' : 'set by your admin'}</div><div><span class="wk-dot" aria-hidden="true"></span> <b>Custom</b> differs from the default</div></div>
-        <p class="xs faint mt12">Automatic tailoring and approvals: <a href="#settings/workflow">Workflow &amp; cadence</a>.</p></nav>
+</nav>
       <div class="stack" style="min-width:0"><div id="settings-error" class="settings-error" role="alert" ${SETTING_ERRORS.workers ? '' : 'hidden'}>${esc(SETTING_ERRORS.workers || '')}</div>
-        ${wkSettingsCard('parsing', 'JD parsing')}${wkSettingsCard('recovery', 'JD recovery')}${wkSettingsCard('ranking', 'Ranking', ranking)}${wkSettingsCard('insights', 'Job insights')}${wkSettingsCard('tailoring', 'Tailoring', tailoring)}${backoff}
+        ${wkSettingsCard('parsing', 'JD parsing')}${wkSettingsCard('recovery', 'JD recovery')}${wkSettingsCard('ranking', 'Ranking', ranking)}${wkSettingsCard('insights', 'Job insights')}${wkSettingsCard('tailoring', 'Tailoring', tailoringExtra)}${wkApprovalsCard(b)}${backoff}
         <div class="wk-set-footer">${settingsFooter('workers')}</div></div></div></fieldset></form>`;
 }
 
@@ -640,6 +656,8 @@ const WORKERS_ACTIONS = {
   'wk-range': el => { wkState().range = el.dataset.id; wkApplyFilters(wkState().tab); },
   'wk-open': el => { wkState().tab = el.dataset.tab || wkState().tab; if (S.orch) Object.assign(S.orch, { node: null, edge: null }); go('workers'); },
   'wk-refresh': () => busy('wkRefresh', wkReload),
+  // A browser setting, not an account one: it applies at once and needs a click for the browser's permission prompt.
+  'wk-notify': async el => { await setNotifyApproved(el.checked); render(); },
   'wk-nudge': el => busy('wkNudge' + el.dataset.kind, async () => {
     const out = await api(`/api/workers/${el.dataset.kind}/nudge`, { method: 'POST' });
     await wkReload();

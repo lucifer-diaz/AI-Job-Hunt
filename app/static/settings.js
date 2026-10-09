@@ -7,15 +7,18 @@ const SETTINGS_SECTIONS = [
   ['resumes', 'Resumes', 'Each resume, its data and the roles it is for', '03'],
   ['account', 'Account & security', 'Manage access to your workspace', '04'],
   ['api-keys', 'API keys', 'Connect your own providers', '05'],
-  ['workflow', 'Workflow & cadence', 'Set a pace that works for you', '06'],
-  ['domain', 'Domain filter', 'Which discovered jobs are kept, and what it learned from you', '07'],
-  ['gmail', 'Gmail inbox', 'Read-only updates on the applications you submitted', '08'],
+  ['domain', 'Domain filter', 'Which discovered jobs are kept, and what it learned from you', '06'],
+  ['gmail', 'Gmail inbox', 'Read-only updates on the applications you submitted', '07'],
 ];
 // AI models moved to AI Orchestration → Models (ai_models.js); its direct-provider form ('ai') is still saved here.
-const SETTINGS_FORMS = ['profile', 'preferences', 'resumes', 'resume-data', 'account', 'keys', 'workflow', 'domain'];
-// Processing limits and rate-limit backoff: edited in Running workers → Settings (app/static/workers.js), saved with
-// the same PATCH /api/settings as the rest of the workflow settings.
-const WORKER_SETTING_FIELDS = ['ranking_concurrency', 'tailoring_concurrency', 'ranking_interval_minutes', 'rate_limit_backoff', 'rate_limit_base_seconds', 'rate_limit_multiplier', 'rate_limit_max_seconds'];
+const SETTINGS_FORMS = ['profile', 'preferences', 'resumes', 'resume-data', 'account', 'keys', 'domain'];
+// Everything that paces and steers the background work is edited in Running workers → Settings (app/static/workers.js)
+// and saved with one PATCH /api/settings: processing limits, the ranking cadence, rate-limit backoff, approvals, who
+// tailors and reviews, the tailored resume length and automatic tailoring.
+const WORKER_SETTING_FIELDS = ['ranking_concurrency', 'tailoring_concurrency', 'ranking_interval_minutes', 'rate_limit_backoff', 'rate_limit_base_seconds', 'rate_limit_multiplier', 'rate_limit_max_seconds',
+  'application_mode', 'min_review_score', 'execution_mode', 'auto_tailor', 'auto_tailor_min_fit_score', 'tailor_pages', 'tailor_budget_1', 'tailor_budget_2', 'tailor_budget_3'];
+// Your weekly target and follow-up wait are personal pacing, not a worker setting: they live with Job preferences.
+const RHYTHM_FIELDS = ['weekly_target', 'followup_days'];
 const DOMAIN_FIELDS = ['enabled', 'learn_from_feedback', 'exclude_terms', 'skill_excludes', 'include_terms'];
 const API_KEYS = [['openrouter', 'OpenRouter', 'AI model marketplace'], ['openai', 'OpenAI', 'GPT models'], ['anthropic', 'Anthropic', 'Claude models'], ['gemini', 'Gemini', 'Gemini models (Google AI Studio key)'], ['apify', 'Apify', 'Job discovery']];
 const CHIP_FIELDS = [
@@ -82,12 +85,14 @@ function settingsBaseline(form) {
   const p = D.profile || {}, sp = p.search_preferences || {}, st = D.settings || {}, ai = st.ai?.saved || {};
   if (form === 'profile') return Object.fromEntries(PROFILE_FIELDS.map(k => [k, p[k] ?? '']));
   if (form === 'resumes') return { master_resume: p.master_resume || '' };
-  if (form === 'preferences') return { ...Object.fromEntries(PREFERENCE_TOP.map(k => [k, p[k] ?? (k === 'target_roles' || k === 'preferred_locations' ? [] : '')])), ...Object.fromEntries(PREFERENCE_NESTED.map(k => [k, sp[k] ?? (k.startsWith('open_') ? false : ['total_experience', 'notice_period'].includes(k) ? '' : [])])) };
+  if (form === 'preferences') return { weekly_target: D.prefs?.weekly_target, followup_days: D.prefs?.followup_days, ...Object.fromEntries(PREFERENCE_TOP.map(k => [k, p[k] ?? (k === 'target_roles' || k === 'preferred_locations' ? [] : '')])), ...Object.fromEntries(PREFERENCE_NESTED.map(k => [k, sp[k] ?? (k.startsWith('open_') ? false : ['total_experience', 'notice_period'].includes(k) ? '' : [])])) };
   if (form === 'ai') return { llm_provider: ai.llm_provider || '', model: ai.model || '', require_free: ai.require_free == null ? '' : String(ai.require_free), ...Object.fromEntries(['rank', 'tailor', 'review', 'followup'].map(k => [`stage_${k}`, ai.stage_models?.[k] || ''])) };
-  if (form === 'workflow') return { application_mode: st.application_mode, min_review_score: st.min_review_score, execution_mode: st.execution_mode || 'backend', ranking_concurrency: st.ranking_concurrency ?? st.processing_maximums?.ranking_concurrency, tailoring_concurrency: st.tailoring_concurrency ?? st.processing_maximums?.tailoring_concurrency,
-    ...tailorLengthBaseline(st.tailoring_length),
-    ranking_interval_minutes: st.ranking_interval_minutes ?? 0, rate_limit_backoff: st.rate_limits?.enabled ?? true, rate_limit_base_seconds: st.rate_limits?.base_seconds ?? 30, rate_limit_multiplier: st.rate_limits?.multiplier ?? 2, rate_limit_max_seconds: st.rate_limits?.max_seconds ?? 900, auto_tailor: !!st.auto_tailor?.enabled, auto_tailor_min_fit_score: st.auto_tailor?.min_fit_score ?? 0, weekly_target: D.prefs?.weekly_target, followup_days: D.prefs?.followup_days };
-  if (form === 'workers') { const w = settingsBaseline('workflow'); return { ...Object.fromEntries(WORKER_SETTING_FIELDS.map(k => [k, w[k]])), ...wkSettingsBaseline() }; }
+  if (form === 'workers') {
+    return { application_mode: st.application_mode, min_review_score: st.min_review_score, execution_mode: st.execution_mode || 'backend', ranking_concurrency: st.ranking_concurrency ?? st.processing_maximums?.ranking_concurrency, tailoring_concurrency: st.tailoring_concurrency ?? st.processing_maximums?.tailoring_concurrency,
+      ...tailorLengthBaseline(st.tailoring_length),
+      ranking_interval_minutes: st.ranking_interval_minutes ?? 0, rate_limit_backoff: st.rate_limits?.enabled ?? true, rate_limit_base_seconds: st.rate_limits?.base_seconds ?? 30, rate_limit_multiplier: st.rate_limits?.multiplier ?? 2, rate_limit_max_seconds: st.rate_limits?.max_seconds ?? 900, auto_tailor: !!st.auto_tailor?.enabled, auto_tailor_min_fit_score: st.auto_tailor?.min_fit_score ?? 0,
+      ...wkSettingsBaseline() };
+  }
   if (form === 'domain') return Object.fromEntries(DOMAIN_FIELDS.map(k => [k, D.domain?.[k] ?? (k === 'enabled' || k === 'learn_from_feedback' ? true : [])]));
   return {};
 }
@@ -201,6 +206,7 @@ function renderPreferenceSettings() {
   return settingsGroup('Your next role', 'These preferences guide discovery and ranking.', settingsChips(['target_roles', 'preferred_locations', 'countries'])) +
     settingsGroup('Skills & interests', '', settingsChips(['primary_skills', 'secondary_skills', 'industries', 'exclude_companies', 'languages'])) +
     settingsGroup('Availability & expectations', '', `<div class="settings-grid">${settingsField('preferences', 'total_experience', 'Experience (years)', 'type="number" min="0" step="0.5"')}${settingsField('preferences', 'notice_period', 'Notice period (days)', 'type="number" min="0" step="1"', 'Use 0 if you are available immediately.')}${settingsField('preferences', 'compensation_notes', 'Expected compensation', 'placeholder="e.g. INR 75 lakh / year"', 'Include currency and pay period.')}</div>`) +
+    settingsGroup('Your rhythm', 'Set realistic targets and a helpful follow-up cadence.', `<div class="settings-grid">${settingsField('preferences', 'weekly_target', 'Weekly application target', 'type="number" min="1" max="50" required')}${settingsField('preferences', 'followup_days', 'Follow-up after (days)', 'type="number" min="1" max="60" required')}</div><p class="settings-help">Follow-up drafts are never sent automatically.</p>`) +
     settingsGroup('Work arrangements', '', `<div class="field"><span>Work authorization by country</span>${authorizationEditor(sp.work_authorization)}</div><div class="settings-checks">${checkF('preferences', 'open_to_relocation', sp.open_to_relocation, 'Open to relocation')}${checkF('preferences', 'open_to_hybrid', sp.open_to_hybrid, 'Open to hybrid')}${checkF('preferences', 'open_to_contract', sp.open_to_contract, 'Open to contract')}</div>`) + settingsFooter('preferences');
 }
 function renderResumeSettings() { return renderResumesScreen(); }
@@ -240,14 +246,14 @@ function backoffLadder(b, steps = 4, form = 'workers') {
   const cap = Number(fv(form, 'rate_limit_max_seconds', b.rate_limit_max_seconds)) || 900;
   return [...Array(steps)].map((_, i) => settingsSeconds(Math.min(cap, base * factor ** i)));
 }
-function renderWorkflowSettings() {
-  const b = settingsBaseline('workflow'), mode = fv('workflow', 'application_mode', b.application_mode), execution = fv('workflow', 'execution_mode', b.execution_mode);
-  return settingsGroup('Approval preferences', 'You stay in control of every application.', `<div class="settings-options">${[['manual_approval', 'Review every packet', 'Approve each tailored packet before it reaches your apply kit.'], ['automatic', 'Auto-approve reviewed packets', 'Packets that meet your minimum score can skip the approval queue.']].map(([id, title, desc]) => `<label class="settings-option ${mode === id ? 'selected' : ''}"><input type="radio" name="settings-mode" data-form="workflow" data-field="application_mode" value="${id}" ${mode === id ? 'checked' : ''}><span><strong>${title}</strong><small>${desc}</small></span></label>`).join('')}</div><p class="settings-help">Submitting applications always stays your action.</p>${settingsField('workflow', 'min_review_score', 'Minimum reviewer score', 'type="number" min="0" max="100" required')}`) +
-    settingsGroup('Tailoring & review', 'Choose who does the tailoring and review reasoning.', `<div class="settings-options">${[['backend', 'Job Hunt OS workers', 'Your configured model API tailors and reviews in the background.'], ['claude_desktop', 'Claude Desktop', 'You tailor and review in bulk from Claude Desktop over MCP; the workers make no model calls for it.']].map(([id, title, desc]) => `<label class="settings-option ${execution === id ? 'selected' : ''}"><input type="radio" name="settings-execution" data-form="workflow" data-field="execution_mode" value="${id}" ${execution === id ? 'checked' : ''}><span><strong>${title}</strong><small>${desc}</small></span></label>`).join('')}</div><p class="settings-help">Every saved result is validated by Job Hunt OS in both modes. See the README section "Claude Desktop + MCP" to connect.</p>`) +
-    renderTailorLengthSettings(b) +
-    renderAutoTailorSettings(b, execution) +
-    settingsGroup('Processing limits and rate limits', 'How much work runs at once, how often ranking runs, and how long to wait after a 429.', `<div class="row between wrap gap10"><p class="settings-help" style="margin:0">These moved to Running workers, next to the queues they pace.</p><a class="btn sm" href="#workers/settings">Open worker settings →</a></div>`) +
-    settingsGroup('Your rhythm', 'Set realistic targets and a helpful follow-up cadence.', `<div class="settings-grid">${settingsField('workflow', 'weekly_target', 'Weekly application target', 'type="number" min="1" max="50" required')}${settingsField('workflow', 'followup_days', 'Follow-up after (days)', 'type="number" min="1" max="60" required')}</div><p class="settings-help">Follow-up drafts are never sent automatically.</p>`) + settingsFooter('workflow');
+// Approvals and who tailors: shown on Running workers → Settings (the Approvals card and the Tailoring card).
+function renderApprovalSettings(b) {
+  const mode = fv('workers', 'application_mode', b.application_mode);
+  return `<div class="settings-options">${[['manual_approval', 'Review every packet', 'Approve each tailored packet before it reaches your apply kit.'], ['automatic', 'Auto-approve reviewed packets', 'Packets that meet your minimum score can skip the approval queue.']].map(([id, title, desc]) => `<label class="settings-option ${mode === id ? 'selected' : ''}"><input type="radio" name="settings-mode" data-form="workers" data-field="application_mode" value="${id}" ${mode === id ? 'checked' : ''}><span><strong>${title}</strong><small>${desc}</small></span></label>`).join('')}</div><p class="settings-help">Submitting applications always stays your action.</p>${settingsField('workers', 'min_review_score', 'Minimum reviewer score', 'type="number" min="0" max="100" required')}`;
+}
+function renderExecutionSettings(b) {
+  const execution = fv('workers', 'execution_mode', b.execution_mode);
+  return `<div class="settings-options">${[['backend', 'Job Hunt OS workers', 'Your configured model API tailors and reviews in the background.'], ['claude_desktop', 'Claude Desktop', 'You tailor and review in bulk from Claude Desktop over MCP; the workers make no model calls for it.']].map(([id, title, desc]) => `<label class="settings-option ${execution === id ? 'selected' : ''}"><input type="radio" name="settings-execution" data-form="workers" data-field="execution_mode" data-rerender value="${id}" ${execution === id ? 'checked' : ''}><span><strong>${title}</strong><small>${desc}</small></span></label>`).join('')}</div><p class="settings-help">Every saved result is validated by Job Hunt OS in both modes. See the README section "Claude Desktop + MCP" to connect.</p>`;
 }
 // Tailored resume length (app.services.resume_length): a page target and bullets per role, newest role first.
 const TAILOR_PAGES = [[1, '1 page', 'The most focused: recent roles only get detail.'], [2, '2 pages', 'Recommended for most experienced candidates.'], [3, '3 pages', 'Only for long careers where every role matters: most recruiters read one or two pages.']];
@@ -262,25 +268,25 @@ function parseBudget(text) {
   return values;
 }
 function renderTailorLengthSettings(b) {
-  const pages = String(fv('workflow', 'tailor_pages', b.tailor_pages)), presets = D.settings.tailoring_length?.presets || {};
-  const field = `tailor_budget_${pages}`, text = fv('workflow', field, b[field]);
+  const pages = String(fv('workers', 'tailor_pages', b.tailor_pages)), presets = D.settings.tailoring_length?.presets || {};
+  const field = `tailor_budget_${pages}`, text = fv('workers', field, b[field]);
   let budget = [];
   try { budget = parseBudget(text); } catch { budget = []; }
   const rows = budget.map((n, i) => `<span class="pill ${n ? 'plain' : 'muted'}">${i === budget.length - 1 && budget.length < 12 ? `${esc(ORDINALS[i])} and older` : esc(ORDINALS[i])}: ${n ? `${n} bullet${n === 1 ? '' : 's'}` : 'heading only'}</span>`).join('');
   return settingsGroup('Tailored resume length', 'How long tailored resumes are. Your resume data is the foundation: tailoring picks the bullets that fit each job, up to each role’s budget, with the most detail on your latest roles. You can pick another length for one job when you tailor it.',
-    `<div class="settings-options">${TAILOR_PAGES.map(([id, title, desc]) => `<label class="settings-option ${pages === String(id) ? 'selected' : ''}"><input type="radio" name="settings-tailor-pages" data-form="workflow" data-field="tailor_pages" data-rerender value="${id}" ${pages === String(id) ? 'checked' : ''}><span><strong>${title}${id === 3 ? ' <span class="pill warn">Not recommended</span>' : ''}</strong><small>${desc}</small></span></label>`).join('')}</div>
-    <div class="settings-grid mt12">${settingsField('workflow', field, `Bullets per role for ${pages === '1' ? '1 page' : `${pages} pages`}, newest role first`, `placeholder="${attr((presets[pages] || []).join(', '))}" data-rerender`, 'The last number repeats for every older role. 0 keeps a role’s title, employer and dates with no bullets.')}</div>
+    `<div class="settings-options">${TAILOR_PAGES.map(([id, title, desc]) => `<label class="settings-option ${pages === String(id) ? 'selected' : ''}"><input type="radio" name="settings-tailor-pages" data-form="workers" data-field="tailor_pages" data-rerender value="${id}" ${pages === String(id) ? 'checked' : ''}><span><strong>${title}${id === 3 ? ' <span class="pill warn">Not recommended</span>' : ''}</strong><small>${desc}</small></span></label>`).join('')}</div>
+    <div class="settings-grid mt12">${settingsField('workers', field, `Bullets per role for ${pages === '1' ? '1 page' : `${pages} pages`}, newest role first`, `placeholder="${attr((presets[pages] || []).join(', '))}" data-rerender`, 'The last number repeats for every older role. 0 keeps a role’s title, employer and dates with no bullets.')}</div>
     <div class="row wrap gap6 mt8" data-tailor-budget>${rows}</div>
     <div class="mt8">${btn('Reset to preset', 'tailor-budget-reset', { pages }, 'sm ghost')}</div>`);
 }
 // Automatic tailoring (app.services.auto_tailor): ranking queues the jobs it qualifies; the tailor worker runs them.
 function renderAutoTailorSettings(b, execution) {
-  const desktop = execution === 'claude_desktop', on = !desktop && !!fv('workflow', 'auto_tailor', b.auto_tailor);
-  const slots = fv('workflow', 'tailoring_concurrency', b.tailoring_concurrency);
-  const minimum = Number(fv('workflow', 'auto_tailor_min_fit_score', b.auto_tailor_min_fit_score)) || 0;
-  return settingsGroup('Automatic tailoring', 'What happens when ranking qualifies a job.', `<label class="check mb10"><input type="checkbox" data-form="workflow" data-field="auto_tailor" data-rerender ${on ? 'checked' : ''} ${desktop ? 'disabled' : ''}>Tailor qualified jobs automatically after ranking</label>
+  const desktop = execution === 'claude_desktop', on = !desktop && !!fv('workers', 'auto_tailor', b.auto_tailor);
+  const slots = fv('workers', 'tailoring_concurrency', b.tailoring_concurrency);
+  const minimum = Number(fv('workers', 'auto_tailor_min_fit_score', b.auto_tailor_min_fit_score)) || 0;
+  return settingsGroup('Automatic tailoring', 'What happens when ranking qualifies a job.', `<label class="check mb10"><input type="checkbox" data-form="workers" data-field="auto_tailor" data-rerender ${on ? 'checked' : ''} ${desktop ? 'disabled' : ''}>Tailor qualified jobs automatically after ranking</label>
     ${desktop ? '<p class="settings-help">Automatic tailoring only runs on Job Hunt OS workers. In Claude Desktop mode you tailor from Claude Desktop.</p>'
-    : on ? `<div class="settings-grid">${settingsField('workflow', 'auto_tailor_min_fit_score', 'Only when fit score is at least', 'type="number" min="0" max="100" required', '0 tailors every qualified job.')}</div>
+    : on ? `<div class="settings-grid">${settingsField('workers', 'auto_tailor_min_fit_score', 'Only when fit score is at least', 'type="number" min="0" max="100" required', '0 tailors every qualified job.')}</div>
       <p class="settings-help">${minimum ? `A job the ranking qualifies with a fit score of ${minimum} or more` : 'Every job the ranking qualifies'} goes into the tailoring queue. It starts at once when a tailoring slot is free (up to ${esc(slots)} at a time), otherwise it waits and starts as soon as one frees up. Jobs already waiting in the Tailor queue are not included, and a job whose tailoring you cancel is never queued again.</p>`
     : '<p class="settings-help">Off: qualified jobs wait in the Tailor queue until you start them.</p>'}`);
 }
@@ -307,7 +313,7 @@ function renderDomainSettings() {
   ${settingsGroup('Existing jobs', 'After changing the lists, check the jobs that are not ranked yet again. Jobs you kept are never touched.', btn(label('domainReapply', 'Apply to existing jobs', 'Checking…'), 'domain-reapply', {}, 'soft', isBusy('domainReapply')))}
   ${settingsFooter('domain')}`;
 }
-const SETTINGS_RENDERERS = { profile: renderProfileSettings, preferences: renderPreferenceSettings, resumes: renderResumeSettings, 'resume-data': () => renderResumeDataSettings(), account: renderAccountSettings, 'api-keys': renderKeySettings, workflow: renderWorkflowSettings, domain: renderDomainSettings, gmail: () => renderInboxSettings() };
+const SETTINGS_RENDERERS = { profile: renderProfileSettings, preferences: renderPreferenceSettings, resumes: renderResumeSettings, 'resume-data': () => renderResumeDataSettings(), account: renderAccountSettings, 'api-keys': renderKeySettings, domain: renderDomainSettings, gmail: () => renderInboxSettings() };
 function renderSettings() {
   if (D.settingsLoadError) return `<div class="settings-content"><div class="settings-error" role="alert">Settings could not be loaded: ${esc(D.settingsLoadError)}</div>${btn('Try again', 'settings-retry', {}, 'mt16')}</div>`;
   if (!D.profile || !D.settings || !D.prefs) return loading();
@@ -343,10 +349,15 @@ async function settingsSave(form) {
   settingsPendingTags(form).forEach(el => commitTag(el, false));
   try { if (!settingsValidate(form)) return; }
   catch (err) { SETTING_ERRORS[form] = err.message; render(); return; }
-  if (form === 'workflow' && fv(form, 'application_mode', D.settings.application_mode) === 'automatic' && D.settings.application_mode !== 'automatic' && !confirm('Auto-approval skips the manual queue once a packet passes review. Submitting stays your action. Continue?')) return;
+  if (form === 'workers' && fv(form, 'application_mode', D.settings.application_mode) === 'automatic' && D.settings.application_mode !== 'automatic' && !confirm('Auto-approval skips the manual queue once a packet passes review. Submitting stays your action. Continue?')) return;
   let saved = 'Changes saved';
   await settingsRun(form, async () => {
-    if (['profile', 'preferences', 'resumes'].includes(form)) {
+    if (form === 'preferences') {
+      // Weekly target and follow-up wait are saved apart from the profile (PUT /api/preferences).
+      const rhythm = Object.fromEntries(Object.entries(settingsChanges(form)).filter(([k]) => RHYTHM_FIELDS.includes(k)).map(([k, v]) => [k, Number(v)]));
+      if (Object.keys(rhythm).length) D.prefs = await api('/api/preferences', { method: 'PUT', body: rhythm });
+    }
+    if (['profile', 'resumes'].includes(form) || (form === 'preferences' && Object.keys(settingsPayload(form)).length)) {  // not when only the rhythm changed
       const { created_resume_id: created, created_resume_version: version, created_resume_active: active, ...profile } = await api('/api/profile', { method: 'PATCH', body: settingsPayload(form) });
       D.profile = profile;
       // Saved text is a new resume version. It is used only once you make it active: the selection never moves by itself.
@@ -359,7 +370,7 @@ async function settingsSave(form) {
       D.settings = await api('/api/settings/keys', { method: 'PUT', body: { [editingKey]: value } }); editingKey = null;
     }
     if (form === 'account') await api('/api/auth/password', { method: 'POST', body: S.forms.account });
-    if (form === 'workflow' || form === 'workers') await saveWorkflowSettings(form);
+    if (form === 'workers') await saveWorkflowSettings(form);
     if (form === 'workers') { await wkSaveExtra(settingsChanges('workers')); await loadWorkers().catch(() => null); }  // the queues show the new limits
     if (form === 'domain') D.domain = await api('/api/settings/domain', { method: 'PUT', body: { ...settingsBaseline('domain'), ...settingsChanges('domain') } });
     delete S.forms[form];
@@ -369,27 +380,19 @@ async function settingsSave(form) {
     if (form === 'ai' && typeof aimLoad === 'function') await aimLoad();  // the Route card shows the direct model
   }, () => form === 'account' ? 'Password updated. Other sessions are signed out.' : saved);
 }
-async function saveWorkflowSettings(form = 'workflow') {
+async function saveWorkflowSettings(form = 'workers') {
   const changes = settingsChanges(form);
   const numeric = ['min_review_score', 'ranking_concurrency', 'tailoring_concurrency', 'ranking_interval_minutes', 'rate_limit_base_seconds', 'rate_limit_multiplier', 'rate_limit_max_seconds', 'auto_tailor_min_fit_score'];
   const settingsKeys = ['application_mode', 'min_review_score', 'execution_mode', 'ranking_concurrency', 'tailoring_concurrency', 'ranking_interval_minutes', 'rate_limit_backoff', 'auto_tailor', ...numeric.slice(4)];
-  const approval = Object.fromEntries(Object.entries(changes).filter(([k]) => settingsKeys.includes(k)).map(([k, v]) => [k, numeric.includes(k) ? Number(v) : v]));
-  const cadence = Object.fromEntries(Object.entries(changes).filter(([k]) => ['weekly_target', 'followup_days'].includes(k)).map(([k, v]) => [k, Number(v)]));
+  const body = Object.fromEntries(Object.entries(changes).filter(([k]) => settingsKeys.includes(k)).map(([k, v]) => [k, numeric.includes(k) ? Number(v) : v]));
   // The default length of tailored resumes: the page target and any edited budget ("" restores the preset).
   const length = {};
   if ('tailor_pages' in changes) length.pages = Number(changes.tailor_pages);
   for (const p of ['1', '2', '3']) if (`tailor_budget_${p}` in changes) (length.budgets ||= {})[p] = String(changes[`tailor_budget_${p}`]).trim() ? parseBudget(changes[`tailor_budget_${p}`]) : [];
-  if (Object.keys(length).length) approval.tailoring_length = length;
-  let saved = false;
-  try {
-    if (Object.keys(approval).length) { D.settings = await api('/api/settings', { method: 'PATCH', body: approval }); saved = true; }
-    if (Object.keys(cadence).length) {
-      try { D.prefs = await api('/api/preferences', { method: 'PUT', body: cadence }); saved = true; }
-      catch (err) { throw new Error(`${Object.keys(approval).length ? 'Approval settings saved. ' : ''}Cadence could not be saved: ${err.message}`); }
-    }
-  } finally {
-    if (saved) await refreshSettingsSummary(form);
-  }
+  if (Object.keys(length).length) body.tailoring_length = length;
+  if (!Object.keys(body).length) return;
+  D.settings = await api('/api/settings', { method: 'PATCH', body });
+  await refreshSettingsSummary(form);
 }
 function settingsResumeGuard() {
   return !settingsDirty('resumes') || confirm('This action replaces your unsaved resume text. Continue?');
@@ -408,7 +411,7 @@ async function settingsUploadResume(file) {
     : 'Resume uploaded. Review its data below, and make it active when you want it used');
 }
 const SETTINGS_ACTIONS = {
-  'tailor-budget-reset': el => { setF('workflow', `tailor_budget_${el.dataset.pages}`, (D.settings.tailoring_length?.presets?.[el.dataset.pages] || []).join(', ')); render(); },
+  'tailor-budget-reset': el => { setF('workers', `tailor_budget_${el.dataset.pages}`, (D.settings.tailoring_length?.presets?.[el.dataset.pages] || []).join(', ')); render(); },
   'settings-retry': async () => { D.settingsLoadError = ''; render(); await load(); },
   'settings-section': el => settingsNavigate(el.value),
   'settings-save': el => settingsSave(el.dataset.form),

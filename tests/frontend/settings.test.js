@@ -8,7 +8,7 @@ const settingsSource = readFileSync('app/static/settings.js', 'utf8');
 const resumeDataSource = readFileSync('app/static/resume_data.js', 'utf8');
 const jobDataSource = readFileSync('app/static/job_data.js', 'utf8');
 const appSource = readFileSync('app/static/app.js', 'utf8').split('/* ───────────── boot ───────────── */')[0];
-const names = ['S', 'D', 'A', 'setF', 'render', 'readHash', 'setHash', 'orchState', 'settingsNavigate', 'settingsChanges', 'settingsPayload', 'settingsDirty', 'settingsCanLeave', 'settingsSave', 'settingsUploadResume', 'profileCompleteness', 'addTags', 'commitTag', 'SETTING_ERRORS', 'SETTINGS_SUCCESS', 'SETTINGS_SECTIONS', 'SETTINGS_ACTIONS', 'RD', 'resumeDataDirty', 'rdReset', 'JD', 'renderJobStructured', 'jobDataInput', 'packetLength'];
+const names = ['S', 'D', 'A', 'wkState', 'setF', 'render', 'readHash', 'setHash', 'orchState', 'settingsNavigate', 'settingsChanges', 'settingsPayload', 'settingsDirty', 'settingsCanLeave', 'settingsSave', 'settingsUploadResume', 'profileCompleteness', 'addTags', 'commitTag', 'SETTING_ERRORS', 'SETTINGS_SUCCESS', 'SETTINGS_SECTIONS', 'SETTINGS_ACTIONS', 'RD', 'resumeDataDirty', 'rdReset', 'JD', 'renderJobStructured', 'jobDataInput', 'packetLength'];
 let ui, fetchMock, context;
 function response(data, status = 200) { return { ok: status < 400, status, text: async () => JSON.stringify(data) }; }
 function data() {
@@ -19,6 +19,17 @@ function data() {
       ai: { saved: { llm_provider: '', model: '', require_free: null, stage_models: {} }, env: { llm_provider: 'openai', models: { openai: 'default-model' }, require_free: true, stage_models: {} } } } };
 }
 function section(id) { ui.S.settingsSection = id; ui.render(); }
+// Approvals, tailoring and cadence live on Running workers → Settings (the `workers` form).
+function workerSettings() {
+  const field = (name, type, def) => ({ name, label: name, help: '', type, min: 1, max: 10, default: def });
+  ui.D.wkSettings = { account: { tailoring: { values: { auto: true, max_attempts: 2 }, fields: [field('auto', 'bool', true), field('max_attempts', 'int', 2)] } },
+    server: {}, server_editable: false, schedules: {} };
+  ui.D.wk = { workers: [], cooldowns: [], active: 0, running: 0 };
+  // Saving reloads the workers screen: answer it with what is on screen.
+  fetchMock.mockImplementation(async url => response(url === '/api/workers' ? ui.D.wk : url === '/api/workers/settings' ? ui.D.wkSettings
+    : url === '/api/workspace/summary' ? ui.D.summary : {}));
+  ui.S.screen = 'workers'; ui.wkState().tab = 'settings'; ui.render();
+}
 function resumeCard(overrides = {}) {
   return { id: 1, name: 'cv.pdf', version: 1, is_active: true, verification_status: 'UNVERIFIED', reviewed_percent: 0, setups: [], domain: null, roles: [], has_original: true, file: { id: 11, filename: 'cv.pdf', size: 2048, media_type: 'application/pdf' }, ...overrides };
 }
@@ -74,7 +85,11 @@ describe('focused settings UI', () => {
     history.replaceState(null, '', '#settings'); ui.readHash(); expect(ui.S.settingsSection).toBe('profile');
     history.replaceState(null, '', '#settings/api-keys'); ui.readHash(); expect(ui.S.settingsSection).toBe('api-keys');
     history.replaceState(null, '', '#settings/unknown'); ui.readHash(); expect(ui.S.settingsSection).toBe('profile');
-    ui.settingsNavigate('workflow'); expect(location.hash).toBe('#settings/workflow');
+    ui.settingsNavigate('api-keys'); expect(location.hash).toBe('#settings/api-keys');
+    // Workflow & cadence moved to Running workers → Settings; old links land there.
+    history.replaceState(null, '', '#settings/workflow'); ui.readHash();
+    expect(ui.S.screen).toBe('workers'); expect(ui.wkState().tab).toBe('settings');
+    ui.S.screen = 'settings';
     // AI models moved to AI Orchestration → Models & routing; old links land there.
     expect([...document.querySelectorAll('.settings-nav a')].map(x => x.getAttribute('href'))).not.toContain('#settings/ai');
     history.replaceState(null, '', '#settings/ai'); ui.readHash();
@@ -129,7 +144,7 @@ describe('focused settings UI', () => {
     ui.setF('profile', 'name', 'Unsaved'); confirm.mockReturnValueOnce(false);
     expect(ui.settingsCanLeave('overview')).toBe(false);
     section('account'); ui.setF('account', 'new_password', 'temporary password');
-    ui.settingsNavigate('workflow'); expect(ui.S.forms.account).toBeUndefined(); expect(ui.S.forms.profile.name).toBe('Unsaved');
+    ui.settingsNavigate('api-keys'); expect(ui.S.forms.account).toBeUndefined(); expect(ui.S.forms.profile.name).toBe('Unsaved');
     expect(ui.settingsCanLeave('overview')).toBe(true); expect(ui.S.forms.profile).toBeUndefined();
   });
   it('saves one provider without changing or exposing another', async () => {
@@ -160,19 +175,34 @@ describe('focused settings UI', () => {
     fetchMock.mockResolvedValueOnce(response(ui.D.settings)); await ui.settingsSave('ai');
     expect(fetchMock.mock.calls[0][0]).toBe('/api/settings');
   });
-  it('requires confirmation for automatic approval and reports partial workflow failure', async () => {
-    section('workflow'); ui.setF('workflow', 'application_mode', 'automatic'); ui.setF('workflow', 'weekly_target', '20');
-    confirm.mockReturnValueOnce(false); await ui.settingsSave('workflow'); expect(fetchMock).not.toHaveBeenCalled();
+  it('requires confirmation for automatic approval before saving it from Running workers', async () => {
+    workerSettings(); ui.setF('workers', 'application_mode', 'automatic');
+    confirm.mockReturnValueOnce(false); await ui.settingsSave('workers'); expect(fetchMock).not.toHaveBeenCalled();
     fetchMock.mockResolvedValueOnce(response({ ...ui.D.settings, application_mode: 'automatic' }));
-    fetchMock.mockResolvedValueOnce(response({ detail: 'Unavailable' }, 503));
-    await ui.settingsSave('workflow');
-    expect(ui.SETTING_ERRORS.workflow).toContain('Approval settings saved');
-    expect(ui.settingsChanges('workflow')).toEqual({ weekly_target: '20' });
-    expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({ weekly_target: 20 });
+    await ui.settingsSave('workers');
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/settings');
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ application_mode: 'automatic' });
+    expect(ui.SETTING_ERRORS.workers).toBeUndefined();
+  });
+  it('keeps the weekly target and follow-up wait with Job preferences, saved apart from the profile', async () => {
+    section('preferences');
+    expect(document.getElementById('preferences-weekly_target')).not.toBeNull();
+    ui.setF('preferences', 'weekly_target', '20');
+    fetchMock.mockResolvedValueOnce(response({ ...ui.D.prefs, weekly_target: 20 }));
+    await ui.settingsSave('preferences');
+    const writes = fetchMock.mock.calls.filter(([, options]) => options?.method && options.method !== 'GET');
+    expect(writes.map(([url, options]) => [url, options.method, JSON.parse(options.body)])).toEqual([['/api/preferences', 'PUT', { weekly_target: 20 }]]);
+    expect(ui.D.prefs.weekly_target).toBe(20); expect(ui.S.forms.preferences).toBeUndefined();
+    // With a profile change as well, each goes to its own endpoint.
+    ui.setF('preferences', 'followup_days', '14'); ui.setF('preferences', 'target_roles', ['Staff']); fetchMock.mockClear();
+    fetchMock.mockResolvedValueOnce(response({ ...ui.D.prefs, followup_days: 14 })).mockResolvedValueOnce(response({ ...ui.D.profile, target_roles: ['Staff'] }));
+    await ui.settingsSave('preferences');
+    expect(fetchMock.mock.calls.slice(0, 2).map(([url]) => url)).toEqual(['/api/preferences', '/api/profile']);
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({ target_roles: ['Staff'] });
   });
   it('chooses the tailored resume length and edits its bullet budget', async () => {
     ui.D.settings.tailoring_length = { pages: 2, budgets: { 1: [4, 3, 2, 1, 0], 2: [6, 5, 4, 3, 2, 1], 3: [7, 6, 5, 4, 3, 2] }, presets: { 1: [4, 3, 2, 1, 0], 2: [6, 5, 4, 3, 2, 1], 3: [7, 6, 5, 4, 3, 2] } };
-    section('workflow');
+    workerSettings();
     const view = () => document.getElementById('view');
     expect(view().textContent).toContain('Tailored resume length');
     expect(view().textContent).toContain('Not recommended');
@@ -181,17 +211,17 @@ describe('focused settings UI', () => {
     const one = document.querySelector('[data-field="tailor_pages"][value="1"]'); one.checked = true;
     one.dispatchEvent(new Event('change', { bubbles: true }));
     expect(document.querySelector('[data-tailor-budget]').textContent).toContain('5th role and older: heading only');
-    ui.setF('workflow', 'tailor_budget_1', '5, 2'); ui.render();
+    ui.setF('workers', 'tailor_budget_1', '5, 2'); ui.render();
     expect(document.querySelector('[data-tailor-budget]').textContent).toContain('2nd role and older: 2 bullets');
     fetchMock.mockResolvedValueOnce(response(ui.D.settings));
-    await ui.settingsSave('workflow');
+    await ui.settingsSave('workers');
     const [url, options] = fetchMock.mock.calls[0];
     expect([url, JSON.parse(options.body)]).toEqual(['/api/settings', { tailoring_length: { pages: 1, budgets: { 1: [5, 2] } } }]);
-    ui.setF('workflow', 'tailor_budget_1', '5, nine'); fetchMock.mockClear();
-    await ui.settingsSave('workflow');
-    expect(fetchMock).not.toHaveBeenCalled(); expect(ui.SETTING_ERRORS.workflow).toContain('whole numbers from 0 to 8');
+    ui.setF('workers', 'tailor_budget_1', '5, nine'); fetchMock.mockClear();
+    await ui.settingsSave('workers');
+    expect(fetchMock).not.toHaveBeenCalled(); expect(ui.SETTING_ERRORS.workers).toContain('whole numbers from 0 to 8');
     ui.A['tailor-budget-reset']({ dataset: { pages: '1' } });
-    expect(ui.S.forms.workflow.tailor_budget_1).toBe('4, 3, 2, 1, 0');
+    expect(ui.S.forms.workers.tailor_budget_1).toBe('4, 3, 2, 1, 0');
   });
   it('sends the length chosen for one job, and nothing when it is the default', async () => {
     fetchMock.mockResolvedValue(response({ queued: [{ id: 1, job_id: 7 }], skipped: [] }));
@@ -212,20 +242,20 @@ describe('focused settings UI', () => {
     expect(ui.packetLength({ untailored: true, length: { estimated_pages: 2 } })).toBe('');
   });
   it('turns on automatic tailoring with its own fit score', async () => {
-    section('workflow');
+    workerSettings();
     expect(document.getElementById('view').textContent).toContain('qualified jobs wait in the Tailor queue');
-    expect(document.getElementById('workflow-auto_tailor_min_fit_score')).toBeNull();
+    expect(document.getElementById('workers-auto_tailor_min_fit_score')).toBeNull();
     const box = document.querySelector('[data-field="auto_tailor"]'); box.checked = true;
     box.dispatchEvent(new Event('change', { bubbles: true }));  // the checkbox itself reveals the fit score field
-    expect(document.getElementById('workflow-auto_tailor_min_fit_score')).not.toBeNull();
+    expect(document.getElementById('workers-auto_tailor_min_fit_score')).not.toBeNull();
     expect(document.getElementById('view').textContent).toContain('starts at once when a tailoring slot is free (up to 2 at a time)');
-    ui.setF('workflow', 'auto_tailor_min_fit_score', '80'); ui.render();
+    ui.setF('workers', 'auto_tailor_min_fit_score', '80'); ui.render();
     expect(document.getElementById('view').textContent).toContain('fit score of 80 or more');
     fetchMock.mockResolvedValueOnce(response({ ...ui.D.settings, auto_tailor: { enabled: true, min_fit_score: 80, enabled_at: '2026-09-28T10:00:00' } }));
-    await ui.settingsSave('workflow');
+    await ui.settingsSave('workers');
     const [url, options] = fetchMock.mock.calls[0];
     expect([url, options.method, JSON.parse(options.body)]).toEqual(['/api/settings', 'PATCH', { auto_tailor: true, auto_tailor_min_fit_score: 80 }]);
-    ui.D.settings.execution_mode = 'claude_desktop'; section('workflow');
+    ui.D.settings.execution_mode = 'claude_desktop'; workerSettings();
     expect(document.querySelector('[data-field="auto_tailor"]').disabled).toBe(true);
     expect(document.getElementById('view').textContent).toContain('only runs on Job Hunt OS workers');
   });
@@ -341,10 +371,10 @@ describe('focused settings UI', () => {
     delete ui.S.forms.resumes; fetchMock.mockResolvedValueOnce(response({ added: 2 }));
     await ui.A['parse-evidence'](); expect(fetchMock.mock.calls[0][0]).toContain('parse-evidence');
   });
-  it('saves cadence alone and never writes untouched approval settings', async () => {
-    section('workflow'); ui.setF('workflow', 'followup_days', '14');
+  it('saves the rhythm alone and never writes untouched profile fields', async () => {
+    section('preferences'); ui.setF('preferences', 'followup_days', '14');
     fetchMock.mockResolvedValueOnce(response({ ...ui.D.prefs, followup_days: 14 }));
-    await ui.settingsSave('workflow'); expect(fetchMock.mock.calls.filter(([, options]) => options.method !== 'GET')).toHaveLength(1);
+    await ui.settingsSave('preferences'); expect(fetchMock.mock.calls.filter(([, options]) => options.method !== 'GET')).toHaveLength(1);
     expect(fetchMock.mock.calls[0][0]).toBe('/api/preferences'); expect(ui.D.prefs.followup_days).toBe(14);
   });
   it('supports section selector changes and password reuse validation', async () => {
@@ -398,15 +428,17 @@ describe('focused settings UI', () => {
     await ui.settingsSave('preferences');
     expect(document.getElementById('side-foot').textContent).toContain('2 scheduled setups · 2 roles × 3 locations');
   });
-  it('refreshes the shell even if cadence fails after approval settings save', async () => {
-    section('workflow'); ui.setF('workflow', 'application_mode', 'automatic'); ui.setF('workflow', 'followup_days', '14');
+  it('refreshes the shell after approval settings save, and keeps the rhythm change if it cannot be saved', async () => {
+    workerSettings(); ui.setF('workers', 'application_mode', 'automatic');
     fetchMock.mockResolvedValueOnce(response({ ...ui.D.settings, application_mode: 'automatic' }));
-    fetchMock.mockResolvedValueOnce(response({ detail: 'Cadence offline' }, 503));
     fetchMock.mockResolvedValueOnce(response({ ...ui.D.summary, application_mode: 'automatic' }));
-    await ui.settingsSave('workflow');
+    await ui.settingsSave('workers');
     expect(document.getElementById('side-meta').textContent).toContain('automatic');
-    expect(ui.SETTING_ERRORS.workflow).toContain('Approval settings saved');
-    expect(ui.settingsChanges('workflow')).toEqual({ followup_days: '14' });
+    ui.S.screen = 'settings'; section('preferences'); ui.setF('preferences', 'followup_days', '14');
+    fetchMock.mockResolvedValueOnce(response({ detail: 'Cadence offline' }, 503));
+    await ui.settingsSave('preferences');
+    expect(ui.SETTING_ERRORS.preferences).toContain('Cadence offline');
+    expect(ui.settingsChanges('preferences')).toEqual({ followup_days: '14' });
   });
   it('distinguishes summary-refresh failure from save failure', async () => {
     input('profile-name', 'Already saved');

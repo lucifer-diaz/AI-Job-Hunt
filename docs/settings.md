@@ -1,14 +1,14 @@
 # Focused settings editors
 
-Settings uses a section sidebar on desktop and a native section selector below 900px. The existing `#settings` URL opens Profile. Deep links use `#settings/profile`, `preferences`, `resumes`, `resume-data`, `account`, `api-keys`, `ai`, and `workflow`.
+Settings uses a section sidebar on desktop and a native section selector below 900px. The existing `#settings` URL opens Profile. Deep links use `#settings/profile`, `preferences`, `resumes`, `resume-data`, `account`, `api-keys`, and `domain`. `#settings/ai` (AI models) and `#settings/workflow` (approvals, tailoring and cadence) moved: they open AI Orchestration → Models and Running workers → Settings.
 
 ## Frontend boundaries
 
 `app/static/settings.js` owns section renderers, baseline comparisons, partial payloads, validation, and settings actions. It loads before the existing workspace script and uses its shared form, API, routing, and rendering helpers. No production JavaScript build is required. `app.css` scopes the new layout under settings classes.
 
-Profile, preferences, resume text, AI, and workflow drafts are independent. Ordinary drafts survive section changes; navigating out of Settings or reloading warns before losing edits. API-key and password drafts are memory-only and are cleared when leaving their section, cancelling, or saving successfully. Saving disables that editor and blocks section navigation until the request finishes. Inline errors retain drafts for retry.
+Profile, preferences, resume text and AI drafts are independent (worker, approval and cadence settings are one draft on Running workers → Settings). Ordinary drafts survive section changes; navigating out of Settings or reloading warns before losing edits. API-key and password drafts are memory-only and are cleared when leaving their section, cancelling, or saving successfully. Saving disables that editor and blocks section navigation until the request finishes. Inline errors retain drafts for retry.
 
-Profile, preference, AI, and workflow saves refresh the workspace summary so the shell shows the saved identity, model, approval mode, and auto-search counts. A summary-refresh failure is reported separately from a successful save and does not restore an already-saved draft. Partial workflow saves also refresh the summary.
+Profile, preference, AI and worker-setting saves refresh the workspace summary so the shell shows the saved identity, model, approval mode, and auto-search counts. A summary-refresh failure is reported separately from a successful save and does not restore an already-saved draft. 
 
 The UI saves changed fields only. Pending chip input is committed before saving, including locations with commas. Valid numeric zero values count toward completeness. Making a resume active warns before replacing unsaved resume text. Uploads, saved text and file deletes never change the active resume: saved text becomes a new, inactive version, an upload is inactive unless it is the first resume, and deleting a file keeps its version (and any draft). Parsing evidence requires saved text. Advanced AI overrides and master text are collapsible.
 
@@ -34,7 +34,7 @@ All routes require the existing signed-in session and same-origin write protecti
 | `PUT /api/preferences` | Now preserves omitted preference fields, including stored warning/email flags. Existing complete payloads retain their behavior. |
 | `POST /api/auth/password` | Takes `current_password`, `new_password`, and `confirm_password`; returns `{ "ok": true }` and a new session cookie. |
 
-Existing profile/settings PUT routes remain available with their previous replacement behavior. API-key and resume routes are reused unchanged. Workflow saves approval and cadence separately; if cadence fails after approval succeeds, the UI reports the partial success and retries only remaining changes.
+Existing profile/settings PUT routes remain available with their previous replacement behavior. API-key and resume routes are reused unchanged. The weekly target and follow-up wait are saved by Job preferences through `PUT /api/preferences`, before the profile fields; if that call fails the draft is kept for retry. Approval, tailoring, cadence and limit settings are saved from Running workers → Settings in one `PATCH /api/settings`.
 
 Partial JSON updates reload the row under a write lock. PostgreSQL uses `FOR UPDATE`; SQLite first acquires its single-writer lock with a no-op row update. This prevents simultaneous section saves from dropping each other's nested values. Concurrent writes to the same field remain last-write-wins.
 
@@ -58,7 +58,7 @@ node --check app/static/resume_data.js
 
 Python dev dependencies include pytest-cov and Ruff. Node is needed only for tests (Node 22.12+ or a compatible newer runtime). Vitest uses jsdom and Node VM contexts to exercise the actual production scripts without running automatic network boot. V8 coverage measures `settings.js` and `resume_data.js`; thresholds are 85% for statements, branches, functions and lines.
 
-Backend coverage includes partial updates, explicit clearing, inheritance, isolation, password policy, session rotation, rollback, stale password updates, and concurrent nested writes. Frontend coverage includes draft isolation, routing, pending tags, secret cleanup, validation, per-provider writes, resume safeguards, retry/error handling, and partial workflow saves.
+Backend coverage includes partial updates, explicit clearing, inheritance, isolation, password policy, session rotation, rollback, stale password updates, and concurrent nested writes. Frontend coverage includes draft isolation, routing, pending tags, secret cleanup, validation, per-provider writes, resume safeguards, and retry/error handling.
 
 Browser checks use an isolated local database with fictional profile data, mock AI, and disabled workers. Verify widths of 375, 768, and 1440px, keyboard navigation, overflow, section switching, profile saving, and disclosures. Password rotation is exercised through backend tests, without changing a real user's credentials.
 
