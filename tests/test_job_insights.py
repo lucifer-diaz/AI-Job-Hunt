@@ -506,16 +506,22 @@ def _apify_transport(items, *, status="SUCCEEDED", seen=None):
 @pytest.fixture
 def apify_fake(monkeypatch):
     from app.services import sources as sources_module
+    from app.services.external_api import external_client
 
     holder = {"items": [], "status": "SUCCEEDED", "seen": []}
-    real = sources_module.apify_client
 
-    def client(token, **kwargs):
-        made = real(token, **kwargs)
-        made._transport = _apify_transport(holder["items"], status=holder["status"], seen=holder["seen"])
-        return made
+    def client(token, *, operation, user_id=None, metadata=None, timeout=30, json_body=False, service="apify_api",
+               job_id=None, workflow_type=None):
+        # The transport is given at construction: a proxy set in the environment can then never route around it.
+        return external_client("APIFY", service=service, operation=operation, timeout=timeout, user_id=user_id,
+                               metadata=metadata or {}, job_id=job_id, workflow_type=workflow_type,
+                               headers={"Authorization": f"Bearer {token}"},
+                               transport=_apify_transport(holder["items"], status=holder["status"],
+                                                          seen=holder["seen"]))
     monkeypatch.setattr(sources_module, "apify_client", client)
     monkeypatch.setattr(get_settings(), "apify_glassdoor_compensation_actor", "someone/salary-actor")
+    monkeypatch.setattr(get_settings(), "apify_glassdoor_compensation_input",
+                        '{"companyName": "{company}", "jobTitle": "{role}", "maxItems": "{limit}"}')
     monkeypatch.setattr("app.services.user_settings.apify_token", lambda db, user_id=None: "apify_api_" + "x" * 30)
     return holder
 
@@ -696,8 +702,10 @@ def test_reported_questions_carry_their_sources_and_generated_ones_never_do(owne
     assert reported[0]["origin"] == "REPORTED" and reported[0]["kind"] == "FACT" and reported[0]["source_ids"]
     assert reported[0]["source_type"] == "GLASSDOOR"
     generated = insight.generated_questions
-    assert {q["origin"] for q in generated} == {"ROLE_DERIVED", "CANDIDATE_SPECIFIC"}
+    # The profile question cited neither evidence nor a gap, so it is dropped rather than shown as grounded.
+    assert {q["origin"] for q in generated} == {"ROLE_DERIVED"}
     assert all(q["kind"] == "GENERATED" and "source_ids" not in q and q["why_likely"] for q in generated)
+    assert generated[0]["id"].startswith("q") and len(generated[0]["id"]) == 13, "a stable content id"
     assert insight.questions_to_ask[0]["kind"] == "GENERATED"
     assert insight.interview_process["durations"][0]["text"] == "3 weeks"
 
@@ -724,7 +732,9 @@ def test_model_calls_are_recorded_with_their_worker_and_prompt_version(owner, mo
                                                       LLMRequestLog.prompt_name.in_(("company_insights",
                                                                                      "interview_insights")))).all()
     assert {r.prompt_name for r in rows} == {"company_insights", "interview_insights"}
-    assert {r.stage for r in rows} == {"COMPANY_INSIGHTS"} and all(r.prompt_version == "v1" for r in rows)
+    assert {(r.prompt_name, r.stage) for r in rows} == {("company_insights", "COMPANY_INSIGHTS"),
+                                                        ("interview_insights", "INTERVIEW_INSIGHTS")}
+    assert all(r.prompt_version == "v1" for r in rows)
     assert insight_of(job_id).prompt_versions == {"company_insights": "v1", "interview_insights": "v1"}
 
 
@@ -867,3 +877,133 @@ def test_compensation_prep_never_invents_an_employer_budget(owner):
     prep = insight_of(job_id).compensation_prep
     assert prep["posted"] is None and prep["recruiter_budget"] is None and prep["discussion_range"] is None
     assert prep["questions"] and all(q["kind"] == "GENERATED" for q in prep["questions"])
+
+
+# ───────────── review fixes ─────────────
+
+def test_a_refresh_without_the_model_keeps_the_observations_its_kept_sections_cite(owner, monkeypatch):
+    values = FakeSource("official_company", [obs("VALUES", "OFFICIAL_COMPANY", {"value": "Ownership"},
+                                                 match_scope="COMPANY")], source_type="OFFICIAL_COMPANY")
+    monkeypatch.setattr(service, "SOURCES", [PostingSource(), values])
+    job_id = new_job(owner)
+    run_insights()
+    cited = insight_of(job_id).company["official_values"][0]["source_ids"]
+    monkeypatch.setattr(synthesis, "run", lambda *a, **k: synthesis.Synthesis(errors=["model down"]))
+    refresh(job_id)
+    run_insights()
+    insight = insight_of(job_id)
+    assert insight.company["official_values"][0]["source_ids"] == cited
+    with SessionLocal() as db:
+        kept = db.get(InsightObservation, cited[0])
+        current = db.scalars(select(InsightObservation).where(InsightObservation.job_insight_id == insight.id,
+                                                              InsightObservation.superseded_at.is_(None))).all()
+    assert kept is not None and kept.superseded_at is not None, "still cited, so kept (marked superseded)"
+    assert [o.data["value"] for o in current] == ["Ownership"] and current[0].id != cited[0]
+    monkeypatch.undo()
+    monkeypatch.setattr(service, "SOURCES", [PostingSource(), values])
+    monkeypatch.setattr(get_settings(), "llm_provider", "mock")
+    refresh(job_id)
+    run_insights()  # the model is back: the section is rebuilt and the old row is no longer cited
+    with SessionLocal() as db:
+        assert db.get(InsightObservation, cited[0]) is None
+
+
+def test_posting_facts_are_saved_even_when_every_outside_source_and_the_model_fail(owner, monkeypatch):
+    monkeypatch.setattr(get_settings(), "job_insights_max_attempts", 1)
+    monkeypatch.setattr(service, "SOURCES", [PostingSource(), FakeSource("glassdoor_compensation", status=FAILED)])
+    monkeypatch.setattr(synthesis, "run", lambda *a, **k: synthesis.Synthesis(errors=["model down"]))
+    job_id = new_job(owner, raw={"salary_min": 150000, "salary_max": 170000, "salary_currency": "SGD",
+                                 "salary_interval": "year"})
+    assert run_insights() == ["failed"]
+    insight = insight_of(job_id)
+    assert insight.compensation["employer_posted_range"]["low"] == 150_000 and insight.status == "PARTIAL"
+
+
+def test_an_actor_without_an_input_template_is_never_run(monkeypatch):
+    monkeypatch.setattr(get_settings(), "apify_payscale_actor", "someone/payscale")
+    monkeypatch.setattr(get_settings(), "apify_payscale_input", "")
+    assert "APIFY_PAYSCALE_INPUT" in apify.PayScaleSource().configured()
+    assert not hasattr(apify, "default_input")
+
+
+def test_a_reported_stage_must_cite_an_interview_report():
+    research = [{"id": 1, "category": "VALUES", "source_type": "OFFICIAL_COMPANY"},
+                {"id": 2, "category": "INTERVIEW_PROCESS", "source_type": "GLASSDOOR"}]
+    answer = CompanyInsightSynthesis.model_validate({"interview_stages": [
+        {"name": "Values round", "order": 1, "origin": "REPORTED", "supporting_source_ids": [1]},
+        {"name": "System design", "order": 2, "origin": "REPORTED", "supporting_source_ids": [2]}],
+        "research_confidence": 0.5})
+    out = synthesis.validate_company(answer, research, [])
+    assert [(s.name, s.origin) for s in out.interview_stages] == [("System design", "REPORTED")]
+
+
+def test_ungrounded_generated_questions_are_dropped():
+    answer = InterviewPrepResult.model_validate({"generated_questions": [
+        {"question": "Tell me about Kafka at scale?", "rationale": "Required"},
+        {"question": "Tell me about your pipeline work?", "origin": "CANDIDATE_SPECIFIC", "rationale": "Strong"},
+        {"question": "Tell me about Python services?", "rationale": "Required", "requirement_ids": ["req_001"]}]})
+    dropped: list[str] = []
+    out = synthesis.ground_questions(answer, has_requirements=True, dropped=dropped)
+    assert [q.question for q in out.generated_questions] == ["Tell me about Python services?"] and len(dropped) == 2
+
+
+def test_citations_are_checked_against_only_what_the_prompt_showed():
+    from app.prompts.company_insights import MAX_OBSERVATIONS, shown_observations
+
+    many = [{"id": i, "category": "VALUES", "source_type": "OFFICIAL_COMPANY", "data": {"value": f"V{i}"}}
+            for i in range(MAX_OBSERVATIONS + 30)]
+    shown = shown_observations(many)
+    assert len(shown) <= MAX_OBSERVATIONS
+    unseen = CompanyInsightSynthesis.model_validate({"official_values": [
+        {"value": "Guess", "supporting_source_ids": [MAX_OBSERVATIONS + 5]}], "research_confidence": 0.5})
+    with pytest.raises(synthesis.SynthesisRejected):
+        synthesis.validate_company(unseen, shown, [])
+
+
+def test_pay_questions_with_figures_are_discarded():
+    prep = InterviewPrepResult.model_validate({"compensation_questions": [
+        "Would SGD 200,000 be approved?", "Is 180k within the band?", "What is the approved band for this level?"]})
+    out = service.compensation_prep({}, prep, None)
+    assert [q["question"] for q in out["questions"]] == ["What is the approved band for this level?"]
+
+
+def test_an_unknown_employer_basis_is_not_compared_with_market_base_pay():
+    out = compensation.compensation_insight(_rows(salary("EMPLOYER", 300_000, 320_000, basis="UNKNOWN",
+                                                         confidence=0.98),
+                                                  salary("GLASSDOOR", 180_000, 200_000, basis="BASE")))
+    assert out["status"] == "EMPLOYER_POSTED" and out["conflict"] is None
+    assert out["base_salary"]["low"] == 180_000, "only the market's base salary is called base salary"
+
+
+def test_only_http_links_are_stored():
+    assert service.safe_url("javascript:alert(1)") is None
+    assert service.safe_url("data:text/html,x") is None
+    assert service.safe_url("https://grab.com/values") == "https://grab.com/values"
+
+
+def test_provenance_is_paged(owner, signed_in, monkeypatch):
+    many = FakeSource("glassdoor_interview", [obs("INTERVIEW_QUESTION", "GLASSDOOR", {"question": f"Question {i}?"})
+                                              for i in range(5)], ttl="interview")
+    monkeypatch.setattr(service, "SOURCES", [PostingSource(), many])
+    job_id = new_job(owner)
+    run_insights()
+    client = signed_in(owner)
+    first = client.get(f"/api/jobs/{job_id}/insights/sources?limit=2").json()
+    assert first["total"] == 5 and first["truncated"] and first["next_offset"] == 2 and len(first["observations"]) == 2
+    last = client.get(f"/api/jobs/{job_id}/insights/sources?offset=4&limit=2").json()
+    assert not last["truncated"] and last["next_offset"] is None and len(last["observations"]) == 1
+
+
+def test_the_research_node_counts_the_calls_research_actually_makes():
+    from types import SimpleNamespace
+
+    from app.services import orchestration
+    from app.services import orchestration_topology as topo
+
+    node = topo.NODES_BY_ID["company_insights"]
+    for provider, operation in (("APIFY", "glassdoor_compensation_run"), ("APIFY", "payscale_compensation_dataset"),
+                                ("WEB", "official_company_page")):
+        assert orchestration._matches(node, SimpleNamespace(provider=provider, operation=operation)), operation
+    assert not orchestration._matches(node, SimpleNamespace(provider="WEB", operation="jd_recovery_http"))
+    prep = topo.NODES_BY_ID["interview_insights"]
+    assert node.llm_stages == ("COMPANY_INSIGHTS",) and prep.llm_stages == ("INTERVIEW_INSIGHTS",)

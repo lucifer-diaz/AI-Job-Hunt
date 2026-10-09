@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -107,9 +107,11 @@ def interview(job_id: int, db: Session = Depends(get_user_db)) -> dict[str, Any]
 
 
 @router.get("/api/jobs/{job_id}/insights/sources")
-def sources(job_id: int, db: Session = Depends(get_user_db)) -> dict[str, Any]:
-    """Provenance: every observation behind the insights, and what each source returned on the last run."""
-    return views.observations_view(db, _job(db, job_id))
+def sources(job_id: int, offset: int = Query(0, ge=0), limit: int = Query(views.PAGE_SIZE, ge=1, le=views.PAGE_SIZE),
+            db: Session = Depends(get_user_db)) -> dict[str, Any]:
+    """Provenance: the observations behind the insights (paged; `next_offset` when there are more), and what each
+    source returned on the last run."""
+    return views.observations_view(db, _job(db, job_id), offset=offset, limit=limit)
 
 
 @router.put("/api/jobs/{job_id}/insights/inputs")

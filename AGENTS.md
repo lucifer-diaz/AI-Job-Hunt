@@ -191,8 +191,8 @@ change has to keep:
 * **A refresh never erases last known good data because one provider failed**: a failed source keeps its previous
   observations, a run without the model keeps the previous synthesized sections (`service.SYNTHESIZED`), and a run
   where everything failed changes nothing and is retried. Recruiter input is never written by research.
-* **Do not invent Apify actor IDs or provider schemas.** Actors are settings (`APIFY_*_ACTOR`, blank =
-  NOT_CONFIGURED), their input is an admin template, their output is read through aliases in `apify.py`, and an
+* **Do not invent Apify actor IDs or provider schemas.** Actors are settings (`APIFY_*_ACTOR`) and their input is an
+  admin template (`APIFY_*_INPUT`); a source missing either is NOT_CONFIGURED, never run with a guessed input, their output is read through aliases in `apify.py`, and an
   unrecognized shape is FAILED ("schema not recognized").
 * **Add a source as an adapter** (`base.InsightSource`: `name`, `label`, `source_type`, `company_level`,
   `configured()`, `fetch(snapshot)`) in `service.SOURCES`; it never raises, never touches the database and calls out

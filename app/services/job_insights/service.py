@@ -15,12 +15,15 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextvars
+import hashlib
+import re
 import time
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any
+from urllib.parse import urlparse
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from app.models import Application, InsightObservation, Job, JobInsight
@@ -72,6 +75,10 @@ LOCAL_SOURCES = ("job_posting", "recruiter")  # read stored data only; they neve
 ANSWERED = (OK, NO_DATA, NEEDS_REVIEW)
 # Sections the company synthesis shapes: a run without it never replaces a previous run's version.
 SYNTHESIZED = ("company", "interview_process", "reported_questions", "risks", "unknowns")
+INSIGHT_SECTIONS = ("compensation", "compensation_prep", "company", "interview_process", "reported_questions",
+                    "generated_questions", "questions_to_ask", "focus_areas", "value_prep", "risks", "unknowns")
+# A pay question a model wrote must not carry a figure: amounts come only from sources (app.services.compensation).
+MONEY = re.compile(r"(?:[$£€₹]|\b[A-Z]{3}\b)\s?\d|\d[\d,.]*\s?[kKmM]\b|\d{1,3}(?:,\d{3})+|\d{4,}|\blakhs?\b|\bLPA\b")
 WEBSITE_KEYS = ("company_website", "companyWebsite", "company_url", "companyUrl", "employer_website",
                 "employerWebsite", "company.website", "company.url", "hiringOrganization.sameAs",
                 "hiringOrganization.url")
@@ -146,11 +153,13 @@ def cached(db: Session, *, user_id: int, insight_id: int, source: Any, key: str,
     fresh. Never another account's: research is per account, like everything it owns."""
     o = InsightObservation
     latest = db.scalar(select(func.max(o.fetched_at)).where(
-        o.user_id == user_id, o.cache_key == key, o.source_name == source.name, o.job_insight_id != insight_id))
+        o.user_id == user_id, o.cache_key == key, o.source_name == source.name, o.job_insight_id != insight_id,
+        o.superseded_at.is_(None)))
     if latest is None or latest < now - timedelta(days=_ttl_days(source)):
         return None
     rows = db.scalars(select(o).where(o.user_id == user_id, o.cache_key == key, o.source_name == source.name,
-                                      o.fetched_at == latest, o.job_insight_id != insight_id).order_by(o.id)).all()
+                                      o.fetched_at == latest, o.job_insight_id != insight_id,
+                                      o.superseded_at.is_(None)).order_by(o.id)).all()
     insight_ids = {r.job_insight_id for r in rows}
     if len(insight_ids) > 1:  # one batch only: the newest insight's copy
         newest = max(insight_ids)
@@ -254,7 +263,10 @@ def collect(snapshot: Snapshot, reused: dict[str, list[ObservationIn]]) -> list[
 def store(sessions: Callable[[], Session], claim_: InsightClaim, results: list[SourceResult],
           now: datetime) -> list[dict[str, Any]] | None:
     """Replace the observations of every source that answered; keep those of sources that did not. Lease-guarded.
-    Returns every observation the insight now has, or None when the lease was lost."""
+
+    Replaced rows are marked superseded, not deleted: a section this run may keep from an earlier one (when its model
+    step fails) still cites them. `settle` prunes the superseded rows nothing cites any more. Returns the insight's
+    current observations, or None when the lease was lost."""
     with sessions() as db:
         task = held(db, claim_)
         if task is None:
@@ -265,15 +277,17 @@ def store(sessions: Callable[[], Session], claim_: InsightClaim, results: list[S
             return None
         answered = [r for r in results if r.status in ANSWERED]
         if answered:
-            db.execute(delete(InsightObservation).where(InsightObservation.job_insight_id == insight.id,
-                                                        InsightObservation.source_name.in_([r.name for r in answered]))
-                       .execution_options(synchronize_session=False))
+            db.execute(update(InsightObservation).where(
+                InsightObservation.job_insight_id == insight.id,
+                InsightObservation.source_name.in_([r.name for r in answered]),
+                InsightObservation.superseded_at.is_(None)).values(superseded_at=now)
+                .execution_options(synchronize_session=False))
         for result in answered:
             for o in result.observations:
                 db.add(InsightObservation(
                     user_id=task.user_id, job_insight_id=insight.id, category=o.category, source_type=o.source_type,
                     source_name=result.name, provider=o.provider, actor_id=o.actor_id,
-                    source_url=(o.source_url or "")[:1200] or None, source_reference=o.source_reference,
+                    source_url=safe_url(o.source_url), source_reference=o.source_reference,
                     title=(o.title or "")[:300] or None, match_scope=o.match_scope, match_status=o.match_status,
                     match_reason=(o.match_reason or "")[:300] or None, confidence=max(0.0, min(1.0, o.confidence)),
                     recency=o.recency, observed_at=o.observed_at, fetched_at=o.fetched_at or now,
@@ -281,9 +295,47 @@ def store(sessions: Callable[[], Session], claim_: InsightClaim, results: list[S
         labels = {s.name: s.label for s in SOURCES}
         task.source_status = {r.name: {**r.summary(now), "label": labels.get(r.name, r.name)} for r in results}
         db.commit()
-        rows = db.scalars(select(InsightObservation).where(InsightObservation.job_insight_id == insight.id)
+        rows = db.scalars(select(InsightObservation).where(InsightObservation.job_insight_id == insight.id,
+                                                           InsightObservation.superseded_at.is_(None))
                           .order_by(InsightObservation.id)).all()
         return [observation_dict(r) for r in rows]
+
+
+def safe_url(url: str | None) -> str | None:
+    """Only http(s) links are kept: an actor's or a page's `javascript:` / `data:` URL never reaches the screen."""
+    text = (url or "").strip()
+    return text[:1200] if urlparse(text).scheme in ("http", "https") and urlparse(text).netloc else None
+
+
+def cited_ids(value: Any) -> set[int]:
+    """Every observation id a stored section cites, wherever it cites it."""
+    found: set[int] = set()
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in ("source_ids", "value_source_ids") and isinstance(item, list):
+                found |= {i for i in item if isinstance(i, int)}
+            elif key == "id" and isinstance(item, int) and "source_type" in value:
+                found.add(item)  # a compensation observation row or a provenance entry
+            else:
+                found |= cited_ids(item)
+    elif isinstance(value, list):
+        for item in value:
+            found |= cited_ids(item)
+    return found
+
+
+def prune_superseded(db: Session, insight: JobInsight) -> int:
+    """Delete superseded observations that no section of the insight cites any more."""
+    keep = set()
+    for name in INSIGHT_SECTIONS:
+        keep |= cited_ids(getattr(insight, name))
+    stale = [i for i in db.scalars(select(InsightObservation.id).where(
+        InsightObservation.job_insight_id == insight.id, InsightObservation.superseded_at.is_not(None))).all()
+        if i not in keep]
+    if stale:
+        db.execute(delete(InsightObservation).where(InsightObservation.id.in_(stale))
+                   .execution_options(synchronize_session=False))
+    return len(stale)
 
 
 # ───────────── 4. sections ─────────────
@@ -329,7 +381,8 @@ def sentiment(observations: list[dict[str, Any]]) -> dict[str, Any] | None:
 def compensation_prep(comp: dict[str, Any], prep: Any, profile_target: str | None) -> dict[str, Any]:
     """What to say about pay: the figures as their sources state them, and questions to ask. Never a fabricated
     employer budget, and a market estimate is never called the company's band."""
-    questions = list(getattr(prep, "compensation_questions", None) or []) or [
+    written = [q for q in getattr(prep, "compensation_questions", None) or [] if not MONEY.search(q)]
+    questions = written or [
         "Could you share the approved base salary and total-compensation band for this level?",
         "How is the level for this role decided, and what does the band look like one level up?",
         "What makes up total compensation here (bonus, equity, benefits), and how is each paid out?"]
@@ -428,13 +481,13 @@ def build_sections(observations: list[dict[str, Any]], result: synthesis.Synthes
     prep = result.interview
     if prep is not None:
         sections["generated_questions"] = [
-            {"id": f"q{i + 1}", "question": q.question, "origin": q.origin, "category": q.category, "stage": q.stage,
+            {"id": question_id(q.origin, q.question), "question": q.question, "origin": q.origin, "category": q.category, "stage": q.stage,
              "difficulty": q.difficulty, "why_likely": q.rationale, "requirement_ids": q.requirement_ids,
              "requirements": [result.requirement_labels.get(r, r) for r in q.requirement_ids],
              "evidence_ids": q.evidence_ids, "gap_requirement_ids": q.gap_requirement_ids,
              "gaps": [result.requirement_labels.get(r, r) for r in q.gap_requirement_ids],
              "preparation": q.preparation or None, "kind": "GENERATED",
-             "label": "Generated preparation — not reported by candidates"} for i, q in enumerate(prep.generated_questions)]
+             "label": "Generated preparation — not reported by candidates"} for q in prep.generated_questions]
         sections["questions_to_ask"] = [{"stage": q.stage, "question": q.question, "context": q.context or None,
                                          "kind": "GENERATED"} for q in prep.questions_to_ask]
         sections["focus_areas"] = [{"area": f.area, "why": f.why, "requirement_ids": f.requirement_ids,
@@ -461,6 +514,12 @@ def build_sections(observations: list[dict[str, Any]], result: synthesis.Synthes
                          "kind": "UNKNOWN"})
     sections["risks"], sections["unknowns"] = risks, unknowns
     return sections
+
+
+def question_id(origin: str, question: str) -> str:
+    """Stable across refreshes: the same question keeps its id, so a prepared answer never moves to another one."""
+    digest = hashlib.sha1(f"{origin}|{' '.join(question.lower().split())}".encode()).hexdigest()[:12]
+    return f"q{digest}"
 
 
 def run_status(results: list[SourceResult], result: synthesis.Synthesis) -> str:
@@ -496,20 +555,6 @@ def settle(sessions: Callable[[], Session], claim_: InsightClaim, results: list[
         failures = [f"{r.name}: {r.detail or r.status}" for r in results if r.status in (FAILED, BLOCKED)]
         error = "; ".join(failures + result.errors)[:2000] or None
         insight.last_attempt_at = now
-        if status == "FAILED":
-            own = worker_settings.for_user(db, task.user_id, KIND)
-            insight.last_error = error
-            if insight.status == "NONE":
-                insight.status = "FAILED"
-            if task.attempt_count < own["max_attempts"]:
-                release(task, now, error or "Every source failed", retry_seconds=own["retry_seconds"],
-                        category=ErrorCategory.EXTERNAL_SERVICE)
-                label = "retrying"
-            else:
-                finish(task, "FAILED", now, error, ErrorCategory.EXTERNAL_SERVICE)
-                label = "failed"
-            db.commit()
-            return label
         profile = get_profile(db)
         sections = build_sections(
             observations, result, job={"title": job.title or "", "company": job.company or "",
@@ -520,6 +565,23 @@ def settle(sessions: Callable[[], Session], claim_: InsightClaim, results: list[
             if result.company is None and name in SYNTHESIZED and getattr(insight, name) is not None:
                 continue  # the model did not run this time: what the last good run wrote stands
             setattr(insight, name, value)
+        prune_superseded(db, insight)
+        if status == "FAILED":
+            # Every outside source and the model failed. What the posting and the recruiter notes say is saved above
+            # (it is this job's own data); the research itself is retried.
+            own = worker_settings.for_user(db, task.user_id, KIND)
+            insight.last_error = error
+            if insight.status == "NONE":
+                insight.status = "PARTIAL" if observations else "FAILED"
+            if task.attempt_count < own["max_attempts"]:
+                release(task, now, error or "Every source failed", retry_seconds=own["retry_seconds"],
+                        category=ErrorCategory.EXTERNAL_SERVICE)
+                label = "retrying"
+            else:
+                finish(task, "FAILED", now, error, ErrorCategory.EXTERNAL_SERVICE)
+                label = "failed"
+            db.commit()
+            return label
         if result.prompt_versions:
             insight.prompt_versions = {**(insight.prompt_versions or {}), **result.prompt_versions}
             insight.model = (result.model or "")[:200] or insight.model

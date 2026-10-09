@@ -178,11 +178,13 @@ NODES: tuple[Node, ...] = (
          "the company's own site, and Glassdoor and PayScale through Apify when an admin configured them; a model "
          "then organises what was found, citing every source. Salary is computed in code.", "support", (3, 2),
          workers=("COMPANY_INSIGHTS",), llm_stages=("COMPANY_INSIGHTS",),
-         external=(ExternalMatch("APIFY", "job_insights"), ExternalMatch("WEB", "job_insights")),
+         # The operations job insights actually emits (app.services.job_insights.apify / sources).
+         external=(ExternalMatch("APIFY", "glassdoor_"), ExternalMatch("APIFY", "payscale_"),
+                   ExternalMatch("WEB", "official_company_page")),
          monitoring_tab="external", workers_tab="insights", screen="approvals"),
     Node("interview_insights", "Interview preparation", (AI,), "Writes interview preparation from the posting, the "
          "fit analysis and verified evidence, always labelled as generated (never as questions the company asks).",
-         "support", (4, 2), workers=("INTERVIEW_INSIGHTS",), llm_stages=("COMPANY_INSIGHTS",),
+         "support", (4, 2), workers=("INTERVIEW_INSIGHTS",), llm_stages=("INTERVIEW_INSIGHTS",),
          monitoring_tab="llm", screen="approvals"),
 )
 

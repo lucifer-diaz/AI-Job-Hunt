@@ -83,7 +83,7 @@ MONITORING_STAGE = {"RESUME_PARSER": "RESUME_PARSER", "EVIDENCE_EXTRACTION": "RE
                     "JD_PARSER": "JD_PARSER", "JD_RECOVERY": "JD_RECOVERY",
                     "TAILOR": "TAILOR", "REVIEWER": "REVIEWER", "APPLICATION_ANSWER": "APPLICATION",
                     "FOLLOWUP": "FOLLOW_UP", "INBOX_CLASSIFIER": "INBOX", "COMPANY_INSIGHTS": "COMPANY_INSIGHTS",
-                    "INTERVIEW_INSIGHTS": "COMPANY_INSIGHTS",
+                    "INTERVIEW_INSIGHTS": "INTERVIEW_INSIGHTS",
                     "AI_OPTIMIZATION": "ADVISOR"}
 
 # Quality-escalation conditions a worker policy may use (app.services.model_resolution.escalation_reason).

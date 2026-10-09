@@ -92,9 +92,12 @@ def validate_company(answer: Any, observations: list[dict[str, Any]], dropped: l
     dropped += [f"reported question without a reporting source: '{q.question[:60]}'" for q in answer.reported_questions
                 if q not in keep]
     answer.reported_questions = keep
+    process = lambda o: o["category"] in ("INTERVIEW_PROCESS", "INTERVIEW_QUESTION")
     for stage in answer.interview_stages:
-        if stage.origin == "REPORTED" and not stage.supporting_source_ids:
-            stage.origin = "INFERRED"  # a stage nothing reports is never shown as reported
+        if stage.origin == "REPORTED" and not cited(stage, process):
+            # A stage no interview report describes is never shown as reported (a value or a review is no report).
+            dropped.append(f"stage '{stage.name}' cited no interview report; kept only as inferred")
+            stage.origin = "INFERRED"
         if stage.origin == "INFERRED":
             stage.supporting_source_ids = []
     answer.interview_stages = [s for s in answer.interview_stages if s.origin == "REPORTED" or s.rationale]
@@ -124,6 +127,22 @@ def validate_interview(answer: Any, *, requirement_ids: set[str], evidence_ids: 
             problems.append(f"value preparation cites unknown evidence ids {unknown[:5]}")
     if problems:
         raise SynthesisRejected("; ".join(problems[:6]))
+    return answer
+
+
+def ground_questions(answer: Any, *, has_requirements: bool, dropped: list[str]) -> Any:
+    """A generated question is shown under its heading only with what grounds it: a ROLE_DERIVED question names the
+    requirement it tests (when the posting was parsed into requirements), a CANDIDATE_SPECIFIC one the evidence or
+    gap it probes. Ungrounded questions are dropped and noted, never shown."""
+    keep = []
+    for q in answer.generated_questions:
+        if q.origin == "ROLE_DERIVED" and has_requirements and not q.requirement_ids:
+            dropped.append(f"role question without a requirement: '{q.question[:60]}'")
+        elif q.origin == "CANDIDATE_SPECIFIC" and not (q.evidence_ids or q.gap_requirement_ids):
+            dropped.append(f"profile question without evidence or a gap: '{q.question[:60]}'")
+        else:
+            keep.append(q)
+    answer.generated_questions = keep
     return answer
 
 
@@ -174,14 +193,14 @@ def run(sessions: Callable[[], Session], *, user_id: int, job_id: int, attempt: 
         observations: list[dict[str, Any]]) -> Synthesis:
     """Both model calls. Never raises: a failure is recorded in `errors` and that part stays None."""
     from app.prompts import build_company_insights_prompt, build_interview_insights_prompt
-    from app.prompts.company_insights import COMPANY_INSIGHTS_PROMPT_VERSION
+    from app.prompts.company_insights import COMPANY_INSIGHTS_PROMPT_VERSION, shown_observations
     from app.prompts.contracts import CompanyInsightSynthesis, InterviewPrepResult
     from app.prompts.interview_insights import INTERVIEW_INSIGHTS_PROMPT_VERSION
     from app.services.llm import LLMCall, LLMClient, LLMError
     from app.services.user_settings import ai_ready
 
     out = Synthesis()
-    research = research_view(observations)
+    research = shown_observations(research_view(observations))
     with sessions() as db:
         db.info["user_id"] = user_id
         ready, why = ai_ready(db, user_id)
@@ -233,9 +252,10 @@ def run(sessions: Callable[[], Session], *, user_id: int, job_id: int, attempt: 
                 value_ids = {v["id"] for v in values}
                 result = client.generate_prompt(prompt, LLMCall(
                     workflow_type="job", entity_id=job_id, attempt=attempt,
-                    validate=lambda data: validate_interview(InterviewPrepResult.model_validate(data),
-                                                             requirement_ids=known_requirements,
-                                                             evidence_ids=known_evidence, value_ids=value_ids)))
+                    validate=lambda data: ground_questions(
+                        validate_interview(InterviewPrepResult.model_validate(data), requirement_ids=known_requirements,
+                                           evidence_ids=known_evidence, value_ids=value_ids),
+                        has_requirements=bool(known_requirements), dropped=out.dropped)))
                 out.interview, out.model = result.validated, out.model or result.model
                 out.prompt_versions["interview_insights"] = INTERVIEW_INSIGHTS_PROMPT_VERSION
             except (LLMError, SynthesisRejected, ValueError) as exc:

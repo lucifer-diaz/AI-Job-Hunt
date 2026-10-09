@@ -2740,19 +2740,20 @@ Code: `app/services/job_insights/` (tasks, sources, apify, matching, synthesis, 
 
 ### Configuring Glassdoor and PayScale actors
 
-No actor ID is built in: Store actors and their schemas change, so an admin chooses and checks each one.
+No actor ID or input schema is built in: Store actors and their schemas change, so an admin chooses and checks each
+one, and sets both its ID and its input. A source missing either is *not configured*.
 
 ```bash
 APIFY_GLASSDOOR_COMPENSATION_ACTOR=   # e.g. someone/glassdoor-salaries   (blank = NOT_CONFIGURED)
 APIFY_GLASSDOOR_INTERVIEW_ACTOR=
 APIFY_GLASSDOOR_REVIEWS_ACTOR=
 APIFY_PAYSCALE_ACTOR=
-# Optional input per actor: JSON whose strings may use {company}, {role}, {location} and {limit}
+# Input per actor (required): JSON whose strings may use {company}, {role}, {location} and {limit}
 APIFY_GLASSDOOR_COMPENSATION_INPUT={"companyName": "{company}", "jobTitle": "{role}", "location": "{location}", "maxItems": "{limit}"}
 ```
 
-Without an input template a generic input is sent (`companyName`, `company`, `jobTitle`, `query`, `location`,
-`maxItems`); set the template to match your actor. Runs use each account's own Apify key, through the shared
+Without an input template the source stays *not configured*: a paid actor run is never started with guessed field
+names. Runs use each account's own Apify key, through the shared
 instrumented client (`provider=APIFY`, `service=job_insights`, operations such as `glassdoor_compensation_run`,
 `…_status`, `…_dataset`), and keep the run and dataset ids as the observation's reference. Output is read through field
 aliases (`employerName`/`companyName`, `basePayLow`/`minSalary`/`payPercentile10`, `question`/`questions`, …); a

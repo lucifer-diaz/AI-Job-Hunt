@@ -46,6 +46,12 @@ const insAgo = iso => {
   const mins = Math.max(0, Math.round((Date.now() - toDate(iso).getTime()) / 60000));
   return mins < 60 ? `${mins}m ago` : mins < 2880 ? `${Math.round(mins / 60)}h ago` : `${Math.round(mins / 1440)}d ago`;
 };
+// A link only for http(s) URLs: a source's `javascript:` or `data:` URL is shown as plain text, never made clickable.
+function insLink(url, text, cls = '') {
+  let ok = false;
+  try { ok = ['http:', 'https:'].includes(new URL(url).protocol); } catch { ok = false; }
+  return ok ? `<a class="${cls}" href="${attr(url)}" target="_blank" rel="noopener noreferrer">${esc(text)}</a>` : esc(text);
+}
 const insSourcesNote = ids => ids?.length ? `<span class="xs faint">${ids.length} source${ids.length === 1 ? '' : 's'}</span>` : '';
 
 /* ───────────── loading ───────────── */
@@ -58,19 +64,22 @@ async function loadInsights(jobId) {
 function insVisible(jobId) {
   return (S.jobOpen === jobId && S.jobTab === 'insights') || (S.screen === 'approvals' && S.approvalJob === jobId);
 }
-// While research runs, look again every few seconds — only while its insights are on screen.
+// While research runs, look again every few seconds — only while its insights are on screen. A hidden tab or one
+// failed request waits for the next tick rather than stopping; a closed view stops, and reopening reloads.
 function scheduleInsPoll(jobId) {
   clearTimeout(insTimer); insTimer = null;
   if (!D.insights?.[jobId]?.researching) return;
   insTimer = setTimeout(async () => {
-    if (!insVisible(jobId) || document.hidden) return;
-    try { await loadInsights(jobId); } catch { return; }
+    if (!insVisible(jobId)) return;
+    if (document.hidden) { scheduleInsPoll(jobId); return; }
+    try { await loadInsights(jobId); } catch { scheduleInsPoll(jobId); return; }
     render();
   }, INS_POLL);
 }
 const insLoading = new Set();
 function insEnsure(jobId) {
-  if (!jobId || D.insights?.[jobId] || insLoading.has(jobId)) return;
+  // Cached insights are reused, except a copy that still says research is running: that one is read again.
+  if (!jobId || (D.insights?.[jobId] && !D.insights[jobId].researching) || insLoading.has(jobId)) return;
   insLoading.add(jobId);
   loadInsights(jobId).then(render).catch(e => toast(e.message, true)).finally(() => insLoading.delete(jobId));
 }
@@ -149,12 +158,12 @@ function insCompany(x) {
   const s = c.sentiment;
   return `<div class="col gap14">
     ${c.summary ? `<div>${insItem(c.summary.text, c.summary.kind, ' ' + insSourcesNote(c.summary.source_ids))}</div>` : ''}
-    ${c.website ? `<div class="xs muted">Website: <a href="${attr(c.website)}" target="_blank" rel="noopener">${esc(c.website)}</a></div>` : ''}
+    ${c.website ? `<div class="xs muted">Website: ${insLink(c.website, c.website)}</div>` : ''}
     ${(c.mission || []).length ? `<div><div class="caps mb8">MISSION</div>${c.mission.map(m => insItem(m.text, m.kind)).join('')}</div>` : ''}
     <div class="ins-two"><div><div class="caps mb8">OFFICIAL VALUES</div>${values.length ? values.map(v => {
         const p = prep.find(q => (q.value_source_ids || []).some(id => (v.source_ids || []).includes(id)));
         return `<div class="ins-item col"><div class="row gap8"><span class="small b grow">${esc(v.value)}</span>${insKind(v.kind)}</div>
-          ${v.sources?.[0]?.url ? `<a class="xs" href="${attr(v.sources[0].url)}" target="_blank" rel="noopener">${esc(v.sources[0].title || 'Official page')} ↗</a>` : ''}
+          ${v.sources?.[0]?.url ? `<span class="xs">${insLink(v.sources[0].url, `${v.sources[0].title || 'Official page'} ↗`)}</span>` : ''}
           ${p ? `<div class="box soft mt6"><div class="row gap6">${insKind('GENERATED')}<span class="xs">Possible question</span></div><div class="small mt4">${esc(p.question)}</div>${p.evidence?.filter(Boolean).length ? `<div class="xs muted mt4">Your evidence: ${p.evidence.filter(Boolean).map(esc).join(' · ')}</div>` : ''}</div>` : ''}</div>`; }).join('')
         : '<div class="small muted">No official values found on the company\'s own pages.</div>'}</div>
       <div><div class="caps mb8">EMPLOYEE-REPORTED THEMES</div>${themes.length ? themes.map(t => insItem(t.theme, t.kind, ` <span class="xs faint">· ${esc(insWords(t.sentiment))}</span>`)).join('')
@@ -221,7 +230,8 @@ function insSources(x, jobId) {
       ${(x.sources || []).map(s => `<tr><td class="mono" aria-hidden="true">${esc(s.symbol)}</td><td class="small">${esc(s.label)}</td><td>${pill(INS_SOURCE_WORD[s.status] || insWords(s.status), INS_SOURCE_TONE[s.status] || 'muted')}${s.cached ? ` ${pill('reused', 'plain')}` : ''}</td><td class="xs">${s.observations || 0}${s.rejected ? ` <span class="faint">(${s.rejected} other compan${s.rejected === 1 ? 'y' : 'ies'}/roles set aside)</span>` : ''}</td><td class="xs muted">${esc(s.detail || '')}</td></tr>`).join('')}</tbody></table>
     <div class="xs faint">${Object.entries(x.legend || {}).map(([k, v]) => `${esc(k)} ${esc(v)}`).join(' · ')}</div>
     <div>${prov ? `<div class="caps mb8">EVERY OBSERVATION</div><table class="ins-table"><thead><tr><th>Category</th><th>Source</th><th>Match</th><th>Confidence</th><th>Observed</th><th>Fetched</th></tr></thead><tbody>
-        ${prov.observations.map(o => `<tr><td class="xs">${esc(insWords(o.category))}</td><td class="xs">${o.source_url ? `<a href="${attr(o.source_url)}" target="_blank" rel="noopener">${esc(o.title || insWords(o.source_type))}</a>` : esc(o.title || insWords(o.source_type))}${o.actor_id ? ` <span class="faint">· ${esc(o.actor_id)}</span>` : ''}</td><td class="xs">${esc(insWords(o.match_status))}${o.match_scope ? ` · ${esc(insWords(o.match_scope))}` : ''}${o.match_reason ? `<div class="faint">${esc(o.match_reason)}</div>` : ''}</td><td class="xs mono">${o.confidence != null ? Math.round(o.confidence * 100) + '%' : '—'}</td><td class="xs">${esc(fmtDay(o.observed_at) || '—')}</td><td class="xs">${esc(fmtDay(o.fetched_at))}</td></tr>`).join('') || '<tr><td colspan="6">None.</td></tr>'}</tbody></table>`
+        ${prov.observations.map(o => `<tr><td class="xs">${esc(insWords(o.category))}</td><td class="xs">${o.source_url ? insLink(o.source_url, o.title || insWords(o.source_type)) : esc(o.title || insWords(o.source_type))}${o.superseded ? ' <span class="faint">(earlier result, still cited)</span>' : ''}${o.actor_id ? ` <span class="faint">· ${esc(o.actor_id)}</span>` : ''}</td><td class="xs">${esc(insWords(o.match_status))}${o.match_scope ? ` · ${esc(insWords(o.match_scope))}` : ''}${o.match_reason ? `<div class="faint">${esc(o.match_reason)}</div>` : ''}</td><td class="xs mono">${o.confidence != null ? Math.round(o.confidence * 100) + '%' : '—'}</td><td class="xs">${esc(fmtDay(o.observed_at) || '—')}</td><td class="xs">${esc(fmtDay(o.fetched_at))}</td></tr>`).join('') || '<tr><td colspan="6">None.</td></tr>'}</tbody></table>
+        <div class="xs faint mt6">Showing ${prov.observations.length} of ${prov.total}.</div>${prov.next_offset != null ? btn(label('insprov' + jobId, 'Show more', 'Loading…'), 'ins-provenance', { id: jobId, more: 1 }, 'sm ghost mt6', isBusy('insprov' + jobId)) : ''}`
       : btn(label('insprov' + jobId, 'Show every observation', 'Loading…'), 'ins-provenance', { id: jobId }, 'sm ghost', isBusy('insprov' + jobId))}</div>
     <div class="box"><div class="base b mb4">Your inputs</div><div class="xs muted mb10">Used from the next refresh. Research never overwrites them, and a recruiter's budget outranks any estimate.</div>
       <label class="xs b">Company website <span class="faint">(${esc(id.website_source === 'USER' ? 'yours' : id.website_source === 'POSTING' ? 'from the posting' : 'not known — never guessed')})</span></label>
@@ -299,6 +309,7 @@ const INSIGHTS_ACTIONS = {
     return busy('insrefresh' + id, async () => {
       const out = await api(`/api/jobs/${id}/insights/refresh`, { method: 'POST' });
       D.insights = { ...(D.insights || {}), [id]: out };
+      D.insPrep = Object.fromEntries(Object.entries(D.insPrep || {}).filter(([k]) => !k.startsWith(`${id}:`)));
       scheduleInsPoll(id);
       return out;
     }, 'Researching in the background — this updates on its own');
@@ -321,9 +332,10 @@ const INSIGHTS_ACTIONS = {
     });
   },
   'ins-provenance': el => {
-    const id = Number(el.dataset.id);
+    const id = Number(el.dataset.id), prev = el.dataset.more ? D.insProv?.[id] : null;
     return busy('insprov' + id, async () => {
-      D.insProv = { ...(D.insProv || {}), [id]: await api(`/api/jobs/${id}/insights/sources`) };
+      const page = await api(`/api/jobs/${id}/insights/sources?` + qs({ offset: prev?.next_offset ?? 0 }));
+      D.insProv = { ...(D.insProv || {}), [id]: prev ? { ...page, observations: [...prev.observations, ...page.observations] } : page };
     });
   },
   'ins-stage-load': el => {

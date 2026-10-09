@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models import Application, InsightObservation, Job, JobInsight, JobInsightTask
@@ -185,18 +185,28 @@ def public_data(row: InsightObservation) -> dict[str, Any]:
     return out
 
 
-def observations_view(db: Session, job: Job) -> dict[str, Any]:
-    """Provenance for every researched fact: where it came from, when, and how well it matched this job."""
+PAGE_SIZE = 200
+
+
+def observations_view(db: Session, job: Job, *, offset: int = 0, limit: int = PAGE_SIZE) -> dict[str, Any]:
+    """Provenance for every researched fact: where it came from, when, and how well it matched this job. Paged: the
+    total and the next offset say when there is more. Superseded rows still cited by a kept section are included."""
     insight = db.scalar(select(JobInsight).where(JobInsight.job_id == job.id))
+    limit, offset = max(1, min(limit, PAGE_SIZE)), max(0, offset)
+    total = 0 if insight is None else db.scalar(select(func.count(InsightObservation.id)).where(
+        InsightObservation.job_insight_id == insight.id)) or 0
     rows = [] if insight is None else db.scalars(select(InsightObservation).where(
-        InsightObservation.job_insight_id == insight.id).order_by(InsightObservation.id).limit(500)).all()
-    return {"job_id": job.id, "observations": [
+        InsightObservation.job_insight_id == insight.id).order_by(InsightObservation.id)
+        .offset(offset).limit(limit)).all()
+    following = offset + len(rows)
+    return {"job_id": job.id, "total": total, "offset": offset, "truncated": following < total,
+            "next_offset": following if following < total else None, "observations": [
         {"id": r.id, "category": r.category, "source_type": r.source_type, "source_name": r.source_name,
          "provider": r.provider, "actor_id": r.actor_id, "source_url": r.source_url,
          "source_reference": r.source_reference, "title": r.title, "match_scope": r.match_scope,
          "match_status": r.match_status, "match_reason": r.match_reason, "confidence": r.confidence,
          "recency": r.recency, "observed_at": _iso(r.observed_at), "fetched_at": _iso(r.fetched_at),
-         "data": public_data(r)} for r in rows],
+         "superseded": r.superseded_at is not None, "data": public_data(r)} for r in rows],
         "sources": sources_table(_finished_task(db, job.id))}
 
 

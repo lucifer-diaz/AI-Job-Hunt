@@ -209,7 +209,11 @@ def release(task: JobInsightTask, now: datetime, error: str, *, retry_in: float 
 
 
 def held(db: Session, claim_: InsightClaim) -> JobInsightTask | None:
-    """The task, only while this worker still holds its lease."""
-    return db.scalar(select(JobInsightTask).where(
+    """The task, only while this worker still holds its lease. On PostgreSQL the row stays locked until the caller's
+    transaction ends, so Kill (which locks it too) cannot take the lease between this check and the commit."""
+    query = select(JobInsightTask).where(
         JobInsightTask.id == claim_.task_id, JobInsightTask.status == PROCESSING,
-        JobInsightTask.lock_token == claim_.lock_token).execution_options(populate_existing=True))
+        JobInsightTask.lock_token == claim_.lock_token).execution_options(populate_existing=True)
+    if db.get_bind().dialect.name == "postgresql":
+        query = query.with_for_update()
+    return db.scalar(query)

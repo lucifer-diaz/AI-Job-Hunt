@@ -350,7 +350,10 @@ def compensation_insight(observations: list[dict[str, Any]], *, role_title: str 
                         "method": "Weighted median of the annual low and high of each matching observation "
                                   "(weights: match quality × recency × source confidence)",
                         "label": "Market estimate — not the employer's approved band"}
-        if employer is not None and _mid(employer) and market_range["midpoint"] and employer["currency"] == currency:
+        # Compared only like for like: same currency and the same known basis. A posting that does not say whether
+        # its range is base or total pay is never measured against market base salary.
+        if employer is not None and _mid(employer) and market_range["midpoint"] and employer["currency"] == currency \
+                and employer["basis"] == basis and basis != "UNKNOWN":
             gap = abs(market_range["midpoint"] - _mid(employer)) / min(market_range["midpoint"], _mid(employer))
             if gap > conflict_threshold:
                 conflict = {"threshold": conflict_threshold, "spread": round(gap, 3), "between": "employer and market",
@@ -381,8 +384,7 @@ def compensation_insight(observations: list[dict[str, Any]], *, role_title: str 
     def by_basis(wanted: str) -> dict[str, Any] | None:
         if market_range is not None and basis == wanted:
             return {k: market_range[k] for k in ("low", "midpoint", "high", "currency", "period")}
-        if employer is not None and employer["basis"] in (wanted, "UNKNOWN") and wanted == "BASE" \
-                and employer["annual_low"] is not None:
+        if employer is not None and employer["basis"] == wanted and employer["annual_low"] is not None:
             low_, high_ = employer["annual_low"], employer["annual_high"] or employer["annual_low"]
             return {"low": low_, "midpoint": (low_ + high_) / 2, "high": high_, "currency": employer["currency"],
                     "period": "year"}

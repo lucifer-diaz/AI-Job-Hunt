@@ -9,6 +9,7 @@ Output contract: app.prompts.contracts.CompanyInsightSynthesis.
 """
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from app.prompts.common import (
@@ -62,15 +63,21 @@ list is better than an unsupported item.""",
 )
 
 
+def shown_observations(observations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Exactly the observations the prompt shows (bounded in count and size). Citations are validated against this
+    list, never the full set, so the model cannot cite an observation it was not given."""
+    return json.loads(to_json(observations[:MAX_OBSERVATIONS], limit=MAX_RESEARCH_CHARS))
+
+
 def build_company_insights_prompt(job: dict[str, Any], observations: list[dict[str, Any]]) -> Prompt:
     """`job` is {title, company, location}; `observations` are accepted research observations as
     {id, category, source_type, title, data} (no compensation figures). No candidate data is part of this prompt."""
-    shown = observations[:MAX_OBSERVATIONS]
+    shown = shown_observations(observations)
     user = user_message(
         COMPANY_INSIGHTS_MARKER,
         section("JOB", to_json({k: v for k, v in job.items() if v})),
         section("OBSERVATION IDS", to_json([o["id"] for o in shown])),
-        untrusted("COMPANY RESEARCH", "untrusted_research", to_json(shown, limit=MAX_RESEARCH_CHARS)),
+        untrusted("COMPANY RESEARCH", "untrusted_research", to_json(shown)),
     )
     return Prompt("company_insights", COMPANY_INSIGHTS_PROMPT_VERSION, COMPANY_INSIGHTS_MARKER,
                   COMPANY_INSIGHTS_SYSTEM, user, CompanyInsightSynthesis)

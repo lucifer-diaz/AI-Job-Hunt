@@ -1,9 +1,9 @@
 """Job Insights sources that run an Apify actor: Glassdoor salaries, interviews and reviews, and PayScale salaries.
 
-No actor ID is built in. Store actors and their input and output schemas change, so an admin configures each one
-(APIFY_GLASSDOOR_COMPENSATION_ACTOR, APIFY_GLASSDOOR_INTERVIEW_ACTOR, APIFY_GLASSDOOR_REVIEWS_ACTOR,
-APIFY_PAYSCALE_ACTOR) after checking it, and optionally its input (APIFY_*_INPUT: a JSON template whose strings may use
-{company}, {role}, {location} and {limit}). A source without an actor, or an account without an Apify key, is
+No actor ID or input schema is built in. Store actors and their input and output schemas change, so an admin
+configures each one after checking it: the actor (APIFY_GLASSDOOR_COMPENSATION_ACTOR, APIFY_GLASSDOOR_INTERVIEW_ACTOR,
+APIFY_GLASSDOOR_REVIEWS_ACTOR, APIFY_PAYSCALE_ACTOR) and its input (APIFY_*_INPUT: a JSON template whose strings may
+use {company}, {role}, {location} and {limit}). A source missing either, or an account without an Apify key, is
 NOT_CONFIGURED and research carries on without it.
 
 Runs use Apify's documented run API with the account's own token, through the shared instrumented client
@@ -119,14 +119,6 @@ def render_input(template: str, values: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise TypeError("The actor input template must be a JSON object")
     return fill(parsed)
-
-
-def default_input(values: dict[str, Any]) -> dict[str, Any]:
-    """A generic input for an actor without a configured template. Field names differ between actors, so the README
-    says to set APIFY_*_INPUT; most actors ignore fields they do not define."""
-    return {"companyName": values["company"], "company": values["company"], "jobTitle": values["role"],
-            "query": f"{values['company']} {values['role']}".strip(), "location": values["location"],
-            "maxItems": values["limit"]}
 
 
 class ActorRunFailed(Exception):
@@ -272,6 +264,9 @@ class ApifyInsightSource:
     def configured(self) -> str | None:
         if not self.actor_id():
             return f"No actor configured ({self.actor_setting.upper()})"
+        if not (getattr(get_settings(), self.input_setting, "") or "").strip():
+            # Field names differ between actors and a run costs money: never start one with a guessed input.
+            return f"No actor input configured ({self.input_setting.upper()})"
         return None
 
     def fetch(self, snapshot: Snapshot) -> SourceResult:
@@ -285,7 +280,7 @@ class ApifyInsightSource:
                   "limit": DEFAULT_LIMIT}
         template = (getattr(settings, self.input_setting, "") or "").strip()
         try:
-            actor_input = render_input(template, values) if template else default_input(values)
+            actor_input = render_input(template, values)
         except (ValueError, TypeError) as exc:
             return SourceResult(self.name, FAILED, detail=f"The configured actor input is not valid JSON: {exc}"[:200])
         actor_id = self.actor_id()

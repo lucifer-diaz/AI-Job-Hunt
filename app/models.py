@@ -905,6 +905,9 @@ class InsightObservation(Base):
     fetched_at: Mapped[datetime] = mapped_column(DateTime, default=now)
     # company/role/location/source: an observation another job of the same account can reuse while it is fresh.
     cache_key: Mapped[str | None] = mapped_column(String(400), nullable=True)
+    # Replaced by a newer answer from the same source. Kept only while a section kept from an earlier run still cites
+    # it (a refresh whose model step failed), so a displayed fact never loses its provenance; never used as current data.
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     data: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
@@ -1532,7 +1535,7 @@ class JobRankingTask(Base):
 
 
 LLM_STAGES = ("RANKER", "TAILOR", "REVIEWER", "RESUME_PARSER", "JD_PARSER", "JD_RECOVERY", "APPLICATION", "FOLLOW_UP",
-              "INBOX", "COMPANY_INSIGHTS", "ADVISOR", "OTHER")
+              "INBOX", "COMPANY_INSIGHTS", "INTERVIEW_INSIGHTS", "ADVISOR", "OTHER")
 LLM_ERROR_TYPES = ("TIMEOUT", "RATE_LIMIT", "INVALID_JSON", "SCHEMA_VALIDATION", "PROVIDER_ERROR", "CONTEXT_OVERFLOW",
                    "CONFIGURATION", "OTHER")
 OPTIMIZATION_TASK_STATUSES = ("PENDING", "PROCESSING", "COMPLETED", "FAILED")
