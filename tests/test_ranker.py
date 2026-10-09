@@ -253,6 +253,68 @@ def test_two_workers_claiming_at_once_never_get_the_same_task(pg_sessions, owner
                    for job_id in ids for t in tasks_of(db, job_id))
 
 
+def test_a_job_still_being_parsed_is_not_claimed_and_takes_no_batch_slot(pg_sessions, owner, model, monkeypatch):
+    from app.models import JobDescriptionParseTask
+
+    monkeypatch.setattr(get_settings(), "jd_parse_enabled", True)
+    waiting = add_jobs(pg_sessions, 1, owner)[0]
+    ready = add_jobs(pg_sessions, 1, owner)[0]
+    with pg_sessions() as db:
+        ranker.sweep(db)
+        db.add(JobDescriptionParseTask(user_id=owner, job_id=waiting, description_hash="h", status="PENDING",
+                                       reason="new", attempt_count=0))
+        db.commit()
+    with pg_sessions() as db:  # one slot: the older job is not ready, so the ready one gets it
+        claimed = ranker.claim(db, worker_id="w", limit=1, ready_accounts=[owner], auto_rank_accounts=[owner])
+    assert [c.job_id for c in claimed] == [ready]
+    with pg_sessions() as db:
+        task, = tasks_of(db, waiting)
+        assert task.status == "PENDING" and task.attempt_count == 0 and task.next_attempt_at is None
+        assert db.get(Job, waiting).state is S.RANK_PENDING  # untouched: never moved to RANKING and parked
+        db.execute(update(JobDescriptionParseTask).where(JobDescriptionParseTask.job_id == waiting)
+                   .values(status="COMPLETED"))
+        db.commit()
+    with pg_sessions() as db:  # the parse finished: claimable at once
+        again = ranker.claim(db, worker_id="w", limit=1, ready_accounts=[owner], auto_rank_accounts=[owner])
+    assert [c.job_id for c in again] == [waiting]
+
+
+def test_finishing_a_parse_releases_a_ranking_parked_for_it_and_wakes_the_ranker(pg_sessions, owner, model, monkeypatch):
+    from app import scheduler_hooks
+    from app.services import job_description
+
+    job_id = add_jobs(pg_sessions, 1, owner)[0]
+    with pg_sessions() as db:
+        ranker.sweep(db)
+        task, = tasks_of(db, job_id)
+        task.next_attempt_at = utcnow() + timedelta(minutes=15)
+        task.last_error = "The job description is still being parsed"
+        db.commit()
+    woken = []
+    scheduler_hooks.register("ranking", lambda: woken.append("ranking"))
+    try:
+        with pg_sessions() as db:
+            job_description.hand_to_ranking(db, job_id)
+    finally:
+        scheduler_hooks.unregister("ranking")
+    assert woken == ["ranking"]
+    with pg_sessions() as db:
+        task, = tasks_of(db, job_id)
+        assert task.next_attempt_at is None and task.run_now_at is None  # due now, but no cooldown bypass
+
+
+def test_a_parked_task_does_not_restart_the_accounts_cadence(pg_sessions, owner, model):
+    job_id = add_jobs(pg_sessions, 1, owner)[0]
+    with pg_sessions() as db:
+        ranker.sweep(db)
+        claim, = ranker.claim(db, worker_id="w", limit=1, ready_accounts=[owner], auto_rank_accounts=[owner])
+    with pg_sessions() as db:
+        ranker._wait(db, claim, "The job description is still being parsed", utcnow())
+    with pg_sessions() as db:
+        task, = tasks_of(db, job_id)
+        assert task.status == "PENDING" and task.started_at is None
+
+
 def test_a_bounded_batch_is_claimed_and_model_calls_are_limited(pg_sessions, owner, model, monkeypatch):
     monkeypatch.setattr(get_settings(), "ranking_batch_size", 3)
     monkeypatch.setattr(get_settings(), "ranking_concurrency", 2)

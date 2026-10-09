@@ -20,6 +20,7 @@ import copy
 import hashlib
 import html
 import json
+import logging
 import re
 import uuid
 from dataclasses import dataclass, field
@@ -49,6 +50,8 @@ from app.prompts.job_description_parser import (
 from app.services import backoff, worker_settings
 from app.services.lifecycle import STOPPED_BY_USER, ErrorCategory
 from app.settings import get_settings
+
+log = logging.getLogger(__name__)
 
 PENDING, PROCESSING, COMPLETED, FAILED = "PENDING", "PROCESSING", "COMPLETED", "FAILED"
 RAW, NORMALIZED, PARSED, NEEDS_REVIEW, MANUALLY_CORRECTED = ("RAW", "NORMALIZED", "PARSED", "NEEDS_REVIEW",
@@ -877,6 +880,7 @@ def process(sessions: Any, claim: ParseClaim) -> str:
         store_parse(db, job, parsed)
         _finish(task, COMPLETED, now)
         db.commit()
+        hand_to_ranking(db, job_id)
         return "parsed"
 
 
@@ -885,6 +889,7 @@ def _failed(db: Session, claim: ParseClaim, exc: Exception, now: datetime, *, co
     task = _held(db, claim)
     if task is None:
         return "lost"
+    handoff_job_id = task.job_id
     message = f"{type(exc).__name__}: {exc}"
     if config:
         outcome = _wait(task, message, now)
@@ -898,7 +903,23 @@ def _failed(db: Session, claim: ParseClaim, exc: Exception, now: datetime, *, co
         task.next_attempt_at = now + timedelta(seconds=own["retry_seconds"] * task.attempt_count)
         outcome = "retrying"
     db.commit()
+    if outcome == "failed":  # a failed parse no longer holds ranking back: it falls back to the raw description
+        hand_to_ranking(db, handoff_job_id)
     return outcome
+
+
+def hand_to_ranking(db: Session, job_id: int) -> None:
+    """The description is ready for ranking (parsed, or given up on): release a ranking parked waiting for it and wake
+    the ranking worker so it starts now. Only a hint on top of the task table; it never changes the parse's outcome."""
+    try:
+        from app import scheduler_hooks
+        from app.services import ranker
+
+        ranker.release_parked(db, job_id)
+        scheduler_hooks.nudge("ranking")
+    except Exception:  # noqa: BLE001
+        db.rollback()
+        log.warning("could not hand job %s to ranking", job_id, exc_info=True)
 
 
 def parse_now(db: Session, job: Job) -> ParsedJobDescription:

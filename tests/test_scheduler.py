@@ -226,3 +226,37 @@ def test_zero_interval_disables_scheduling_but_not_manual_runs(sessions):
     assert jobs["off"]["enabled"] is False and jobs["off"]["last_status"] is None
     manual = asyncio.run(scheduler.run_job("off", "manual"))
     assert manual.status == "skipped" and manual.result == {"skipped": "nothing to do"}
+
+
+def test_a_nudge_runs_a_job_now_and_once_more_when_it_arrives_mid_run(sessions):
+    from app import scheduler_hooks
+
+    clock = Clock()
+    started, release = [], threading.Event()
+
+    def work(ctx):
+        started.append(ctx.trigger)
+        if len(started) == 1:
+            release.wait(5)  # still running when the second nudge arrives
+        return {"n": len(started)}
+
+    scheduler = Scheduler([spec("ranking", work), spec("off", lambda ctx: {"n": 0})], sessions,
+                          intervals={"ranking": 5, "off": 0}, tick_seconds=3600, lease_seconds=600, instance_id="i",
+                          clock=clock)
+
+    async def scenario():
+        await scheduler.start()
+        try:
+            await asyncio.sleep(0.2)  # the start-up tick ran it once on schedule
+            scheduler_hooks.nudge("ranking")  # during that first run
+            scheduler_hooks.nudge("ranking")  # and again: one extra run is enough
+            scheduler_hooks.nudge("off")  # interval 0 means disabled: never run by a nudge
+            await asyncio.sleep(0.2)
+            release.set()
+            await asyncio.sleep(0.6)
+            return list(started)
+        finally:
+            await scheduler.stop()
+
+    assert asyncio.run(scenario()) == ["schedule", "manual"]
+    assert scheduler_hooks._wakers == {}  # unregistered on stop
