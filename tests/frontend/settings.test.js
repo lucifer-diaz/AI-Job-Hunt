@@ -308,6 +308,19 @@ describe('focused settings UI', () => {
     expect(ui.SETTINGS_SUCCESS.resumes).toBe('Saved as resume v3. It is not used until you make it active');
     expect(ui.RD.viewId).toBe(7);
   });
+  it('never carries an open resume data draft over to a new resume', async () => {
+    const current = { ...resumeCard(), revision: 4, structured: { summary: { text: 'Old summary' } }, progress: { blocking: [], sections: [], entries: [], percent: 0, counts: {} } };
+    resumesLoaded([resumeCard()]); ui.D.resumeData.current = current; section('resumes');
+    const editing = () => { ui.RD.editing = 'summary'; ui.RD.draft = { summary: { text: 'Edited summary' } }; };
+    editing(); ui.setF('resumes', 'master_resume', 'Pasted text');
+    confirm.mockReturnValueOnce(false); await ui.settingsSave('resumes');
+    expect(fetchMock).not.toHaveBeenCalled(); expect(ui.RD.draft.summary.text).toBe('Edited summary');
+    confirm.mockReturnValueOnce(false); await ui.settingsUploadResume(new File(['x'], 'new.txt'));
+    expect(fetchMock).not.toHaveBeenCalled(); expect(ui.RD.editing).toBe('summary');
+    fetchMock.mockResolvedValueOnce(response({ ...ui.D.profile, created_resume_id: 9, created_resume_version: 2, created_resume_active: false }));
+    confirm.mockReturnValueOnce(true); await ui.settingsSave('resumes');
+    expect(ui.RD.draft).toBeNull(); expect(ui.RD.editing).toBeNull(); expect(ui.RD.viewId).toBe(9);
+  });
   it('deleting a resume asks once, keeps text drafts, and the active one cannot be deleted', async () => {
     resumesLoaded([resumeCard(), resumeCard({ id: 2, name: 'older.pdf', version: 2, is_active: false })]); section('resumes');
     expect([...document.querySelectorAll('[data-act="rd-delete-version"]')].map(b => b.dataset.id)).toEqual(['2']);

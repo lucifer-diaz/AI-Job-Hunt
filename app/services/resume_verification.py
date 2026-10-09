@@ -132,8 +132,11 @@ def record_version(db: Session, profile: CandidateProfile, raw_text: str, *, doc
     existing = None
     if document is not None:
         existing = db.scalar(query.where(Resume.source_file_hash == document.checksum, Resume.raw_text_hash == digest))
-    if existing is None:
-        existing = db.scalar(query.where(Resume.raw_text_hash == digest).order_by(desc(Resume.version)))
+    if existing is None:  # the same text: reused, unless it already has another file (a distinct upload stays listed)
+        same_text = query.where(Resume.raw_text_hash == digest)
+        if document is not None:
+            same_text = same_text.where(Resume.resume_document_id.is_(None))
+        existing = db.scalar(same_text.order_by(desc(Resume.version)))
     if existing is not None:
         if document is not None and existing.resume_document_id is None:
             existing.resume_document_id = document.id

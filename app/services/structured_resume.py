@@ -822,8 +822,11 @@ def render_document(data: dict[str, Any] | None) -> str:
                 out += ["", f"### {' | '.join(p for p in (title, company, location, dates) if p)}"]
             else:  # without an employer or dates, the rest goes under the heading so no part lands in the wrong place
                 out += ["", f"### {' | '.join(p for p in (title, company) if p)}"]
-                if dates:
-                    out.append(dates)
+                # With an employer, "Location | Dates" under the heading; without one a location would read as the
+                # employer, so it stays out of the text (it is still in the structured data).
+                meta = [location, dates] if company else [dates]
+                if any(meta):
+                    out.append(" | ".join(p for p in meta if p))
             out += [f"- {text}" for text in _ordered_bullets(role, keep)]
     projects = [p for p in data.get("projects") or [] if keep(p) and (p.get("name") or p.get("description"))]
     if projects:

@@ -129,9 +129,9 @@ class Role:
     def location(self) -> str:
         if len(self.parts) > 3:
             return self.parts[2]
-        if len(self.parts) > 1:
-            return ""
         rest = [p for p in self.meta_parts if not DATE_RANGE_RE.search(p)]
+        if len(self.parts) > 1:  # "Title | Company" with "Location | Dates" written under it
+            return rest[0] if rest else ""
         return rest[1] if len(rest) > 1 else ""
 
     @property
@@ -144,6 +144,14 @@ class Role:
     def full_header(self) -> str:
         """Title, employer, location and dates on one line, wherever the master resume put them."""
         return " | ".join(p for p in (self.title, self.company, self.location, self.dates) if p)
+
+    def heading_lines(self, title: str | None = None, company: str | None = None) -> list[str]:
+        """The role heading as rendered: one "### " line, plus the location on its own line when there are no
+        dates (on the heading, "Title | Company | Location" would read the location as the dates)."""
+        title, company = title or self.title, company if company is not None else self.company
+        if self.location and not self.dates and company:
+            return [f"### {' | '.join(p for p in (title, company) if p)}", self.location]
+        return [f"### {' | '.join(p for p in (title, company, self.location, self.dates) if p)}"]
 
 
 @dataclass
@@ -337,9 +345,8 @@ def render_resume(parsed: ParsedResume, *, name: str = "", headline: str = "", s
                     cap = role_caps.get(index, len(role.bullets))
                     bullets = (bullets or (fallback_bullets or {}).get(index) or role.bullets)[:cap]
                 fix = role_headings.get(index)
-                header = (" | ".join(p for p in (fix["title"], fix["company"], role.location, role.dates) if p)
-                          if fix else role.full_header)
-                out += ["", f"### {header}", *[f"- {to_plain(b).strip()}" for b in bullets]]
+                heading = role.heading_lines(fix["title"], fix["company"]) if fix else role.heading_lines()
+                out += ["", *heading, *[f"- {to_plain(b).strip()}" for b in bullets]]
             continue
         out.extend(section.lines)
     return "\n".join(out).strip() + "\n"

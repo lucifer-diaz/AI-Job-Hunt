@@ -498,9 +498,12 @@ def build_ranking_context(db: Session, profile: CandidateProfile, job: Job, evid
     context = _with_job(context, jc.build_ranking_job_context(db, job, candidate=context))
     raw = rv.raw_text(profile)
     if policy["resume_source"] == "master_text":
-        # The candidate chose the resume text as written: ranking reads that text, not the parsed data.
+        # The candidate chose the resume text as written: ranking reads that text, nothing from the parsed data
+        # (no structured summary or background, education or certifications that could contradict it).
         context.relevant_experience, context.relevant_projects = [], []
         context.relevant_skills, context.unverified_facts = [], []
+        context.education, context.certifications = [], []
+        context.candidate = {k: v for k, v in context.candidate.items() if k not in ("summary", "verified_background")}
         context.resume_text = raw
     elif not context.relevant_experience:
         context.resume_text = raw  # nothing structured to select from: the resume as written

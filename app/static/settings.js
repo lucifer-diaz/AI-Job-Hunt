@@ -339,6 +339,7 @@ async function refreshSettingsSummary(form) {
 }
 async function settingsSave(form) {
   if (form === 'resume-data') return resumeDataSave();
+  if (form === 'resumes' && !rdLeaveDraft()) return;  // the new resume is shown next: never with the old one's draft
   settingsPendingTags(form).forEach(el => commitTag(el, false));
   try { if (!settingsValidate(form)) return; }
   catch (err) { SETTING_ERRORS[form] = err.message; render(); return; }
@@ -394,12 +395,13 @@ function settingsResumeGuard() {
   return !settingsDirty('resumes') || confirm('This action replaces your unsaved resume text. Continue?');
 }
 async function settingsUploadResume(file) {
+  if (!rdLeaveDraft()) return;  // the uploaded resume is shown next: never with another one's open draft
   let active = false;
   await settingsRun('resumes', async () => {
     const form = new FormData(); form.append('file', file);
     const out = await api('/api/profile/resume', { method: 'POST', form });
     // An upload never changes the active resume (only your first one becomes active), so unsaved text stays.
-    active = !!out.is_active; RD.viewId = out.resume_id ?? null; rdReset();
+    active = !!out.is_active; RD.viewId = out.resume_id ?? null;
     if (active) D.profile = await api('/api/profile');
     D.resumeData = await api(rdResumeUrl()); D.resumeChoices = null; RD.changes = null; RD.raw = null;
   }, () => active ? 'Resume uploaded and set as active. Review its data below'

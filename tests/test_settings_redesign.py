@@ -43,10 +43,13 @@ def test_profile_patch_preserves_other_sections(account):
     assert result['master_resume'] == 'Newest resume'
     assert result['target_roles'] == ['Lead']
     assert result['search_preferences'] == {**initial['search_preferences'], 'notice_period': '0'}
-    cleared = client.patch('/api/profile', json={'target_roles': [], 'master_resume': ''}).json()
-    # Blank text is not a resume: the active one stays (the master text mirrors it) and no version is created.
-    assert cleared['target_roles'] == [] and cleared['master_resume'] == 'Newest resume'
-    assert 'created_resume_id' not in cleared
+    # Blank text is not a resume and never clears one: refused, and nothing in the request is saved.
+    refused = client.patch('/api/profile', json={'target_roles': [], 'master_resume': ''})
+    assert refused.status_code == 422 and 'delete it' in refused.text
+    kept = client.get('/api/profile').json()
+    assert kept['target_roles'] == ['Lead'] and kept['master_resume'] == 'Newest resume'
+    cleared = client.patch('/api/profile', json={'target_roles': []}).json()
+    assert cleared['target_roles'] == [] and 'created_resume_id' not in cleared
 
 
 @pytest.mark.parametrize('body', [{'name': None}, {'master_resume': None},

@@ -34,6 +34,12 @@ const rdClone = value => JSON.parse(JSON.stringify(value ?? null));
 const rdStatus = node => node?.verification?.status || 'UNVERIFIED';
 function rdDate(iso) { return iso ? new Date(iso + (iso.endsWith('Z') ? '' : 'Z')).toLocaleString() : ''; }
 function rdReset() { RD.editing = null; RD.draft = null; RD.blocking = null; }
+// Before the screen shows another resume (view, activate, delete, a new upload or text): an open section edit
+// belongs to the resume it was opened on, so it is discarded — after asking when it has changes. False: stay.
+function rdLeaveDraft() {
+  if (RD.editing && resumeDataDirty() && !confirm('Discard unsaved resume data edits?')) return false;
+  rdReset(); return true;
+}
 function resumeDataDirty() {
   const active = rdActive();
   return !!(RD.editing && RD.draft && active && JSON.stringify(RD.draft) !== JSON.stringify(active.structured));
@@ -289,16 +295,17 @@ const RESUME_DATA_ACTIONS = {
     RD.decisions = {};
     return rdPost('reparse/resolve', { decisions }, 'Re-parse choices applied');
   },
-  'rd-activate': el => settingsResumeGuard() && rdRun(async () => { await api(`/api/resumes/${el.dataset.id}/activate`, { method: 'POST' }); RD.viewId = null; D.resumeData = await api(rdResumeUrl()); D.profile = await api('/api/profile'); delete S.forms.resumes; D.resumeChoices = null; RD.changes = null; RD.raw = null; }, 'Active resume changed: ranking, tailoring and review now use it'),
+  'rd-activate': el => settingsResumeGuard() && rdLeaveDraft() && rdRun(async () => { await api(`/api/resumes/${el.dataset.id}/activate`, { method: 'POST' }); RD.viewId = null; D.resumeData = await api(rdResumeUrl()); D.profile = await api('/api/profile'); delete S.forms.resumes; D.resumeChoices = null; RD.changes = null; RD.raw = null; }, 'Active resume changed: ranking, tailoring and review now use it'),
   'rd-view': el => {
-    if (RD.editing && resumeDataDirty() && !confirm('Discard unsaved resume data edits?')) return;
-    rdReset(); RD.viewId = Number(el.dataset.id); RD.tab = 'structured';
+    if (!rdLeaveDraft()) return;
+    RD.viewId = Number(el.dataset.id); RD.tab = 'structured';
     return rdRun(async () => { D.resumeData = await api(rdResumeUrl()); RD.changes = null; RD.raw = null; })
       .then(() => document.getElementById('rd-detail')?.scrollIntoView?.({ block: 'start' }));
   },
   // The active resume cannot be deleted (the server refuses too): make another one active first.
   'rd-delete-version': el => {
     if (!confirm(`Delete ${el.dataset.name}? Its file, data and verification are removed. Jobs or searches that used it go back to matching by target roles (else the active resume), and facts only it verified stop being used.`)) return;
+    if (RD.viewId === Number(el.dataset.id) && !rdLeaveDraft()) return;
     return rdRun(async () => {
       const out = await api(`/api/resumes/${el.dataset.id}`, { method: 'DELETE' });
       if (RD.viewId === Number(el.dataset.id)) RD.viewId = null;

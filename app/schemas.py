@@ -145,7 +145,7 @@ class ProfilePatch(ProfileIn):
     @model_validator(mode="after")
     def reject_null_resume(self) -> ProfilePatch:
         if "master_resume" in self.model_fields_set and self.master_resume is None:
-            raise ValueError("Use an empty string to clear resume text")
+            raise ValueError("master_resume cannot be null: send resume text, or leave it out")
         return self
 
 

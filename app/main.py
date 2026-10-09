@@ -837,6 +837,9 @@ def profile_put(payload: ProfileIn, db: Session = Depends(get_user_db)):
 def _save_resume_text(db: Session, profile: CandidateProfile, text: str | None) -> dict:
     """Edited resume text is a new version of its own. It is never made active here and never written over the
     master text, which mirrors the active version (resume_verification.set_active)."""
+    if text is not None and not text.strip():
+        # Text never clears a resume (the master text mirrors the active one): delete a resume to remove it.
+        raise HTTPException(422, "Resume text is empty. To remove a resume, delete it in Settings → Resumes.")
     if text is None or text.strip() == (profile.master_resume or "").strip():
         return {}
     db.flush()
@@ -918,16 +921,6 @@ def resume_download(db: Session = Depends(get_user_db)):
         raise HTTPException(404, "No uploaded resume")
     return FileResponse(document.storage_path, media_type=document.media_type,
                         filename=document.original_filename)
-
-
-@app.delete("/api/profile/resume")
-def resume_delete(db: Session = Depends(get_user_db)):
-    document = db.scalar(select(ResumeDocument).where(ResumeDocument.active.is_(True)).order_by(desc(ResumeDocument.id)))
-    if not document:
-        raise HTTPException(404, "No uploaded resume")
-    document.active = False
-    db.commit()
-    return {"ok": True}
 
 
 @app.get("/api/evidence")

@@ -86,6 +86,23 @@ def test_the_document_shows_corrections_and_leaves_out_what_was_rejected():
     assert parsed.roles[0].bullets == ["Reduced incidents by 45% across Kafka pipelines"]
 
 
+def test_a_role_without_dates_keeps_its_location():
+    data = sr.materialize(sr.parse_deterministic(STRUCTURED))
+    lead = data["experience"][0]
+    for key in ("start_date", "end_date", "raw_start_date", "raw_end_date", "is_current", "current"):
+        lead.pop(key, None)
+    lead["location"] = "Bengaluru (hybrid)"  # corrected in Resume Data
+    document = sr.render_document(data)
+    parsed = parse_resume(document)
+    assert [(r.title, r.company, r.location, r.dates) for r in parsed.roles] == [
+        ("Lead Engineer", "Zendrive (India)", "Bengaluru (hybrid)", ""),
+        ("Developer", "Pixel Co", "Remote", "Jan 2020 - May 2024")]
+    from app.services.resume_format import render_resume
+
+    again = parse_resume(render_resume(parsed))  # a tailored resume renders it the same way
+    assert (again.roles[0].location, again.roles[0].dates) == ("Bengaluru (hybrid)", "")
+
+
 # ───────────── the selection never moves by itself ─────────────
 
 def test_only_the_first_resume_becomes_active_by_itself(user):
@@ -124,6 +141,9 @@ def test_the_text_as_written_is_what_ranking_reads_when_that_is_the_source(user,
     with session(user) as db:
         context = build_ranking_context(db, profile_of(db, user), db.get(Job, job_id))
         assert context.resume_text == RESUME_A and context.relevant_experience == []
+        assert "summary" not in context.candidate and "verified_background" not in context.candidate, \
+            "nothing parsed from the data travels beside the text"
+        assert context.education == [] and context.certifications == []
         db.rollback()
 
 
@@ -247,3 +267,25 @@ def test_deleting_a_resume_removes_its_file_too(user):
     assert out["file_deleted"] is True
     cards = client.get("/api/settings/resume").json()["versions"]
     assert [c["file"]["filename"] for c in cards] == ["backend.txt"], "no orphan file comes back as a resume"
+
+
+def test_a_different_file_with_the_same_text_is_its_own_resume(user):
+    first, second = _upload("backend.txt", RESUME_A), _upload("backend-copy.txt", RESUME_A + "\n\n")
+    assert first["resume_id"] != second["resume_id"], "a distinct upload is never hidden behind another file"
+    files = sorted(c["file"]["filename"] for c in client.get("/api/settings/resume").json()["versions"] if c["file"])
+    assert files == ["backend-copy.txt", "backend.txt"]
+    assert _upload("backend.txt", RESUME_A)["resume_id"] == first["resume_id"], "the same file again: the same resume"
+
+
+def test_blank_resume_text_is_refused_not_silently_ignored(user):
+    _upload("backend.txt", RESUME_A)
+    for method in (client.patch, client.put):
+        response = method("/api/profile", json={"master_resume": "   "})
+        assert response.status_code == 422 and "delete it" in response.text
+    assert client.get("/api/profile").json()["master_resume"].strip() == RESUME_A.strip()
+
+
+def test_the_legacy_file_delete_route_is_gone(user):
+    _upload("backend.txt", RESUME_A)
+    assert client.delete("/api/profile/resume").status_code == 405, "removing a resume goes through DELETE /api/resumes/{id}"
+    assert client.get("/api/profile/resume").status_code == 200, "the active resume's file still downloads"
