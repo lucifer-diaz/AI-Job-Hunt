@@ -1078,3 +1078,23 @@ form#settings-editor.wk-settings{background:none;border:0;box-shadow:none;border
 @media (max-width:900px){.wk-split{grid-template-columns:1fr}.wk-facts{border-left:0;padding-left:0;border-top:1px solid var(--line2);padding-top:12px}}
 @media (max-width:640px){.wk-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}.wk-row{grid-template-columns:22px 1fr}.wk-row-actions{justify-content:flex-start}.wk-cap{grid-template-columns:1fr}}
 @media (prefers-reduced-motion:reduce){.wk-pulse.on{animation:none}}
+
+/* ───────────── Job insights (job_insights.js) ───────────── */
+.ins-tabs{margin-top:12px}
+.ins-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}
+.ins-two{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:18px}
+.ins-item{display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-bottom:1px solid var(--line3)}
+.ins-item.col{flex-direction:column;align-items:stretch;gap:4px}
+.ins-item:last-child{border-bottom:0}
+.ins-line{display:flex;align-items:baseline;gap:8px;padding:6px 0;border-bottom:1px dashed var(--line2)}
+.ins-line.strong{border-bottom:0;border-top:1px solid var(--line2);padding-top:10px}
+.ins-q{padding:10px 12px;border:1px solid var(--line2);border-radius:10px;margin-bottom:8px;background:var(--softer)}
+.ins-stages{display:flex;flex-direction:column;gap:6px}
+.ins-stage{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+.ins-table{width:100%;border-collapse:collapse;font-size:12.5px}
+.ins-table th{text-align:left;font-weight:600;color:var(--muted,#6b7084);padding:6px 8px;border-bottom:1px solid var(--line2)}
+.ins-table td{padding:6px 8px;border-bottom:1px solid var(--line3);vertical-align:top}
+.ins-how summary{cursor:pointer;color:var(--brand-ink)}
+.ins-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px}
+.ins-form label,.ins label.xs{display:flex;flex-direction:column;gap:4px}
+@media (max-width:640px){.ins-table{display:block;overflow-x:auto}}

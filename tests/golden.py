@@ -16,9 +16,11 @@ from app.prompts import (
     build_application_email_match_prompt,
     build_application_inbox_prompt,
     build_application_question_prompt,
+    build_company_insights_prompt,
     build_cover_letter_prompt,
     build_followup_prompt,
     build_inbox_classification_prompt,
+    build_interview_insights_prompt,
     build_job_description_parser_prompt,
     build_job_description_recovery_prompt,
     build_ranking_prompt,
@@ -76,6 +78,13 @@ def build(fixture: dict[str, Any]) -> Prompt:
     if name == "followup":
         return build_followup_prompt(profile, job=job, application=given["application"],
                                      recruiters=given["recruiters"], resume=given["resume"], evidence=evidence)
+    if name == "company_insights":
+        return build_company_insights_prompt({"title": job.title, "company": job.company, "location": job.location},
+                                             given["observations"])
+    if name == "interview_insights":
+        return build_interview_insights_prompt(job={"title": job.title, "company": job.company},
+                                               context=given["context"], fit_analysis=given["fit_analysis"],
+                                               evidence=evidence, research=given["research"], stage=given["stage"])
     raise KeyError(f"no builder for golden prompt {name}")
 
 

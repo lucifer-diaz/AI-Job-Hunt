@@ -17,14 +17,20 @@ from app.prompts.application_inbox import (
                                        build_application_inbox_prompt,
 )
 from app.prompts.common import Prompt
+from app.prompts.company_insights import (
+                                       COMPANY_INSIGHTS_PROMPT_VERSION,
+                                       build_company_insights_prompt,
+)
 from app.prompts.contracts import (
                                        ApplicationAnswerResult,
                                        ApplicationEmailAnalysis,
                                        ApplicationEmailMatchResult,
+                                       CompanyInsightSynthesis,
                                        CoverLetterResult,
                                        EvidenceExtractionResult,
                                        FollowUpResult,
                                        InboxClassificationResult,
+                                       InterviewPrepResult,
                                        JobDescriptionParserOutput,
                                        JobDescriptionRecoveryResult,
                                        OptimizationReport,
@@ -39,6 +45,10 @@ from app.prompts.inbox import (
                                        INBOX_CATEGORIES,
                                        INBOX_PROMPT_VERSION,
                                        build_inbox_classification_prompt,
+)
+from app.prompts.interview_insights import (
+                                       INTERVIEW_INSIGHTS_PROMPT_VERSION,
+                                       build_interview_insights_prompt,
 )
 from app.prompts.job_description_parser import (
                                        JOB_DESCRIPTION_PARSER_PROMPT_VERSION,
@@ -82,6 +92,8 @@ PROMPT_VERSIONS = {
     "application_email_match": APPLICATION_INBOX_PROMPT_VERSION,
     "agents": AGENT_PROMPT_VERSION,
     "ai_optimization": AI_OPTIMIZATION_PROMPT_VERSION,
+    "company_insights": COMPANY_INSIGHTS_PROMPT_VERSION,
+    "interview_insights": INTERVIEW_INSIGHTS_PROMPT_VERSION,
     "mcp_tailoring": MCP_TAILORING_PROMPT_VERSION,
     "mcp_review": MCP_REVIEW_PROMPT_VERSION,
     "mcp_application": MCP_APPLICATION_PROMPT_VERSION,
@@ -105,9 +117,11 @@ OUTPUT_CONTRACTS = {
     "application_inbox": ApplicationEmailAnalysis,
     "application_email_match": ApplicationEmailMatchResult,
     "ai_optimization": OptimizationReport,
+    "company_insights": CompanyInsightSynthesis,
+    "interview_insights": InterviewPrepResult,
 }
 # Worker prompt names reserved in app.services.ai_workers with no production prompt yet (nothing calls them).
-RESERVED_PROMPTS = ("company_insights", "interview_insights")
+RESERVED_PROMPTS: tuple[str, ...] = ()
 # Conversation instructions (Claude Desktop over MCP, the ADK agents): not model calls the backend makes. Their saved
 # results are validated by the backend (app.services.tailoring_results, review_results, job_hunt_agent.tools).
 CONVERSATION_PROMPTS = ("agents", "mcp_tailoring", "mcp_review", "mcp_application")
@@ -123,10 +137,12 @@ __all__ = [
                                        "build_application_email_match_prompt",
                                        "build_application_inbox_prompt",
                                        "build_application_question_prompt",
+                                       "build_company_insights_prompt",
                                        "build_cover_letter_prompt",
                                        "build_evidence_extraction_prompt",
                                        "build_followup_prompt",
                                        "build_inbox_classification_prompt",
+                                       "build_interview_insights_prompt",
                                        "build_job_description_parser_prompt",
                                        "build_job_description_recovery_prompt",
                                        "build_model_health_prompt",

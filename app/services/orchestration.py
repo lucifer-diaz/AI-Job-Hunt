@@ -48,6 +48,7 @@ from app.models import (
     Job,
     JobDescriptionFetchTask,
     JobDescriptionParseTask,
+    JobInsightTask,
     JobRanking,
     JobRankingTask,
     LLMRequestLog,
@@ -389,10 +390,16 @@ TASK_TABLES = (
     TaskTable("jd_parser", JobDescriptionParseTask, ("PENDING",), ("PROCESSING",), ("FAILED",), (), ("COMPLETED",),
               JobDescriptionParseTask.attempt_count, JobDescriptionParseTask.started_at,
               JobDescriptionParseTask.completed_at),
+    TaskTable("company_insights", JobInsightTask, ("PENDING",), ("PROCESSING",), ("FAILED",), (),
+              ("COMPLETED", "PARTIAL"), JobInsightTask.attempt_count, JobInsightTask.started_at,
+              JobInsightTask.completed_at),
     TaskTable("ranker", JobRankingTask, ("PENDING",), ("PROCESSING",), ("FAILED",), (), ("COMPLETED",),
               JobRankingTask.attempt_count, JobRankingTask.started_at, JobRankingTask.completed_at),
 )
 TASK_BY_NODE = {t.node_id: t for t in TASK_TABLES}
+# The Running workers kind (app.services.worker_settings) behind each task table, for its attempt limit.
+WORKER_KIND_BY_NODE = {"jd_recovery": "recovery", "jd_parser": "parsing", "company_insights": "insights",
+                       "ranker": "ranking"}
 
 
 def _blank_live() -> dict[str, int]:
@@ -696,6 +703,15 @@ def _fact_rows(db: Session, scope: Scope, edge: topo.Edge) -> list[tuple[int | N
         a = Application
         q = select(a.job_id, a.approved_at, a.approved_at, a.applied_at).where(a.approved_at >= s, a.approved_at <= e)
         return [tuple(r) for r in db.execute(_owned(q, a.user_id, u).limit(lim)).all()]
+    if key == "approval__company_insights":
+        t = JobInsightTask
+        q = select(t.job_id, t.created_at, t.created_at, t.completed_at).where(t.created_at >= s, t.created_at <= e)
+        return [tuple(r) for r in db.execute(_owned(q, t.user_id, u).limit(lim)).all()]
+    if key == "company_insights__interview_insights":
+        t = JobInsightTask
+        q = select(t.job_id, t.completed_at).where(t.completed_at >= s, t.completed_at <= e,
+                                                    t.status.in_(("COMPLETED", "PARTIAL")))
+        return [(r[0], r[1], None, None) for r in db.execute(_owned(q, t.user_id, u).limit(lim)).all()]
     if key == "application__application_inbox":
         a = Application
         q = select(a.job_id, a.applied_at).where(a.applied_at >= s, a.applied_at <= e)
@@ -1406,8 +1422,9 @@ def live(db: Session, scope: Scope) -> dict[str, Any]:
                          "attempt": attempt, "max_attempts": limit, "task": task, "task_id": task_id}
 
     own = {kind: worker_settings.get(db, owner, kind, "max_attempts") for kind in ("recovery", "parsing", "ranking",
-                                                                                  "tailoring")}
-    for t, limit in zip(TASK_TABLES, (own["recovery"], own["parsing"], own["ranking"]), strict=True):
+                                                                                  "insights", "tailoring")}
+    for t in TASK_TABLES:
+        limit = own[WORKER_KIND_BY_NODE[t.node_id]]
         m = t.model
         rows = db.execute(select(m.id, m.job_id, m.status, m.attempt_count, m.created_at, t.started)
                           .where(m.user_id == owner, m.status.in_(t.pending + t.running))

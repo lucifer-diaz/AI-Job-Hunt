@@ -9,14 +9,14 @@
    ranking cadence and any provider cooldown. Every number and row comes from /api/workers/* (app.services.workers). */
 'use strict';
 
-const WK_KINDS = [['parsing', 'JD parsing'], ['recovery', 'JD recovery'], ['ranking', 'Ranking'], ['tailoring', 'Tailoring'], ['reviewing', 'Reviewing']];
+const WK_KINDS = [['parsing', 'JD parsing'], ['recovery', 'JD recovery'], ['ranking', 'Ranking'], ['insights', 'Job insights'], ['tailoring', 'Tailoring'], ['reviewing', 'Reviewing']];
 // Tabs drawn from the generic task list (/api/workers/{kind}); ranking and tailoring keep their own views.
-const WK_GENERIC = ['parsing', 'recovery', 'reviewing'];
+const WK_GENERIC = ['parsing', 'recovery', 'insights', 'reviewing'];
 // The worker tabs, then the account's worker settings (processing limits and rate-limit backoff).
 const WK_TABS = [...WK_KINDS, ['settings', 'Settings']];
 // [label, tone, symbol]: a status is always a word and a symbol, never colour alone.
 const WK_STATUS = { RUNNING: ['Running', 'brand', '●'], QUEUED: ['Queued', 'muted', '○'], RETRYING: ['Retrying', 'warn', '↻'],
-  COMPLETED: ['Done', 'good', '✓'], SUCCEEDED: ['Done', 'good', '✓'], FAILED: ['Failed', 'bad', '✕'],
+  COMPLETED: ['Done', 'good', '✓'], SUCCEEDED: ['Done', 'good', '✓'], PARTIAL: ['Partial', 'warn', '◐'], FAILED: ['Failed', 'bad', '✕'],
   BLOCKED: ['Blocked', 'bad', '⛔'], SKIPPED: ['Skipped', 'muted', '–'], CANCELLED: ['Cancelled', 'muted', '–'],
   STOPPED: ['Stopped', 'muted', '■'] };
 const WK_POLL_ACTIVE = 3000, WK_POLL_IDLE = 20000;
@@ -24,7 +24,7 @@ const WK_POLL_ACTIVE = 3000, WK_POLL_IDLE = 20000;
 const WK_FILTERS = [['all', 'All statuses'], ['active', 'Active (running, queued, retrying)'], ['running', 'Running'],
   ['queued', 'Queued'], ['retrying', 'Retrying'], ['failed', 'Failed, blocked or stopped'], ['done', 'Done']];
 const WK_FILTER_MEMBERS = { active: ['RUNNING', 'QUEUED', 'RETRYING'], running: ['RUNNING'], queued: ['QUEUED'],
-  retrying: ['RETRYING'], failed: ['FAILED', 'BLOCKED', 'STOPPED'], done: ['COMPLETED', 'SUCCEEDED', 'SKIPPED', 'CANCELLED'] };
+  retrying: ['RETRYING'], failed: ['FAILED', 'BLOCKED', 'STOPPED'], done: ['COMPLETED', 'PARTIAL', 'SUCCEEDED', 'SKIPPED', 'CANCELLED'] };
 let wkTimer = null, wkSearchTimer = null;
 
 function wkState() {
@@ -359,7 +359,7 @@ async function wkSaveExtra(changes) {
   if (Object.keys(server).length) D.wkSettings.server = (await api('/api/workers/server-settings', { method: 'PUT', body: { values: server } })).server;
 }
 const wkSecs = s => s < 60 ? `${s}s` : s < 3600 ? `${Math.round(s / 6) / 10}m`.replace('.0m', 'm') : `${Math.round(s / 360) / 10}h`.replace('.0h', 'h');
-const WK_SET_ICONS = { parsing: '▤', recovery: '⟲', ranking: '★', tailoring: '✎', backoff: '⏱' };
+const WK_SET_ICONS = { parsing: '▤', recovery: '⟲', ranking: '★', insights: '◈', tailoring: '✎', backoff: '⏱' };
 // The unit beside a number, and how its default reads, from the setting's name.
 function wkUnit(name) {
   if (/seconds/.test(name)) return ['sec', v => wkSecs(Number(v))];
@@ -399,6 +399,7 @@ function wkServerRows(kind) {
   return `<div class="wk-scol server"><div class="wk-scol-head"><span class="wk-scol-icon" aria-hidden="true">${w.server_editable ? '⚙' : '🔒'}</span><div><b>Server · every account</b><small>${w.server_editable ? 'You are an admin: changes pace every account’s scheduler jobs and apply within seconds.' : 'Set by your admin; shown for reference.'}</small></div></div>${rows}</div>`;
 }
 function wkSettingsCard(kind, title, extra = '') {
+  if (!D.wkSettings.account[kind]) return '';  // a worker this server does not have
   const x = D.wkSettings.account[kind], key = wkAKey(kind, 'auto'), on = !!fv('workers', key, x.values.auto);
   const spec = wkSpec(kind) || {}, active = wkCount(spec.counts);
   const facts = wkScheduleFacts(spec.scheduler, kind).map(f => `<span>${esc(f)}</span>`).join('') + (active ? `<span>● ${active} active</span>` : '');
@@ -427,14 +428,15 @@ function wkSettings() {
       <div class="wk-scol server"><div class="wk-scol-head"><span class="wk-scol-icon" aria-hidden="true">↗</span><div><b>Waits after 429s in a row</b><small>Worked out from the values on the left.</small></div></div><div class="wk-pad">${ladder}<p class="settings-help mt12">A provider's own <code>Retry-After</code> wins when it asks for longer. Model calls and Apify calls back off separately; the first normal answer resets it. Kill all and Reset backoff clear a wait that is running now.</p></div></div></div>`
     : '<div class="wk-paused-note">Off: every queued task calls the provider again straight away, even while it is refusing them.</div>'}</section>`;
   const auto = id => !!fv('workers', wkAKey(id, 'auto'), D.wkSettings.account[id].values.auto);
-  const nav = [['parsing', 'JD parsing'], ['recovery', 'JD recovery'], ['ranking', 'Ranking'], ['tailoring', 'Tailoring'], ['backoff', 'Rate limits']]
+  const nav = [['parsing', 'JD parsing'], ['recovery', 'JD recovery'], ['ranking', 'Ranking'], ['insights', 'Job insights'], ['tailoring', 'Tailoring'], ['backoff', 'Rate limits']]
+    .filter(([id]) => id === 'backoff' || D.wkSettings.account[id])
     .map(([id, t]) => `<a href="#wk-set-${id}" data-act="wk-set-jump" data-id="${id}"><span class="wk-set-icon sm" aria-hidden="true">${WK_SET_ICONS[id]}</span><span class="grow">${t}</span>${id === 'backoff' ? (backoffOn ? '<i class="wk-state on">On</i>' : '<i class="wk-state">Off</i>') : auto(id) ? '<i class="wk-state on">Auto</i>' : '<i class="wk-state paused">Paused</i>'}</a>`).join('');
   return `<form id="settings-editor" class="wk-settings" data-form="workers" novalidate><fieldset ${isBusy('settings-workers') ? 'disabled' : ''}>
     <div class="wk-set-layout"><nav class="wk-set-nav card" aria-label="Worker settings"><div class="caps-sm mb8">WORKER SETTINGS</div>${nav}
         <div class="wk-legend-box mt12"><div><span aria-hidden="true">👤</span> <b>Your account</b> only your tasks</div><div><span aria-hidden="true">${D.wkSettings.server_editable ? '⚙' : '🔒'}</span> <b>Server</b> ${D.wkSettings.server_editable ? 'every account (admin)' : 'set by your admin'}</div><div><span class="wk-dot" aria-hidden="true"></span> <b>Custom</b> differs from the default</div></div>
         <p class="xs faint mt12">Automatic tailoring and approvals: <a href="#settings/workflow">Workflow &amp; cadence</a>.</p></nav>
       <div class="stack" style="min-width:0"><div id="settings-error" class="settings-error" role="alert" ${SETTING_ERRORS.workers ? '' : 'hidden'}>${esc(SETTING_ERRORS.workers || '')}</div>
-        ${wkSettingsCard('parsing', 'JD parsing')}${wkSettingsCard('recovery', 'JD recovery')}${wkSettingsCard('ranking', 'Ranking', ranking)}${wkSettingsCard('tailoring', 'Tailoring', tailoring)}${backoff}
+        ${wkSettingsCard('parsing', 'JD parsing')}${wkSettingsCard('recovery', 'JD recovery')}${wkSettingsCard('ranking', 'Ranking', ranking)}${wkSettingsCard('insights', 'Job insights')}${wkSettingsCard('tailoring', 'Tailoring', tailoring)}${backoff}
         <div class="wk-set-footer">${settingsFooter('workers')}</div></div></div></fieldset></form>`;
 }
 
@@ -562,7 +564,7 @@ function renderWorkers() {
     filterCounts = data?.status_counts || null;
     // The filters narrow the task list, not the metrics, so they sit right above the list.
     const insights = { parsing: wkParsingInsights, recovery: wkRecoveryInsights, reviewing: wkReviewingInsights }[w.tab];
-    body = !data ? loading() : `${insights(data)}${wkFilterBar(w.tab, filterCounts)}${wkBulkBar(w.tab)}${wkTable(w.tab, data)}`;
+    body = !data ? loading() : `${insights ? insights(data) : ''}${wkFilterBar(w.tab, filterCounts)}${wkBulkBar(w.tab)}${wkTable(w.tab, data)}`;
   }
   return `<div class="stack">${top}${wkCooldowns(s.cooldowns)}${wkHero(w.tab, spec, act)}${wkActivity(act)}${body}</div>`;
 }

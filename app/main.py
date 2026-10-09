@@ -41,6 +41,7 @@ from app.discovery_api import router as discovery_router
 from app.hunter_api import router as hunter_router
 from app.infrastructure.browser import shutdown_browser_service
 from app.job_description_api import router as job_description_router
+from app.job_insights_api import router as job_insights_router
 from app.models import (
     Application,
     CandidateProfile,
@@ -174,6 +175,7 @@ app.include_router(orchestration_router)
 app.include_router(workers_router)
 app.include_router(resume_router)
 app.include_router(job_description_router)
+app.include_router(job_insights_router)
 app.include_router(discovery_router)
 app.include_router(ai_models_router)
 app.include_router(application_inbox_router)

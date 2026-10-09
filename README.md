@@ -58,6 +58,7 @@ Auto-submit is intentionally not offered: approved packets always become an appl
 - Prompt-injection hardening for untrusted job descriptions
 - **Application Inbox Agent**: read-only Gmail checks for replies about the applications you submitted — targeted searches, confidence-scored matching, rule-then-model classification, a tracker timeline, safe stage updates and a daily digest — see [Application Inbox Agent](#application-inbox-agent)
 - **Job description recovery**: postings that arrive without a usable description are read from their URL in the background (HTTP, then headless Chromium, then AI-assisted block selection), validated and parsed — see [13. Job Description Recovery](#13-job-description-recovery)
+- **Job Insights**: every approved job gets source-backed research in the background — compensation (posting first, then recruiter, Glassdoor and PayScale through configurable Apify actors), official company values kept apart from employee-reported culture, reported vs generated interview questions, questions to ask, and stage-specific prep — see [14a. Job Insights](#14a-job-insights-company-compensation-and-interview-research)
 - **LiteLLM gateway**: per-worker model assignments, tiers, auto router, preview/apply, version history and rollback (AI Orchestration → Models)
 - OpenAI, Anthropic, Gemini, **OpenRouter**, or no-cost mock provider
 - LLM monitoring (tokens, context size, latency, estimated cost, failures) and a recommend-only AI Optimization Advisor
@@ -2691,6 +2692,166 @@ data and edit history go; the uploaded file stays in the resume library. Jobs an
 matching by tags (else the active resume) — nothing is re-ranked by itself. Verified evidence it produced is re-linked
 to the newest remaining version that verifies the same fact, and un-verified otherwise, so tailoring never cites a fact
 no remaining resume supports.
+
+## 14a. Job Insights (company, compensation and interview research)
+
+Every approved job gets a research package: what it pays, what the company says about itself, how it interviews,
+which questions candidates report, preparation written for you, and the questions worth asking each interviewer.
+Every researched fact carries its source, and every item says what kind of statement it is:
+
+| Kind | Meaning | Example |
+| --- | --- | --- |
+| **FACT** | A source states it (with provenance) | "The careers page lists *Customer obsession* as a value." |
+| **DERIVED** | An interpretation of sources | "Employees report a fast pace." |
+| **GENERATED** | Preparation a model wrote | "Prepare an example of owning an incident end to end." |
+| **UNKNOWN** | Nothing answers it | "The posting does not state a salary." |
+
+### How it runs
+
+```
+approve (workflow.approve_job) / Find insights / Refresh
+  → JobInsightTask PENDING                     ← approval never waits, and never fails because of research
+  → scheduler job `job_insights` (claim with SKIP LOCKED + a guarded UPDATE, lease, retries)
+  → sources side by side (bounded), fresh cached observations reused
+  → insight_observations (provenance)          → compensation computed in code
+  → COMPANY_INSIGHTS model: values / culture / reported stages and questions, each citing observation ids
+  → INTERVIEW_INSIGHTS model: role-derived and candidate-specific prep from the structured JD, fit analysis, evidence
+  → job_insights (one row per job; a section is only replaced by a run that produced it)
+```
+
+Code: `app/services/job_insights/` (tasks, sources, apify, matching, synthesis, service, views),
+`app/services/compensation.py` (`compensation_insight`), prompts `app/prompts/company_insights.py` and
+`app/prompts/interview_insights.py`, API `app/job_insights_api.py`, UI `app/static/job_insights.js`.
+
+### Source priority
+
+1. **Employer** — the posting's own salary (`compensation.extract_posting_salary`), benefits, remote policy. Always
+   the highest salary source; an estimate never replaces it. A job board's *estimate* shown beside a posting
+   (Glassdoor's `salary_source: glassdoor_estimate`) is market data, not the employer's.
+2. **Recruiter** — what you enter in Insights → Sources → Your inputs (budget, process, questions, comments). Research
+   never overwrites it, and a recruiter budget outranks any estimate.
+3. **Official company website** — mission, values, benefits, a short description. Read over HTTP from a website the
+   posting named or you entered; **a domain is never guessed**. Each redirect hop is checked (`url_safety`); a login
+   wall, CAPTCHA or 429 is recorded as BLOCKED and never bypassed.
+4. **Glassdoor via Apify** — company salaries, interview reports and questions, employee review aggregates.
+5. **PayScale via Apify** — salary estimates.
+6. **Public web search** — no provider is integrated, so it is always *not configured*.
+7. **Generated preparation** — written last, from the above, and always labelled GENERATED.
+
+### Configuring Glassdoor and PayScale actors
+
+No actor ID or input schema is built in: Store actors and their schemas change, so an admin chooses and checks each
+one, and sets both its ID and its input. A source missing either is *not configured*.
+
+```bash
+APIFY_GLASSDOOR_COMPENSATION_ACTOR=   # e.g. someone/glassdoor-salaries   (blank = NOT_CONFIGURED)
+APIFY_GLASSDOOR_INTERVIEW_ACTOR=
+APIFY_GLASSDOOR_REVIEWS_ACTOR=
+APIFY_PAYSCALE_ACTOR=
+# Input per actor (required): JSON whose strings may use {company}, {role}, {location} and {limit}
+APIFY_GLASSDOOR_COMPENSATION_INPUT={"companyName": "{company}", "jobTitle": "{role}", "location": "{location}", "maxItems": "{limit}"}
+```
+
+Without an input template the source stays *not configured*: a paid actor run is never started with guessed field
+names. Runs use each account's own Apify key, through the shared
+instrumented client (`provider=APIFY`, `service=job_insights`, operations such as `glassdoor_compensation_run`,
+`…_status`, `…_dataset`), and keep the run and dataset ids as the observation's reference. Output is read through field
+aliases (`employerName`/`companyName`, `basePayLow`/`minSalary`/`payPercentile10`, `question`/`questions`, …); a
+dataset that matches none is reported as *Schema not recognized* rather than guessed at. A source that is not
+configured, fails, times out, is rate limited or returns nothing affects only itself.
+
+### Matching (`matching.py`)
+
+Third-party data is attached only when it is about this company, role and place:
+
+* **Company** — the canonical domain wins (another domain is rejected); then the name without legal suffixes. A short
+  or shared name (Grab, Apple, Meta, Stripe…) with nothing confirming it is NEEDS_REVIEW and is not used.
+* **Role** — titles are normalized into seniority, discipline and core words (`original_title`, `normalized_title`,
+  `seniority`, `discipline` are stored). The same core is a role match; the same discipline is a *similar* role, kept
+  at lower weight with the mapping recorded; anything else is discarded.
+* **Location** — company + role + city, then country, then market role + city / country, then global (lowest
+  weight). Pay from another country is rejected.
+* **Recency** — under 12 months HIGH, 12–24 MEDIUM, older LOW; old data is kept unless
+  `INSIGHT_MAX_OBSERVATION_AGE_MONTHS` is set. The date range is shown.
+
+### Compensation confidence
+
+`compensation.compensation_insight` is deterministic; no model ever produces a figure.
+
+* Original values (currency, period, basis) are kept; annual values in the same currency are added beside them
+  (52 weeks, 260 days or 2,080 hours a year). **No currency is converted** — an observation in another currency is
+  shown and left out of the estimate, with the reason.
+* Base salary, total cash and total compensation are never compared with one another.
+* Market observations that agree (midpoints within 25%) form a weighted-median estimate:
+  `MULTI_SOURCE_CONSENSUS` (or `SINGLE_SOURCE_ESTIMATE`), weighted by match × recency × source confidence.
+* Credible estimates more than 25% apart — or an employer figure that far from the market — are
+  `CONFLICTING_ESTIMATES`: alternatives are listed and no midpoint is made up.
+* The discussion anchor is the employer's range, else the recruiter's budget, else the market estimate labelled
+  *"ask the recruiter for the approved band"*. A market estimate is never presented as the employer's band.
+
+### Reported and generated questions
+
+* **Reported by candidates** — only from INTERVIEW_QUESTION observations, each with its source, role and date;
+  duplicates are merged only when clearly the same and keep their wording (shortened). Recruiter-mentioned questions
+  are reported too, with source RECRUITER.
+* **Likely for this role** (ROLE_DERIVED) and **Based on your profile** (CANDIDATE_SPECIFIC) — generated from the
+  structured JD (`job_context.build_interview_insights_job_context`, reused unchanged), the Ranker's completed fit
+  analysis and your verified evidence. Each has a rationale and the requirement / evidence / gap ids it rests on, never
+  a source attribution. The gateway rejects an answer that cites an id it was not shown.
+* **Prepare answer** builds a STAR outline from your verified evidence (no model call) and lists the gaps not to
+  claim. It is never saved as evidence.
+* Interview stages are REPORTED (a source describes them) or INFERRED (with the reason); never equivalent.
+
+### Company values
+
+Official values come only from the company's own pages. Employee-reported themes come only from review sources and
+are a separate list labelled *Employee-reported*; review aggregates (ratings, sample size) are shown as what employees
+report, never as fact. Review text is never shown or copied: only aggregates and short derived themes.
+
+### Refresh and cache
+
+* Approval queues research automatically; **Find insights** / **Refresh** (job modal → Insights, Approvals card) queue
+  it on demand. One active task per job: a second click returns the first.
+* Observations are reused for another job **of the same account** with the same company / role / location while fresh:
+  `COMPANY_INSIGHT_TTL_DAYS=30` (official site, reviews), `COMPENSATION_INSIGHT_TTL_DAYS=14` (Glassdoor/PayScale
+  salaries), `INTERVIEW_INSIGHT_TTL_DAYS=30` (interview reports). Refresh bypasses the cache.
+* A failed source keeps what it found last time; a run without the model keeps the previous synthesized sections; a
+  run where every outside source and the model failed is retried (`JOB_INSIGHTS_MAX_ATTEMPTS`) and changes nothing.
+  The screen then says *Refresh failed — last successful data: …*.
+* Runs are PARTIAL when any source failed or needs review, COMPLETED when nothing did.
+* Scheduler: `JOB_INSIGHTS_INTERVAL_MINUTES=5`, `JOB_INSIGHTS_BATCH_SIZE=5`, `JOB_INSIGHTS_MAX_CONCURRENCY=2` (editable
+  in Running workers → Settings), `JOB_INSIGHTS_SOURCE_CONCURRENCY=3`, `JOB_INSIGHTS_SOURCE_TIMEOUT_SECONDS=120`,
+  `JOB_INSIGHTS_ENABLED=true`. Running workers → Job insights shows, kills and re-runs tasks.
+
+### Stage-specific preparation
+
+`GET /api/applications/{id}/insights` projects the job's insights for the tracker stage (nothing is copied):
+recruiter screen (summary, pay, questions for the recruiter), interviewing (hiring manager, technical, system design,
+behavioral, final), take-home (technical/coding), offer/negotiating (compensation and offer questions). The Tracker's
+*Interview prep for this stage* card shows it.
+
+### API
+
+| Method | Path | |
+| --- | --- | --- |
+| GET | `/api/jobs/{id}/insights` | the package, research state, sources |
+| POST | `/api/jobs/{id}/insights/refresh` | Find insights / Refresh (queues; deduplicated) |
+| GET | `/api/jobs/{id}/insights/compensation` · `/company` · `/interview` · `/sources` | one section; `sources` lists every observation with its provenance |
+| PUT | `/api/jobs/{id}/insights/inputs` | your company website and recruiter notes |
+| POST | `/api/jobs/{id}/insights/questions/{qid}/prepare` | an answer outline from verified evidence |
+| GET | `/api/applications/{id}/insights` | the stage view |
+
+`GET /api/jobs/{id}/interview-insights` (the deterministic structured-JD context) is unchanged.
+
+### Security and privacy
+
+Every task, insight and observation belongs to the job's account (`app/tenancy.py`); another account's job is not
+found, and the cache never crosses accounts. No credential is stored or returned; tokens stay in memory and every call
+goes through the instrumented client, whose redaction removes them. Page and review text is never returned by the API;
+observations keep short extracts only. External text reaches a model only inside `untrusted()` blocks, with the rule
+to never follow instructions in it. Model calls go through the LLM gateway (workers `COMPANY_INSIGHTS` and
+`INTERVIEW_INSIGHTS`, default tier PRIMARY_REASONING, configurable in Settings → AI Models), recorded with prompt
+version, tokens, latency and trace in Monitoring → LLM requests (stage COMPANY_INSIGHTS).
 
 ## 15. Recommended next upgrades
 

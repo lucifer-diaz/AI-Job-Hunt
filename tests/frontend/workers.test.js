@@ -82,7 +82,7 @@ beforeEach(() => {
   vi.stubGlobal('fetch', fetchMock);
   if (!ui) {
     context = createContext({ document, window, location, history: window.history, navigator, URLSearchParams, FormData, File, Intl, setTimeout, clearTimeout, setInterval, clearInterval, console });
-    for (const file of ['monitoring.js', 'orchestration.js', 'workers.js', 'settings.js', 'resume_data.js', 'job_data.js', 'knowledge.js', 'inbox.js', 'guide.js']) {
+    for (const file of ['monitoring.js', 'orchestration.js', 'workers.js', 'settings.js', 'resume_data.js', 'job_data.js', 'knowledge.js', 'inbox.js', 'guide.js', 'job_insights.js']) {
       runInContext(readFileSync(`app/static/${file}`, 'utf8'), context, { filename: resolve(`app/static/${file}`) });
     }
     runInContext(appSource, context, { filename: resolve('app/static/app.js') });
@@ -113,7 +113,7 @@ describe('Running workers', () => {
   it('has a tab per worker with its queue size, kept in the URL', async () => {
     await open();
     const tabs = [...view().querySelectorAll('[data-act="wk-tab"]')].map(b => b.textContent.trim());
-    expect(tabs).toEqual(['JD parsing 3', 'JD recovery', 'Ranking 1', 'Tailoring', 'Reviewing 1', '⚙ Settings']);
+    expect(tabs).toEqual(['JD parsing 3', 'JD recovery', 'Ranking 1', 'Job insights', 'Tailoring', 'Reviewing 1', '⚙ Settings']);
     ui.A['wk-tab']({ dataset: { id: 'recovery' } });
     expect(location.hash).toBe('#workers/recovery');
     await flush();

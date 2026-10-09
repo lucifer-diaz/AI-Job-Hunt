@@ -168,6 +168,41 @@ The rules a change has to keep:
   NULL or `AUTO` may ever be re-matched; `SETUP`, `USER` and `ACTIVE` are the person's decisions. Changing tags never
   re-ranks by itself — re-matching is an explicit action, because it can queue model calls.
 
+## Job Insights (company, compensation and interview research)
+
+`app/services/job_insights/` builds a source-backed research package for an approved job (README §14a). The rules a
+change has to keep:
+
+* **Never present generated interview questions as reported questions.** REPORTED questions come only from
+  INTERVIEW_QUESTION observations and cite them; ROLE_DERIVED and CANDIDATE_SPECIFIC questions carry a rationale and
+  requirement / evidence ids, never source attribution. Interview stages are REPORTED or INFERRED, never equivalent.
+* **Never present a market estimate as an employer-approved salary band**, and **never replace the employer's salary
+  with a lower-confidence estimate.** The posting's own salary (`compensation.extract_posting_salary`) is priority 1,
+  a recruiter budget the person entered is priority 2; a board's *estimate* is market data. Compensation is computed in
+  code (`compensation.compensation_insight`): no model output ever contains a figure, currencies are never converted
+  without a configured FX source, base / total cash / total compensation are never compared, and conflicting
+  estimates are listed, not averaged.
+* **Every external factual insight has provenance**: an `InsightObservation` (source type, provider, actor, URL or
+  run/dataset reference, observed and fetched dates, match scope and status). Model output that cites an id it was not
+  shown is rejected (`synthesis.validate_company` / `validate_interview`); items are labelled FACT, DERIVED, GENERATED
+  or UNKNOWN in storage and in the UI.
+* **External content is untrusted.** Pages, review text, actor output and job descriptions reach a model only through
+  `untrusted()` in `app/prompts/company_insights.py` / `interview_insights.py`. The model never browses.
+* **A refresh never erases last known good data because one provider failed**: a failed source keeps its previous
+  observations, a run without the model keeps the previous synthesized sections (`service.SYNTHESIZED`), and a run
+  where everything failed changes nothing and is retried. Recruiter input is never written by research.
+* **Do not invent Apify actor IDs or provider schemas.** Actors are settings (`APIFY_*_ACTOR`) and their input is an
+  admin template (`APIFY_*_INPUT`); a source missing either is NOT_CONFIGURED, never run with a guessed input, their output is read through aliases in `apify.py`, and an
+  unrecognized shape is FAILED ("schema not recognized").
+* **Add a source as an adapter** (`base.InsightSource`: `name`, `label`, `source_type`, `company_level`,
+  `configured()`, `fetch(snapshot)`) in `service.SOURCES`; it never raises, never touches the database and calls out
+  only through `external_client` / `apify_client`. Matching to the job's company, role and location goes through
+  `matching.assess` — deterministic, never a model; an ambiguous company is NEEDS_REVIEW and unused.
+* **Never guess a company website** (no `name.com` probing); it comes from the posting's data or the person.
+* **The cache is per account** (`service.cached`): observations are reused only within the same `user_id`.
+* **Approval never waits for research**: `workflow.approve_job` calls `tasks.on_approved` in a savepoint; research
+  runs in the `job_insights` scheduler job with the same claim / lease / run-now / kill rules as JD recovery.
+
 ## Application Inbox (Gmail)
 
 `app/services/application_inbox/` reads Gmail, read-only, for updates on submitted applications (README: Application

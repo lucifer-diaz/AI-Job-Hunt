@@ -26,8 +26,8 @@ from app.models import (AIConfigAuditEntry, AIConfigVersion, AIModel, AIOptimiza
                         AIRoutingConfig, AppSetting, Application, ApplicationCommunicationEvent, ApplicationEmailMessage,
                         ApplicationEvent, ApplicationInboxDigest, CandidateProfile, GmailConnection, LiteLLMConnection,
                         ModelTier, WorkerModelConfig,
-                        ConversationAction, Evidence, FollowUp, Job, JobDescriptionFetchTask, JobDescriptionParseTask,
-                        JobFeedbackEvent, JobRanking, JobRankingTask, RemovedPosting,
+                        ConversationAction, Evidence, FollowUp, InsightObservation, Job, JobDescriptionFetchTask,
+                        JobDescriptionParseTask, JobFeedbackEvent, JobInsight, JobInsightTask, JobRanking, JobRankingTask, RemovedPosting,
                         JobRequirementEvidence, JobStructuredDataChange, KnowledgeAnswer, McpToken, Resume,
                         ProviderCooldown, ResumeDataChange, ResumeDocument, ResumeVariant, ResumeVersion, SavedSearch,
                         SearchProfile,
@@ -40,7 +40,7 @@ OWNED_MODELS = (CandidateProfile, AppSetting, ResumeDocument, KnowledgeAnswer, E
                 JobDescriptionFetchTask, RemovedPosting, JobFeedbackEvent,
                 LiteLLMConnection, AIModel, ModelTier, WorkerModelConfig, AIRoutingConfig, AIConfigVersion,
                 AIConfigAuditEntry, GmailConnection, ApplicationEmailMessage, ApplicationCommunicationEvent,
-                ApplicationInboxDigest)
+                ApplicationInboxDigest, JobInsightTask, JobInsight, InsightObservation)
 # Rows that inherit their owner from a parent row: model -> (relationship, foreign key, parent model).
 INHERITED_OWNER = {
     Application: ("job", "job_id", Job),
@@ -52,6 +52,9 @@ INHERITED_OWNER = {
     JobStructuredDataChange: ("job", "job_id", Job),
     JobDescriptionParseTask: ("job", "job_id", Job),
     JobDescriptionFetchTask: ("job", "job_id", Job),
+    JobInsightTask: ("job", "job_id", Job),
+    JobInsight: ("job", "job_id", Job),
+    InsightObservation: ("insight", "job_insight_id", JobInsight),
     WorkflowTransition: ("job", "job_id", Job),
     ApplicationEvent: ("application", "application_id", Application),
     FollowUp: ("application", "application_id", Application),

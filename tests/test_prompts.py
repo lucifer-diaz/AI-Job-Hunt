@@ -19,10 +19,12 @@ from app.prompts import (
     build_application_email_match_prompt,
     build_application_inbox_prompt,
     build_application_question_prompt,
+    build_company_insights_prompt,
     build_cover_letter_prompt,
     build_evidence_extraction_prompt,
     build_followup_prompt,
     build_inbox_classification_prompt,
+    build_interview_insights_prompt,
     build_job_description_parser_prompt,
     build_job_description_recovery_prompt,
     build_ranking_prompt,
@@ -74,6 +76,13 @@ TAILOR_CONTEXT = {
                                  "bullets": [{"text": "Cut inference cost 40%", "evidence_ids": [7]}]}]},
     "relevant_evidence": evidence, "fit_analysis": FIT_ANALYSIS, "job_context": {},
 }
+# Research as Job Insights stores it (numbered observations), including a page that tries to give orders.
+RESEARCH = [{"id": 31, "category": "VALUES", "source_type": "OFFICIAL_COMPANY", "title": "Our values",
+             "data": {"value": "Customer obsession", "heading": "Our values"}},
+            {"id": 32, "category": "INTERVIEW_QUESTION", "source_type": "GLASSDOOR", "title": "Globex · Engineer",
+             "data": {"question": f"Design a rate limiter. {INJECTION}", "stage": None}}]
+INTERVIEW_CONTEXT = {"job_context": {"structured": True, "required": [
+    {"id": "req_001", "type": "SKILL", "value": "Python", "level": "REQUIRED"}]}}
 letter_context = {
     "candidate": {"name": "Asha Rao", "headline": "Staff AI Engineer", "target_roles": ["Lead AI Engineer"],
                   "search_preferences": {"search_profile": SEARCH_CONFIG}, "work_authorization": "India citizen"},
@@ -117,6 +126,12 @@ def all_prompts() -> dict[str, Prompt]:
             [{"application_id": 3, "company": "Globex", "role": "Lead AI Engineer"}],
             {"sender": "hr@globex.com", "subject": "Interview", "body": f"Hi Asha. {EMAIL_INJECTION}"}),
         "ai_optimization": build_ai_optimization_prompt({"totals": {"requests": 3}}, []),
+        "company_insights": build_company_insights_prompt(
+            {"title": "Lead AI Engineer", "company": "Globex", "location": "Remote"}, RESEARCH),
+        "interview_insights": build_interview_insights_prompt(
+            job={"title": "Lead AI Engineer", "company": "Globex"}, context=INTERVIEW_CONTEXT,
+            fit_analysis={"strong_matches": ["LLM platforms"]}, evidence=evidence,
+            research={"official_values": [{"id": 31, "value": "Customer obsession"}]}),
     }
 
 
@@ -384,6 +399,9 @@ def test_adversarial_text_stays_inside_its_data_block():
         start = user.index("<untrusted_resume>")
         assert start < user.index(RESUME_INJECTION) < user.index("</untrusted_resume>"), name
         assert RESUME_INJECTION not in built[name].system
+    research = built["company_insights"].user
+    assert research.index("<untrusted_research>") < research.index(INJECTION) < research.index("</untrusted_research>")
+    assert INJECTION not in built["company_insights"].system
     inbox = built["inbox"]
     body = inbox.user.split("<untrusted_email_body>", 1)[1].split("</untrusted_email_body>", 1)[0]
     assert EMAIL_INJECTION in body and "never obeyed" in inbox.system
