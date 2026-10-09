@@ -33,16 +33,20 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from pydantic import ValidationError
-from sqlalchemy import and_, desc, exists, func, or_, select
+from sqlalchemy import and_, desc, exists, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import (
+    ACTIVE_JD_FETCH_STATUSES,
+    ACTIVE_JD_PARSE_STATUSES,
     ACTIVE_RANKING_TASK_STATUSES,
     AppSetting,
     CandidateProfile,
     Evidence,
     Job,
+    JobDescriptionFetchTask,
+    JobDescriptionParseTask,
     JobRanking,
     JobRankingTask,
     Resume,
@@ -635,6 +639,35 @@ def _clear_lease(task: JobRankingTask) -> None:
     task.locked_at = task.locked_by = task.lock_token = task.lock_expires_at = None
 
 
+PARKED_FOR_DESCRIPTION = "The job description is "  # the start of both reasons ranking waits on a description
+
+
+def _description_pending() -> Any:
+    """True for a task whose job's description is still being parsed or recovered: it is not ready to rank.
+
+    Claiming such a task only parks it again (`_wait`), after it took a slot of the batch from jobs that are ready, so the
+    claim leaves it PENDING and untouched; it becomes claimable the moment the parse or recovery ends."""
+    pending = exists().where(JobDescriptionFetchTask.job_id == JobRankingTask.job_id,
+                             JobDescriptionFetchTask.status.in_(ACTIVE_JD_FETCH_STATUSES))
+    if get_settings().jd_parse_enabled:
+        pending = or_(pending, exists().where(JobDescriptionParseTask.job_id == JobRankingTask.job_id,
+                                              JobDescriptionParseTask.status.in_(ACTIVE_JD_PARSE_STATUSES)))
+    return pending
+
+
+def release_parked(db: Session, job_id: int) -> int:
+    """A description finished parsing or recovering: let the job's ranking that was parked waiting for it run now.
+
+    Only clears the wait (`next_attempt_at`); it never sets run_now_at, so a provider cooldown still applies. Commits."""
+    released = db.execute(
+        update(JobRankingTask).where(JobRankingTask.job_id == job_id, JobRankingTask.status == PENDING,
+                                     JobRankingTask.next_attempt_at.is_not(None),
+                                     JobRankingTask.last_error.like(f"{PARKED_FOR_DESCRIPTION}%"))
+        .values(next_attempt_at=None).execution_options(synchronize_session=False)).rowcount
+    db.commit()
+    return released
+
+
 def claim(db: Session, *, worker_id: str, limit: int, ready_accounts: Iterable[int], auto_rank_accounts: Iterable[int],
           now: datetime | None = None, lease_seconds: int | None = None) -> list[TaskClaim]:
     """Lease up to `limit` due PENDING tasks and move their jobs to RANKING. Commits.
@@ -661,7 +694,8 @@ def claim(db: Session, *, worker_id: str, limit: int, ready_accounts: Iterable[i
         .where(JobRankingTask.status == PENDING,
                or_(JobRankingTask.next_attempt_at.is_(None), JobRankingTask.next_attempt_at <= now),
                JobRankingTask.user_id.in_(ready),
-               or_(JobRankingTask.force.is_(True), JobRankingTask.user_id.in_(auto)))
+               or_(JobRankingTask.force.is_(True), JobRankingTask.user_id.in_(auto)),
+               ~_description_pending())
         .order_by(JobRankingTask.run_now_at.is_(None), JobRankingTask.force.desc(),
                   JobRankingTask.next_attempt_at.asc().nulls_first(), JobRankingTask.id)
         .limit(limit)
@@ -819,6 +853,7 @@ def _wait(db: Session, claimed: TaskClaim, message: str, now: datetime) -> str:
     task, job = _owned(db, claimed)
     _clear_lease(task)
     task.status, task.attempt_count = PENDING, max(0, task.attempt_count - 1)
+    task.started_at = None  # waiting is not a ranking start: it must not restart the account's cadence
     task.next_attempt_at = now + timedelta(seconds=get_settings().ranking_wait_seconds)
     task.last_error, task.error_category = message[:MAX_ERROR_LENGTH], ErrorCategory.CONFIGURATION
     if job is not None:

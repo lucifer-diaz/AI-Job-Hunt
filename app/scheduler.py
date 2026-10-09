@@ -29,6 +29,7 @@ from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app import scheduler_hooks
 from app.models import SchedulerJob
 from app.services import system_log, threads, tracing
 from app.services.scheduled_jobs import JOBS, JobContext, JobSpec
@@ -83,6 +84,9 @@ class Scheduler:
         self.started_at: datetime | None = None
         self._loop_task: asyncio.Task | None = None
         self._inflight: dict[str, asyncio.Task] = {}
+        self._wake: set[str] = set()  # nudged while a pass was running: run once more when it ends
+        self._event_loop: asyncio.AbstractEventLoop | None = None
+        self._wakers: dict[str, Callable[[], None]] = {}
 
     @property
     def running(self) -> bool:
@@ -104,10 +108,18 @@ class Scheduler:
             return
         await threads.run_io(self.ensure_rows)
         self.started_at = self.clock()
+        self._event_loop = asyncio.get_running_loop()
+        for name in self.specs:
+            self._wakers[name] = waker = (lambda n=name: self.nudge(n))
+            scheduler_hooks.register(name, waker)
         self._loop_task = asyncio.create_task(self._loop(), name="jobhunt-scheduler")
         log.info("scheduler started on %s", self.instance_id)
 
     async def stop(self, timeout: float = 10.0) -> None:
+        for name, waker in self._wakers.items():
+            scheduler_hooks.unregister(name, waker)
+        self._wakers.clear()
+        self._wake.clear()
         if self._loop_task is not None:
             self._loop_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -139,9 +151,38 @@ class Scheduler:
             task = self._inflight.get(name)
             if task is not None and not task.done():
                 continue
-            self._inflight[name] = asyncio.create_task(self.run_job(name, "schedule"), name=f"job-{name}")
+            self._launch(name, "schedule")
             started.append(name)
         return started
+
+    def _launch(self, name: str, trigger: str) -> None:
+        task = asyncio.create_task(self.run_job(name, trigger), name=f"job-{name}")
+        self._inflight[name] = task
+        task.add_done_callback(lambda _t, n=name: self._rerun_if_nudged(n))
+
+    def _rerun_if_nudged(self, name: str) -> None:
+        if name in self._wake and self.running and self.interval(name) > 0:
+            self._wake.discard(name)
+            self._launch(name, "manual")
+
+    def nudge(self, name: str) -> None:
+        """Run job `name` now: work was queued for it. Safe from any thread; a hint, never a queue.
+
+        A pass already running here is not interrupted; it runs once more when it ends, because it may have claimed
+        before this work existed. The run takes the same database lease as a scheduled one, so it never overlaps."""
+        loop = self._event_loop
+        if not self.enabled or loop is None or loop.is_closed() or name not in self.specs:
+            return
+        loop.call_soon_threadsafe(self._nudge_in_loop, name)
+
+    def _nudge_in_loop(self, name: str) -> None:
+        if not self.running or self.interval(name) <= 0:
+            return
+        task = self._inflight.get(name)
+        if task is not None and not task.done():
+            self._wake.add(name)
+        else:
+            self._launch(name, "manual")
 
     # ───────────── running a job ─────────────
 

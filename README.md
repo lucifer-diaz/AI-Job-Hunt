@@ -1096,7 +1096,7 @@ dropped — the queue just moves at the pace you chose.
 ### Tailored resume length
 
 Your resume data is the **foundation** a tailored resume is built from, not a checklist. For each job, tailoring
-picks the bullets that serve that posting and leaves the rest out. **Settings → Workflow & cadence → Tailored
+picks the bullets that serve that posting and leaves the rest out. **Running workers → Settings → Tailoring → Tailored
 resume length** sets the page target: **1 page**, **2 pages** (the default) or **3 pages** (not recommended).
 
 Each length has a bullet budget per role, newest role first. The last number repeats for every older role:
@@ -1124,7 +1124,7 @@ Each length has a bullet budget per role, newest role first. The last number rep
 
 ### Automatic tailoring
 
-**Settings → Workflow & cadence → Automatic tailoring** (off by default) queues a job for tailoring as soon as the
+**Running workers → Settings → Tailoring → Automatic tailoring** (off by default) queues a job for tailoring as soon as the
 ranking qualifies it (`app/services/auto_tailor.py`). The task starts at once when one of the account's tailoring
 slots is free; otherwise it waits in the queue and the tailor worker starts it when a slot frees up. An optional
 **fit score** (0 = every qualified job) holds back jobs that qualified with a lower score.
@@ -1477,7 +1477,7 @@ implement it.
 
 ### Approving below your reviewer minimum
 
-`min_review_score` (Settings → Workflow & cadence) is the score a tailored packet normally has to reach before
+`min_review_score` (Running workers → Settings → Approvals) is the score a tailored packet normally has to reach before
 it can be approved. You can waive it for a single packet: the Approve button becomes **Approve anyway…**, and
 the panel behind it shows the score against your minimum, lists the pre-submit checks that are still flagged,
 and takes an optional note.
@@ -1633,8 +1633,8 @@ The **Settings** tab holds every worker setting, one card per worker, saved toge
 | --- | --- | --- |
 | Your account, every worker | **Run automatically** (off = the queue waits; Run now still runs one task), attempts per task, wait before a retry | `AppSetting.preferences["workers"]` (`app/services/worker_settings.py`), `GET/PUT /api/workers/settings` |
 | Your account, JD recovery | Use the browser when HTTP finds nothing; ask a model on ambiguous pages | same |
-| Your account, ranking and tailoring | Jobs ranked at once, *rank at most every N minutes*, packets tailored at once (moved from Workflow & cadence); ranking's first and longest retry wait | `PATCH /api/settings` and the table above |
-| Your account, rate limits | Back off after a 429: first wait, multiplier, longest wait (moved from Workflow & cadence) | `PATCH /api/settings` |
+| Your account, ranking and tailoring | Jobs ranked at once, *rank at most every N minutes*, packets tailored at once (Running workers → Settings); ranking's first and longest retry wait | `PATCH /api/settings` and the table above |
+| Your account, rate limits | Back off after a 429: first wait, multiplier, longest wait (Running workers → Settings) | `PATCH /api/settings` |
 | The server (admins edit; others see them read-only) | Per scheduler job: run every N minutes (0 = off), tasks per run, side by side; ranking's most-per-account ceiling | `server_settings` table (migration 0033, `app/services/server_settings.py`), `PUT /api/workers/server-settings` |
 
 A value you never change follows the server, so an account that never opens the tab behaves as before; saving the server
@@ -1644,8 +1644,22 @@ pass claims tasks only as slots free up and re-reads *side by side* and *tasks p
 first; a changed interval starts counting from now. `.env` only supplies the default, and saving the environment's
 value removes the override. A model call can still be limited further down the line: a worker's *maximum concurrency*
 in AI Orchestration → Models, or LiteLLM / Ollama's own limits.
-Pausing a worker only holds its queue: a ranking you ask for yourself (and any Run now) still runs. Automatic tailoring
-and approvals stay in Workflow & cadence.
+Pausing a worker only holds its queue: a ranking you ask for yourself (and any Run now) still runs. Approvals (when a
+reviewed packet may be approved without you, and the desktop notification when a job is approved), who tailors and
+reviews, the tailored resume length and automatic tailoring are on the same tab: the **Tailoring** and **Approvals**
+cards (they used to be Settings → Workflow & cadence; that link now lands here). The weekly target and follow-up wait moved
+to Settings → Job preferences.
+
+**Hand-offs and Nudge.** A worker that finishes a job wakes the next one at once instead of waiting for its next pass:
+a finished parse (or recovery) wakes ranking, a queued tailoring task wakes the tailor worker. The wake-up is only a hint;
+the task tables stay the queue, so a missed one costs nothing (the scheduler's interval still applies). Ranking leaves a
+job whose description is still being parsed or recovered where it is (it is not claimed, takes no batch slot and is not
+parked), and starts it the moment the description is ready. If a hand-off was missed anyway, each worker's header has
+**Nudge to <next stage> · N**: it moves that worker's finished jobs that never reached the next stage (recovery → parsing,
+parsing → ranking, ranking → tailoring when automatic tailoring is on, reviewed packets → approval when your approval
+mode and minimum score would already approve them), each through the worker's own path. It never skips a provider
+cooldown and leaves stopped, removed, approved and applied jobs alone. When a job is approved the browser raises a desktop
+notification (once per approval, per browser; turn it off on the Approvals card).
 
 Every tab has a filter bar: search by job title, company or `#job id`, and a status filter (all, active, running, queued,
 retrying, failed or blocked, done) that says how many tasks each choice would show; the Ranking tab adds the tracker's
@@ -1906,7 +1920,7 @@ MCP_PACKET_DIR=./data/packets     # where get_job_packet writes resume files for
 
 Requests above these limits are rejected, not truncated.
 
-**3. Choose the mode (optional).** Settings → Workflow & cadence → *Tailoring & review* → **Claude Desktop**. In that mode, the background tailoring queue skips your jobs, so no model API is called for them. A task queued before you switched is cancelled rather than run. MCP saves never call a model API in either mode.
+**3. Choose the mode (optional).** Running workers → Settings → Tailoring → *Who tailors and reviews* → **Claude Desktop**. In that mode, the background tailoring queue skips your jobs, so no model API is called for them. A task queued before you switched is cancelled rather than run. MCP saves never call a model API in either mode.
 
 ### Verifying the connection
 
@@ -2947,7 +2961,7 @@ and operational checks.
 ### Focused settings
 
 Settings now has separate Profile, Job preferences, Resumes, Account & security,
-API keys and Workflow & cadence sections (AI models live in AI Orchestration → Models), with independent saves and
+API keys sections (AI models live in AI Orchestration → Models), with independent saves and
 mobile navigation. Account & security supports password changes that keep this
 browser signed in and revoke other sessions. See [settings contracts, testing,
 and rollback notes](docs/settings.md).

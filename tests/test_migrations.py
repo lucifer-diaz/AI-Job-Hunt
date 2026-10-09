@@ -202,12 +202,12 @@ def test_0014_turns_existing_resumes_into_unverified_versions(tmp_path):
     engine.dispose()
 
 
-def test_0034_reconciles_the_resume_selection_without_losing_text(tmp_path):
+def test_0036_reconciles_the_resume_selection_without_losing_text(tmp_path):
     """The active version wins; the drifted master text is kept as an inactive version; the mirrors follow."""
     engine = create_engine(f"sqlite:///{tmp_path / 'selection.db'}")
     now = datetime(2026, 10, 1, 9, 0)  # noqa: DTZ001  stored naive, like every timestamp column
     with engine.begin() as connection:
-        command.upgrade(alembic_config(connection), "0033")
+        command.upgrade(alembic_config(connection), "0035")
         user = _insert(connection, "users", email="drift@example.com", password_hash="!")
         profile = _insert(connection, "candidate_profiles", user_id=user, master_resume="Text typed later")
         a = _insert(connection, "resume_documents", user_id=user, original_filename="a.pdf", media_type="application/pdf",
@@ -220,7 +220,7 @@ def test_0034_reconciles_the_resume_selection_without_losing_text(tmp_path):
                     raw_text=raw, revision=0, is_active=active, is_default=default, verification_status="UNVERIFIED",
                     created_at=now, updated_at=now)
     with engine.begin() as connection:
-        command.upgrade(alembic_config(connection), "0034")
+        command.upgrade(alembic_config(connection), "0036")
     with engine.connect() as connection:
         rows = connection.execute(text(
             "SELECT version, name, source, raw_text, is_active, is_default FROM resumes ORDER BY version")).all()

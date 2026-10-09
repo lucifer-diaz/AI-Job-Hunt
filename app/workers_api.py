@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.auth import CurrentUser, current_user, get_user_db
 from app.scheduler_hooks import run_soon
-from app.services import backoff, monitoring, server_settings, worker_settings, workers
+from app.services import backoff, monitoring, server_settings, worker_handoff, worker_settings, workers
 
 router = APIRouter(prefix="/api/workers")
 
@@ -183,6 +183,30 @@ def retry_tasks(kind: str, payload: RetryIn, request: Request, background: Backg
     if job and out["retried"]:
         run_soon(background, request.app, job)
     return out
+
+
+@router.post("/{kind}/run-queued")
+def run_queued(kind: str, request: Request, background: BackgroundTasks, user: CurrentUser = Depends(current_user),
+               db: Session = Depends(get_user_db)) -> dict[str, Any]:
+    """Run every queued or waiting task of this worker now, in bulk (see workers.run_queued_now)."""
+    out = _guard(workers.run_queued_now, db, user.id, kind)
+    job = workers.KINDS[kind].scheduler_job
+    if job and out["released"]:
+        run_soon(background, request.app, job)
+    return out
+
+
+class NudgeIn(BaseModel):
+    job_ids: list[int] | None = Field(default=None, max_length=500)
+
+
+@router.post("/{kind}/nudge")
+def nudge_forward(kind: str, payload: NudgeIn | None = None, user: CurrentUser = Depends(current_user),
+                  db: Session = Depends(get_user_db)) -> dict[str, Any]:
+    """Move this worker's finished jobs that never reached the next stage on to it (each through its normal path).
+    `job_ids` limits it to those jobs: one row's button, or the rows shown."""
+    _guard(workers.kind_of, kind)
+    return worker_handoff.nudge_forward(db, user.id, kind, payload.job_ids if payload else None)
 
 
 @router.post("/{kind}/tasks/{task_id}/run-now")

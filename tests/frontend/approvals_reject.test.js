@@ -130,7 +130,7 @@ describe('rejecting a job from Approvals', () => {
     expect(panel).toContain('45');
     expect(panel).toContain('55');
     expect(panel).toContain('your minimum does not change');
-    expect(view().querySelector('a[href="#settings/workflow"]').textContent).toBe('Change my minimum');
+    expect(view().querySelector('a[href="#workers/settings"]').textContent).toBe('Change my minimum');
 
     await ui.A.approve({ dataset: { id: '7', override: '1' } });
     const [url, options] = fetchMock.mock.calls.find(([u]) => u.endsWith('/approve'));

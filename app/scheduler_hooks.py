@@ -1,7 +1,35 @@
 """Request-side hooks into the in-app scheduler (app.scheduler), kept free of imports so any router can use them."""
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
 from typing import Any
+
+log = logging.getLogger(__name__)
+
+# Wake-up hints. A worker (the scheduler's jobs, the tailor worker) registers how to wake it; any code, on any thread,
+# calls `nudge(name)` after it queued work for that worker. The task tables stay the only queue: a nudge only makes
+# the next pass start now instead of at the next tick, so a lost or repeated one changes nothing.
+_wakers: dict[str, Callable[[], None]] = {}
+
+
+def register(name: str, wake: Callable[[], None]) -> None:
+    _wakers[name] = wake
+
+
+def unregister(name: str, wake: Callable[[], None] | None = None) -> None:
+    if wake is None or _wakers.get(name) is wake:
+        _wakers.pop(name, None)
+
+
+def nudge(name: str) -> None:
+    """Ask the worker `name` to look for work now. Never raises and never blocks."""
+    wake = _wakers.get(name)
+    if wake is not None:
+        try:
+            wake()
+        except Exception:  # a hint must never change the outcome of the work that sent it
+            log.exception("could not nudge %s", name)
 
 
 def run_soon(background: Any, app: Any, name: str) -> None:

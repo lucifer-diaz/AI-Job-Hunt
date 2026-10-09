@@ -10,8 +10,8 @@ active version (resumes.is_active) is the only selection (app.services.resume_ve
 * the master text becomes the active version's text, and the library marks only that version's file as active;
 * is_default (a second selection nothing read) is cleared.
 
-Revision ID: 0034
-Revises: 0033
+Revision ID: 0036
+Revises: 0035
 Create Date: 2026-10-08 10:00:00
 """
 import hashlib
@@ -21,8 +21,8 @@ from datetime import UTC, datetime
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = '0034'
-down_revision: str | None = '0033'
+revision: str = '0036'
+down_revision: str | None = '0035'
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

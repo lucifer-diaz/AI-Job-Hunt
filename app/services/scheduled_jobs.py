@@ -26,6 +26,7 @@ from typing import Any
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
+from app import scheduler_hooks
 from app.models import (
     Application,
     Job,
@@ -366,9 +367,16 @@ async def jd_recovery_job(ctx: JobContext) -> dict[str, Any]:
 
     async def run(claim: jd_recovery.FetchClaim) -> str:
         try:
-            return await jd_recovery.process(ctx.sessions, claim, browser=browser)
+            outcome = await jd_recovery.process(ctx.sessions, claim, browser=browser)
         except Exception:  # noqa: BLE001  the lease expires and the task is retried (recover_expired)
             return "lost"
+        if outcome != "lost":
+            # Ranking skips a job while its recovery is active, so any end of recovery (recovered, failed, blocked,
+            # skipped, unchanged…) may have made a queued ranking ready. Only new text needs a parse.
+            if outcome == "recovered":
+                scheduler_hooks.nudge("jd_parsing")
+            scheduler_hooks.nudge("ranking")
+        return outcome
 
     try:
         claimed, outcomes = await run_live(

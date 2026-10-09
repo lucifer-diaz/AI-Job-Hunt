@@ -55,6 +55,8 @@ beforeEach(() => {
   routes = { summary: summary(), parsing: parsing(), activity: activity(), settings: settings(), workerSettings: workerSettings(), fail: false };
   fetchMock = vi.fn(async (url, opt = {}) => {
     if (routes.fail && url.startsWith('/api/workers')) return response({ detail: 'Workers are unavailable' }, 503);
+    if (opt.method === 'POST' && url.endsWith('/run-queued')) { routes.runQueued = url; return response({ kind: 'ranking', released: 3, task_ids: [1, 2, 3] }); }
+    if (opt.method === 'POST' && url.endsWith('/nudge')) { routes.nudged = url; routes.nudgeBody = opt.body ? JSON.parse(opt.body) : null; return response({ kind: 'parsing', to: 'Ranking', moved: [4, 5], skipped: [{ job_id: 6, reason: 'Dismissed in triage' }], message: null }); }
     if (opt.method === 'POST' && url.includes('/run-now')) return response(row({ status: 'QUEUED', run_now: true }));
     if (opt.method === 'POST' && url.includes('/cooldowns/reset')) return response({ cleared: ['OPENROUTER'] });
     if (opt.method === 'POST' && url.includes('kill')) return response({ stopped: 2, running: 1, cooldowns_cleared: url.endsWith('kill') ? [] : ['OPENROUTER'] });
@@ -169,6 +171,58 @@ describe('Running workers', () => {
     routes.parsing = { ...parsing(), rows: [row({ status: 'RETRYING', run_now: true, can_run_now: true, attempt: 1 })] };
     await open();
     expect(view().querySelector('.wk-row').textContent).toContain('First in line');
+  });
+
+  it('nudges finished jobs on to the next stage, and only offers it when some are waiting', async () => {
+    routes.summary.workers.find(w => w.kind === 'parsing').next_stage = { to: 'Ranking', waiting: 2 };
+    routes.summary.workers.find(w => w.kind === 'recovery').next_stage = { to: 'Parsing', waiting: 0 };
+    let v = await open();
+    const button = v.querySelector('[data-act="wk-nudge"]');
+    expect(button.textContent.trim()).toBe('Nudge to Ranking · 2');
+    expect(button.disabled).toBe(false);
+    await ui.A['wk-nudge']({ dataset: { kind: 'parsing' } });
+    expect(routes.nudged).toBe('/api/workers/parsing/nudge');
+    expect(document.getElementById('toast').textContent).toBe('Moved 2 jobs to Ranking · 1 skipped: Dismissed in triage');
+
+    v = await open('recovery');
+    expect(v.querySelector('[data-act="wk-nudge"]').disabled).toBe(true);  // nothing between recovery and parsing
+    v = await open('insights');
+    expect(v.querySelector('[data-act="wk-nudge"]')).toBeNull();  // the last stage has no next one
+  });
+
+  it('nudges one finished task, or every finished task shown, when its job is waiting for the next stage', async () => {
+    routes.summary.workers.find(w => w.kind === 'parsing').next_stage = { to: 'Ranking', waiting: 2, job_ids: [4, 5] };
+    routes.parsing = { ...parsing(), rows: [row({ task_id: 21, job_id: 4, status: 'COMPLETED', can_kill: false }),
+      row({ task_id: 22, job_id: 5, status: 'COMPLETED', can_kill: false }), row({ task_id: 23, job_id: 6, status: 'COMPLETED', can_kill: false }),
+      row({ task_id: 24, job_id: 7, status: 'FAILED', can_kill: false })] };
+    const v = await open();
+    const rows = [...v.querySelectorAll('.wk-row')];
+    expect(rows[0].querySelector('[data-act="wk-nudge"]').textContent.trim()).toBe('→ Ranking');
+    expect(rows[2].querySelector('[data-act="wk-nudge"]')).toBeNull();  // job 6 is already past it
+    expect(rows[2].textContent).toContain('moved on');
+    expect(rows[3].querySelector('[data-act="wk-nudge"]')).toBeNull();  // a failed task is retried, not nudged
+    expect(v.textContent).toContain('Nudge 2 shown to Ranking');
+    await ui.A['wk-nudge']({ dataset: { kind: 'parsing', job: '4' } });
+    expect(routes.nudgeBody).toEqual({ job_ids: [4] });
+    await ui.A['wk-nudge']({ dataset: { kind: 'parsing', jobs: '4,5' } });
+    expect(routes.nudgeBody).toEqual({ job_ids: [4, 5] });
+    await ui.A['wk-nudge']({ dataset: { kind: 'parsing' } });
+    expect(routes.nudgeBody).toBeNull();
+  });
+
+  it('ranks everything that is queued now, in bulk, after asking', async () => {
+    let v = await open('ranking');
+    const button = v.querySelector('[data-act="wk-run-queued"]');
+    expect(button.textContent.trim()).toBe('Rank 1 queued now');
+    confirmMock.mockClear();
+    await ui.A['wk-run-queued']({ dataset: { kind: 'ranking', n: '1' } });
+    expect(confirmMock).not.toHaveBeenCalled();  // one task needs no question
+    expect(routes.runQueued).toBe('/api/workers/ranking/run-queued');
+    await ui.A['wk-run-queued']({ dataset: { kind: 'ranking', n: '3' } });
+    expect(confirmMock).toHaveBeenCalledTimes(1);
+    expect(document.getElementById('toast').textContent).toBe('3 queued tasks released to run now');
+    v = await open('tailoring');
+    expect(v.querySelector('[data-act="wk-run-queued"]')).toBeNull();  // tailoring has no wait to skip
   });
 
   it('shows the rate-limit backoff and resets it', async () => {
@@ -336,11 +390,18 @@ describe('Running workers', () => {
     window.history.replaceState(null, '', '#workers/settings');
     ui.readHash();
     expect(ui.wkState().tab).toBe('settings');
-    ui.S.screen = 'settings'; ui.S.settingsSection = 'workflow'; ui.D.prefs = { weekly_target: 5, followup_days: 7 };
-    ui.D.profile = {};
-    ui.render();
-    expect(view().querySelector('#workflow-ranking_concurrency')).toBeNull();
-    expect(view().querySelector('a[href="#workers/settings"]')).not.toBeNull();
+    // Approvals, who tailors, the resume length and automatic tailoring moved here from Settings → Workflow & cadence.
+    expect(view().querySelector('#wk-set-approvals [data-field="application_mode"][value="automatic"]')).not.toBeNull();
+    expect(view().querySelector('#workers-min_review_score')).not.toBeNull();
+    expect(view().querySelector('#wk-set-tailoring [data-field="execution_mode"][value="claude_desktop"]')).not.toBeNull();
+    expect(view().querySelector('#wk-set-tailoring [data-field="tailor_pages"][value="2"]')).not.toBeNull();
+    expect(view().querySelector('#wk-set-tailoring [data-field="auto_tailor"]')).not.toBeNull();
+    expect(view().querySelector('#wk-notify')).not.toBeNull();
+    expect(view().textContent).not.toContain('Workflow & cadence');
+    // The old Settings section is gone: its link lands on this tab.
+    window.history.replaceState(null, '', '#settings/workflow');
+    ui.readHash();
+    expect(ui.S.screen).toBe('workers'); expect(ui.wkState().tab).toBe('settings');
   });
 
   it('shows the server settings read-only to an account that is not an admin', async () => {

@@ -67,7 +67,10 @@ def test_packet_flows_from_triage_to_tracker():
     detail = client.get(f"/api/approvals/{job['id']}").json()
     assert len(detail["checklist"]) == 6
     assert client.get(f"/api/jobs/{job['id']}/apply-kit").status_code == 400
+    before = client.get("/api/workspace/summary").json()["approved"]
     assert client.post(f"/api/jobs/{job['id']}/approve").status_code == 200
+    after = client.get("/api/workspace/summary").json()["approved"]  # what the browser compares to raise a notification
+    assert after["count"] == before["count"] + 1 and after["latest_at"] and after["latest_at"] >= (before["latest_at"] or "")
 
     kit = client.get(f"/api/jobs/{job['id']}/apply-kit").json()
     assert [f["kind"] for f in kit["files"]] == ["PDF", "DOCX", "TXT"]
@@ -278,7 +281,7 @@ def test_knowledge_edit_and_url_guards():
 def test_board_import_errors_are_readable(monkeypatch):
     import httpx
 
-    def missing_board(_db, token):
+    def missing_board(_db, token, **_filters):
         request = httpx.Request("GET", f"https://boards-api.greenhouse.io/v1/boards/{token}/jobs")
         raise httpx.HTTPStatusError("404", request=request, response=httpx.Response(404, request=request))
 
@@ -286,6 +289,25 @@ def test_board_import_errors_are_readable(monkeypatch):
     response = client.post("/api/import/greenhouse/nope")
     assert response.status_code == 404
     assert response.json()["detail"] == "No public Greenhouse board named 'nope'"
+
+
+def test_board_import_can_be_limited_to_teams_and_roles(monkeypatch):
+    posting = lambda i, title, team: {"id": i, "title": title, "content": "<p>Build things</p>", "absolute_url": f"https://x.test/{i}",
+                                      "location": {"name": "Remote"}, "departments": [{"name": team}]}
+    base = int(uuid.uuid4().int % 10**9)  # the test database is shared, so every run posts new ids
+    board = [posting(base + 1, "Backend Engineer", "Engineering"), posting(base + 2, "Data Engineer", "Data"),
+             posting(base + 3, "Account Executive", "Sales"), posting(base + 4, "Staff Engineer", "Engineering")]
+    monkeypatch.setattr("app.services.sources._fetch_greenhouse", lambda token: board)
+
+    teams = client.get("/api/import/greenhouse/acme/teams").json()["teams"]
+    assert teams == [{"name": "Engineering", "count": 2}, {"name": "Data", "count": 1}, {"name": "Sales", "count": 1}]
+
+    only_team = client.post("/api/import/greenhouse/acme", json={"teams": ["engineering"]}).json()
+    assert (only_team["seen"], only_team["total"]) == (2, 4)
+    both = client.post("/api/import/greenhouse/acme", json={"teams": ["Data", "Sales"], "roles": ["engineer"]}).json()
+    assert (both["seen"], both["created"]) == (1, 1)  # Data Engineer only: in a chosen team and a matching title
+    everything = client.post("/api/import/greenhouse/acme").json()
+    assert (everything["seen"], everything["total"]) == (4, 4)
 
 
 def test_rank_batch_queues_unranked_jobs_without_ranking_them():

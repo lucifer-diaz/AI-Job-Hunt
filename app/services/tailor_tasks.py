@@ -127,6 +127,10 @@ def enqueue(db: Session, ids: list[int], mode: str = "tailor", regenerate: bool 
             continue
         tasks.append(task)
     db.commit()
+    if tasks:
+        from app import scheduler_hooks
+
+        scheduler_hooks.nudge("tailor")  # start now instead of at the next poll; the task table is the queue
     return {"queued": [task_dict(t) for t in tasks], "skipped": skipped}
 
 
@@ -331,12 +335,28 @@ class TailorWorker:
         self.worker_id = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:6]}"
         self._loop_task: asyncio.Task | None = None
         self._inflight: set[asyncio.Task] = set()
+        self._wake: asyncio.Event | None = None
+        self._event_loop: asyncio.AbstractEventLoop | None = None
 
     async def start(self) -> None:
         if self._loop_task is None:
+            from app import scheduler_hooks
+
+            self._event_loop = asyncio.get_running_loop()
+            self._wake = asyncio.Event()
+            scheduler_hooks.register("tailor", self.nudge)
             self._loop_task = asyncio.create_task(self._loop(), name="jobhunt-tailor-worker")
 
+    def nudge(self) -> None:
+        """Look for queued tasks now instead of at the next poll. Safe from any thread; the queue is the task table."""
+        loop, wake = self._event_loop, self._wake
+        if loop is not None and wake is not None and not loop.is_closed():
+            loop.call_soon_threadsafe(wake.set)
+
     async def stop(self, timeout: float = 10.0) -> None:
+        from app import scheduler_hooks
+
+        scheduler_hooks.unregister("tailor", self.nudge)
         if self._loop_task is not None:
             self._loop_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -359,7 +379,13 @@ class TailorWorker:
                     job.add_done_callback(self._inflight.discard)
             except Exception:  # never let one bad poll end the loop
                 log.exception("tailor worker poll failed")
-            await asyncio.sleep(self.poll_seconds)
+            if self._wake is None:
+                await asyncio.sleep(self.poll_seconds)
+                continue
+            # Sleep until the next poll, or until something queued a task and nudged.
+            with suppress(TimeoutError):
+                await asyncio.wait_for(self._wake.wait(), self.poll_seconds)
+            self._wake.clear()
 
 
 def build_worker(sessions: SessionFactory | None = None) -> TailorWorker:

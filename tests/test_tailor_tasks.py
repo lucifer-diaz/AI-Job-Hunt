@@ -114,3 +114,40 @@ def test_tasks_are_private_to_their_account(anonymous):
     assert bob.post("/api/tailor-tasks/cancel", json={"ids": [task_id]}).json() == {"cancelled": 0}
     assert [t["id"] for t in alice.get("/api/tailor-tasks").json()] == [task_id]
     assert TestClient(app).get("/api/tailor-tasks").status_code == 401
+
+
+def test_queueing_a_task_wakes_the_tailor_worker_instead_of_waiting_for_the_poll():
+    import asyncio
+    import time
+
+    claimed_at = []
+
+    use_resume_text(client, "Built Python FastAPI services at 10k rps", name="Test Candidate", headline="Engineer")
+
+    async def scenario():
+        worker = tailor_tasks.TailorWorker(SessionLocal, concurrency=1, poll_seconds=30.0)  # a poll alone would take 30 s
+        real = tailor_tasks.claim_next
+
+        def spy(*args, **kwargs):
+            task_id = real(*args, **kwargs)
+            if task_id is not None:
+                claimed_at.append(time.monotonic())
+            return task_id
+
+        tailor_tasks.claim_next = spy
+        try:
+            await worker.start()
+            await asyncio.sleep(0.3)  # the first poll found nothing
+            started = time.monotonic()
+            await asyncio.to_thread(lambda: client.post("/api/tailor-tasks", json={"ids": [shortlisted_job()]}))
+            for _ in range(50):
+                if claimed_at:
+                    break
+                await asyncio.sleep(0.1)
+            return started
+        finally:
+            tailor_tasks.claim_next = real
+            await worker.stop()
+
+    started = asyncio.run(scenario())
+    assert claimed_at and claimed_at[0] - started < 5

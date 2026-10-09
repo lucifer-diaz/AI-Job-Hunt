@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlparse
 
 import httpx
@@ -99,6 +100,7 @@ from app.services.contacts import recruiters_of, set_primary_recruiter
 from app.services.exports import markdown_to_simple_pdf
 from app.services.knowledge import question_key
 from app.services.sources import (
+    board_teams,
     import_greenhouse,
     import_lever,
     refresh_apify_run,
@@ -472,9 +474,16 @@ def add_job(payload: ManualJobIn, db: Session = Depends(get_user_db)):
     return {"created": created, "job": job_dict(job)}
 
 
-def _board_import(importer, db: Session, token: str, label: str):
+class BoardImportIn(BaseModel):
+    """Which part of a company board to import; empty means every open role."""
+    teams: list[str] = Field(default_factory=list, max_length=20)
+    roles: list[str] = Field(default_factory=list, max_length=20)
+
+
+def _board_import(importer, db: Session, token: str, label: str, payload: BoardImportIn | None = None):
     try:
-        return importer(db, token)
+        payload = payload or BoardImportIn()
+        return importer(db, token, teams=payload.teams, roles=payload.roles)
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code == 404:
             raise HTTPException(404, f"No public {label} board named '{token}'") from exc
@@ -486,13 +495,20 @@ def _board_import(importer, db: Session, token: str, label: str):
 
 
 @app.post("/api/import/lever/{site}")
-def lever(site: str, db: Session = Depends(get_user_db)):
-    return _board_import(import_lever, db, site, "Lever")
+def lever(site: str, payload: BoardImportIn | None = None, db: Session = Depends(get_user_db)):
+    return _board_import(import_lever, db, site, "Lever", payload)
 
 
 @app.post("/api/import/greenhouse/{board_token}")
-def greenhouse(board_token: str, db: Session = Depends(get_user_db)):
-    return _board_import(import_greenhouse, db, board_token, "Greenhouse")
+def greenhouse(board_token: str, payload: BoardImportIn | None = None, db: Session = Depends(get_user_db)):
+    return _board_import(import_greenhouse, db, board_token, "Greenhouse", payload)
+
+
+@app.get("/api/import/{kind}/{token}/teams")
+def board_team_list(kind: Literal["greenhouse", "lever"], token: str, db: Session = Depends(get_user_db)):
+    """The teams a company board has open roles in (nothing is imported)."""
+    label = "Lever" if kind == "lever" else "Greenhouse"
+    return {"teams": _board_import(lambda _db, tok, **_: board_teams(kind, tok), db, token, label)}
 
 
 @app.post("/api/search/apify")

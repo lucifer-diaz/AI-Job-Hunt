@@ -172,6 +172,8 @@ function readHash() {
   if (screen === 'discovery' && sub === 'ranking') { S.screen = 'workers'; wkState().tab = 'ranking'; return; }
   // AI models moved from Settings to AI Orchestration → Models.
   if (screen === 'settings' && sub === 'ai') { S.screen = 'orchestration'; orchState().workspace = 'models'; return; }
+  // Workflow & cadence moved to Running workers → Settings (approvals, tailoring, cadence); old links land there.
+  if (screen === 'settings' && sub === 'workflow') { S.screen = 'workers'; wkState().tab = 'settings'; return; }
   if (screen === 'orchestration') orchState().workspace = sub === 'models' ? 'models' : 'pipeline';
   if (SCREENS.includes(screen)) S.screen = screen;
   if (screen === 'workers' && WK_TABS.some(([id]) => id === sub)) wkState().tab = sub;
@@ -330,7 +332,7 @@ let loadSeq = 0;
 async function load() {
   const seq = ++loadSeq;
   try {
-    await Promise.all([LOADERS[S.screen](), api('/api/workspace/summary').then(s => { D.summary = s; })]);
+    await Promise.all([LOADERS[S.screen](), api('/api/workspace/summary').then(s => { D.summary = s; announceApprovals(s); })]);
   } catch (e) { toast(e.message, true); }
   if (seq === loadSeq) { render(); focusPacket(); guideRefresh(); }
 }
@@ -667,7 +669,7 @@ function renderRanking(r = D.ranking) {
       <div class="grow" style="min-width:0"><div class="small b ellipsis">${esc(t.title)} <span class="muted" style="font-weight:400">· ${esc(t.company)}</span></div>
         <div class="xs ellipsis ${t.status === 'FAILED' ? '' : 'muted'}" style="${t.status === 'FAILED' ? 'color:var(--bad)' : ''}" title="${attr(detail)}">${esc(why)} · ${esc(detail)}</div>
         ${rankProgress(t, r.in_flight)}</div>
-      ${wkRankActions(t)}${retry}${remove}${btn('Job', 'open-job', { id: t.job_id }, 'sm')}${rankTaskPill(t)}</div>`;
+      ${wkRankActions(t)}${retry}${remove}${wkRowNudge('ranking', t.job_id, t.status)}${btn('Job', 'open-job', { id: t.job_id }, 'sm')}${rankTaskPill(t)}</div>`;
   };
   const section = (key, title, sub, items, actions = '') => `<section class="card flush">
     <div class="row between wrap gap10" style="padding:14px 18px;border-bottom:1px solid var(--line2)"><div><div class="card-title" style="font-size:16px">${esc(title)}</div><div class="card-sub">${esc(sub)}</div></div>${actions ? `<div class="row gap8">${actions}</div>` : ''}</div>
@@ -924,9 +926,12 @@ function renderSetup() {
           <button class="linkbtn" data-act="go" data-screen="discovery" data-mode="table">See every job in the table →</button></div></div>` : ''}
     </section>
     ${renderManualAdd()}
-    <section class="card pad16"><div class="card-title sm mb4">Import a company board</div><div class="small muted mb12">Pull every open role from a company's Greenhouse or Lever board. No Apify token needed.</div>
+    <section class="card pad16"><div class="card-title sm mb4">Import a company board</div><div class="small muted mb12">Pull the open roles from a company's Greenhouse or Lever board — all of them, or only the teams and roles you pick. No Apify token needed.</div>
       <div class="row gap8">${selectF('board', 'kind', 'greenhouse', [['greenhouse', 'Greenhouse'], ['lever', 'Lever']], 'style="width:auto"')}${inputF('board', 'token', '', 'placeholder="Board token, e.g. stripe"')}</div>
       <div class="helper">The token is the company slug in boards.greenhouse.io/<b>stripe</b> or jobs.lever.co/<b>stripe</b>.</div>
+      <label class="field mt8">Role keywords <span class="faint">(optional)</span>${inputF('board', 'roles', '', 'placeholder="e.g. engineer, data scientist" aria-describedby="board-roles-help"')}<span class="helper" id="board-roles-help">Only roles whose title has one of these words. Separate several with commas.</span></label>
+      <div class="mt8"><div class="row base between"><span class="xs muted">Teams <span class="faint">(optional)</span></span>${btn(label('boardTeams', S.boardTeams ? 'Refresh teams' : 'Find teams', 'Looking…'), 'board-teams', {}, 'ghost sm', isBusy('boardTeams'))}</div>
+        ${S.boardTeams ? (S.boardTeams.length ? `<div class="row gap6 wrap mt6" role="group" aria-label="Teams">${S.boardTeams.map(t => { const on = (fv('board', 'teams', []) || []).includes(t.name); return `<button type="button" class="btn sm ${on ? 'soft' : ''}" data-act="toggle-board-team" data-team="${attr(t.name)}" aria-pressed="${on ? 'true' : 'false'}">${on ? '✓ ' : ''}${esc(t.name)} <span class="tiny faint">${t.count}</span></button>`; }).join('')}</div>` : '<div class="helper">This board does not list teams — use role keywords instead.</div>') : '<div class="helper">Look up the board to choose from its teams. Nothing picked imports every open role.</div>'}</div>
       ${btn(label('board', 'Import board', 'Importing…'), 'import-board', {}, 'block mt8', isBusy('board'))}</section>
   </div></div>`;
 }
@@ -1032,7 +1037,7 @@ function renderTaskStack(tasks = D.tasks || [], all = tasks) {
       <div class="grow" style="min-width:0"><div class="small b ellipsis">${esc(t.title)} <span class="muted" style="font-weight:400">· ${esc(t.company)}</span></div>
         <div class="xs ${t.status === 'failed' ? '' : 'muted'} ellipsis" style="${t.status === 'failed' ? 'color:var(--bad)' : ''}">${t.mode === 'skip' ? 'Skip tailoring · ' : ''}${detail}</div>
         ${active ? `<div class="row base gap8 mt6"><span class="grow">${bar(t.progress + '%', t.status === 'running' ? '#5b4ae8' : '#c9cbe0')}</span><span class="xs mono muted none" style="width:34px;text-align:right">${t.progress}%</span></div>` : ''}</div>
-      ${wkTailorActions(t)}${actions}${taskPill(t)}</div>`;
+      ${wkTailorActions(t)}${S.screen === 'workers' ? wkRowNudge('tailoring', t.job_id, t.status.toUpperCase()) : ''}${actions}${taskPill(t)}</div>`;
   }).join('');
   return `<section class="card flush">
     <div class="row wrap gap10" style="padding:14px 18px;border-bottom:1px solid var(--line2)">
@@ -1220,7 +1225,7 @@ function renderApprovalOverride(job, a, r) {
       <div class="col gap4">${flagged.map(c => `<div class="xs"><b>${esc(c.label)}</b> · ${esc(c.detail)}</div>`).join('')}</div></div>` : ''}
     ${inputF('override', 'note', '', 'placeholder="Why this one is fine anyway (optional)" maxlength="2000"')}
     <div class="row gap8 wrap mt10">${btn(label('approve', 'Approve anyway → apply kit', 'Approving…'), 'approve', { id: job.id, override: '1' }, 'good', isBusy('approve'))}
-      <a class="btn sm ghost" href="#settings/workflow">Change my minimum</a></div></div>`;
+      <a class="btn sm ghost" href="#workers/settings">Change my minimum</a></div></div>`;
 }
 
 // Turning a job down. The reason is optional on purpose: one click is enough when you just want it gone,
@@ -1619,6 +1624,7 @@ async function refreshTasks() {
     toast(one ? (one.status === 'succeeded' ? `${one.company}: packet ready · reviewer ${fitTxt(one.result?.reviewer_score)}${one.result?.auto_approved ? ' · auto-approved' : ''}` : one.status === 'failed' ? `${one.company}: ${one.error}` : `${one.company}: cancelled`)
       : `${ok.length} packet${ok.length === 1 ? '' : 's'} ready${bad.length ? ` · ${bad.length} failed` : ''}`, !ok.length && !!bad.length);
   }
+  if (finished.some(t => t.result?.auto_approved)) refreshApprovals();
   scheduleTaskPoll();
   return { finished };
 }
@@ -1700,7 +1706,10 @@ const FANOUT = { role_location: 'one run per role × location', location: 'one r
 const ACTOR_USES = { boards: 'Boards', location: 'Location', distance: 'Radius', country: 'Country', remote: 'Remote only', job_type: 'Job type', hours: 'Posted within', easy_apply: 'Easy Apply', fetch_description: 'Full descriptions', annual_salary: 'Annual salary', linkedin_company_ids: 'Company IDs', seniority: 'Seniority', salary_only: 'Salary listed', visa_sponsorship: 'Visa sponsorship', exclude_keywords: 'Exclude', skip_agencies: 'Skip agencies', remote_platforms: 'Boards', remoteok_url: 'Start page', yc_batches: 'YC batches', startup_details: 'Company details', hn_month: 'Thread month', min_salary: 'Min salary' };
 const STARTUP_ACTORS = { waas: 'antishock/workatastartup-jobs-scraper', yc: 'automation-lab/ycombinator-jobs-scraper', hn: 'parseforge/hn-whoishiring-scraper', wellfound: 'blackfalcondata/wellfound-scraper' };
 // A user-added actor reads whichever filters its input template names.
-const TEMPLATE_USES = { hours_old: 'hours', days_old: 'hours', is_remote: 'remote', job_type: 'job_type', location: 'location', locations: 'location', sites: 'boards', country: 'country' };
+const TEMPLATE_USES = { hours_old: 'hours', days_old: 'hours', is_remote: 'remote', job_type: 'job_type', location: 'location', locations: 'location', sites: 'boards', country: 'country',
+  seniority: 'seniority', distance: 'distance', easy_apply: 'easy_apply', fetch_description: 'fetch_description', enforce_annual_salary: 'annual_salary', salary_only: 'salary_only',
+  visa_sponsorship: 'visa_sponsorship', exclude_keywords: 'exclude_keywords', linkedin_company_ids: 'linkedin_company_ids', skip_agencies: 'skip_agencies', min_salary: 'min_salary',
+  yc_batches: 'yc_batches', hn_month: 'hn_month', startup_details: 'startup_details', remote_platforms: 'remote_platforms', remoteok_url: 'remoteok_url' };
 function actorUses(a) {
   if (!a.custom) return a.supports || [];
   const text = JSON.stringify(a.input_template || {});
@@ -1714,7 +1723,7 @@ function actorCard(a, on) {
       <span class="xs muted" style="display:block" id="${id}-about">${esc(a.summary)} <span class="sr-only">Cost ${esc(a.cost)}, ${esc(FANOUT[a.fan_out] || a.fan_out)}.</span></span>
       <span class="tiny faint" style="display:block;margin-top:4px" aria-hidden="true"><span class="mono">${esc(a.id)}</span> · ${esc(a.cost)} · ${esc(FANOUT[a.fan_out] || a.fan_out)}</span>
       ${uses.length ? `<span class="actor-uses" aria-label="Settings it uses: ${attr(uses.join(', '))}">${uses.map(u => `<span>${esc(u)}</span>`).join('')}</span>` : ''}</span>
-    ${a.custom ? `<button type="button" class="btn ghost sm danger none" data-act="remove-actor" data-actor="${attr(a.id)}" aria-label="Remove ${attr(a.name)}">Remove</button>` : ''}</label>`;
+    ${a.custom ? `<span class="row gap6"><button type="button" class="btn ghost sm" data-act="edit-actor" data-actor="${attr(a.id)}" aria-label="Edit ${attr(a.name)}">Edit</button><button type="button" class="btn ghost sm danger none" data-act="remove-actor" data-actor="${attr(a.id)}" aria-label="Remove ${attr(a.name)}">Remove</button></span>` : ''}</label>`;
 }
 function actorPicker(list, on) {
   const groups = [...new Set([...(D.actors?.groups || []), ...list.map(a => a.group)])];
@@ -1741,15 +1750,17 @@ function usedCheck(list, on, key, field, value, text) {
 const COUNTRIES = ['usa', 'uk', 'canada', 'australia', 'india', 'singapore', 'uae', 'germany', 'france', 'netherlands', 'ireland', 'spain', 'italy', 'japan', 'brazil', 'mexico', 'south africa', 'new zealand'];
 const DEFAULT_TEMPLATE = JSON.stringify({ searchTerm: '{{role}}', location: '{{location}}', maxItems: '{{max_results}}' }, null, 2);
 function addActorForm() {
-  return `<div class="box brand mt10" style="padding:14px"><div class="small b mb4">Add an Apify actor</div>
-    <div class="xs muted mb8">Any Store actor that returns job listings. Items are normalized automatically — title, company, location, URL and description.</div>
-    <div class="row gap8 wrap">${inputF('ca', 'id', '', 'placeholder="username/actor-name" style="flex:1 1 220px;margin-top:0"')}${btn(label('lookup', 'Look up on Apify', 'Looking up…'), 'lookup-actor', {}, 'sm', isBusy('lookup'))}</div>
+  const editing = S.editActor, f = S.forms.ca || {};
+  return `<div class="box brand mt10" style="padding:14px"><div class="small b mb4">${editing ? `Edit ${esc(f.name || editing)}` : 'Add an Apify actor'}</div>
+    <div class="xs muted mb8">${editing ? 'Change how this actor is called: its name, how many runs it starts and the input it receives.' : 'Any Store actor that returns job listings. Items are normalized automatically — title, company, location, URL and description.'}</div>
+    <div class="row gap8 wrap">${inputF('ca', 'id', '', `placeholder="username/actor-name" style="flex:1 1 220px;margin-top:0" ${editing ? 'readonly aria-readonly="true"' : ''}`)}${btn(label('lookup', editing ? 'Load input schema' : 'Look up on Apify', 'Looking up…'), 'lookup-actor', {}, 'sm', isBusy('lookup'))}</div>
     ${inputF('ca', 'name', '', 'placeholder="Display name"')}
     <label class="field mt8">Runs${selectF('ca', 'fan_out', 'role_location', Object.entries(FANOUT).map(([k, v]) => [k, v[0].toUpperCase() + v.slice(1)]))}</label>
     <label class="field mt8">Input template (JSON)${textareaF('ca', 'input_template', DEFAULT_TEMPLATE, 'style="font-family:var(--mono);font-size:11.5px;min-height:130px"')}</label>
-    <div class="helper">Placeholders: ${(D.actors?.placeholders || []).map(x => `<span class="mono">{{${x}}}</span>`).join(' ')}. A value that is only a placeholder keeps its type (number, list, true/false).</div>
-    ${S.caFields ? `<div class="xs muted mt8">This actor accepts: ${S.caFields.map(f => `<span class="mono">${esc(f.name)}${f.required ? '*' : ''}</span>`).join(', ') || 'no documented inputs'}</div>` : ''}
-    ${btn('Add actor', 'add-actor', {}, 'primary sm mt10')}</div>`;
+    <div class="helper" role="group" aria-label="Placeholders">Placeholders — select a value in the template (or place the cursor) and click one to insert it: <span class="row gap6 wrap mt4">${(D.actors?.placeholders || []).map(x => `<button type="button" class="btn sm" data-act="insert-placeholder" data-name="${attr(x)}"><span class="mono">{{${x}}}</span></button>`).join('')}</span> A value that is only a placeholder keeps its type (number, list, true/false).</div>
+    ${S.caFields ? `<div class="xs muted mt8" role="group" aria-label="Input schema">This actor accepts — click a field to add it with the matching placeholder:
+      <div class="row gap6 wrap mt4">${S.caFields.map(x => `<button type="button" class="btn sm" data-act="insert-actor-field" data-name="${attr(x.name)}" title="${attr([x.type, x.title, x.suggested && `fills with ${x.suggested}`].filter(Boolean).join(' · '))}"><span class="mono">${esc(x.name)}${x.required ? '*' : ''}</span>${x.suggested ? ` <span class="tiny mono" style="color:var(--brand)">${esc(x.suggested)}</span>` : x.type ? ` <span class="tiny faint">${esc(x.type)}</span>` : ''}</button>`).join('') || 'no documented inputs'}</div></div>` : ''}
+    <div class="row gap8 mt10">${btn(editing ? 'Save changes' : 'Add actor', 'add-actor', {}, 'primary sm')}${editing ? btn('Cancel', 'toggle-add-actor', {}, 'ghost sm') : ''}</div></div>`;
 }
 const setupResumeValue = p => p.resume_mode === 'fixed' || (!p.resume_mode && p.resume_id) ? String(p.resume_id) : (p.resume_mode || 'auto');
 const setupResume = value => ['auto', 'active'].includes(String(value)) ? { resume_mode: String(value), resume_id: null } : { resume_mode: 'fixed', resume_id: Number(value) };
@@ -2064,7 +2075,41 @@ const A = {
   'toggle-actor': el => toggleIn('actors', el.dataset.actor),
   'toggle-list': el => toggleIn(el.dataset.key, el.dataset.value),
   'toggle-inputs': () => { S.showInputs = !S.showInputs; render(); },
-  'toggle-add-actor': (el, e) => { e.preventDefault(); S.addActor = !S.addActor; S.caFields = null; render(); },
+  'toggle-add-actor': (el, e) => { e.preventDefault(); S.addActor = !S.addActor; S.editActor = null; S.caFields = null; delete S.forms.ca; render(); },
+  'edit-actor': (el, e) => {
+    e.preventDefault(); e.stopPropagation();
+    const p = D.searchProfile.profile, id = el.dataset.actor;
+    const entry = fv('sp', 'custom_actors', p.custom_actors || []).find(c => c.id === id);
+    if (!entry) return;
+    S.forms.ca = { id, name: entry.name || id, fan_out: entry.fan_out || 'role_location', input_template: JSON.stringify(entry.input_template || {}, null, 2) };
+    S.addActor = true; S.editActor = id; S.caFields = null;
+    render();
+    document.getElementById('ca-input_template')?.scrollIntoView?.({ block: 'center' });
+  },
+  'insert-placeholder': el => {
+    const box = document.getElementById('ca-input_template'), f = S.forms.ca || {};
+    const text = box ? box.value : (f.input_template ?? DEFAULT_TEMPLATE);
+    const start = box ? box.selectionStart : text.length, end = box ? box.selectionEnd : text.length;
+    const token = `{{${el.dataset.name}}}`;
+    // Inside a string the placeholder goes in as is; over a bare value (false, 20…) it replaces it as a quoted string.
+    const inString = (text.slice(0, start).match(/(?<!\\)"/g) || []).length % 2 === 1;
+    const insert = inString ? token : `"${token}"`;
+    setF('ca', 'input_template', text.slice(0, start) + insert + text.slice(end));
+    render();
+    const next = document.getElementById('ca-input_template');
+    if (next) { next.focus(); next.selectionStart = next.selectionEnd = start + insert.length; }
+  },
+  'insert-actor-field': el => {
+    const f = S.forms.ca || {}, name = el.dataset.name;
+    let template;
+    try { template = JSON.parse(f.input_template ?? DEFAULT_TEMPLATE); } catch { return toast('Fix the JSON before adding a field', true); }
+    if (!template || typeof template !== 'object' || Array.isArray(template)) return toast('The input template must be a JSON object', true);
+    if (name in template) return toast(`${name} is already in the template`);
+    const field = (S.caFields || []).find(x => x.name === name) || {};
+    template[name] = field.suggested || (field.default ?? field.prefill ?? (field.type === 'integer' || field.type === 'number' ? 0 : field.type === 'boolean' ? false : field.type === 'array' ? [] : field.type === 'object' ? {} : ''));
+    setF('ca', 'input_template', JSON.stringify(template, null, 2));
+    render();
+  },
   'remove-actor': (el, e) => {
     e.preventDefault(); e.stopPropagation();
     const p = D.searchProfile.profile, id = el.dataset.actor;
@@ -2076,25 +2121,30 @@ const A = {
     const id = (fv('ca', 'id', '') || '').trim();
     if (!/^[\w.-]+[/~][\w.-]+$/.test(id)) throw new Error('Enter the actor as username/actor-name');
     const out = await api('/api/search/actors/lookup', { method: 'POST', body: { id } });
-    setF('ca', 'id', out.id); setF('ca', 'name', out.name);
-    if (Object.keys(out.input_template).length) setF('ca', 'input_template', JSON.stringify(out.input_template, null, 2));
+    if (!S.editActor) {
+      setF('ca', 'id', out.id); setF('ca', 'name', out.name);
+      if (Object.keys(out.input_template).length) setF('ca', 'input_template', JSON.stringify(out.input_template, null, 2));
+    }
     S.caFields = out.fields;
     return out;
   }, out => `Found ${out.name} · ${out.fields.length} documented inputs`),
   'add-actor': () => {
     const f = S.forms.ca || {}, p = D.searchProfile.profile, id = (f.id || '').trim();
     if (!/^[\w.-]+[/~][\w.-]+$/.test(id)) return toast('Enter the actor as username/actor-name', true);
-    if ((D.actors?.actors || []).some(a => !a.custom && a.id === id)) return toast('That actor is already built in — just tick it', true);
+    if (!S.editActor && (D.actors?.actors || []).some(a => !a.custom && a.id === id)) return toast('That actor is already built in — just tick it', true);
     let template;
     try { template = JSON.parse(f.input_template ?? DEFAULT_TEMPLATE); } catch { return toast('The input template is not valid JSON', true); }
     if (!template || typeof template !== 'object' || Array.isArray(template)) return toast('The input template must be a JSON object', true);
-    const customs = fv('sp', 'custom_actors', p.custom_actors || []).filter(c => c.id !== id);
-    customs.push({ id, name: (f.name || '').trim() || id, fan_out: f.fan_out || 'role_location', input_template: template });
+    const entry = { id, name: (f.name || '').trim() || id, fan_out: f.fan_out || 'role_location', input_template: template };
+    const existing = fv('sp', 'custom_actors', p.custom_actors || []);
+    // Editing keeps the actor where it was in the list; adding appends (replacing a same-id entry).
+    const customs = existing.some(c => c.id === id) ? existing.map(c => c.id === id ? entry : c) : [...existing, entry];
     setF('sp', 'custom_actors', customs);
     const selected = fv('sp', 'actors', p.actors || []);
     if (!selected.includes(id)) setF('sp', 'actors', [...selected, id]);
-    delete S.forms.ca; S.addActor = false; S.caFields = null;
-    render(); toast('Actor added — save the profile to keep it');
+    const edited = !!S.editActor;
+    delete S.forms.ca; S.addActor = false; S.editActor = null; S.caFields = null;
+    render(); toast(edited ? 'Actor updated — save the profile to keep it' : 'Actor added — save the profile to keep it');
   },
   'save-search': () => busy('saveSp', saveSetup, setup => `“${setup.name}” saved`),
   'save-as-new': () => busy('saveAsNew', () => createSetup(), setup => `Saved as “${setup.name}”`),
@@ -2197,12 +2247,24 @@ const A = {
     toast(out.created ? 'Added to your triage queue' : 'That job was already in the pipeline — details refreshed');
     openJob(out.job.id);
   }),
+  'board-teams': () => busy('boardTeams', async () => {
+    const kind = fv('board', 'kind', 'greenhouse'), token = (fv('board', 'token', '') || '').trim();
+    if (!/^[\w.-]+$/.test(token)) throw new Error('Enter the board token — letters, numbers, dots or dashes');
+    const out = await api(`/api/import/${kind}/${encodeURIComponent(token)}/teams`);
+    S.boardTeams = out.teams; setF('board', 'teams', []);
+    return out;
+  }, out => out.teams.length ? `${out.teams.length} teams found` : 'This board does not list teams'),
+  'toggle-board-team': el => {
+    const team = el.dataset.team, chosen = fv('board', 'teams', []) || [];
+    setF('board', 'teams', chosen.includes(team) ? chosen.filter(t => t !== team) : [...chosen, team]); render();
+  },
   'import-board': () => busy('board', async () => {
     const kind = fv('board', 'kind', 'greenhouse'), token = (fv('board', 'token', '') || '').trim();
     if (!/^[\w.-]+$/.test(token)) throw new Error('Enter the board token — letters, numbers, dots or dashes');
-    const out = await api(`/api/import/${kind}/${encodeURIComponent(token)}`, { method: 'POST' });
-    delete S.forms.board; await load(); return out;
-  }, out => `Imported ${out.created} new of ${out.seen} open roles — they are in your triage queue`),
+    const body = { teams: fv('board', 'teams', []) || [], roles: String(fv('board', 'roles', '') || '').split(',').map(r => r.trim()).filter(Boolean) };
+    const out = await api(`/api/import/${kind}/${encodeURIComponent(token)}`, { method: 'POST', body });
+    delete S.forms.board; S.boardTeams = null; await load(); return out;
+  }, out => `Imported ${out.created} new of ${out.seen} ${out.seen === out.total ? 'open' : 'matching'} roles — they are in your triage queue`),
   'ranking-retry': el => busy('rankRetry' + el.dataset.job, async () => {
     const out = await api(`/api/jobs/${el.dataset.job}/rank`, { method: 'POST' });
     await loadRanking();
@@ -2519,11 +2581,57 @@ document.addEventListener('toggle', e => {
   if (id && e.target.isConnected) { if (e.target.open) SETTING_DETAILS.add(id); else SETTING_DETAILS.delete(id); }
 }, true);
 
+/* ───────────── desktop notification: a job was approved ───────────── */
+// The server says when the newest approval happened (summary.approved.latest_at); the browser remembers the last one it
+// announced, so each approval raises one notification, a reload repeats none and history is never replayed.
+const NOTIFY_KEYS = { on: 'jobhunt.notify.approved', seen: 'jobhunt.notify.approved.seen' };
+// Where localStorage is blocked (some private or embedded contexts) the values live in memory for this page instead.
+const lsMemory = new Map();
+const lsGet = key => { try { const v = localStorage.getItem(key); if (v !== null) return v; } catch { /* use memory */ } return lsMemory.has(key) ? lsMemory.get(key) : null; };
+const lsSet = (key, value) => { lsMemory.set(key, String(value)); try { localStorage.setItem(key, value); } catch { /* memory only */ } };
+const notifySupported = () => typeof Notification !== 'undefined';
+// On unless the person turned it off here; the browser's own permission still has the last word.
+const notifyWanted = () => lsGet(NOTIFY_KEYS.on) !== 'off';
+const notifyPermission = () => (notifySupported() ? Notification.permission : 'unsupported');
+async function setNotifyApproved(on) {
+  lsSet(NOTIFY_KEYS.on, on ? 'on' : 'off');
+  if (on && notifySupported() && Notification.permission === 'default') await Notification.requestPermission();  // needs a click
+  return notifyPermission();
+}
+function announceApprovals(summary) {
+  if (!summary?.approved) return false;
+  const latest = summary.approved.latest_at, seen = lsGet(NOTIFY_KEYS.seen);
+  // First visit: what is already approved is not news. With no approval yet the baseline is empty (''), so the first
+  // approval that ever happens is announced.
+  if (seen === null) { lsSet(NOTIFY_KEYS.seen, latest || ''); return false; }
+  if (!latest) return false;
+  if (latest <= seen) return false;
+  lsSet(NOTIFY_KEYS.seen, latest);
+  if (!notifyWanted()) return false;
+  const count = summary.approved.count, body = `${count} approved packet${count === 1 ? '' : 's'} ready: check them before you apply.`;
+  if (notifySupported() && Notification.permission === 'granted') {
+    const note = new Notification('Job approved', { body, tag: 'jobhunt-approved' });
+    note.onclick = () => { window.focus?.(); go('approvals'); note.close?.(); };
+  } else toast(`Job approved · ${body}`);
+  return true;
+}
+async function refreshApprovals() {
+  try { const s = await api('/api/workspace/summary'); D.summary = s; return announceApprovals(s); } catch { return false; }
+}
+// Slow and quiet: it runs in a hidden tab too (that is when a notification matters) and never redraws the screen.
+const APPROVAL_POLL_MS = 30000;
+let approvalTimer = null;
+function watchApprovals() {
+  clearInterval(approvalTimer);
+  approvalTimer = setInterval(refreshApprovals, APPROVAL_POLL_MS);
+}
+
 /* ───────────── boot ───────────── */
 readHash();
 setHash();
 render();
 refreshTasks();
+watchApprovals();
 load().then(async () => {
   guideBoot();
   try { const prof = await api('/api/profile'); D.profileRoles = prof.target_roles || []; } catch { /* optional */ }

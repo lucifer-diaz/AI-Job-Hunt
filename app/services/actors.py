@@ -35,7 +35,11 @@ ACTOR_GROUPS = ("Job boards", "LinkedIn", "Remote boards", "Startups", "Your act
 HN_MONTH_RE = re.compile(r"^(current|\d{4}-(0[1-9]|1[0-2]))$")
 YC_BATCH_RE = re.compile(r"^[WSFX]\d{2}$", re.IGNORECASE)
 PLACEHOLDERS = ("role", "roles", "location", "locations", "max_results", "hours_old", "days_old",
-                "is_remote", "job_type", "sites", "country", "skill", "skills")
+                "is_remote", "job_type", "sites", "country", "skill", "skills",
+                # The rest of the setup form, so an actor can read any filter a person can set.
+                "seniority", "distance", "offset", "easy_apply", "fetch_description", "enforce_annual_salary",
+                "salary_only", "visa_sponsorship", "exclude_keywords", "linkedin_company_ids", "skip_agencies",
+                "min_salary", "yc_batches", "hn_month", "startup_details", "remote_platforms", "remoteok_url")
 REMOTE_WORDS = {"remote", "anywhere", "worldwide", "global"}
 
 
@@ -591,6 +595,17 @@ def custom_spec(entry: dict) -> ActorSpec:
             "job_type": sp.get("job_type") or "", "sites": sp.get("sites") or [],
             "country": sp.get("country_indeed") or "",
             "skill": (primary_skills(sp) or [""])[0], "skills": primary_skills(sp),
+            "seniority": list(sp.get("seniority") or []), "distance": int(sp.get("distance") if sp.get("distance") is not None else 50),
+            "offset": int(sp.get("offset") or 0), "easy_apply": bool(sp.get("easy_apply")),
+            "fetch_description": bool(sp.get("fetch_description", True)),
+            "enforce_annual_salary": bool(sp.get("enforce_annual_salary")), "salary_only": bool(sp.get("salary_only")),
+            "visa_sponsorship": bool(sp.get("visa_sponsorship")),
+            "exclude_keywords": list(sp.get("exclude_keywords") or []),
+            "linkedin_company_ids": list(sp.get("linkedin_company_ids") or []),
+            "skip_agencies": bool(sp.get("skip_agencies", True)), "min_salary": int(sp.get("min_salary") or 0),
+            "yc_batches": list(sp.get("yc_batches") or []), "hn_month": sp.get("hn_month") or "current",
+            "startup_details": bool(sp.get("startup_details", True)),
+            "remote_platforms": list(sp.get("remote_platforms") or []), "remoteok_url": sp.get("remoteok_url") or "",
         }
         bad = unknown_placeholders(template)
         warnings = [f"{entry.get('name') or entry['id']}: unknown placeholders {', '.join(bad)} were sent as text."] if bad else []

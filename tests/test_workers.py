@@ -515,3 +515,176 @@ def test_clear_finished_hides_the_list_only_and_can_be_undone(user_id, signed_in
     with SessionLocal() as db:
         assert ranker.finished_cleared_at(db, user_id) is not None
     assert client.post("/api/workers/nope/clear").status_code == 404
+
+
+# ───────────── nudge forward ─────────────
+
+def _next(client, kind):
+    return next(w for w in client.get("/api/workers").json()["workers"] if w["kind"] == kind)["next_stage"]
+
+
+def test_nudge_moves_a_recovered_description_into_parsing_once(user_id, signed_in, monkeypatch):
+    monkeypatch.setattr(get_settings(), "jd_parse_enabled", True)
+    with SessionLocal() as db:
+        job = add_job(db, user_id)
+        stopped = add_job(db, user_id)
+        done = JobDescriptionFetchTask(user_id=user_id, job_id=job.id, status="COMPLETED", result_code="RECOVERED")
+        done_stopped = JobDescriptionFetchTask(user_id=user_id, job_id=stopped.id, status="COMPLETED", result_code="RECOVERED")
+        db.add_all([done, done_stopped])
+        parse_task(db, user_id, stopped, status="FAILED", last_error="Stopped by you")
+        db.commit()
+        job_id = job.id
+    client = signed_in(user_id)
+    assert _next(client, "recovery") == {"to": "Parsing", "waiting": 1, "job_ids": [job_id]}
+    out = client.post("/api/workers/recovery/nudge").json()
+    assert (out["to"], out["moved"], out["skipped"]) == ("Parsing", [job_id], [])
+    with SessionLocal() as db:
+        task = db.scalar(select(JobDescriptionParseTask).where(JobDescriptionParseTask.job_id == job_id))
+        assert task.status == "PENDING" and task.run_now_at is None
+    again = client.post("/api/workers/recovery/nudge").json()
+    assert again["moved"] == [] and again["message"]  # idempotent: nothing left to move
+
+
+def test_nudge_moves_a_parsed_job_into_ranking_and_releases_a_parked_one(user_id, signed_in):
+    with SessionLocal() as db:
+        fresh, stopped = (add_job(db, user_id) for _ in range(2))
+        parked = add_job(db, user_id, state=ranker.S.RANK_PENDING)
+        for job in (fresh, parked, stopped):
+            parse_task(db, user_id, job, status="COMPLETED")
+        db.add(JobRankingTask(user_id=user_id, job_id=parked.id, status="PENDING", attempt_count=0,
+                              next_attempt_at=utcnow() + timedelta(minutes=15),
+                              last_error="The job description is still being parsed"))
+        db.add(JobRankingTask(user_id=user_id, job_id=stopped.id, status="SKIPPED", attempt_count=0,
+                              last_error="Stopped by you"))
+        db.commit()
+        fresh_id, parked_id, stopped_id = fresh.id, parked.id, stopped.id
+    out = signed_in(user_id).post("/api/workers/parsing/nudge").json()
+    assert out["to"] == "Ranking" and set(out["moved"]) == {fresh_id, parked_id}
+    with SessionLocal() as db:
+        assert db.scalar(select(JobRankingTask).where(JobRankingTask.job_id == fresh_id)).status == "PENDING"
+        task = db.scalar(select(JobRankingTask).where(JobRankingTask.job_id == parked_id))
+        assert task.next_attempt_at is None and task.run_now_at is None
+        assert db.scalars(select(JobRankingTask).where(JobRankingTask.job_id == stopped_id)).all()[0].last_error == "Stopped by you"
+        assert len(db.scalars(select(JobRankingTask).where(JobRankingTask.job_id == stopped_id)).all()) == 1
+
+
+def test_nudge_queues_qualified_jobs_for_tailoring_only_when_automatic_tailoring_is_on(user_id, signed_in):
+    from app.models import AppSetting
+
+    with SessionLocal() as db:
+        job = add_job(db, user_id, status="shortlisted", fit_score=82, state=ranker.S.QUALIFIED)
+        db.commit()
+        job_id = job.id
+    client = signed_in(user_id)
+    assert _next(client, "ranking") == {"to": "Tailoring", "waiting": 0, "job_ids": []}  # auto-tailor is off
+    with SessionLocal() as db:
+        row = db.scalar(select(AppSetting).where(AppSetting.user_id == user_id)) or AppSetting(user_id=user_id)
+        row.preferences = {**(row.preferences or {}), "auto_tailor": {"enabled": True, "enabled_at": "2020-01-01T00:00:00"}}
+        db.add(row)
+        db.commit()
+    assert _next(client, "ranking")["waiting"] == 1
+    out = client.post("/api/workers/ranking/nudge").json()
+    assert out["moved"] == [job_id]
+    with SessionLocal() as db:
+        task = db.scalar(select(TailorTask).where(TailorTask.job_id == job_id))
+        assert task.status == "queued" and task.run_now_at is None
+    assert client.post("/api/workers/ranking/nudge").json()["moved"] == []
+
+
+def test_nudge_approves_a_reviewed_packet_only_where_the_accounts_policy_would(user_id, signed_in):
+    from app.models import AppSetting
+
+    with SessionLocal() as db:
+        high, low = add_job(db, user_id, status="tailored"), add_job(db, user_id, status="tailored")
+        db.add_all([ResumeVariant(user_id=user_id, job_id=high.id, version=1, reviewer_score=91, markdown="x"),
+                    ResumeVariant(user_id=user_id, job_id=low.id, version=1, reviewer_score=40, markdown="x")])
+        row = db.scalar(select(AppSetting).where(AppSetting.user_id == user_id)) or AppSetting(user_id=user_id)
+        row.application_mode, row.min_review_score = "manual_approval", 70
+        db.add(row)
+        db.commit()
+        high_id, low_id = high.id, low.id
+    client = signed_in(user_id)
+    assert client.post("/api/workers/tailoring/nudge").json()["moved"] == []  # manual approval: a person decides
+    with SessionLocal() as db:
+        db.scalar(select(AppSetting).where(AppSetting.user_id == user_id)).application_mode = "automatic"
+        db.commit()
+    assert _next(client, "reviewing") == {"to": "Approval", "waiting": 1, "job_ids": [high_id]}
+    assert client.post("/api/workers/reviewing/nudge").json()["moved"] == [high_id]
+    with SessionLocal() as db:
+        assert db.get(Job, high_id).status == "approved" and db.get(Job, low_id).status == "tailored"
+        assert db.get(Job, high_id).application.status == "approved"
+
+
+def test_nudge_can_be_limited_to_chosen_jobs_and_says_why_one_was_not_moved(user_id, signed_in, monkeypatch):
+    monkeypatch.setattr(get_settings(), "jd_parse_enabled", True)
+    with SessionLocal() as db:
+        first, second, parsed = add_job(db, user_id), add_job(db, user_id), add_job(db, user_id)
+        for job in (first, second):
+            db.add(JobDescriptionFetchTask(user_id=user_id, job_id=job.id, status="COMPLETED", result_code="RECOVERED"))
+        parse_task(db, user_id, parsed, status="COMPLETED")
+        db.commit()
+        first_id, second_id, parsed_id = first.id, second.id, parsed.id
+    client = signed_in(user_id)
+    assert set(_next(client, "recovery")["job_ids"]) == {first_id, second_id}
+    out = client.post("/api/workers/recovery/nudge", json={"job_ids": [first_id, parsed_id]}).json()
+    assert out["moved"] == [first_id]
+    assert [s["job_id"] for s in out["skipped"]] == [parsed_id] and "Not waiting for Parsing" in out["skipped"][0]["reason"]
+    with SessionLocal() as db:  # the second job was not asked for, so it stays where it was
+        assert db.scalars(select(JobDescriptionParseTask).where(JobDescriptionParseTask.job_id == second_id)).all() == []
+
+
+def test_nudge_never_touches_another_account_and_insights_has_no_next_stage(user_id, signed_in, monkeypatch):
+    monkeypatch.setattr(get_settings(), "jd_parse_enabled", True)
+    other = make_user(SessionLocal)
+    with SessionLocal() as db:
+        theirs = add_job(db, other)
+        db.add(JobDescriptionFetchTask(user_id=other, job_id=theirs.id, status="COMPLETED", result_code="RECOVERED"))
+        db.commit()
+        theirs_id = theirs.id
+    client = signed_in(user_id)
+    assert client.post("/api/workers/recovery/nudge").json()["moved"] == []
+    with SessionLocal() as db:
+        assert db.scalars(select(JobDescriptionParseTask).where(JobDescriptionParseTask.job_id == theirs_id)).all() == []
+    assert _next(client, "insights") is None
+    assert client.post("/api/workers/insights/nudge").json()["message"] == "This worker has no next stage"
+    assert client.post("/api/workers/nonsense/nudge").status_code == 404
+
+
+def test_run_queued_now_releases_every_waiting_task_without_skipping_cooldowns(user_id, signed_in):
+    other = make_user(SessionLocal)
+    with SessionLocal() as db:
+        queued, waiting, stopped, theirs = (add_job(db, uid) for uid in (user_id, user_id, user_id, other))
+        later = utcnow() + timedelta(minutes=15)
+        for job, uid, extra in ((queued, user_id, {}), (waiting, user_id, {"next_attempt_at": later, "attempt_count": 1}),
+                                (stopped, user_id, {"last_error": "Stopped by you"}), (theirs, other, {"next_attempt_at": later})):
+            db.add(JobRankingTask(user_id=uid, job_id=job.id, status="PENDING", **{"attempt_count": 0, **extra}))
+        db.commit()
+        ids = {"queued": queued.id, "waiting": waiting.id, "stopped": stopped.id, "theirs": theirs.id}
+    out = signed_in(user_id).post("/api/workers/ranking/run-queued").json()
+    assert out["released"] == 2
+    with SessionLocal() as db:
+        task = {name: db.scalar(select(JobRankingTask).where(JobRankingTask.job_id == job_id)) for name, job_id in ids.items()}
+        assert task["queued"].force and task["waiting"].force and task["waiting"].next_attempt_at is None
+        assert all(t.run_now_at is None for t in task.values())  # a provider cooldown still applies
+        assert not task["stopped"].force and not task["theirs"].force and task["theirs"].next_attempt_at is not None
+    assert signed_in(user_id).post("/api/workers/tailoring/run-queued").status_code == 409
+
+
+def test_approval_nudge_leaves_held_and_stopped_packets_alone(user_id, signed_in):
+    from app.models import AppSetting
+
+    with SessionLocal() as db:
+        passed, held, stopped = (add_job(db, user_id, status=st) for st in ("tailored", "pending_approval", "tailored"))
+        for job in (passed, held, stopped):
+            db.add(ResumeVariant(user_id=user_id, job_id=job.id, version=1, reviewer_score=95, markdown="x"))
+        db.add(TailorTask(user_id=user_id, job_id=stopped.id, status="cancelled", stage="done", attempts=1,
+                          error="Stopped by you"))
+        row = db.scalar(select(AppSetting).where(AppSetting.user_id == user_id)) or AppSetting(user_id=user_id)
+        row.application_mode, row.min_review_score = "automatic", 70
+        db.add(row)
+        db.commit()
+        passed_id, held_id, stopped_id = passed.id, held.id, stopped.id
+    out = signed_in(user_id).post("/api/workers/reviewing/nudge").json()
+    assert out["moved"] == [passed_id]  # a reviewer's hold for a person, and a stopped run, stay as they are
+    with SessionLocal() as db:
+        assert db.get(Job, held_id).status == "pending_approval" and db.get(Job, stopped_id).status == "tailored"
