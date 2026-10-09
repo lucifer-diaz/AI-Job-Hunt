@@ -41,7 +41,7 @@ from app.models import (
 )
 from app.prompts import build_evidence_extraction_prompt
 from app.scheduler_hooks import run_soon
-from app.services import feedback_learning, ranker, resume_length, resume_verification
+from app.services import ats_keywords, feedback_learning, ranker, resume_length, resume_verification
 from app.services.actors import (
     ACTOR_GROUPS,
     BUILTIN,
@@ -1620,18 +1620,12 @@ def run_detail(run_id: int, db: Session = Depends(get_user_db)):
 # ───────────────────────────── tailor / approvals / apply kit ─────────────────────────────
 
 def keyword_coverage(job: Job, resume: ResumeVariant | None) -> list[dict]:
+    """The posting's ATS keywords and whether the tailored resume covers each (app.services.ats_keywords)."""
     analysis = job.fit_analysis or {}
-    text = (resume.markdown.split("## Source Resume")[0] if resume else "").lower()
     names = requirement_names(analysis)  # a ranking may list requirements by id ("1", "req_002"): show their text
-    gaps = " ".join(str(g) for g in ranked_list(analysis, "gaps", names)
-                    + ranked_list(analysis, "must_have_missing", names)).lower()
-    words = list(dict.fromkeys(str(w) for w in [*ranked_list(analysis, "keywords", names),
-                                                 *ranked_list(analysis, "strong_matches", names)]))[:14]
-    out = []
-    for word in words:
-        status = "covered" if str(word).lower() in text else "partial" if str(word).lower() in gaps else "missing"
-        out.append({"word": str(word), "status": status})
-    return out
+    gaps = " ".join(str(g) for g in ranked_list(analysis, "gaps", names) + ranked_list(analysis, "must_have_missing", names)
+                    + ranked_list(analysis, "partial_matches", names))
+    return ats_keywords.coverage(job, resume.markdown if resume else "", analysis, names, gaps)
 
 
 # Status filters for the Tailor and Approvals screens: filter name -> test on a row.
@@ -1704,10 +1698,9 @@ def tailor_queue(q: str = "", min_fit: int = 0, min_review: int = 0, board: str 
     for job in jobs:
         resume = latest.get(job.id)
         coverage = keyword_coverage(job, resume) if resume else []
-        covered = sum(1 for word in coverage if word["status"] == "covered")
         rows.append({**job_card(job), "has_resume": resume is not None,
                      "reviewer_score": resume.reviewer_score if resume else None,
-                     "ats_pct": round(100 * covered / len(coverage)) if coverage else None,
+                     "ats_pct": ats_keywords.score(coverage),
                      "untailored": bool((resume.content or {}).get("untailored")) if resume else False,
                      "resume_version": resume.version if resume else None,
                      "review_decision": (resume.reviewer_notes or {}).get("decision") if resume else None,
@@ -1726,7 +1719,6 @@ def packet(db: Session, job: Job) -> dict:
         return base
     edits = resume_edits(db, resume)
     coverage = keyword_coverage(job, resume)
-    covered = sum(1 for k in coverage if k["status"] == "covered")
     notes = resume.reviewer_notes or {}
     review = ([{"tone": "good", "text": s} for s in notes.get("strengths") or []]
               + [{"tone": "warn", "text": s} for s in notes.get("improvements") or []]
@@ -1737,7 +1729,7 @@ def packet(db: Session, job: Job) -> dict:
         "untailored": bool((resume.content or {}).get("untailored")),
         "cover_letter": strip_citations(resume.cover_letter), "cover_words": len(resume.cover_letter.split()),
         "edits": edits, "review": review, "keywords": coverage,
-        "ats_pct": round(100 * covered / len(coverage)) if coverage else None,
+        "ats_pct": ats_keywords.score(coverage),
         # The page target it was tailored for (app.services.resume_length) and a rough estimate of its length.
         "length": {"target_pages": ((resume.content or {}).get("length_plan") or {}).get("pages"),
                    "estimated_pages": resume_length.estimate_pages(resume.markdown or "")},
