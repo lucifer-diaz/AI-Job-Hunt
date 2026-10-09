@@ -75,6 +75,9 @@ class User(Base):
     job_requirements: Mapped[list[JobRequirementEvidence]] = relationship(back_populates="user", passive_deletes=True)
     job_parse_tasks: Mapped[list[JobDescriptionParseTask]] = relationship(back_populates="user", passive_deletes=True)
     job_fetch_tasks: Mapped[list[JobDescriptionFetchTask]] = relationship(back_populates="user", passive_deletes=True)
+    job_insight_tasks: Mapped[list[JobInsightTask]] = relationship(back_populates="user", passive_deletes=True)
+    job_insights: Mapped[list[JobInsight]] = relationship(back_populates="user", passive_deletes=True)
+    insight_observations: Mapped[list[InsightObservation]] = relationship(back_populates="user", passive_deletes=True)
     removed_postings: Mapped[list[RemovedPosting]] = relationship(back_populates="user", passive_deletes=True)
     job_feedback: Mapped[list[JobFeedbackEvent]] = relationship(back_populates="user", passive_deletes=True)
     job_structured_changes: Mapped[list[JobStructuredDataChange]] = relationship(back_populates="user",
@@ -542,6 +545,10 @@ class Job(Base):
                                                                       passive_deletes=True)
     fetch_tasks: Mapped[list[JobDescriptionFetchTask]] = relationship(back_populates="job", cascade="all, delete-orphan",
                                                                       passive_deletes=True)
+    insight_tasks: Mapped[list[JobInsightTask]] = relationship(back_populates="job", cascade="all, delete-orphan",
+                                                               passive_deletes=True)
+    insight: Mapped[JobInsight | None] = relationship(back_populates="job", uselist=False, cascade="all, delete-orphan",
+                                                      passive_deletes=True)
     application: Mapped[Application | None] = relationship(back_populates="job", uselist=False, cascade="all, delete-orphan")
     transitions: Mapped[list[WorkflowTransition]] = relationship(back_populates="job", cascade="all, delete-orphan",
                                                                  passive_deletes=True,
@@ -728,6 +735,184 @@ class JobDescriptionFetchTask(Base):
 
     job: Mapped[Job] = relationship(back_populates="fetch_tasks")
     user: Mapped[User] = relationship(back_populates="job_fetch_tasks")
+
+
+JOB_INSIGHT_TASK_STATUSES = ("PENDING", "PROCESSING", "COMPLETED", "PARTIAL", "FAILED", "SKIPPED")
+ACTIVE_JOB_INSIGHT_TASK_STATUSES = ("PENDING", "PROCESSING")
+JOB_INSIGHT_TASK_REASONS = ("AUTO_APPROVED", "USER_REQUEST", "REFRESH", "BACKLOG")
+JOB_INSIGHT_STATUSES = ("NONE", "COMPLETED", "PARTIAL", "FAILED")
+INSIGHT_CATEGORIES = ("COMPENSATION", "COMPANY", "VALUES", "CULTURE", "SENTIMENT", "INTERVIEW_PROCESS",
+                      "INTERVIEW_QUESTION")
+INSIGHT_SOURCE_TYPES = ("EMPLOYER", "JOB_DESCRIPTION", "RECRUITER", "OFFICIAL_COMPANY", "GLASSDOOR", "PAYSCALE",
+                        "INDEED", "LEVELS_FYI", "PUBLIC_WEB")
+INSIGHT_MATCH_STATUSES = ("ACCEPTED", "NEEDS_REVIEW", "REJECTED")
+
+
+class JobInsightTask(Base):
+    """One queued research run for a job's insights (app.services.job_insights), claimed by the scheduler.
+
+    A job has at most one PENDING or PROCESSING task (uq_job_insight_tasks_active_job), so approval, a person's
+    Refresh and the backlog sweep can never research the same job twice at once. Finished tasks are kept: they say
+    which sources answered (`source_status`) and why a run failed.
+    """
+
+    __tablename__ = "job_insight_tasks"
+    __table_args__ = (
+        CheckConstraint(f"status IN ({_values(JOB_INSIGHT_TASK_STATUSES)})", name="ck_job_insight_tasks_status"),
+        CheckConstraint(f"reason IN ({_values(JOB_INSIGHT_TASK_REASONS)})", name="ck_job_insight_tasks_reason"),
+        CheckConstraint("attempt_count >= 0", name="ck_job_insight_tasks_attempt_count"),
+        Index("uq_job_insight_tasks_active_job", "job_id", unique=True,
+              postgresql_where=text(f"status IN ({_values(ACTIVE_JOB_INSIGHT_TASK_STATUSES)})"),
+              sqlite_where=text(f"status IN ({_values(ACTIVE_JOB_INSIGHT_TASK_STATUSES)})")),
+        Index("ix_job_insight_tasks_claim", "status", "next_attempt_at"),
+        Index("ix_job_insight_tasks_user_created", "user_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("job_insight_tasks")
+    job_id: Mapped[int] = mapped_column(
+        ForeignKey("jobs.id", ondelete="CASCADE", name="fk_job_insight_tasks_job_id"), index=True)
+    application_id: Mapped[int | None] = mapped_column(
+        ForeignKey("applications.id", ondelete="SET NULL", name="fk_job_insight_tasks_application_id"), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="PENDING")
+    reason: Mapped[str] = mapped_column(String(20), default="AUTO_APPROVED")
+    # A person's Refresh: researched again even when cached observations are still fresh.
+    force_refresh: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_category: Mapped[ErrorCategory | None] = mapped_column(_enum_type(ErrorCategory), nullable=True)
+    # {source name: {status, detail, observations, cached, fetched_at}}: what each source returned on this run.
+    source_status: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    locked_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    lock_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lock_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Asked to run now from Running workers (app.services.workers): claimed first, without waiting. Cleared on claim.
+    run_now_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    job: Mapped[Job] = relationship(back_populates="insight_tasks")
+    user: Mapped[User] = relationship(back_populates="job_insight_tasks")
+
+
+class JobInsight(Base):
+    """A job's research package: one row per job, rewritten section by section as research succeeds.
+
+    Every list item carries `kind` (FACT, DERIVED, GENERATED or UNKNOWN), and every FACT names the observations it rests
+    on (`source_ids` → insight_observations.id). A section is only replaced by a run that produced it, so a failed
+    refresh never erases what the last good run found. `recruiter_input` is the person's own entry and research never
+    writes it.
+    """
+
+    __tablename__ = "job_insights"
+    __table_args__ = (
+        CheckConstraint(f"status IN ({_values(JOB_INSIGHT_STATUSES)})", name="ck_job_insights_status"),
+        UniqueConstraint("job_id", name="uq_job_insights_job_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("job_insights")
+    job_id: Mapped[int] = mapped_column(
+        ForeignKey("jobs.id", ondelete="CASCADE", name="fk_job_insights_job_id"))
+    status: Mapped[str] = mapped_column(String(20), default="NONE")
+    # Identity the research matched against (app.services.job_insights.matching), never inferred by a model.
+    company_name: Mapped[str] = mapped_column(String(300), default="")
+    canonical_company: Mapped[str] = mapped_column(String(300), default="")
+    company_domain: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    # The company's own website: from the posting's data, or entered by the person. Never guessed.
+    company_website: Mapped[str | None] = mapped_column(String(1200), nullable=True)
+    company_website_source: Mapped[str | None] = mapped_column(String(20), nullable=True)  # POSTING | USER
+    original_title: Mapped[str] = mapped_column(String(300), default="")
+    normalized_title: Mapped[str] = mapped_column(String(300), default="")
+    seniority: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    discipline: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    city: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    country: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    currency: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    # Sections (each written whole, only by a run that produced it).
+    compensation: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    company: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    interview_process: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    reported_questions: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    generated_questions: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    questions_to_ask: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    focus_areas: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    value_prep: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    compensation_prep: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    risks: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    unknowns: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    # The person's own notes from the recruiter: {recruiter_name, budget_low, budget_high, currency, period, basis,
+    # interview_process, recruiter_questions, comments}. Research reads it and never writes it.
+    recruiter_input: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # What produced the generated sections: {company_insights: v1, interview_insights: v1}, the model, a confidence.
+    prompt_versions: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    model: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    generated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)  # first successful run
+    refreshed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)  # latest successful run
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)  # the latest run's failure, if any
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+    job: Mapped[Job] = relationship(back_populates="insight")
+    user: Mapped[User] = relationship(back_populates="job_insights")
+    observations: Mapped[list[InsightObservation]] = relationship(
+        back_populates="insight", cascade="all, delete-orphan", passive_deletes=True, order_by="InsightObservation.id")
+
+
+class InsightObservation(Base):
+    """One researched fact as its source stated it: a salary range, a stated value, a reported interview question.
+
+    Concise normalized extracts only (`data`), never a page or a review copied whole. Provenance travels with it:
+    source type, provider, actor, URL or run reference, when it was observed and fetched, how well it matched this
+    job's company, role and location, and whether that match was accepted.
+    """
+
+    __tablename__ = "insight_observations"
+    __table_args__ = (
+        CheckConstraint(f"category IN ({_values(INSIGHT_CATEGORIES)})", name="ck_insight_observations_category"),
+        CheckConstraint(f"source_type IN ({_values(INSIGHT_SOURCE_TYPES)})",
+                        name="ck_insight_observations_source_type"),
+        CheckConstraint(f"match_status IN ({_values(INSIGHT_MATCH_STATUSES)})",
+                        name="ck_insight_observations_match_status"),
+        CheckConstraint("confidence >= 0 AND confidence <= 1", name="ck_insight_observations_confidence"),
+        Index("ix_insight_observations_insight_category", "job_insight_id", "category"),
+        Index("ix_insight_observations_cache", "user_id", "cache_key", "fetched_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("insight_observations")
+    job_insight_id: Mapped[int] = mapped_column(
+        ForeignKey("job_insights.id", ondelete="CASCADE", name="fk_insight_observations_job_insight_id"), index=True)
+    category: Mapped[str] = mapped_column(String(30))
+    source_type: Mapped[str] = mapped_column(String(30))
+    source_name: Mapped[str] = mapped_column(String(40))  # the adapter that produced it, e.g. glassdoor_compensation
+    provider: Mapped[str | None] = mapped_column(String(40), nullable=True)  # APIFY | WEB | None (stored data)
+    actor_id: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    source_url: Mapped[str | None] = mapped_column(String(1200), nullable=True)
+    source_reference: Mapped[str | None] = mapped_column(String(300), nullable=True)  # e.g. apify run/dataset id
+    title: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    match_scope: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    match_status: Mapped[str] = mapped_column(String(20), default="ACCEPTED")
+    match_reason: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    confidence: Mapped[float] = mapped_column(Float, default=0.5)
+    recency: Mapped[str | None] = mapped_column(String(10), nullable=True)  # HIGH | MEDIUM | LOW | UNKNOWN
+    observed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    # company/role/location/source: an observation another job of the same account can reuse while it is fresh.
+    cache_key: Mapped[str | None] = mapped_column(String(400), nullable=True)
+    # Replaced by a newer answer from the same source. Kept only while a section kept from an earlier run still cites
+    # it (a refresh whose model step failed), so a displayed fact never loses its provenance; never used as current data.
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    data: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+    insight: Mapped[JobInsight] = relationship(back_populates="observations")
+    user: Mapped[User] = relationship(back_populates="insight_observations")
 
 
 class RemovedPosting(Base):
@@ -1350,7 +1535,7 @@ class JobRankingTask(Base):
 
 
 LLM_STAGES = ("RANKER", "TAILOR", "REVIEWER", "RESUME_PARSER", "JD_PARSER", "JD_RECOVERY", "APPLICATION", "FOLLOW_UP",
-              "INBOX", "COMPANY_INSIGHTS", "ADVISOR", "OTHER")
+              "INBOX", "COMPANY_INSIGHTS", "INTERVIEW_INSIGHTS", "ADVISOR", "OTHER")
 LLM_ERROR_TYPES = ("TIMEOUT", "RATE_LIMIT", "INVALID_JSON", "SCHEMA_VALIDATION", "PROVIDER_ERROR", "CONTEXT_OVERFLOW",
                    "CONFIGURATION", "OTHER")
 OPTIMIZATION_TASK_STATUSES = ("PENDING", "PROCESSING", "COMPLETED", "FAILED")

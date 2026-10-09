@@ -127,9 +127,10 @@ def test_the_topology_registry_is_consistent_and_honest_about_kinds():
     assert nodes["jd_recovery"]["optional_ai"] is True
     assert nodes["approval"]["types"] == ["HUMAN_GATE"]
     assert nodes["discovery"]["primary_type"] == "EXTERNAL"
-    # Reserved stages are listed, never drawn as if they ran.
-    assert "company_insights" not in nodes and {r["id"] for r in t["reserved"]} == {"company_insights",
-                                                                                  "interview_insights"}
+    # Job Insights is implemented: research is an async external stage with AI, preparation is AI only.
+    assert t["reserved"] == []
+    assert set(nodes["company_insights"]["types"]) == {"ASYNC_WORKER", "EXTERNAL", "AI"}
+    assert nodes["interview_insights"]["workers"] == ["INTERVIEW_INSIGHTS"]
     assert all(e["source"] in nodes and e["target"] in nodes for e in t["edges"])
     assert all(set(t["node_types"]) >= set(n["types"]) for n in t["nodes"])
 
@@ -571,7 +572,7 @@ def test_node_detail_has_routing_recent_activity_and_matching_recommendations(us
     assert client.get("/api/orchestration/graph").json()["nodes"]["ranker"]["recommendations"] == 1
     assert out["recent"]["failed_tasks"][0]["error_category"] == "TIMEOUT"
     assert SECRET not in json.dumps(out)
-    assert client.get("/api/orchestration/nodes/company_insights").status_code == 404
+    assert client.get("/api/orchestration/nodes/company_insights").status_code == 200
     assert client.get("/api/orchestration/nodes/nope").status_code == 404
 
 

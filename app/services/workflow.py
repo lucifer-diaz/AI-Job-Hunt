@@ -407,6 +407,11 @@ def approve_job(db: Session, job: Job, *, override: bool = False, note: str = ""
         # The tracker timeline should say the minimum was waived, and why, long after the decision.
         db.add(ApplicationEvent(application=application, kind="approval", title="Approved below the reviewer minimum",
                                 detail=(note or "").strip()[:2000] or f"Reviewer scored {latest.reviewer_score:.0f}"))
+    db.flush()
+    # Job Insights research starts in the background; approval never waits for it and never fails because of it.
+    from app.services.job_insights import tasks as job_insights
+
+    job_insights.on_approved(db, job)
     db.commit()
     db.refresh(application)
     return application

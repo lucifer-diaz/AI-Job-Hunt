@@ -172,11 +172,20 @@ NODES: tuple[Node, ...] = (
     Node("ai_advisor", "AI Optimization Advisor", (AI, ASYNC), "Analyses LLM telemetry and recommends; it never "
          "changes a model, a route or a setting.", "support", (6, -1), workers=("AI_OPTIMIZATION",),
          llm_stages=("ADVISOR",), monitoring_tab="advisor"),
-    # Designed but not built yet (app.prompts RESERVED_PROMPTS): listed, never drawn as live.
-    Node("company_insights", "Company insights", (AI,), "Reserved: no prompt is implemented yet.", "support", (8, -1),
-         workers=("COMPANY_INSIGHTS",), llm_stages=("COMPANY_INSIGHTS",), implemented=False),
-    Node("interview_insights", "Interview insights", (AI,), "Reserved: no prompt is implemented yet.", "support",
-         (9, -1), workers=("INTERVIEW_INSIGHTS",), implemented=False),
+    # Job Insights (app.services.job_insights): researched in the background once a job is approved, so the nodes sit
+    # right under Approval.
+    Node("company_insights", "Job insights research", (ASYNC, EXT, AI), "Researches an approved job: the posting, "
+         "the company's own site, and Glassdoor and PayScale through Apify when an admin configured them; a model "
+         "then organises what was found, citing every source. Salary is computed in code.", "support", (3, 2),
+         workers=("COMPANY_INSIGHTS",), llm_stages=("COMPANY_INSIGHTS",),
+         # The operations job insights actually emits (app.services.job_insights.apify / sources).
+         external=(ExternalMatch("APIFY", "glassdoor_"), ExternalMatch("APIFY", "payscale_"),
+                   ExternalMatch("WEB", "official_company_page")),
+         monitoring_tab="external", workers_tab="insights", screen="approvals"),
+    Node("interview_insights", "Interview preparation", (AI,), "Writes interview preparation from the posting, the "
+         "fit analysis and verified evidence, always labelled as generated (never as questions the company asks).",
+         "support", (4, 2), workers=("INTERVIEW_INSIGHTS",), llm_stages=("INTERVIEW_INSIGHTS",),
+         monitoring_tab="llm", screen="approvals"),
 )
 
 EDGES: tuple[Edge, ...] = (
@@ -210,6 +219,10 @@ EDGES: tuple[Edge, ...] = (
          "kind=stage)"),
     Edge("resume_parser", "ranker", "verified evidence", kind="support"),
     Edge("compensation", "discovery", "salary enrichment", kind="support"),
+    Edge("approval", "company_insights", "research", kind="support", measure="insight tasks created "
+         "(job_insight_tasks.created_at)", timed=True),
+    Edge("company_insights", "interview_insights", "researched", kind="support", measure="research runs that saved "
+         "insights (job_insight_tasks COMPLETED or PARTIAL)"),
 )
 
 NODES_BY_ID: dict[str, Node] = {n.id: n for n in NODES}

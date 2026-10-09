@@ -360,13 +360,14 @@ def _apify_operation(path: str) -> str:
 
 
 def apify_client(token: str, *, operation: str, user_id: int | None = None, metadata: dict[str, Any] | None = None,
-                 timeout: float | int = 30, json_body: bool = False):
+                 timeout: float | int = 30, json_body: bool = False, service: str = "apify_api",
+                 job_id: int | None = None, workflow_type: str | None = None):
     """The instrumented HTTP client every Apify call uses. Telemetry comes with it; nothing else is needed."""
     headers = {"Authorization": f"Bearer {token}"}
     if json_body:
         headers["Content-Type"] = "application/json"
-    return external_client("APIFY", service="apify_api", operation=operation, timeout=timeout, headers=headers,
-                           user_id=user_id, metadata=metadata or {})
+    return external_client("APIFY", service=service, operation=operation, timeout=timeout, headers=headers,
+                           user_id=user_id, metadata=metadata or {}, job_id=job_id, workflow_type=workflow_type)
 
 
 def apify_get(path: str, params: dict[str, Any] | None = None, token: str | None = None, *,

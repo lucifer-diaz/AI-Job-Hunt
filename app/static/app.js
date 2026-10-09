@@ -223,6 +223,7 @@ const LOADERS = {
     D.approvals = D.approvalFacets.items;
     if (!S.approvalJob || !D.approvals.some(j => j.id === S.approvalJob)) S.approvalJob = (D.approvals[0] || {}).id || null;
     D.approval = S.approvalJob ? await api(`/api/approvals/${S.approvalJob}`) : null;
+    if (S.approvalJob) await loadInsights(S.approvalJob).catch(() => null);
   },
   async tracker() {
     D.tracker = await api('/api/tracker');
@@ -1197,6 +1198,7 @@ function renderApprovalsBody(list) {
     ${a.approval?.override ? `<div class="banner warn" style="margin:0 22px;display:block"><b>Approved below your reviewer minimum.</b>${a.approval.note ? ` ${esc(a.approval.note)}` : ''}</div>` : ''}
     ${S.rejecting === job.id ? renderRejectPicker(job, a) : ''}
     ${S.overriding === job.id ? renderApprovalOverride(job, a, r) : ''}
+    ${renderInsightsCard(job.id)}
     ${r ? `<div style="padding:18px 22px;border-bottom:1px solid var(--line2)"><div class="base b mb12">Pre-submit checklist</div>
       <div class="grid-auto" style="grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px">${a.checklist.map(c => `<div class="check-item ${c.state}"><span class="mark">${c.state === 'ok' ? '✓' : '!'}</span><div><div class="small b lbl">${esc(c.label)}</div><div class="xs muted mt4">${esc(c.detail)}</div></div></div>`).join('')}</div></div>
     <div class="grid-auto" style="grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:0">
@@ -1335,6 +1337,7 @@ function renderTracker() {
           ${sel.inbox_reply ? '<div class="xs mb8" style="color:var(--good)">The employer already replied (Email activity), so a follow-up is probably unnecessary.</div>' : ''}
           <div class="small ink2 pretty" style="line-height:1.55;white-space:pre-wrap">${esc(sel.draft || 'No draft yet. Generate one — nothing is ever sent for you.')}</div>
           <div class="row gap8 mt10">${sel.draft ? btn('Review &amp; copy', 'copy-draft', { app: sel.id }, 'sm primary') : ''}${btn(label('nudge' + sel.id, sel.draft ? 'Regenerate' : 'Draft follow-up', 'Drafting…'), 'draft-nudge', { app: sel.id, stay: 1 }, 'sm' + (sel.draft ? '' : ' primary'), isBusy('nudge' + sel.id))}</div></div>
+        ${renderStagePrep(sel)}
         ${S.scheduling ? renderScheduleForm(sel) : btn('Schedule an interview', 'schedule-start', {}, 'block')}
       </div></div>
   </section></div>`;
@@ -1520,6 +1523,7 @@ function renderJobModal() {
       <div class="row gap12 wrap xs faint" style="margin-top:20px;padding-top:16px;border-top:1px solid var(--line2)"><span class="row gap6"><span style="width:9px;height:9px;border-radius:3px;background:#9fe0d2"></span>matched to your evidence</span><span class="row gap6"><span style="width:9px;height:9px;border-radius:3px;background:#ffd79a"></span>gap — needs a real answer</span><span>source: ${esc(j.board)}${j.search_run_id ? ` · pulled in run #${j.search_run_id}` : ''}</span>${descBadge(j.description_state, true)}${btn('Edit description', 'edit-job-description', { id: j.id }, 'sm ghost')}</div></div>`;
   else if (S.jobTab === 'requirements') tab = `<div style="padding:20px 22px" class="col gap14">${fitSummary(j)}${j.fit_analysis.must_have_missing?.length ? `<div class="box bad"><div class="xs b mb4" style="color:var(--bad)">MUST-HAVES MISSING</div><div class="small">${esc(j.fit_analysis.must_have_missing.join(' · '))}</div></div>` : ''}<div><div class="caps mb8">KEYWORDS</div><div class="row wrap gap6">${j.keywords.map(k => pill(k, 'plain', 'lg')).join('') || '<span class="small muted">Rank this job to extract keywords.</span>'}</div></div></div>`;
   else if (S.jobTab === 'structured') tab = renderJobStructured(j);
+  else if (S.jobTab === 'insights') tab = renderJobInsights(j.id);
   else tab = `<div style="padding:20px 22px">${textareaF('jobnotes', j.id, j.notes, 'placeholder="Anything worth remembering about this role…" style="min-height:160px"')}${btn(label('jobnotes', 'Save notes', 'Saving…'), 'save-job-notes', { id: j.id }, 'primary sm mt10', isBusy('jobnotes'))}</div>`;
   return `<div class="overlay" data-act="overlay-close"><div class="modal" role="dialog" aria-label="Job detail" data-scroll-key="job-modal-${j.id}">
     <div class="modal-head"><div class="row top-align gap16 wrap"><div class="avatar lg">${esc(initials(j.company))}</div>
@@ -1534,7 +1538,7 @@ function renderJobModal() {
     ${rejectionBanner(j)}
     ${j.domain_match === 'NOT_MATCHING' ? `<div class="banner warn" style="margin:0 24px;display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span class="grow"><b>Hidden: not matching.</b> ${esc(j.domain_reason || 'Outside your domain')} — not ranked, no model used.</span>${btn(label('keep' + j.id, 'Keep this job', 'Keeping…'), 'domain-keep', { id: j.id }, 'sm soft', isBusy('keep' + j.id))}</div>` : ''}
     <div class="split gap16" style="padding:18px 24px 24px">
-      <section class="card flush" style="flex:1 1 420px;min-width:0"><div class="tabs under">${[['description', 'Description'], ['structured', 'Structured JD'], ['requirements', 'Requirements map'], ['notes', 'Notes']].map(([id, t]) => `<button class="${S.jobTab === id ? 'on' : ''}" data-act="job-tab" data-id="${id}">${t}</button>`).join('')}</div>${tab}</section>
+      <section class="card flush" style="flex:1 1 420px;min-width:0"><div class="tabs under">${[['description', 'Description'], ['structured', 'Structured JD'], ['requirements', 'Requirements map'], ['insights', 'Insights'], ['notes', 'Notes']].map(([id, t]) => `<button class="${S.jobTab === id ? 'on' : ''}" data-act="job-tab" data-id="${id}">${t}</button>`).join('')}</div>${tab}</section>
       <div class="col gap14" style="flex:1 1 280px;min-width:0">
         <section class="card pad18"><div class="row gap8 mb14">${pill('AI', 'brand')}<span class="card-title sm">Fit breakdown</span></div>
           ${D.resumeChoices?.length ? `<div class="mb12"><div class="row gap8" style="align-items:center;min-width:0"><span class="xs muted" style="white-space:nowrap">Resume used</span>${resumeSelect('job-resume', j.resume_choice_id, { id: j.id, choice: j.resume_choice })}</div>${j.resume_choice === 'AUTO' ? '<div class="xs faint mt4">Matched by resume tags</div>' : ''}</div>` : ''}
@@ -1872,7 +1876,7 @@ const A = {
   'overlay-close': (el, e) => { if (e.target !== el) return; S.jobOpen = null; S.kitJob = null; S.paletteOpen = false; render(); },
   'open-job': el => openJob(el.dataset.id),
   'close-job': () => { S.jobOpen = null; render(); },
-  'job-tab': el => { S.jobTab = el.dataset.id; render(); },
+  'job-tab': el => { S.jobTab = el.dataset.id; render(); if (S.jobTab === 'insights') insEnsure(S.jobOpen); },
   'modal-tailor': async el => {
     const id = Number(el.dataset.id), j = D.jobModal;
     if (!j.resume_id && ['discovered', 'shortlisted', 'maybe', 'archived', 'dismissed'].includes(j.status)) await api(`/api/jobs/${id}/triage`, { method: 'POST', body: { action: 'shortlist' } }).catch(e => toast(e.message, true));
@@ -2280,7 +2284,7 @@ const A = {
     delete S.forms['cover' + el.dataset.resume]; await load();
   }, 'Cover letter saved'),
   // approvals
-  'select-approval': async el => { S.approvalJob = Number(el.dataset.id); render(); D.approval = await api(`/api/approvals/${S.approvalJob}`).catch(() => null); render(); },
+  'select-approval': async el => { S.approvalJob = Number(el.dataset.id); render(); insEnsure(S.approvalJob); D.approval = await api(`/api/approvals/${S.approvalJob}`).catch(() => null); render(); },
   'approve-override-open': el => { S.overriding = Number(el.dataset.id); S.rejecting = null; delete S.forms.override; render(); },
   'approve-override-close': (el, e) => { e?.preventDefault?.(); S.overriding = null; delete S.forms.override; render(); },
   approve: el => busy('approve', async () => {
@@ -2377,6 +2381,7 @@ const A = {
   ...WORKERS_ACTIONS,
   ...INBOX_ACTIONS,
   ...GUIDE_ACTIONS,
+  ...INSIGHTS_ACTIONS,
 };
 function tagFallback(form, key) {
   if (form === 'sp') return D.searchProfile?.profile?.[key] || [];

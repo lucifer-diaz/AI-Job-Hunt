@@ -114,6 +114,17 @@ class Settings(BaseSettings):
     apify_indeed_actor: str = "crawlerbros/indeed-jobs-scraper"
     apify_glassdoor_actor: str = "crawlerbros/glassdoor-jobs-scraper"
     apify_naukri_actor: str = "crawlerbros/naukri-scraper"
+    # Job Insights research actors (app.services.job_insights.apify). Blank = that source is NOT_CONFIGURED: no ID is
+    # ever assumed, because Store actors and their input/output schemas change. An admin sets an actor they have
+    # checked, and optionally its input as a JSON template with {company}, {role}, {location} and {limit} fields.
+    apify_glassdoor_compensation_actor: str = ""
+    apify_glassdoor_interview_actor: str = ""
+    apify_glassdoor_reviews_actor: str = ""
+    apify_payscale_actor: str = ""
+    apify_glassdoor_compensation_input: str = ""
+    apify_glassdoor_interview_input: str = ""
+    apify_glassdoor_reviews_input: str = ""
+    apify_payscale_input: str = ""
     # When a multi-board run fails, search its boards again with their dedicated actors (once).
     apify_auto_fallback: bool = True
     apify_request_timeout_seconds: int = 30
@@ -225,6 +236,26 @@ class Settings(BaseSettings):
     jd_fetch_llm_enabled: bool = True
     # Local testing only: lets recovery read from localhost and private addresses. Never enable in production.
     jd_fetch_allow_private_hosts: bool = False
+    # Job Insights (app.services.job_insights): source-backed company, compensation and interview research for an
+    # approved job, built in the background. Approval never waits for it.
+    job_insights_enabled: bool = True
+    job_insights_interval_minutes: int = 5
+    job_insights_batch_size: int = 5
+    job_insights_max_concurrency: int = 2
+    job_insights_max_attempts: int = 3
+    job_insights_retry_seconds: int = 600
+    job_insights_lease_seconds: int = 900
+    # Sources researched side by side for one job, and the longest one source may take (an Apify run included).
+    job_insights_source_concurrency: int = 3
+    job_insights_source_timeout_seconds: int = 120
+    # Approved jobs from before this feature: how many are queued per run.
+    job_insights_enqueue_batch_size: int = 20
+    # How long researched observations are reused for another job of the same account (company / role / location).
+    company_insight_ttl_days: int = 30
+    compensation_insight_ttl_days: int = 14
+    interview_insight_ttl_days: int = 30
+    # Observations older than this many months are kept but weighted lowest; 0 never drops them.
+    insight_max_observation_age_months: int = 0
     # A posting that no longer exists (404/410, "no longer accepting applications") is deleted, and a tombstone stops
     # it being imported again (app.services.job_removal). Approved and applied jobs are never deleted.
     auto_delete_removed_jobs: bool = True
