@@ -55,6 +55,7 @@ beforeEach(() => {
   routes = { summary: summary(), parsing: parsing(), activity: activity(), settings: settings(), workerSettings: workerSettings(), fail: false };
   fetchMock = vi.fn(async (url, opt = {}) => {
     if (routes.fail && url.startsWith('/api/workers')) return response({ detail: 'Workers are unavailable' }, 503);
+    if (opt.method === 'POST' && url.endsWith('/nudge')) { routes.nudged = url; return response({ kind: 'parsing', to: 'Ranking', moved: [4, 5], skipped: [{ job_id: 6, reason: 'Dismissed in triage' }], message: null }); }
     if (opt.method === 'POST' && url.includes('/run-now')) return response(row({ status: 'QUEUED', run_now: true }));
     if (opt.method === 'POST' && url.includes('/cooldowns/reset')) return response({ cleared: ['OPENROUTER'] });
     if (opt.method === 'POST' && url.includes('kill')) return response({ stopped: 2, running: 1, cooldowns_cleared: url.endsWith('kill') ? [] : ['OPENROUTER'] });
@@ -169,6 +170,23 @@ describe('Running workers', () => {
     routes.parsing = { ...parsing(), rows: [row({ status: 'RETRYING', run_now: true, can_run_now: true, attempt: 1 })] };
     await open();
     expect(view().querySelector('.wk-row').textContent).toContain('First in line');
+  });
+
+  it('nudges finished jobs on to the next stage, and only offers it when some are waiting', async () => {
+    routes.summary.workers.find(w => w.kind === 'parsing').next_stage = { to: 'Ranking', waiting: 2 };
+    routes.summary.workers.find(w => w.kind === 'recovery').next_stage = { to: 'Parsing', waiting: 0 };
+    let v = await open();
+    const button = v.querySelector('[data-act="wk-nudge"]');
+    expect(button.textContent.trim()).toBe('Nudge to Ranking · 2');
+    expect(button.disabled).toBe(false);
+    await ui.A['wk-nudge']({ dataset: { kind: 'parsing' } });
+    expect(routes.nudged).toBe('/api/workers/parsing/nudge');
+    expect(document.getElementById('toast').textContent).toBe('Moved 2 jobs to Ranking · 1 skipped: Dismissed in triage');
+
+    v = await open('recovery');
+    expect(v.querySelector('[data-act="wk-nudge"]').disabled).toBe(true);  // nothing between recovery and parsing
+    v = await open('insights');
+    expect(v.querySelector('[data-act="wk-nudge"]')).toBeNull();  // the last stage has no next one
   });
 
   it('shows the rate-limit backoff and resets it', async () => {

@@ -637,13 +637,17 @@ def scheduler_facts(scheduler: Any, job: str | None) -> dict[str, Any] | None:
 
 
 def summary(db: Session, user_id: int, scheduler: Any = None, now: datetime | None = None) -> dict[str, Any]:
+    from app.services import worker_handoff
+
     now = now or utcnow()
     per_kind = counts(db, user_id, now)
     return {"generated_at": _iso(now), "cooldowns": backoff.active(db, user_id, now=now),
             "workers": [{"kind": s.kind, "label": s.label, "description": s.description, "node_id": s.node_id,
                          "counts": per_kind[s.kind], "scheduler": scheduler_facts(scheduler, s.scheduler_job),
                          "paused": not worker_settings.get(db, user_id, s.settings_kind, "auto"), "view_of": s.view_of,
-                         "cleared_at": _iso(cleared_at(db, user_id, s.kind))}
+                         "cleared_at": _iso(cleared_at(db, user_id, s.kind)),
+                         # Nudge forward: where this worker's finished jobs go next, and how many are stuck before it.
+                         "next_stage": worker_handoff.next_stage(db, user_id, s.kind)}
                         for s in KINDS.values()],
             "active": sum(per_kind[k]["active"] for k, s in KINDS.items() if s.view_of is None),
             "running": sum(per_kind[k]["running"] for k, s in KINDS.items() if s.view_of is None)}

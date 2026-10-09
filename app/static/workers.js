@@ -208,6 +208,14 @@ function wkLimits(tab) {
   if (tab === 'recovery') { const x = D.wkData?.recovery?.diagnostics?.settings; return x ? [`⇉ ${x.max_concurrency} at a time · batches of ${x.batch_size}`] : []; }
   return [];
 }
+// Nudge forward: move this worker's finished jobs that never reached the next stage on to it (insights has none).
+function wkNudgeButton(tab, spec) {
+  const next = spec.next_stage;
+  if (!next) return '';
+  const n = next.waiting || 0, key = 'wkNudge' + tab;
+  const title = n ? `${n} finished job${n === 1 ? '' : 's'} not yet in ${next.to}: move them now` : `Nothing is waiting between ${spec.label} and ${next.to}`;
+  return `<span title="${attr(title)}">${btn(label(key, `Nudge to ${next.to}${n ? ` · ${n}` : ''}`, 'Nudging…'), 'wk-nudge', { kind: tab }, `sm ${n ? 'primary' : ''}`, !n || isBusy(key))}</span>`;
+}
 function wkHero(tab, spec, act) {
   const c = spec.counts || {}, s = spec.scheduler, live = c.running > 0;
   const stoppable = (c.running || 0) + (c.retrying || 0);
@@ -228,7 +236,7 @@ function wkHero(tab, spec, act) {
     <div class="wk-hero-head"><div style="min-width:0;flex:1">
         <div class="wk-hero-title"><span class="wk-pulse ${live ? 'on' : ''}" aria-hidden="true"></span>${esc(spec.label || '')}${live ? ' <span class="orch-chip brand">● working</span>' : active ? ' <span class="orch-chip muted">○ waiting</span>' : ' <span class="orch-chip good">✓ idle</span>'}${spec.paused ? ' <a class="orch-chip warn" href="#workers/settings">⏸ paused for your account</a>' : ''}</div>
         <div class="card-sub mt4">${esc(spec.description || '')}</div></div>
-      <div class="row gap8 wrap">${btn(label('wkKillAll' + tab, `Kill all ${spec.label || ''}`.trim(), 'Stopping…'), 'wk-kill-all', { kind: tab }, 'sm danger', !stoppable || isBusy('wkKillAll' + tab))}
+      <div class="row gap8 wrap">${wkNudgeButton(tab, spec)}${btn(label('wkKillAll' + tab, `Kill all ${spec.label || ''}`.trim(), 'Stopping…'), 'wk-kill-all', { kind: tab }, 'sm danger', !stoppable || isBusy('wkKillAll' + tab))}
         ${btn(label('wkRefresh', 'Refresh', 'Refreshing…'), 'wk-refresh', {}, 'sm', isBusy('wkRefresh'))}</div></div>
     <div class="wk-meta">${meta}</div>
     <div class="wk-kpis">${kpi('Running', c.running || 0, 'right now', 'brand', '●')}${kpi('Queued', c.queued || 0, 'waiting their turn', 'muted', '○')}
@@ -632,6 +640,11 @@ const WORKERS_ACTIONS = {
   'wk-range': el => { wkState().range = el.dataset.id; wkApplyFilters(wkState().tab); },
   'wk-open': el => { wkState().tab = el.dataset.tab || wkState().tab; if (S.orch) Object.assign(S.orch, { node: null, edge: null }); go('workers'); },
   'wk-refresh': () => busy('wkRefresh', wkReload),
+  'wk-nudge': el => busy('wkNudge' + el.dataset.kind, async () => {
+    const out = await api(`/api/workers/${el.dataset.kind}/nudge`, { method: 'POST' });
+    await wkReload();
+    return out;
+  }, out => out.message || `Moved ${out.moved.length} job${out.moved.length === 1 ? '' : 's'} to ${out.to}${out.skipped.length ? ` · ${out.skipped.length} skipped: ${out.skipped[0].reason}` : ''}`),
   'wk-run-now': el => busy(`wkRun${el.dataset.kind}${el.dataset.id}`, async () => {
     const out = await api(`/api/workers/${el.dataset.kind}/tasks/${el.dataset.id}/run-now`, { method: 'POST' });
     await wkReload();

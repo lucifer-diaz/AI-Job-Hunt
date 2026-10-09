@@ -47,24 +47,31 @@ def _enabled_at(config: dict[str, Any]) -> datetime | None:
         return None
 
 
-def _candidates(db: Session, config: dict[str, Any]):
-    """The query for jobs automatic tailoring may queue, or None when it is off for this account."""
+def _candidates(db: Session, config: dict[str, Any], *, manual: bool = False):
+    """The query for jobs automatic tailoring may queue, or None when it is off for this account.
+
+    `manual` is a person pressing Nudge forward on Running workers: they ask for the jobs that qualified and never
+    reached tailoring, so the "ranked after automatic tailoring was turned on" rule is dropped. Automatic tailoring
+    must still be on (it is the account's choice to spend model calls on tailoring without being asked each time), and
+    everything else (qualified, in the Tailor queue, the fit score, no task or decision yet) still applies."""
     since = _enabled_at(config)
-    if not config["enabled"] or since is None or execution_mode_for(db) != "backend":
+    if not config["enabled"] or (since is None and not manual) or execution_mode_for(db) != "backend":
         return None
-    ranked_at = (select(func.max(JobRanking.created_at)).where(JobRanking.job_id == Job.id)
-                 .correlate(Job).scalar_subquery())
     query = select(Job).where(Job.state == S.QUALIFIED, Job.status == TAILOR_QUEUE_STATUS,
-                              Job.fit_score.is_not(None), ranked_at >= since,
+                              Job.fit_score.is_not(None),
                               Job.auto_tailor_status.is_(None), ~exists().where(TailorTask.job_id == Job.id))
+    if not manual:
+        ranked_at = (select(func.max(JobRanking.created_at)).where(JobRanking.job_id == Job.id)
+                     .correlate(Job).scalar_subquery())
+        query = query.where(ranked_at >= since)
     if config["min_fit_score"] is not None:
         query = query.where(Job.fit_score >= config["min_fit_score"])
     return query
 
 
-def queue(db: Session, job_ids: list[int] | None = None) -> dict[str, Any]:
+def queue(db: Session, job_ids: list[int] | None = None, *, manual: bool = False) -> dict[str, Any]:
     """Queue the eligible jobs among `job_ids` (every eligible job when None). Commits."""
-    query = _candidates(db, auto_tailor_for(db))
+    query = _candidates(db, auto_tailor_for(db), manual=manual)
     if query is None:
         return {"queued": [], "skipped": []}
     if job_ids is not None:
@@ -99,6 +106,14 @@ def after_qualified(sessions: SessionFactory, user_id: int, job_id: int) -> bool
                              category="WORKFLOW", level="WARNING", workflow="auto_tailor", user_id=user_id,
                              entity_type="job", entity_id=job_id, status="FAILED")
         return False
+
+
+def waiting_job_ids(db: Session, limit: int = 200) -> list[int]:
+    """Qualified jobs that never reached tailoring (for Running workers → Nudge forward), best fit first."""
+    query = _candidates(db, auto_tailor_for(db), manual=True)
+    if query is None:
+        return []
+    return list(db.scalars(query.with_only_columns(Job.id).order_by(Job.fit_score.desc(), Job.id).limit(limit)).all())
 
 
 def sweep(db: Session) -> dict[str, int] | None:
