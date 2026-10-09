@@ -159,10 +159,21 @@ The rules a change has to keep:
 * **Dead postings go through `job_removal.remove_posting`**: tombstone, log line, `delete_job` (which also removes task
   rows, for SQLite). Approved or applied jobs are never deleted, and only a page that says the posting is gone counts.
   Import paths check `job_removal.is_removed` before creating a job.
-* **Resolve the resume through `resume_verification.for_job(db, profile, job)`** in every workflow that has a job
-  (ranking, tailoring, review, follow-ups, MCP), and `resume_for(db, profile)` instead of `active_resume` in context
-  builders. The job view only changes `master_resume` / the resume version read; it never activates a resume or writes
-  the master text. A job without `resume_id` behaves exactly as before.
+* **One resume selection: the active version (`Resume.is_active`).** Only `resume_verification.set_active` changes it,
+  and only because the person asked (Make active). Uploads, saved resume text, structured edits, file deletes and
+  re-parses never activate a version; the one exception is a profile's very first resume. `CandidateProfile.master_resume`
+  and `ResumeDocument.active` are mirrors that `set_active` keeps in step — never write them anywhere else. There is no
+  "default" resume.
+* **Resolve the resume through `resume_verification.for_job(db, profile, job)`** (`selected(db, profile)` without a job)
+  in every workflow (ranking, tailoring, review, follow-ups, MCP). It returns a view whose `chosen_resume` is the job's own
+  resume, else the active one, and whose `master_resume` is that resume in the form the candidate policy's
+  `resume_source` names: `structured` renders its structured data (`structured_resume.render_document`, rejected units
+  left out), `master_text` is its raw text as written. Never read `profile.master_resume` of a bare profile in a
+  workflow, and never parse the raw text in structured mode. Ranking identity (snapshot, hashes) uses
+  `resume_verification.raw_text(view)`, so verifying facts does not re-rank every job. The view only changes what is read;
+  it never activates a resume or writes the master text.
+* **Setups pin resumes, and their jobs follow.** Changing a setup's resume re-applies it to the jobs it found
+  (`discovery.follow_setup`) — never to jobs the person pinned (`USER`, `ACTIVE`) or approved/applied ones.
 * **Resume choice is deterministic and pins win** (`app/services/resume_matching.py`): tags live on `Resume`
   (`domain`, `roles`); `discovery.choose_resume` applies the setup's pin, else `auto_assign`. Only `resume_choice`
   NULL or `AUTO` may ever be re-matched; `SETUP`, `USER` and `ACTIVE` are the person's decisions. Changing tags never

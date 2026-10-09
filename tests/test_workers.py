@@ -213,7 +213,7 @@ def test_a_killed_tailoring_run_stops_for_good_and_can_never_save(user_id, signe
     fresh = client.post(f"/api/workers/tailoring/tasks/{task_id}/run-now").json()["task_id"]
     assert tailor_tasks.claim_next(SessionLocal, "worker-1", 900) == fresh
 
-    def tailor(db, job, progress):  # stands in for workflow.tailor_job: the model call, then the save
+    def tailor(db, job, progress, pages=None):  # stands in for workflow.tailor_job: the model call, then the save
         client.post(f"/api/workers/tailoring/tasks/{fresh}/kill").raise_for_status()  # stopped mid-run
         job.title = "Changed by a stopped run"
         db.commit()

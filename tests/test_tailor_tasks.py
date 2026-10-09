@@ -10,6 +10,7 @@ from app.main import app
 from app.models import TailorTask
 from app.services import tailor_tasks
 from app.settings import get_settings
+from tests.resume_support import use_resume_text
 
 client = TestClient(app)
 
@@ -36,8 +37,7 @@ def tasks_by_job():
 
 
 def test_tasks_queue_run_in_the_background_and_report_progress(monkeypatch):
-    assert client.put("/api/profile", json={"name": "Test Candidate", "headline": "Engineer",
-                                            "master_resume": "Built Python FastAPI services at 10k rps"}).status_code == 200
+    use_resume_text(client, "Built Python FastAPI services at 10k rps", name="Test Candidate", headline="Engineer")
     first, second, broken, skip = (shortlisted_job() for _ in range(4))
     not_shortlisted = client.post("/api/jobs/from-url", json={
         "url": f"https://example.com/jobs/{uuid.uuid4().hex}", "title": "Engineer", "company": "Other",
@@ -53,7 +53,7 @@ def test_tasks_queue_run_in_the_background_and_report_progress(monkeypatch):
     stages = []
     real_tailor = tailor_tasks.tailor_job
 
-    def flaky_tailor(db, job, progress):
+    def flaky_tailor(db, job, progress, pages=None):
         if job.id == broken:
             raise RuntimeError("model timed out")
 
@@ -61,7 +61,7 @@ def test_tasks_queue_run_in_the_background_and_report_progress(monkeypatch):
             progress(stage)
             with SessionLocal() as s:
                 stages.append(s.get(TailorTask, next(t["id"] for t in tasks_by_job().values() if t["job_id"] == job.id)).stage)
-        return real_tailor(db, job, progress=spy)
+        return real_tailor(db, job, progress=spy, pages=pages)
 
     monkeypatch.setattr(tailor_tasks, "tailor_job", flaky_tailor)
     assert tailor_tasks.run_pending(SessionLocal) == 4

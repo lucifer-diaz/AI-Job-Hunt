@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app.settings import get_settings
+from tests.resume_support import use_resume_text
 
 client = TestClient(app)
 
@@ -61,7 +62,7 @@ def test_bulk_delete_protects_submitted_jobs_and_cascades():
     ids = make_jobs(3, uuid.uuid4().hex[:8])
     tailored, applied, plain = ids
     # Tailoring needs resume content to present: an empty resume is refused before any model call.
-    assert client.put("/api/profile", json={"master_resume": "Built Python FastAPI services at 10k rps"}).status_code == 200
+    use_resume_text(client, "Built Python FastAPI services at 10k rps")
     for job_id in (tailored, applied):
         client.post(f"/api/jobs/{job_id}/triage", json={"action": "shortlist"})
         assert client.post(f"/api/jobs/{job_id}/tailor").status_code == 200

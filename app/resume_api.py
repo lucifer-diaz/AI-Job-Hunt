@@ -1,4 +1,4 @@
-"""Resume Data API: structured resume review, editing and verification (Settings → Resume Data).
+"""Resume Data API: structured resume review, editing and verification (Settings → Resumes).
 
 `{resume_id}` here is a resume version (app.models.Resume). The older `/api/resumes/{id}/edits` and
 `/cover-letter` routes in app.workspace address tailored resume variants and are unrelated.
@@ -13,10 +13,11 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.auth import get_user_db
-from app.models import Resume
+from app.models import Resume, ResumeDocument, SavedSearch
 from app.services import resume_verification as rv
 from app.services.structured_resume import SECTION_LABELS, StructuredResumeIn
 from app.services.user_settings import (
@@ -78,7 +79,7 @@ def summary(resume: Resume) -> dict:
     return {"id": resume.id, "name": resume.name, "version": resume.version, "source": resume.source,
             "source_filename": resume.source_filename, "source_file_hash": resume.source_file_hash,
             "has_original": bool(resume.source_storage_path and Path(resume.source_storage_path).is_file()),
-            "is_active": resume.is_active, "is_default": resume.is_default,
+            "is_active": resume.is_active,
             "verification_status": resume.verification_status, "verified_at": _iso(resume.verified_at),
             "parser": resume.parser, "parser_version": resume.parser_version, "revision": resume.revision,
             "created_at": _iso(resume.created_at), "updated_at": _iso(resume.updated_at),
@@ -98,16 +99,54 @@ def _commit(db: Session, resume: Resume) -> dict:
     return detail(resume)
 
 
+def _setups_by_resume(db: Session) -> dict[int | None, list[dict]]:
+    """Search setups by the resume they pin (None: setups that always use the active resume)."""
+    out: dict[int | None, list[dict]] = {}
+    for setup in db.scalars(select(SavedSearch).order_by(SavedSearch.id)).all():
+        settings = setup.settings or {}
+        chosen = settings.get("resume_id")
+        mode = settings.get("resume_mode") or ("fixed" if isinstance(chosen, int) else "auto")
+        if mode == "fixed" and isinstance(chosen, int):
+            out.setdefault(chosen, []).append({"id": setup.id, "name": setup.name})
+        elif mode == "active":
+            out.setdefault(None, []).append({"id": setup.id, "name": setup.name})
+    return out
+
+
+def _card(version: Resume, files: dict[int, ResumeDocument], setups: list[dict]) -> dict:
+    """One resume as Settings → Resumes lists it: the version, its uploaded file, how much of its data is reviewed,
+    the roles it targets (its tags) and the setups that use it."""
+    document = files.get(version.resume_document_id) if version.resume_document_id else None
+    return {**summary(version), "setups": setups, "reviewed_percent": rv.progress(version.structured_data)["percent"],
+            "file": {"id": document.id, "filename": document.original_filename, "size": document.size,
+                     "media_type": document.media_type} if document is not None else None}
+
+
 @router.get("/api/settings/resume")
-def settings_resume(db: Session = Depends(get_user_db)):
-    """The active resume with its verification progress, every version, and the candidate policy."""
+def settings_resume(resume_id: int | None = Query(None), db: Session = Depends(get_user_db)):
+    """Every resume (one per version, each with its own file, structured data and target roles), the active one,
+    the one being viewed (`current`: `resume_id`, else the active one) with its verification progress, and the
+    candidate policy.
+
+    Viewing or editing a resume never makes it active: only POST /api/resumes/{id}/activate does."""
     profile = profile_for(db)
     active = rv.active_resume(db, profile)
+    files = {d.id: d for d in db.scalars(select(ResumeDocument)).all()}
+    linked = set(db.scalars(select(Resume.resume_document_id).where(Resume.resume_document_id.is_not(None))).all())
+    for document in files.values():  # a file uploaded before versions existed gets its resume (inactive) now
+        if document.id not in linked:
+            rv.version_of_document(db, profile, document)
     all_versions = rv.versions(db, profile)
     for version in all_versions:
         rv.ensure_structured(db, version)
     db.commit()
-    return {"active": detail(active) if active else None, "versions": [summary(v) for v in all_versions],
+    current = next((v for v in all_versions if v.id == resume_id), None) if resume_id else None
+    current = current or active
+    setups = _setups_by_resume(db)
+    return {"active": detail(active) if active else None,
+            "current": detail(current) if current else None,
+            "versions": [_card(v, files, setups.get(v.id, []) + (setups.get(None, []) if v.is_active else []))
+                         for v in all_versions],
             "policy": candidate_policy(db)}
 
 
@@ -235,19 +274,23 @@ def activate(resume_id: int, db: Session = Depends(get_user_db)):
 
 @router.delete("/api/resumes/{resume_id}")
 def delete_version(resume_id: int, db: Session = Depends(get_user_db)):
-    """Delete a resume version (not the active one). Its uploaded file stays in the library; jobs that used it go
-    back to matching by tags, and evidence only it verified is un-verified."""
+    """Delete a resume (not the active one): its structured data, history and uploaded file. Jobs and setups that
+    used it go back to matching by tags, and evidence only it verified is un-verified. A file another resume still
+    uses is kept."""
     resume = _resume(db, resume_id)
+    document = db.get(ResumeDocument, resume.resume_document_id) if resume.resume_document_id else None
     try:
         out = rv.delete_version(db, resume)
     except rv.ActiveResumeError as exc:
         raise HTTPException(409, str(exc)) from exc
+    stored = None
+    if document is not None and not db.scalar(select(Resume.id).where(Resume.resume_document_id == document.id)):
+        stored = Path(document.storage_path)
+        db.delete(document)
     db.commit()
-    return {"deleted": resume_id, **out}
+    if (stored is not None and stored.is_file()
+            and not db.scalar(select(ResumeDocument.id).where(ResumeDocument.storage_path == str(stored)))
+            and not rv.storage_in_use(db, str(stored))):
+        stored.unlink(missing_ok=True)
+    return {"deleted": resume_id, "file_deleted": stored is not None, **out}
 
-
-@router.post("/api/resumes/{resume_id}/default")
-def make_default(resume_id: int, db: Session = Depends(get_user_db)):
-    resume = _resume(db, resume_id)
-    rv.set_default(db, resume)
-    return _commit(db, resume)

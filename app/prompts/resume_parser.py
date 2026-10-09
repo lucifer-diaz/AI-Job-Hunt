@@ -1,7 +1,7 @@
 """Resume prompts: parsing an uploaded resume into structured JSON, and evidence-claim extraction.
 
 Uploads are parsed deterministically (app.services.structured_resume). This parser prompt runs when the user asks
-for an AI re-parse in Settings → Resume Data; its output is only ever shown as a comparison against the current
+for an AI re-parse in Settings → Resumes; its output is only ever shown as a comparison against the current
 structured data (app.services.resume_verification.reparse), never written over it.
 """
 from __future__ import annotations

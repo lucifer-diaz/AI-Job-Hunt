@@ -202,6 +202,39 @@ def test_0014_turns_existing_resumes_into_unverified_versions(tmp_path):
     engine.dispose()
 
 
+def test_0034_reconciles_the_resume_selection_without_losing_text(tmp_path):
+    """The active version wins; the drifted master text is kept as an inactive version; the mirrors follow."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'selection.db'}")
+    now = datetime(2026, 10, 1, 9, 0)  # noqa: DTZ001  stored naive, like every timestamp column
+    with engine.begin() as connection:
+        command.upgrade(alembic_config(connection), "0033")
+        user = _insert(connection, "users", email="drift@example.com", password_hash="!")
+        profile = _insert(connection, "candidate_profiles", user_id=user, master_resume="Text typed later")
+        a = _insert(connection, "resume_documents", user_id=user, original_filename="a.pdf", media_type="application/pdf",
+                    storage_path="/files/a", checksum="a" * 64, size=1, extracted_text="A text", active=False)
+        b = _insert(connection, "resume_documents", user_id=user, original_filename="b.pdf", media_type="application/pdf",
+                    storage_path="/files/b", checksum="b" * 64, size=1, extracted_text="B text", active=True)
+        for version, document, raw, active, default in ((1, a, "A text", True, False), (2, b, "B text", False, True)):
+            _insert(connection, "resumes", user_id=user, candidate_profile_id=profile, resume_document_id=document,
+                    name=f"v{version}", version=version, source="upload", raw_text_hash=str(version) * 64,
+                    raw_text=raw, revision=0, is_active=active, is_default=default, verification_status="UNVERIFIED",
+                    created_at=now, updated_at=now)
+    with engine.begin() as connection:
+        command.upgrade(alembic_config(connection), "0034")
+    with engine.connect() as connection:
+        rows = connection.execute(text(
+            "SELECT version, name, source, raw_text, is_active, is_default FROM resumes ORDER BY version")).all()
+        master = connection.scalar(text("SELECT master_resume FROM candidate_profiles"))
+        files = dict(connection.execute(text("SELECT id, active FROM resume_documents")).all())
+    assert [(r.version, r.raw_text, bool(r.is_active)) for r in rows] == [
+        (1, "A text", True), (2, "B text", False), (3, "Text typed later", False)], "the chosen version stays active"
+    assert (rows[2].name, rows[2].source) == ("Recovered edited text", "manual_text")
+    assert not any(r.is_default for r in rows), "one selection: no default"
+    assert master == "A text", "the master text mirrors the active version"
+    assert {k: bool(v) for k, v in files.items()} == {a: True, b: False}, "the library marks the active version's file"
+    engine.dispose()
+
+
 def test_0028_keeps_one_active_tailoring_task_per_job(tmp_path):
     """The unique index needs at most one queued or running task per job: the running one (else the oldest) stays."""
     engine = create_engine(f"sqlite:///{tmp_path / 'tailor.db'}")

@@ -9,6 +9,7 @@ from app.main import app
 from app.services.exports import markdown_to_simple_pdf
 from app.services.resume_format import parse_resume, render_legacy, render_resume, strip_citations, to_plain
 from app.settings import get_settings
+from tests.resume_support import use_resume_text
 
 client = TestClient(app)
 
@@ -100,8 +101,7 @@ def test_tailoring_keeps_structure_and_revert_restores_master_bullet(monkeypatch
     monkeypatch.setattr(LLMClient, "_mock_tailoring", staticmethod(lambda user: {
         "summary": None, "skills_order": [], "highlights": [], "selected_evidence_ids": [],
         "role_updates": [{"role_index": 0, "bullets": [{"text": rewrite, "evidence_ids": []}]}]}))
-    assert client.put("/api/profile", json={"name": "Rohan Roy", "headline": "AI Engineering Leader",
-                                            "master_resume": MASTER}).status_code == 200
+    use_resume_text(client, MASTER, name="Rohan Roy", headline="AI Engineering Leader")
     tag = uuid.uuid4().hex[:8]
     job = client.post("/api/jobs/from-url", json={"url": f"https://example.com/format/{tag}", "title": "AI Lead",
                                                   "company": f"Format Co {tag}", "description": "Python AI agents"}).json()["job"]
@@ -110,8 +110,9 @@ def test_tailoring_keeps_structure_and_revert_restores_master_bullet(monkeypatch
     resume = client.get(f"/api/tailor/{job['id']}").json()["resume"]
     markdown = resume["markdown"]
     assert "Source Resume" not in markdown
+    # The default resume source is the structured data: the document is rendered from it (roles, projects, education).
     for header in ("### AI Consultant | Flow AI", "### Software Development Engineer 3 | Zendrive (India)",
-                   "## Projects", "### B.Tech, Computer Science"):
+                   "## Projects", "## Education", "B.Tech"):
         assert header in markdown
     assert f"- {rewrite}" in markdown
     bullet = next(e for e in resume["edits"] if e["section"].startswith("EXPERIENCE"))

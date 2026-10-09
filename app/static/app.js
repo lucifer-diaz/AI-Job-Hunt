@@ -16,7 +16,7 @@ const S = {
   checked: new Set(), rankedIds: new Set(), selJob: null, jobOpen: null, jobTab: 'description',
   paletteOpen: false, paletteQuery: '', paletteJobs: [],
   kitJob: null, tailorJob: null, tailorTab: 'diff', editing: null,
-  tailorMode: 'single', tailorChecked: new Set(), tailorRegenerate: false,
+  tailorMode: 'single', tailorChecked: new Set(), tailorRegenerate: false, tailorPages: '',  // '' = the default length in Settings
   pf: { tailor: pfDefaults('tailor'), approvals: pfDefaults('approvals') },
   approvalJob: null, rejecting: null, overriding: null, selApp: null, trackerView: 'board', tf: { q: '', location: 'all', min_fit: 0 }, rf: { q: '', location: 'all' }, runSel: null, setupSel: null,
   scheduling: false, editingRecruiter: false, recruiterDraft: [], ivDraft: null, manualMissing: null,
@@ -237,8 +237,7 @@ const LOADERS = {
   async settings() {
     D.settingsLoadError = '';
     try {
-      [D.profile, D.settings, D.prefs, D.resumes] = await Promise.all([
-        api('/api/profile'), api('/api/settings'), api('/api/preferences'), api('/api/profile/resumes')]);
+      [D.profile, D.settings, D.prefs] = await Promise.all([api('/api/profile'), api('/api/settings'), api('/api/preferences')]);
     } catch (err) { D.settingsLoadError = err.message; throw err; }
   },
 };
@@ -1083,6 +1082,7 @@ function renderBulkTailor(queue) {
       ${btn(`Select not tailored (${untailored.length})`, 'tailor-select', { which: 'untailored' }, 'sm', !untailored.length)}
       ${btn(allOn ? 'Clear' : 'Select all', 'tailor-select', { which: allOn ? 'none' : 'all' }, 'sm')}
       ${btn(`Skip tailoring${eligible ? ` ${eligible}` : ''}`, 'bulk-tailor', { mode: 'skip' }, 'sm', !eligible || queueing)}
+      ${tailorPagesPicker()}
       <span title="${attr(eligible > tailorable ? `${eligible - tailorable} selected job${eligible - tailorable === 1 ? ' is' : 's are'} not ranked yet: rank first, or skip tailoring` : 'Tailor the selected jobs')}">${btn(queueing ? 'Queueing…' : `Tailor${tailorable ? ` ${tailorable}` : ''}`, 'bulk-tailor', { mode: 'tailor' }, 'sm primary', !tailorable || queueing)}</span>
     </div>
     <div class="row wrap gap10 xs muted" style="padding:10px 18px;border-bottom:1px solid var(--line2)">
@@ -1118,7 +1118,7 @@ function renderTailorSingle(queue) {
       ${job.status === 'approved' ? btn(label('revise', 'Send back for revision', 'Sending back…'), 'revise', { id: job.id }, 'sm', isBusy('revise')) + btn('Open apply kit', 'open-kit', { id: job.id }, 'sm good') : ''}</section>` : '');
   if (!r) {
     return `<div class="stack">${stack}<section class="card row gap16 wrap" id="tailor-packet"><div class="grow" style="min-width:220px"><div class="card-title" style="font-size:16px">Tailoring for ${esc(job.title)} · ${esc(job.company)}</div><div class="card-sub">Fit ${fitTxt(job.fit)} · no packet generated yet</div></div>${picker}</section>
-      <section class="card">${empty(generating ? 'Drafting your packet…' : skipping ? 'Reviewing your master resume…' : 'No packet yet', generating ? `${task ? `${STAGE_LABEL[task.stage]} · ${task.progress}%. ` : ''}Tailoring and an independent review run on the server. You can leave this page.` : skipping ? `${STAGE_LABEL[task.stage]}. Your master resume is used unchanged; the reviewer is scoring it against this posting.` : 'Generate a tailored resume, cover letter and reviewer score. Tailoring may only cite your master resume and verified evidence. If this posting needs no tailoring, skip it and send your master resume as-is.', btn(generating ? 'Generating…' : 'Generate tailored packet', 'generate', { id: job.id }, 'primary lg', working) + btn(skipping ? 'Skipping…' : 'Skip tailoring', 'skip-tailor', { id: job.id }, 'lg', working) + btn('Read the posting', 'open-job', { id: job.id }))}</section></div>`;
+      <section class="card">${empty(generating ? 'Drafting your packet…' : skipping ? 'Reviewing your master resume…' : 'No packet yet', generating ? `${task ? `${STAGE_LABEL[task.stage]} · ${task.progress}%. ` : ''}Tailoring and an independent review run on the server. You can leave this page.` : skipping ? `${STAGE_LABEL[task.stage]}. Your master resume is used unchanged; the reviewer is scoring it against this posting.` : 'Generate a tailored resume, cover letter and reviewer score. Tailoring may only cite your master resume and verified evidence. If this posting needs no tailoring, skip it and send your master resume as-is.', tailorPagesPicker() + btn(generating ? 'Generating…' : 'Generate tailored packet', 'generate', { id: job.id }, 'primary lg', working) + btn(skipping ? 'Skipping…' : 'Skip tailoring', 'skip-tailor', { id: job.id }, 'lg', working) + btn('Read the posting', 'open-job', { id: job.id }))}</section></div>`;
   }
   const accepted = r.edits.filter(e => e.status === 'accepted').length;
   const threshold = p.application_mode === 'automatic'
@@ -1148,11 +1148,11 @@ function renderTailorSingle(queue) {
   }
   return `<div class="stack">${stack}
   <section class="card row gap16 wrap" id="tailor-packet" style="padding:16px 20px">
-    <div class="grow" style="min-width:220px"><div class="card-title" style="font-size:16px">Tailoring for ${esc(job.title)} · ${esc(job.company)}</div><div class="card-sub">v${r.version} · generated ${esc(r.generated)} · ${r.untailored ? 'master resume, not tailored' : 'edits must trace to verified evidence'}</div></div>
+    <div class="grow" style="min-width:220px"><div class="card-title" style="font-size:16px">Tailoring for ${esc(job.title)} · ${esc(job.company)}</div><div class="card-sub">v${r.version} · generated ${esc(r.generated)}${packetLength(r)} · ${r.untailored ? 'master resume, not tailored' : 'edits must trace to verified evidence'}</div></div>
     ${picker}
     <div class="row gap14"><div class="metric"><div class="n" style="color:${r.reviewer_score >= p.min_review_score ? 'var(--good)' : 'var(--warn)'}">${fitTxt(r.reviewer_score)}</div><div class="l">REVIEWER</div></div>
       <div class="metric"><div class="n">${r.ats_pct == null ? '—' : r.ats_pct + '%'}</div><div class="l">ATS KEYWORDS</div></div>
-      ${btn(generating ? (r.untailored ? 'Tailoring…' : 'Regenerating…') : (r.untailored ? 'Tailor instead' : 'Regenerate'), 'generate', { id: job.id }, '', working || locked)}
+      ${locked ? '' : tailorPagesPicker()}${btn(generating ? (r.untailored ? 'Tailoring…' : 'Regenerating…') : (r.untailored ? 'Tailor instead' : 'Regenerate'), 'generate', { id: job.id }, '', working || locked)}
       ${r.untailored ? '' : btn(skipping ? 'Skipping…' : 'Skip tailoring', 'skip-tailor', { id: job.id }, '', working || locked)}
       ${btn('Job description', 'open-job', { id: job.id })}
       ${locked ? '' : btn('Send to approval', 'go', { screen: 'approvals', approval: job.id }, 'primary')}</div>
@@ -1165,7 +1165,7 @@ function renderTailorSingle(queue) {
       <section class="card pad18"><div class="row gap8 mb12">${pill('AI', 'brand')}<span class="card-title sm">Reviewer notes</span><span class="mono bb base" style="margin-left:auto;color:var(--good)">${fitTxt(r.reviewer_score)} / 100</span></div>
         <div class="col gap10">${r.review.length ? r.review.map(n => `<div class="row top-align gap10"><span class="note-dot" style="background:${{ good: '#0f9c86', warn: '#e0a136', bad: '#c22f4e' }[n.tone]}"></span><div class="small ink2 pretty" style="line-height:1.55">${esc(n.text)}</div></div>`).join('') : '<div class="small muted">The reviewer left no notes.</div>'}</div>
         <div class="xs faint mt12" style="padding-top:12px;border-top:1px solid var(--line2)">${esc(threshold)}</div></section>
-      <section class="card pad18"><div class="card-title sm mb12">Keyword coverage</div><div class="row wrap gap6">${r.keywords.length ? r.keywords.map(k => `<span class="kw ${k.status}" title="${k.status}">${esc(k.word)}</span>`).join('') : '<span class="small muted">Rank the job to extract keywords.</span>'}</div></section>
+      <section class="card pad18"><div class="card-title sm mb12">Keyword coverage</div><div class="row wrap gap6">${r.keywords.length ? r.keywords.map(k => `<span class="kw ${k.status}" title="${k.status}">${esc(k.word)}</span>`).join('') : '<span class="small muted">No keywords yet: they come from the parsed job description (Job description → Structured).</span>'}</div></section>
       <section class="card pad18"><div class="card-title sm mb10">Exports</div><div class="col gap8">
         <a class="btn between" href="/api/jobs/${job.id}/resume.pdf">Resume PDF <span class="faint">plain text</span></a>
         <a class="btn between" href="/api/jobs/${job.id}/resume.docx">Resume DOCX <span class="faint">ATS-safe</span></a>
@@ -1632,10 +1632,22 @@ function scheduleTaskPoll() {
     if (finished.length) await load(); else render();
   }, 2500);
 }
+// The resume length for the next tailoring run (app.services.resume_length); '' uses the default in Settings.
+function tailorPagesPicker() {
+  const options = [['', 'Default length'], ['1', '1 page'], ['2', '2 pages'], ['3', '3 pages (not recommended)']];
+  return `<select class="select sm" data-act-change="tailor-pages" aria-label="Tailored resume length" title="How long the tailored resume is: your latest roles get the most bullets">${options.map(([v, t]) => `<option value="${v}" ${S.tailorPages === v ? 'selected' : ''}>${t}</option>`).join('')}</select>`;
+}
+function packetLength(r) {
+  const l = r.length || {};
+  if (r.untailored || !l.estimated_pages) return '';
+  const over = l.target_pages && l.estimated_pages > l.target_pages + 0.15;
+  return ` · ${l.target_pages ? `target ${l.target_pages} page${l.target_pages === 1 ? '' : 's'} · ` : ''}<span data-packet-length${over ? ' style="color:var(--warn)"' : ''}>≈${l.estimated_pages} page${l.estimated_pages === 1 ? '' : 's'}</span>${over ? ' · over target: accept fewer bullets or regenerate' : ''}`;
+}
 function queueTailoring(ids, mode, regenerate, busyKey, onQueued) {
   if (!ids.length) return;
+  const pages = mode === 'tailor' && S.tailorPages ? { pages: Number(S.tailorPages) } : {};
   return busy(busyKey, async () => {
-    const out = await api('/api/tailor-tasks', { method: 'POST', body: { ids, mode, regenerate } });
+    const out = await api('/api/tailor-tasks', { method: 'POST', body: { ids, mode, regenerate, ...pages } });
     onQueued?.(out);
     await refreshTasks();
     return out;
@@ -1825,6 +1837,9 @@ async function saveSetup() {
   if (!setup) return createSetup();
   flushTagDrafts();
   const out = await api(`/api/search/setups/${setup.id}`, { method: 'PUT', body: setupPayload() });
+  // A changed resume: the jobs this setup found follow it (not the ones you pinned yourself, approved or applied).
+  const moved = out.resume_jobs?.changed?.length || 0;
+  if (moved) toast(`${moved} job${moved === 1 ? '' : 's'} from this setup now use${moved === 1 ? 's' : ''} its resume${out.resume_jobs.ranking_queued?.length ? ` · ${out.resume_jobs.ranking_queued.length} queued for ranking again` : ''}`);
   return adoptSetup(out.setup);
 }
 async function createSetup(body) {
@@ -1950,7 +1965,7 @@ const A = {
     const url = el.dataset.kind === 'file' ? `/api/profile/resumes/${el.dataset.id}/tags` : `/api/resumes/${el.dataset.id}/tags`;
     const out = await api(url, { method: 'PUT', body });
     S.tagEdit = null; delete S.forms.rtag; D.resumeChoices = null;
-    [D.resumes, D.resumeData] = await Promise.all([api('/api/profile/resumes').catch(() => D.resumes), api('/api/settings/resume').catch(() => D.resumeData)]);
+    D.resumeData = await api(rdResumeUrl()).catch(() => D.resumeData);  // the resume being reviewed stays open
     return out;
   }, 'Tags saved — new jobs are matched with them'),
   'resume-rematch': () => busy('resumeRematch', async () => {
@@ -2278,6 +2293,7 @@ const A = {
     S.tailorChecked = new Set(which === 'all' ? queue.map(j => j.id) : which === 'untailored' ? queue.filter(j => !j.has_resume || j.status === 'needs_retailor').map(j => j.id) : []);
     render();
   },
+  'tailor-pages': el => { S.tailorPages = el.value; render(); },
   'tailor-regenerate': (el, e) => { e.stopPropagation(); S.tailorRegenerate = !S.tailorRegenerate; render(); },
   'bulk-tailor': el => {
     const ids = (D.tailorQueue || []).filter(j => S.tailorChecked.has(j.id) && !activeTask(j.id) && (S.tailorRegenerate || !j.has_resume || j.status === 'needs_retailor')

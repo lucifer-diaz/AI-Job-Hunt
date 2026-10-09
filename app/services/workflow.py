@@ -13,7 +13,6 @@ import logging
 import re
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from typing import Any
 
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
@@ -85,15 +84,19 @@ def generation_provenance(prompt_version: str, result: LLMResult) -> dict:
             "config_version": routing.get("config_version"), "escalated": bool(routing.get("escalated"))}
 
 
-def tailor_job(db: Session, job: Job, progress: Progress = _no_progress) -> ResumeVariant:
+def tailor_job(db: Session, job: Job, progress: Progress = _no_progress, pages: int | None = None) -> ResumeVariant:
     """Tailor from verified facts and the Ranker's completed fit analysis. Ranking never runs here: it is the
     asynchronous ranker's job (app.services.ranker). Without a completed analysis the context builder raises
-    ContextError(RANKING_REQUIRED) and no model is called."""
+    ContextError(RANKING_REQUIRED) and no model is called.
+
+    `pages` (1, 2 or 3) is this job's page target; omitted, the account's default (app.services.resume_length)."""
+    from app.services import resume_length
     from app.services.tailoring_results import apply_tailoring_patch
 
     profile = rv.for_job(db, get_profile(db), job)  # the job's chosen resume, else the active one
+    plan = resume_length.plan_for(db, job.user_id, pages)
     # Verified facts relevant to this job only; raises UnverifiedResumeError / ContextError before any model call.
-    context = build_tailoring_context(db, profile, job)
+    context = build_tailoring_context(db, profile, job, plan)
     progress("tailoring")
     llm = LLMClient.for_user(db)
     prompt = build_tailoring_prompt(candidate_profile=profile, job=job, context=context)
@@ -103,8 +106,11 @@ def tailor_job(db: Session, job: Job, progress: Progress = _no_progress) -> Resu
     allowed = context.evidence_ids | {bullet["id"] for part in ("roles", "projects")
                                       for unit in context.source_resume.get(part) or []
                                       for bullet in unit["bullets"] if "id" in bullet}
-    content = apply_tailoring_patch(db, profile, job, result.validated, allowed_evidence=allowed)
+    content = apply_tailoring_patch(db, profile, job, result.validated, allowed_evidence=allowed,
+                                    length_plan=context.length_plan)
     content.update(generation_provenance(prompt.version, result))
+    # A role the Tailor left alone shows its first bullets in this order (most relevant first) up to its budget.
+    content["fallback_bullets"] = {str(role["role_index"]): list(role["bullets"]) for role in context.roles}
     content["context"] = {**context.resume, **context.stats.as_dict(), "evidence_ids": sorted(context.evidence_ids),
                           "context_builder_version": context.call_stats()["context_builder_version"],
                           "excluded_evidence": context.excluded_evidence,
@@ -176,6 +182,9 @@ def skip_tailoring(db: Session, job: Job, progress: Progress = _no_progress) -> 
     """Use the master resume unchanged for a job that needs no tailoring. No AI edits; the reviewer still scores it."""
     profile = rv.for_job(db, get_profile(db), job)
     if not (profile.master_resume or "").strip():
+        if isinstance(profile, rv.JobProfile) and profile.resume_source == "structured":
+            raise ValueError("This resume's structured data is empty: review it in Settings → Resumes, or switch "
+                             "the resume source to the resume text")
         raise ValueError("Add a master resume in Settings before skipping tailoring")
     markdown = render_resume(parse_resume(profile.master_resume), name=profile.name, headline=profile.headline)
     resume = persist_tailored_resume(db, job, {"untailored": True, "summary": "", "skills": [], "experience": [],
@@ -218,8 +227,20 @@ def _role_bullets(parsed: ParsedResume, content: dict) -> dict[int, list[str]]:
     return out
 
 
+def _resume_view(profile: CandidateProfile | rv.JobProfile) -> CandidateProfile | rv.JobProfile:
+    """A profile passed without its view (no job at hand) reads the active resume in the policy's form."""
+    from sqlalchemy.orm import object_session
+
+    if isinstance(profile, rv.JobProfile):
+        return profile
+    db = object_session(profile)
+    return rv.selected(db, profile) if db is not None else profile
+
+
 def edit_slots(profile: CandidateProfile, content: dict) -> tuple[ParsedResume, list[dict]]:
-    """The reviewable units of a tailored resume. Edits and the rebuilt Markdown share this order."""
+    """The reviewable units of a tailored resume. Edits and the rebuilt Markdown share this order. "Before" is the
+    selected resume's document (its structured data, or its text as written: resume_verification.selected)."""
+    profile = _resume_view(profile)
     parsed = parse_resume(profile.master_resume or "")
     primary = (profile.search_preferences or {}).get("primary_skills") or []
     slots = [
@@ -314,26 +335,22 @@ def build_resume_markdown(profile: CandidateProfile, content: dict) -> str:
         bucket = role_bullets.setdefault(slot["role_index"], [])
         if value and value not in bucket:
             bucket.append(value)
+    caps, fallback = length_caps(content)
     return render_resume(parsed, name=profile.name, headline=profile.headline, summary=summary or None,
                          top_skills=relevant_skills(parsed, skill_list), role_bullets=role_bullets, highlights=highlights,
-                         role_headings=_role_headings(profile, parsed))
+                         role_caps=caps, fallback_bullets=fallback)
 
 
-def _role_headings(profile: CandidateProfile, parsed: Any) -> dict[int, dict[str, str]]:
-    """The user's verified heading corrections (per the candidate policy's resume source). Best effort: without a
-    session, or on any error, the master resume's own headings are used."""
-    from sqlalchemy.orm import object_session
-
-    from app.services.context_builder import role_headings
-
-    db = object_session(profile)
-    if db is None:
-        return {}
-    try:
-        return role_headings(db, profile, parsed)
-    except Exception:  # noqa: BLE001  a heading correction must never stop a resume from rendering
-        log.warning("could not apply verified role headings", exc_info=True)
-        return {}
+def length_caps(content: dict) -> tuple[dict[int, int] | None, dict[int, list[str]] | None]:
+    """A tailored resume's bullet budget per role_index and the bullets a role it left alone falls back to (most
+    relevant first), from content["length_plan"] (app.services.resume_length). (None, None) for packets made
+    before length plans: they render exactly as they always did."""
+    plan = content.get("length_plan") or {}
+    if not plan.get("role_caps"):
+        return None, None
+    caps = {int(k): int(v) for k, v in plan["role_caps"].items()}
+    fallback = {int(k): list(v) for k, v in (content.get("fallback_bullets") or {}).items()}
+    return caps, fallback
 
 
 def update_resume_edit(db: Session, resume: ResumeVariant, index: int, status: str | None, text: str | None) -> None:

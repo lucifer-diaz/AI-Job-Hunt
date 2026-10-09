@@ -10,7 +10,7 @@ Profile, preferences, resume text, AI, and workflow drafts are independent. Ordi
 
 Profile, preference, AI, and workflow saves refresh the workspace summary so the shell shows the saved identity, model, approval mode, and auto-search counts. A summary-refresh failure is reported separately from a successful save and does not restore an already-saved draft. Partial workflow saves also refresh the summary.
 
-The UI saves changed fields only. Pending chip input is committed before saving, including locations with commas. Valid numeric zero values count toward completeness. Uploading or selecting a primary resume warns before replacing unsaved master text. Deleting the only uploaded resume preserves master text and any draft; confirmed drafts are cleared only when the backend promotes a replacement. Parsing evidence requires saved text. Advanced AI overrides and master text are collapsible.
+The UI saves changed fields only. Pending chip input is committed before saving, including locations with commas. Valid numeric zero values count toward completeness. Making a resume active warns before replacing unsaved resume text. Uploads, saved text and file deletes never change the active resume: saved text becomes a new, inactive version, an upload is inactive unless it is the first resume, and deleting a file keeps its version (and any draft). Parsing evidence requires saved text. Advanced AI overrides and master text are collapsible.
 
 `app/static/ai_models.js` owns the AI models section (LiteLLM connection, model registry, tiers, worker
 assignments, auto router, preview/apply, version history; see the README's "LiteLLM & AI Model Configuration"). It
@@ -18,8 +18,9 @@ loads after `settings.js`, registers its renderer and actions in settings' table
 `/api/settings/ai`. Its edits are saved to the draft configuration immediately and reach workers only through
 Preview → Apply; the direct-provider editor above lives under its Advanced tab.
 
-`app/static/resume_data.js` owns the Resume Data section (structured resume review, editing and verification; see
-the README's "Resume Data & Verification"). It loads after `settings.js`. Its section edit draft counts as the
+`app/static/resume_data.js` owns the Resumes section: the list of resumes (each with its file, data progress and
+target roles) and the review, editing and verification of one resume's data below it (see the README's "Resume Data &
+Verification"); `#settings/resume-data` links open it. It loads after `settings.js`. Its section edit draft counts as the
 `resume-data` form, so leaving Settings, switching tabs or cancelling warns before discarding it.
 
 ## API contracts

@@ -22,6 +22,7 @@ from app.services import llm, mcp_tokens, tailor_tasks
 from app.services.user_settings import profile_for, settings_for
 from app.settings import get_settings
 from tests.conftest import make_user
+from tests.resume_support import use_resume_text
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL_CALL = llm.LLMClient.generate_prompt_json
@@ -500,7 +501,7 @@ def test_backend_mode_still_tailors_and_reviews_with_the_model(monkeypatch):
     monkeypatch.setattr(llm.LLMClient, "generate_prompt_json", MODEL_CALL)  # the backend path calls the (mock) model
     monkeypatch.setattr(get_settings(), "llm_provider", "mock")
     client = TestClient(app)
-    assert client.put("/api/profile", json={"name": "Test Candidate", "master_resume": "Built Python services"}).status_code == 200
+    use_resume_text(client, "Built Python services", name="Test Candidate")
     assert client.patch("/api/settings", json={"execution_mode": "backend"}).json()["execution_mode"] == "backend"
     job = client.post("/api/jobs/from-url", json={"url": f"https://example.com/jobs/{uuid.uuid4().hex}",
                                                    "title": "Engineer", "company": "Acme", "description": "Python"}).json()["job"]

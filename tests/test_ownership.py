@@ -13,6 +13,7 @@ from app.services.lifecycle import WorkflowState as S
 from app.settings import get_settings
 from app.tenancy import OWNED_MODELS
 from tests.conftest import ensure_test_user, make_user
+from tests.resume_support import use_resume_text
 
 client = TestClient(app)
 
@@ -53,7 +54,7 @@ def test_a_user_reaches_their_data_through_relationships():
 
 def test_tailoring_through_the_api_owns_every_row_it_creates():
     tag = uuid.uuid4().hex[:8]
-    assert client.put("/api/profile", json={"master_resume": "Built Python FastAPI services at 10k rps"}).status_code == 200
+    use_resume_text(client, "Built Python FastAPI services at 10k rps")
     job = client.post("/api/jobs/from-url", json={"url": f"https://example.com/own/{tag}", "title": "Staff Engineer",
                                                   "company": f"Own Co {tag}", "description": "Python"}).json()["job"]
     client.post(f"/api/jobs/{job['id']}/triage", json={"action": "shortlist"})

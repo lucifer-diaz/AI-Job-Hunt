@@ -62,41 +62,52 @@ def test_skipped_tailoring_is_marked_in_the_queue():
     assert row["untailored"] is True and row["reviewer_score"] is not None
 
 
-def test_uploading_and_choosing_a_resume_decides_what_tailoring_uses():
+def test_uploading_never_changes_the_active_resume_choosing_one_does():
+    before = master_resume()
     first = f"Alpha resume {uuid.uuid4().hex[:8]}"
     second = f"Beta resume {uuid.uuid4().hex[:8]}"
     older = upload("alpha.txt", first).json()["id"]
-    newer = upload("beta.txt", second).json()["id"]
-    assert master_resume() == second, "the newest upload is what tailoring uses"
+    newer_upload = upload("beta.txt", second).json()
+    newer = newer_upload["id"]
+    assert newer_upload["is_active"] is False and master_resume() in (before, first), \
+        "an upload is a new version; the active resume is still the one you chose"
 
+    client.post(f"/api/profile/resumes/{newer}/primary")
+    assert master_resume() == second, "choosing a file makes its version the active resume"
     resumes = {r["id"]: r for r in client.get("/api/profile/resumes").json()}
-    assert resumes[newer]["active"] and resumes[newer]["in_use"] and not resumes[older]["in_use"]
+    assert resumes[newer]["active"] and resumes[newer]["in_use"] and not resumes[older]["active"]
 
     client.post(f"/api/profile/resumes/{older}/primary")
     assert master_resume() == first
     resumes = {r["id"]: r for r in client.get("/api/profile/resumes").json()}
     assert resumes[older]["in_use"] and not resumes[newer]["in_use"]
+    active = client.get("/api/settings/resume").json()["active"]
+    assert active["id"] == resumes[older]["version_id"], "the library and Resume Data name the same active resume"
 
 
-def test_a_stale_profile_form_cannot_overwrite_a_newer_resume():
+def test_a_stale_profile_form_cannot_change_the_active_resume():
     text = f"Gamma resume {uuid.uuid4().hex[:8]}"
-    upload("gamma.txt", text)
+    client.post(f"/api/profile/resumes/{upload('gamma.txt', text).json()['id']}/primary")
     profile = client.get("/api/profile").json()
-    profile.pop("master_resume")  # the browser is on a page loaded before the upload
+    stale = {**profile, "master_resume": "text the page loaded before the upload"}
 
     assert client.put("/api/profile", json={**profile, "name": "Rohan"}).status_code == 200
     assert master_resume() == text
+    saved = client.put("/api/profile", json={**stale, "name": "Rohan"}).json()
+    assert master_resume() == text, "text from an old page becomes its own version, never the active one"
+    assert saved["created_resume_active"] is False
 
-    assert client.put("/api/profile", json={**profile, "master_resume": "hand written"}).status_code == 200
-    assert master_resume() == "hand written", "an explicit edit still wins"
+    assert client.post(f"/api/resumes/{saved['created_resume_id']}/activate").status_code == 200
+    assert master_resume() == stale["master_resume"], "it is used once it is made active"
 
 
-def test_deleting_a_resume_promotes_the_next_one_and_keeps_the_original_file():
+def test_deleting_a_file_never_changes_the_active_resume_and_keeps_the_original():
     from pathlib import Path
 
     first, second = f"Delta {uuid.uuid4().hex[:8]}", f"Epsilon {uuid.uuid4().hex[:8]}"
     older = upload("delta.txt", first).json()["id"]
     newer = upload("epsilon.txt", second).json()["id"]
+    client.post(f"/api/profile/resumes/{newer}/primary")
     with SessionLocal() as db:
         db.info["user_id"] = ensure_test_user().id
         from app.models import ResumeDocument
@@ -104,8 +115,8 @@ def test_deleting_a_resume_promotes_the_next_one_and_keeps_the_original_file():
     assert stored.is_file()
 
     out = client.delete(f"/api/profile/resumes/{newer}")
-    assert out.status_code == 200 and out.json()["promoted"] == older
-    assert master_resume() == first, "deleting the primary falls back to the next newest"
+    assert out.status_code == 200 and out.json()["promoted"] is None
+    assert master_resume() == second, "the active resume is a version: removing its file does not change it"
     assert stored.exists(), "a resume version still references its original upload, so the file is kept"
     assert newer not in [r["id"] for r in client.get("/api/profile/resumes").json()]
 

@@ -11,6 +11,7 @@ from app.main import app
 from app.models import Job, ResumeVariant, SearchRun
 from app.settings import get_settings
 from app.workspace import extract_job_posting, location_key
+from tests.resume_support import use_resume_text
 
 client = TestClient(app)
 
@@ -35,10 +36,9 @@ def make_job(title="Lead AI Engineer", company=None, location="Remote"):
 
 
 def test_packet_flows_from_triage_to_tracker():
-    assert client.put("/api/profile", json={
-        "name": "Test Candidate", "headline": "Engineer", "email": "t@example.com", "phone": "123",
-        "master_resume": "Built Python FastAPI services handling 10k requests per second\nLed 5 engineers on AWS",
-        "target_roles": ["Lead AI Engineer"]}).status_code == 200
+    use_resume_text(client, "Built Python FastAPI services handling 10k requests per second\nLed 5 engineers on AWS",
+                    name="Test Candidate", headline="Engineer", email="t@example.com", phone="123",
+                    target_roles=["Lead AI Engineer"])
     client.post("/api/evidence", json={"claim": "Built Python FastAPI services at 10k rps", "company": "Acme",
                                        "skills": ["Python", "FastAPI"]})
     job = make_job()
@@ -104,8 +104,7 @@ def test_packet_flows_from_triage_to_tracker():
 def test_skip_tailoring_uses_the_master_resume_unchanged():
     master = ("# Test Candidate\nEngineer\n## Experience\n### Lead | Acme | Remote | 2020 - 2024\n"
               "- Built Python FastAPI services handling 10k requests per second\n")
-    assert client.put("/api/profile", json={"name": "Test Candidate", "headline": "Engineer", "email": "t@example.com",
-                                            "phone": "123", "master_resume": master}).status_code == 200
+    use_resume_text(client, master, name="Test Candidate", headline="Engineer", email="t@example.com", phone="123")
     job = make_job()
     assert client.post(f"/api/jobs/{job['id']}/skip-tailoring").status_code == 409  # not shortlisted yet
     client.post(f"/api/jobs/{job['id']}/triage", json={"action": "shortlist"})
@@ -127,8 +126,7 @@ def test_skip_tailoring_uses_the_master_resume_unchanged():
 def test_bulk_tailor_processes_the_queue_in_batches(monkeypatch):
     import app.main as main
 
-    assert client.put("/api/profile", json={"name": "Test Candidate", "headline": "Engineer",
-                                            "master_resume": "Built Python FastAPI services at 10k rps"}).status_code == 200
+    use_resume_text(client, "Built Python FastAPI services at 10k rps", name="Test Candidate", headline="Engineer")
     first, second, broken, has_packet, not_shortlisted = [make_job()["id"] for _ in range(5)]
     for job_id in (first, second, broken, has_packet):
         client.post(f"/api/jobs/{job_id}/triage", json={"action": "shortlist"})
@@ -136,10 +134,10 @@ def test_bulk_tailor_processes_the_queue_in_batches(monkeypatch):
 
     real_tailor = main.tailor_job
 
-    def flaky_tailor(db, job):
+    def flaky_tailor(db, job, pages=None):
         if job.id == broken:
             raise RuntimeError("model timed out")
-        return real_tailor(db, job)
+        return real_tailor(db, job, pages=pages)
 
     monkeypatch.setattr(main, "tailor_job", flaky_tailor)
     ids = [first, second, broken, has_packet, not_shortlisted, 999999]
@@ -259,7 +257,7 @@ def test_tracker_stages_preferences_and_evidence_parsing():
 
     # Unique text: a persistent TEST_DATABASE_URL keeps claims from earlier runs.
     text = f"Cut cloud spend by 35% across 3 regions in 2024 ({uuid.uuid4().hex[:8]})"
-    client.put("/api/profile", json={"master_resume": f"{text}\nshort"})
+    use_resume_text(client, f"{text}\nshort")
     parsed = client.post("/api/profile/resume/parse-evidence").json()
     assert parsed["added"] >= 1
     evidence = client.get("/api/evidence").json()
@@ -314,8 +312,7 @@ def test_extract_job_posting_reads_json_ld():
 
 
 def test_tailor_and_approval_queues_filter_and_sort():
-    assert client.put("/api/profile", json={"name": "Test Candidate", "headline": "Engineer",
-                                            "master_resume": "Built Python FastAPI services at 10k rps"}).status_code == 200
+    use_resume_text(client, "Built Python FastAPI services at 10k rps", name="Test Candidate", headline="Engineer")
     tag = uuid.uuid4().hex[:8]
     tailored, skipped, bare, approved = (make_job(title=f"Engineer {tag} {n}", company=f"Filter {tag} {n}")["id"]
                                          for n in range(4))
@@ -354,8 +351,7 @@ def test_tailor_and_approval_queues_filter_and_sort():
 
 
 def applied_application():
-    assert client.put("/api/profile", json={"name": "Test Candidate", "headline": "Engineer",
-                                            "master_resume": "Built Python FastAPI services at 10k rps"}).status_code == 200
+    use_resume_text(client, "Built Python FastAPI services at 10k rps", name="Test Candidate", headline="Engineer")
     job = make_job()
     client.post(f"/api/jobs/{job['id']}/triage", json={"action": "shortlist"})
     assert client.post(f"/api/jobs/{job['id']}/tailor").status_code == 200
@@ -419,8 +415,7 @@ def test_location_filters_group_by_city():
 
 
 def test_discovery_tailor_and_approvals_filter_by_location():
-    assert client.put("/api/profile", json={"name": "Test Candidate", "headline": "Engineer",
-                                            "master_resume": "Built Python FastAPI services at 10k rps"}).status_code == 200
+    use_resume_text(client, "Built Python FastAPI services at 10k rps", name="Test Candidate", headline="Engineer")
     tag = uuid.uuid4().hex[:8]
     blr, blr2, ggn = (make_job(title=f"Engineer {tag} {n}", company=f"Place {tag} {n}", location=where)["id"]
                       for n, where in enumerate(["Bengaluru, Karnataka, India", "Bengaluru, India", "Gurugram, India"]))

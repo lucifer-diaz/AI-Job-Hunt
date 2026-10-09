@@ -8,7 +8,7 @@ const settingsSource = readFileSync('app/static/settings.js', 'utf8');
 const resumeDataSource = readFileSync('app/static/resume_data.js', 'utf8');
 const jobDataSource = readFileSync('app/static/job_data.js', 'utf8');
 const appSource = readFileSync('app/static/app.js', 'utf8').split('/* ───────────── boot ───────────── */')[0];
-const names = ['S', 'D', 'A', 'setF', 'render', 'readHash', 'setHash', 'orchState', 'settingsNavigate', 'settingsChanges', 'settingsPayload', 'settingsDirty', 'settingsCanLeave', 'settingsSave', 'settingsUploadResume', 'settingsUseResume', 'profileCompleteness', 'addTags', 'commitTag', 'SETTING_ERRORS', 'SETTINGS_SECTIONS', 'SETTINGS_ACTIONS', 'RD', 'resumeDataDirty', 'rdReset', 'JD', 'renderJobStructured', 'jobDataInput'];
+const names = ['S', 'D', 'A', 'setF', 'render', 'readHash', 'setHash', 'orchState', 'settingsNavigate', 'settingsChanges', 'settingsPayload', 'settingsDirty', 'settingsCanLeave', 'settingsSave', 'settingsUploadResume', 'profileCompleteness', 'addTags', 'commitTag', 'SETTING_ERRORS', 'SETTINGS_SUCCESS', 'SETTINGS_SECTIONS', 'SETTINGS_ACTIONS', 'RD', 'resumeDataDirty', 'rdReset', 'JD', 'renderJobStructured', 'jobDataInput', 'packetLength'];
 let ui, fetchMock, context;
 function response(data, status = 200) { return { ok: status < 400, status, text: async () => JSON.stringify(data) }; }
 function data() {
@@ -19,6 +19,10 @@ function data() {
       ai: { saved: { llm_provider: '', model: '', require_free: null, stage_models: {} }, env: { llm_provider: 'openai', models: { openai: 'default-model' }, require_free: true, stage_models: {} } } } };
 }
 function section(id) { ui.S.settingsSection = id; ui.render(); }
+function resumeCard(overrides = {}) {
+  return { id: 1, name: 'cv.pdf', version: 1, is_active: true, verification_status: 'UNVERIFIED', reviewed_percent: 0, setups: [], domain: null, roles: [], has_original: true, file: { id: 11, filename: 'cv.pdf', size: 2048, media_type: 'application/pdf' }, ...overrides };
+}
+function resumesLoaded(versions = []) { ui.D.resumeData = { active: null, current: null, versions, policy: {} }; }
 function input(id, value) {
   const el = document.getElementById(id); el.value = value;
   el.dispatchEvent(new Event('input', { bubbles: true }));
@@ -48,7 +52,7 @@ beforeEach(() => {
   context.fetch = fetchMock; context.confirm = confirm;
   ui.S.forms = {}; ui.S.busy = {}; ui.S.screen = 'settings'; ui.S.settingsSection = 'profile';
   Object.keys(ui.SETTING_ERRORS).forEach(k => delete ui.SETTING_ERRORS[k]);
-  ui.rdReset(); ui.RD.tab = 'structured'; ui.RD.changes = null; ui.RD.raw = null; ui.RD.decisions = {}; ui.RD.loading = false;
+  ui.rdReset(); ui.RD.viewId = null; ui.RD.tab = 'structured'; ui.RD.changes = null; ui.RD.raw = null; ui.RD.decisions = {}; ui.RD.loading = false;
   Object.assign(ui.D, data(), { settingsLoadError: '', resumeData: undefined }); ui.render();
 });
 
@@ -166,6 +170,47 @@ describe('focused settings UI', () => {
     expect(ui.settingsChanges('workflow')).toEqual({ weekly_target: '20' });
     expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({ weekly_target: 20 });
   });
+  it('chooses the tailored resume length and edits its bullet budget', async () => {
+    ui.D.settings.tailoring_length = { pages: 2, budgets: { 1: [4, 3, 2, 1, 0], 2: [6, 5, 4, 3, 2, 1], 3: [7, 6, 5, 4, 3, 2] }, presets: { 1: [4, 3, 2, 1, 0], 2: [6, 5, 4, 3, 2, 1], 3: [7, 6, 5, 4, 3, 2] } };
+    section('workflow');
+    const view = () => document.getElementById('view');
+    expect(view().textContent).toContain('Tailored resume length');
+    expect(view().textContent).toContain('Not recommended');
+    expect(document.querySelector('[data-field="tailor_pages"][value="2"]').checked).toBe(true);
+    expect(document.querySelector('[data-tailor-budget]').textContent).toContain('Most recent role: 6 bullets');
+    const one = document.querySelector('[data-field="tailor_pages"][value="1"]'); one.checked = true;
+    one.dispatchEvent(new Event('change', { bubbles: true }));
+    expect(document.querySelector('[data-tailor-budget]').textContent).toContain('5th role and older: heading only');
+    ui.setF('workflow', 'tailor_budget_1', '5, 2'); ui.render();
+    expect(document.querySelector('[data-tailor-budget]').textContent).toContain('2nd role and older: 2 bullets');
+    fetchMock.mockResolvedValueOnce(response(ui.D.settings));
+    await ui.settingsSave('workflow');
+    const [url, options] = fetchMock.mock.calls[0];
+    expect([url, JSON.parse(options.body)]).toEqual(['/api/settings', { tailoring_length: { pages: 1, budgets: { 1: [5, 2] } } }]);
+    ui.setF('workflow', 'tailor_budget_1', '5, nine'); fetchMock.mockClear();
+    await ui.settingsSave('workflow');
+    expect(fetchMock).not.toHaveBeenCalled(); expect(ui.SETTING_ERRORS.workflow).toContain('whole numbers from 0 to 8');
+    ui.A['tailor-budget-reset']({ dataset: { pages: '1' } });
+    expect(ui.S.forms.workflow.tailor_budget_1).toBe('4, 3, 2, 1, 0');
+  });
+  it('sends the length chosen for one job, and nothing when it is the default', async () => {
+    fetchMock.mockResolvedValue(response({ queued: [{ id: 1, job_id: 7 }], skipped: [] }));
+    ui.S.tailorPages = '1'; await ui.A.generate({ dataset: { id: '7' } });
+    const first = fetchMock.mock.calls.find(([url, opt]) => url === '/api/tailor-tasks' && opt?.method === 'POST');
+    expect(JSON.parse(first[1].body)).toEqual({ ids: [7], mode: 'tailor', regenerate: true, pages: 1 });
+    fetchMock.mockClear(); ui.S.tailorPages = '';
+    await ui.A.generate({ dataset: { id: '7' } });
+    const second = fetchMock.mock.calls.find(([url, opt]) => url === '/api/tailor-tasks' && opt?.method === 'POST');
+    expect(JSON.parse(second[1].body)).toEqual({ ids: [7], mode: 'tailor', regenerate: true });
+    fetchMock.mockClear(); ui.S.tailorPages = '3';
+    await ui.A['skip-tailor']({ dataset: { id: '7' } });
+    const skip = fetchMock.mock.calls.find(([url, opt]) => url === '/api/tailor-tasks' && opt?.method === 'POST');
+    expect(JSON.parse(skip[1].body).pages).toBeUndefined();  // skipping keeps the resume as it is
+    ui.S.tailorPages = '';
+    expect(ui.packetLength({ length: { target_pages: 1, estimated_pages: 0.9 } })).toContain('target 1 page · <span data-packet-length>≈0.9 pages');
+    expect(ui.packetLength({ length: { target_pages: 1, estimated_pages: 1.6 } })).toContain('over target');
+    expect(ui.packetLength({ untailored: true, length: { estimated_pages: 2 } })).toBe('');
+  });
   it('turns on automatic tailoring with its own fit score', async () => {
     section('workflow');
     expect(document.getElementById('view').textContent).toContain('qualified jobs wait in the Tailor queue');
@@ -184,20 +229,31 @@ describe('focused settings UI', () => {
     expect(document.querySelector('[data-field="auto_tailor"]').disabled).toBe(true);
     expect(document.getElementById('view').textContent).toContain('only runs on Job Hunt OS workers');
   });
-  it('protects dirty resume text before primary selection and upload', async () => {
+  it('protects dirty resume text before making a resume active, while an upload keeps the draft', async () => {
+    resumesLoaded([resumeCard(), resumeCard({ id: 2, name: 'other.pdf', version: 2, is_active: false })]);
     section('resumes'); ui.setF('resumes', 'master_resume', 'Unsaved resume');
-    confirm.mockReturnValue(false); await ui.settingsUseResume(1); await ui.settingsUploadResume(new File(['test'], 'test.txt'));
+    confirm.mockReturnValue(false); await ui.A['rd-activate']({ dataset: { id: '2' } });
     expect(fetchMock).not.toHaveBeenCalled(); expect(ui.S.forms.resumes.master_resume).toBe('Unsaved resume');
+    // An upload never changes the active resume, so it neither asks nor touches the draft; the new resume opens.
+    fetchMock.mockResolvedValueOnce(response({ id: 9, resume_id: 3, is_active: false })).mockResolvedValueOnce(response({ active: null, current: null, versions: [], policy: {} }));
+    await ui.settingsUploadResume(new File(['test'], 'test.txt'));
+    expect(fetchMock.mock.calls[1][0]).toBe('/api/settings/resume?resume_id=3');
+    expect(ui.S.forms.resumes.master_resume).toBe('Unsaved resume');
+    expect(ui.SETTINGS_SUCCESS.resumes).toContain('make it active when you want it used');
     confirm.mockReturnValue(true);
-    fetchMock.mockResolvedValueOnce(response([])).mockResolvedValueOnce(response({ ...ui.D.profile, master_resume: 'From file' }));
-    await ui.settingsUseResume(1); expect(ui.S.forms.resumes).toBeUndefined(); expect(ui.D.profile.master_resume).toBe('From file');
+    fetchMock.mockResolvedValueOnce(response({})).mockResolvedValueOnce(response({ active: null, current: null, versions: [], policy: {} })).mockResolvedValueOnce(response({ ...ui.D.profile, master_resume: 'From file' }));
+    await ui.A['rd-activate']({ dataset: { id: '2' } });
+    expect(ui.S.forms.resumes).toBeUndefined(); expect(ui.D.profile.master_resume).toBe('From file');
   });
   it('renders dangerous profile and filename content as text', () => {
     ui.D.profile.name = '<img src=x onerror=alert(1)>'; ui.render();
     expect(document.querySelector('.settings-identity img')).toBeNull();
-    ui.D.resumes = [{ id: 1, filename: '<svg onload=alert(1)>.txt', size: 10, words: 2, active: true, in_use: false }]; section('resumes');
+    resumesLoaded([resumeCard({ name: '<svg onload=alert(1)>', file: { id: 1, filename: '<svg onload=alert(1)>.txt', size: 10 } }),
+      resumeCard({ id: 2, name: 'other.txt', version: 2, is_active: false, file: null })]); section('resumes');
     expect(document.querySelector('.settings-resume svg')).toBeNull();
-    expect(document.body.textContent).toContain('Your edited text is being used');
+    expect(document.body.textContent).toContain('Uploading or editing never changes which resume is active');
+    expect([...document.querySelectorAll('[data-act="rd-activate"]')].map(b => b.dataset.id)).toEqual(['2']);
+    expect(document.body.textContent).toContain('Created from text');
   });
   it('saves pending chip text and enables Save before blur', async () => {
     section('preferences'); input('preferences-primary_skills', 'Rust');
@@ -237,28 +293,49 @@ describe('focused settings UI', () => {
     expect([...document.querySelectorAll('[data-act="settings-key-edit"]')].every(el => el.disabled)).toBe(true);
     expect(document.body.textContent).toContain('Key storage is unavailable');
   });
-  it('uploads resumes and saves explicit text with refreshed file provenance', async () => {
-    section('resumes');
-    fetchMock.mockResolvedValueOnce(response({ id: 1 })).mockResolvedValueOnce(response({ ...ui.D.profile, master_resume: 'Uploaded' })).mockResolvedValueOnce(response([]));
+  it('uploads a first resume as active, and saves edited text as an inactive resume', async () => {
+    resumesLoaded(); section('resumes');
+    fetchMock.mockResolvedValueOnce(response({ id: 1, resume_id: 1, is_active: true })).mockResolvedValueOnce(response({ ...ui.D.profile, master_resume: 'Uploaded' })).mockResolvedValueOnce(response({ active: null, current: null, versions: [], policy: {} }));
     await ui.settingsUploadResume(new File(['Uploaded'], 'test.txt'));
     expect(fetchMock.mock.calls[0][1].body).toBeInstanceOf(FormData);
     expect(ui.D.profile.master_resume).toBe('Uploaded');
+    expect(ui.SETTINGS_SUCCESS.resumes).toContain('set as active');
     ui.setF('resumes', 'master_resume', 'Edited text');
-    fetchMock.mockResolvedValueOnce(response({ ...ui.D.profile, master_resume: 'Edited text' })).mockResolvedValueOnce(response([]));
+    fetchMock.mockResolvedValueOnce(response({ ...ui.D.profile, master_resume: 'Uploaded', created_resume_id: 7, created_resume_version: 3, created_resume_active: false }));
     await ui.settingsSave('resumes');
-    expect(JSON.parse(fetchMock.mock.calls[3][1].body)).toEqual({ master_resume: 'Edited text' });
+    const patch = fetchMock.mock.calls.find(([url, opt]) => url === '/api/profile' && opt?.method === 'PATCH');
+    expect(JSON.parse(patch[1].body)).toEqual({ master_resume: 'Edited text' });
+    expect(ui.D.profile.master_resume).toBe('Uploaded'); expect(ui.D.profile.created_resume_id).toBeUndefined();
+    expect(ui.SETTINGS_SUCCESS.resumes).toBe('Saved as resume v3. It is not used until you make it active');
+    expect(ui.RD.viewId).toBe(7);
   });
-  it('protects primary deletion but keeps text drafts when deleting a secondary file', async () => {
-    section('resumes'); ui.D.resumes = [{ id: 1, filename: 'primary.txt', active: true }, { id: 2, filename: 'older.txt', active: false }];
+  it('never carries an open resume data draft over to a new resume', async () => {
+    const current = { ...resumeCard(), revision: 4, structured: { summary: { text: 'Old summary' } }, progress: { blocking: [], sections: [], entries: [], percent: 0, counts: {} } };
+    resumesLoaded([resumeCard()]); ui.D.resumeData.current = current; section('resumes');
+    const editing = () => { ui.RD.editing = 'summary'; ui.RD.draft = { summary: { text: 'Edited summary' } }; };
+    editing(); ui.setF('resumes', 'master_resume', 'Pasted text');
+    confirm.mockReturnValueOnce(false); await ui.settingsSave('resumes');
+    expect(fetchMock).not.toHaveBeenCalled(); expect(ui.RD.draft.summary.text).toBe('Edited summary');
+    confirm.mockReturnValueOnce(false); await ui.settingsUploadResume(new File(['x'], 'new.txt'));
+    expect(fetchMock).not.toHaveBeenCalled(); expect(ui.RD.editing).toBe('summary');
+    fetchMock.mockResolvedValueOnce(response({ ...ui.D.profile, created_resume_id: 9, created_resume_version: 2, created_resume_active: false }));
+    confirm.mockReturnValueOnce(true); await ui.settingsSave('resumes');
+    expect(ui.RD.draft).toBeNull(); expect(ui.RD.editing).toBeNull(); expect(ui.RD.viewId).toBe(9);
+  });
+  it('deleting a resume asks once, keeps text drafts, and the active one cannot be deleted', async () => {
+    resumesLoaded([resumeCard(), resumeCard({ id: 2, name: 'older.pdf', version: 2, is_active: false })]); section('resumes');
+    expect([...document.querySelectorAll('[data-act="rd-delete-version"]')].map(b => b.dataset.id)).toEqual(['2']);
     ui.setF('resumes', 'master_resume', 'Draft');
-    confirm.mockReturnValueOnce(true).mockReturnValueOnce(false);
-    await ui.A['resume-delete']({ dataset: { id: '1', name: 'primary.txt' } }); expect(fetchMock).not.toHaveBeenCalled();
-    fetchMock.mockResolvedValueOnce(response({ resumes: [] })).mockResolvedValueOnce(response(ui.D.profile));
-    await ui.A['resume-delete']({ dataset: { id: '2', name: 'older.txt' } });
+    confirm.mockReturnValueOnce(false);
+    await ui.A['rd-delete-version']({ dataset: { id: '2', name: 'older.pdf · v2' } }); expect(fetchMock).not.toHaveBeenCalled();
+    fetchMock.mockResolvedValueOnce(response({ deleted: 2, file_deleted: true, jobs: 0 })).mockResolvedValueOnce(response({ active: null, current: null, versions: [resumeCard()], policy: {} }));
+    await ui.A['rd-delete-version']({ dataset: { id: '2', name: 'older.pdf · v2' } });
+    expect(confirm).toHaveBeenCalledTimes(2);
     expect(ui.S.forms.resumes.master_resume).toBe('Draft');
+    expect(ui.D.resumeData.versions.map(v => v.id)).toEqual([1]);
   });
   it('requires saved text for evidence extraction', async () => {
-    section('resumes'); ui.setF('resumes', 'master_resume', 'Draft');
+    resumesLoaded(); section('resumes'); ui.setF('resumes', 'master_resume', 'Draft');
     await ui.A['parse-evidence'](); expect(fetchMock).not.toHaveBeenCalled();
     expect(ui.SETTING_ERRORS.resumes).toContain('Save your resume');
     delete ui.S.forms.resumes; fetchMock.mockResolvedValueOnce(response({ added: 2 }));
@@ -342,31 +419,6 @@ describe('focused settings UI', () => {
     expect(document.querySelector('[data-settings-save]').disabled).toBe(true);
     expect(ui.D.summary.profile.name).toBe('Alex Morgan');
   });
-  it('preserves unsaved edits when the only uploaded resume is deleted', async () => {
-    section('resumes'); ui.D.resumes = [{ id: 1, filename: 'only.txt', active: true }];
-    ui.setF('resumes', 'master_resume', 'Do not discard this draft');
-    fetchMock.mockResolvedValueOnce(response({ promoted: null, resumes: [] })).mockResolvedValueOnce(response(ui.D.profile));
-    await ui.A['resume-delete']({ dataset: { id: '1', name: 'only.txt' } });
-    expect(confirm).toHaveBeenCalledTimes(1);
-    expect(ui.S.forms.resumes.master_resume).toBe('Do not discard this draft');
-    expect(ui.settingsDirty('resumes')).toBe(true);
-  });
-  it('clears a confirmed draft only when the backend actually promotes a replacement', async () => {
-    section('resumes'); ui.D.resumes = [{ id: 1, filename: 'primary.txt', active: true }, { id: 2, filename: 'replacement.txt', active: false }];
-    ui.setF('resumes', 'master_resume', 'Draft');
-    fetchMock.mockResolvedValueOnce(response({ promoted: 2, resumes: [] })).mockResolvedValueOnce(response({ ...ui.D.profile, master_resume: 'Replacement text' }));
-    await ui.A['resume-delete']({ dataset: { id: '1', name: 'primary.txt' } });
-    expect(confirm).toHaveBeenCalledTimes(2);
-    expect(ui.S.forms.resumes).toBeUndefined();
-    expect(ui.D.profile.master_resume).toBe('Replacement text');
-  });
-  it('retains a draft when an expected replacement disappeared before deletion', async () => {
-    section('resumes'); ui.D.resumes = [{ id: 1, filename: 'primary.txt', active: true }, { id: 2, filename: 'replacement.txt', active: false }];
-    ui.setF('resumes', 'master_resume', 'Draft');
-    fetchMock.mockResolvedValueOnce(response({ promoted: null, resumes: [] })).mockResolvedValueOnce(response(ui.D.profile));
-    await ui.A['resume-delete']({ dataset: { id: '1', name: 'primary.txt' } });
-    expect(ui.S.forms.resumes.master_resume).toBe('Draft');
-  });
 
 });
 
@@ -385,27 +437,28 @@ describe('resume data', () => {
       sections: [['personal_information', 'VERIFIED'], ['summary', 'UNVERIFIED'], ['skills', 'VERIFIED'], ['experience', 'NEEDS_REVIEW'], ['projects', 'EMPTY']].map(([section, state]) => ({ section, label: section, state, required: true, counts: { UNVERIFIED: state === 'UNVERIFIED' ? 1 : 0, EDITED: state === 'NEEDS_REVIEW' ? 1 : 0 } })),
       entries: [{ section: 'experience', item_id: 'exp_zendrive_2024', label: 'Lead Engineer · Zendrive', state: 'NEEDS_REVIEW', counts: {} }],
       blocking: [{ item_id: 'summary', label: 'Builds platforms' }] };
-    return { id: 5, name: 'resume.pdf', version: 2, is_active: true, is_default: true, verification_status: 'NEEDS_REVIEW', verified_at: '2026-09-01T10:00:00', revision: 3, source_filename: 'resume.pdf', has_original: true, structured, progress, pending_reparse: null, ...overrides };
+    return { id: 5, name: 'resume.pdf', version: 2, is_active: true, verification_status: 'NEEDS_REVIEW', verified_at: '2026-09-01T10:00:00', revision: 3, source_filename: 'resume.pdf', has_original: true, structured, progress, pending_reparse: null, ...overrides };
   }
   function settle() { return new Promise(r => setTimeout(r, 0)); }
   function route(routes) {
     fetchMock.mockImplementation(async (url, opt = {}) => {
       const key = `${opt.method || 'GET'} ${url}`;
-      const hit = Object.entries(routes).find(([k]) => key === k || key.startsWith(k));
+      const hit = Object.entries(routes).find(([k]) => key === k) || Object.entries(routes).find(([k]) => key.startsWith(k));
       if (!hit) return response({});
       const value = typeof hit[1] === 'function' ? hit[1](JSON.parse(opt.body || 'null')) : hit[1];
       return value && value.__status ? response(value.body, value.__status) : response(value);
     });
   }
   async function open(active = detail(), extra = {}) {
-    route({ 'GET /api/settings/resume': { active, versions: [active, { id: 4, name: 'old.pdf', version: 1, is_active: false, is_default: false, verification_status: 'UNVERIFIED' }], policy: { allow_unverified_resume_facts: false, ranking_uses_unverified: true } }, ...extra });
+    route({ 'GET /api/settings/resume': { active, versions: [active, { id: 4, name: 'old.pdf', version: 1, is_active: false, verification_status: 'UNVERIFIED', setups: [{ id: 3, name: 'ML roles' }] }], policy: { allow_unverified_resume_facts: false, ranking_uses_unverified: true } }, ...extra });
     section('resume-data'); await settle();
   }
 
   it('shows verification progress, statuses and blocks Verify Resume while items need review', async () => {
     await open();
     const view = document.getElementById('view').innerHTML;
-    expect(document.querySelector('h2').textContent).toBe('Resume Data');
+    expect(document.querySelector('h2').textContent).toBe('Resumes');
+    expect(document.querySelector('[data-rd-resume="5"]').getAttribute('aria-current')).toBe('true');
     expect(document.querySelector('[data-rd-percent]').textContent).toContain('67%');
     expect(view).toContain('require review');
     expect(view).toContain('Builds &lt;platforms&gt;');
@@ -417,12 +470,17 @@ describe('resume data', () => {
   it('verifies an item, a section and the whole resume through the API', async () => {
     const verified = detail({ verification_status: 'VERIFIED', progress: { ...detail().progress, blocking: [] } });
     await open(detail(), { 'POST /api/resumes/5/verify-item': body => { expect(body).toEqual({ item_id: 'summary', status: 'VERIFIED' }); return verified; },
-      'POST /api/resumes/5/verify-section': verified, 'POST /api/resumes/5/unverify-item': detail(), 'POST /api/resumes/5/verify': verified });
+      'POST /api/resumes/5/verify-section': verified, 'POST /api/resumes/5/unverify-item': detail({ progress: { ...detail().progress, blocking: [] } }), 'POST /api/resumes/5/verify': verified });
     await ui.A['rd-verify-item']({ dataset: { id: 'summary', status: 'VERIFIED' } });
     expect(ui.D.resumeData.active.verification_status).toBe('VERIFIED');
-    expect(document.querySelector('[data-act="rd-verify-resume"]').disabled).toBe(false);
+    const button = () => document.querySelector('[data-act="rd-verify-resume"]');
+    expect(button().disabled).toBe(true);
+    expect(button().textContent).toContain('Resume verified');
+    await ui.A['rd-verify-resume']();  // an already verified resume is not verified again
+    expect(fetchMock.mock.calls.some(([url]) => url === '/api/resumes/5/verify')).toBe(false);
     await ui.A['rd-verify-section']({ dataset: { section: 'experience' } });
-    await ui.A['rd-unverify']({ dataset: { id: 'ach_1' } });
+    await ui.A['rd-unverify']({ dataset: { id: 'ach_1' } });  // back to review: Verify Resume is offered again
+    expect(button().disabled).toBe(false);
     await ui.A['rd-verify-resume']();
     expect(fetchMock.mock.calls.map(([url, opt]) => `${opt?.method || 'GET'} ${url}`)).toContain('POST /api/resumes/5/verify');
   });
@@ -484,7 +542,7 @@ describe('resume data', () => {
     ui.A['rd-tab']({ dataset: { tab: 'raw' } }); await settle();
     const raw = document.querySelector('[data-rd-raw]');
     expect(raw.textContent).toBe('RAW <b>resume</b>');
-    expect(document.querySelector('#settings-editor textarea')).toBeNull();
+    expect(document.querySelector('[data-rd-raw] textarea, #rd-detail textarea')).toBeNull();
     ui.A['rd-tab']({ dataset: { tab: 'original' } });
     expect(document.querySelector('a[href="/api/resumes/5/original"]')).toBeTruthy();
     ui.A['rd-tab']({ dataset: { tab: 'history' } }); await settle();
@@ -507,9 +565,18 @@ describe('resume data', () => {
   });
   it('switches versions and saves the candidate policy', async () => {
     let policy;
-    await open(detail(), { 'POST /api/resumes/4/activate': detail(), 'POST /api/resumes/4/default': detail(), 'PUT /api/settings/resume/policy': body => { policy = body; return { allow_unverified_resume_facts: true, ranking_uses_unverified: true }; } });
+    const old = detail({ id: 4, name: 'old.pdf', version: 1, is_active: false });
+    await open(detail(), { 'GET /api/settings/resume?resume_id=4': { active: detail(), current: old, versions: [detail(), old], policy: {} },
+      'POST /api/resumes/4/activate': detail(), 'PUT /api/settings/resume/policy': body => { policy = body; return { allow_unverified_resume_facts: true, ranking_uses_unverified: true }; } });
+    expect(document.getElementById('view').textContent).toContain('Used by ML roles');
+    expect(document.querySelector('[data-act="rd-default"]')).toBeNull();
+    // Viewing another version opens it for editing without making it active.
+    await ui.A['rd-view']({ dataset: { id: '4' } });
+    expect(fetchMock.mock.calls.some(([url]) => url === '/api/settings/resume?resume_id=4')).toBe(true);
+    expect(fetchMock.mock.calls.some(([url, opt]) => url.includes('/activate') && opt?.method === 'POST')).toBe(false);
+    expect(document.getElementById('view').textContent).toContain('This resume is not active');
     await ui.A['rd-activate']({ dataset: { id: '4' } });
-    await ui.A['rd-default']({ dataset: { id: '4' } });
+    expect(ui.RD.viewId).toBeNull();
     await ui.A['rd-policy']({ dataset: { key: 'allow_unverified_resume_facts' }, checked: true });
     expect(policy).toEqual({ allow_unverified_resume_facts: true });
     expect(ui.D.resumeData.policy.allow_unverified_resume_facts).toBe(true);
@@ -548,7 +615,8 @@ describe('resume data', () => {
   it('handles no resume and load failures', async () => {
     route({ 'GET /api/settings/resume': { active: null, versions: [], policy: {} } });
     section('resume-data'); await settle();
-    expect(document.getElementById('view').innerHTML).toContain('No resume yet');
+    expect(document.getElementById('view').innerHTML).toContain('Your experience starts here');
+    expect(document.getElementById('rd-detail')).toBeNull();
     route({ 'GET /api/settings/resume': { __status: 500, body: { detail: 'boom' } } });
     await ui.A['rd-reload'](); 
     expect(document.getElementById('view').innerHTML).toContain('could not be loaded');

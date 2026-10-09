@@ -80,7 +80,7 @@ def task_dict(task: TailorTask) -> dict[str, Any]:
     job = task.job
     return {
         "id": task.id, "job_id": task.job_id, "title": job.title if job else "", "company": job.company if job else "",
-        "mode": task.mode, "regenerate": task.regenerate, "status": task.status, "stage": stage,
+        "mode": task.mode, "regenerate": task.regenerate, "pages": (task.options or {}).get("pages"), "status": task.status, "stage": stage,
         "progress": STAGE_PROGRESS[task.mode].get(stage, 0), "error": task.error, "result": task.result,
         "created_at": _iso(task.created_at), "started_at": _iso(task.started_at), "finished_at": _iso(task.finished_at),
     }
@@ -88,9 +88,11 @@ def task_dict(task: TailorTask) -> dict[str, Any]:
 
 # ───────────── per-user operations (the session belongs to the signed-in user) ─────────────
 
-def enqueue(db: Session, ids: list[int], mode: str = "tailor", regenerate: bool = False) -> dict[str, Any]:
+def enqueue(db: Session, ids: list[int], mode: str = "tailor", regenerate: bool = False,
+            pages: int | None = None) -> dict[str, Any]:
     """Queue tailoring for jobs in the Tailor queue. Jobs already queued or running, or with a packet
-    (unless `regenerate`), are skipped with a reason."""
+    (unless `regenerate`), are skipped with a reason. `pages` is their page target (None = the default in Settings,
+    read when the task runs)."""
     wanted = list(dict.fromkeys(ids))
     jobs = {j.id: j for j in db.scalars(select(Job).where(Job.id.in_(wanted))).all()}
     has_packet = set(db.scalars(select(ResumeVariant.job_id).where(ResumeVariant.job_id.in_(wanted))).all())
@@ -113,7 +115,8 @@ def enqueue(db: Session, ids: list[int], mode: str = "tailor", regenerate: bool 
         if reason:
             skipped.append({"id": job_id, "reason": reason})
             continue
-        task = TailorTask(job_id=job.id, mode=mode, regenerate=regenerate, status="queued", stage="queued", attempts=0)
+        task = TailorTask(job_id=job.id, mode=mode, regenerate=regenerate, status="queued", stage="queued", attempts=0,
+                          options={"pages": pages} if pages and mode == "tailor" else None)
         try:
             # uq_tailor_tasks_active_job: another request may have queued this job since the check above.
             with db.begin_nested():
@@ -248,6 +251,7 @@ def run_task(sessions: SessionFactory, task_id: int, worker_id: str, lease_secon
         if task is None or task.status != "running" or not (task.locked_by or "").startswith(worker_id[:180]):
             return "missing"
         user_id, job_id, mode = task.user_id, task.job_id, task.mode
+        pages = (task.options or {}).get("pages")
         holder, run_now = task.locked_by, task.run_now_at is not None
     worker_id = holder  # every write below is guarded by this claim's own name
     if run_now and not _write(sessions, task_id, worker_id, run_now_at=None):  # used once, by this run only
@@ -284,9 +288,10 @@ def run_task(sessions: SessionFactory, task_id: int, worker_id: str, lease_secon
                 raise ValueError("This job was deleted")
             if job.status not in SKIP_TAILORING_STATUSES:
                 raise ValueError(f"This job is {job.status.replace('_', ' ')} and can no longer be tailored")
-            run = skip_tailoring if mode == "skip" else tailor_job
             with backoff.bypass(run_now):
-                out = packet_outcome(db, job, run(db, job, progress=progress))
+                made = skip_tailoring(db, job, progress=progress) if mode == "skip" \
+                    else tailor_job(db, job, progress=progress, pages=pages)
+                out = packet_outcome(db, job, made)
             result = {key: out[key] for key in ("resume_id", "version", "reviewer_score", "auto_approved", "untailored")}
             status, error = "succeeded", None
         except TaskAbandoned:

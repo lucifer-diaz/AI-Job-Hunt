@@ -151,7 +151,8 @@ def test_relevant_evidence_is_filtered_to_the_job(user):
 def test_context_token_reduction_is_measured_and_recorded(user, monkeypatch):
     job_id = add_job(user)
     long_resume = RESUME + "\n## Additional Information\n" + "\n".join(f"- Unrelated hobby number {i} " * 3 for i in range(300))
-    client.patch("/api/profile", json={"master_resume": long_resume})
+    created = client.patch("/api/profile", json={"master_resume": long_resume}).json()["created_resume_id"]
+    assert client.post(f"/api/resumes/{created}/activate").status_code == 200  # edited text is used once activated
     verify("experience")
     context = build(user, cb.build_tailoring_context, job_id)
     stats = context.stats
@@ -185,7 +186,7 @@ def test_tailoring_is_blocked_without_verified_facts(user):
     with pytest.raises(cb.UnverifiedResumeError):
         build(user, cb.build_tailoring_context, job_id)
     out = client.post(f"/api/jobs/{job_id}/tailor")
-    assert out.status_code == 400 and "Resume Data" in out.json()["detail"]
+    assert out.status_code == 400 and "Settings → Resumes" in out.json()["detail"]
     client.put("/api/settings/resume/policy", json={"allow_unverified_resume_facts": True})
     context = build(user, cb.build_tailoring_context, job_id)
     assert any(b["type"] == "unverified" for role in context.relevant_experience for b in role["bullets"])
