@@ -291,8 +291,9 @@ def test_board_import_errors_are_readable(monkeypatch):
 def test_board_import_can_be_limited_to_teams_and_roles(monkeypatch):
     posting = lambda i, title, team: {"id": i, "title": title, "content": "<p>Build things</p>", "absolute_url": f"https://x.test/{i}",
                                       "location": {"name": "Remote"}, "departments": [{"name": team}]}
-    board = [posting(9101, "Backend Engineer", "Engineering"), posting(9102, "Data Engineer", "Data"),
-             posting(9103, "Account Executive", "Sales"), posting(9104, "Staff Engineer", "Engineering")]
+    base = int(uuid.uuid4().int % 10**9)  # the test database is shared, so every run posts new ids
+    board = [posting(base + 1, "Backend Engineer", "Engineering"), posting(base + 2, "Data Engineer", "Data"),
+             posting(base + 3, "Account Executive", "Sales"), posting(base + 4, "Staff Engineer", "Engineering")]
     monkeypatch.setattr("app.services.sources._fetch_greenhouse", lambda token: board)
 
     teams = client.get("/api/import/greenhouse/acme/teams").json()["teams"]
