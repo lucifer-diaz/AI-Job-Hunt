@@ -2,6 +2,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import desc, select
@@ -308,6 +309,36 @@ def test_board_import_can_be_limited_to_teams_and_roles(monkeypatch):
     assert (both["seen"], both["created"]) == (1, 1)  # Data Engineer only: in a chosen team and a matching title
     everything = client.post("/api/import/greenhouse/acme").json()
     assert (everything["seen"], everything["total"]) == (4, 4)
+
+
+def test_board_preview_lists_roles_and_import_can_take_only_the_chosen(monkeypatch):
+    posting = lambda i, title, team: {"id": i, "title": title, "content": "<p>Build things</p>", "absolute_url": f"https://x.test/{i}",
+                                      "location": {"name": "Remote"}, "departments": [{"name": team}]}
+    base = int(uuid.uuid4().int % 10**9)
+    board = [posting(base + 1, "Backend Engineer", "Engineering"), posting(base + 2, "Data Engineer", "Data"),
+             posting(base + 3, "Account Executive", "Sales")]
+    monkeypatch.setattr("app.services.sources._fetch_greenhouse", lambda token: board)
+
+    preview = client.post("/api/import/greenhouse/acme/preview", json={"roles": ["engineer"]}).json()
+    assert preview["total"] == 3 and [j["title"] for j in preview["jobs"]] == ["Backend Engineer", "Data Engineer"]
+    assert preview["jobs"][0]["team"] == "Engineering" and not any(j["in_pipeline"] for j in preview["jobs"])
+
+    chosen = str(base + 2)
+    result = client.post("/api/import/greenhouse/acme", json={"roles": ["engineer"], "source_refs": [chosen]}).json()
+    assert (result["seen"], result["created"]) == (1, 1)  # only the ticked role was added
+    none = client.post("/api/import/greenhouse/acme", json={"roles": ["engineer"], "source_refs": []}).json()
+    assert (none["seen"], none["created"]) == (0, 0)  # an explicit empty selection never means "everything"
+    again = client.post("/api/import/greenhouse/acme/preview", json={"roles": ["engineer"]}).json()
+    assert {j["source_ref"]: j["in_pipeline"] for j in again["jobs"]} == {str(base + 1): False, chosen: True}
+
+
+def test_board_preview_errors_are_readable(monkeypatch):
+    def gone(token):
+        raise httpx.HTTPStatusError("nope", request=httpx.Request("GET", "https://x.test"),
+                                    response=httpx.Response(404))
+    monkeypatch.setattr("app.services.sources._fetch_lever", gone)
+    response = client.post("/api/import/lever/nope/preview", json={})
+    assert response.status_code == 404 and "Lever" in response.json()["detail"]
 
 
 def test_rank_batch_queues_unranked_jobs_without_ranking_them():

@@ -932,7 +932,7 @@ function renderSetup() {
       <label class="field mt8">Role keywords <span class="faint">(optional)</span>${inputF('board', 'roles', '', 'placeholder="e.g. engineer, data scientist" aria-describedby="board-roles-help"')}<span class="helper" id="board-roles-help">Only roles whose title has one of these words. Separate several with commas.</span></label>
       <div class="mt8"><div class="row base between"><span class="xs muted">Teams <span class="faint">(optional)</span></span>${btn(label('boardTeams', S.boardTeams ? 'Refresh teams' : 'Find teams', 'Looking…'), 'board-teams', {}, 'ghost sm', isBusy('boardTeams'))}</div>
         ${S.boardTeams ? (S.boardTeams.length ? `<div class="row gap6 wrap mt6" role="group" aria-label="Teams">${S.boardTeams.map(t => { const on = (fv('board', 'teams', []) || []).includes(t.name); return `<button type="button" class="btn sm ${on ? 'soft' : ''}" data-act="toggle-board-team" data-team="${attr(t.name)}" aria-pressed="${on ? 'true' : 'false'}">${on ? '✓ ' : ''}${esc(t.name)} <span class="tiny faint">${t.count}</span></button>`; }).join('')}</div>` : '<div class="helper">This board does not list teams — use role keywords instead.</div>') : '<div class="helper">Look up the board to choose from its teams. Nothing picked imports every open role.</div>'}</div>
-      ${btn(label('board', 'Import board', 'Importing…'), 'import-board', {}, 'block mt8', isBusy('board'))}</section>
+      <div class="row gap8 mt8">${btn(label('boardReview', 'Review roles first', 'Loading…'), 'board-review', {}, 'ghost grow', isBusy('boardReview'))}${btn(label('board', 'Import board', 'Importing…'), 'import-board', {}, 'grow', isBusy('board'))}</div></section>
   </div></div>`;
 }
 
@@ -1241,6 +1241,21 @@ function renderRejectPicker(job, a) {
     ${inputF('reject', 'notes', '', 'placeholder="Anything worth remembering (optional)" maxlength="2000"')}
     <div class="row gap8 wrap mt10">${btn(label('reject', chosen ? 'Reject with this reason' : 'Reject without a reason', 'Rejecting…'), 'reject-confirm', { id: job.id }, 'danger-solid', isBusy('reject'))}
       ${chosen ? btn('Clear reason', 'reject-reason', { id: '' }, 'sm ghost') : ''}</div></div>`;
+}
+function renderBoardReview() {
+  const r = S.boardReview, open = r.jobs.filter(j => !j.in_pipeline), n = r.selected.size;
+  return `<div class="overlay center" data-act="overlay-close"><div class="modal white" role="dialog" aria-label="Review board roles" style="max-width:640px">
+    <div class="row top-align between gap16" style="padding:20px 24px;border-bottom:1px solid var(--line2)"><div>
+      <div style="font-size:19px;font-weight:600;letter-spacing:-.02em">Review roles · ${esc(r.token)}</div>
+      <div class="small muted mt4">${r.jobs.length} matching of ${r.total} open roles${open.length < r.jobs.length ? ` · ${r.jobs.length - open.length} already in your pipeline` : ''}. Untick any you don't want.</div></div>
+      ${btn('Close', 'board-review-close', {}, 'none')}</div>
+    <div class="row gap8" style="padding:10px 24px">${btn('Select all', 'board-review-all', {}, 'ghost sm')}${btn('Select none', 'board-review-none', {}, 'ghost sm')}</div>
+    <div style="max-height:52vh;overflow:auto;border-top:1px solid var(--line2)">${r.jobs.length ? r.jobs.map(j => `<label class="row gap10" style="padding:10px 24px;border-bottom:1px solid #f8f9fd;${j.in_pipeline ? 'opacity:.5' : 'cursor:pointer'}">
+      <input type="checkbox" data-act="toggle-board-job" data-ref="${attr(j.source_ref)}" ${r.selected.has(j.source_ref) ? 'checked' : ''} ${j.in_pipeline ? 'disabled' : ''}>
+      <div class="grow"><div class="small b">${esc(j.title)}</div><div class="tiny muted">${esc([j.team, j.location].filter(Boolean).join(' · ')) || '—'}${j.in_pipeline ? ' · already added' : ''}</div></div>
+      ${j.url ? `<a class="tiny" href="${attr(j.url)}" target="_blank" rel="noopener">Posting ↗</a>` : ''}</label>`).join('') : '<div class="small muted" style="padding:20px 24px">No roles match these filters.</div>'}</div>
+    <div class="row gap8 end" style="padding:14px 24px;border-top:1px solid var(--line2)">${btn('Cancel', 'board-review-close', {}, 'ghost')}${btn(label('board', `Add ${n} selected`, 'Importing…'), 'board-review-import', {}, '', isBusy('board') || !n)}</div>
+  </div></div>`;
 }
 function renderKit() {
   const k = D.kit; if (!k) return `<div class="overlay center" data-act="overlay-close"><div class="modal white" style="padding:40px">${loading()}</div></div>`;
@@ -1603,8 +1618,8 @@ function render() {
   $('#top').innerHTML = renderTop();
   $('#view').innerHTML = RENDER[S.screen]();
   $('#overlays').innerHTML = (S.jobOpen ? renderJobModal() : '') + (S.kitJob ? renderKit() : '') + (S.paletteOpen ? renderPalette() : '') + (S.mon?.request ? renderMonRequestModal() : '')
-    + (S.mon?.ext?.request ? renderMonExtRequestModal() : '') + (S.mon?.logs?.entry ? renderMonLogModal() : '');
-  document.body.style.overflow = (S.jobOpen || S.kitJob || S.paletteOpen || S.mon?.request) ? 'hidden' : '';
+    + (S.boardReview ? renderBoardReview() : '') + (S.mon?.ext?.request ? renderMonExtRequestModal() : '') + (S.mon?.logs?.entry ? renderMonLogModal() : '');
+  document.body.style.overflow = (S.jobOpen || S.kitJob || S.paletteOpen || S.mon?.request || S.boardReview) ? 'hidden' : '';
   restoreScroll(kept);
   if (fid) {
     const el = document.getElementById(fid);
@@ -1897,7 +1912,7 @@ const A = {
     const approved = list.find(a => a.status === 'approved');
     if (approved) openKit(approved.id); else { toast('No approved packet is waiting for submission', true); render(); }
   },
-  'overlay-close': (el, e) => { if (e.target !== el) return; S.jobOpen = null; S.kitJob = null; S.paletteOpen = false; render(); },
+  'overlay-close': (el, e) => { if (e.target !== el) return; S.boardReview = null; S.jobOpen = null; S.kitJob = null; S.paletteOpen = false; render(); },
   'open-job': el => openJob(el.dataset.id),
   'close-job': () => { S.jobOpen = null; render(); },
   'job-tab': el => { S.jobTab = el.dataset.id; render(); if (S.jobTab === 'insights') insEnsure(S.jobOpen); },
@@ -2258,6 +2273,25 @@ const A = {
     const team = el.dataset.team, chosen = fv('board', 'teams', []) || [];
     setF('board', 'teams', chosen.includes(team) ? chosen.filter(t => t !== team) : [...chosen, team]); render();
   },
+  'board-review': () => busy('boardReview', async () => {
+    const kind = fv('board', 'kind', 'greenhouse'), token = (fv('board', 'token', '') || '').trim();
+    if (!/^[\w.-]+$/.test(token)) throw new Error('Enter the board token — letters, numbers, dots or dashes');
+    const body = { teams: fv('board', 'teams', []) || [], roles: String(fv('board', 'roles', '') || '').split(',').map(r => r.trim()).filter(Boolean) };
+    const out = await api(`/api/import/${kind}/${encodeURIComponent(token)}/preview`, { method: 'POST', body });
+    S.boardReview = { kind, token, jobs: out.jobs, total: out.total, selected: new Set(out.jobs.filter(j => !j.in_pipeline).map(j => j.source_ref)) };
+    return out;
+  }, out => `${out.jobs.length} matching roles to review`),
+  'toggle-board-job': el => { const s = S.boardReview?.selected; if (!s) return; const ref = el.dataset.ref; if (s.has(ref)) s.delete(ref); else s.add(ref); render(); },
+  'board-review-all': () => { const r = S.boardReview; r.selected = new Set(r.jobs.filter(j => !j.in_pipeline).map(j => j.source_ref)); render(); },
+  'board-review-none': () => { S.boardReview.selected = new Set(); render(); },
+  'board-review-close': () => { S.boardReview = null; render(); },
+  'board-review-import': () => busy('board', async () => {
+    const r = S.boardReview;
+    if (!r?.selected.size) throw new Error('Pick at least one role');
+    const body = { teams: fv('board', 'teams', []) || [], roles: String(fv('board', 'roles', '') || '').split(',').map(x => x.trim()).filter(Boolean), source_refs: [...r.selected] };
+    const out = await api(`/api/import/${r.kind}/${encodeURIComponent(r.token)}`, { method: 'POST', body });
+    delete S.forms.board; S.boardTeams = null; S.boardReview = null; await load(); return out;
+  }, out => `Added ${out.created} new role${out.created === 1 ? '' : 's'} — they are in your triage queue`),
   'import-board': () => busy('board', async () => {
     const kind = fv('board', 'kind', 'greenhouse'), token = (fv('board', 'token', '') || '').trim();
     if (!/^[\w.-]+$/.test(token)) throw new Error('Enter the board token — letters, numbers, dots or dashes');
@@ -2527,7 +2561,7 @@ function commitTag(el, redraw = true) {
 document.addEventListener('keydown', e => {
   const el = e.target;
   if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); A.palette(); return; }
-  if (e.key === 'Escape') { if (S.paletteOpen || S.jobOpen || S.kitJob) { S.paletteOpen = false; S.jobOpen = null; S.kitJob = null; render(); } return; }
+  if (e.key === 'Escape') { if (S.boardReview && !S.paletteOpen && !S.jobOpen && !S.kitJob) { S.boardReview = null; render(); return; } if (S.paletteOpen || S.jobOpen || S.kitJob) { S.paletteOpen = false; S.jobOpen = null; S.kitJob = null; render(); } return; }
   if (el.dataset && el.dataset.tag) {
     if (e.key === 'Enter' || (e.key === ',' && el.dataset.split !== 'newline')) { e.preventDefault(); if (el.value.trim()) commitTag(el); return; }
     if (e.key === 'Backspace' && !el.value) {

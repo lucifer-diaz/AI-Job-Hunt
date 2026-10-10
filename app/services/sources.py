@@ -153,64 +153,99 @@ def board_teams(kind: str, token: str) -> list[dict[str, Any]]:
     return teams
 
 
-def import_lever(db: Session, site: str, teams: list[str] | None = None, roles: list[str] | None = None) -> dict[str, int]:
-    everything = _fetch_lever(site)
-    data = _board_filter(everything, _lever_teams, lambda i: i.get("text"), teams, roles)
+def _lever_fields(item: dict, site: str) -> dict[str, Any]:
+    categories = item.get("categories") or {}
+    lists = item.get("lists") or []
+    list_text = "\n".join(
+        f"{x.get('text','')}: {BeautifulSoup(x.get('content',''), 'html.parser').get_text(' ', strip=True)}"
+        for x in lists
+    )
+    description = "\n\n".join(
+        filter(
+            None,
+            [
+                item.get("descriptionPlain")
+                or BeautifulSoup(item.get("description", ""), "html.parser").get_text(" ", strip=True),
+                list_text,
+                item.get("additionalPlain")
+                or BeautifulSoup(item.get("additional", ""), "html.parser").get_text(" ", strip=True),
+            ],
+        )
+    )
+    return {
+        "source": "lever",
+        "source_ref": str(item.get("id")),
+        "title": item.get("text") or "Untitled",
+        "company": site,
+        "location": categories.get("location") or "",
+        "url": item.get("hostedUrl") or item.get("applyUrl") or "",
+        "description": description,
+        "raw": item,
+    }
+
+
+def _greenhouse_fields(item: dict, board_token: str) -> dict[str, Any]:
+    return {
+        "source": "greenhouse",
+        "source_ref": str(item.get("id")),
+        "title": item.get("title") or "Untitled",
+        "company": board_token,
+        "location": (item.get("location") or {}).get("name", ""),
+        "url": item.get("absolute_url") or "",
+        "description": BeautifulSoup(item.get("content", ""), "html.parser").get_text("\n", strip=True),
+        "raw": item,
+    }
+
+
+_BOARDS = {
+    "lever": (lambda token: _fetch_lever(token), _lever_teams, lambda i: i.get("text"), _lever_fields),
+    "greenhouse": (lambda token: _fetch_greenhouse(token), _greenhouse_teams, lambda i: i.get("title"), _greenhouse_fields),
+}
+
+
+def _import_board(db: Session, kind: str, token: str, teams, roles, source_refs) -> dict[str, int]:
+    fetch, teams_of, title_of, fields = _BOARDS[kind]
+    everything = fetch(token)
+    data = _board_filter(everything, teams_of, title_of, teams, roles)
+    if source_refs is not None:
+        chosen = set(source_refs)
+        data = [i for i in data if str(i.get("id")) in chosen]
     created = 0
     for item in data:
-        categories = item.get("categories") or {}
-        lists = item.get("lists") or []
-        list_text = "\n".join(
-            f"{x.get('text','')}: {BeautifulSoup(x.get('content',''), 'html.parser').get_text(' ', strip=True)}"
-            for x in lists
-        )
-        description = "\n\n".join(
-            filter(
-                None,
-                [
-                    item.get("descriptionPlain")
-                    or BeautifulSoup(item.get("description", ""), "html.parser").get_text(" ", strip=True),
-                    list_text,
-                    item.get("additionalPlain")
-                    or BeautifulSoup(item.get("additional", ""), "html.parser").get_text(" ", strip=True),
-                ],
-            )
-        )
-        _, is_new = upsert_job(
-            db,
-            source="lever",
-            source_ref=str(item.get("id")),
-            title=item.get("text") or "Untitled",
-            company=site,
-            location=categories.get("location") or "",
-            url=item.get("hostedUrl") or item.get("applyUrl") or "",
-            description=description,
-            raw=item,
-        )
+        _, is_new = upsert_job(db, **fields(item, token))
         created += int(is_new)
     return {"seen": len(data), "created": created, "total": len(everything)}
+
+
+def import_lever(db: Session, site: str, teams: list[str] | None = None, roles: list[str] | None = None,
+                 source_refs: list[str] | None = None) -> dict[str, int]:
+    return _import_board(db, "lever", site, teams, roles, source_refs)
 
 
 def import_greenhouse(db: Session, board_token: str, teams: list[str] | None = None,
-                      roles: list[str] | None = None) -> dict[str, int]:
-    everything = _fetch_greenhouse(board_token)
-    data = _board_filter(everything, _greenhouse_teams, lambda i: i.get("title"), teams, roles)
-    created = 0
-    for item in data:
-        description = BeautifulSoup(item.get("content", ""), "html.parser").get_text("\n", strip=True)
-        _, is_new = upsert_job(
-            db,
-            source="greenhouse",
-            source_ref=str(item.get("id")),
-            title=item.get("title") or "Untitled",
-            company=board_token,
-            location=(item.get("location") or {}).get("name", ""),
-            url=item.get("absolute_url") or "",
-            description=description,
-            raw=item,
-        )
-        created += int(is_new)
-    return {"seen": len(data), "created": created, "total": len(everything)}
+                      roles: list[str] | None = None, source_refs: list[str] | None = None) -> dict[str, int]:
+    return _import_board(db, "greenhouse", board_token, teams, roles, source_refs)
+
+
+def preview_board(db: Session, kind: str, token: str, teams: list[str] | None = None,
+                  roles: list[str] | None = None) -> dict[str, Any]:
+    """The roles an import with these filters would consider, saving nothing. Marks the ones already in the pipeline."""
+    fetch, teams_of, title_of, fields = _BOARDS[kind]
+    everything = fetch(token)
+    data = _board_filter(everything, teams_of, title_of, teams, roles)
+    refs = [str(i.get("id")) for i in data]
+    owner = require_user_id(db)
+    known = set(db.scalars(select(Job.source_ref).where(Job.user_id == owner, Job.source == kind,
+                                                        Job.source_ref.in_(refs)))) if refs else set()
+    jobs = []
+    for item, ref in zip(data, refs, strict=True):
+        f = fields(item, token)
+        jobs.append({
+            "source_ref": ref, "title": f["title"], "location": f["location"], "url": f["url"],
+            "team": ", ".join(dict.fromkeys(teams_of(item))),
+            "in_pipeline": ref in known,
+        })
+    return {"jobs": jobs, "total": len(everything)}
 
 
 def fetch_job_page(url: str) -> str:

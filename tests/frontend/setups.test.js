@@ -238,6 +238,30 @@ describe('import a company board', () => {
   });
 });
 
+describe('review a board before importing', () => {
+  it('previews the roles, then imports only the ticked ones', async () => {
+    const calls = [];
+    const jobs = [{ source_ref: 'a', title: 'Eng', team: 'T', location: '', url: '', in_pipeline: false },
+                  { source_ref: 'b', title: 'PM', team: 'T', location: '', url: '', in_pipeline: false },
+                  { source_ref: 'c', title: 'Old', team: 'T', location: '', url: '', in_pipeline: true }];
+    fetchMock.mockImplementation(async (url, opts) => {
+      calls.push([String(url), opts?.body]);
+      if (String(url).endsWith('/preview')) return response({ jobs, total: 9 });
+      return response(opts?.method === 'POST' ? { seen: 1, created: 1, total: 9 } : []);
+    });
+    ui.setF('board', 'token', 'acme');
+    await ui.A['board-review']();
+    expect([...ui.S.boardReview.selected]).toEqual(['a', 'b']);  // already-added roles start unticked
+    expect(document.querySelector('[aria-label="Review board roles"]')).not.toBeNull();
+    ui.A['toggle-board-job']({ dataset: { ref: 'b' } });
+    await ui.A['board-review-import']();
+    const post = calls.find(c => !c[0].endsWith('/preview') && c[1]);
+    expect(post[0]).toBe('/api/import/greenhouse/acme');
+    expect(JSON.parse(post[1]).source_refs).toEqual(['a']);
+    expect(ui.S.boardReview).toBeNull();
+  });
+});
+
 describe('add one manually', () => {
   const click = el => el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
   const mode = id => click(buttonFor('manual-mode').find(b => b.dataset.id === id));
