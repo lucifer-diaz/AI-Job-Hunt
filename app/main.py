@@ -101,6 +101,7 @@ from app.services.exports import markdown_to_simple_pdf
 from app.services.knowledge import question_key
 from app.services.sources import (
     board_teams,
+    preview_board,
     import_greenhouse,
     import_lever,
     refresh_apify_run,
@@ -478,12 +479,14 @@ class BoardImportIn(BaseModel):
     """Which part of a company board to import; empty means every open role."""
     teams: list[str] = Field(default_factory=list, max_length=20)
     roles: list[str] = Field(default_factory=list, max_length=20)
+    source_refs: list[str] = Field(default_factory=list, max_length=500)  # import only these postings
 
 
 def _board_import(importer, db: Session, token: str, label: str, payload: BoardImportIn | None = None):
     try:
         payload = payload or BoardImportIn()
-        return importer(db, token, teams=payload.teams, roles=payload.roles)
+        extra = {"source_refs": payload.source_refs} if payload.source_refs else {}
+        return importer(db, token, teams=payload.teams, roles=payload.roles, **extra)
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code == 404:
             raise HTTPException(404, f"No public {label} board named '{token}'") from exc
@@ -509,6 +512,15 @@ def board_team_list(kind: Literal["greenhouse", "lever"], token: str, db: Sessio
     """The teams a company board has open roles in (nothing is imported)."""
     label = "Lever" if kind == "lever" else "Greenhouse"
     return {"teams": _board_import(lambda _db, tok, **_: board_teams(kind, tok), db, token, label)}
+
+
+@app.post("/api/import/{kind}/{token}/preview")
+def board_preview(kind: Literal["greenhouse", "lever"], token: str, payload: BoardImportIn | None = None,
+                  db: Session = Depends(get_user_db)):
+    """The roles an import would add, so a person can review them first (nothing is imported)."""
+    label = "Lever" if kind == "lever" else "Greenhouse"
+    return _board_import(lambda _db, tok, **kw: preview_board(_db, kind, tok, kw["teams"], kw["roles"]),
+                         db, token, label, payload)
 
 
 @app.post("/api/search/apify")
