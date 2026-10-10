@@ -207,7 +207,7 @@ def _import_board(db: Session, kind: str, token: str, teams, roles, source_refs)
     fetch, teams_of, title_of, fields = _BOARDS[kind]
     everything = fetch(token)
     data = _board_filter(everything, teams_of, title_of, teams, roles)
-    if source_refs:
+    if source_refs is not None:
         chosen = set(source_refs)
         data = [i for i in data if str(i.get("id")) in chosen]
     created = 0

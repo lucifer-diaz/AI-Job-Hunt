@@ -479,13 +479,14 @@ class BoardImportIn(BaseModel):
     """Which part of a company board to import; empty means every open role."""
     teams: list[str] = Field(default_factory=list, max_length=20)
     roles: list[str] = Field(default_factory=list, max_length=20)
-    source_refs: list[str] = Field(default_factory=list, max_length=500)  # import only these postings
+    # Import only these postings. Omitted = no restriction; an explicit empty list imports nothing.
+    source_refs: list[str] | None = Field(default=None, max_length=5000)
 
 
 def _board_import(importer, db: Session, token: str, label: str, payload: BoardImportIn | None = None):
     try:
         payload = payload or BoardImportIn()
-        extra = {"source_refs": payload.source_refs} if payload.source_refs else {}
+        extra = {"source_refs": payload.source_refs} if payload.source_refs is not None else {}
         return importer(db, token, teams=payload.teams, roles=payload.roles, **extra)
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code == 404:

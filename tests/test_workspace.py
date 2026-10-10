@@ -326,6 +326,8 @@ def test_board_preview_lists_roles_and_import_can_take_only_the_chosen(monkeypat
     chosen = str(base + 2)
     result = client.post("/api/import/greenhouse/acme", json={"roles": ["engineer"], "source_refs": [chosen]}).json()
     assert (result["seen"], result["created"]) == (1, 1)  # only the ticked role was added
+    none = client.post("/api/import/greenhouse/acme", json={"roles": ["engineer"], "source_refs": []}).json()
+    assert (none["seen"], none["created"]) == (0, 0)  # an explicit empty selection never means "everything"
     again = client.post("/api/import/greenhouse/acme/preview", json={"roles": ["engineer"]}).json()
     assert {j["source_ref"]: j["in_pipeline"] for j in again["jobs"]} == {str(base + 1): False, chosen: True}
 
