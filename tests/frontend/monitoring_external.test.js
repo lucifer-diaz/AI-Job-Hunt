@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const appSource = readFileSync('app/static/app.js', 'utf8').split('/* ───────────── boot ───────────── */')[0];
 const names = ['S', 'D', 'A', 'render', 'monState', 'MON_TABS', 'renderMonExternal', 'renderMonApify', 'renderMonLogs',
-  'renderMonRequestModal'];
+  'renderMonRequestModal', 'renderMonExtRequestModal', 'monCaptured'];
 let ui, context, fetchMock;
 
 const response = (data, status = 200) => ({ ok: status < 400, status, text: async () => JSON.stringify(data) });
@@ -195,6 +195,25 @@ describe('Monitoring · external APIs', () => {
 });
 
 describe('Monitoring · LLM request structured output', () => {
+  it('shows the captured request and response of a call, pretty-printed, or says they were not captured', () => {
+    const call = { id: 7, request_id: 'r-7', created_at: '2026-10-10T11:05:34', provider: 'LITELLM', operation: 'model_test',
+      status: 'FAILED', error_type: 'CLIENT_ERROR', http_status_code: 400, http_method: 'POST', endpoint_host: 'localhost:4000',
+      endpoint_path: '/v1/chat/completions', latency_ms: 812, attempt: 1, retry_count: 0, cost_source: 'unknown',
+      error_message: 'HTTP 400', metadata: null,
+      payload: { request: { method: 'POST', url: 'http://localhost:4000/v1/chat/completions', headers: { authorization: '[redacted]' },
+                            body: '{"model":"groq/openai/gpt-oss-20b","max_tokens":512}' },
+                 response: { status: 400, headers: {}, body: '{"error":{"code":"json_validate_failed","failed_generation":""}}' } } };
+    ui.D.monExtRequest = call;
+    ui.monState().ext.request = 7;
+    const html = ui.renderMonExtRequestModal();
+    expect(html).toContain('REQUEST AND RESPONSE');
+    expect(html).toContain('POST http://localhost:4000/v1/chat/completions');
+    expect(html).toContain('authorization: [redacted]');
+    expect(html).toContain('HTTP 400');
+    expect(html).toContain('&quot;code&quot;: &quot;json_validate_failed&quot;');  // pretty-printed JSON
+    expect(ui.monCaptured(null)).toContain('were not captured');
+  });
+
   it('shows how the contract was enforced and why an answer failed it', () => {
     const request = { id: 41, request_id: 'r-41', created_at: '2026-09-25T10:00:00', stage: 'TAILOR', status: 'FAILED',
       error_type: 'SCHEMA_VALIDATION', structured_output_valid: false, structured_output_retry_count: 0,

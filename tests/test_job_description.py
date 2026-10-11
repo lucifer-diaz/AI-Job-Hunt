@@ -934,3 +934,35 @@ def test_the_jobs_table_filters_by_description_state(user):
     assert {key for key, _name, _n in out["description_states"]} == set(jd.DESCRIPTION_STATES)
     assert client.get("/api/jobs/search", params={"description": "nope"}).status_code == 422
     assert client.get(f"/api/jobs/{parsed}").json()["description_state"] == "PARSED"
+
+
+def test_a_wrong_shape_in_the_structured_description_is_a_schema_failure_inside_the_call(user, monkeypatch):
+    """A small model answering education_requirements as an object: the gateway sees it as the schema failure it is,
+    logs it so, and asks once more with the exact problem, instead of logging a success the task cannot use."""
+    from app.models import LLMRequestLog
+    from app.services.llm import LLMClient, LLMSchemaError
+
+    answers = [
+        {"structured_description": {"education_requirements": {"Minimum education": "Bachelor's degree"}},
+         "requirements": []},
+        {"structured_description": {"education_requirements": ["Bachelor's degree"]}, "requirements": []},
+    ]
+    sent = []
+
+    def model(self, provider, system, user_message, task, model_name, config, attempt):
+        from app.services.llm import LLMResult
+        sent.append(user_message)
+        attempt.sent, attempt.model = True, "small-model"
+        return LLMResult(answers[len(sent) - 1], "mock", "small-model")
+    monkeypatch.setattr(LLMClient, "_dispatch", model)
+    job_id = add_job(user)
+    with session(user) as db:
+        parsed = jd.parse_now(db, db.get(Job, job_id))
+    assert parsed.structured_description.education_requirements == ["Bachelor's degree"]
+    assert len(sent) == 2 and "structured_description.education_requirements" in sent[1]
+    with SessionLocal() as db:
+        rows = db.scalars(select(LLMRequestLog).where(LLMRequestLog.workflow_entity_id == job_id)
+                          .order_by(LLMRequestLog.id)).all()
+    assert [(r.status, r.error_type) for r in rows][-2:] == [("FAILED", "SCHEMA_VALIDATION"), ("SUCCEEDED", None)]
+    with pytest.raises(LLMSchemaError):
+        jd.checked({"structured_description": {"education_requirements": {"a": "b"}}, "requirements": []})

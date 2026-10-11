@@ -183,6 +183,40 @@ function wkRankActions(t) {
 function wkTailorActions(t) {
   return wkButtons('tailoring', t.id, { kill: t.status === 'running', runNow: t.status === 'queued' });
 }
+// When a task last ran: the start of its latest attempt (ranking keeps it in last_attempt_at, because a ranking
+// waiting for its account clears started_at). A task that has never started says so.
+const wkAgo = iso => {
+  const sec = Math.max(0, Math.round((Date.now() - toDate(iso)) / 1000));
+  return sec < 45 ? 'just now' : sec < 3600 ? `${Math.max(1, Math.round(sec / 60))}m ago` : sec < 86400 ? `${Math.round(sec / 3600)}h ago` : `${Math.round(sec / 86400)}d ago`;
+};
+function wkLastRun(t) {
+  const at = t?.last_attempt_at || t?.started_at;
+  if (!at) return '<div class="wk-last never"><small>Not run yet</small></div>';
+  return `<div class="wk-last" title="${attr(`Last run ${fmtDateTime(at)}`)}"><b>${esc(fmtDateTime(at))}</b><small>${esc(wkAgo(at))}</small></div>`;
+}
+// The model a task uses (or its next request will use), and the route it goes by.
+const WK_CHANGE = { FAILOVER: ['Failed over', 'bad'], RESTING: ['Using a backup', 'warn'], FALLBACK: ['Fallback', 'warn'], ESCALATED: ['Escalated', 'brand'], CONFIG: ['Model changed', 'brand'] };
+const WK_ACTIVE = ['RUNNING', 'QUEUED', 'RETRYING', 'running', 'queued', 'PENDING', 'PROCESSING'];
+function wkModel(r) {
+  const m = r.model;
+  if (m?.source === 'none') return '<div class="wk-model nocall"><small>No model call</small></div>';
+  if (!m?.model) return '<div class="wk-model empty" aria-hidden="true"></div>';
+  const verb = m.source === 'used' ? (WK_ACTIVE.includes(r.status) ? 'in use' : 'used') : 'next request';
+  return `<div class="wk-model" title="${attr(`${m.source === 'used' ? 'In use' : 'Next request'}: ${m.model} via ${m.route_label}${m.via ? ` (${m.via})` : ''}${m.backups?.length ? ` · backups ${m.backups.join(', ')}` : ''}`)}">
+    <span class="wk-route ${m.route === 'LITELLM' ? 'gw' : 'direct'}">${esc(m.route_label)}</span><span class="mono ellipsis">${esc(m.model)}</span>
+    <small>${verb}${m.via ? ` · ${esc(m.via)}` : ''}</small></div>`;
+}
+function wkModelChange(r) {
+  const c = r.model_change;
+  if (!c) return `<div class="wk-change none">${r.model?.model ? '<span class="faint xs">No change</span>' : ''}</div>`;  // finished without a model call: nothing to say
+  const [label, tone] = WK_CHANGE[c.kind] || [c.kind, 'muted'];
+  return `<div class="wk-change t-${tone}" title="${attr(`${label}: ${c.from || '?'} → ${c.to || '?'} — ${c.reason || ''}`)}"><b>${esc(label)}</b>
+    <span class="mono ellipsis">${c.from ? `<s>${esc(c.from)}</s> → ` : ''}${esc(c.to || '—')}</span></div>`;
+}
+// The same two facts for the ranking tracker and the tailoring list, which lay their rows out their own way.
+function wkModelCells(t) {
+  return t?.model?.model || t?.model?.source === 'none' ? `<div class="wk-cells">${wkModel(t)}${wkModelChange(t)}</div>` : '';
+}
 function wkTable(kind, data) {
   const rows = data?.rows || [], f = wkFilter(kind), filtered = f.q.trim() || f.status !== 'all';
   if (!rows.length) {
@@ -194,10 +228,11 @@ function wkTable(kind, data) {
   const shown = data.total > rows.length ? ` · showing the first ${rows.length} of ${data.total}` : '';
   return `<section class="card flush"><div class="row between wrap gap10" style="padding:14px 18px;border-bottom:1px solid var(--line2)">
       <div><div class="card-title" style="font-size:16px">Tasks${filtered ? ' matching your filters' : ''}</div><div class="card-sub">${active} waiting, running or retrying · ${rows.length - active} finished in the last day${shown}</div></div>${wkShownNudge(kind, rows)}</div>
-    <div style="max-height:560px;overflow:auto" data-scroll-key="wk-${kind}">${rows.map(r => `<div class="wk-row ${r.status === 'RUNNING' ? 'running' : ''} ${wkSel(kind).has(r.task_id) ? 'picked' : ''}">
+    <div style="max-height:560px;overflow:auto" data-scroll-key="wk-${kind}"><div class="wk-head" aria-hidden="true"><div></div><div>Status</div><div>Task</div><div>Last run</div><div>Model &amp; route</div><div>Change</div><div></div></div>${rows.map(r => `<div class="wk-row ${r.status === 'RUNNING' ? 'running' : ''} ${wkSel(kind).has(r.task_id) ? 'picked' : ''}">
       <div>${['FAILED', 'BLOCKED', 'STOPPED'].includes(r.status) && !r.retried_by ? wkSelectBox(kind, r.task_id, r.title) : ''}</div><div>${wkChip(r.status)}</div>
       <div style="min-width:0"><div class="small b ellipsis">${esc(r.title || `Job #${r.job_id}`)} <span class="muted" style="font-weight:400">· ${esc(r.company || '')}</span> <span class="xs faint mono" style="font-weight:400">#${r.job_id}</span></div>
         <div class="wk-detail xs ${['FAILED', 'BLOCKED'].includes(r.status) ? 'orch-bad' : 'muted'}"><span class="ellipsis" title="${attr(wkDetail(r))}">${wkTries(r)}${esc(wkDetail(r))}</span>${wkRowWhy(r)}</div></div>
+      ${wkLastRun(r)}${wkModel(r)}${wkModelChange(r)}
       <div class="wk-row-actions">${r.retried_by ? `<span class="orch-chip muted" title="${attr(`A newer task (#${r.retried_by.task_id}) is handling this job`)}">↻ Run again</span>` : ''}${wkButtons(kind, r.task_id, { kill: r.can_kill, runNow: r.can_run_now })}${wkRowNudge(kind, r.job_id, r.status)}${btn('Job', 'open-job', { id: r.job_id }, 'sm')}</div></div>`).join('')}</div></section>`;
 }
 

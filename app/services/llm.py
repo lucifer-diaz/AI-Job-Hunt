@@ -41,7 +41,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
-from app.services import llm_telemetry, model_resolution, tracing
+from app.services import failover, llm_telemetry, model_resolution, tracing
 from app.services.ai_config import is_free_model
 from app.services.ai_config import resolve as resolve_ai_config
 from app.services.ai_workers import label as worker_label
@@ -329,6 +329,21 @@ class LLMClient:
             return "litellm", model_resolution.get(self.user_id, STAGE_WORKERS.get(task)).model or ""
         return config["llm_provider"], config["stage_models"].get(task) or config["model"]
 
+    def route_for(self, worker_type: str) -> dict[str, Any]:
+        """Where this worker's next request goes, without calling anything: the route (LITELLM or a direct provider),
+        the model, the configured assignment and, through LiteLLM, the model failover has moved it from (if any)."""
+        config = self._config()
+        if config["llm_provider"] == "litellm":
+            primary = model_resolution.get(self.user_id, worker_type)
+            resolved = failover.apply(primary, self.user_id)
+            return {"route": "LITELLM", "model": resolved.model, "primary": primary.model, "mode": resolved.mode,
+                    "configured": resolved.configured, "failed_over_from": resolved.failed_over_from,
+                    "backups": resolved.chain()}
+        stage = next((name for name, worker in STAGE_WORKERS.items() if worker == worker_type), None)
+        model = config["stage_models"].get(stage) or config["model"]
+        return {"route": str(config["llm_provider"]).upper(), "model": model, "primary": model, "mode": None,
+                "configured": None, "failed_over_from": None, "backups": []}
+
     def _generate(self, system: str, user: str, task: str, *, prompt_name: str | None = None,
                   prompt_version: str | None = None, call: LLMCall | None = None) -> LLMResult:
         config = self._config()
@@ -449,7 +464,7 @@ class LLMClient:
         """One logical request: the worker's model, then — only when its escalation policy says so — one
         escalated request to a stronger model. Each is recorded as its own telemetry row."""
         worker_type = call.worker_type or worker_for_prompt(prompt_name) or STAGE_WORKERS.get(task)
-        resolved = call.resolved or model_resolution.get(self.user_id, worker_type)
+        resolved = failover.apply(call.resolved or model_resolution.get(self.user_id, worker_type), self.user_id)
         try:
             first = self._gateway_attempt(system, user, resolved.model, resolved, call, prompt_name, prompt_version)
         except Exception as exc:
@@ -483,6 +498,7 @@ class LLMClient:
                           worker_type=resolved.worker_type, model_mode=resolved.mode,
                           configured_model=resolved.configured, config_version=resolved.config_version,
                           escalated=escalation is not None, escalation_reason=escalation,
+                          routing_cause="FAILOVER" if resolved.failed_over_from and escalation is None else None,
                           context_window=resolved.context_limit(model))
         started = time.monotonic()
         failure: BaseException | None = None
@@ -534,10 +550,11 @@ class LLMClient:
                          {"role": "user", "content": user}],
             **params, "timeout": timeout, "num_retries": retries,
         }
-        # Infrastructure fallback is LiteLLM's (a client-side fallback on this request). An escalated request has
+        # Infrastructure fallback is LiteLLM's (a client-side fallback on this request): the worker's fallback and
+        # secondary models, already ordered by route health (app.services.failover). An escalated request has
         # already been judged; it gets no silent fallback to a weaker model.
-        if resolved.fallback_model and escalation is None:
-            body["fallbacks"] = [resolved.fallback_model]
+        if resolved.chain() and escalation is None:
+            body["fallbacks"] = resolved.chain()
         if resolved.send_metadata:
             body["metadata"] = model_resolution.request_metadata(
                 resolved, workflow_type=call.workflow_type, entity_id=call.entity_id, attempt=call.attempt,

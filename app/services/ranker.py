@@ -1213,6 +1213,7 @@ def task_dict(task: JobRankingTask) -> dict[str, Any]:
             "error_category": task.error_category.value if task.error_category else None,
             "next_attempt_at": _iso(task.next_attempt_at), "created_at": _iso(task.created_at),
             "started_at": _iso(task.started_at), "completed_at": _iso(task.completed_at),
+            "last_attempt_at": _iso(task.last_attempt_at),
             "candidate_profile_id": task.candidate_profile_id, "resume_id": task.resume_id,
             "ranking_id": task.ranking_id}
 
@@ -1332,6 +1333,13 @@ def clear_finished(db: Session, user_id: int, *, clear: bool = True, now: dateti
     db.commit()
 
 
+def _attach_models(db: Session, user_id: int, active: list[dict[str, Any]]) -> None:
+    """The model and route each waiting or running ranking uses (read only; app.services.workers)."""
+    from app.services import workers
+
+    workers.attach_models(db, user_id, "ranking", active, workers.ranking_status)
+
+
 def tracker(db: Session, user_id: int, now: datetime | None = None, *, q: str = "",
             location: str = "all") -> dict[str, Any]:
     """Where the account's ranking work stands: waiting, running, retrying and finished in the last day.
@@ -1428,6 +1436,7 @@ def tracker(db: Session, user_id: int, now: datetime | None = None, *, q: str = 
     decisions = Counter(r["ranking"]["decision"] for r in recent[:TRACKER_LIMIT] if r["ranking"])
     active = [item for item in active if wanted(item)][:TRACKER_LIMIT]
     recent = [item for item in recent if wanted(item)][:TRACKER_LIMIT]
+    _attach_models(db, user_id, active + recent)
     in_flight = counts["queued"] + counts["retry_scheduled"] + counts["waiting"] + counts["processing"]
     finished = counts["completed"] + counts["failed"] + counts["skipped"]
     return {

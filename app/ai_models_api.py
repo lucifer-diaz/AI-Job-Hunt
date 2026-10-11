@@ -17,6 +17,7 @@ from app.auth import CurrentUser, current_user, get_user_db
 from app.security import SecretsUnavailable
 from app.services import ai_model_config as config
 from app.services import ai_registry
+from app.services.external_api import RateLimitedCooldown
 from app.services.litellm_client import ollama_tags
 from app.services.user_settings import lock_settings_row, settings_for
 from app.settings import get_settings
@@ -44,6 +45,7 @@ class WorkerIn(Revisioned):
     primary_model: str | None = None
     tier_name: str | None = None
     fallback_model: str | None = None
+    secondary_models: list[str] | None = None
     temperature: float | None = None
     max_output_tokens: int | None = None
     context_window: int | None = None
@@ -93,6 +95,8 @@ class ModelIn(Revisioned):
     num_ctx: int | None = None
     keep_alive: str | None = None
     deployment_params: dict[str, Any] | None = None
+    fallback_models: list[str] | None = None
+    rest_seconds: int | None = None
 
 
 class ApplyIn(BaseModel):
@@ -115,6 +119,8 @@ def _call(fn, *args: Any, **kwargs: Any) -> Any:
         raise HTTPException(exc.status_code, exc.detail) from exc
     except SecretsUnavailable as exc:
         raise HTTPException(400, f"{exc}. Ask the server admin to set SECRET_KEY.") from exc
+    except RateLimitedCooldown as exc:
+        raise HTTPException(429, f"{exc}. Try again in a moment.") from exc
 
 
 def _set(payload: BaseModel) -> dict[str, Any]:
@@ -213,6 +219,17 @@ def models_unmanage(name: str, revision: int | None = None, db: Session = Depend
     return _call(config.remove_managed_model, db, require_user_id(db), name, revision)
 
 
+@router.post("/models/{name:path}/remove")
+def models_remove(name: str, payload: Revisioned | None = None, db: Session = Depends(get_user_db)):
+    """Remove a model from Job Hunt OS (409 with `references` while anything uses it)."""
+    return _call(config.remove_model, db, require_user_id(db), name, (payload or Revisioned()).revision)
+
+
+@router.post("/models/{name:path}/restore")
+def models_restore(name: str, payload: Revisioned | None = None, db: Session = Depends(get_user_db)):
+    return _call(config.restore_model, db, require_user_id(db), name, (payload or Revisioned()).revision)
+
+
 @router.post("/models/{name:path}/test")
 def models_test(name: str, db: Session = Depends(get_user_db)):
     return _call(ai_registry.test_model, db, require_user_id(db), name)
@@ -273,6 +290,12 @@ def preview(db: Session = Depends(get_user_db)):
 def apply(payload: ApplyIn, db: Session = Depends(get_user_db)):
     return _call(config.apply, db, require_user_id(db),
                                    expected_revision=payload.revision, expected_version=payload.base_version)
+
+
+@router.post("/discard")
+def discard(db: Session = Depends(get_user_db)):
+    """Put the draft back to the active version (the screen calls it when an immediate save could not be applied)."""
+    return _call(config.discard_draft, db, require_user_id(db))
 
 
 @router.post("/verify")

@@ -33,6 +33,7 @@ from sqlalchemy.orm import Session
 
 from app import auth
 from app.ai_models_api import router as ai_models_router
+from app.failover_api import router as failover_router
 from app.application_inbox_api import router as application_inbox_router
 from app.auth import PASSWORD_MIN_LENGTH, CurrentUser, current_user, get_user_db
 from app.auth import router as auth_router
@@ -181,6 +182,7 @@ app.include_router(job_description_router)
 app.include_router(job_insights_router)
 app.include_router(discovery_router)
 app.include_router(ai_models_router)
+app.include_router(failover_router)
 app.include_router(application_inbox_router)
 app.include_router(setup_guide_router)
 
@@ -710,7 +712,11 @@ def queue_tailor_tasks(payload: TailorTasksIn, db: Session = Depends(get_user_db
 
 @app.get("/api/tailor-tasks")
 def list_tailor_tasks(db: Session = Depends(get_user_db)):
-    return tailor_tasks.list_tasks(db)
+    from app.services import workers
+
+    items = tailor_tasks.list_tasks(db)
+    workers.attach_tailoring_models(db, require_user_id(db), items)  # model and route per active task (read only)
+    return items
 
 
 @app.post("/api/tailor-tasks/cancel")

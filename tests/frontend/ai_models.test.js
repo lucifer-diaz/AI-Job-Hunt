@@ -26,7 +26,7 @@ function overview() {
   };
 }
 const flush = () => new Promise(r => setTimeout(r, 0));
-async function open(tab = 'overview') {
+async function open(tab = 'workers') {
   ui.S.screen = 'orchestration'; ui.orchState().workspace = 'models'; ui.AIM.tab = tab; ui.AIM.data = undefined; ui.render();
   await flush(); await flush();
 }
@@ -46,7 +46,7 @@ beforeEach(() => {
   });
   if (!ui) {
     context = createContext({ document, window, location, history, navigator, URLSearchParams, FormData, File, setTimeout, clearTimeout, setInterval, clearInterval, console });
-    for (const file of ['monitoring.js', 'orchestration.js', 'workers.js', 'settings.js', 'ai_models.js', 'resume_data.js', 'job_data.js', 'knowledge.js', 'inbox.js', 'guide.js', 'job_insights.js']) {
+    for (const file of ['monitoring.js', 'orchestration.js', 'workers.js', 'settings.js', 'ai_models.js', 'failover.js', 'resume_data.js', 'job_data.js', 'knowledge.js', 'inbox.js', 'guide.js', 'job_insights.js']) {
       runInContext(readFileSync(`app/static/${file}`, 'utf8'), context, { filename: resolve(`app/static/${file}`) });
     }
     runInContext(appSource, context, { filename: resolve('app/static/app.js') });
@@ -54,57 +54,68 @@ beforeEach(() => {
   }
   context.fetch = fetchMock; context.confirm = confirm;
   ui.S.forms = {}; ui.S.busy = {};
-  Object.assign(ui.AIM, { tab: 'overview', data: undefined, loading: false, error: '', drawer: null, preview: null, runtime: null, versions: null, audit: null, tests: {}, ollama: null, adding: false });
+  Object.assign(ui.AIM, { tab: 'overview', data: undefined, loading: false, error: '', drawer: null, preview: null, runtime: null, versions: null, audit: null, tests: {}, ollama: null, adding: false, more: {}, refs: {}, fbEdit: null, failed: null });
   Object.assign(ui.D, { profile: { name: 'A', search_preferences: {} }, prefs: {}, settings: { ai: { saved: { stage_models: {} }, env: { llm_provider: 'openrouter', models: {}, stage_models: {} }, effective: {} }, configured: {}, keys: {} }, summary: { model: 'local-reasoning', application_mode: 'manual_approval', counts: {} } });
 });
 
 describe('AI Orchestration → Models & routing', () => {
-  it('shows model selection for the route in use: LiteLLM workers, or the direct provider’s models', async () => {
-    await open();
-    expect(text()).toContain('Models · LiteLLM workers');
+  it('keeps the direct provider form in Settings, open when the route is direct and folded away otherwise', async () => {
+    await open('settings');
     expect(document.querySelector('#view details[data-settings-details="aim-direct"] summary').textContent)
-      .toContain('Direct provider · OpenRouter (kept ready for when you switch the route)');
+      .toContain('Direct provider · OpenRouter (used when the route is direct)');
     expect(document.querySelector('#view .aim-direct-models')).toBeNull();
-
     routes['GET /api/settings/ai'] = () => ({ ...overview(), gateway_enabled: false, llm_provider: 'openrouter',
       gateway: { ...overview().gateway, gateway_enabled: false } });
-    await open();
+    await open('settings');
     const direct = document.querySelector('#view .aim-direct-models');
     expect(direct.textContent).toContain('Model defaults');
     expect(direct.querySelector('#ai-llm_provider')).not.toBeNull();
-    expect(text()).not.toContain('Models · LiteLLM workers');
+    expect(document.querySelector('#view details[data-settings-details="aim-litellm"]')).not.toBeNull();  // LiteLLM kept for switching back
+    await open('workers');
+    expect(text()).toContain('Workers call OpenRouter directly right now');
   });
-
-  it('keeps direct provider settings off the Advanced tab', async () => {
-    await open('advanced');
-    expect(text()).not.toContain('Direct providers');
-    expect(document.querySelector('#view #ai-llm_provider')).toBeNull();
+  it('keeps provider settings off the Workers, Models and Reliability tabs', async () => {
+    for (const tab of ['workers', 'models', 'reliability']) {
+      await open(tab);
+      expect(document.querySelector('#view #ai-llm_provider'), tab).toBeNull();
+    }
   });
-
-  it('chooses between LiteLLM and the direct provider in the Gateway section', async () => {
+  it('chooses between LiteLLM and the direct provider in Settings → Route', async () => {
     routes['PUT /api/settings/ai/gateway'] = sent => ({ ...overview().gateway, gateway_enabled: sent.enabled });
-    await open();
+    await open('settings');
     const buttons = [...document.querySelectorAll('#view .seg[aria-label="AI gateway"] button')];
     expect(buttons.map(b => b.textContent.trim())).toEqual(['LiteLLM gateway', 'OpenRouter (direct)']);
     expect(buttons[0].getAttribute('aria-pressed')).toBe('true');
     expect(buttons.every(b => b.type === 'button')).toBe(true);  // inside the settings form: never a submit
+    confirm.mockReturnValueOnce(false);
+    buttons[1].click();  // cancelled: the route stays as it is
+    await flush();
+    expect(call('PUT', '/api/settings/ai/gateway')).toHaveLength(0);
+    expect(confirm.mock.calls.at(-1)[0]).toContain('Switch every AI worker to OpenRouter directly');
     buttons[1].click();
     await flush(); await flush(); await flush();
     expect(body('PUT', '/api/settings/ai/gateway')).toEqual({ enabled: false });
     expect(call('GET', '/api/settings/ai').length).toBeGreaterThan(1);  // the tab reloads to show the new route
   });
-
-  it('loads the overview and shows gateway, version, pending changes and each worker', async () => {
+  it('shows the route, connection, version and each worker’s model and backups in one place', async () => {
+    routes['GET /api/settings/ai'] = () => ({ ...overview(), workers: [worker('RANKER', 'Ranker', { tier: 'PRIMARY_REASONING', fallback_model: 'local-fast', secondary_models: ['local-deep'] }, 'local-reasoning'), ...overview().workers.slice(1)] });
     await open();
     expect(call('GET', '/api/settings/ai').length).toBe(1);
-    expect(text()).toContain('LiteLLM gateway on');
-    expect(text()).toContain('Active v4');
-    expect(text()).toContain('1 pending change');
-    expect(text()).toContain('Ranker'); expect(text()).toContain('local-reasoning');
+    expect(ui.AIM.tab).toBe('workers');
+    expect(text()).toContain('LiteLLM'); expect(text()).toContain('Connected'); expect(text()).toContain('Active v4');
+    expect(text()).toContain('1 change is saved but not applied yet');  // a draft left from before: Apply now or Undo
+    const ranker = document.querySelector('select[data-worker="RANKER"]');
+    expect(ranker.value).toBe('tier:PRIMARY_REASONING');
+    expect(document.querySelector('select[data-worker="REVIEWER"]').value).toBe('model:local-deep');
+    expect(document.querySelector('select[data-worker="INBOX_CLASSIFIER"]').value).toBe('auto');
+    expect([...ranker.closest('tr').querySelectorAll('.aim-chain li')].map(li => li.textContent)).toEqual(['1local-fast', '2local-deep']);
+    expect(ranker.closest('tr').querySelector('.aim-health').textContent).toBe('Healthy');
+    expect(ranker.closest('tr').querySelector('.aim-wk-mono').textContent).toBe('RA');
+    expect(document.querySelector('select[data-worker="REVIEWER"]').closest('tr').querySelector('.aim-wk-none').textContent).toBe('No backup');
+    expect(text()).not.toContain('How a request finds its model');  // no overview diagram any more
   });
-
   it('labels every form control on every tab', async () => {
-    for (const tab of ['overview', 'workers', 'models', 'routing', 'litellm', 'advanced']) {
+    for (const tab of ['workers', 'models', 'reliability', 'settings']) {
       await open(tab);
       for (const el of document.querySelectorAll('#settings-editor input:not([type="radio"]), #settings-editor select, #settings-editor textarea')) {
         expect(el.getAttribute('aria-label') || el.labels?.length, `${tab}: ${el.id || el.outerHTML}`).toBeTruthy();
@@ -116,17 +127,21 @@ describe('AI Orchestration → Models & routing', () => {
     await open('workers');
     ui.A['aim-worker']({ dataset: { worker: 'RANKER' } });
     expect(document.getElementById('aiw-reasoning_effort')).not.toBeNull(); // local-reasoning reasons
-    ui.setF('aiw', 'model_mode', 'FIXED'); ui.setF('aiw', 'primary_model', 'local-deep'); ui.render();
+    ui.setF('aiw', 'target', 'model:local-deep'); ui.render();
     expect(document.getElementById('aiw-reasoning_effort')).toBeNull(); // local-deep does not
     expect(text()).toContain('does not support it');
-    ui.setF('aiw', 'primary_model', 'mystery'); ui.render();
+    ui.setF('aiw', 'target', 'model:mystery'); ui.render();
     expect(text()).toContain('Structured Output Required');
-    ui.setF('aiw', 'primary_model', 'local-fast'); ui.render();
+    ui.setF('aiw', 'target', 'model:local-fast'); ui.render();
     expect(text()).toContain('may not satisfy Ranker requirements');
+    // By default the drawer shows the model, the backups and on/off; the rest is folded away.
+    const drawer = document.querySelector('.aim-drawer');
+    const visible = [...drawer.querySelectorAll('select, input')].filter(el => !el.closest('details'));
+    expect(visible.map(el => el.id)).toEqual(['aiw-target', 'aiw-backup_0', 'aiw-enabled']);
   });
-
-  it('saves a worker to the draft with the revision it was based on', async () => {
+  it('saves a worker and applies it straight away', async () => {
     routes['PUT /api/settings/ai/workers/RANKER'] = () => ({ worker: {}, draft_revision: 8 });
+    routes['POST /api/settings/ai/apply'] = () => ({ status: 'SYNCED', version: 5 });
     await open('workers');
     ui.A['aim-worker']({ dataset: { worker: 'RANKER' } });
     ui.setF('aiw', 'temperature', '0.2'); ui.setF('aiw', 'context_window', '16384');
@@ -135,10 +150,57 @@ describe('AI Orchestration → Models & routing', () => {
     const sent = body('PUT', '/api/settings/ai/workers/RANKER');
     expect(sent).toMatchObject({ revision: 7, model_mode: 'TIER', tier_name: 'PRIMARY_REASONING', temperature: 0.2, context_window: 16384, max_output_tokens: null,
       escalation: { tier: 'DEEP_REVIEW', model: null, conditions: ['LOW_CONFIDENCE'], confidence_threshold: 0.85 } });
+    expect(body('POST', '/api/settings/ai/apply')).toEqual({ revision: 7, base_version: 4 });
     expect(ui.AIM.drawer).toBeNull();
-    expect(call('GET', '/api/settings/ai').length).toBe(2); // reloaded after the save
+    expect(document.getElementById('toast').textContent).toBe('Ranker saved · v5');
   });
 
+  it('changes a worker’s model from its row, mapping the choice to mode, model and tier', async () => {
+    routes['PUT /api/settings/ai/workers/REVIEWER'] = () => ({});
+    routes['PUT /api/settings/ai/workers/RANKER'] = () => ({});
+    routes['PUT /api/settings/ai/workers/INBOX_CLASSIFIER'] = () => ({});
+    routes['POST /api/settings/ai/apply'] = () => ({ status: 'PENDING', version: 5 });
+    await open('workers');
+    await ui.A['aim-worker-target']({ dataset: { worker: 'REVIEWER' }, value: 'tier:DEEP_REVIEW' });
+    expect(body('PUT', '/api/settings/ai/workers/REVIEWER')).toEqual({ revision: 7, model_mode: 'TIER', tier_name: 'DEEP_REVIEW', primary_model: 'local-deep' });
+    expect(document.getElementById('toast').textContent).toContain('restart LiteLLM');
+    await ui.A['aim-worker-target']({ dataset: { worker: 'RANKER' }, value: 'model:local-fast' });
+    expect(body('PUT', '/api/settings/ai/workers/RANKER')).toEqual({ revision: 7, model_mode: 'FIXED', primary_model: 'local-fast', tier_name: 'PRIMARY_REASONING' });
+    await ui.A['aim-worker-target']({ dataset: { worker: 'INBOX_CLASSIFIER' }, value: 'auto' });
+    expect(body('PUT', '/api/settings/ai/workers/INBOX_CLASSIFIER')).toMatchObject({ model_mode: 'AUTO_ROUTER', tier_name: 'FAST' });
+  });
+
+  it('shows a refused save with its reasons, keeps the drawer, and undoes it on request', async () => {
+    routes['PUT /api/settings/ai/workers/RANKER'] = () => ({});
+    routes['POST /api/settings/ai/apply'] = () => [{ detail: { message: 'invalid', validation: { errors: [{ message: 'A model can appear only once' }], warnings: [{ message: 'unknown JSON support' }] } } }, 422];
+    routes['POST /api/settings/ai/discard'] = () => ({ status: 'DISCARDED' });
+    await open('workers');
+    ui.A['aim-worker']({ dataset: { worker: 'RANKER' } });
+    ui.setF('aiw', 'backup_0', 'local-reasoning');
+    await ui.A['aim-worker-save']({ dataset: { worker: 'RANKER' } });
+    expect(ui.AIM.drawer).toBe('RANKER'); expect(ui.S.forms.aiw.backup_0).toBe('local-reasoning');
+    expect(document.getElementById('toast').textContent).toContain('Not saved: A model can appear only once');
+    expect(text()).toContain('Not saved.'); expect(text()).toContain('unknown JSON support');
+    await ui.A['aim-discard']();
+    expect(call('POST', '/api/settings/ai/discard').length).toBe(1);
+    expect(ui.AIM.failed).toBeNull(); expect(ui.S.forms.aiw).toBeUndefined();
+    routes['POST /api/settings/ai/apply'] = () => [{ detail: 'LiteLLM refused the deployment' }, 502];
+    await ui.A['aim-apply']();
+    expect(ui.AIM.failed.errors).toEqual(['LiteLLM refused the deployment']);
+  });
+  it('saves backups in order as the fallback and secondary models, growing the list as it fills', async () => {
+    routes['PUT /api/settings/ai/workers/RANKER'] = () => ({ worker: {}, draft_revision: 8 });
+    await open('workers');
+    ui.A['aim-worker']({ dataset: { worker: 'RANKER' } });
+    expect(document.querySelectorAll('#view select[data-field^="backup_"]')).toHaveLength(1);
+    ui.setF('aiw', 'backup_0', 'local-fast'); ui.render();
+    expect(document.querySelectorAll('#view select[data-field^="backup_"]')).toHaveLength(2);
+    ui.setF('aiw', 'backup_2', 'local-deep'); ui.setF('aiw', 'backup_3', 'local-fast');  // a gap and a repeat
+    ui.render();
+    expect(text()).not.toContain('A backup cannot be the model itself');
+    await ui.A['aim-worker-save']({ dataset: { worker: 'RANKER' } });
+    expect(body('PUT', '/api/settings/ai/workers/RANKER')).toMatchObject({ fallback_model: 'local-fast', secondary_models: ['local-deep'] });
+  });
   it('reloads and keeps the drawer when someone else changed the draft', async () => {
     routes['PUT /api/settings/ai/workers/RANKER'] = () => [{ detail: { message: 'Someone else changed the AI configuration' } }, 409];
     await open('workers');
@@ -149,35 +211,98 @@ describe('AI Orchestration → Models & routing', () => {
     expect(document.getElementById('toast').textContent).toContain('Someone else changed');
   });
 
-  it('previews changes, formats token sizes and applies the previewed revision', async () => {
-    routes['POST /api/settings/ai/preview'] = () => ({ base_version: 4, draft_revision: 7, can_apply: true, sync_plan: { mode: 'admin_api', create: [], remove: [] },
-      validation: { errors: [], warnings: [{ message: 'Reviewer and Tailor use the same model' }] },
-      changes: [{ path: 'effective.REVIEWER', label: 'Reviewer · effective model', before: 'local-reasoning', after: 'local-deep', kind: 'effective' },
-                { path: 'workers.RANKER.context_window', label: 'Ranker · context window', before: 16384, after: 24576, kind: 'changed' },
-                { path: 'workers.RANKER.timeout_seconds', label: 'Ranker · timeout', before: null, after: 3600, kind: 'changed' }] });
+  it('applies a waiting draft from the strip, or undoes it', async () => {
     routes['POST /api/settings/ai/apply'] = () => ({ status: 'SYNCED', version: 5 });
+    routes['POST /api/settings/ai/discard'] = () => ({ status: 'DISCARDED' });
     await open();
-    await ui.A['aim-preview']();
-    expect(text()).toContain('local-reasoning → local-deep');
-    expect(text()).toContain('16K → 24K'); expect(text()).toContain('— → 3600');
-    expect(text()).toContain('Nothing changes inside LiteLLM');
+    expect(document.querySelector('[data-act="aim-apply"]')).not.toBeNull();
     await ui.A['aim-apply']();
     expect(body('POST', '/api/settings/ai/apply')).toEqual({ revision: 7, base_version: 4 });
-    expect(ui.AIM.preview).toBeNull();
-    expect(document.getElementById('toast').textContent).toBe('v5 applied');
+    expect(document.getElementById('toast').textContent).toBe('Applied · v5');
+    await ui.A['aim-discard']();
+    expect(document.getElementById('toast').textContent).toBe('Changes undone');
+    routes['GET /api/settings/ai'] = () => ({ ...overview(), pending_changes: [] });
+    await open();
+    expect(document.querySelector('[data-act="aim-apply"]')).toBeNull();  // nothing waiting: no notice
+  });
+  it('reports a conflicting save and reloads without leaving an error notice', async () => {
+    routes['PUT /api/settings/ai/tiers/FAST'] = () => ({});
+    routes['POST /api/settings/ai/apply'] = () => [{ detail: { message: 'The active configuration is now v5' } }, 409];
+    await open('models');
+    await ui.A['aim-tier-model']({ dataset: { tier: 'FAST' }, value: 'local-deep' });
+    expect(document.getElementById('toast').textContent).toContain('now v5');
+    expect(ui.AIM.failed).toBeNull();
+  });
+  it('shows each model as a card: monogram, health, stats and the first workers that use it', async () => {
+    routes['GET /api/settings/ai'] = () => ({ ...overview(), models: [model('local-reasoning', { health_status: 'HEALTHY', health_latency_ms: 90, used_by: ['RANKER', 'REVIEWER', 'INBOX_CLASSIFIER', 'TAILOR'] }), model('ollama_chat/qwen2.5', { enabled: false })] });
+    await open('models');
+    const [first, second] = document.querySelectorAll('.aim-mcard');
+    expect(first.querySelector('.aim-mcard-mono').textContent).toBe('LR');
+    expect(second.querySelector('.aim-mcard-mono').textContent).toBe('QW');  // letters only, and the provider prefix is not part of it
+    expect(second.querySelector('.aim-mcard-name').textContent).toBe('ollama_chat/qwen2.5');  // the whole name, never cut
+    expect(second.querySelector('.aim-mcard-path').textContent).toBe('ollama_chat/');
+    expect(second.querySelector('.aim-mcard-name').classList.contains('ellipsis')).toBe(false);
+    expect(first.querySelector('.aim-mcard-path')).toBeNull();  // no provider path: nothing dimmed
+    expect(first.querySelector('.aim-health').textContent).toBe('Healthy');
+    expect(first.querySelector('.aim-mcard-stats').textContent).toContain('24K'); expect(first.querySelector('.aim-mcard-stats').textContent).toContain('90ms');
+    expect([...first.querySelectorAll('.aim-user')].map(x => x.textContent)).toEqual(['Ranker', 'Reviewer', 'Inbox Classifier', '+1 more']);
+    expect(first.querySelector('.aim-mcard-users').title).toContain('TAILOR');
+    expect(second.classList.contains('off')).toBe(true); expect(second.textContent).toContain('Not used by any worker');
+    expect(first.getAttribute('style')).toMatch(/--h:\d+/);
   });
 
-  it('keeps Apply disabled on validation errors and shows a rejected apply', async () => {
-    routes['POST /api/settings/ai/preview'] = () => ({ base_version: 4, draft_revision: 7, can_apply: false, changes: [], sync_plan: { create: [{ model_name: 'local-small' }], remove: [], mode: 'config_file', restart_required: true },
-      validation: { errors: [{ message: 'The fallback model cannot be the primary model' }], warnings: [] } });
-    await open();
-    await ui.A['aim-preview']();
-    expect(document.querySelector('[data-act="aim-apply"]').disabled).toBe(true);
-    expect(text()).toContain('cannot be the primary model'); expect(text()).toContain('LiteLLM restart required');
-    routes['POST /api/settings/ai/apply'] = () => [{ detail: { message: 'invalid', validation: { errors: [{ message: 'late error' }], warnings: [] } } }, 422];
-    ui.AIM.preview.can_apply = true;
-    await ui.A['aim-apply']();
-    expect(ui.AIM.preview.can_apply).toBe(false); expect(text()).toContain('late error');
+  it('sets a model’s own fallbacks and rest time on its card, applied at once', async () => {
+    routes['GET /api/settings/ai'] = () => ({ ...overview(), models: [model('local-reasoning', { fallback_models: ['local-fast'], rest_seconds: 900, health_latency_ms: 147510 }), model('local-fast', { health_latency_ms: 840 }), model('local-deep')] });
+    routes['PUT /api/settings/ai/models/local-reasoning'] = () => ({});
+    routes['POST /api/settings/ai/apply'] = () => ({ status: 'SYNCED', version: 5 });
+    await open('models');
+    const [card, fast] = document.querySelectorAll('.aim-mcard');
+    expect(card.querySelector('.aim-mcard-fb .aim-chain').textContent).toBe('1local-fast');
+    expect(card.querySelector('.aim-mcard-fb').textContent).toContain('Rests 15 minutes after a rate limit or failures');
+    expect(fast.querySelector('.aim-mcard-fb').textContent).toContain('No fallback');
+    expect(fast.querySelector('.aim-mcard-fb').textContent).toContain('Rests as set in Reliability');
+    expect(card.querySelector('.aim-mcard-stats').textContent).toContain('147.5s');  // long latencies in seconds
+    expect(fast.querySelector('.aim-mcard-stats').textContent).toContain('840ms');
+    ui.A['aim-fb-edit']({ dataset: { name: 'local-reasoning' } });
+    const options = [...document.querySelectorAll('#fb-local-reasoning-m0 option')].map(o => o.value);
+    expect(options).not.toContain('local-reasoning');  // never itself
+    expect(document.querySelectorAll('select[data-form="fb-local-reasoning"][data-field^="m"]')).toHaveLength(2);
+    ui.setF('fb-local-reasoning', 'm1', 'local-deep'); ui.setF('fb-local-reasoning', 'rest', '3600');
+    await ui.A['aim-fb-save']({ dataset: { name: 'local-reasoning' } });
+    expect(body('PUT', '/api/settings/ai/models/local-reasoning')).toEqual({ revision: 7, fallback_models: ['local-fast', 'local-deep'], rest_seconds: 3600 });
+    expect(document.getElementById('toast').textContent).toBe('Fallbacks for local-reasoning saved · v5');
+    expect(ui.AIM.fbEdit).toBeNull();
+    ui.A['aim-fb-edit']({ dataset: { name: 'local-reasoning' } });
+    ui.setF('fb-local-reasoning', 'm0', ''); ui.setF('fb-local-reasoning', 'rest', '');
+    await ui.A['aim-fb-save']({ dataset: { name: 'local-reasoning' } });
+    expect(body('PUT', '/api/settings/ai/models/local-reasoning')).toEqual({ revision: 7, fallback_models: [], rest_seconds: null });
+  });
+
+  it('deletes a model after asking, lists where it is still used, and restores a removed one', async () => {
+    routes['GET /api/settings/ai'] = () => ({ ...overview(), models: [model('local-fast', { managed: true }), model('whisper')],
+      removed_models: [{ name: 'old-model', removed_at: '2026-10-10T11:00:00' }] });
+    routes['POST /api/settings/ai/models/local-fast/remove'] = () => [{ detail: { message: 'local-fast is still used by: tier FAST', references: ['tier FAST', 'Ranker (backup 1)'] } }, 409];
+    routes['POST /api/settings/ai/models/whisper/remove'] = () => ({ removed: 'whisper' });
+    routes['POST /api/settings/ai/models/old-model/restore'] = () => ({ restored: 'old-model' });
+    routes['POST /api/settings/ai/apply'] = () => ({ status: 'SYNCED', version: 5 });
+    await open('models');
+    expect(document.querySelector('details[data-settings-details="aim-removed"] summary').textContent).toContain('Removed models (1)');
+    ui.A['aim-model-more']({ dataset: { name: 'local-fast' } });
+    expect(document.querySelector('[data-act="aim-model-remove"][data-name="local-fast"]').textContent).toBe('Delete model');
+    await ui.A['aim-model-remove']({ dataset: { name: 'local-fast', managed: '1' } });
+    expect(confirm.mock.calls.at(-1)[0]).toContain('Its deployment is also removed from LiteLLM');
+    expect(call('POST', '/api/settings/ai/apply')).toHaveLength(0);  // refused: nothing applied
+    const card = [...document.querySelectorAll('.aim-mcard')].find(c => c.textContent.includes('local-fast'));
+    expect(card.querySelector('[role="alert"]').textContent).toContain('Still used by: tier FAST, Ranker (backup 1)');
+    await ui.A['aim-model-remove']({ dataset: { name: 'whisper', managed: '' } });
+    expect(confirm.mock.calls.at(-1)[0]).toContain('It stays in LiteLLM');
+    expect(body('POST', '/api/settings/ai/models/whisper/remove')).toEqual({ revision: 7 });
+    expect(document.getElementById('toast').textContent).toBe('whisper deleted · v5');
+    confirm.mockReturnValueOnce(false);
+    ui.A['aim-model-remove']({ dataset: { name: 'whisper', managed: '' } });
+    expect(call('POST', '/api/settings/ai/models/whisper/remove')).toHaveLength(1);  // cancelled: not sent again
+    await ui.A['aim-model-restore']({ dataset: { name: 'old-model' } });
+    expect(document.getElementById('toast').textContent).toBe('old-model restored · v5');
   });
 
   it('shows known, unknown and missing capabilities, and tests a model', async () => {
@@ -203,7 +328,8 @@ describe('AI Orchestration → Models & routing', () => {
   });
 
   it('turns the auto router off and on through its classifier', async () => {
-    await open('routing');
+    await open('models');
+    expect(document.querySelector('details[data-settings-details="aim-router"] summary').textContent).toContain('Auto router · Heuristic');
     expect(document.getElementById('aim-route-tier_SIMPLE').value).toBe('local-fast');
     ui.setF('aim-route', 'classifier', 'DISABLED'); ui.render();
     expect(document.getElementById('aim-route-tier_SIMPLE')).toBeNull();
@@ -216,7 +342,7 @@ describe('AI Orchestration → Models & routing', () => {
   it('never shows the saved key and sends a key only when one was typed', async () => {
     routes['PUT /api/settings/ai/connection'] = () => ({});
     routes['POST /api/settings/ai/test-connection'] = () => ({ reachable: true, authenticated: false, discovery: false, models: 0, latency_ms: 12, status: 'AUTH_FAILED', label: 'Authentication failed', error: 'LiteLLM refused the API key' });
-    await open('litellm');
+    await open('settings');
     expect(document.getElementById('aim-conn-api_key').value).toBe('');
     expect(document.getElementById('view').innerHTML).not.toContain('sk-');
     ui.setF('aim-conn', 'base_url', 'http://litellm:4000');
@@ -230,7 +356,7 @@ describe('AI Orchestration → Models & routing', () => {
     routes['GET /api/settings/ai/versions'] = () => ({ versions: [{ id: 14, version: 4, changed_by: 'me', source: 'USER', summary: 'Reviewer', created_at: '2026-09-25T10:00:00' }, { id: 12, version: 2, changed_by: 'system', source: 'MIGRATION', summary: 'Initial', created_at: '2026-09-24T10:00:00' }] });
     routes['GET /api/settings/ai/audit'] = () => ({ entries: [{ action: 'APPLY', result: 'REJECTED', actor: 'me', source: 'USER', error: 'bad', created_at: '2026-09-25T10:00:00' }] });
     routes['POST /api/settings/ai/versions/12/restore'] = () => ({ version: 5 });
-    await open('advanced'); await flush(); await flush();
+    await open('settings'); await flush(); await flush();
     expect(text()).toContain('v4'); expect(text()).toContain('Initial'); expect(text()).toContain('REJECTED');
     expect(document.querySelectorAll('[data-act="aim-restore"]').length).toBe(1); // not on the active version
     await ui.A['aim-restore']({ dataset: { id: 12, version: 2 } });
@@ -260,41 +386,35 @@ describe('Monitoring → model routing', () => {
 
 describe('Settings → AI Models actions', () => {
   const ok = () => ({});
-  it('switches tabs, toggles the gateway and checks the runtime', async () => {
-    routes['PUT /api/settings/ai/gateway'] = ok;
+  it('switches tabs, follows old tab names and checks what workers run', async () => {
     routes['GET /api/settings/ai/runtime'] = () => ({ live_error: null, workers: [
       { label: 'Ranker', desired: 'a', active: 'a', state: 'SYNCED' }, { label: 'Reviewer', desired: 'b', active: 'c', state: 'PENDING' },
       { label: 'Tailor', desired: 'd', active: 'd', state: 'OUT_OF_SYNC' }] });
     await open();
+    expect([...document.querySelectorAll('#view .aim-ws-nav button b')].map(b => b.textContent)).toEqual(['Workers', 'Models', 'Reliability', 'Settings']);
     ui.A['aim-tab']({ dataset: { tab: 'models' } }); expect(ui.AIM.tab).toBe('models');
-    ui.A['aim-tab']({ dataset: { tab: 'overview' } });
-    await ui.A['aim-gateway']({ dataset: { on: '' } });
-    expect(body('PUT', '/api/settings/ai/gateway')).toEqual({ enabled: false });
-    expect(document.getElementById('toast').textContent).toContain('Gateway off');
+    for (const [old, now] of [['overview', 'Workers'], ['routing', 'Models'], ['litellm', 'Settings'], ['advanced', 'Settings']]) {
+      ui.A['aim-tab']({ dataset: { tab: old } });
+      expect(document.querySelector('#view .aim-ws-nav [aria-selected="true"]').textContent).toContain(now);
+    }
     await ui.A['aim-runtime']();
     expect(text()).toContain('Synced ✓'); expect(text()).toContain('Out of sync'); expect(text()).toContain('LiteLLM was read just now');
-    routes['GET /api/settings/ai'] = () => ({ ...overview(), gateway_enabled: false, llm_provider: 'openrouter', pending_changes: [], connection: { ...overview().connection, status: 'UNKNOWN', base_url: null, last_sync_at: null, last_sync_error: 'boom' } });
+    routes['GET /api/settings/ai'] = () => ({ ...overview(), gateway_enabled: false, llm_provider: 'openrouter', pending_changes: [], connection: { ...overview().connection, status: 'UNKNOWN', base_url: null } });
     await open();
-    expect(text()).toContain('Direct provider: openrouter'); expect(text()).toContain('Not tested'); expect(text()).toContain('No base URL yet'); expect(text()).toContain('boom');
-    expect(document.querySelector('[data-act="aim-preview"]').disabled).toBe(true);
-    await ui.A['aim-gateway']({ dataset: { on: '1' } });
-    expect(body('PUT', '/api/settings/ai/gateway')).toEqual({ enabled: true });
+    expect(text()).toContain('Direct · OpenRouter'); expect(text()).not.toContain('Not tested');  // no LiteLLM status on the direct route
   });
-
-  it('opens the drawer from the overview, shows the auto router state and closes it', async () => {
+  it('opens the drawer from a row, shows the auto router state and closes it', async () => {
     await open();
     ui.A['aim-worker']({ dataset: { worker: 'INBOX_CLASSIFIER' } });
     expect(ui.AIM.tab).toBe('workers');
-    expect(text()).toContain('Auto Router: on'); expect(document.getElementById('aiw-tier_name')).not.toBeNull();
-    ui.setF('aiw', 'fallback_model', 'jobhunt-auto'); ui.setF('aiw', 'context_window', '999999'); ui.render();
-    ui.setF('aiw', 'model_mode', 'FIXED'); ui.setF('aiw', 'primary_model', 'local-reasoning'); ui.setF('aiw', 'fallback_model', 'local-reasoning'); ui.render();
-    expect(text()).toContain('The fallback cannot be the primary model'); expect(text()).toContain('exceeds the 24K');
+    expect(text()).toContain('requests go to jobhunt-auto');
+    ui.setF('aiw', 'context_window', '999999'); ui.setF('aiw', 'target', 'model:local-reasoning'); ui.setF('aiw', 'backup_0', 'local-reasoning'); ui.render();
+    expect(text()).toContain('A backup cannot be the model itself'); expect(text()).toContain('exceeds the 24K');
     ui.A['aim-drawer-close']();
     expect(ui.AIM.drawer).toBeNull(); expect(ui.S.forms.aiw).toBeUndefined();
     ui.A['aim-worker']({ dataset: { worker: 'NOPE' } });
     expect(document.querySelector('.aim-drawer')).toBeNull();
   });
-
   it('runs a worker test and shows success and failure', async () => {
     let answer = { success: true, answered_by: 'ollama_chat/gpt-oss:20b', latency_ms: 800, input_tokens: 40, output_tokens: 12, schema_ok: true, routing: { model_group: 'local-reasoning', routing_tier: 'MEDIUM', escalated: true, escalation_reason: 'LOW_CONFIDENCE' } };
     routes['POST /api/settings/ai/workers/RANKER/test'] = () => answer;
@@ -310,15 +430,23 @@ describe('Settings → AI Models actions', () => {
     expect(text()).toContain('✗ model local-reasoning · schema ✗');
   });
 
-  it('changes models: enable, type, stop managing, sync', async () => {
+  it('changes models: enable, type, stop managing, sync — each applied at once', async () => {
     routes['PUT /api/settings/ai/models/local-fast'] = ok;
     routes['DELETE /api/settings/ai/models/local-fast'] = ok;
     routes['POST /api/settings/ai/models/sync'] = () => ({ models: 5, added: ['new-one'] });
+    routes['POST /api/settings/ai/apply'] = () => ({ status: 'SYNCED', version: 5 });
     routes['GET /api/settings/ai'] = () => ({ ...overview(), models: [model('local-fast', { managed: true, present_in_litellm: false, health_status: 'HEALTHY', health_latency_ms: 90 }), model('bad', { enabled: false, health_status: 'UNHEALTHY' })] });
     await open('models');
     expect(text()).toContain('Managed'); expect(text()).toContain('Not in LiteLLM'); expect(text()).toContain('Healthy'); expect(text()).toContain('Unhealthy');
+    expect(document.querySelector('[data-act-change="aim-model-type"]')).toBeNull();  // type and management sit behind ⋯
+    ui.A['aim-model-more']({ dataset: { name: 'local-fast' } });
+    expect(document.querySelector('[data-act-change="aim-model-type"]').dataset.name).toBe('local-fast');
+    expect(text()).toContain('Stop managing');
+    ui.A['aim-model-more']({ dataset: { name: 'local-fast' } });
+    expect(document.querySelector('[data-act-change="aim-model-type"]')).toBeNull();
     await ui.A['aim-model-toggle']({ dataset: { name: 'local-fast', on: '' } });
     expect(body('PUT', '/api/settings/ai/models/local-fast')).toEqual({ revision: 7, enabled: false });
+    expect(document.getElementById('toast').textContent).toBe('local-fast disabled · v5');
     await ui.A['aim-model-type']({ dataset: { name: 'local-fast' }, value: 'FAST' });
     expect(body('PUT', '/api/settings/ai/models/local-fast')).toEqual({ revision: 7, model_type: 'FAST' });
     await ui.A['aim-model-unmanage']({ dataset: { name: 'local-fast' } });
@@ -326,12 +454,12 @@ describe('Settings → AI Models actions', () => {
     confirm.mockReturnValueOnce(false);
     ui.A['aim-model-unmanage']({ dataset: { name: 'local-fast' } });
     await ui.A['aim-sync']();
-    expect(document.getElementById('toast').textContent).toBe('5 models discovered, 1 new');
+    expect(document.getElementById('toast').textContent).toBe('5 models discovered, 1 new · v5');
+    expect(call('POST', '/api/settings/ai/apply').length).toBe(4);
     routes['GET /api/settings/ai'] = () => ({ ...overview(), models: [] });
     await open('models');
     expect(text()).toContain('No models yet');
   });
-
   it('adds a model even when Ollama is unreachable, and requires a name', async () => {
     routes['GET /api/settings/ai/ollama'] = () => [{ detail: 'down' }, 500];
     await open('models');
@@ -347,7 +475,7 @@ describe('Settings → AI Models actions', () => {
     routes['PUT /api/settings/ai/tiers/FAST'] = ok;
     routes['PUT /api/settings/ai/tiers/CHEAP'] = ok;
     routes['PUT /api/settings/ai/routing'] = ok;
-    await open('routing');
+    await open('models');
     await ui.A['aim-tier-model']({ dataset: { tier: 'FAST' }, value: 'local-reasoning' });
     expect(body('PUT', '/api/settings/ai/tiers/FAST')).toEqual({ revision: 7, litellm_model_name: 'local-reasoning' });
     await ui.A['aim-tier-toggle']({ dataset: { tier: 'FAST', on: '' } });
@@ -369,9 +497,9 @@ describe('Settings → AI Models actions', () => {
     routes['PUT /api/settings/ai/connection'] = ok;
     routes['POST /api/settings/ai/verify'] = () => ({ status: 'OUT_OF_SYNC', differences: ['missing local-small'], missing_models: ['tier-x'] });
     routes['GET /api/settings/ai'] = () => ({ ...overview(), connection: { ...overview().connection, secret_storage: false, base_url_saved: '', base_url_env: 'http://env:4000', managed_config_path: '/srv/jobhunt_models.yaml', restart_command_configured: false, last_error: 'old error', status: 'AUTH_FAILED', sync_status: 'PENDING', last_sync_at: '2026-09-25T10:00:00', last_sync_error: 'restart needed' } });
-    await open('litellm');
+    await open('settings');
     expect(text()).toContain('Key storage is unavailable'); expect(text()).toContain('Using the server default http://env:4000');
-    expect(text()).toContain('/srv/jobhunt_models.yaml'); expect(text()).toContain('restart LiteLLM after applying'); expect(text()).toContain('old error');
+    expect(text()).toContain('/srv/jobhunt_models.yaml'); expect(text()).toContain('restart LiteLLM after saving'); expect(text()).toContain('old error');
     ui.setF('aim-conn', 'api_key', 'sk-new-key-1234'); ui.setF('aim-conn', 'sync_mode', 'disabled');
     await ui.A['aim-conn-save']();
     expect(body('PUT', '/api/settings/ai/connection')).toEqual({ api_key: 'sk-new-key-1234', sync_mode: 'disabled' });
@@ -382,29 +510,19 @@ describe('Settings → AI Models actions', () => {
     expect(text()).toContain('OUT_OF_SYNC — missing local-small — not served: tier-x');
   });
 
-  it('closes the preview, reports a conflicting apply and a pending restart', async () => {
-    routes['POST /api/settings/ai/preview'] = () => ({ base_version: 4, draft_revision: 7, can_apply: true, changes: [{ path: 'models.x.deployment_params', label: 'Model x · deployment', before: null, after: { num_ctx: 4096 }, kind: 'added' }], sync_plan: { mode: 'config_file', create: [{ model_name: 'x' }], remove: [{ model_name: 'y' }], restart_required: true }, validation: { errors: [], warnings: [], live_checked: false, live_error: 'unreachable' } });
-    await open();
-    await ui.A['aim-preview']();
-    expect(text()).toContain('create x · remove y via config_file'); expect(text()).toContain('{"num_ctx":4096}'); expect(text()).toContain('could not be checked: unreachable');
+  it('says when a save needs a LiteLLM restart or changed nothing', async () => {
+    routes['PUT /api/settings/ai/tiers/FAST'] = () => ({});
     routes['POST /api/settings/ai/apply'] = () => ({ status: 'PENDING', version: 5 });
-    await ui.A['aim-apply']();
-    expect(document.getElementById('toast').textContent).toContain('restart LiteLLM');
-    await ui.A['aim-preview']();
-    routes['POST /api/settings/ai/apply'] = () => [{ detail: { message: 'The active configuration is now v5' } }, 409];
-    await ui.A['aim-apply']();
-    expect(ui.AIM.preview).toBeNull(); expect(document.getElementById('toast').textContent).toContain('now v5');
-    await ui.A['aim-preview']();
+    await open('models');
+    await ui.A['aim-tier-model']({ dataset: { tier: 'FAST' }, value: 'local-deep' });
+    expect(document.getElementById('toast').textContent).toBe('Tier FAST saved · v5 — restart LiteLLM to load it');
     routes['POST /api/settings/ai/apply'] = () => ({ status: 'UNCHANGED', version: 4 });
-    await ui.A['aim-apply']();
-    expect(document.getElementById('toast').textContent).toBe('Nothing to apply');
-    await ui.A['aim-preview'](); ui.A['aim-preview-close']();
-    expect(ui.AIM.preview).toBeNull();
+    await ui.A['aim-tier-model']({ dataset: { tier: 'FAST' }, value: 'local-fast' });
+    expect(document.getElementById('toast').textContent).toBe('Tier FAST saved · nothing changed');
   });
-
   it('handles an empty history and a failed history load', async () => {
     routes['GET /api/settings/ai/versions'] = () => [{ detail: 'nope' }, 500];
-    await open('advanced'); await flush(); await flush();
+    await open('settings'); await flush(); await flush();
     expect(ui.AIM.versions).toEqual([]); expect(text()).toContain('Nothing recorded yet');
     confirm.mockReturnValueOnce(false);
     ui.A['aim-restore']({ dataset: { id: 1, version: 1 } });
@@ -418,11 +536,11 @@ describe('Settings → AI Models actions', () => {
     expect(location.hash).toBe('#orchestration/models');
     expect(ui.AIM.tab).toBe('workers'); expect(ui.AIM.drawer).toBe('RANKER');
     expect(document.querySelector('#view .aim-drawer h3').textContent).toBe('Ranker');
-    expect(document.querySelector('#view .aim-ws-nav [aria-selected="true"]').textContent).toContain('Worker assignments');
-    expect([...document.querySelectorAll('#view .aim-worker-card .aim-worker-model')].map(x => x.textContent)).toContain('USESlocal-reasoning');
+    expect(document.querySelector('#view .aim-ws-nav [aria-selected="true"]').textContent).toContain('Workers');
+    expect(document.querySelector('#view select[data-worker="RANKER"]').closest('tr').textContent).toContain('local-reasoning');
     ui.A['orch-settings-ai']({ dataset: {} });
     await flush(); await flush();
-    expect(ui.AIM.tab).toBe('advanced');
+    expect(ui.AIM.tab).toBe('settings');
     ui.A['orch-workspace']({ dataset: { id: 'pipeline' } });
     expect(location.hash).toBe('#orchestration');
     history.replaceState(null, '', '#orchestration/models'); ui.readHash();

@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const appSource = readFileSync('app/static/app.js', 'utf8').split('/* ───────────── boot ───────────── */')[0];
 const names = ['S', 'D', 'A', 'render', 'go', 'wkState', 'loadWorkers', 'wkPoll', 'wkPollDelay', 'scheduleWkPoll',
-  'stopWkPoll', 'readHash', 'WK_KINDS'];
+  'stopWkPoll', 'readHash', 'WK_KINDS', 'fmtDateTime', 'wkLastRun'];
 let ui, context, fetchMock, confirmMock, routes;
 
 const response = (data, status = 200) => ({ ok: status < 400, status, text: async () => JSON.stringify(data) });
@@ -147,6 +147,37 @@ describe('Running workers', () => {
     expect(rows[2].querySelector('[data-act="wk-run-now"]')).not.toBeNull();
   });
 
+  it('shows each active task’s model and route, and what moved it off its model', async () => {
+    const base = parsing();
+    base.rows = [
+      row({ model: { model: 'nemotron-3-super:cloud', route: 'LITELLM', route_label: 'LiteLLM', via: 'tier DEEP_REVIEW', source: 'used', backups: ['Openrouter'] },
+        model_change: { kind: 'FAILOVER', from: 'nemotron-3-super:cloud', to: 'Openrouter', reason: 'its model was resting' } }),
+      row({ task_id: 12, status: 'QUEUED', can_kill: false, can_run_now: true, attempt: 0,
+        model: { model: 'openrouter/free', route: 'OPENROUTER', route_label: 'OpenRouter', via: null, source: 'next', backups: [] }, model_change: null }),
+      row({ task_id: 13, status: 'FAILED', can_kill: false, can_run_now: true })];
+    routes.parsing = base;
+    const w = await open();
+    const rows = [...w.querySelectorAll('.wk-row')];
+    expect(w.querySelector('.wk-head').textContent).toContain('Model & route');
+    expect(rows[0].querySelector('.wk-route').textContent).toBe('LiteLLM');
+    expect(rows[0].querySelector('.wk-model').textContent).toContain('nemotron-3-super:cloud');
+    expect(rows[0].querySelector('.wk-model small').textContent).toBe('in use · tier DEEP_REVIEW');
+    expect(rows[0].querySelector('.wk-change').classList.contains('t-bad')).toBe(true);
+    expect(rows[0].querySelector('.wk-change').textContent).toContain('Failed over');
+    expect(rows[0].querySelector('.wk-change s').textContent).toBe('nemotron-3-super:cloud');
+    expect(rows[0].querySelector('.wk-change').title).toContain('its model was resting');
+    expect(rows[1].querySelector('.wk-route.direct').textContent).toBe('OpenRouter');
+    expect(rows[1].querySelector('.wk-model small').textContent).toBe('next request');
+    expect(rows[1].querySelector('.wk-change').textContent).toContain('No change');
+    expect(rows[2].querySelector('.wk-model.empty')).not.toBeNull();  // a finished task shows no model
+    base.rows = [row({ task_id: 14, status: 'COMPLETED', model: { model: 'old-model', route: 'LITELLM', route_label: 'LiteLLM', via: null, source: 'used', backups: [] }, model_change: null }),
+      row({ task_id: 15, status: 'FAILED', model: { model: null, source: 'none' }, model_change: null })];
+    const done = [...(await open()).querySelectorAll('.wk-row')];
+    expect(done[0].querySelector('.wk-model small').textContent).toBe('used');
+    expect(done[0].querySelector('.wk-change').textContent).toContain('No change');
+    expect(done[1].querySelector('.wk-model.nocall').textContent).toBe('No model call');
+  });
+
   it('kills one task, and asks before killing a whole worker or every worker', async () => {
     await open();
     await ui.A['wk-kill']({ dataset: { kind: 'parsing', id: '11' } });
@@ -241,12 +272,30 @@ describe('Running workers', () => {
     const rowEl = [...v.querySelectorAll('.lrow')].find(r => r.textContent.includes('AI Engineer'));
     expect(rowEl.querySelector('[data-act="wk-run-now"]').dataset.id).toBe('31');
     expect(rowEl.querySelector('[data-act="wk-kill"]')).toBeNull();  // nothing to stop yet
+    expect(rowEl.querySelector('.wk-last').textContent).toBe('Not run yet');
   });
 
   it('keeps the tailoring task list in the Tailoring tab, with Kill on a running task', async () => {
     const v = await open('tailoring');
     expect(v.textContent).toContain('Backend Lead');
     expect(v.querySelector('[data-act="wk-kill"][data-kind="tailoring"]').dataset.id).toBe('41');
+    const last = v.querySelector('.lrow .wk-last');
+    expect(last.querySelector('b').textContent).toBe(ui.fmtDateTime('2026-10-04T10:00:00'));
+    expect(last.querySelector('small').textContent).toMatch(/ago$/);
+  });
+
+  it('shows when each task last ran, preferring a ranking’s last attempt, and says when one never has', async () => {
+    const recent = new Date(Date.now() - 5 * 60000).toISOString().slice(0, 19);
+    const base = parsing();
+    base.rows = [row({ started_at: recent }), row({ task_id: 12, status: 'QUEUED', started_at: null, can_kill: false, can_run_now: true, attempt: 0 })];
+    routes.parsing = base;
+    const v = await open();
+    expect(v.querySelector('.wk-head').textContent).toContain('Last run');
+    const [ran, never] = [...v.querySelectorAll('.wk-row')];
+    expect(ran.querySelector('.wk-last small').textContent).toBe('5m ago');
+    expect(ran.querySelector('.wk-last').title).toContain('Last run');
+    expect(never.querySelector('.wk-last').textContent).toBe('Not run yet');
+    expect(ui.wkLastRun({ started_at: null, last_attempt_at: recent }).includes('5m ago')).toBe(true);
   });
 
   it('sends old links to the ranking tracker here', () => {

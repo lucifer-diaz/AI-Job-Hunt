@@ -209,6 +209,27 @@ def row_card(r: Any) -> dict[str, Any]:
             "request_size_bytes": r.request_size_bytes, "response_size_bytes": r.response_size_bytes}
 
 
+def captured(row: Any) -> dict[str, Any] | None:
+    """The captured request and response of one call, redacted again on read; None when nothing was captured."""
+    from app.services.redaction import redact_headers, redact_text
+    from app.settings import get_settings
+
+    payload = getattr(row, "payload", None)
+    if not isinstance(payload, dict):
+        return None
+    limit = max(get_settings().external_api_payload_limit, get_settings().external_api_capture_limit)
+
+    def part(value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+        return {**{k: v for k, v in value.items() if k in ("method", "status")},
+                "url": redact_text(value.get("url"), 2000) if value.get("url") else None,
+                "headers": redact_headers(value.get("headers") or {}),
+                "body": redact_text(value.get("body"), limit) if value.get("body") else None}
+    return {"request": part(payload.get("request")), "response": part(payload.get("response")),
+            "error": redact_text(payload.get("error"), 2000) if payload.get("error") else None}
+
+
 def list_requests(db: Session, f: ExternalFilter, page: int = 1, per_page: int = 25) -> dict[str, Any]:
     total = db.scalar(select(func.count(Row.id)).where(*conditions(f))) or 0
     per_page = max(1, min(per_page, 100))
@@ -236,6 +257,7 @@ def request_detail(db: Session, request_row_id: int, user_id: int | None) -> dic
         "rate_limit_remaining": row.rate_limit_remaining,
         "rate_limit_reset_at": row.rate_limit_reset_at.isoformat() if row.rate_limit_reset_at else None,
         "error_message": row.error_message, "metadata": row.request_metadata, "entity": entity,
+        "payload": captured(row),
         "llm": ({"id": llm.id, "stage": llm.stage, "model": llm.model, "input_tokens": llm.input_tokens,
                  "output_tokens": llm.output_tokens, "estimated_cost": _money(llm.estimated_cost),
                  "structured_output_valid": llm.structured_output_valid, "prompt_version": llm.prompt_version}
@@ -407,9 +429,15 @@ def log_detail(db: Session, log_id: int, user_id: int | None) -> dict[str, Any] 
         return None
     external = db.scalar(select(Row).where(Row.request_id == item.external_request_id)) \
         if item.external_request_id else None
+    llm_requests = _llm_requests_for(db, item, user_id)
+    if external is None and len(llm_requests) == 1 and llm_requests[0].get("external_request_id"):
+        # A line about one LLM call: its provider request is where the raw error body (if captured) lives.
+        external = db.scalar(select(Row).where(Row.request_id == llm_requests[0]["external_request_id"]))
+    if external is not None and user_id is not None and external.user_id not in (None, user_id):
+        external = None
     return {**_log_card(item),
-            "external_request": row_card(external) if external is not None else None,
-            "llm_requests": _llm_requests_for(db, item, user_id),
+            "external_request": {**row_card(external), "payload": captured(external)} if external is not None else None,
+            "llm_requests": llm_requests,
             "related": [_log_card(other) for other in db.scalars(
                 select(SystemLogEntry).where(SystemLogEntry.trace_id == item.trace_id, SystemLogEntry.id != item.id)
                 .order_by(SystemLogEntry.id).limit(20)).all()] if item.trace_id else []}
@@ -433,6 +461,7 @@ def _llm_requests_for(db: Session, item: SystemLogEntry, user_id: int | None) ->
         query = query.where(LLMRequestLog.user_id == user_id)
     rows_ = db.scalars(query.order_by(LLMRequestLog.id).limit(20)).all()
     return [{"id": r.id, "stage": r.stage, "model": r.model or r.requested_model, "status": r.status,
+             "external_request_id": r.external_request_id,
              "created_at": r.created_at.isoformat(), "captured": bool(r.debug_prompt or r.debug_response),
              # The line is about exactly this call: its prompt and response come with it, redacted again on read.
              "payload": _payload(r) if len(rows_) == 1 else None}
@@ -534,6 +563,23 @@ def advisor_aggregates(db: Session, user_id: int, start: datetime, end: datetime
 # ───────────── retention ─────────────
 
 PRUNE_BATCH = 5000
+
+
+def clear_captured(db: Session, now: datetime | None = None, days: int | None = None) -> int:
+    """Forget captured request/response bodies older than the capture retention (the row and its numbers stay).
+    Bounded: one batch per run. Commits."""
+    from sqlalchemy import update
+
+    from app.settings import get_settings
+
+    keep = days if days is not None else get_settings().llm_prompt_debug_retention_days
+    cutoff = (now or utcnow()) - timedelta(days=max(0, keep))
+    ids = list(db.scalars(select(Row.id).where(Row.payload.is_not(None), Row.created_at < cutoff)
+                          .order_by(Row.id).limit(PRUNE_BATCH)).all())
+    if ids:
+        db.execute(update(Row).where(Row.id.in_(ids)).values(payload=None).execution_options(synchronize_session=False))
+        db.commit()
+    return len(ids)
 
 
 def prune(db: Session, now: datetime | None = None, retention_days: int | None = None) -> dict[str, int]:

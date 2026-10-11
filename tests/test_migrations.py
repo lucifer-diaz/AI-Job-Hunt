@@ -260,3 +260,34 @@ def test_0028_keeps_one_active_tailoring_task_per_job(tmp_path):
         command.downgrade(alembic_config(connection), "0027")
     assert "auto_tailor_status" not in {c["name"] for c in inspect(engine).get_columns("jobs")}
     engine.dispose()
+
+
+def test_0039_repairs_what_the_renumbering_let_an_install_skip(tmp_path):
+    """An install that stood at the old '0035' never ran the Job Insights 0035; 0039 puts back what it adds, and is a
+    no-op where everything is already there."""
+    import sqlalchemy as sa
+    from alembic.operations import Operations
+    from alembic.runtime.migration import MigrationContext
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'skipped.db'}")
+    old_stages = ", ".join(f"'{s}'" for s in ("RANKER", "TAILOR", "REVIEWER", "RESUME_PARSER", "JD_PARSER",
+                                               "JD_RECOVERY", "APPLICATION", "FOLLOW_UP", "INBOX", "COMPANY_INSIGHTS",
+                                               "ADVISOR", "OTHER"))
+    with engine.begin() as connection:
+        command.upgrade(alembic_config(connection), "0038")
+        op = Operations(MigrationContext.configure(connection))
+        with op.batch_alter_table("insight_observations") as batch:
+            batch.drop_column("superseded_at")
+        with op.batch_alter_table("llm_request_logs") as batch:
+            batch.drop_constraint("ck_llm_request_logs_stage", type_="check")
+            batch.create_check_constraint("ck_llm_request_logs_stage", f"stage IN ({old_stages})")
+    with engine.begin() as connection:
+        command.upgrade(alembic_config(connection), "0039")
+    inspector = sa.inspect(engine)
+    assert "superseded_at" in {c["name"] for c in inspector.get_columns("insight_observations")}
+    stage = next(c for c in inspector.get_check_constraints("llm_request_logs") if c["name"] == "ck_llm_request_logs_stage")
+    assert "INTERVIEW_INSIGHTS" in stage["sqltext"]
+    with engine.begin() as connection:  # already repaired: running it again changes nothing
+        command.downgrade(alembic_config(connection), "0038")
+        command.upgrade(alembic_config(connection), "0039")
+    engine.dispose()

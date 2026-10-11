@@ -346,6 +346,9 @@ def record(attempt: Attempt, *, latency_ms: int, error: BaseException | None = N
         entry = build_entry(attempt, latency_ms=latency_ms, error=error, error_type=error_type)
         persist(entry)
         log_call(entry)
+        from app.services import model_health
+
+        model_health.record_outcome(entry)  # route health: never raises
     except Exception:  # noqa: BLE001  telemetry is best effort by design
         log.warning("could not record LLM telemetry for %s/%s", attempt.provider, attempt.requested_model,
                     exc_info=True)

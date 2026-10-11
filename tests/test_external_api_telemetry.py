@@ -325,3 +325,72 @@ def test_the_decorator_records_a_failure_and_re_raises():
         send()
     row = only()
     assert row.operation == "send" and row.status == "FAILED" and row.error_type == "INVALID_RESPONSE"
+
+
+# ───────────── captured request and response bodies ─────────────
+
+@pytest.fixture
+def capture_on(owner):
+    from app.models import AppSetting
+    from app.services import llm_telemetry
+    from app.services.user_settings import settings_for
+
+    def switch(enabled: bool):
+        with SessionLocal() as db:
+            row = settings_for(db, owner)
+            prefs = dict(row.preferences or {})
+            prefs["monitoring"] = {**(prefs.get("monitoring") or {}), llm_telemetry.CAPTURE_PREFERENCE: enabled}
+            db.query(AppSetting).filter(AppSetting.id == row.id).update({"preferences": prefs})
+            db.commit()
+        llm_telemetry.forget_capture_setting(owner)
+    switch(True)
+    yield switch
+    switch(False)
+
+
+def test_an_account_that_turns_on_capture_keeps_redacted_request_and_response_bodies(owner, capture_on):
+    with client(user_id=owner, headers={"Authorization": f"Bearer {SECRET_TOKEN}"}) as http:
+        http.post("https://api.apify.com/v2/actors/x~y/runs",
+                  json={"query": "staff engineer", "api_key": "sk-live-" + "x" * 30, "nested": {"token": "abc"}})
+    row = only()
+    payload = row.payload
+    request, response = payload["request"], payload["response"]
+    assert request["method"] == "POST" and request["url"].startswith("https://api.apify.com/v2/actors")
+    assert '"query": "staff engineer"' in request["body"]
+    assert "sk-live" not in request["body"] and '"token": "abc"' not in request["body"]  # credential fields replaced
+    assert SECRET_TOKEN not in str(request["headers"])  # the Authorization header keeps only its name
+    assert response["status"] == 200 and '"run-1"' in response["body"]
+    assert row.request_metadata is None  # the short debug extracts stay off: this is the account's own capture
+
+
+def test_capture_is_capped_off_by_default_and_cleared_after_its_retention(owner, capture_on, monkeypatch):
+    from app.services import external_monitoring
+
+    monkeypatch.setattr(get_settings(), "external_api_capture_limit", 300)
+    with client(user_id=owner) as http:
+        http.post("https://api.apify.com/v2/actors/x~y/runs", content=b"client_secret=GOCSPX-abc&q=" + b"y" * 2000,
+                  headers={"content-type": "application/x-www-form-urlencoded"})
+    body = only().payload["request"]["body"]
+    assert len(body) <= 300 and "GOCSPX-abc" not in body and "q=" in body
+    capture_on(False)
+    with client(user_id=owner) as http:
+        http.post("https://api.apify.com/v2/actors/x~y/runs", json={"query": "q"})
+    assert logged()[-1].payload is None  # off: nothing kept
+    with SessionLocal() as db:
+        cleared = external_monitoring.clear_captured(db, now=utcnow() + __import__("datetime").timedelta(days=8))
+    assert cleared == 1 and all(r.payload is None for r in logged())
+    assert len(logged()) == 2  # the rows and their numbers stay
+
+
+def test_a_log_line_shows_the_captured_request_and_response(owner, capture_on):
+    from app.services import external_monitoring
+
+    with client(user_id=owner) as http:
+        http.post("https://api.apify.com/v2/actors/missing", json={"query": "q"})
+    with SessionLocal() as db:
+        line = db.scalars(select(SystemLogEntry).where(SystemLogEntry.user_id == owner)
+                          .order_by(SystemLogEntry.id.desc())).first()
+        detail = external_monitoring.log_detail(db, line.id, owner)
+    shown = detail["external_request"]["payload"]
+    assert '"query": "q"' in shown["request"]["body"]
+    assert shown["response"]["status"] == 404 and "no such actor" in shown["response"]["body"]

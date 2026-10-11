@@ -304,6 +304,7 @@ def rows(db: Session, user_id: int, kind: str, now: datetime | None = None, *, q
     order = {"RUNNING": 0, "QUEUED": 1, "RETRYING": 2}
     out.sort(key=lambda r: (order.get(r["status"], 3), not r["run_now"],
                             r["next_attempt_at"] or "", -(r["task_id"]) if r["status"] not in order else r["task_id"]))
+    attach_models(db, user_id, spec, out[:ROW_LIMIT])
     return {"rows": out[:ROW_LIMIT], "total": len(out), "truncated": len(out) > ROW_LIMIT or len(tasks) >= SCAN_LIMIT,
             "status_counts": counts, "filters": {"q": text, "status": status or "all"},
             "cleared_at": _iso(since), "cleared_hidden": _hidden(db, spec, user_id, since, now)}
@@ -382,6 +383,136 @@ def _mark_retried(db: Session, spec: WorkerKind, user_id: int, rows_: list[dict[
         if latest is not None and latest.id != r["task_id"]:
             r["can_run_now"] = False
             r["retried_by"] = {"task_id": latest.id, "status": _display_status(spec, latest, now)}
+
+
+# ───────────── the model a task uses ─────────────
+# Read, never decided: the route and model come from the active configuration and the failover overlay
+# (LLMClient.route_for), what a running task actually called comes from its own LLM request rows. No model is called.
+
+def _route_label(route: str) -> str:
+    if route == "LITELLM":
+        return "LiteLLM"
+    from app.services.user_settings import KEY_LABELS
+
+    return KEY_LABELS.get(route.lower(), route.title())
+
+
+def _via(plan: dict[str, Any]) -> str | None:
+    if plan.get("mode") == "AUTO_ROUTER":
+        return "auto router"
+    if plan.get("mode") == "TIER" and plan.get("configured"):
+        return f"tier {plan['configured']}"
+    return None
+
+
+def _change(plan: dict[str, Any], last: Any | None, finished: bool = False) -> dict[str, Any] | None:
+    """What moved this task off its assigned model, newest fact first; None when nothing did. For a finished task only
+    what happened in its own request counts: today's configuration or resting models say nothing about it."""
+    if last is not None:
+        if last.escalated:
+            return {"kind": "ESCALATED", "from": plan.get("primary"), "to": last.model or last.requested_model,
+                    "reason": (last.escalation_reason or "").replace("_", " ").lower() or "quality escalation"}
+        if last.routing_cause == "FAILOVER":
+            return {"kind": "FAILOVER", "from": plan.get("primary"), "to": last.model or last.requested_model,
+                    "reason": "its model was resting"}
+        if last.fallback_used:
+            return {"kind": "FALLBACK", "from": last.requested_model, "to": last.model,
+                    "reason": "LiteLLM fell back after an error"}
+        if finished:
+            return None
+        if plan.get("model") and last.requested_model and last.requested_model != plan["model"] \
+                and last.requested_model != plan.get("failed_over_from"):
+            return {"kind": "CONFIG", "from": last.requested_model, "to": plan["model"],
+                    "reason": "the model was changed since its last request"}
+    if plan.get("failed_over_from"):
+        return {"kind": "RESTING", "from": plan["failed_over_from"], "to": plan.get("model"),
+                "reason": "its model is resting, so a backup answers"}
+    return None
+
+
+def attach_models(db: Session, user_id: int, spec: WorkerKind | str, rows_: list[dict[str, Any]],
+                  status_of: Callable[[dict[str, Any]], str | None] | None = None) -> None:
+    """Add `model` (route, model, how it was chosen) and `model_change` to every row.
+
+    A finished task shows the model of its own last request (between its creation and its finish), or `source:
+    "none"` when it never called a model; only what happened in that request counts as a change (failover, LiteLLM
+    fallback, escalation). A running or retrying task shows its own latest request when there is one; otherwise, like
+    a waiting task, the model its next request goes to. Bounded (one query), metadata only, and it never raises.
+    `status_of` reads a row's RUNNING / QUEUED / RETRYING when the rows are not Running workers rows (the ranking
+    tracker, the tailoring task list); anything else is finished."""
+    spec = kind_of(spec) if isinstance(spec, str) else spec
+    status_of = status_of or (lambda r: r.get("status"))
+    rows_ = [r for r in rows_ if r.get("job_id")]
+    if not rows_:
+        return
+    try:
+        from app.models import LLMRequestLog
+        from app.services.llm import LLMClient
+        from app.services.orchestration_topology import NODES
+
+        workers = next((n.workers for n in NODES if n.id == spec.node_id), ())
+        if not workers:
+            return
+        plan = LLMClient.for_user(db, user_id).route_for(workers[0])
+        since = min((r["created_at"] for r in rows_ if r.get("created_at")), default=None)
+        if since is None:
+            return
+        logs = db.execute(select(LLMRequestLog).where(
+            LLMRequestLog.user_id == user_id, LLMRequestLog.workflow_type == "job",
+            LLMRequestLog.workflow_entity_id.in_({r["job_id"] for r in rows_}),
+            LLMRequestLog.worker_type.in_(workers), LLMRequestLog.created_at >= datetime.fromisoformat(since))
+            .order_by(LLMRequestLog.id.desc()).limit(1000)).scalars().all()
+        by_job: dict[int, list[Any]] = {}
+        for log in logs:  # newest first
+            by_job.setdefault(log.workflow_entity_id, []).append(log)
+        for r in rows_:
+            active = status_of(r) in STATUS_FILTERS["active"]
+            start = datetime.fromisoformat(r["created_at"]) if r.get("created_at") else None
+            finished = r.get("finished_at") or r.get("completed_at")
+            end = datetime.fromisoformat(finished) + timedelta(seconds=5) if finished and not active else None
+            last = next((log for log in by_job.get(r["job_id"], [])
+                         if (start is None or log.created_at >= start) and (end is None or log.created_at <= end)),
+                        None)
+            if not active:
+                r["model"] = _used(last, plan) if last is not None else {"model": None, "source": "none"}
+                r["model_change"] = _change(plan, last, finished=True) if last is not None else None
+                continue
+            used = last is not None and status_of(r) in ("RUNNING", "RETRYING")
+            r["model"] = _used(last, plan) if used else {
+                "model": plan.get("model"), "route": plan["route"], "route_label": _route_label(plan["route"]),
+                "via": _via(plan), "source": "next", "backups": plan.get("backups") or []}
+            r["model_change"] = _change(plan, last if used else None)
+    except Exception:
+        import logging
+
+        logging.getLogger("jobhunt.workers").warning("could not read task models", exc_info=True)
+
+
+def _used(last: Any, plan: dict[str, Any]) -> dict[str, Any]:
+    """The model and route one of the task's own requests went to."""
+    route = (last.provider or "").upper()
+    route = "LITELLM" if route in ("LITELLM", "") else route
+    return {"model": last.model or last.requested_model, "route": route, "route_label": _route_label(route),
+            "via": _via(plan) if route == plan.get("route") else None, "source": "used",
+            "backups": plan.get("backups") or []}
+
+
+def ranking_status(item: dict[str, Any]) -> str | None:
+    """A ranking tracker task in Running workers' words."""
+    if item.get("status") == "PROCESSING":
+        return "RUNNING"
+    if item.get("status") == "PENDING":
+        return "RETRYING" if item.get("attempt_count") else "QUEUED"
+    return None
+
+
+def attach_tailoring_models(db: Session, user_id: int, items: list[dict[str, Any]]) -> None:
+    """Tailoring tasks: the reviewer's model while a task is at its review step, the tailor's otherwise."""
+    status = {"running": "RUNNING", "queued": "QUEUED"}
+    reviewing = [i for i in items if i.get("stage") == "reviewing"]
+    attach_models(db, user_id, "reviewing", reviewing, lambda i: status.get(i.get("status")))
+    attach_models(db, user_id, "tailoring", [i for i in items if i.get("stage") != "reviewing"],
+                  lambda i: status.get(i.get("status")))
 
 
 def _labels(db: Session, job_ids: list[int], user_id: int) -> dict[int, tuple[str, str]]:

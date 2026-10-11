@@ -418,3 +418,88 @@ def test_gateway_settings_never_create_a_row_and_only_the_first_account_gets_the
         assert config.gateway_settings(db, first)[1] == "sk-env-key-00000000"
         assert db.scalar(select(LiteLLMConnection).where(LiteLLMConnection.user_id == user_id)) is None
         assert not db.new and not db.dirty
+
+
+def test_discard_puts_the_draft_back_to_the_active_version_and_creates_no_version(account, litellm):
+    account.call("POST", "/models/sync")
+    account.apply()
+    active = account.get("")["active_version"]
+    account.worker("RANKER", temperature=0.3, secondary_models=["tier-1-fast"])
+    assert account.get("")["pending_changes"]
+    out = account.call("POST", "/discard")
+    assert out["status"] == "DISCARDED" and out["active_version"] == active
+    after = account.get("")
+    assert after["pending_changes"] == [] and after["active_version"] == active
+    ranker = next(w for w in after["workers"] if w["worker_type"] == "RANKER")
+    assert ranker["config"]["temperature"] is None and ranker["config"]["secondary_models"] == []
+
+
+def test_a_model_keeps_its_own_fallbacks_and_rest_time_and_they_are_validated(account, litellm):
+    account.call("POST", "/models/sync")
+    names = [m["name"] for m in account.get("")["models"]]
+    model, other = names[0], names[1]
+    account.call("PUT", f"/models/{model}", json={"revision": account.revision(), "fallback_models": [other, other],
+                                                   "rest_seconds": 900})
+    saved = next(m for m in account.get("")["models"] if m["name"] == model)
+    assert saved["fallback_models"] == [other] and saved["rest_seconds"] == 900
+    account.apply()
+    assert model_resolution.active_snapshot(account.user_id)[1]["models"][model]["fallback_models"] == [other]
+    account.call("PUT", f"/models/{model}", expect=422, json={"revision": account.revision(), "fallback_models": [model]})
+    account.call("PUT", f"/models/{model}", expect=422, json={"revision": account.revision(), "rest_seconds": 5})
+    account.call("PUT", f"/models/{model}", json={"revision": account.revision(), "fallback_models": ["not-a-model"]})
+    errors = account.call("POST", "/preview")["validation"]["errors"]
+    assert any("not-a-model" in e["message"] for e in errors)
+
+
+def test_a_model_test_leaves_room_for_reasoning_and_names_an_empty_answer(account, litellm):
+    account.call("POST", "/models/sync")
+    account.call("PUT", "/models/tier-2-reasoning", json={"revision": account.revision(),
+                                                          "overrides": {"supports_reasoning": True}})
+    assert account.call("POST", "/models/tier-2-reasoning/test")["success"]
+    sent = litellm.chat_bodies[-1]
+    assert sent["max_tokens"] >= 512 and sent["reasoning_effort"] == "low"  # room to think before {"ok": true}
+    account.call("POST", "/models/tier-1-fast/test")
+    assert "reasoning_effort" not in litellm.chat_bodies[-1]  # not known to reason: not sent
+    litellm.answer("tier-2-reasoning", "")  # a reasoning model that spent everything thinking
+    out = account.call("POST", "/models/tier-2-reasoning/test")
+    assert not out["success"] and "returned no output" in out["error"]
+
+
+def test_removing_a_model_is_refused_while_used_and_a_sync_does_not_bring_it_back(account, litellm):
+    account.call("POST", "/models/sync")
+    account.apply()
+    used = account.call("POST", "/models/tier-2-reasoning/remove", expect=409,
+                        json={"revision": account.revision()})["detail"]
+    assert "tier PRIMARY_REASONING" in used["references"]
+    account.call("PUT", "/models/tier-2-reasoning", json={"revision": account.revision(), "fallback_models": ["cloud-mini"]})
+    refused = account.call("POST", "/models/cloud-mini/remove", expect=409, json={"revision": account.revision()})
+    assert "tier-2-reasoning's fallbacks" in refused["detail"]["references"]
+    account.call("PUT", "/models/tier-2-reasoning", json={"revision": account.revision(), "fallback_models": []})
+    before = account.get("")["active_version"]
+    account.call("POST", "/models/cloud-mini/remove", json={"revision": account.revision()})
+    out = account.apply()
+    overview = account.get("")
+    assert "cloud-mini" not in [m["name"] for m in overview["models"]]
+    assert [r["name"] for r in overview["removed_models"]] == ["cloud-mini"]
+    assert out["version"] > before and "cloud-mini" not in model_resolution.active_snapshot(account.user_id)[1]["models"]
+    synced = account.call("POST", "/models/sync")
+    assert "cloud-mini" not in synced["added"] and "cloud-mini" not in [m["name"] for m in account.get("")["models"]]
+    assert any(d["model_name"] == "cloud-mini" for d in litellm.deployments)  # discovered: still in LiteLLM
+    account.call("POST", "/models/cloud-mini/restore", json={"revision": account.revision()})
+    assert "cloud-mini" in [m["name"] for m in account.get("")["models"]]
+    account.call("POST", "/models/nothing-here/remove", expect=404, json={"revision": account.revision()})
+
+
+def test_removing_a_managed_model_deletes_its_deployment_and_a_rollback_brings_it_back(account, litellm):
+    account.call("POST", "/models/sync")
+    account.call("POST", "/models", expect=201, json={"revision": account.revision(), "litellm_model_name": "local-small",
+                                          "ollama_model": "llama3.2:3b", "num_ctx": 4096, "model_type": "CUSTOM"})
+    added = account.apply()
+    assert any(d["model_name"] == "local-small" for d in litellm.managed())
+    account.call("POST", "/models/local-small/remove", json={"revision": account.revision()})
+    account.apply()
+    assert not any(d["model_name"] == "local-small" for d in litellm.managed())  # ours: removed from LiteLLM too
+    versions = account.get("/versions")["versions"]
+    with_model = next(v for v in versions if v["version"] == added["version"])
+    account.call("POST", f"/versions/{with_model['id']}/restore", json={"base_version": account.get("")["active_version"]})
+    assert "local-small" in [m["name"] for m in account.get("")["models"]]

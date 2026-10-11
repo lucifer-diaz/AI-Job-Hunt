@@ -592,8 +592,11 @@ def parse_job_description(db: Session, job: Job, *, user_id: int | None = None) 
     if not text.strip():
         raise ValueError("This job has no description to parse")
     prompt = build_job_description_parser_prompt(job, text, [heading for heading, _ in sections_of(text) if heading])
+    # The full schema is checked inside the model call, not after it: a wrong shape (education_requirements as an
+    # object, say) is then recorded as the schema failure it is and gets the gateway's one correction retry, instead
+    # of a call logged as successful whose answer the task cannot use.
     raw = LLMClient.for_user(db, user_id or job.user_id).generate_prompt_json(
-        prompt, LLMCall(workflow_type="job", entity_id=job.id))
+        prompt, LLMCall(workflow_type="job", entity_id=job.id, validate=checked))
     return with_board_facts(job, ground(validated(raw if isinstance(raw, dict) else {}), text))
 
 
@@ -622,6 +625,20 @@ def validated(raw: dict[str, Any]) -> ParsedJobDescription:
     body["structured_description"] = within_limits(StructuredJobDescriptionIn, body.get("structured_description") or {})
     body["requirements"] = (body.get("requirements") or [])[:200]
     return ParsedJobDescription.model_validate(body)
+
+
+def checked(raw: Any) -> ParsedJobDescription:
+    """`validated` as the model call's validator: a shape problem is the gateway's schema error, naming each field."""
+    from pydantic import ValidationError
+
+    from app.services.llm import LLMSchemaError
+
+    try:
+        return validated(raw if isinstance(raw, dict) else {})
+    except ValidationError as exc:
+        problems = [f"{'.'.join(str(p) for p in error['loc']) or 'output'}: {error['msg']}"
+                    for error in exc.errors()[:6]]
+        raise LLMSchemaError("JobDescriptionParserOutput", "WRONG_OUTPUT_SCHEMA", problems) from exc
 
 
 def _plain(text: str) -> str:

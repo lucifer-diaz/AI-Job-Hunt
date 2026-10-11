@@ -324,7 +324,8 @@ def test_model_test_is_tiny_and_records_health(gateway, litellm):
     out = gateway.call("POST", "/models/tier-1-fast/test")
     assert out["success"] and out["structured_output"] is True and out["model_group"] == "tier-1-fast"
     body = litellm.chat_bodies[-1]
-    assert body["max_tokens"] == 20 and len(body["messages"][1]["content"]) < 100
+    # A tiny prompt; the answer has room for a reasoning model to think first (ai_registry.TEST_MAX_TOKENS).
+    assert body["max_tokens"] == 512 and len(body["messages"][1]["content"]) < 100
     litellm.unavailable.add("tier-3-review")
     failed = gateway.call("POST", "/models/tier-3-review/test")
     assert failed["success"] is False and "unavailable" in failed["error"]

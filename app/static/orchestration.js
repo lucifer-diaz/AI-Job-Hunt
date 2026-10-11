@@ -611,7 +611,7 @@ const ORCHESTRATION_ACTIONS = {
   'orch-settings-ai': el => {
     const worker = el?.dataset?.worker || '';
     Object.assign(orchState(), { workspace: 'models', node: null, edge: null });
-    Object.assign(AIM, worker ? { tab: 'workers', drawer: worker } : { tab: 'advanced', drawer: null });
+    Object.assign(AIM, worker ? { tab: 'workers', drawer: worker } : { tab: 'settings', drawer: null });
     delete S.forms.aiw;
     go('orchestration');
   },

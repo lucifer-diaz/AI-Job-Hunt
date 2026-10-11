@@ -1,17 +1,20 @@
-/* AI Orchestration → Models: LiteLLM connection, model catalog, tiers, worker assignments, routing, preview/apply,
-   version history. Loaded after settings.js and before app.js; orchestration.js shows it as its Models workspace.
-   Every value comes from /api/settings/ai. Edits change the draft; nothing reaches a worker until Apply. */
+/* AI Orchestration → Models & routing: which model each AI worker uses, the model catalog and tiers, failover, and the
+   route / LiteLLM connection / version history. Loaded after settings.js and before app.js; orchestration.js shows it
+   as its Models workspace. Every value comes from /api/settings/ai.
+   Saving applies at once: a save writes the draft and applies it as a new version (validated, and LiteLLM synced when
+   needed), so every change can be rolled back from Settings → History. A refused save leaves the draft for Undo. */
 'use strict';
 // [id, label, symbol, what it holds]
-const AIM_TABS = [['overview', 'Overview', '◎', 'Route, health and who uses what'], ['workers', 'Worker assignments', '⇢', 'The model each AI worker uses'],
-  ['models', 'Model catalog', '▤', 'What LiteLLM serves'], ['routing', 'Tiers & routing', '⑂', 'Tiers and the auto router'],
-  ['litellm', 'LiteLLM connection', '⌁', 'Base URL, key and sync'], ['advanced', 'History & audit', '↺', 'Versions and roll back']];
-const AIM_MODES = { FIXED: 'Fixed', TIER: 'Tier', AUTO_ROUTER: 'Auto Router' };
+const AIM_TABS = [['workers', 'Workers', '⇢', 'The model each AI worker uses'], ['models', 'Models', '▤', 'Catalog, tiers and auto router'],
+  ['reliability', 'Reliability', '⟳', 'Failover and model health'], ['settings', 'Settings', '⚙', 'Route, connection and history']];
+// Older links (orchestration nodes, saved URLs) name tabs that were merged.
+const AIM_TAB_ALIASES = { overview: 'workers', routing: 'models', litellm: 'settings', advanced: 'settings' };
 const AIM_CLASSIFIERS = { DISABLED: 'Disabled', HEURISTIC: 'Heuristic', HEURISTIC_V2: 'Heuristic v2 (trained)', LLM: 'LLM classifier', CUSTOM: 'Custom Job Hunt classifier' };
 const AIM_CONDITIONS = { LOW_CONFIDENCE: 'Confidence below threshold', SCHEMA_FAILURE: 'Structured-output validation failed', AMBIGUOUS: 'Ambiguity detected', FATAL_REQUIREMENT_UNCERTAIN: 'Fatal requirement uncertain', MANUAL: 'Manual request' };
 const AIM_SYNC = { SYNCED: ['Synced', 'good'], PENDING: ['Pending', 'warn'], APPLYING: ['Applying', 'brand'], OUT_OF_SYNC: ['Out of sync', 'bad'], FAILED: ['Failed', 'bad'] };
 const AIM_CONN = { CONNECTED: ['Connected', 'good'], DISCONNECTED: ['Disconnected', 'muted'], AUTH_FAILED: ['Authentication failed', 'bad'], UNAVAILABLE: ['LiteLLM unavailable', 'bad'], UNKNOWN: ['Not tested', 'muted'] };
-const AIM = { tab: 'overview', data: undefined, loading: false, error: '', drawer: null, preview: null, runtime: null, versions: null, audit: null, tests: {}, ollama: null, adding: false };
+const AIM_BACKUPS = 4;  // fallback model + up to three secondary models
+const AIM = { tab: 'workers', data: undefined, loading: false, error: '', drawer: null, failed: null, runtime: null, versions: null, audit: null, tests: {}, ollama: null, adding: false };
 
 const aimData = () => AIM.data || {};
 const aimRev = () => aimData().connection?.draft_revision;
@@ -25,8 +28,41 @@ function aimModelOptions(selected, blank = 'Not set') {
   if (selected && !names.includes(selected)) names.push(selected);
   return aimOpt('', blank, selected) + names.map(n => aimOpt(n, n, selected)).join('');
 }
-function aimTierOptions(selected) { return aimOpt('', 'Not set', selected) + Object.keys(aimData().tiers || {}).map(t => aimOpt(t, t, selected)).join(''); }
+const aimPanel = (content, extra = '') => `<section class="card flush aim-panel ${extra}">${content}</section>`;
 
+/* ── a worker's model: one choice instead of mode + model + tier ── */
+// tier:NAME, model:NAME or auto (the auto router; its tier stays what it was, for while the router is off).
+function aimTarget(c) {
+  if (c?.mode === 'FIXED') return c.primary_model ? `model:${c.primary_model}` : '';
+  if (c?.mode === 'AUTO_ROUTER') return 'auto';
+  return c?.tier ? `tier:${c.tier}` : '';
+}
+function aimTargetOptions(selected) {
+  const d = aimData(), tiers = Object.entries(d.tiers || {}), router = d.routing?.auto_router_enabled;
+  const models = aimModels().filter(m => m.enabled).map(m => m.name);
+  const [kind, name] = String(selected || '').split(/:(.*)/s);
+  if (kind === 'model' && name && !models.includes(name)) models.push(name);
+  return aimOpt('', 'Choose a model', selected)
+    + (tiers.length ? `<optgroup label="Tiers">${tiers.map(([t, x]) => aimOpt(`tier:${t}`, `${t}${x.model ? ` · ${x.model}` : ''}`, selected)).join('')}</optgroup>` : '')
+    + (models.length ? `<optgroup label="Models">${models.map(n => aimOpt(`model:${n}`, n, selected)).join('')}</optgroup>` : '')
+    + (router || selected === 'auto' ? `<optgroup label="Auto router">${aimOpt('auto', `Auto router${router ? ` · ${d.routing.auto_router_model_name}` : ' (off)'}`, selected)}</optgroup>` : '');
+}
+function aimTargetFields(target, c = {}) {
+  const [kind, name] = String(target || '').split(/:(.*)/s);
+  if (kind === 'model') return { model_mode: 'FIXED', primary_model: name || null, tier_name: c.tier || null };
+  if (kind === 'auto') return { model_mode: 'AUTO_ROUTER', primary_model: c.primary_model || null, tier_name: c.tier || null };
+  return { model_mode: 'TIER', primary_model: c.primary_model || null, tier_name: name || null };
+}
+// The model a choice resolves to now, so the drawer offers only what that model supports.
+function aimTargetModel(target) {
+  const d = aimData(), [kind, name] = String(target || '').split(/:(.*)/s);
+  if (kind === 'model') return name;
+  if (kind === 'auto') return d.routing?.auto_router_enabled ? d.routing.auto_router_model_name : '';
+  return d.tiers?.[name]?.model || '';
+}
+const aimBackups = c => [c?.fallback_model, ...(c?.secondary_models || [])].filter(Boolean);
+
+/* ── loading and saving ── */
 // Loading from the screen loader: render once at the end like every other loader.
 async function aimLoadQuiet() {
   AIM.loading = true;
@@ -40,13 +76,36 @@ async function aimLoad() {
   catch (err) { AIM.error = err.message; }
   finally { AIM.loading = false; render(); }
 }
-// Run a change, then reload the overview so every tab shows the saved draft and its new revision.
-// A 409 means someone else changed the draft: reload so the next attempt starts from what is saved now.
+// A change that does not touch the versioned configuration (connection, tests, discovery).
 async function aimRun(key, fn, ok) {
   return busy(key, async () => {
-    try { const out = await fn(); AIM.preview = null; await aimLoad(); return out; }
+    try { const out = await fn(); await aimLoad(); return out; }
     catch (err) { if (err.status === 409) await aimLoad(); throw err; }
   }, ok);
+}
+// Apply whatever the draft holds now, as a new version. A refusal is kept on screen with Undo.
+async function aimApplyNow() {
+  await aimLoad();
+  try {
+    const out = await api('/api/settings/ai/apply', { method: 'POST', body: { revision: aimRev(), base_version: aimData().active_version } });
+    AIM.failed = null; AIM.versions = null; await aimLoad();
+    return out;
+  } catch (err) {
+    if (err.status === 409) { await aimLoad(); throw err; }
+    AIM.failed = { errors: (err.detail?.validation?.errors || []).map(e => e.message), warnings: (err.detail?.validation?.warnings || []).map(w => w.message), message: err.message };
+    if (!AIM.failed.errors.length) AIM.failed.errors = [err.message];
+    await aimLoad();
+    throw new Error(`Not saved: ${AIM.failed.errors[0]}`);
+  }
+}
+const aimSaved = (ok, out) => out?.status === 'PENDING' ? `${ok} · v${out.version} — restart LiteLLM to load it` : out?.status === 'UNCHANGED' ? `${ok} · nothing changed` : `${ok} · v${out?.version}`;
+// A change to the configuration: write it, then apply it at once.
+async function aimSave(key, write, ok = 'Saved') {
+  return busy(key, async () => {
+    try { await write(); }
+    catch (err) { if (err.status === 409) await aimLoad(); throw err; }
+    return aimApplyNow();
+  }, out => aimSaved(typeof ok === 'function' ? ok(out) : ok, out));
 }
 
 /* ───────────── shell ───────────── */
@@ -54,90 +113,62 @@ function renderAIModels() {
   if (AIM.data === undefined && !AIM.loading && !AIM.error) { aimLoad(); return loading(); }
   if (AIM.error && !AIM.data) return `<section class="card"><div class="settings-error" role="alert">AI model settings could not be loaded: ${esc(AIM.error)}</div>${btn('Try again', 'aim-reload', {}, 'mt16')}</section>`;
   if (!AIM.data) return loading();
-  const d = aimData(), tab = AIM_TABS.some(([id]) => id === AIM.tab) ? AIM.tab : 'overview';
-  const body = { overview: aimOverview, workers: aimWorkers, models: aimModelsTab, routing: aimRouting, litellm: aimLiteLLM, advanced: aimAdvanced }[tab]();
-  const counts = { workers: (d.workers || []).length, models: aimModels().filter(m => m.enabled).length, routing: Object.keys(d.tiers || {}).length, advanced: `v${d.active_version ?? 0}`,
-    litellm: (AIM_CONN[d.connection?.status] || AIM_CONN.UNKNOWN)[0] };
+  if (typeof FO !== 'undefined' && FO.settings === null && !FO.loading && typeof foLoad === 'function') { FO.loading = true; foLoad(); }
+  const d = aimData(), tab = AIM_TAB_ALIASES[AIM.tab] || (AIM_TABS.some(([id]) => id === AIM.tab) ? AIM.tab : 'workers');
+  AIM.tab = tab;
+  const body = { workers: aimWorkers, models: aimModelsTab, reliability: aimReliability, settings: aimSettings }[tab]();
+  const resting = typeof FO !== 'undefined' ? FO.routes?.resting || 0 : 0;
+  const counts = { workers: (d.workers || []).length, models: aimModels().filter(m => m.enabled).length, reliability: resting ? `${resting} resting` : null, settings: `v${d.active_version ?? 0}` };
   const nav = AIM_TABS.map(([id, name, sym, hint]) => `<button type="button" role="tab" aria-selected="${id === tab}" class="${id === tab ? 'on' : ''}" data-act="aim-tab" data-tab="${id}">
       <span class="aim-nav-sym" aria-hidden="true">${sym}</span><span class="grow"><b>${name}</b><small>${esc(hint)}</small></span>${counts[id] != null ? `<span class="aim-nav-count">${esc(String(counts[id]))}</span>` : ''}</button>`).join('');
-  return `<div class="aim-ws">${aimChangeBar()}
+  return `<div class="aim-ws">${aimStrip()}
     <div class="aim-ws-layout"><nav class="card aim-ws-nav" role="tablist" aria-label="Models and routing">${nav}</nav>
-      <div class="aim-ws-main" role="tabpanel">${body}</div></div>${AIM.preview ? aimPreviewPanel() : ''}${AIM.drawer ? aimDrawer() : ''}</div>`;
+      <div class="aim-ws-main" role="tabpanel">${body}</div></div>${AIM.drawer ? aimDrawer() : ''}</div>`;
 }
-// The header of the workspace: the route, the active version, what is waiting in the draft, and Preview → Apply.
-function aimChangeBar() {
-  const d = aimData(), pending = (d.pending_changes || []).length, conn = d.connection || {};
-  const [syncLabel, tone] = AIM_SYNC[pending ? 'PENDING' : conn.sync_status] || AIM_SYNC.SYNCED;
-  return `<section class="card aim-hero"><div class="row between wrap gap14">
-      <div style="min-width:0;flex:1"><div class="aim-hero-title">Models &amp; routing</div>
-        <div class="card-sub">Which model each AI worker uses and how its requests are routed. Edits go to a draft — nothing reaches a worker until you preview and apply it as a new version.</div></div>
-      ${d.gateway ? `<div class="col gap6" style="align-items:flex-end">${gatewaySegment(d.gateway)}<span class="xs muted">${esc(gatewayNow(d.gateway))}</span></div>` : ''}</div>
-    <div class="aim-bar ${pending ? 'pending' : ''}"><div class="row gap8 wrap">${pill(d.gateway_enabled ? 'LiteLLM gateway on' : `Direct provider: ${d.llm_provider || 'unknown'}`, d.gateway_enabled ? 'good' : 'muted')}${pill(`Active v${d.active_version ?? 0}`, 'brand')}${pill(syncLabel, tone)}<span class="settings-help">${pending ? `${pending} pending change${pending === 1 ? '' : 's'} — nothing reaches a worker until you apply.` : 'The active configuration matches your settings.'}</span></div>
-      <div class="row gap8">${btn(isBusy('aim-preview') ? 'Checking…' : pending ? `Preview ${pending} change${pending === 1 ? '' : 's'} →` : 'Preview changes', 'aim-preview', {}, `sm ${pending ? 'primary' : ''}`, !pending || isBusy('aim-preview'))}</div></div>
-    ${d.gateway ? gatewayMissing(d.gateway) : ''}</section>`;
-}
-const aimPanel = (content, extra = '') => `<section class="card flush aim-panel ${extra}">${content}</section>`;
-const aimMode = c => c?.mode === 'FIXED' ? 'Fixed model' : c?.mode === 'AUTO_ROUTER' ? `Auto Router${c.tier ? ` · ${c.tier} when off` : ''}` : `Tier ${c?.tier || '—'}`;
-
-/* ───────────── overview ───────────── */
-function aimOverview() {
+// One line of status: the route, LiteLLM, the active version, resting models; and what to do when a save was refused.
+function aimStrip() {
   const d = aimData(), conn = d.connection || {}, [connLabel, connTone] = AIM_CONN[conn.status] || AIM_CONN.UNKNOWN;
-  const workers = d.workers || [], models = aimModels();
-  const modes = Object.keys(AIM_MODES).map(k => [k, workers.filter(w => (w.config?.mode || 'TIER') === k).length]).filter(([, n]) => n);
-  const healthy = models.filter(m => m.health_status === 'HEALTHY').length;
-  const flow = `<div class="aim-flow" aria-label="How a request finds its model">
-      <div class="aim-flow-step"><small>1 · WORKER</small><b>${workers.length} AI workers</b><span>each asks by its own name, never a model name</span></div><i aria-hidden="true">→</i>
-      <div class="aim-flow-step"><small>2 · ASSIGNMENT</small><b>${modes.map(([k, n]) => `${n} ${{ FIXED: 'fixed', TIER: 'on a tier', AUTO_ROUTER: 'auto-routed' }[k]}`).join(' · ') || '—'}</b><span>a fixed model, a tier, or the auto router</span></div><i aria-hidden="true">→</i>
-      <div class="aim-flow-step"><small>3 · MODEL</small><b>${d.gateway_enabled ? `${models.filter(m => m.enabled).length} models in LiteLLM` : esc(d.gateway?.direct_label || d.llm_provider || 'Direct provider')}</b><span>${d.gateway_enabled ? 'served through the gateway' : 'called directly with its default model'}</span></div><i aria-hidden="true">→</i>
-      <div class="aim-flow-step"><small>4 · ON FAILURE</small><b>${workers.filter(w => w.config?.fallback_model).length} with a fallback</b><span>LiteLLM retries outages; quality escalation is separate</span></div></div>`;
-  const cards = `<div class="aim-cards">
-      <div class="aim-card"><small>ROUTE</small><strong>${d.gateway_enabled ? 'LiteLLM gateway' : 'Direct provider'}</strong><p class="settings-help">${d.gateway ? esc(gatewayNow(d.gateway)) : ''}</p></div>
-      <div class="aim-card"><small>LITELLM</small><strong>${pill(connLabel, connTone)} ${conn.litellm_version ? `<span class="xs muted">v${esc(conn.litellm_version)}</span>` : ''}</strong><p class="settings-help">${conn.base_url ? esc(conn.base_url) : 'No base URL yet'}${conn.last_successful_sync_at ? ` · models synced ${esc(fmtDateTime(conn.last_successful_sync_at))}` : ''}</p></div>
-      <div class="aim-card"><small>CONFIGURATION</small><strong>Active version v${d.active_version ?? 0}</strong><p class="settings-help">${conn.last_sync_at ? `Last applied ${esc(fmtDateTime(conn.last_sync_at))}` : 'Not applied yet'}${conn.last_sync_error ? ` · ${esc(conn.last_sync_error)}` : ''}</p></div>
-      <div class="aim-card"><small>CATALOG</small><strong>${models.filter(m => m.enabled).length} of ${models.length} models enabled</strong><p class="settings-help">${healthy} healthy · ${models.filter(m => m.health_status === 'UNHEALTHY').length} unhealthy · ${models.filter(m => !m.health_status || m.health_status === 'UNKNOWN').length} not tested</p></div></div>`;
-  return `${aimPanel(`<div class="aim-pad"><div class="card-title mb12">How a request finds its model</div>${flow}</div>`)}${cards}${aimModelSelection(d)}`;
-}
-// Model selection follows the route: through LiteLLM each worker's model is set here per worker; calling a
-// provider directly, the provider's default model (and optional per-stage models) apply. The other route's
-// settings are kept, one click away, for when you switch.
-function aimModelSelection(d) {
-  const rows = (d.workers || []).map(w => {
-    const c = w.config || {};
-    return `<button type="button" class="aim-map-row" data-act="aim-worker" data-worker="${attr(w.worker_type)}"><span class="aim-map-worker"><b>${esc(w.label)}</b><small>${esc(w.description || '')}</small></span>
-      <i aria-hidden="true">→</i><span class="aim-model-chip mono">${esc(w.resolved?.model || '—')}</span><span class="orch-chip muted">${esc(aimMode(c))}</span>
-      <span class="xs muted">${c.fallback_model ? `fallback <span class="mono">${esc(c.fallback_model)}</span>` : 'no fallback'}</span>${c.enabled === false ? '<span class="orch-chip bad">off</span>' : ''}${w.resolved?.note ? `<span class="xs muted">${esc(w.resolved.note)}</span>` : ''}</button>`;
-  }).join('');
-  const workers = aimPanel(settingsGroup('Models · LiteLLM workers', 'Which model each worker uses through LiteLLM. Select one to change it.', `<div class="aim-map">${rows}</div>`)) +
-    aimPanel(settingsGroup('Desired and active', 'Compare your settings with what workers run now and what LiteLLM serves.', `${btn(isBusy('aim-runtime') ? 'Checking…' : 'Check runtime', 'aim-runtime', {}, 'sm', isBusy('aim-runtime'))}${AIM.runtime ? aimRuntimeTable() : ''}`));
-  const direct = D.settings?.ai ? `<form id="settings-editor" data-form="ai" class="aim-direct-form" novalidate><fieldset ${isBusy('settings-ai') ? 'disabled' : ''}><div id="settings-error" class="settings-error" role="alert" ${SETTING_ERRORS.ai ? '' : 'hidden'}>${esc(SETTING_ERRORS.ai || '')}</div>${renderAISettings()}</fieldset></form>` : '';
-  const label = d.gateway?.direct_label || 'the direct provider';
-  if (d.gateway_enabled) {
-    return workers + (direct ? aimPanel(settingsDetails('aim-direct', `Direct provider · ${esc(label)} (kept ready for when you switch the route)`, direct)) : '');
-  }
-  return `<div class="aim-direct-models" data-route="direct"><p class="settings-help" style="margin:4px 4px 10px">Workers call ${esc(label)} directly with the models below. The LiteLLM worker models stay under Worker assignments for when you switch.</p>${aimPanel(direct)}</div>`;
-}
-function aimRuntimeTable() {
-  const r = AIM.runtime;
-  return `<p class="settings-help">${r.live_error ? `LiteLLM could not be read: ${esc(r.live_error)}` : 'LiteLLM was read just now.'}</p><div class="mon-table-wrap"><table class="mon-table"><thead><tr><th>Worker</th><th>Desired</th><th>Active</th><th>Status</th></tr></thead><tbody>${(r.workers || []).map(w => { const [text, tone] = AIM_SYNC[w.state] || AIM_SYNC.SYNCED; return `<tr><td>${esc(w.label)}</td><td class="mono">${esc(w.desired || '—')}</td><td class="mono">${esc(w.active || '—')}</td><td>${pill(w.state === 'SYNCED' ? 'Synced ✓' : text, tone)}</td></tr>`; }).join('')}</tbody></table></div>`;
+  const pending = (d.pending_changes || []).length, resting = typeof FO !== 'undefined' ? FO.routes?.resting || 0 : 0;
+  const f = AIM.failed;
+  const notice = f ? `<div class="settings-error aim-failed" role="alert"><strong>Not saved.</strong>${f.errors.slice(0, 3).map(e => `<p>${esc(e)}</p>`).join('')}${f.errors.length > 3 ? `<p class="settings-help">and ${f.errors.length - 3} more</p>` : ''}${(f.warnings || []).map(w => `<p class="settings-help">${esc(w)}</p>`).join('')}<div class="row gap8 mt8">${btn(isBusy('aim-discard') ? 'Undoing…' : 'Undo changes', 'aim-discard', {}, 'sm', isBusy('aim-discard'))}${btn('Try again', 'aim-apply', {}, 'sm', isBusy('aim-apply'))}</div></div>`
+    : pending ? `<div class="settings-notice aim-failed" role="status">${pending} change${pending === 1 ? ' is' : 's are'} saved but not applied yet.<div class="row gap8 mt8">${btn(isBusy('aim-apply') ? 'Applying…' : 'Apply now', 'aim-apply', {}, 'primary sm', isBusy('aim-apply'))}${btn('Undo', 'aim-discard', {}, 'sm', isBusy('aim-discard'))}</div></div>` : '';
+  return `<section class="card aim-hero"><div class="row between wrap gap10">
+      <div style="min-width:min(100%,280px);flex:1"><div class="aim-hero-title">Models &amp; routing</div>
+        <div class="card-sub">Which model each AI worker uses. Saving applies straight away; every save is a version you can roll back in Settings.</div></div>
+      <div class="row gap6 wrap">${pill(d.gateway_enabled ? 'LiteLLM' : `Direct · ${d.gateway?.direct_label || d.llm_provider || 'provider'}`, d.gateway_enabled ? 'good' : 'muted')}${d.gateway_enabled ? pill(connLabel, connTone) : ''}${pill(`Active v${d.active_version ?? 0}`, 'brand')}${resting ? `<button type="button" class="pill bad" data-act="aim-tab" data-tab="reliability">${resting} model${resting === 1 ? '' : 's'} resting</button>` : ''}</div></div>
+    ${d.gateway ? gatewayMissing(d.gateway) : ''}${notice}</section>`;
 }
 
 /* ───────────── workers ───────────── */
+// Health of the model a worker uses, from the failover overlay: resting, probing, or fine.
+function aimHealth(w) {
+  const dot = (label, tone, title = '') => `<span class="aim-health ${tone}"${title ? ` title="${attr(title)}"` : ''}><i aria-hidden="true"></i>${label}</span>`;
+  if (w.config?.enabled === false) return dot('Off', 'muted');
+  const routes = (typeof FO !== 'undefined' && FO.routes?.routes) || [], model = w.resolved?.model;
+  const route = routes.find(r => r.model === model && (!r.worker_type || r.worker_type === w.worker_type) && (r.resting || r.half_open));
+  if (route?.resting) return dot('Resting', 'bad', route.reason || '');
+  if (route?.half_open) return dot('Recovering', 'warn');
+  return dot('Healthy', 'good');
+}
+// A backup chain in the order it is tried: 1 → 2 → 3, each in its model's own colour.
+function aimBackupChain(backups, none = 'No backup', noun = 'Backup') {
+  if (!backups.length) return `<span class="aim-wk-none">${esc(none)}</span>`;
+  return `<ol class="aim-chain">${backups.map((b, i) => `<li style="--h:${aimHue(b)}" title="${attr(`${noun} ${i + 1}: ${b}`)}"><b>${i + 1}</b><span class="mono">${esc(b)}</span></li>`).join('')}</ol>`;
+}
 function aimWorkers() {
-  const d = aimData(), cards = (d.workers || []).map(w => {
-    const c = w.config || {}, test = AIM.tests[`worker:${w.worker_type}`], m = aimModel(w.resolved?.model), e = c.escalation;
-    const facts = [['Assignment', aimMode(c)], ['Fallback', c.fallback_model ? `<span class="mono">${esc(c.fallback_model)}</span>` : '<span class="muted">none</span>'],
-      ['Escalates to', e ? esc(e.model || (e.tier ? `tier ${e.tier}` : '—')) : '<span class="muted">never</span>'],
-      ['Needs', `${esc(aimTokens(w.min_context_tokens))} context${w.structured_output_required ? ' · JSON' : ''}`],
-      ['Model has', m ? `${esc(aimTokens(m.context_window))} context · JSON ${aimYes(m.supports_structured_output)}` : '<span class="muted">unknown</span>']];
+  const d = aimData();
+  const rows = (d.workers || []).map(w => {
+    const c = w.config || {}, test = AIM.tests[`worker:${w.worker_type}`], m = aimModel(w.resolved?.model);
     const short = m && m.context_window && m.context_window < w.min_context_tokens;
-    return `<article class="card aim-worker-card ${c.enabled === false ? 'off' : ''}"><div class="row between gap8"><div style="min-width:0"><div class="b">${esc(w.label)}${w.has_prompt ? '' : ' <span class="settings-help">(reserved)</span>'}</div><div class="xs muted">${esc(w.description || '')}</div></div>
-        <div class="row gap4">${w.structured_output_required ? '<span class="orch-chip brand">JSON</span>' : ''}${c.enabled === false ? '<span class="orch-chip bad">Off</span>' : '<span class="orch-chip good">✓ On</span>'}</div></div>
-      <div class="aim-worker-model"><small>USES</small><span class="mono">${esc(w.resolved?.model || '—')}</span></div>
-      ${short ? `<div class="xs" style="color:var(--warn)">▲ ${esc(m.name)} has less context than ${esc(w.label)} needs.</div>` : ''}
-      <dl class="aim-facts">${facts.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('')}</dl>
-      <div class="row gap6 mt10">${btn('Edit', 'aim-worker', { worker: w.worker_type }, 'sm primary')}${btn(isBusy(`aim-wtest-${w.worker_type}`) ? 'Testing…' : 'Test', 'aim-worker-test', { worker: w.worker_type }, 'sm', isBusy(`aim-wtest-${w.worker_type}`))}</div>${test ? aimTestResult(test) : ''}</article>`;
+    return `<tr class="${c.enabled === false ? 'off' : ''}">
+      <td><div class="aim-wk" style="--h:${aimHue(w.worker_type)}"><span class="aim-wk-mono" aria-hidden="true">${esc(aimMonogram(w.label))}</span><div class="aim-wk-name"><b>${esc(w.label)}</b>${w.has_prompt ? '' : '<span class="aim-wk-tag">reserved</span>'}<small title="${attr(w.description || '')}">${esc(w.description || '')}</small>${short ? `<small class="aim-wk-warn">▲ ${esc(m.name)} has less context than it needs</small>` : ''}</div></div></td>
+      <td><select class="select aim-inline" aria-label="Model for ${attr(w.label)}" data-act-change="aim-worker-target" data-worker="${attr(w.worker_type)}">${aimTargetOptions(aimTarget(c))}</select></td>
+      <td>${aimBackupChain(aimBackups(c))}</td>
+      <td>${aimHealth(w)}</td>
+      <td class="aim-wk-act">${btn('Edit', 'aim-worker', { worker: w.worker_type }, 'sm')}</td></tr>${test ? `<tr class="aim-wk-test"><td colspan="5">${aimTestResult(test)}</td></tr>` : ''}`;
   }).join('');
-  return `<div class="aim-section-head"><div class="card-title">Worker model assignments</div><div class="card-sub">Workers reference a model, a tier or the auto router — never a provider model name in code. Edits take effect after Apply.</div></div><div class="aim-grid">${cards}</div>`;
+  const direct = d.gateway_enabled ? '' : `<p class="settings-notice">Workers call ${esc(d.gateway?.direct_label || 'the direct provider')} directly right now (Settings). These assignments apply when the LiteLLM route is on.</p>`;
+  return aimPanel(settingsGroup('Workers', 'Pick the model each worker uses. Backups take over when it is rate limited or failing.', `${direct}<div class="aim-wk-wrap"><table class="aim-workers"><thead><tr><th>Worker</th><th>Model</th><th>Backups</th><th>Health</th><th><span class="sr-only">Actions</span></th></tr></thead><tbody>${rows}</tbody></table></div>`));
 }
 function aimTestResult(t) {
   if (t.error && !t.success) return `<div class="settings-error aim-test">${esc(t.error)}</div>`;
@@ -145,91 +176,148 @@ function aimTestResult(t) {
   const bits = [`model ${t.answered_by || t.underlying_model || t.model || '?'}`, r.model_group ? `group ${r.model_group}` : '', r.routing_tier ? `tier ${r.routing_tier}` : '', t.latency_ms != null ? `${t.latency_ms} ms` : '', t.input_tokens != null ? `${t.input_tokens}+${t.output_tokens ?? 0} tokens` : '', t.schema_ok === true || t.structured_output === true ? 'schema ✓' : t.schema_ok === false || t.structured_output === false ? 'schema ✗' : '', r.escalated ? `escalated (${r.escalation_reason})` : ''].filter(Boolean);
   return `<div class="settings-help aim-test" role="status">${t.success ? '✓' : '✗'} ${esc(bits.join(' · '))}</div>`;
 }
+
+/* ── the worker drawer: model, backups, on/off; generation and escalation folded away ── */
 function aimWorkerBaseline(w) {
-  const c = w.config || {}, e = c.escalation || {};
-  return { model_mode: c.mode || 'TIER', primary_model: c.primary_model || '', tier_name: c.tier || '', fallback_model: c.fallback_model || '', temperature: c.temperature ?? '', max_output_tokens: c.max_output_tokens ?? '', context_window: c.context_window ?? '', reasoning_effort: c.reasoning_effort || '', timeout_seconds: c.timeout_seconds ?? '', retry_count: c.retry_count ?? '', max_concurrency: c.max_concurrency ?? '', use_structured_output: c.use_structured_output !== false, enabled: c.enabled !== false, esc_target: e.model ? `model:${e.model}` : e.tier ? `tier:${e.tier}` : '', esc_threshold: e.confidence_threshold ?? '', ...Object.fromEntries(Object.keys(AIM_CONDITIONS).map(k => [`esc_${k}`, (e.conditions || []).includes(k)])) };
-}
-// The model a worker's drawer currently points at, so only options that model supports are shown.
-function aimDrawerModel(v) {
-  const d = aimData();
-  if (v.model_mode === 'FIXED') return v.primary_model;
-  if (v.model_mode === 'AUTO_ROUTER' && d.routing?.auto_router_enabled) return d.routing.auto_router_model_name;
-  return d.tiers?.[v.tier_name]?.model || '';
+  const c = w.config || {}, e = c.escalation || {}, backups = aimBackups(c);
+  return { target: aimTarget(c), ...Object.fromEntries(Array.from({ length: AIM_BACKUPS }, (_, i) => [`backup_${i}`, backups[i] || ''])), temperature: c.temperature ?? '', max_output_tokens: c.max_output_tokens ?? '', context_window: c.context_window ?? '', reasoning_effort: c.reasoning_effort || '', timeout_seconds: c.timeout_seconds ?? '', retry_count: c.retry_count ?? '', max_concurrency: c.max_concurrency ?? '', use_structured_output: c.use_structured_output !== false, enabled: c.enabled !== false, esc_target: e.model ? `model:${e.model}` : e.tier ? `tier:${e.tier}` : '', esc_threshold: e.confidence_threshold ?? '', ...Object.fromEntries(Object.keys(AIM_CONDITIONS).map(k => [`esc_${k}`, (e.conditions || []).includes(k)])) };
 }
 function aimDrawerValues(w) { const base = aimWorkerBaseline(w); return Object.fromEntries(Object.keys(base).map(k => [k, fv('aiw', k, base[k])])); }
+const aimDrawerBackups = v => Array.from({ length: AIM_BACKUPS }, (_, i) => v[`backup_${i}`]).filter(Boolean);
 function aimWarnings(w, v) {
-  const m = aimModel(aimDrawerModel(v)), out = [];
+  const m = aimModel(aimTargetModel(v.target)), out = [];
   if (!m) return out;
   if (w.structured_output_required && m.supports_structured_output === false) out.push(`${m.name} cannot return structured output, which ${w.label} requires.`);
   else if (w.structured_output_required && m.supports_structured_output == null && m.model_type !== 'AUTO_ROUTER') out.push(`Structured Output Required: it is unknown whether ${m.name} returns JSON reliably.`);
   if (m.context_window && m.context_window < w.min_context_tokens) out.push(`This model may not satisfy ${w.label} requirements (${aimTokens(m.context_window)} context; ${aimTokens(w.min_context_tokens)} recommended).`);
   if (v.context_window && m.context_window && Number(v.context_window) > m.context_window) out.push(`Context ${aimTokens(Number(v.context_window))} exceeds the ${aimTokens(m.context_window)} ${m.name} runs with.`);
-  if (v.fallback_model && v.fallback_model === m.name) out.push('The fallback cannot be the primary model.');
+  if (aimDrawerBackups(v).includes(m.name)) out.push('A backup cannot be the model itself.');
   return out;
 }
 function aimDrawer() {
   const w = (aimData().workers || []).find(x => x.worker_type === AIM.drawer);
   if (!w) return '';
-  const v = aimDrawerValues(w), model = aimModel(aimDrawerModel(v)), d = aimData(), warnings = aimWarnings(w, v);
-  const f = (key, label, extra = '', help = '') => `<label class="field" for="aiw-${key}"><span>${label}</span>${inputF('aiw', key, v[key], extra)}${help ? `<span class="settings-help">${help}</span>` : ''}</label>`;
-  const target = v.model_mode === 'FIXED' ? `<label class="field" for="aiw-primary_model"><span>Primary model</span><select class="select" id="aiw-primary_model" data-form="aiw" data-field="primary_model" data-live="1">${aimModelOptions(v.primary_model, 'Choose a model')}</select></label>`
-    : `<label class="field" for="aiw-tier_name"><span>${v.model_mode === 'AUTO_ROUTER' ? 'Tier while the auto router is off' : 'Tier'}</span><select class="select" id="aiw-tier_name" data-form="aiw" data-field="tier_name" data-live="1">${aimTierOptions(v.tier_name)}</select></label>`;
-  const router = v.model_mode === 'AUTO_ROUTER' ? `<p class="settings-help">Auto Router: ${d.routing?.auto_router_enabled ? `on — requests go to <span class="mono">${esc(d.routing.auto_router_model_name)}</span>` : 'off — the tier above is used until it is turned on (Routing tab)'}.</p>` : '';
+  const v = aimDrawerValues(w), model = aimModel(aimTargetModel(v.target)), d = aimData(), warnings = aimWarnings(w, v);
+  const f = (key, label, extra = '') => `<label class="field" for="aiw-${key}"><span>${label}</span>${inputF('aiw', key, v[key], extra)}</label>`;
+  // Filled backups plus one empty slot, so the list grows as you fill it.
+  const shown = Math.min(AIM_BACKUPS, aimDrawerBackups(v).length + 1);
+  const backups = Array.from({ length: shown }, (_, i) => `<label class="field" for="aiw-backup_${i}"><span>Backup ${i + 1}</span><select class="select" id="aiw-backup_${i}" data-form="aiw" data-field="backup_${i}" data-live="1">${aimModelOptions(v[`backup_${i}`], 'None')}</select></label>`).join('');
+  const router = v.target === 'auto' ? `<p class="settings-help">Auto router: ${d.routing?.auto_router_enabled ? `requests go to <span class="mono">${esc(d.routing.auto_router_model_name)}</span>` : `off — tier ${esc(w.config?.tier || '—')} is used until it is on (Models tab)`}.</p>` : '';
   const reasoning = model?.supports_reasoning === true ? `<label class="field" for="aiw-reasoning_effort"><span>Reasoning effort</span><select class="select" id="aiw-reasoning_effort" data-form="aiw" data-field="reasoning_effort">${aimOpt('', 'Model default', v.reasoning_effort)}${['low', 'medium', 'high'].map(x => aimOpt(x, x.toUpperCase(), v.reasoning_effort)).join('')}</select></label>` : `<p class="settings-help">Reasoning effort: ${model ? (model.supports_reasoning === false ? `${esc(model.name)} does not support it.` : `unknown whether ${esc(model.name)} supports it, so it is not offered.`) : 'choose a model first.'}</p>`;
   const conditions = Object.entries(AIM_CONDITIONS).map(([k, label]) => checkF('aiw', `esc_${k}`, v[`esc_${k}`], label)).join('');
   const escTargets = aimOpt('', 'No escalation', v.esc_target) + Object.keys(d.tiers || {}).map(t => aimOpt(`tier:${t}`, `Tier ${t}`, v.esc_target)).join('') + aimModels().filter(m => m.enabled).map(m => aimOpt(`model:${m.name}`, m.name, v.esc_target)).join('');
   return `<aside class="aim-drawer" role="dialog" aria-modal="false" aria-labelledby="aim-drawer-title"><header class="row between"><h3 id="aim-drawer-title">${esc(w.label)}</h3>${btn('Close', 'aim-drawer-close', {}, 'sm')}</header><p class="settings-help">${esc(w.description || '')}${w.structured_output_required ? ' · <strong>Structured Output Required</strong>' : ''}</p>
     ${warnings.length ? `<div class="settings-notice" role="status">${warnings.map(x => `<p>${esc(x)}</p>`).join('')}</div>` : ''}
-    <div class="settings-grid"><label class="field" for="aiw-model_mode"><span>Model mode</span><select class="select" id="aiw-model_mode" data-form="aiw" data-field="model_mode" data-live="1">${Object.entries(AIM_MODES).map(([k, t]) => aimOpt(k, t, v.model_mode)).join('')}</select></label>${target}
-    <label class="field" for="aiw-fallback_model"><span>Fallback model (infrastructure)</span><select class="select" id="aiw-fallback_model" data-form="aiw" data-field="fallback_model" data-live="1">${aimModelOptions(v.fallback_model, 'No fallback')}</select><span class="settings-help">Used by LiteLLM on timeouts, rate limits and outages only.</span></label></div>${router}
-    <div class="settings-grid">${f('temperature', 'Temperature', 'type="number" min="0" max="2" step="0.1" placeholder="Model default"')}${f('max_output_tokens', 'Max output tokens', `type="number" min="1" max="${model?.max_output_tokens || 200000}" placeholder="Model default"`)}${f('context_window', 'Context window (tokens)', `type="number" min="512" placeholder="${attr(model?.context_window ? `Model: ${model.context_window}` : 'Model default')}" data-live="1"`)}${reasoning}${f('timeout_seconds', 'Timeout (seconds)', 'type="number" min="1" max="3600" placeholder="Server default"')}${f('retry_count', 'Retries', 'type="number" min="0" max="10" placeholder="Server default"')}${f('max_concurrency', 'Maximum concurrency', 'type="number" min="1" max="100" placeholder="No limit"')}</div>
-    <div class="settings-checks">${checkF('aiw', 'use_structured_output', v.use_structured_output, 'Structured output (JSON mode)')}${checkF('aiw', 'enabled', v.enabled, 'Worker enabled')}</div>
-    ${settingsDetails('aim-escalation', 'Quality escalation', `<p class="settings-help">Separate from the fallback above: when an answer is not good enough, Job Hunt OS asks a stronger model once.</p><div class="settings-grid"><label class="field" for="aiw-esc_target"><span>Escalate to</span><select class="select" id="aiw-esc_target" data-form="aiw" data-field="esc_target">${escTargets}</select></label>${f('esc_threshold', 'Confidence threshold', 'type="number" min="0" max="1" step="0.05" placeholder="e.g. 0.85"')}</div><div class="settings-checks">${conditions}</div>`)}
-    <footer class="row gap8 mt14">${btn(isBusy('aim-worker-save') ? 'Saving…' : 'Save to draft', 'aim-worker-save', { worker: w.worker_type }, 'primary', isBusy('aim-worker-save'))}${btn(isBusy(`aim-wtest-${w.worker_type}`) ? 'Testing…' : 'Test with draft', 'aim-worker-test', { worker: w.worker_type }, '', isBusy(`aim-wtest-${w.worker_type}`))}</footer>${AIM.tests[`worker:${w.worker_type}`] ? aimTestResult(AIM.tests[`worker:${w.worker_type}`]) : ''}</aside>`;
+    <label class="field" for="aiw-target"><span>Model</span><select class="select" id="aiw-target" data-form="aiw" data-field="target" data-live="1">${aimTargetOptions(v.target)}</select></label>${router}
+    <div class="settings-grid">${backups}</div><p class="settings-help">Backups are tried in order when the model is rate limited, failing or down. Reliability decides when.</p>
+    <div class="settings-checks">${checkF('aiw', 'enabled', v.enabled, 'Worker enabled')}</div>
+    ${settingsDetails('aim-generation', 'Generation settings', `<div class="settings-grid">${f('temperature', 'Temperature', 'type="number" min="0" max="2" step="0.1" placeholder="Model default"')}${f('max_output_tokens', 'Max output tokens', `type="number" min="1" max="${model?.max_output_tokens || 200000}" placeholder="Model default"`)}${f('context_window', 'Context window (tokens)', `type="number" min="512" placeholder="${attr(model?.context_window ? `Model: ${model.context_window}` : 'Model default')}" data-live="1"`)}${reasoning}${f('timeout_seconds', 'Timeout (seconds)', 'type="number" min="1" max="3600" placeholder="Server default"')}${f('retry_count', 'Retries', 'type="number" min="0" max="10" placeholder="Server default"')}${f('max_concurrency', 'Maximum concurrency', 'type="number" min="1" max="100" placeholder="No limit"')}</div><div class="settings-checks">${checkF('aiw', 'use_structured_output', v.use_structured_output, 'Structured output (JSON mode)')}</div>`)}
+    ${settingsDetails('aim-escalation', 'Quality escalation', `<p class="settings-help">When an answer is not good enough, ask a stronger model once. Separate from backups, which handle outages.</p><div class="settings-grid"><label class="field" for="aiw-esc_target"><span>Escalate to</span><select class="select" id="aiw-esc_target" data-form="aiw" data-field="esc_target">${escTargets}</select></label>${f('esc_threshold', 'Confidence threshold', 'type="number" min="0" max="1" step="0.05" placeholder="e.g. 0.85"')}</div><div class="settings-checks">${conditions}</div>`)}
+    <footer class="row gap8 mt14">${btn(isBusy('aim-worker-save') ? 'Saving…' : 'Save', 'aim-worker-save', { worker: w.worker_type }, 'primary', isBusy('aim-worker-save'))}${btn(isBusy(`aim-wtest-${w.worker_type}`) ? 'Testing…' : 'Test', 'aim-worker-test', { worker: w.worker_type }, '', isBusy(`aim-wtest-${w.worker_type}`))}</footer>${AIM.tests[`worker:${w.worker_type}`] ? aimTestResult(AIM.tests[`worker:${w.worker_type}`]) : ''}</aside>`;
 }
 function aimWorkerPayload(w) {
   const v = aimDrawerValues(w), num = x => x === '' || x == null ? null : Number(x);
   const [kind, name] = String(v.esc_target || '').split(/:(.*)/s);
   const conditions = Object.keys(AIM_CONDITIONS).filter(k => v[`esc_${k}`]);
-  return { revision: aimRev(), model_mode: v.model_mode, primary_model: v.primary_model || null, tier_name: v.tier_name || null, fallback_model: v.fallback_model || null, temperature: num(v.temperature), max_output_tokens: num(v.max_output_tokens), context_window: num(v.context_window), reasoning_effort: v.reasoning_effort || null, timeout_seconds: num(v.timeout_seconds), retry_count: num(v.retry_count), max_concurrency: num(v.max_concurrency), use_structured_output: !!v.use_structured_output, enabled: !!v.enabled,
+  const backups = [...new Set(aimDrawerBackups(v))];
+  return { revision: aimRev(), ...aimTargetFields(v.target, w.config), fallback_model: backups[0] || null, secondary_models: backups.slice(1), temperature: num(v.temperature), max_output_tokens: num(v.max_output_tokens), context_window: num(v.context_window), reasoning_effort: v.reasoning_effort || null, timeout_seconds: num(v.timeout_seconds), retry_count: num(v.retry_count), max_concurrency: num(v.max_concurrency), use_structured_output: !!v.use_structured_output, enabled: !!v.enabled,
     escalation: kind && conditions.length ? { model: kind === 'model' ? name : null, tier: kind === 'tier' ? name : null, conditions, confidence_threshold: num(v.esc_threshold) } : null };
 }
 
-/* ───────────── models ───────────── */
+/* ───────────── models: catalog, tiers, auto router ───────────── */
 function aimModelsTab() {
   const d = aimData(), labels = Object.fromEntries((d.workers || []).map(w => [w.worker_type, w.label]));
-  const cards = aimModels().map(m => {
-    const test = AIM.tests[`model:${m.name}`], health = m.health_status === 'HEALTHY' ? pill('Healthy', 'good') : m.health_status === 'UNHEALTHY' ? pill('Unhealthy', 'bad') : pill('Not tested', 'muted');
-    const caps = [['JSON', m.supports_structured_output], ['tools', m.supports_tools], ['reasoning', m.supports_reasoning], ['vision', m.supports_vision]].map(([n, v]) => `<span class="aim-cap ${v === true ? 'yes' : v === false ? 'no' : ''}" title="${attr(`${n}: ${aimYes(v)}`)}">${n}${v === true ? ' ✓' : v === false ? ' ✗' : ' ?'}</span>`).join('');
-    const users = (m.used_by || []).map(u => `<span class="orch-chip muted">${esc(labels[u] || u)}</span>`).join('');
-    return `<article class="card aim-model-card ${m.enabled ? '' : 'off'}"><div class="row between gap8" style="align-items:flex-start"><div style="min-width:0"><div class="mono b ellipsis" title="${attr(m.name)}">${esc(m.name)}</div><div class="xs muted ellipsis">${esc(m.provider || 'provider unknown')} · ${esc(m.underlying_model || 'model unknown')}</div></div>${health}</div>
-      <div class="row gap4 wrap mt8">${m.managed ? pill('Managed', 'brand') : ''}${m.present_in_litellm ? '' : pill('Not in LiteLLM', 'warn')}${m.enabled ? '' : pill('Disabled', 'muted')}</div>
-      <div class="aim-model-stats"><div><small>Context</small><b>${esc(aimTokens(m.context_window))}</b>${m.max_context_window ? `<span class="xs faint">/ ${esc(aimTokens(m.max_context_window))} max</span>` : ''}</div><div><small>Latency</small><b>${m.health_latency_ms != null ? `${m.health_latency_ms} ms` : '—'}</b></div></div>
-      <div class="row gap4 wrap">${caps}</div>
-      <div class="xs muted mt8">Used by ${users || 'no worker'}</div>
-      <div class="row gap6 wrap mt10" style="align-items:center"><select class="select aim-inline" aria-label="Type of ${attr(m.name)}" data-act-change="aim-model-type" data-name="${attr(m.name)}">${(d.options?.model_types || []).map(t => aimOpt(t, t.replace('_', ' ').toLowerCase(), m.model_type)).join('')}</select>
-        ${btn(isBusy(`aim-mtest-${m.name}`) ? 'Testing…' : 'Test', 'aim-model-test', { name: m.name }, 'sm', isBusy(`aim-mtest-${m.name}`))}${btn(m.enabled ? 'Disable' : 'Enable', 'aim-model-toggle', { name: m.name, on: m.enabled ? '' : '1' }, 'sm')}${m.managed ? btn('Stop managing', 'aim-model-unmanage', { name: m.name }, 'sm') : ''}</div>${test ? aimTestResult(test) : ''}</article>`;
-  }).join('');
-  return `<div class="aim-section-head row between wrap gap10"><div><div class="card-title">Available models</div><div class="card-sub">Discovered from LiteLLM. Values LiteLLM or Ollama do not report stay unknown.</div></div>
-      <div class="row gap8">${btn(isBusy('aim-sync') ? 'Syncing…' : 'Sync models from LiteLLM', 'aim-sync', {}, 'primary sm', isBusy('aim-sync'))}${btn(AIM.adding ? 'Cancel' : 'Add local Ollama model', 'aim-add-toggle', {}, 'sm')}</div></div>
-    ${AIM.adding ? aimPanel(aimAddForm()) : ''}${cards ? `<div class="aim-grid">${cards}</div>` : `<section class="card"><div class="settings-empty"><strong>No models yet</strong><p>Connect LiteLLM, then sync to discover its models.</p></div></section>`}`;
+  const cards = aimModels().map(m => aimModelCard(m, labels, d)).join('');
+  return `<div class="aim-section-head row between wrap gap10"><div><div class="card-title">Models</div><div class="card-sub">What LiteLLM serves. Values LiteLLM or Ollama do not report stay unknown.</div></div>
+      <div class="row gap8">${btn(isBusy('aim-sync') ? 'Syncing…' : 'Sync from LiteLLM', 'aim-sync', {}, 'primary sm', isBusy('aim-sync'))}${btn(AIM.adding ? 'Cancel' : 'Add local Ollama model', 'aim-add-toggle', {}, 'sm')}</div></div>
+    ${AIM.adding ? aimPanel(aimAddForm()) : ''}${cards ? `<div class="aim-grid">${cards}</div>` : `<section class="card"><div class="settings-empty"><strong>No models yet</strong><p>Connect LiteLLM in Settings, then sync to discover its models.</p></div></section>`}
+    ${aimRemoved()}${aimTiers()}`;
+}
+/* ── a model card: who it is, how it is doing, what it can do, who uses it ── */
+// A model's full name, never cut: the provider path ("groq/qwen/") dimmed before the model itself, with break points
+// after "/", ":" and "-" so a long name wraps at a sensible place.
+function aimModelName(name) {
+  const text = String(name || ''), cut = text.lastIndexOf('/') + 1;
+  const soft = part => esc(part).replace(/([/:\-])/g, '$1<wbr>');
+  return `${cut ? `<span class="aim-mcard-path">${soft(text.slice(0, cut))}</span>` : ''}${soft(text.slice(cut))}`;
+}
+// A stable colour per model, so the same model looks the same everywhere it appears.
+function aimHue(name) { let h = 0; for (const ch of String(name)) h = (h * 31 + ch.charCodeAt(0)) % 360; return h; }
+function aimMonogram(name) {
+  const parts = String(name).replace(/^[^/]*\//, '').split(/[-_:.\s/]+/).filter(Boolean);
+  const next = parts.slice(1).find(x => /^[a-z]/i.test(x));
+  return ((parts[0]?.[0] || '?') + (next?.[0] || parts[0]?.[1] || '')).toUpperCase();
+}
+const AIM_HEALTH = { HEALTHY: ['Healthy', 'good'], UNHEALTHY: ['Unhealthy', 'bad'] };
+const AIM_CAPS = [['JSON', 'supports_structured_output', '{ }'], ['tools', 'supports_tools', '⚒'], ['reasoning', 'supports_reasoning', '◇'], ['vision', 'supports_vision', '◉']];
+function aimModelCard(m, labels, d) {
+  const test = AIM.tests[`model:${m.name}`], open = AIM.more?.[m.name], [healthLabel, tone] = AIM_HEALTH[m.health_status] || ['Not tested', 'muted'];
+  const users = m.used_by || [], shown = users.slice(0, 3), hidden = users.length - shown.length;
+  const sub = [m.provider || 'provider unknown', m.underlying_model && m.underlying_model !== m.name ? m.underlying_model : ''].filter(Boolean).join(' · ');
+  const caps = AIM_CAPS.map(([n, key, icon]) => { const v = m[key]; return `<span class="aim-cap ${v === true ? 'yes' : v === false ? 'no' : 'unk'}" title="${attr(`${n}: ${aimYes(v)}`)}"><i aria-hidden="true">${icon}</i>${n}<b aria-hidden="true">${v === true ? '✓' : v === false ? '✗' : '?'}</b></span>`; }).join('');
+  const stat = (k, v, hint = '') => `<div><dt>${k}</dt><dd>${v}${hint ? `<small>${hint}</small>` : ''}</dd></div>`;
+  const tags = [m.managed ? pill('Managed', 'brand') : '', m.present_in_litellm ? '' : pill('Not in LiteLLM', 'warn'), m.enabled ? '' : pill('Disabled', 'muted'), m.model_type && m.model_type !== 'CUSTOM' ? pill(m.model_type.replace('_', ' ').toLowerCase(), 'plain') : ''].join('');
+  const more = open ? `<div class="aim-mcard-more"><label class="field" for="aim-type-${attr(m.name)}"><span>Type</span><select class="select" id="aim-type-${attr(m.name)}" data-act-change="aim-model-type" data-name="${attr(m.name)}">${(d.options?.model_types || []).map(t => aimOpt(t, t.replace('_', ' ').toLowerCase(), m.model_type)).join('')}</select></label>${m.managed ? btn('Stop managing', 'aim-model-unmanage', { name: m.name }, 'sm') : ''}${btn(isBusy('aim-model-remove') ? 'Deleting…' : 'Delete model', 'aim-model-remove', { name: m.name, managed: m.managed ? '1' : '' }, 'sm danger', isBusy('aim-model-remove'))}</div>` : '';
+  const refs = AIM.refs?.[m.name];
+  return `<article class="card aim-mcard ${m.enabled ? '' : 'off'}" style="--h:${aimHue(m.name)}">
+    <header class="aim-mcard-head"><span class="aim-mcard-mono" aria-hidden="true">${esc(aimMonogram(m.name))}</span>
+      <div class="aim-mcard-title"><div class="aim-mcard-name mono b" title="${attr(m.name)}">${aimModelName(m.name)}</div><div class="xs muted ellipsis" title="${attr(sub)}">${esc(sub)}</div></div>
+      <span class="aim-health ${tone}"><i aria-hidden="true"></i>${healthLabel}</span></header>
+    ${tags ? `<div class="aim-mcard-tags">${tags}</div>` : ''}
+    <dl class="aim-mcard-stats">${stat('Context', esc(aimTokens(m.context_window)), m.max_context_window ? `/ ${esc(aimTokens(m.max_context_window))}` : '')}${stat('Latency', aimLatency(m.health_latency_ms))}${stat('Workers', String(users.length))}</dl>
+    <div class="aim-mcard-caps">${caps}</div>
+    <div class="aim-mcard-users" title="${attr(users.map(u => labels[u] || u).join(', '))}">${users.length ? `<span class="xs muted">Used by</span>${shown.map(u => `<span class="aim-user">${esc(labels[u] || u)}</span>`).join('')}${hidden ? `<span class="aim-user more">+${hidden} more</span>` : ''}` : '<span class="xs faint">Not used by any worker</span>'}</div>
+    ${aimFallbacks(m)}
+    ${refs ? `<div class="settings-error small" role="alert"><strong>Not deleted.</strong> Still used by: ${refs.map(esc).join(', ')}. Change those first.</div>` : ''}
+    ${more}
+    <footer class="aim-mcard-foot">${btn(isBusy(`aim-mtest-${m.name}`) ? 'Testing…' : 'Test', 'aim-model-test', { name: m.name }, 'sm', isBusy(`aim-mtest-${m.name}`))}${btn(m.enabled ? 'Disable' : 'Enable', 'aim-model-toggle', { name: m.name, on: m.enabled ? '' : '1' }, 'sm')}
+      <button type="button" class="btn sm aim-mcard-dots ${open ? 'on' : ''}" data-act="aim-model-more" data-name="${attr(m.name)}" aria-expanded="${open ? 'true' : 'false'}" aria-label="More for ${attr(m.name)}" title="Type and management">⋯</button></footer>
+    ${test ? aimTestResult(test) : ''}</article>`;
+}
+// Latency from the model's health check: milliseconds while short, seconds once it is long.
+const aimLatency = ms => ms == null ? '—' : ms < 10000 ? `${ms}<small>ms</small>` : `${Math.round(ms / 100) / 10}<small>s</small>`;
+// How long a failing model rests before it is tried again: the model's own choice, or the Reliability setting.
+const AIM_REST = [['', 'Reliability setting'], [60, '1 minute'], [300, '5 minutes'], [900, '15 minutes'], [1800, '30 minutes'],
+  [3600, '1 hour'], [21600, '6 hours'], [86400, '24 hours']];
+const aimRestLabel = s => s ? (AIM_REST.find(([v]) => v === s)?.[1] || (s < 3600 ? `${Math.round(s / 60)} minutes` : `${Math.round(s / 3600)} hours`)) : null;
+// A model's own failover: the models every worker on it falls back to, in order, and how long it rests.
+function aimFallbacks(m) {
+  const editing = AIM.fbEdit === m.name, list = m.fallback_models || [], rest = aimRestLabel(m.rest_seconds);
+  const view = `<div class="aim-mcard-fb"><div class="row between gap6"><span class="xs muted">Falls back to</span>${btn(editing ? 'Cancel' : 'Fallbacks', 'aim-fb-edit', { name: m.name }, 'sm aim-fb-btn')}</div>
+    ${aimBackupChain(list, 'No fallback', 'Fallback')}<span class="xs muted">${rest ? `Rests ${esc(rest)} after a rate limit or failures, then is tried again` : 'Rests as set in Reliability, then is tried again'}</span></div>`;
+  if (!editing) return view;
+  const key = `fb-${m.name}`, values = Array.from({ length: 4 }, (_, i) => fv(key, `m${i}`, list[i] || ''));
+  const shown = Math.min(4, values.filter(Boolean).length + 1);
+  const others = aimModels().filter(x => x.enabled && x.name !== m.name).map(x => x.name);
+  const options = selected => aimOpt('', 'None', selected) + [...new Set([...others, ...(selected ? [selected] : [])])].map(n => aimOpt(n, n, selected)).join('');
+  const selects = Array.from({ length: shown }, (_, i) => `<label class="field" for="${attr(key)}-m${i}"><span>Fallback ${i + 1}</span><select class="select" id="${attr(key)}-m${i}" data-form="${attr(key)}" data-field="m${i}" data-live="1">${options(values[i])}</select></label>`).join('');
+  const restValue = fv(key, 'rest', m.rest_seconds ?? '');
+  return `<div class="aim-mcard-fb editing"><p class="xs muted">Every worker using ${esc(m.name)} tries these, in order, after its own backups, when ${esc(m.name)} is rate limited or failing.</p>${selects}
+    <label class="field" for="${attr(key)}-rest"><span>Rest after a failure</span><select class="select" id="${attr(key)}-rest" data-form="${attr(key)}" data-field="rest">${AIM_REST.map(([v, t]) => aimOpt(v, t, restValue)).join('')}</select><span class="settings-help">Then it is tried again. A set time is the same every time; the Reliability setting doubles after each failure in a row.</span></label>
+    ${btn(isBusy('aim-fb') ? 'Saving…' : 'Save fallbacks', 'aim-fb-save', { name: m.name }, 'primary sm', isBusy('aim-fb'))}</div>`;
+}
+// Models a person removed: out of every picker and the configuration, and left removed by a sync, until restored.
+function aimRemoved() {
+  const list = aimData().removed_models || [];
+  if (!list.length) return '';
+  const rows = list.map(r => `<div class="row between gap10" style="padding:6px 0"><span><span class="mono">${esc(r.name)}</span> <span class="xs muted">removed ${esc(fmtDateTime(r.removed_at))}</span></span>${btn(isBusy('aim-model-restore') ? 'Restoring…' : 'Restore', 'aim-model-restore', { name: r.name }, 'sm', isBusy('aim-model-restore'))}</div>`).join('');
+  return aimPanel(settingsDetails('aim-removed', `Removed models (${list.length})`, `<p class="settings-help">Removed from Job Hunt OS; a sync does not bring them back. A model LiteLLM serves on its own is still there.</p>${rows}`));
 }
 function aimAddForm() {
   const o = AIM.ollama, local = (o?.models || []).map(m => aimOpt(m.name, `${m.name}${m.context_length ? ` · ${aimTokens(m.context_length)} ctx` : ''}`, fv('aim-add', 'ollama_model', ''))).join('');
-  return `<div class="settings-group aim-add"><p class="settings-help">Job Hunt OS deploys this model into LiteLLM on the next Apply (needs a sync mode under LiteLLM).${o && !o.reachable ? ` Ollama at ${esc(o.api_base)} did not answer; type the model name instead.` : ''}</p><div class="settings-grid"><label class="field" for="aim-add-litellm_model_name"><span>LiteLLM model name (alias)</span>${inputF('aim-add', 'litellm_model_name', '', 'placeholder="local-fast" required')}</label><label class="field" for="aim-add-ollama_model"><span>Ollama model</span>${local ? `<select class="select" id="aim-add-ollama_model" data-form="aim-add" data-field="ollama_model">${aimOpt('', 'Choose…', fv('aim-add', 'ollama_model', ''))}${local}</select>` : inputF('aim-add', 'ollama_model', '', 'placeholder="llama3.2:3b"')}</label><label class="field" for="aim-add-num_ctx"><span>Context size (num_ctx)</span>${inputF('aim-add', 'num_ctx', '', 'type="number" min="512" placeholder="8192"')}</label><label class="field" for="aim-add-keep_alive"><span>Keep alive</span>${inputF('aim-add', 'keep_alive', '', 'placeholder="15m"')}</label><label class="field" for="aim-add-model_type"><span>Type</span><select class="select" id="aim-add-model_type" data-form="aim-add" data-field="model_type">${(aimData().options?.model_types || []).map(t => aimOpt(t, t.replace('_', ' ').toLowerCase(), fv('aim-add', 'model_type', 'CUSTOM'))).join('')}</select></label></div>${btn(isBusy('aim-add') ? 'Adding…' : 'Add to draft', 'aim-add', {}, 'primary sm', isBusy('aim-add'))}</div>`;
+  return `<div class="settings-group aim-add"><p class="settings-help">Job Hunt OS deploys this model into LiteLLM when you add it (needs a sync mode in Settings).${o && !o.reachable ? ` Ollama at ${esc(o.api_base)} did not answer; type the model name instead.` : ''}</p><div class="settings-grid"><label class="field" for="aim-add-litellm_model_name"><span>LiteLLM model name (alias)</span>${inputF('aim-add', 'litellm_model_name', '', 'placeholder="local-fast" required')}</label><label class="field" for="aim-add-ollama_model"><span>Ollama model</span>${local ? `<select class="select" id="aim-add-ollama_model" data-form="aim-add" data-field="ollama_model">${aimOpt('', 'Choose…', fv('aim-add', 'ollama_model', ''))}${local}</select>` : inputF('aim-add', 'ollama_model', '', 'placeholder="llama3.2:3b"')}</label><label class="field" for="aim-add-num_ctx"><span>Context size (num_ctx)</span>${inputF('aim-add', 'num_ctx', '', 'type="number" min="512" placeholder="8192"')}</label><label class="field" for="aim-add-keep_alive"><span>Keep alive</span>${inputF('aim-add', 'keep_alive', '', 'placeholder="15m"')}</label><label class="field" for="aim-add-model_type"><span>Type</span><select class="select" id="aim-add-model_type" data-form="aim-add" data-field="model_type">${(aimData().options?.model_types || []).map(t => aimOpt(t, t.replace('_', ' ').toLowerCase(), fv('aim-add', 'model_type', 'CUSTOM'))).join('')}</select></label></div>${btn(isBusy('aim-add') ? 'Adding…' : 'Add model', 'aim-add', {}, 'primary sm', isBusy('aim-add'))}</div>`;
 }
-
-/* ───────────── routing: tiers and the auto router ───────────── */
-function aimRouting() {
+function aimTiers() {
   const d = aimData(), tiers = d.tiers || {}, r = d.routing || {};
   const tierRows = Object.entries(tiers).map(([name, t]) => `<tr><td class="mono">${esc(name)}<div class="settings-help">${esc(t.description || '')}</div></td><td><select class="select aim-inline" aria-label="Model for tier ${attr(name)}" data-act-change="aim-tier-model" data-tier="${attr(name)}">${aimModelOptions(t.model)}</select></td><td>${btn(t.enabled ? 'Disable' : 'Enable', 'aim-tier-toggle', { tier: name, on: t.enabled ? '' : '1' }, 'sm')}</td></tr>`).join('');
   const rv = k => fv('aim-route', k, k.startsWith('tier_') ? (r.tier_models || {})[k.slice(5)] || '' : r[k] ?? '');
   const classifier = rv('auto_router_enabled') ? rv('classifier') : 'DISABLED';
   const tierSelects = (d.options?.routing_tiers || ['SIMPLE', 'MEDIUM', 'COMPLEX', 'REASONING']).map(t => `<label class="field" for="aim-route-tier_${t}"><span>${t}</span><select class="select" id="aim-route-tier_${t}" data-form="aim-route" data-field="tier_${t}">${aimModelOptions(rv(`tier_${t}`))}</select></label>`).join('');
-  return aimPanel(settingsGroup('Model tiers', 'Logical tiers workers can point at. Change the model behind a tier and every worker on it follows (after Apply).', `<div class="mon-table-wrap"><table class="mon-table"><thead><tr><th>Tier</th><th>Model</th><th></th></tr></thead><tbody>${tierRows}</tbody></table></div><div class="row gap8 mt14"><label class="field" for="aim-tier-new"><span>New tier</span>${inputF('aim-tier', 'new', '', 'placeholder="e.g. CHEAP_JSON" pattern="[A-Za-z][A-Za-z0-9_]+"')}</label>${btn('Add tier', 'aim-tier-add', {}, 'sm')}</div>`) +
-    settingsGroup('LiteLLM Auto Router', 'LiteLLM classifies each request and routes it to the model for its complexity tier.', `<div class="settings-grid"><label class="field" for="aim-route-classifier"><span>Auto Router</span><select class="select" id="aim-route-classifier" data-form="aim-route" data-field="classifier" data-live="1">${Object.entries(AIM_CLASSIFIERS).map(([k, t]) => aimOpt(k, t, classifier)).join('')}</select></label><label class="field" for="aim-route-auto_router_model_name"><span>Router model name</span>${inputF('aim-route', 'auto_router_model_name', r.auto_router_model_name || '', 'placeholder="jobhunt-auto"')}</label></div>
-      ${classifier === 'DISABLED' ? '<p class="settings-help">Off: Auto Router workers use their tier.</p>' : `<div class="settings-checks">${checkF('aim-route', 'manage_auto_router', rv('manage_auto_router'), 'Job Hunt OS deploys this router into LiteLLM (otherwise it must already exist there)')}${checkF('aim-route', 'send_metadata', rv('send_metadata'), 'Send Job Hunt OS request metadata (worker, workflow, retry, confidence)')}</div><div class="settings-grid">${tierSelects}<label class="field" for="aim-route-default_model"><span>Default model</span><select class="select" id="aim-route-default_model" data-form="aim-route" data-field="default_model">${aimModelOptions(rv('default_model'))}</select></label>${classifier === 'LLM' ? `<label class="field" for="aim-route-classifier_model"><span>Classifier model</span><select class="select" id="aim-route-classifier_model" data-form="aim-route" data-field="classifier_model">${aimModelOptions(rv('classifier_model'))}</select></label>` : ''}${classifier === 'CUSTOM' ? `<label class="field" for="aim-route-classifier_plugin"><span>Classifier plugin</span>${inputF('aim-route', 'classifier_plugin', r.classifier_plugin || '', 'placeholder="jobhunt_classifier.router"')}<span class="settings-help">A ClassifierPlugin importable by LiteLLM; see integrations/litellm/jobhunt_classifier.py.</span></label>` : ''}</div>`}
-      ${btn(isBusy('aim-route') ? 'Saving…' : 'Save routing to draft', 'aim-route-save', {}, 'primary sm', isBusy('aim-route'))}`));
+  const router = `<p class="settings-help">LiteLLM classifies each request and sends it to the model for its complexity. Workers set to “Auto router” use it.</p><div class="settings-grid"><label class="field" for="aim-route-classifier"><span>Auto router</span><select class="select" id="aim-route-classifier" data-form="aim-route" data-field="classifier" data-live="1">${Object.entries(AIM_CLASSIFIERS).map(([k, t]) => aimOpt(k, t, classifier)).join('')}</select></label><label class="field" for="aim-route-auto_router_model_name"><span>Router model name</span>${inputF('aim-route', 'auto_router_model_name', r.auto_router_model_name || '', 'placeholder="jobhunt-auto"')}</label></div>
+    ${classifier === 'DISABLED' ? '' : `<div class="settings-checks">${checkF('aim-route', 'manage_auto_router', rv('manage_auto_router'), 'Job Hunt OS deploys this router into LiteLLM (otherwise it must already exist there)')}${checkF('aim-route', 'send_metadata', rv('send_metadata'), 'Send Job Hunt OS request metadata (worker, workflow, retry, confidence)')}</div><div class="settings-grid">${tierSelects}<label class="field" for="aim-route-default_model"><span>Default model</span><select class="select" id="aim-route-default_model" data-form="aim-route" data-field="default_model">${aimModelOptions(rv('default_model'))}</select></label>${classifier === 'LLM' ? `<label class="field" for="aim-route-classifier_model"><span>Classifier model</span><select class="select" id="aim-route-classifier_model" data-form="aim-route" data-field="classifier_model">${aimModelOptions(rv('classifier_model'))}</select></label>` : ''}${classifier === 'CUSTOM' ? `<label class="field" for="aim-route-classifier_plugin"><span>Classifier plugin</span>${inputF('aim-route', 'classifier_plugin', r.classifier_plugin || '', 'placeholder="jobhunt_classifier.router"')}<span class="settings-help">A ClassifierPlugin importable by LiteLLM; see integrations/litellm/jobhunt_classifier.py.</span></label>` : ''}</div>`}
+    ${btn(isBusy('aim-route') ? 'Saving…' : 'Save auto router', 'aim-route-save', {}, 'primary sm', isBusy('aim-route'))}`;
+  return aimPanel(settingsGroup('Tiers', 'Named slots workers can point at. Change the model behind a tier and every worker on it follows.', `<div class="mon-table-wrap"><table class="mon-table"><thead><tr><th>Tier</th><th>Model</th><th></th></tr></thead><tbody>${tierRows}</tbody></table></div><div class="row gap8 mt14"><label class="field" for="aim-tier-new"><span>New tier</span>${inputF('aim-tier', 'new', '', 'placeholder="e.g. CHEAP_JSON" pattern="[A-Za-z][A-Za-z0-9_]+"')}</label>${btn('Add tier', 'aim-tier-add', {}, 'sm')}</div>
+    ${settingsDetails('aim-router', `Auto router · ${classifier === 'DISABLED' ? 'off' : esc(AIM_CLASSIFIERS[classifier] || classifier)}`, router)}`));
 }
 function aimRoutingPayload() {
   const r = aimData().routing || {}, form = S.forms['aim-route'] || {}, body = { revision: aimRev() };
@@ -241,21 +329,38 @@ function aimRoutingPayload() {
   return body;
 }
 
-/* ───────────── LiteLLM connection ───────────── */
-function aimLiteLLM() {
-  const c = aimData().connection || {}, [label, tone] = AIM_CONN[c.status] || AIM_CONN.UNKNOWN, t = AIM.tests.connection;
-  const modes = (c.sync_modes || ['disabled', 'admin_api']).map(m => aimOpt(m, { disabled: 'Disabled (read only)', admin_api: 'Admin API (STORE_MODEL_IN_DB=True)', config_file: 'Managed config file + restart' }[m] || m, fv('aim-conn', 'sync_mode', c.sync_mode))).join('');
-  return aimPanel(settingsGroup('Connection', `${pill(label, tone)} ${c.litellm_version ? `LiteLLM ${esc(c.litellm_version)}` : ''}${c.last_successful_sync_at ? ` · last successful sync ${esc(fmtDateTime(c.last_successful_sync_at))}` : ''}`, `${c.secret_storage === false ? '<div class="settings-notice">Key storage is unavailable until the server has a SECRET_KEY.</div>' : ''}<div class="settings-grid"><label class="field" for="aim-conn-base_url"><span>LiteLLM base URL</span>${inputF('aim-conn', 'base_url', c.base_url_saved || '', `type="url" placeholder="${attr(c.base_url_env || 'http://localhost:4000')}"`)}<span class="settings-help">${c.base_url_env && !c.base_url_saved ? `Using the server default ${esc(c.base_url_env)}.` : ''}</span></label><label class="field" for="aim-conn-api_key"><span>LiteLLM API key</span>${inputF('aim-conn', 'api_key', '', `type="password" autocomplete="off" spellcheck="false" placeholder="${attr(c.api_key_configured ? `Saved ${c.api_key_hint || ''}` : 'sk-…')}"`)}<span class="settings-help">Encrypted; never shown again. Leave blank to keep the saved key.</span></label><label class="field" for="aim-conn-sync_mode"><span>Configuration sync</span><select class="select" id="aim-conn-sync_mode" data-form="aim-conn" data-field="sync_mode">${modes}</select><span class="settings-help">Only managed models and the auto router live in LiteLLM; worker settings travel with each request and never need a sync.</span></label></div><div class="row gap8">${btn(isBusy('aim-conn') ? 'Saving…' : 'Save', 'aim-conn-save', {}, 'primary sm', isBusy('aim-conn'))}${btn(isBusy('aim-conn-test') ? 'Testing…' : 'Test Connection', 'aim-conn-test', {}, 'sm', isBusy('aim-conn-test'))}${c.api_key_configured ? btn('Remove saved key', 'aim-conn-key-remove', {}, 'sm') : ''}</div>${t ? `<ul class="aim-checks" role="status"><li>${t.reachable ? '✓' : '✗'} LiteLLM reachable</li><li>${t.authenticated ? '✓' : '✗'} Authentication</li><li>${t.discovery ? '✓' : '✗'} Model discovery (${t.models} models)</li><li>Latency ${t.latency_ms != null ? `${t.latency_ms} ms` : 'unknown'}</li>${t.error ? `<li class="settings-error">${esc(t.error)}</li>` : ''}</ul>` : ''}${c.last_error && !t ? `<p class="settings-error">${esc(c.last_error)}</p>` : ''}`) +
-    settingsGroup('Synchronization', `${pill((AIM_SYNC[c.sync_status] || AIM_SYNC.SYNCED)[0], (AIM_SYNC[c.sync_status] || AIM_SYNC.SYNCED)[1])} ${c.last_sync_at ? `last applied ${esc(fmtDateTime(c.last_sync_at))}` : ''}`, `${c.last_sync_error ? `<p class="settings-error">${esc(c.last_sync_error)}</p>` : ''}${c.managed_config_path ? `<p class="settings-help">Managed file: <span class="mono">${esc(c.managed_config_path)}</span>${c.restart_command_configured ? ' · restarted automatically' : ' · restart LiteLLM after applying'}</p>` : ''}${btn(isBusy('aim-verify') ? 'Verifying…' : 'Verify against LiteLLM', 'aim-verify', {}, 'sm', isBusy('aim-verify'))}${AIM.tests.verify ? `<p class="settings-help" role="status">${esc(AIM.tests.verify.status)}${(AIM.tests.verify.differences || []).length ? ` — ${esc(AIM.tests.verify.differences.join('; '))}` : ''}${(AIM.tests.verify.missing_models || []).length ? ` — not served: ${esc(AIM.tests.verify.missing_models.join(', '))}` : ''}</p>` : ''}`));
+/* ───────────── reliability ───────────── */
+function aimReliability() {
+  return aimPanel(typeof foPanel === 'function' ? foPanel() : settingsGroup('Automatic failover', '', '<p class="settings-help">Unavailable.</p>'));
 }
 
-/* ───────────── advanced: direct providers, history, audit ───────────── */
-function aimAdvanced() {
+/* ───────────── settings: route, connection, history ───────────── */
+function aimSettings() {
+  const d = aimData(), label = d.gateway?.direct_label || 'the direct provider';
+  const route = d.gateway ? settingsGroup('Route', esc(gatewayNow(d.gateway)), gatewaySegment(d.gateway)) : '';
+  const direct = D.settings?.ai ? `<form id="settings-editor" data-form="ai" class="aim-direct-form" novalidate><fieldset ${isBusy('settings-ai') ? 'disabled' : ''}><div id="settings-error" class="settings-error" role="alert" ${SETTING_ERRORS.ai ? '' : 'hidden'}>${esc(SETTING_ERRORS.ai || '')}</div>${renderAISettings()}</fieldset></form>` : '';
+  const directGroup = direct ? (d.gateway_enabled ? settingsDetails('aim-direct', `Direct provider · ${esc(label)} (used when the route is direct)`, direct) : settingsGroup(`Direct provider · ${esc(label)}`, 'Workers call this provider directly with these models.', direct)) : '';
+  const litellm = aimConnection();
+  return aimPanel(route + (d.gateway_enabled ? litellm + directGroup : `<div class="aim-direct-models" data-route="direct">${directGroup}</div>` + settingsDetails('aim-litellm', 'LiteLLM connection (for when you switch the route)', litellm))) + aimPanel(aimHistoryGroup());
+}
+function aimConnection() {
+  const c = aimData().connection || {}, [label, tone] = AIM_CONN[c.status] || AIM_CONN.UNKNOWN, t = AIM.tests.connection, v = AIM.tests.verify;
+  const modes = (c.sync_modes || ['disabled', 'admin_api']).map(m => aimOpt(m, { disabled: 'Disabled (read only)', admin_api: 'Admin API (STORE_MODEL_IN_DB=True)', config_file: 'Managed config file + restart' }[m] || m, fv('aim-conn', 'sync_mode', c.sync_mode))).join('');
+  const [syncLabel, syncTone] = AIM_SYNC[c.sync_status] || AIM_SYNC.SYNCED;
+  const sync = `${c.last_sync_error ? `<p class="settings-error">${esc(c.last_sync_error)}</p>` : ''}${c.managed_config_path ? `<p class="settings-help">Managed file: <span class="mono">${esc(c.managed_config_path)}</span>${c.restart_command_configured ? ' · restarted automatically' : ' · restart LiteLLM after saving'}</p>` : ''}<div class="row gap8">${btn(isBusy('aim-verify') ? 'Verifying…' : 'Verify against LiteLLM', 'aim-verify', {}, 'sm', isBusy('aim-verify'))}${btn(isBusy('aim-runtime') ? 'Checking…' : 'Check what workers run', 'aim-runtime', {}, 'sm', isBusy('aim-runtime'))}</div>${v ? `<p class="settings-help" role="status">${esc(v.status)}${(v.differences || []).length ? ` — ${esc(v.differences.join('; '))}` : ''}${(v.missing_models || []).length ? ` — not served: ${esc(v.missing_models.join(', '))}` : ''}</p>` : ''}${AIM.runtime ? aimRuntimeTable() : ''}`;
+  return settingsGroup('LiteLLM', `${pill(label, tone)} ${c.litellm_version ? `LiteLLM ${esc(c.litellm_version)}` : ''} ${pill(syncLabel, syncTone)}${c.last_sync_at ? ` last applied ${esc(fmtDateTime(c.last_sync_at))}` : ''}`, `${c.secret_storage === false ? '<div class="settings-notice">Key storage is unavailable until the server has a SECRET_KEY.</div>' : ''}<div class="settings-grid"><label class="field" for="aim-conn-base_url"><span>LiteLLM base URL</span>${inputF('aim-conn', 'base_url', c.base_url_saved || '', `type="url" placeholder="${attr(c.base_url_env || 'http://localhost:4000')}"`)}<span class="settings-help">${c.base_url_env && !c.base_url_saved ? `Using the server default ${esc(c.base_url_env)}.` : ''}</span></label><label class="field" for="aim-conn-api_key"><span>LiteLLM API key</span>${inputF('aim-conn', 'api_key', '', `type="password" autocomplete="off" spellcheck="false" placeholder="${attr(c.api_key_configured ? `Saved ${c.api_key_hint || ''}` : 'sk-…')}"`)}<span class="settings-help">Encrypted; never shown again. Leave blank to keep the saved key.</span></label><label class="field" for="aim-conn-sync_mode"><span>Configuration sync</span><select class="select" id="aim-conn-sync_mode" data-form="aim-conn" data-field="sync_mode">${modes}</select><span class="settings-help">Only managed models and the auto router live in LiteLLM; worker settings travel with each request.</span></label></div><div class="row gap8">${btn(isBusy('aim-conn') ? 'Saving…' : 'Save', 'aim-conn-save', {}, 'primary sm', isBusy('aim-conn'))}${btn(isBusy('aim-conn-test') ? 'Testing…' : 'Test Connection', 'aim-conn-test', {}, 'sm', isBusy('aim-conn-test'))}${c.api_key_configured ? btn('Remove saved key', 'aim-conn-key-remove', {}, 'sm') : ''}</div>${t ? `<ul class="aim-checks" role="status"><li>${t.reachable ? '✓' : '✗'} LiteLLM reachable</li><li>${t.authenticated ? '✓' : '✗'} Authentication</li><li>${t.discovery ? '✓' : '✗'} Model discovery (${t.models} models)</li><li>Latency ${t.latency_ms != null ? `${t.latency_ms} ms` : 'unknown'}</li>${t.error ? `<li class="settings-error">${esc(t.error)}</li>` : ''}</ul>` : ''}${c.last_error && !t ? `<p class="settings-error">${esc(c.last_error)}</p>` : ''}
+    ${settingsDetails('aim-sync-details', 'Synchronization', sync)}`);
+}
+function aimRuntimeTable() {
+  const r = AIM.runtime;
+  return `<p class="settings-help">${r.live_error ? `LiteLLM could not be read: ${esc(r.live_error)}` : 'LiteLLM was read just now.'}</p><div class="mon-table-wrap"><table class="mon-table"><thead><tr><th>Worker</th><th>Desired</th><th>Active</th><th>Status</th></tr></thead><tbody>${(r.workers || []).map(w => { const [text, tone] = AIM_SYNC[w.state] || AIM_SYNC.SYNCED; return `<tr><td>${esc(w.label)}</td><td class="mono">${esc(w.desired || '—')}</td><td class="mono">${esc(w.active || '—')}</td><td>${pill(w.state === 'SYNCED' ? 'Synced ✓' : text, tone)}</td></tr>`; }).join('')}</tbody></table></div>`;
+}
+function aimHistoryGroup() {
   if (AIM.versions === null && !isBusy('aim-history')) aimHistory();
   const versions = (AIM.versions || []).map((v, i) => `<tr><td class="mono">v${v.version}${i === 0 ? ' ' + pill('Active', 'good') : ''}</td><td>${esc(fmtDateTime(v.created_at))}</td><td>${esc(v.changed_by)} <span class="settings-help">${esc(v.source)}</span></td><td>${esc(v.summary)}${v.restored_from_version ? ` <span class="settings-help">(from v${v.restored_from_version})</span>` : ''}</td><td>${i === 0 ? '' : btn('Roll back', 'aim-restore', { id: v.id, version: v.version }, 'sm', isBusy('aim-restore'))}</td></tr>`).join('');
   const audit = (AIM.audit || []).slice(0, 30).map(a => `<tr><td>${esc(fmtDateTime(a.created_at))}</td><td>${esc(a.action)}</td><td>${pill(a.result, a.result === 'SUCCEEDED' ? 'good' : a.result === 'REJECTED' ? 'warn' : 'bad')}</td><td>${esc(a.actor)} <span class="settings-help">${esc(a.source)}</span></td><td class="settings-help">${esc(a.error || (a.version ? `v${a.version}` : ''))}</td></tr>`).join('');
-  return aimPanel(settingsGroup('Version history', 'Every applied configuration is kept. Rolling back applies an old version as a new one; history never changes.', versions ? `<div class="mon-table-wrap aim-wide"><table class="mon-table"><thead><tr><th>Version</th><th>When</th><th>By</th><th>Change</th><th></th></tr></thead><tbody>${versions}</tbody></table></div>` : loading()) +
-    settingsGroup('Audit trail', 'Every attempt to change the configuration, including rejected and failed ones.', audit ? `<div class="mon-table-wrap aim-wide"><table class="mon-table"><thead><tr><th>When</th><th>Action</th><th>Result</th><th>By</th><th>Detail</th></tr></thead><tbody>${audit}</tbody></table></div>` : '<p class="settings-help">Nothing recorded yet.</p>'));  // direct provider settings live on the Overview tab, beside the route
+  return settingsGroup('History', 'Every save is kept as a version. Rolling back applies an old version as a new one.', `${versions ? `<div class="mon-table-wrap aim-wide"><table class="mon-table"><thead><tr><th>Version</th><th>When</th><th>By</th><th>Change</th><th></th></tr></thead><tbody>${versions}</tbody></table></div>` : AIM.versions ? '<p class="settings-help">No versions yet.</p>' : loading()}
+    ${settingsDetails('aim-audit', 'Audit trail', audit ? `<div class="mon-table-wrap aim-wide"><table class="mon-table"><thead><tr><th>When</th><th>Action</th><th>Result</th><th>By</th><th>Detail</th></tr></thead><tbody>${audit}</tbody></table></div>` : '<p class="settings-help">Nothing recorded yet.</p>')}`);
 }
 async function aimHistory() {
   S.busy['aim-history'] = true;
@@ -264,51 +369,61 @@ async function aimHistory() {
   finally { delete S.busy['aim-history']; render(); }
 }
 
-/* ───────────── preview and apply ───────────── */
-function aimValue(v, path = '') {
-  if (v == null || v === '') return '—';
-  if (typeof v === 'number' && /context_window|max_output_tokens|num_ctx/.test(path)) return aimTokens(v);
-  return typeof v === 'object' ? JSON.stringify(v) : String(v);
-}
-function aimPreviewPanel() {
-  const p = AIM.preview, errs = p.validation?.errors || [], warns = p.validation?.warnings || [], plan = p.sync_plan || {};
-  const changes = p.changes || [], effective = changes.filter(c => c.kind === 'effective'), other = changes.filter(c => c.kind !== 'effective');
-  const line = c => `<li><strong>${esc(c.label)}</strong><div class="mono aim-diff">${esc(aimValue(c.before, c.path))} → ${esc(aimValue(c.after, c.path))}</div></li>`;
-  return `<section class="aim-preview" aria-labelledby="aim-preview-title"><header class="row between"><h3 id="aim-preview-title">Preview changes</h3>${btn('Close', 'aim-preview-close', {}, 'sm')}</header>
-    ${effective.length ? `<h4>Workers</h4><ul class="aim-changes">${effective.map(line).join('')}</ul>` : ''}${other.length ? `<details ${effective.length ? '' : 'open'}><summary>All ${other.length} setting change${other.length === 1 ? '' : 's'}</summary><ul class="aim-changes">${other.map(line).join('')}</ul></details>` : ''}
-    ${(plan.create || []).length || (plan.remove || []).length ? `<h4>LiteLLM</h4><p class="settings-help">${(plan.create || []).map(x => `create ${esc(x.model_name)}`).concat((plan.remove || []).map(x => `remove ${esc(x.model_name)}`)).join(' · ')} via ${esc(plan.mode)}${plan.restart_required ? ' · LiteLLM restart required' : ''}</p>` : '<p class="settings-help">Nothing changes inside LiteLLM: these settings travel with each request.</p>'}
-    ${errs.length ? `<div class="settings-error" role="alert"><strong>Fix before applying</strong>${errs.map(e => `<p>${esc(e.message)}</p>`).join('')}</div>` : ''}${warns.length ? `<div class="settings-notice">${warns.map(w => `<p>${esc(w.message)}</p>`).join('')}</div>` : ''}${p.validation?.live_checked === false ? `<p class="settings-help">LiteLLM could not be checked: ${esc(p.validation.live_error || 'unreachable')}</p>` : ''}
-    <footer class="row gap8">${btn(isBusy('aim-apply') ? 'Applying…' : 'Apply', 'aim-apply', {}, 'primary', !p.can_apply || isBusy('aim-apply'))}<span class="settings-help">Applies v${(p.base_version ?? 0) + 1} as one change; if LiteLLM rejects it, v${p.base_version ?? 0} stays active.</span></footer></section>`;
-}
-
+const aimWorkerByType = type => (aimData().workers || []).find(x => x.worker_type === type);
 const AI_MODELS_ACTIONS = {
   'aim-reload': () => { AIM.error = ''; AIM.data = undefined; render(); },
   'aim-tab': el => { AIM.tab = el.dataset.tab; AIM.drawer = null; render(); },
-  'aim-worker': el => { AIM.drawer = el.dataset.worker; delete S.forms.aiw; AIM.tab = AIM.tab === 'overview' ? 'workers' : AIM.tab; render(); document.getElementById('aiw-model_mode')?.focus(); },
+  'aim-worker': el => { AIM.drawer = el.dataset.worker; delete S.forms.aiw; AIM.tab = 'workers'; render(); document.getElementById('aiw-target')?.focus(); },
   'aim-drawer-close': () => { AIM.drawer = null; delete S.forms.aiw; render(); },
-  'aim-worker-save': el => {
-    const w = (aimData().workers || []).find(x => x.worker_type === el.dataset.worker);
-    return aimRun('aim-worker-save', async () => {
-      await api(`/api/settings/ai/workers/${encodeURIComponent(w.worker_type)}`, { method: 'PUT', body: aimWorkerPayload(w) });
-      delete S.forms.aiw; AIM.drawer = null;
-    }, `${w.label} saved to the draft — preview and apply to use it`);
+  'aim-worker-save': async el => {
+    const w = aimWorkerByType(el.dataset.worker);
+    // The drawer closes only once the change is applied; a refused save keeps what was typed.
+    const out = await aimSave('aim-worker-save', () => api(`/api/settings/ai/workers/${encodeURIComponent(w.worker_type)}`, { method: 'PUT', body: aimWorkerPayload(w) }), `${w.label} saved`);
+    if (out) { delete S.forms.aiw; AIM.drawer = null; render(); }
+    return out;
+  },
+  'aim-worker-target': el => {
+    const w = aimWorkerByType(el.dataset.worker);
+    return aimSave('aim-worker-target', () => api(`/api/settings/ai/workers/${encodeURIComponent(w.worker_type)}`, { method: 'PUT', body: { revision: aimRev(), ...aimTargetFields(el.value, w.config) } }), `${w.label} now uses ${el.value.replace(/^(model|tier):/, '') || 'its default'}`);
   },
   'aim-worker-test': el => { const w = el.dataset.worker; return busy(`aim-wtest-${w}`, async () => { AIM.tests[`worker:${w}`] = await api(`/api/settings/ai/workers/${encodeURIComponent(w)}/test`, { method: 'POST', body: { configuration: 'draft' } }); }); },
   'aim-model-test': el => { const n = el.dataset.name; return busy(`aim-mtest-${n}`, async () => { AIM.tests[`model:${n}`] = await api(`/api/settings/ai/models/${encodeURIComponent(n)}/test`, { method: 'POST' }); await aimLoad(); }); },
-  'aim-model-toggle': el => aimRun('aim-model', () => api(`/api/settings/ai/models/${encodeURIComponent(el.dataset.name)}`, { method: 'PUT', body: { revision: aimRev(), enabled: !!el.dataset.on } })),
-  'aim-model-type': el => aimRun('aim-model', () => api(`/api/settings/ai/models/${encodeURIComponent(el.dataset.name)}`, { method: 'PUT', body: { revision: aimRev(), model_type: el.value } })),
-  'aim-model-unmanage': el => { if (!confirm(`Stop managing ${el.dataset.name}? The next Apply removes its deployment from LiteLLM.`)) return; return aimRun('aim-model', () => api(`/api/settings/ai/models/${encodeURIComponent(el.dataset.name)}?revision=${aimRev()}`, { method: 'DELETE' })); },
-  'aim-sync': () => aimRun('aim-sync', () => api('/api/settings/ai/models/sync', { method: 'POST' }), out => `${out.models} models discovered${out.added?.length ? `, ${out.added.length} new` : ''}`),
+  'aim-model-toggle': el => aimSave('aim-model', () => api(`/api/settings/ai/models/${encodeURIComponent(el.dataset.name)}`, { method: 'PUT', body: { revision: aimRev(), enabled: !!el.dataset.on } }), `${el.dataset.name} ${el.dataset.on ? 'enabled' : 'disabled'}`),
+  'aim-model-type': el => aimSave('aim-model', () => api(`/api/settings/ai/models/${encodeURIComponent(el.dataset.name)}`, { method: 'PUT', body: { revision: aimRev(), model_type: el.value } }), 'Model type saved'),
+  'aim-model-unmanage': el => { if (!confirm(`Stop managing ${el.dataset.name}? Its deployment is removed from LiteLLM.`)) return; return aimSave('aim-model', () => api(`/api/settings/ai/models/${encodeURIComponent(el.dataset.name)}?revision=${aimRev()}`, { method: 'DELETE' }), `${el.dataset.name} no longer managed`); },
+  'aim-sync': () => aimSave('aim-sync', async () => { AIM.tests.sync = await api('/api/settings/ai/models/sync', { method: 'POST' }); }, () => { const s = AIM.tests.sync || {}; return `${s.models ?? 0} models discovered${s.added?.length ? `, ${s.added.length} new` : ''}`; }),
+  'aim-fb-edit': el => { const n = el.dataset.name; delete S.forms[`fb-${n}`]; AIM.fbEdit = AIM.fbEdit === n ? null : n; render(); },
+  'aim-fb-save': async el => {
+    const n = el.dataset.name, f = S.forms[`fb-${n}`] || {}, m = aimModel(n) || {};
+    const list = Array.from({ length: 4 }, (_, i) => (`m${i}` in f ? f[`m${i}`] : (m.fallback_models || [])[i]) || '').filter(Boolean);
+    const rest = 'rest' in f ? f.rest : m.rest_seconds ?? '';
+    const out = await aimSave('aim-fb', () => api(`/api/settings/ai/models/${encodeURIComponent(n)}`, { method: 'PUT', body: { revision: aimRev(), fallback_models: [...new Set(list)], rest_seconds: rest === '' || rest == null ? null : Number(rest) } }), `Fallbacks for ${n} saved`);
+    if (out) { AIM.fbEdit = null; delete S.forms[`fb-${n}`]; render(); }
+    return out;
+  },
+  'aim-model-remove': el => {
+    const n = el.dataset.name;
+    const what = el.dataset.managed ? `Its deployment is also removed from LiteLLM.` : `It stays in LiteLLM; Job Hunt OS stops using it.`;
+    if (!confirm(`Delete ${n} from Job Hunt OS? ${what} A sync won't bring it back; you can restore it from Removed models.`)) return;
+    AIM.refs = { ...(AIM.refs || {}) }; delete AIM.refs[n];
+    return aimSave('aim-model-remove', async () => {
+      try { await api(`/api/settings/ai/models/${encodeURIComponent(n)}/remove`, { method: 'POST', body: { revision: aimRev() } }); }
+      catch (err) { if (err.status === 409 && err.detail?.references) { AIM.refs[n] = err.detail.references; render(); } throw err; }
+      AIM.more = { ...(AIM.more || {}), [n]: false };
+    }, `${n} deleted`);
+  },
+  'aim-model-restore': el => aimSave('aim-model-restore', () => api(`/api/settings/ai/models/${encodeURIComponent(el.dataset.name)}/restore`, { method: 'POST', body: { revision: aimRev() } }), `${el.dataset.name} restored`),
+  'aim-model-more': el => { AIM.more = { ...(AIM.more || {}), [el.dataset.name]: !AIM.more?.[el.dataset.name] }; render(); },
   'aim-add-toggle': async () => { AIM.adding = !AIM.adding; render(); if (AIM.adding && !AIM.ollama) { AIM.ollama = await api('/api/settings/ai/ollama').catch(() => ({ reachable: false, models: [] })); render(); } },
   'aim-add': () => {
     const f = S.forms['aim-add'] || {};
     if (!String(f.litellm_model_name || '').trim()) { toast('Give the model a LiteLLM model name', true); return; }
-    return aimRun('aim-add', async () => { await api('/api/settings/ai/models', { method: 'POST', body: { revision: aimRev(), litellm_model_name: f.litellm_model_name.trim(), ollama_model: f.ollama_model || '', num_ctx: f.num_ctx ? Number(f.num_ctx) : null, keep_alive: f.keep_alive || null, model_type: f.model_type || 'CUSTOM' } }); delete S.forms['aim-add']; AIM.adding = false; }, 'Model added to the draft');
+    return aimSave('aim-add', async () => { await api('/api/settings/ai/models', { method: 'POST', body: { revision: aimRev(), litellm_model_name: f.litellm_model_name.trim(), ollama_model: f.ollama_model || '', num_ctx: f.num_ctx ? Number(f.num_ctx) : null, keep_alive: f.keep_alive || null, model_type: f.model_type || 'CUSTOM' } }); delete S.forms['aim-add']; AIM.adding = false; }, 'Model added');
   },
-  'aim-tier-model': el => aimRun('aim-tier', () => api(`/api/settings/ai/tiers/${encodeURIComponent(el.dataset.tier)}`, { method: 'PUT', body: { revision: aimRev(), litellm_model_name: el.value || null } })),
-  'aim-tier-toggle': el => aimRun('aim-tier', () => api(`/api/settings/ai/tiers/${encodeURIComponent(el.dataset.tier)}`, { method: 'PUT', body: { revision: aimRev(), enabled: !!el.dataset.on } })),
-  'aim-tier-add': () => { const name = String(fv('aim-tier', 'new', '')).trim().toUpperCase(); if (!name) return; return aimRun('aim-tier', async () => { await api(`/api/settings/ai/tiers/${encodeURIComponent(name)}`, { method: 'PUT', body: { revision: aimRev(), enabled: true } }); delete S.forms['aim-tier']; }, `Tier ${name} added`); },
-  'aim-route-save': () => aimRun('aim-route', async () => { await api('/api/settings/ai/routing', { method: 'PUT', body: aimRoutingPayload() }); delete S.forms['aim-route']; }, 'Routing saved to the draft'),
+  'aim-tier-model': el => aimSave('aim-tier', () => api(`/api/settings/ai/tiers/${encodeURIComponent(el.dataset.tier)}`, { method: 'PUT', body: { revision: aimRev(), litellm_model_name: el.value || null } }), `Tier ${el.dataset.tier} saved`),
+  'aim-tier-toggle': el => aimSave('aim-tier', () => api(`/api/settings/ai/tiers/${encodeURIComponent(el.dataset.tier)}`, { method: 'PUT', body: { revision: aimRev(), enabled: !!el.dataset.on } }), `Tier ${el.dataset.tier} ${el.dataset.on ? 'enabled' : 'disabled'}`),
+  'aim-tier-add': () => { const name = String(fv('aim-tier', 'new', '')).trim().toUpperCase(); if (!name) return; return aimSave('aim-tier', async () => { await api(`/api/settings/ai/tiers/${encodeURIComponent(name)}`, { method: 'PUT', body: { revision: aimRev(), enabled: true } }); delete S.forms['aim-tier']; }, `Tier ${name} added`); },
+  'aim-route-save': () => aimSave('aim-route', async () => { await api('/api/settings/ai/routing', { method: 'PUT', body: aimRoutingPayload() }); delete S.forms['aim-route']; }, 'Auto router saved'),
   'aim-conn-save': () => {
     const f = S.forms['aim-conn'] || {}, body = {};
     if ('base_url' in f) body.base_url = f.base_url; if (f.api_key) body.api_key = f.api_key; if ('sync_mode' in f) body.sync_mode = f.sync_mode;
@@ -316,24 +431,10 @@ const AI_MODELS_ACTIONS = {
   },
   'aim-conn-key-remove': () => { if (!confirm('Remove the saved LiteLLM key?')) return; return aimRun('aim-conn', () => api('/api/settings/ai/connection', { method: 'PUT', body: { api_key: '' } }), 'Key removed'); },
   'aim-conn-test': () => busy('aim-conn-test', async () => { AIM.tests.connection = await api('/api/settings/ai/test-connection', { method: 'POST' }); await aimLoad(); }, () => AIM.tests.connection?.label),
-  'aim-gateway': el => aimRun('aim-gateway', () => api('/api/settings/ai/gateway', { method: 'PUT', body: { enabled: !!el.dataset.on } }), el.dataset.on ? 'Workers now use the LiteLLM gateway' : 'Gateway off: workers use the direct provider'),
   'aim-runtime': () => busy('aim-runtime', async () => { AIM.runtime = await api('/api/settings/ai/runtime'); }),
   'aim-verify': () => busy('aim-verify', async () => { AIM.tests.verify = await api('/api/settings/ai/verify', { method: 'POST' }); await aimLoad(); }),
-  'aim-preview': () => busy('aim-preview', async () => { AIM.preview = await api('/api/settings/ai/preview', { method: 'POST' }); }),
-  'aim-preview-close': () => { AIM.preview = null; render(); },
-  'aim-apply': () => {
-    const p = AIM.preview;
-    return busy('aim-apply', async () => {
-      try {
-        const out = await api('/api/settings/ai/apply', { method: 'POST', body: { revision: p.draft_revision, base_version: p.base_version } });
-        AIM.preview = null; AIM.versions = null; await aimLoad();
-        toast(out.status === 'PENDING' ? `v${out.version} applied — restart LiteLLM to load it` : out.status === 'UNCHANGED' ? 'Nothing to apply' : `v${out.version} applied`);
-      } catch (err) {
-        if (err.detail?.validation) AIM.preview = { ...p, validation: err.detail.validation, can_apply: false };
-        else { if (err.status === 409) { AIM.preview = null; await aimLoad(); } toast(err.message, true); }
-      }
-    });
-  },
+  'aim-apply': () => busy('aim-apply', aimApplyNow, out => aimSaved('Applied', out)),
+  'aim-discard': () => busy('aim-discard', async () => { await api('/api/settings/ai/discard', { method: 'POST' }); AIM.failed = null; delete S.forms.aiw; await aimLoad(); }, 'Changes undone'),
   'aim-restore': el => {
     if (!confirm(`Roll back to v${el.dataset.version}? It is applied as a new version; history is kept.`)) return;
     return busy('aim-restore', async () => { const out = await api(`/api/settings/ai/versions/${el.dataset.id}/restore`, { method: 'POST', body: { base_version: aimData().active_version } }); AIM.versions = null; await aimLoad(); return out; }, out => `Restored as v${out.version}`);

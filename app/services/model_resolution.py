@@ -73,6 +73,18 @@ class ResolvedWorker:
     # Auto router tier → model, to read the tier LiteLLM chose from the model group that answered.
     router_tiers: dict[str, str] = field(default_factory=dict)
     router_model: str | None = None
+    # Models tried after `fallback_model`, in order, and the model failover moved this request away from (if any).
+    secondary_models: tuple[str, ...] = ()
+    failed_over_from: str | None = None
+    # The fallbacks configured on the model itself (AIModel.fallback_models), tried after the worker's own backups.
+    model_fallbacks: tuple[str, ...] = ()
+
+    def chain(self) -> list[str]:
+        """The models behind the primary, in the order they are tried (LiteLLM client-side fallbacks): the worker's
+        backups first, then the primary model's own fallbacks."""
+        seen = {self.model}
+        return [m for m in (self.fallback_model, *self.secondary_models, *self.model_fallbacks)
+                if m and not (m in seen or seen.add(m))]
 
     def caps(self, model: str | None) -> dict[str, Any]:
         return self.capabilities.get(model or "", {})
@@ -131,6 +143,19 @@ def resolve_model(snapshot: dict[str, Any], worker_type: str) -> tuple[str | Non
     return model, config.get("tier"), note
 
 
+def model_fallbacks_of(snapshot: dict[str, Any], model: str | None) -> tuple[str, ...]:
+    """A model's own fallbacks that are usable now (in the registry and enabled), in order."""
+    entry = (snapshot.get("models") or {}).get(model or "") or {}
+    return tuple(name for name in (entry.get("fallback_models") or [])
+                 if isinstance(name, str) and name and name != model and _enabled_model(snapshot, name)[0])
+
+
+def rest_seconds_of(snapshot: dict[str, Any], model: str | None) -> int | None:
+    """How long this model rests after a failure, when the model sets it; None follows the account's setting."""
+    value = ((snapshot.get("models") or {}).get(model or "") or {}).get("rest_seconds")
+    return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0 else None
+
+
 def escalation_model(snapshot: dict[str, Any], policy: dict[str, Any] | None) -> str | None:
     if not policy:
         return None
@@ -162,12 +187,15 @@ def resolve(snapshot: dict[str, Any], worker_type: str | None, version: int | No
                                 confidence_threshold=policy.get("confidence_threshold"),
                                 label=policy.get("model") or policy.get("tier") or "")
     fallback = config.get("fallback_model") or None
+    secondary = tuple(m for m in (config.get("secondary_models") or ()) if isinstance(m, str) and m)
+    model_fallbacks = model_fallbacks_of(snapshot, model)
     routing = snapshot.get("routing") or {}
-    names = {model, fallback, escalation.model if escalation else None} - {None}
+    names = {model, fallback, *secondary, *model_fallbacks, escalation.model if escalation else None} - {None}
     worker = WORKERS.get(worker_type)
     return ResolvedWorker(
         worker_type=worker_type, mode=config.get("mode"), configured=configured, model=model, note=note,
-        fallback_model=fallback if fallback != model else None,
+        fallback_model=fallback if fallback != model else None, secondary_models=secondary,
+        model_fallbacks=model_fallbacks,
         temperature=config.get("temperature"), max_output_tokens=config.get("max_output_tokens"),
         context_window=config.get("context_window"), reasoning_effort=config.get("reasoning_effort"),
         timeout_seconds=config.get("timeout_seconds"), retry_count=config.get("retry_count"),
