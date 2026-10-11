@@ -34,6 +34,7 @@ enforces), json_mode (JSON only, the contract checked here), prompt_only, or non
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from dataclasses import dataclass, replace
@@ -57,6 +58,9 @@ if TYPE_CHECKING:
 
 __all__ = ["LLMCall", "LLMClient", "LLMConfigError", "LLMContextOverflowError", "LLMError", "LLMRateLimitError",
            "LLMResponseError", "LLMResult", "LLMSchemaError", "LLMTimeoutError"]
+
+
+log = logging.getLogger("jobhunt.llm")
 
 
 class LLMError(RuntimeError):
@@ -236,7 +240,21 @@ def _dict_usage(usage: Any, reported_cost: float | None) -> Usage | None:
     prompt = _int(usage["prompt_tokens"])
     cached = _int((usage.get("prompt_tokens_details") or {}).get("cached_tokens"))
     return Usage(input_tokens=prompt, output_tokens=_int(usage.get("completion_tokens")), cache_read_tokens=cached,
-                 uncached_input_tokens=prompt - (cached or 0), reported_cost=reported_cost)
+                 uncached_input_tokens=prompt - (cached or 0), reported_cost=reported_cost,
+                 reasoning_tokens=_int((usage.get("completion_tokens_details") or {}).get("reasoning_tokens")))
+
+
+def _gateway_timings(attempt: Attempt, facts: dict[str, Any]) -> None:
+    """The model call's own duration is what LiteLLM spent on the request minus its overhead; both come from response
+    headers, so when either is absent the duration stays unknown (never inferred from our wall-clock latency)."""
+    try:
+        overhead, total = facts.get("overhead_duration_ms"), facts.get("response_duration_ms")
+        if overhead is not None and overhead >= 0:
+            attempt.gateway_overhead_ms = int(overhead)
+        if overhead is not None and total is not None and total >= overhead >= 0:
+            attempt.generation_ms = int(total - overhead)
+    except Exception:  # noqa: BLE001  timing facts are telemetry; they must never fail the request
+        log.warning("could not read gateway timings", exc_info=True)
 
 
 def _gateway_error(model: str, exc: Exception) -> LLMError:
@@ -565,7 +583,10 @@ class LLMClient:
                     "worker_type": resolved.worker_type, "prompt_name": attempt.prompt_name,
                     "prompt_version": attempt.prompt_version, "params_withheld": withheld or None,
                     "escalation": escalation}
+        waiting = time.monotonic()
         with model_resolution.concurrency_slot(resolved, self.user_id, timeout) as free:
+            if resolved.max_concurrency:  # without a limit there is no queue to measure
+                attempt.queue_wait_ms = int((time.monotonic() - waiting) * 1000)
             if not free:
                 raise LLMRateLimitError(f"{worker_label(resolved.worker_type)} already has {resolved.max_concurrency} "
                                         "requests in flight (max concurrency)")
@@ -585,6 +606,9 @@ class LLMClient:
         attempt.response_text = ((choice or {}).get("message") or {}).get("content") or "{}"
         attempt.model = facts.get("model_name") or _answered_model_name(chat.body) or model
         attempt.litellm_call_id = facts.get("call_id")
+        _gateway_timings(attempt, facts)
+        tier = chat.body.get("service_tier") if isinstance(chat.body, dict) else None
+        attempt.service_tier = tier if isinstance(tier, str) else None
         attempt.model_group = facts.get("model_group")
         if facts.get("attempted_fallbacks") is not None:
             attempt.fallback_used = facts["attempted_fallbacks"] > 0
@@ -612,7 +636,9 @@ class LLMClient:
         cost = getattr(usage, "cost", None) if getattr(usage, "cost", None) is not None else extra.get("cost")
         return Usage(input_tokens=prompt, output_tokens=completion, cache_read_tokens=cached,
                      uncached_input_tokens=prompt - (cached or 0),
-                     reported_cost=float(cost) if isinstance(cost, (int, float)) else None)
+                     reported_cost=float(cost) if isinstance(cost, (int, float)) else None,
+                     reasoning_tokens=_int(getattr(getattr(usage, "completion_tokens_details", None),
+                                                   "reasoning_tokens", None)))
 
     def _openai(self, system: str, user: str, model: str, attempt: Attempt) -> LLMResult:
         if not self.keys.get("openai"):
@@ -633,6 +659,8 @@ class LLMClient:
         except Exception as exc:
             raise _provider_error("OpenAI", model, exc) from exc
         attempt.model, attempt.usage = _answered_model(response, model), self._openai_usage(response)
+        tier = getattr(response, "service_tier", None)
+        attempt.service_tier = tier if isinstance(tier, str) else None
         if attempt.usage:
             attempt.usage.reported_cost = None  # OpenAI does not report cost; the catalog prices it
         attempt.response_text = response.choices[0].message.content or "{}"

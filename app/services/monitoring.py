@@ -62,12 +62,15 @@ class MonitoringFilter:
     workflow_type: str | None = None
     entity_id: int | None = None
     worker_type: str | None = None
+    config_version: int | None = None
+    routing_tier: str | None = None
 
     def public(self) -> dict[str, Any]:
         return {"start": self.start.isoformat(), "end": self.end.isoformat(), "all_accounts": self.user_id is None,
                 "provider": self.provider, "model": self.model, "stage": self.stage,
                 "prompt_version": self.prompt_version, "status": self.status, "workflow_type": self.workflow_type,
-                "entity_id": self.entity_id, "worker_type": self.worker_type}
+                "entity_id": self.entity_id, "worker_type": self.worker_type,
+                "config_version": self.config_version, "routing_tier": self.routing_tier}
 
 
 def time_range(name: str | None = None, start: datetime | None = None, end: datetime | None = None,
@@ -101,14 +104,15 @@ def _rate(part: int, whole: int) -> float | None:
     return round(part / whole, 4) if whole else None
 
 
-def rows(db: Session, f: MonitoringFilter) -> list[Any]:
-    query = select(*ROW_COLUMNS).where(LLMRequestLog.created_at >= f.start, LLMRequestLog.created_at <= f.end)
+def rows(db: Session, f: MonitoringFilter, columns: tuple = ROW_COLUMNS) -> list[Any]:
+    query = select(*columns).where(LLMRequestLog.created_at >= f.start, LLMRequestLog.created_at <= f.end)
     if f.user_id is not None:
         query = query.where(LLMRequestLog.user_id == f.user_id)
     for column, value in ((LLMRequestLog.provider, f.provider), (LLMRequestLog.model, f.model),
                           (LLMRequestLog.stage, f.stage), (LLMRequestLog.prompt_version, f.prompt_version),
                           (LLMRequestLog.status, f.status), (LLMRequestLog.workflow_type, f.workflow_type),
-                          (LLMRequestLog.workflow_entity_id, f.entity_id), (LLMRequestLog.worker_type, f.worker_type)):
+                          (LLMRequestLog.workflow_entity_id, f.entity_id), (LLMRequestLog.worker_type, f.worker_type),
+                          (LLMRequestLog.config_version, f.config_version), (LLMRequestLog.routing_tier, f.routing_tier)):
         if value not in (None, ""):
             query = query.where(column == value)
     return db.execute(query.order_by(LLMRequestLog.created_at.desc()).limit(MAX_ROWS)).all()
@@ -340,12 +344,15 @@ def routing(items: list[Any]) -> dict[str, Any]:
 def options(db: Session, f: MonitoringFilter) -> dict[str, list[str]]:
     """Values the filter selects can offer, from the whole range regardless of the other filters."""
     base = replace(f, provider=None, model=None, stage=None, prompt_version=None, status=None, workflow_type=None,
-                   entity_id=None, worker_type=None)
+                   entity_id=None, worker_type=None,
+                   config_version=None, routing_tier=None)
     items = rows(db, base)
     return {"providers": sorted({r.provider for r in items}), "models": sorted({r.model for r in items if r.model}),
             "stages": list(LLM_STAGES), "prompt_versions": sorted({r.prompt_version for r in items if r.prompt_version}),
             "statuses": ["SUCCEEDED", "FAILED"],
-            "worker_types": sorted({r.worker_type for r in items if r.worker_type})}
+            "worker_types": sorted({r.worker_type for r in items if r.worker_type}),
+            "config_versions": sorted({r.config_version for r in items if r.config_version is not None}, reverse=True),
+            "routing_tiers": sorted({r.routing_tier for r in items if r.routing_tier})}
 
 
 def dashboard(db: Session, f: MonitoringFilter) -> dict[str, Any]:

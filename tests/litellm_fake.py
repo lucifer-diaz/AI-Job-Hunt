@@ -158,12 +158,16 @@ class FakeLiteLLM:
         return self._json(200, {"id": "chatcmpl-1", "model": group, "object": "chat.completion",
                                 "choices": [{"index": 0, "finish_reason": "stop",
                                              "message": {"role": "assistant", "content": content}}],
-                                "usage": {"prompt_tokens": 40, "completion_tokens": 12, "total_tokens": 52}},
+                                "service_tier": "default",
+                                "usage": {"prompt_tokens": 40, "completion_tokens": 12, "total_tokens": 52,
+                                          "completion_tokens_details": {"reasoning_tokens": 5}}},
                           headers={"x-litellm-call-id": call_id, "x-litellm-model-group": group,
                                    "x-litellm-model-name": underlying, "x-litellm-model-id": "dep-" + group,
                                    "x-litellm-version": "1.102.1", "x-litellm-response-cost": "0.0",
                                    "x-litellm-attempted-fallbacks": str(attempted),
-                                   "x-litellm-attempted-retries": "0"})
+                                   "x-litellm-attempted-retries": "0",
+                                   "x-litellm-response-duration-ms": "900.5",
+                                   "x-litellm-overhead-duration-ms": "40.2"})
 
 
 # ───────────── fixtures (import them into a test module to use them) ─────────────

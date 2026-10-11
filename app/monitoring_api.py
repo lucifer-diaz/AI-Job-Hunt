@@ -25,7 +25,7 @@ from app.models import (
     AIOptimizationTask,
 )
 from app.scheduler_hooks import run_soon
-from app.services import ai_advisor, external_monitoring, monitoring
+from app.services import ai_advisor, external_monitoring, model_performance, monitoring
 from app.services.user_settings import lock_settings_row, settings_for
 
 router = APIRouter(prefix="/api/monitoring")
@@ -45,6 +45,8 @@ def monitoring_filter(
     job_id: int | None = None,
     entity_id: int | None = None,
     worker_type: str | None = Query(None, max_length=40),
+    config_version: int | None = Query(None, ge=0),
+    routing_tier: str | None = Query(None, max_length=30),
     all_accounts: bool = False,
 ) -> monitoring.MonitoringFilter:
     if all_accounts and not user.is_admin:
@@ -57,7 +59,8 @@ def monitoring_filter(
     return monitoring.MonitoringFilter(start=begin, end=finish, user_id=None if all_accounts else user.id,
                                        provider=provider, model=model, stage=stage, prompt_version=prompt_version,
                                        status=status, workflow_type=workflow_type, entity_id=entity_id,
-                                       worker_type=worker_type)
+                                       worker_type=worker_type, config_version=config_version,
+                                       routing_tier=routing_tier)
 
 
 Filter = Depends(monitoring_filter)
@@ -82,6 +85,23 @@ def stages(f: monitoring.MonitoringFilter = Filter, db: Session = Depends(get_us
 @router.get("/models")
 def models(f: monitoring.MonitoringFilter = Filter, db: Session = Depends(get_user_db)):
     return {"filter": f.public(), "models": monitoring.by_model(monitoring.rows(db, f))}
+
+
+@router.get("/performance")
+def performance(f: monitoring.MonitoringFilter = Filter,
+                group_by: str = Query("model", pattern="^(model|provider|worker|stage|prompt_version|config_version|"
+                                                       "routing_tier|service_tier|hour|day)$"),
+                db: Session = Depends(get_user_db)):
+    """Model comparison: reliability, latency, throughput, cost, quality and context for every value of `group_by`,
+    computed from the raw request rows. Outcome signals (reviewer, corrections) are the account's own."""
+    items = monitoring.rows(db, f, model_performance.COLUMNS)
+    out = model_performance.compare(items, group_by, f.start, f.end)
+    out["filter"] = f.public()
+    out["truncated"] = len(items) >= monitoring.MAX_ROWS
+    out["outcomes"] = (model_performance.quality_signals(db, f.user_id, f.start, f.end)
+                       if f.user_id is not None else None)  # per-account tables: not aggregated across accounts
+    out["options"] = monitoring.options(db, f)
+    return out
 
 
 @router.get("/costs")
