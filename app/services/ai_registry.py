@@ -137,6 +137,8 @@ def discover(db: Session, user_id: int) -> dict[str, Any]:
     for name in sorted(names):
         facts = describe(groups.get(name, []), ollama)
         row = rows.get(name)
+        if row is not None and row.removed_at is not None:
+            continue  # a person removed it from Job Hunt OS: a sync leaves it removed (Restore brings it back)
         if row is None:
             row = AIModel(user_id=user_id, litellm_model_name=name, display_name=name, source="DISCOVERED",
                           model_type=facts.get("model_type") or "CUSTOM", created_at=started)
@@ -159,7 +161,7 @@ def discover(db: Session, user_id: int) -> dict[str, Any]:
             row.health_checked_at = started
         row.updated_at = started
     for name, row in rows.items():
-        if name not in names and row.present_in_litellm:
+        if name not in names and row.present_in_litellm and row.removed_at is None:
             row.present_in_litellm = False
             missing.append(name)
     db.flush()
@@ -178,6 +180,9 @@ def discover(db: Session, user_id: int) -> dict[str, Any]:
             "ollama_enriched": sorted(base for base, tags in ollama.items() if tags)}
 
 
+TEST_MAX_TOKENS = 512
+
+
 def test_model(db: Session, user_id: int, name: str) -> dict[str, Any]:
     """A tiny, safe request straight to one model. Records the model's health; no account data is sent."""
     row = db.scalar(select(AIModel).where(AIModel.user_id == user_id, AIModel.litellm_model_name == name))
@@ -186,9 +191,13 @@ def test_model(db: Session, user_id: int, name: str) -> dict[str, Any]:
     # The same model timeout as real requests (LLM_REQUEST_TIMEOUT_SECONDS): a slow or cold-loading local model
     # should not fail its health test when it would answer a worker in time.
     timeout = int(get_settings().llm_request_timeout_seconds or 120)
-    body: dict[str, Any] = {"model": name, "messages": prompt.messages(), "max_tokens": 20, "temperature": 0,
-                            "drop_params": True, "timeout": timeout, "num_retries": 0,
+    # Room to answer: a reasoning model spends tokens thinking before it writes {"ok": true}, and with a tiny budget
+    # its answer comes back empty (Groq then rejects JSON mode: "json_validate_failed"). Still a tiny request.
+    body: dict[str, Any] = {"model": name, "messages": prompt.messages(), "max_tokens": TEST_MAX_TOKENS,
+                            "temperature": 0, "drop_params": True, "timeout": timeout, "num_retries": 0,
                             "metadata": {"jobhunt": True, "worker_type": "MODEL_TEST"}}
+    if row is not None and row.supports_reasoning is True:
+        body["reasoning_effort"] = "low"
     if structured:
         body["response_format"] = {"type": "json_object"}
     result: dict[str, Any] = {"model": name, "success": False, "latency_ms": None, "model_group": None,
@@ -198,6 +207,9 @@ def test_model(db: Session, user_id: int, name: str) -> dict[str, Any]:
         with config.api_for(db, user_id, service="model_test") as api:
             chat = api.chat(body, operation="model_test", metadata={"model": name}, timeout=timeout + 15)
         content = ((chat.body.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+        if not content.strip():
+            raise config.AIConfigError("The model returned no output. A reasoning model may need more tokens than the "
+                                       "test allows, or the model may not answer chat requests")
         result.update(success=True, latency_ms=chat.latency_ms, model_group=chat.litellm.get("model_group"),
                       underlying_model=chat.litellm.get("model_name") or chat.body.get("model"),
                       litellm_call_id=chat.litellm.get("call_id"))

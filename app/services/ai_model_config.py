@@ -65,15 +65,18 @@ TIER_NAME = re.compile(r"^[A-Z][A-Z0-9_]{1,59}$")
 MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+\-]{0,199}$")
 PLUGIN_PATH = re.compile(r"^[A-Za-z_]\w*(\.[A-Za-z_]\w*)+$")
 LIMITS = {"temperature": (0.0, 2.0), "max_output_tokens": (1, 200_000), "context_window": (512, 2_000_000),
-          "timeout_seconds": (1, 3600), "retry_count": (0, 10), "max_concurrency": (1, 100)}
-WORKER_FIELDS = ("model_mode", "primary_model", "tier_name", "fallback_model", "temperature", "max_output_tokens",
+          "timeout_seconds": (1, 3600), "retry_count": (0, 10), "max_concurrency": (1, 100),
+          "rest_seconds": (10, 604_800)}
+MAX_MODEL_FALLBACKS = 4
+WORKER_FIELDS = ("model_mode", "primary_model", "tier_name", "fallback_model", "secondary_models", "temperature", "max_output_tokens",
                  "context_window", "reasoning_effort", "timeout_seconds", "retry_count", "max_concurrency",
                  "use_structured_output", "enabled", "escalation")
 ROUTING_FIELDS = ("auto_router_enabled", "auto_router_model_name", "manage_auto_router", "classifier",
                   "classifier_model", "classifier_plugin", "tier_models", "default_model", "send_metadata")
 CAPABILITIES = ("supports_structured_output", "supports_tools", "supports_reasoning", "supports_vision")
 OVERRIDABLE = (*CAPABILITIES, "context_window", "max_output_tokens")
-FIELD_LABELS = {"mode": "mode", "primary_model": "model", "tier": "tier", "fallback_model": "fallback model",
+FIELD_LABELS = {"mode": "mode", "primary_model": "model", "tier": "tier", "fallback_model": "fallback model", "secondary_models": "secondary models",
+                "fallback_models": "model fallbacks", "rest_seconds": "rest time",
                 "temperature": "temperature", "max_output_tokens": "max output tokens",
                 "context_window": "context window", "reasoning_effort": "reasoning effort",
                 "timeout_seconds": "timeout", "retry_count": "retries", "max_concurrency": "max concurrency",
@@ -439,12 +442,14 @@ def model_snapshot(row: AIModel) -> dict[str, Any]:
             "max_context_window": row.max_context_window, "overrides": dict(row.overrides or {}),
             "managed": row.managed,
             "deployment_params": safe_params(row.deployment_params) if row.managed and row.deployment_params
-            else None}
+            else None,
+            "fallback_models": list(row.fallback_models or []), "rest_seconds": row.rest_seconds}
 
 
 def worker_snapshot(row: WorkerModelConfig) -> dict[str, Any]:
     return {"mode": row.model_mode, "primary_model": row.primary_model, "tier": row.tier_name,
-            "fallback_model": row.fallback_model, "temperature": row.temperature,
+            "fallback_model": row.fallback_model, "secondary_models": list(row.secondary_models or []),
+            "temperature": row.temperature,
             "max_output_tokens": row.max_output_tokens, "context_window": row.context_window,
             "reasoning_effort": row.reasoning_effort, "timeout_seconds": row.timeout_seconds,
             "retry_count": row.retry_count, "max_concurrency": row.max_concurrency,
@@ -466,7 +471,8 @@ def routing_snapshot(row: AIRoutingConfig | None) -> dict[str, Any]:
 
 def draft_snapshot(db: Session, user_id: int) -> dict[str, Any]:
     """The desired configuration, in the same shape a version stores."""
-    models = db.scalars(select(AIModel).where(AIModel.user_id == user_id).order_by(AIModel.litellm_model_name)).all()
+    models = db.scalars(select(AIModel).where(AIModel.user_id == user_id, AIModel.removed_at.is_(None))
+                        .order_by(AIModel.litellm_model_name)).all()
     tiers = db.scalars(select(ModelTier).where(ModelTier.user_id == user_id).order_by(ModelTier.name)).all()
     workers = db.scalars(select(WorkerModelConfig).where(WorkerModelConfig.user_id == user_id)
                          .order_by(WorkerModelConfig.worker_type)).all()
@@ -663,6 +669,20 @@ def validate(snapshot: dict[str, Any], *, live: LiveState | None = None, gateway
                                  f"LiteLLM has no model named {router_name}; turn on 'managed by Job Hunt OS' or "
                                  "define the router in LiteLLM"))
 
+    # A model's own fallbacks: usable models, never the model itself. Two models may name each other: a chain only
+    # ever takes the primary model's own fallbacks (never a fallback's fallbacks), so it cannot loop.
+    for name, entry in models.items():
+        for index, target in enumerate(entry.get("fallback_models") or []):
+            path = f"models.{name}.fallback_models.{index}"
+            if target == name:
+                errors.append(_issue(path, "A model cannot fall back to itself"))
+            else:
+                check_model(path, target, what="fallback model")
+        rest = entry.get("rest_seconds")
+        if rest is not None and not _in_range(rest, "rest_seconds"):
+            low, high = LIMITS["rest_seconds"]
+            errors.append(_issue(f"models.{name}.rest_seconds", f"Rest time must be between {low} and {high} seconds"))
+
     fallback_edges = _router_fallback_edges(live.router_settings)
     resolved: dict[str, str | None] = {}
     for worker_type, config in (snapshot.get("workers") or {}).items():
@@ -703,6 +723,14 @@ def validate(snapshot: dict[str, Any], *, live: LiveState | None = None, gateway
                 cycle = _fallback_cycle(model, {**fallback_edges, model: {*fallback_edges.get(model, set()), fallback}})
                 if cycle:
                     errors.append(_issue(f"{base}.fallback_model", "Circular fallback: " + " → ".join(cycle)))
+        seen = {model, fallback}
+        for index, extra in enumerate(config.get("secondary_models") or []):
+            path = f"{base}.secondary_models.{index}"
+            if extra in seen:
+                errors.append(_issue(path, "A model can appear only once in the primary, fallback and secondary models"))
+                continue
+            seen.add(extra)
+            check_model(path, extra, what="secondary model")
         for name in ("temperature", "max_output_tokens", "context_window", "timeout_seconds", "retry_count",
                      "max_concurrency"):
             value = config.get(name)
@@ -871,6 +899,13 @@ def update_worker(db: Session, user_id: int, worker_type: str, changes: dict[str
                 raise AIConfigError(f"Model mode is one of {', '.join(WORKER_MODEL_MODES)}")
         elif name in ("primary_model", "fallback_model"):
             value = _clean_model_name(value, FIELD_LABELS.get(name, name))
+        elif name == "secondary_models":
+            if value in (None, ""):
+                value = None
+            elif isinstance(value, (list, tuple)) and len(value) <= 8:
+                value = [m for m in (_clean_model_name(v, "Secondary model") for v in value) if m] or None
+            else:
+                raise AIConfigError("Secondary models: a list of up to 8 model names")
         elif name == "tier_name":
             value = (str(value).strip().upper() or None) if value not in (None, "") else None
         elif name == "temperature":
@@ -1011,6 +1046,7 @@ def add_managed_model(db: Session, user_id: int, payload: dict[str, Any],
         raise AIConfigError(f"{name} already exists in LiteLLM and is not managed by Job Hunt OS; choose another name")
     conn = _bump(db, user_id, expected_revision)
     row = existing or AIModel(user_id=user_id, litellm_model_name=name, source="USER", created_at=utcnow())
+    row.removed_at = None  # adding a removed model again brings it back
     row.display_name = str(payload.get("display_name") or name)[:200]
     row.managed, row.deployment_params, row.enabled = True, params, True
     row.model_type = payload.get("model_type") if payload.get("model_type") in AI_MODEL_TYPES else row.model_type or "CUSTOM"
@@ -1053,6 +1089,18 @@ def update_model(db: Session, user_id: int, name: str, changes: dict[str, Any],
                 clean[k] = bool(v) if k in CAPABILITIES else _number(v, "context_window" if k == "context_window"
                                                                         else "max_output_tokens", int)
             row.overrides = clean or None
+        elif key == "fallback_models":
+            if value in (None, ""):
+                row.fallback_models = None
+                continue
+            if not isinstance(value, (list, tuple)) or len(value) > MAX_MODEL_FALLBACKS:
+                raise AIConfigError(f"Fallback models: a list of up to {MAX_MODEL_FALLBACKS} model names")
+            names = [m for m in (_clean_model_name(v, "Fallback model") for v in value) if m]
+            if name in names:
+                raise AIConfigError("A model cannot fall back to itself")
+            row.fallback_models = list(dict.fromkeys(names)) or None
+        elif key == "rest_seconds":
+            row.rest_seconds = None if value in (None, "") else _number(value, "rest_seconds", int)
         elif key in ("deployment_params", "ollama_model", "num_ctx", "keep_alive", "api_base"):
             continue  # handled below
         else:
@@ -1079,6 +1127,69 @@ def update_model(db: Session, user_id: int, name: str, changes: dict[str, Any],
     return {"model": model_snapshot(row), "draft_revision": conn.draft_revision}
 
 
+def model_references(snapshot: dict[str, Any], name: str) -> list[str]:
+    """Every place a configuration still uses a model, in words a person can act on. Empty: nothing uses it."""
+    out: list[str] = []
+    for worker_type, config in sorted((snapshot.get("workers") or {}).items()):
+        who = label(worker_type)
+        if config.get("mode") == "FIXED" and config.get("primary_model") == name:
+            out.append(f"{who} (its model)")
+        backups = [config.get("fallback_model"), *(config.get("secondary_models") or [])]
+        out += [f"{who} (backup {i})" for i, b in enumerate(backups, 1) if b == name]
+        if (config.get("escalation") or {}).get("model") == name:
+            out.append(f"{who} (quality escalation)")
+    out += [f"tier {tier}" for tier, entry in sorted((snapshot.get("tiers") or {}).items()) if entry.get("model") == name]
+    out += [f"{other}'s fallbacks" for other, entry in sorted((snapshot.get("models") or {}).items())
+            if other != name and name in (entry.get("fallback_models") or [])]
+    routing = snapshot.get("routing") or {}
+    if routing.get("auto_router_enabled") and routing.get("auto_router_model_name") == name:
+        out.append("the auto router")
+    out += [f"auto router tier {tier}" for tier, model in sorted((routing.get("tier_models") or {}).items())
+            if model == name]
+    for key, what in (("default_model", "auto router default model"), ("classifier_model", "auto router classifier")):
+        if routing.get(key) == name:
+            out.append(what)
+    return out
+
+
+def remove_model(db: Session, user_id: int, name: str, expected_revision: int | None = None) -> dict[str, Any]:
+    """Remove a model from Job Hunt OS: it leaves the configuration and every picker, and a sync leaves it removed.
+    A model Job Hunt OS manages loses its LiteLLM deployment on the apply that follows; a discovered one stays in
+    LiteLLM (its configuration is not ours). Refused while anything still uses it. Commits."""
+    from app.models import ModelRouteState
+
+    ensure_seeded(db, user_id)
+    row = db.scalar(select(AIModel).where(AIModel.user_id == user_id, AIModel.litellm_model_name == name,
+                                          AIModel.removed_at.is_(None)))
+    if row is None:
+        raise NotFound(f"{name} is not in the model registry")
+    references = model_references(draft_snapshot(db, user_id), name)
+    if references:
+        raise ConfigConflict(f"{name} is still used by: {', '.join(references)}. Change those first.",
+                             references=references)
+    conn = _bump(db, user_id, expected_revision)
+    # `managed` is kept: the snapshot leaves the model out, so the apply deletes an owned deployment anyway, and a
+    # Restore redeploys it
+    row.removed_at, row.enabled, row.updated_at = utcnow(), False, utcnow()
+    db.execute(delete(ModelRouteState).where(ModelRouteState.user_id == user_id, ModelRouteState.model == name))
+    audit(db, user_id, "REMOVE", actor=_actor(db, user_id), changes=[{"model": name}])
+    db.commit()
+    return {"removed": name, "draft_revision": conn.draft_revision}
+
+
+def restore_model(db: Session, user_id: int, name: str, expected_revision: int | None = None) -> dict[str, Any]:
+    """Bring a removed model back, enabled; a model Job Hunt OS managed is redeployed by the apply that follows."""
+    row = db.scalar(select(AIModel).where(AIModel.user_id == user_id, AIModel.litellm_model_name == name,
+                                          AIModel.removed_at.is_not(None)))
+    if row is None:
+        raise NotFound(f"{name} is not a removed model")
+    conn = _bump(db, user_id, expected_revision)
+    row.removed_at, row.enabled, row.updated_at = None, True, utcnow()
+    audit(db, user_id, "RESTORE", actor=_actor(db, user_id), changes=[{"model": name}])
+    db.commit()
+    return {"restored": name, "draft_revision": conn.draft_revision}
+
+
 def remove_managed_model(db: Session, user_id: int, name: str, expected_revision: int | None = None) -> dict[str, Any]:
     """Stop managing a model: the next Apply removes its deployment from LiteLLM."""
     row = db.scalar(select(AIModel).where(AIModel.user_id == user_id, AIModel.litellm_model_name == name))
@@ -1101,7 +1212,7 @@ def write_snapshot_to_draft(db: Session, user_id: int, snapshot: dict[str, Any])
                                                             created_at=utcnow())
         row.model_mode, row.primary_model, row.tier_name = config.get("mode") or "TIER", config.get("primary_model"), \
             config.get("tier")
-        for name in ("fallback_model", "temperature", "max_output_tokens", "context_window", "reasoning_effort",
+        for name in ("fallback_model", "secondary_models", "temperature", "max_output_tokens", "context_window", "reasoning_effort",
                      "timeout_seconds", "retry_count", "max_concurrency", "escalation"):
             setattr(row, name, config.get(name))
         row.use_structured_output = config.get("use_structured_output", True)
@@ -1129,7 +1240,7 @@ def write_snapshot_to_draft(db: Session, user_id: int, snapshot: dict[str, Any])
     models = {m.litellm_model_name: m for m in db.scalars(select(AIModel).where(AIModel.user_id == user_id)).all()}
     wanted_models = snapshot.get("models") or {}
     for name, row in models.items():
-        if name not in wanted_models and row.managed:
+        if name not in wanted_models and row.managed and row.removed_at is None:
             row.managed = False  # added after that version: its deployment is removed again
     for name, entry in wanted_models.items():
         row = models.get(name) or AIModel(user_id=user_id, litellm_model_name=name, source="USER",
@@ -1138,6 +1249,9 @@ def write_snapshot_to_draft(db: Session, user_id: int, snapshot: dict[str, Any])
         row.enabled = entry.get("enabled", True)
         row.model_type = entry.get("model_type") or "CUSTOM"
         row.overrides = entry.get("overrides") or None
+        row.removed_at = None  # rolling back to a version that had it brings it back
+        row.fallback_models = list(entry.get("fallback_models") or []) or None
+        row.rest_seconds = entry.get("rest_seconds")
         row.managed = bool(entry.get("managed"))
         if entry.get("managed"):
             row.deployment_params = entry.get("deployment_params")
@@ -1317,6 +1431,34 @@ def restore(db: Session, user_id: int, version_id: int, *, actor: str | None = N
         raise
 
 
+def discard_draft(db: Session, user_id: int) -> dict[str, Any]:
+    """Throw away edits that were never applied: the draft becomes the active version again. Creates no version.
+
+    The settings screen saves by applying straight away; when that apply is refused (validation, LiteLLM), this puts
+    the draft back so a refused edit is never left waiting. Commits."""
+    ensure_seeded(db, user_id)
+    active = active_version(db, user_id)
+    if active is None:
+        raise NotFound("There is no applied configuration to go back to")
+    snapshot = active.configuration_snapshot or {}
+    write_snapshot_to_draft(db, user_id, snapshot)
+    _unrestore(db, user_id, snapshot, active.created_at)
+    db.commit()
+    return {"status": "DISCARDED", "active_version": active.version_number,
+            "draft_revision": connection_for(db, user_id).draft_revision}
+
+
+def _unrestore(db: Session, user_id: int, snapshot: dict[str, Any], since: datetime | None) -> None:
+    """A model restored after the active version and absent from it is removed again: Undo puts a refused Restore back."""
+    restored = {(c or {}).get("model") for r in db.scalars(select(AIConfigAuditEntry).where(
+        AIConfigAuditEntry.user_id == user_id, AIConfigAuditEntry.action == "RESTORE",
+        *([AIConfigAuditEntry.created_at >= since] if since else []))).all() for c in (r.changes or [])}
+    wanted = snapshot.get("models") or {}
+    for row in db.scalars(select(AIModel).where(AIModel.user_id == user_id, AIModel.removed_at.is_(None))).all():
+        if row.litellm_model_name in restored and row.litellm_model_name not in wanted:
+            row.removed_at, row.enabled, row.updated_at = utcnow(), False, utcnow()
+
+
 def verify(db: Session, user_id: int) -> dict[str, Any]:
     """Compare what LiteLLM runs with the active version, and record SYNCED / OUT_OF_SYNC."""
     ensure_seeded(db, user_id)
@@ -1353,6 +1495,10 @@ def _referenced(snapshot: dict[str, Any]) -> set[str]:
     names = {model_resolution.resolve_model(snapshot, w)[0] for w in (snapshot.get("workers") or {})}
     for config in (snapshot.get("workers") or {}).values():
         names.add(config.get("fallback_model"))
+        names.update(config.get("secondary_models") or ())
+    models = snapshot.get("models") or {}
+    for name in [n for n in names if n]:  # a primary's own fallbacks join its chain (ResolvedWorker.chain)
+        names.update((models.get(name) or {}).get("fallback_models") or ())
     return {n for n in names if n}
 
 
@@ -1418,6 +1564,7 @@ def usage_by_model(db: Session, user_id: int, snapshot: dict[str, Any]) -> dict[
     out: dict[str, list[str]] = {}
     for worker_type, config in (snapshot.get("workers") or {}).items():
         names = {model_resolution.resolve_model(snapshot, worker_type)[0], config.get("fallback_model"),
+                 *(config.get("secondary_models") or ()),
                  model_resolution.escalation_model(snapshot, config.get("escalation"))}
         for name in names - {None}:
             out.setdefault(name, []).append(worker_type)
@@ -1435,7 +1582,10 @@ def overview(db: Session, user_id: int) -> dict[str, Any]:
     conn = connection_for(db, user_id)
     active = active_version(db, user_id)
     draft = draft_snapshot(db, user_id)
-    models = db.scalars(select(AIModel).where(AIModel.user_id == user_id).order_by(AIModel.litellm_model_name)).all()
+    every = db.scalars(select(AIModel).where(AIModel.user_id == user_id).order_by(AIModel.litellm_model_name)).all()
+    models = [m for m in every if m.removed_at is None]
+    removed = [{"name": m.litellm_model_name, "removed_at": _iso(m.removed_at), "managed_before": m.source == "USER"}
+               for m in every if m.removed_at is not None]
     used = usage_by_model(db, user_id, draft)
     from app.services.ai_config import resolve as resolve_ai_config
     from app.services.user_settings import ai_overrides
@@ -1461,6 +1611,7 @@ def overview(db: Session, user_id: int) -> dict[str, Any]:
                     "health_error": m.health_error, "last_synced_at": _iso(m.last_synced_at),
                     "discovered": {name: getattr(m, name) for name in OVERRIDABLE},
                     "used_by": sorted(used.get(m.litellm_model_name, []))} for m in models],
+        "removed_models": removed,
         "tiers": draft["tiers"], "routing": draft["routing"],
         "options": {"model_modes": list(WORKER_MODEL_MODES), "reasoning_efforts": list(REASONING_EFFORTS),
                     "model_types": list(AI_MODEL_TYPES), "classifiers": list(AUTO_ROUTER_CLASSIFIERS),

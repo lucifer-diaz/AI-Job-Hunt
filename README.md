@@ -16,7 +16,7 @@ The dashboard is a single-page workspace served from `app/static/app.js`; every 
 | Today | "Do this next" (approve → tailor → follow up), follow-ups due, weekly pace; run-sheet variant | `GET /api/workspace/today` |
 | Discovery · triage | One job at a time with fit reasons; keys `S` shortlist, `M` maybe, `X` skip, `⏎` shortlist & tailor | `GET /api/jobs/search?queue=true`, `POST /api/jobs/{id}/triage` |
 | Discovery · table | Filter, sort, paginate and bulk-shortlist the whole pipeline. The stage filter includes "Unranked" (`stage=unranked`: jobs without a fit score) | `GET /api/jobs/search`, `POST /api/jobs/bulk-triage` |
-| Running workers | Every background queue of your account in one place, a tab each: JD parsing, JD recovery, Ranking (the ranking tracker that used to be in Discovery: filtering, queue position and ETA, retry waits, finished rankings, Queue unranked jobs, Remove) and Tailoring (the background task list that used to be on the Tailor screen), each with a 24-hour activity chart, plus a Settings tab for processing limits and rate-limit backoff. Kill stops a task and requeues it fresh; Run now puts one first in line past its retry wait, the ranking cadence and any rate-limit backoff; the rate-limit backoff can be reset | `GET /api/workers`, `GET /api/workers/{kind}`, `GET /api/workers/{kind}/activity`, `POST /api/workers/{kind}/tasks/{id}/kill`, `POST /api/workers/{kind}/tasks/{id}/run-now`, `POST /api/workers/{kind}/kill-all`, `POST /api/workers/kill-all`, `POST /api/workers/cooldowns/reset` |
+| Running workers | Every background queue of your account in one place, a tab each: JD parsing, JD recovery, Ranking (the ranking tracker that used to be in Discovery: filtering, queue position and ETA, retry waits, finished rankings, Queue unranked jobs, Remove) and Tailoring (the background task list that used to be on the Tailor screen), each with a 24-hour activity chart; every task shows its model and route (the model in use, the one its next request goes to, or for a finished task the one its last request used, or "No model call") and, beside it, what moved it off its model (failover, a backup while its model rests, LiteLLM fallback, quality escalation, or a model changed since its last request); plus a Settings tab for processing limits and rate-limit backoff. Kill stops a task and requeues it fresh; Run now puts one first in line past its retry wait, the ranking cadence and any rate-limit backoff; the rate-limit backoff can be reset | `GET /api/workers`, `GET /api/workers/{kind}`, `GET /api/workers/{kind}/activity`, `POST /api/workers/{kind}/tasks/{id}/kill`, `POST /api/workers/{kind}/tasks/{id}/run-now`, `POST /api/workers/{kind}/kill-all`, `POST /api/workers/kill-all`, `POST /api/workers/cooldowns/reset` |
 | Discovery · setup | Saved search setups (named roles × locations × boards, each with its own schedule), run history with what each run searched and pulled, add a job from a URL, an uploaded PDF/DOCX/TXT description or pasted text | `GET/POST /api/search/setups`, `PUT/DELETE /api/search/setups/{id}`, `POST /api/search/setups/{id}/run`, `POST /api/search/setups/{id}/duplicate`, `GET /api/search/apify/runs/{id}/detail`, `POST /api/jobs/from-url`, `POST /api/jobs/read-file`, `POST /api/jobs/from-text` |
 | Tailor | Before → after edits with the evidence each one cites; edit, accept or revert; cover letter; keyword coverage; PDF/DOCX/TXT exports. "Skip tailoring" sends the master resume unchanged (still reviewed) for postings that need no tailoring. The "Bulk tailor" view tailors or skips tailoring for many queued jobs one at a time, with progress and stop | `GET /api/tailor/{job_id}`, `PATCH /api/resumes/{id}/edits/{n}`, `POST /api/jobs/{id}/tailor`, `POST /api/jobs/{id}/skip-tailoring`, `POST /api/jobs/bulk-tailor` |
 | Approvals | Pre-submit checklist, resume preview, reusable answers, notes; approve opens the apply kit, send a packet back for another tailoring pass, or reject the job outright with an optional reason | `GET /api/approvals/{job_id}`, `POST /api/jobs/{id}/revision`, `POST /api/jobs/{id}/reject` |
@@ -59,7 +59,7 @@ Auto-submit is intentionally not offered: approved packets always become an appl
 - **Application Inbox Agent**: read-only Gmail checks for replies about the applications you submitted — targeted searches, confidence-scored matching, rule-then-model classification, a tracker timeline, safe stage updates and a daily digest — see [Application Inbox Agent](#application-inbox-agent)
 - **Job description recovery**: postings that arrive without a usable description are read from their URL in the background (HTTP, then headless Chromium, then AI-assisted block selection), validated and parsed — see [13. Job Description Recovery](#13-job-description-recovery)
 - **Job Insights**: every approved job gets source-backed research in the background — compensation (posting first, then recruiter, Glassdoor and PayScale through configurable Apify actors), official company values kept apart from employee-reported culture, reported vs generated interview questions, questions to ask, and stage-specific prep — see [14a. Job Insights](#14a-job-insights-company-compensation-and-interview-research)
-- **LiteLLM gateway**: per-worker model assignments, tiers, auto router, preview/apply, version history and rollback (AI Orchestration → Models)
+- **LiteLLM gateway**: per-worker model assignments, backups and failover, tiers, auto router, version history and rollback (AI Orchestration → Models & routing)
 - OpenAI, Anthropic, Gemini, **OpenRouter**, or no-cost mock provider
 - LLM monitoring (tokens, context size, latency, estimated cost, failures) and a recommend-only AI Optimization Advisor
 - Claude Desktop + MCP: bulk tailoring and review with your Claude subscription, validated by the backend
@@ -673,22 +673,35 @@ These are kept separate on purpose:
 Escalation policies are stored per worker with the rest of the configuration, and the decision is made in one place
 (`app/services/model_resolution.py`), not in individual workers.
 
-### Apply changes
+### The screen: Workers, Models, Reliability, Settings
 
-Edits change the *desired* configuration only. Nothing reaches a worker until it is applied:
+AI Orchestration → Models & routing has four tabs under a one-line status strip (route, LiteLLM connection, active
+version, models resting):
+
+| Tab | What you do there |
+|---|---|
+| Workers | Pick each worker's model from its row (a tier, a model, or the auto router). **Edit** opens the worker: model, backups (tried in order when the model is rate limited or failing) and on/off; generation settings and quality escalation are folded away. |
+| Models | The catalog from LiteLLM (sync, add a local Ollama model, test, enable), the tiers, and the auto router (folded away). |
+| Reliability | Automatic failover: on/off, routing algorithm, browser alerts, model health; thresholds folded away. |
+| Settings | The route (LiteLLM gateway or a direct provider), the LiteLLM connection and synchronization, the direct provider's models, version history with roll back, and the audit trail. |
+
+### Saving applies at once
+
+Every save is validated and applied straight away as a new version, so it reaches workers on their next request and
+can be rolled back from Settings → History:
 
 ```
-edit → Preview changes → validate → Apply → LiteLLM sync (only if needed) → verification
+save → validate → apply → LiteLLM sync (only if needed) → verification
 ```
 
-**Preview changes** lists every change, including each worker whose effective model changes ("Reviewer:
-local-reasoning → local-deep", "Ranker context: 16K → 24K"), the validation errors and warnings, and what will
-change inside LiteLLM. Validation checks that models exist and are enabled, capabilities fit the worker,
+A save that cannot be applied is refused with its reasons and an **Undo changes** button
+(`POST /api/settings/ai/discard` puts the draft back to the active version and creates no version); the worker editor
+keeps what you typed so you can fix it. Validation checks that models exist and are enabled, capabilities fit the worker,
 contexts and token limits are within known limits, temperatures are valid, fallbacks do not point at themselves or
 loop through LiteLLM's own fallbacks, tiers exist and are mapped, secrets are references and required settings are
 present, and (for the auto router) that LiteLLM accepts the router config.
 
-**Apply** is one logical operation. Worker assignments, generation settings, fallbacks and escalation are sent with
+**Applying** is one logical operation. Worker assignments, generation settings, fallbacks and escalation are sent with
 each request, so they need no LiteLLM change and no restart: the next request uses them. Only managed models and a
 managed auto router live inside LiteLLM, and they are synchronized according to the sync mode:
 
@@ -771,6 +784,40 @@ environment values remain the fallback (`LITELLM_DEFAULT_MODEL` answers for a wo
 Workers read the active version through an in-process cache (`AI_CONFIG_CACHE_SECONDS`, 30 by default). An Apply
 clears it in the process that applied it immediately; other processes see the new version within that many seconds.
 
+### Automatic model failover
+
+Give a worker backups (Workers → Edit → *Backup 1–4*; the first is its LiteLLM fallback model, the rest its
+secondary models) and turn on **Automatic failover** (Reliability). When the worker's primary model is rate limited (a 429) or fails past your
+thresholds, requests move to the best healthy model in its chain, chosen by the routing algorithm you pick:
+
+| Algorithm | Picks |
+|---|---|
+| Configured order | the first healthy model in the chain |
+| Fastest | the healthy model with the lowest recent p95 latency |
+| Most reliable | the healthy model with the lowest recent failure rate |
+| Balanced | the best blend of reliability, speed and output quality |
+
+Each model's performance is tracked per model and per (worker, model) from the real request log: failure rate, rate
+limits, invalid structured output and p95 latency, optionally compared with the route's own 7-day history. A route that
+breaches a threshold rests for a cooldown (doubling each time); afterwards it is probed with live traffic and returns
+after the configured number of successes. Thresholds (window, minimum requests, failure %, rate limits, failures in a
+row, latency, cooldowns, recovery) are yours to set; a route with too few requests is never judged. A scheduled job
+(`model_health`, every 2 minutes) judges the windows. Failover is an overlay: it does not create configuration
+versions, and Route health lists every resting model with a *Put back in service* button.
+
+**Deleting a model.** On a model's card, ⋯ → **Delete model** removes it from Job Hunt OS: it leaves every picker and
+the configuration, and **Sync from LiteLLM** does not bring it back (a model Job Hunt OS deployed is also removed from
+LiteLLM; one LiteLLM serves on its own stays there). While anything still uses it (a worker, a tier, another model's
+fallbacks, the auto router) the delete is refused with the list of places. **Removed models** under the grid restores one.
+
+Models carry failover too: on a model's card (Models → **Fallbacks**) pick up to four models it falls back to, in order,
+and how long it rests after a rate limit or a run of failures (1 minute to 24 hours, or the Reliability setting, which
+doubles each time). Every worker on that model tries its own backups first, then the model's fallbacks; after the rest
+time the model is tried again and returns once it succeeds.
+
+Every switch (and recovery) raises a browser notification, with a message in the app when notifications are blocked.
+Turn alerts on from the Failover card; the browser asks for permission only then.
+
 ### What still needs a LiteLLM restart
 
 - `config_file` sync: LiteLLM reads its config only at startup (1.102 has no file watcher or reload endpoint), so a
@@ -797,7 +844,8 @@ Worker assignments, tiers, generation settings, fallbacks, escalation and the ch
 | `POST /api/settings/ai/workers/{worker_type}/test` | Run the worker's fixture task (draft or active configuration) |
 | `GET /api/settings/ai/tiers`, `PUT/DELETE /api/settings/ai/tiers/{name}` | Tiers |
 | `GET/PUT /api/settings/ai/routing` | The auto router |
-| `POST /api/settings/ai/preview`, `POST /api/settings/ai/apply` | Preview; apply (with the previewed `revision` and `base_version`) |
+| `POST /api/settings/ai/preview`, `POST /api/settings/ai/apply` | Preview; apply (with the `revision` and `base_version` it was based on) |
+| `POST /api/settings/ai/discard` | Throw away unapplied edits: the draft becomes the active version again (no new version) |
 | `POST /api/settings/ai/verify`, `GET /api/settings/ai/runtime` | Compare with LiteLLM; desired vs active vs served |
 | `GET /api/settings/ai/versions`, `GET /api/settings/ai/versions/{id}`, `POST /api/settings/ai/versions/{id}/restore` | History and rollback |
 | `GET /api/settings/ai/audit` | The audit trail |
@@ -1368,8 +1416,13 @@ The Google ADK agents record their Gemini calls through the same pipeline with m
 Rules:
 - **Provider-reported first.** Provider-reported usage is used when present (`usage_source=provider_reported`);
   otherwise tokens are estimated locally (`estimated`). Anything that can be neither stays NULL.
-- **No prompt text.** Prompt and response text are not stored. Only metadata and token counts are kept, unless
-  `LLM_PROMPT_DEBUG=true`. API keys and bearer tokens are redacted from error messages.
+- **No prompt text by default.** Prompt and response text are not stored. Only metadata and token counts are kept,
+  unless `LLM_PROMPT_DEBUG=true` or the account turns on **Capture full requests and responses** (Monitoring → Logs).
+  That switch also keeps the request and response of every external API call (method, URL, headers and body,
+  redacted and capped at `EXTERNAL_API_CAPTURE_LIMIT`), shown as **Request** and **Response** in a log line and in the
+  External APIs request detail, so a provider's own error (for example Groq's `json_validate_failed`) can be read
+  there. Everything captured is cleared after `LLM_PROMPT_DEBUG_RETENTION_DAYS` (7). API keys, bearer tokens and
+  credential-named fields are always redacted.
 - **Monitoring never breaks a request.** If storing telemetry fails, the request still returns its result or its own
   error.
 - **Retention.** Raw rows are kept for `LLM_TELEMETRY_RETENTION_DAYS` (90). The cleanup job then rolls them into

@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from app.services import backoff, tracing
-from app.services.redaction import redact_headers, redact_text, redact_value
+from app.services.redaction import redact_body, redact_headers, redact_text, redact_url, redact_value
 from app.settings import get_settings
 
 if TYPE_CHECKING:
@@ -81,6 +81,8 @@ class ExternalCall:
     cost_source: str = "unknown"
     http_status_code: int | None = None
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    # The redacted request and response, only when someone asked for them (capture_limit): Monitoring shows them.
+    payload: dict[str, Any] | None = None
 
     def note(self, **metadata: Any) -> ExternalCall:
         """Add safe, provider-specific facts (actor id, run id, dataset size…) to this call's telemetry."""
@@ -227,7 +229,7 @@ def build_entry(call: ExternalCall, *, started_at: datetime, completed_at: datet
         "error_message": redact_text(f"{type(error).__name__}: {error}") if error is not None
                          else (f"HTTP {code}" if failure else None),
         "estimated_cost": call.estimated_cost, "cost_currency": call.cost_currency, "cost_source": call.cost_source,
-        "request_metadata": metadata, "created_at": started_at,
+        "request_metadata": metadata, "created_at": started_at, "payload": call.payload,
     }
 
 
@@ -256,7 +258,8 @@ def record(call: ExternalCall, **measurements: Any) -> str | None:
 
 def _apply_backoff(entry: dict[str, Any]) -> None:
     """A 429 starts or lengthens this provider's cooldown; a normal answer ends it."""
-    user_id, provider = entry["user_id"], entry["provider"]
+    user_id = entry["user_id"]
+    provider = cooldown_provider(entry["provider"], entry.get("service"), entry.get("request_metadata"))
     if entry["error_type"] == "RATE_LIMIT" and not (entry["request_metadata"] or {}).get("skipped_by"):
         backoff.record_limit(user_id, provider, retry_after=entry["rate_limit_reset_at"])
     elif entry["status"] == "SUCCEEDED":
@@ -296,6 +299,42 @@ def _log_notable(entry: dict[str, Any]) -> None:
 def _debug_headers(headers: Any) -> dict[str, str] | None:
     """Header names (never their secret values) — only when EXTERNAL_API_DEBUG_PAYLOADS is on."""
     return redact_headers(headers) if get_settings().external_api_debug_payloads else None
+
+
+def capture_limit(call: ExternalCall) -> int | None:
+    """How much of a body to keep, or None to keep none. Bodies are kept only on request: EXTERNAL_API_DEBUG_PAYLOADS
+    for every account (short extracts), or the account's own capture switch (Monitoring → Logs, which also covers LLM
+    prompts) up to EXTERNAL_API_CAPTURE_LIMIT. Never raises."""
+    settings = get_settings()
+    try:
+        from app.services.llm_telemetry import account_captures
+
+        if account_captures(owner_of(call)):  # the account's own switch; LLM_PROMPT_DEBUG covers LLM text only
+            return settings.external_api_capture_limit
+    except Exception:  # noqa: BLE001  telemetry is best effort
+        log.debug("could not read the capture setting", exc_info=True)
+    return settings.external_api_payload_limit if settings.external_api_debug_payloads else None
+
+
+def capture_payload(call: ExternalCall, request: httpx.Request, response: httpx.Response | None = None,
+                    error: BaseException | None = None) -> None:
+    """Keep the redacted request and response on the call when capture is on. Never raises."""
+    try:
+        limit = capture_limit(call)
+        if not limit:
+            return
+        body = None if request.extensions.get("jobhunt_streamed") else request.content
+        payload: dict[str, Any] = {"request": {"method": request.method, "url": redact_url(str(request.url)),
+                                               "headers": redact_headers(request.headers),
+                                               "body": redact_body(body, limit)}}
+        if response is not None:
+            payload["response"] = {"status": response.status_code, "headers": redact_headers(response.headers),
+                                   "body": redact_body(response.content, limit)}
+        if error is not None:
+            payload["error"] = redact_text(f"{type(error).__name__}: {error}", 2000)
+        call.payload = payload
+    except Exception:  # noqa: BLE001  capture must never change a call
+        log.debug("could not capture a payload", exc_info=True)
 
 
 def _payload_extract(raw: bytes | None) -> str | None:
@@ -345,6 +384,7 @@ class InstrumentedClient(httpx.Client):
         try:
             response = super().send(request, **kwargs)
         except Exception as exc:
+            capture_payload(call, request, error=exc)
             self.last_request_id = record(call, started_at=started, completed_at=_finished(started, clock),
                                           method=request.method, url=str(request.url), request_bytes=request_bytes,
                                           error=exc)
@@ -353,6 +393,7 @@ class InstrumentedClient(httpx.Client):
             call.note(request_payload=_payload_extract(request.content),
                       response_payload=_payload_extract(response.content),
                       request_headers=_debug_headers(request.headers))
+            capture_payload(call, request, response)
         self.last_request_id = record(
             call, started_at=started, completed_at=_finished(started, clock), method=request.method,
             url=str(request.url), status_code=response.status_code, request_bytes=request_bytes,
@@ -396,6 +437,17 @@ class InstrumentedAsyncClient(httpx.AsyncClient):
         return response
 
 
+def cooldown_provider(provider: str, service: str | None, metadata: dict[str, Any] | None) -> str:
+    """The key a 429 cooldown is kept under. A model request through the LiteLLM gateway (a worker's request or a
+    model test) rests only that model (`LITELLM:<model>`), so one rate-limited model never blocks the gateway's other
+    models, nor its admin calls (Apply, Sync): that is what lets failover (app.services.failover) send the request
+    somewhere else. Everything else rests the whole provider."""
+    model = (metadata or {}).get("model")
+    if provider.upper() == "LITELLM" and isinstance(model, str) and model:
+        return f"LITELLM:{model}"[:230]
+    return provider
+
+
 def hold_off(call: ExternalCall, *, method: str | None = None, url: str | None = None) -> None:
     """Refuse to make a call while its provider's cooldown is running, and record the one we saved.
 
@@ -406,11 +458,11 @@ def hold_off(call: ExternalCall, *, method: str | None = None, url: str | None =
     if backoff.bypassing():  # a task a person asked to run now (app.services.workers)
         return
     try:
-        backoff.check(owner, call.provider)
+        backoff.check(owner, cooldown_provider(call.provider, call.service, call.metadata))
         return
     except backoff.RateLimited as limited:
         call.note(skipped_by="cooldown", retry_after_seconds=limited.retry_after_seconds)
-        backoff.note_skipped(owner, call.provider)
+        backoff.note_skipped(owner, cooldown_provider(call.provider, call.service, call.metadata))
         moment = utcnow()
         record(call, started_at=moment, completed_at=moment, method=method, url=url,
                error=RateLimitedCooldown(limited.provider, limited.retry_after_seconds), error_type="RATE_LIMIT")

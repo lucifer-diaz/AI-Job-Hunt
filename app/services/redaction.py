@@ -98,6 +98,40 @@ def redact_headers(headers: Any) -> dict[str, str]:
             for name, value in items}
 
 
+def redact_body(raw: bytes | str | None, limit: int) -> str | None:
+    """A request or response body fit to keep for inspection: JSON and form fields with a credential name are
+    replaced, then anything secret-shaped anywhere, then the text is capped. Never raises."""
+    if raw is None or raw == b"" or raw == "":
+        return None
+    text = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+    try:
+        import json
+
+        def walk(value: Any, depth: int = 0) -> Any:
+            if depth > 12:
+                return value
+            if isinstance(value, dict):
+                return {k: REDACTED if _secret_entry(k, v) else walk(v, depth + 1) for k, v in value.items()}
+            if isinstance(value, list):
+                return [walk(v, depth + 1) for v in value]
+            return value
+
+        stripped = text.lstrip()
+        if stripped[:1] in ("{", "["):
+            text = json.dumps(walk(json.loads(text)), ensure_ascii=False, indent=2)
+        elif "=" in text and "\n" not in text.strip() and " " not in text.strip():
+            from urllib.parse import parse_qsl, urlencode
+
+            pairs = parse_qsl(text, keep_blank_values=True)
+            if pairs:
+                # Field by field: a whole-text pass would read "client_secret=…&q=…" as one secret to the end.
+                return "&".join(f"{urlencode([(k, '')])[:-1]}={REDACTED if _secret_entry(k, v) else redact_text(v, limit)}"
+                                for k, v in pairs)[:limit]
+    except (ValueError, TypeError):
+        pass  # not JSON or a form after all: the pattern pass below still applies
+    return redact_text(text, limit)
+
+
 def redact_params(params: Any) -> dict[str, str]:
     pairs = params.items() if hasattr(params, "items") else (params or [])
     return {str(k): REDACTED if is_secret_field(k) else (redact_text(str(v), 200) or "") for k, v in pairs}

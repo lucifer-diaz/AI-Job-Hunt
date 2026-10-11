@@ -544,7 +544,7 @@ function renderAdvisor() {
 function monCaptureSwitch() {
   const c = D.monCapture; if (!c) return '';
   if (c.server_wide) return '<div class="xs muted mt6">Full prompts and responses are captured for every account (LLM_PROMPT_DEBUG is on).</div>';
-  return `<label class="check xs mt6" title="Stores the full prompt and response of each new request, redacted, for ${c.retention_days} days. They include your resume and job text."><input type="checkbox" data-act-change="mon-capture" data-on="${c.enabled ? '' : '1'}" ${c.enabled ? 'checked' : ''} ${isBusy('monCapture') ? 'disabled' : ''}>Capture full prompts and responses${c.enabled ? ` · kept ${c.retention_days} days` : ''}</label>`;
+  return `<label class="check xs mt6" title="Stores the full prompt and response of each new LLM request, and the request and response bodies of external API calls, redacted, for ${c.retention_days} days. They include your resume and job text."><input type="checkbox" data-act-change="mon-capture" data-on="${c.enabled ? '' : '1'}" ${c.enabled ? 'checked' : ''} ${isBusy('monCapture') ? 'disabled' : ''}>Capture full requests and responses (LLM and external APIs)${c.enabled ? ` · kept ${c.retention_days} days` : ''}</label>`;
 }
 function monPayloads(x) {
   if (!x.debug) {
@@ -595,7 +595,28 @@ function renderMonRequestModal() {
     <div class="card-foot row gap8" style="justify-content:flex-end">${x.entity?.job_id ? btn('View job orchestration', 'orch-view-job', { id: x.entity.job_id }) : ''}${x.entity?.job_id ? btn('Open job', 'mon-open-job', { id: x.entity.job_id }) : ''}${btn('Close', 'mon-close')}</div></div></div>`;
 }
 
-/* Detail views. Both show metadata only: no headers, credentials, cookies or bodies are ever stored. */
+// The captured request and response of an external call (kept only while capture is on, redacted, for a week).
+function monCaptured(p, failed) {
+  if (!p || (!p.request && !p.response)) {
+    const c = D.monCapture;
+    return `<div class="box soft"><div class="caps-sm mb4">REQUEST AND RESPONSE</div><div class="small muted">The request and response bodies were not captured for this call; only its size and status were kept.</div>
+      ${c && !c.enabled && !c.server_wide ? `<div class="mt8">${btn('Capture them for new calls', 'mon-capture', { on: 1 }, 'sm')}</div>` : ''}</div>`;
+  }
+  const pretty = text => { try { return JSON.stringify(JSON.parse(text), null, 2); } catch { return text; } };
+  const headers = h => Object.entries(h || {}).map(([k, v]) => `${k}: ${v}`).join('\n');
+  const block = (title, head, part, open) => {
+    if (!part) return '';
+    const text = [head, headers(part.headers), '', part.body ? pretty(part.body) : '(no body)'].filter(x => x != null).join('\n');
+    return `<details ${open ? 'open' : ''}><summary class="small b row between"><span>${title} <span class="faint" style="font-weight:400">· ${(part.body || '').length.toLocaleString()} characters</span></span></summary>
+      <div class="row mt6" style="justify-content:flex-end">${btn('Copy', 'mon-copy', {}, 'sm')}</div><pre class="mon-debug">${esc(text)}</pre></details>`;
+  };
+  return `<div class="col gap10"><div class="caps-sm">REQUEST AND RESPONSE <span class="faint" style="font-weight:400">· redacted: keys, tokens and credential headers are masked</span></div>
+    ${block('Request', p.request ? `${p.request.method || ''} ${p.request.url || ''}` : '', p.request, false)}
+    ${block('Response', p.response ? `HTTP ${p.response.status ?? ''}` : '', p.response, true)}
+    ${p.error ? `<div class="box bad small mono" style="white-space:pre-wrap;word-break:break-word">${esc(p.error)}</div>` : ''}</div>`;
+}
+
+/* Detail views: metadata, plus the request and response bodies when capture was on for the call. */
 function renderMonExtRequestModal() {
   const x = D.monExtRequest;
   if (!x || x.id !== monState().ext.request) return `<div class="overlay" data-act="mon-close"><div class="modal" style="padding:40px">${loading()}</div></div>`;
@@ -622,7 +643,8 @@ function renderMonExtRequestModal() {
       ${x.llm ? `<div class="box soft"><div class="caps-sm mb8">LLM request</div><div class="small">${esc(monStage(x.llm.stage))} · ${esc(x.llm.model || '')} · ${monTokens(x.llm.input_tokens)} in / ${monTokens(x.llm.output_tokens)} out · ${monUSD(x.llm.estimated_cost)}</div></div>` : ''}
       ${meta.length ? `<div><div class="caps-sm mb8">Safe metadata</div><div class="mon-kv-grid">${meta.map(([k, v]) => row(k.replace(/_/g, ' '), esc(typeof v === 'object' ? JSON.stringify(v) : String(v)))).join('')}</div></div>` : ''}
       ${x.error_message ? `<div class="box bad"><div class="xs b mb4" style="color:var(--bad)">ERROR</div><div class="small mono" style="white-space:pre-wrap;word-break:break-word">${esc(x.error_message)}</div></div>` : ''}
-      <div class="xs faint">Headers, credentials and bodies are never stored. Request and response sizes are recorded instead.</div>
+      ${monCaptured(x.payload, x.status === 'FAILED')}
+      <div class="xs faint">Credentials are never stored. Bodies and headers are kept, redacted, only while capture is on (Logs), for a week.</div>
     </div>
     <div class="card-foot row gap8" style="justify-content:flex-end">${btn('Close', 'mon-close')}</div></div></div>`;
 }
@@ -646,13 +668,13 @@ function renderMonLogModal() {
       </div>
       ${call ? `<div class="box soft"><div class="caps-sm mb8">The call it describes</div>
         <div class="small">${esc(call.provider)} ${esc(call.http_method || '')} ${esc(call.endpoint_host || '')}${esc(call.endpoint_path || '')} · ${call.http_status_code ?? '—'} · ${monMs(call.latency_ms)}</div>
-        <div class="mt8">${btn('Open the call', 'mon-ext-request', { id: call.id }, 'sm')}</div></div>` : ''}
+        <div class="mt8">${btn('Open the call', 'mon-ext-request', { id: call.id }, 'sm')}</div></div>${monCaptured(call.payload, call.status === 'FAILED')}` : ''}
       ${x.llm_requests?.length ? `<div class="box soft"><div class="caps-sm mb8">LLM request${x.llm_requests.length === 1 ? '' : 's'} behind this line</div>
         ${x.llm_requests.map(q => `<div class="row between gap10 small" style="padding:3px 0"><span class="ellipsis">${esc(monStage(q.stage))} · ${esc(q.model || '—')} · ${esc(q.status.toLowerCase())}${q.captured ? ' · prompt and response captured' : ''}</span>${btn('Open request', 'mon-log-request', { id: q.id }, 'sm')}</div>`).join('')}</div>` : ''}
       ${x.llm_requests?.length === 1 ? monPayloads({ status: x.llm_requests[0].status, debug: x.llm_requests[0].payload }) : ''}
       ${details.length ? `<div><div class="caps-sm mb8">Details</div><div class="mon-kv-grid">${details.map(([k, v]) => row(k.replace(/_/g, ' '), esc(typeof v === 'object' ? JSON.stringify(v) : String(v)))).join('')}</div></div>` : ''}
       ${x.related?.length ? `<div><div class="caps-sm mb8">Same trace</div>${x.related.map(r => `<div class="row between gap10 small" style="padding:3px 0"><span class="ellipsis">${esc(r.message)}</span><span class="xs faint none">${esc(fmtDateTime(r.created_at))}</span></div>`).join('')}</div>` : ''}
-      <div class="xs faint">Messages and details are redacted before they are stored: no credentials or headers. Prompts and responses are kept only while capture is on.</div>
+      <div class="xs faint">Messages and details are redacted before they are stored: no credentials. Prompts, responses and request/response bodies are kept only while capture is on.</div>
     </div>
     <div class="card-foot row gap8" style="justify-content:flex-end">${x.entity_type === 'job' && x.entity_id ? btn('View job orchestration', 'orch-view-job', { id: x.entity_id }) : ''}${btn('Close', 'mon-close')}</div></div></div>`;
 }

@@ -16,6 +16,7 @@ from __future__ import annotations
 import concurrent.futures
 import contextvars
 import hashlib
+import logging
 import re
 import time
 from collections.abc import Callable
@@ -27,7 +28,7 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from app.models import Application, InsightObservation, Job, JobInsight
-from app.services import backoff, compensation, system_log, tracing, worker_settings
+from app.services import backoff, compensation, redaction, system_log, tracing, worker_settings
 from app.services.job_insights import matching, synthesis
 from app.services.job_insights.apify import (
     GlassdoorCompensationSource,
@@ -614,7 +615,12 @@ def process(sessions: Callable[[], Session], claim_: InsightClaim) -> str:
                                    attempt=snapshot.attempt, observations=observations)
             label = settle(sessions, claim_, results, result, observations, utcnow())
     except Exception as exc:  # noqa: BLE001  an unexpected failure is this task's problem, retried later
-        label = _crashed(sessions, claim_, f"{type(exc).__name__}")
+        # The class name alone ("ProgrammingError") hides the cause; keep its first line, redacted, and the traceback
+        # in the server log.
+        logging.getLogger("jobhunt.job_insights").exception("job insights task %s crashed", claim_.task_id)
+        first_line = (str(exc).strip().splitlines() or [""])[0]
+        detail = type(exc).__name__ + (f": {redaction.redact_text(first_line, 200)}" if first_line else "")
+        label = _crashed(sessions, claim_, detail)
         results, result = [], synthesis.Synthesis(errors=[type(exc).__name__])
     _log(snapshot, claim_, results, result, label, int((time.monotonic() - started) * 1000))
     return label

@@ -688,3 +688,131 @@ def test_approval_nudge_leaves_held_and_stopped_packets_alone(user_id, signed_in
     assert out["moved"] == [passed_id]  # a reviewer's hold for a person, and a stopped run, stay as they are
     with SessionLocal() as db:
         assert db.get(Job, held_id).status == "pending_approval" and db.get(Job, stopped_id).status == "tailored"
+
+
+# ───────────── the model each task uses ─────────────
+
+def llm_row(db, uid, job, *, at, requested="big-model", answered=None, **fields):
+    from app.models import LLMRequestLog
+
+    db.add(LLMRequestLog(request_id=f"wk-{uuid.uuid4()}", user_id=uid, workflow_type="job", workflow_entity_id=job.id,
+                         worker_type="JD_PARSER", stage="OTHER", provider="litellm", requested_model=requested,
+                         model=answered or requested, status="SUCCEEDED", created_at=at, **fields))
+
+
+def test_tasks_show_their_model_route_and_what_changed(user_id, signed_in, monkeypatch):
+    from app.services.llm import LLMClient
+
+    monkeypatch.setattr(LLMClient, "route_for", lambda self, worker: {
+        "route": "OPENROUTER", "model": "openrouter/free", "primary": "openrouter/free", "mode": None,
+        "configured": None, "failed_over_from": None, "backups": []})
+    with SessionLocal() as db:
+        queued, failed_over, escalated, old = (add_job(db, user_id) for _ in range(4))
+        started = utcnow() - timedelta(minutes=1)
+        parse_task(db, user_id, queued)
+        for job in (failed_over, escalated, old):
+            parse_task(db, user_id, job, status="PROCESSING", started_at=started, created_at=started, lock_token="t",
+                       locked_by="w", lock_expires_at=utcnow() + timedelta(minutes=5), attempt_count=1)
+        llm_row(db, user_id, failed_over, at=utcnow(), requested="backup-model", routing_cause="FAILOVER")
+        llm_row(db, user_id, escalated, at=utcnow(), requested="small", answered="large", escalated=True,
+                escalation_reason="LOW_CONFIDENCE")
+        llm_row(db, user_id, old, at=started - timedelta(hours=1), requested="from-an-earlier-task")
+        db.commit()
+        queued, failed_over, escalated, old = (type("J", (), {"id": j.id}) for j in (queued, failed_over, escalated, old))
+    rows = {r["job_id"]: r for r in signed_in(user_id).get("/api/workers/parsing").json()["rows"]}
+
+    nxt = rows[queued.id]["model"]
+    assert nxt == {"model": "openrouter/free", "route": "OPENROUTER", "route_label": "OpenRouter", "via": None,
+                   "source": "next", "backups": []}
+    assert rows[queued.id]["model_change"] is None
+    used = rows[failed_over.id]
+    assert used["model"]["source"] == "used" and used["model"]["model"] == "backup-model"
+    assert used["model"]["route"] == "LITELLM" and used["model"]["route_label"] == "LiteLLM"
+    assert used["model_change"]["kind"] == "FAILOVER" and used["model_change"]["to"] == "backup-model"
+    change = rows[escalated.id]["model_change"]
+    assert change["kind"] == "ESCALATED" and change["to"] == "large" and change["reason"] == "low confidence"
+    assert rows[old.id]["model"]["source"] == "next"  # a request from before this task started is not its own
+
+
+def test_a_waiting_task_says_when_a_backup_will_answer(monkeypatch):
+    plan = {"route": "LITELLM", "model": "backup", "primary": "main", "failed_over_from": "main", "mode": "TIER",
+            "configured": "FAST", "backups": ["backup"]}
+    assert workers._change(plan, None) == {"kind": "RESTING", "from": "main", "to": "backup",
+                                           "reason": "its model is resting, so a backup answers"}
+    assert workers._via(plan) == "tier FAST" and workers._via({"mode": "AUTO_ROUTER"}) == "auto router"
+
+    class Last:
+        escalated, routing_cause, fallback_used, requested_model, model = False, None, False, "old-model", "old-model"
+    changed = workers._change({**plan, "failed_over_from": None, "model": "new-model"}, Last())
+    assert changed["kind"] == "CONFIG" and changed["from"] == "old-model" and changed["to"] == "new-model"
+    Last.fallback_used, Last.model = True, "fallback-model"
+    assert workers._change(plan, Last())["kind"] == "FALLBACK"
+
+
+def test_ranking_and_tailoring_tasks_show_their_model_too(user_id, signed_in, monkeypatch):
+    from app.services.llm import LLMClient
+
+    seen = []
+
+    def plan(self, worker):
+        seen.append(worker)
+        return {"route": "LITELLM", "model": f"{worker.lower()}-model", "primary": f"{worker.lower()}-model",
+                "mode": "TIER", "configured": "FAST", "failed_over_from": None, "backups": []}
+    monkeypatch.setattr(LLMClient, "route_for", plan)
+    with SessionLocal() as db:
+        ranked, tailored, reviewed = (add_job(db, user_id, state="RANK_PENDING") for _ in range(3))
+        db.add(JobRankingTask(user_id=user_id, job_id=ranked.id, status="PENDING"))
+        db.add(TailorTask(user_id=user_id, job_id=tailored.id, status="queued", stage="queued", attempts=0))
+        db.add(TailorTask(user_id=user_id, job_id=reviewed.id, status="running", stage="reviewing", attempts=1,
+                          started_at=utcnow()))
+        db.commit()
+        ranked_id, tailored_id, reviewed_id = ranked.id, tailored.id, reviewed.id
+    client = signed_in(user_id)
+    tracker = client.get("/api/ranking/tracker").json()
+    rank = next(t for t in tracker["active"] if t["job_id"] == ranked_id)
+    assert rank["model"]["model"] == "ranker-model" and rank["model"]["via"] == "tier FAST"
+    tasks = {t["job_id"]: t for t in client.get("/api/tailor-tasks").json()}
+    assert tasks[tailored_id]["model"]["model"] == "tailor-model" and tasks[tailored_id]["model"]["source"] == "next"
+    assert tasks[reviewed_id]["model"]["model"] == "reviewer-model"  # at its review step: the reviewer's model
+    assert {"RANKER", "TAILOR", "REVIEWER"} <= set(seen)
+
+
+def test_a_ranking_task_reports_its_last_attempt(user_id, signed_in):
+    """A ranking waiting for its account clears started_at; the tracker still says when it last ran."""
+    at = utcnow() - timedelta(minutes=7)
+    with SessionLocal() as db:
+        job = add_job(db, user_id, state="RANK_PENDING")
+        db.add(JobRankingTask(user_id=user_id, job_id=job.id, status="PENDING", attempt_count=1, last_attempt_at=at,
+                              started_at=None))
+        db.commit()
+        job_id = job.id
+    tracker = signed_in(user_id).get("/api/ranking/tracker").json()
+    task = next(t for t in tracker["active"] if t["job_id"] == job_id)
+    assert task["started_at"] is None and task["last_attempt_at"] == at.isoformat()
+
+
+def test_finished_tasks_keep_the_model_their_own_last_request_used(user_id, signed_in, monkeypatch):
+    from app.services.llm import LLMClient
+
+    monkeypatch.setattr(LLMClient, "route_for", lambda self, worker: {
+        "route": "LITELLM", "model": "today-model", "primary": "today-model", "mode": "TIER", "configured": "FAST",
+        "failed_over_from": "rested", "backups": []})
+    started = utcnow() - timedelta(hours=1)
+    done_at = utcnow() - timedelta(minutes=30)
+    with SessionLocal() as db:
+        done, escalated, silent = (add_job(db, user_id) for _ in range(3))
+        for job in (done, escalated, silent):
+            parse_task(db, user_id, job, status="COMPLETED", created_at=started, started_at=started,
+                       completed_at=done_at, attempt_count=1)
+        llm_row(db, user_id, done, at=started + timedelta(minutes=5), requested="old-model")
+        llm_row(db, user_id, done, at=utcnow(), requested="a-newer-tasks-model")  # after it finished: not its own
+        llm_row(db, user_id, escalated, at=started + timedelta(minutes=5), requested="small", answered="large",
+                escalated=True, escalation_reason="SCHEMA_FAILURE")
+        db.commit()
+        ids = (done.id, escalated.id, silent.id)
+    rows = {r["job_id"]: r for r in signed_in(user_id).get("/api/workers/parsing").json()["rows"]}
+    first = rows[ids[0]]
+    assert first["model"]["model"] == "old-model" and first["model"]["source"] == "used"
+    assert first["model_change"] is None  # today's configuration and resting models say nothing about the past
+    assert rows[ids[1]]["model_change"]["kind"] == "ESCALATED"
+    assert rows[ids[2]]["model"] == {"model": None, "source": "none"} and rows[ids[2]]["model_change"] is None

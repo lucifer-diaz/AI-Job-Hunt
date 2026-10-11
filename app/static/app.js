@@ -669,7 +669,7 @@ function renderRanking(r = D.ranking) {
       <div class="grow" style="min-width:0"><div class="small b ellipsis">${esc(t.title)} <span class="muted" style="font-weight:400">· ${esc(t.company)}</span></div>
         <div class="xs ellipsis ${t.status === 'FAILED' ? '' : 'muted'}" style="${t.status === 'FAILED' ? 'color:var(--bad)' : ''}" title="${attr(detail)}">${esc(why)} · ${esc(detail)}</div>
         ${rankProgress(t, r.in_flight)}</div>
-      ${wkRankActions(t)}${retry}${remove}${wkRowNudge('ranking', t.job_id, t.status)}${btn('Job', 'open-job', { id: t.job_id }, 'sm')}${rankTaskPill(t)}</div>`;
+      ${typeof wkLastRun === 'function' ? wkLastRun(t) : ''}${typeof wkModelCells === 'function' ? wkModelCells(t) : ''}${wkRankActions(t)}${retry}${remove}${wkRowNudge('ranking', t.job_id, t.status)}${btn('Job', 'open-job', { id: t.job_id }, 'sm')}${rankTaskPill(t)}</div>`;
   };
   const section = (key, title, sub, items, actions = '') => `<section class="card flush">
     <div class="row between wrap gap10" style="padding:14px 18px;border-bottom:1px solid var(--line2)"><div><div class="card-title" style="font-size:16px">${esc(title)}</div><div class="card-sub">${esc(sub)}</div></div>${actions ? `<div class="row gap8">${actions}</div>` : ''}</div>
@@ -1037,7 +1037,7 @@ function renderTaskStack(tasks = D.tasks || [], all = tasks) {
       <div class="grow" style="min-width:0"><div class="small b ellipsis">${esc(t.title)} <span class="muted" style="font-weight:400">· ${esc(t.company)}</span></div>
         <div class="xs ${t.status === 'failed' ? '' : 'muted'} ellipsis" style="${t.status === 'failed' ? 'color:var(--bad)' : ''}">${t.mode === 'skip' ? 'Skip tailoring · ' : ''}${detail}</div>
         ${active ? `<div class="row base gap8 mt6"><span class="grow">${bar(t.progress + '%', t.status === 'running' ? '#5b4ae8' : '#c9cbe0')}</span><span class="xs mono muted none" style="width:34px;text-align:right">${t.progress}%</span></div>` : ''}</div>
-      ${wkTailorActions(t)}${S.screen === 'workers' ? wkRowNudge('tailoring', t.job_id, t.status.toUpperCase()) : ''}${actions}${taskPill(t)}</div>`;
+      ${typeof wkLastRun === 'function' ? wkLastRun(t) : ''}${typeof wkModelCells === 'function' ? wkModelCells(t) : ''}${wkTailorActions(t)}${S.screen === 'workers' ? wkRowNudge('tailoring', t.job_id, t.status.toUpperCase()) : ''}${actions}${taskPill(t)}</div>`;
   }).join('');
   return `<section class="card flush">
     <div class="row wrap gap10" style="padding:14px 18px;border-bottom:1px solid var(--line2)">
@@ -1940,12 +1940,18 @@ const A = {
     document.getElementById('ev-claim')?.focus();
   },
   'tracker-reset-filters': () => { S.tf = { q: '', location: 'all', min_fit: 0 }; render(); },
-  'set-gateway': el => busy('gateway', async () => {
+  'set-gateway': el => {
+    // The route takes effect on every worker's next request; there is no draft to review, so ask first.
+    const g = D.gateway || (typeof AIM !== 'undefined' && AIM.data?.gateway) || {};
+    const target = el.dataset.on ? 'the LiteLLM gateway' : `${g.direct_label || 'the direct provider'} directly`;
+    if (!confirm(`Switch every AI worker to ${target}? It takes effect on their next request. You can switch back here at any time.`)) return;
+    return busy('gateway', async () => {
     D.gateway = await api('/api/settings/ai/gateway', { method: 'PUT', body: { enabled: !!el.dataset.on } });
     api('/api/workspace/summary').then(sum => { D.summary = sum; render(); }).catch(() => {});
     if (S.screen === 'orchestration' && typeof aimLoad === 'function') await aimLoad();  // AI Orchestration → Models shows it too
     return D.gateway;
-  }, g => g.gateway_enabled ? 'Workers now use the LiteLLM gateway' : `Workers now call ${g.direct_label} directly`),
+  }, g => g.gateway_enabled ? 'Workers now use the LiteLLM gateway' : `Workers now call ${g.direct_label} directly`);
+  },
   'edit-job-description': el => { S.jobTab = 'description'; S.descEdit = Number(el.dataset.id); render(); },
   'cancel-job-description': el => {
     S.descEdit = null; if (S.forms.jobdesc) delete S.forms.jobdesc[el.dataset.id];
@@ -2666,6 +2672,7 @@ setHash();
 render();
 refreshTasks();
 watchApprovals();
+if (typeof watchFailover === 'function') watchFailover();
 load().then(async () => {
   guideBoot();
   try { const prof = await api('/api/profile'); D.profileRoles = prof.target_roles || []; } catch { /* optional */ }

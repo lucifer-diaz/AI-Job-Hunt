@@ -62,9 +62,13 @@ call before a request, because a developer can forget one; the client *is* the t
 * **Never store credentials.** Redaction lives in `app/services/redaction.py` and runs inside the
   instrumentation layer, so a caller cannot forget it. Authorization, cookies and API-key headers are replaced
   wholesale; secret-shaped strings are replaced anywhere they appear.
-* **Never store request or response bodies by default.** Sizes are recorded instead.
-  `EXTERNAL_API_DEBUG_PAYLOADS=true` stores short, redacted, capped extracts for debugging. It is off in
-  production, and leaving it off is the default answer.
+* **Never store request or response bodies by default.** Sizes are recorded instead. Bodies are kept only on request:
+  an account's own capture switch (Monitoring → Logs, the same one as LLM prompts) keeps the redacted request and
+  response of its external calls in `external_api_request_logs.payload` (`external_api.capture_payload`, capped at
+  `EXTERNAL_API_CAPTURE_LIMIT`), cleared after `LLM_PROMPT_DEBUG_RETENTION_DAYS` by the cleanup job
+  (`external_monitoring.clear_captured`); `EXTERNAL_API_DEBUG_PAYLOADS=true` does the same, briefer, for every account.
+  Bodies go through `redaction.redact_body` (credential-named JSON and form fields replaced, then secret shapes), and
+  are redacted again on read. Never add another path that stores a body.
 * **LLM prompts and responses are captured only on request**: `LLM_PROMPT_DEBUG` (every account) or an account's own
   switch in Monitoring → LLM requests (`AppSetting.preferences["monitoring"]["capture_llm_payloads"]`, off by default).
   The text is redacted on write and on read, and cleared after `LLM_PROMPT_DEBUG_RETENTION_DAYS` (7).
@@ -89,7 +93,14 @@ These rules keep the model a worker uses a matter of configuration, never of cod
 * **Model configuration changes go through the AI configuration service** (`app/services/ai_model_config.py`):
   edit the draft → preview → validate → apply → version. Do not write `WorkerModelConfig`, `ModelTier`,
   `AIRoutingConfig` or `AIModel` rows anywhere else, and never mutate an `AIConfigVersion`; roll back by applying an
-  old snapshot as a new version.
+  old snapshot as a new version. The Models & routing screen saves by writing the draft and applying it at once; when
+  the apply is refused it offers Undo (`discard_draft`, which puts the draft back to the active version and never
+  creates a version). Keep that pairing: a refused save must never leave edits silently waiting in the draft.
+* **Deleting a model is a soft removal** (`ai_model_config.remove_model`, `AIModel.removed_at`): it leaves the draft,
+  every picker and the next version, and `ai_registry.discover` never brings it back; Restore (or a rollback to a version
+  that had it) does. It is refused while anything still uses it (`model_references`). Only a deployment Job Hunt OS owns
+  leaves LiteLLM (through the normal apply; `managed` is kept, so Restore redeploys it); a discovered model stays in
+  LiteLLM. Undo (`discard_draft`) removes again a model restored since the active version.
 * **Prompts remain under `app/prompts/`.** Prompts say *what* a model is asked to do; worker configuration decides
   *which* model, its generation settings and routing. Never put model selection in a prompt, or a prompt in the
   configuration.
@@ -109,6 +120,39 @@ These rules keep the model a worker uses a matter of configuration, never of cod
   `/openapi.json` first.
 * **No secret in configuration**: a managed deployment's credentials are `os.environ/NAME` references; the LiteLLM
   key is encrypted like the provider keys and never returned, logged or snapshotted.
+
+## Model failover (route health)
+
+`app/services/model_health.py` (health), `app/services/failover.py` (choice) and `app/services/failover_settings.py`
+(thresholds) move a worker's requests off a model that is rate limited or failing, and back when it recovers. The
+rules a change has to keep:
+
+* **Failover is a runtime overlay, never a configuration edit.** It writes `model_route_states` and `failover_events`
+  only. It never writes `WorkerModelConfig`, `ModelTier`, `AIRoutingConfig` or an `AIConfigVersion`; the models a worker
+  may fail over to (`fallback_model`, `secondary_models`) are configuration and change through draft → preview → apply.
+* **Health is judged from what happened, deterministically.** Request outcomes (`llm_request_logs`) and the account's
+  thresholds decide; no model is called. Too few samples (`min_samples`) is never a breach: unknown stays healthy.
+  Configuration errors and context overflows say nothing about a model and are not counted.
+* **PostgreSQL is the only shared state.** No Redis, no cross-process in-memory counters: a trip is a database row,
+  readers cache it for a couple of seconds (`model_health.states`), like `backoff.cooling_until`.
+* **Fails open.** Any error in health tracking or ordering leaves the configured worker untouched and never changes a
+  request's outcome (`record_outcome` and `failover.apply` catch everything).
+* **A chain is the worker's backups, then its model's own fallbacks** (`AIModel.fallback_models`, `ResolvedWorker.chain`).
+  Only the primary model's fallbacks join it, never a fallback's fallbacks, so two models may name each other without a
+  loop. A model's `rest_seconds` is exactly how long it rests after a trip, every time; without it the account's cooldown
+  doubles per trip. Both are configuration (versioned, draft → apply).
+* **A resting model is a last resort, not removed**, so a request is never left with nothing to call. After its
+  cooldown a route is half-open: traffic probes it, `recovery_successes` successes restore it, one failure rests it
+  again for twice as long.
+* **A 429 rests the model, not the gateway.** The LiteLLM cooldown is kept per model (`external_api.cooldown_provider`,
+  `LITELLM:<model>`), so a rate-limited model never blocks the model failover sends the request to. Other providers
+  still cool down as a whole.
+* **Quality escalation and infrastructure failover stay separate.** Failover never decides on answer quality, and an
+  escalated request gets no failover.
+* **Notifications are metadata only** (`/api/failover/events`: model names, cause, counts) and use the existing browser
+  Notification helpers in `app/static/app.js`; permission is asked only on a click, with a toast fallback.
+* **Log lines after the commit.** `model_health._emit` queues the Monitoring line and `_flush_logs` writes it once the
+  transaction is committed; `system_log` uses its own connection.
 
 ## Job description recovery and the shared browser
 
@@ -312,6 +356,12 @@ other static files.
   `asyncio.to_thread` pool, which a few slow model calls can fill and stall every scheduled job.
 * **Bulk retry is many single retries** (`workers.retry`): each task goes through `_requeue_finished`, is skipped with a
   reason rather than failing the batch, and never gets `run_now_at` — a bulk retry never bypasses a provider cooldown.
+* **A task row's model is read, never decided.** `workers.attach_models` adds `model` (route, model, how it was chosen;
+  `source` is `used` from the task's own `llm_request_logs` rows, or `next` from `LLMClient.route_for`) and
+  `model_change` (FAILOVER, RESTING, FALLBACK, ESCALATED, CONFIG) to active rows. One bounded query, metadata only, and
+  it never raises. Finished rows keep the model their own last request used (`source` `used`, or `none` when the task
+  never called a model) and only that request's change (FAILOVER, FALLBACK, ESCALATED); a failover's origin is the
+  request's own `llm_request_logs.failed_over_from`, never today's configuration.
 * **A paused worker holds its queue, never drops it.** Its claim skips the account's tasks unless `run_now_at` is set
   (ranking: unless the task is forced).
 

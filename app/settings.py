@@ -150,6 +150,9 @@ class Settings(BaseSettings):
     # still redacted and capped at external_api_payload_limit bytes.
     external_api_debug_payloads: bool = False
     external_api_payload_limit: int = 2000
+    # How much of a request or response body an account that turned on capture (Monitoring → Logs) keeps per call;
+    # redacted, and cleared after llm_prompt_debug_retention_days like captured LLM text.
+    external_api_capture_limit: int = 32000
     # A call slower than this is logged as a warning in Monitoring → Logs, so slowdowns are visible without a query.
     external_api_slow_call_ms: int = 10_000
     hunter_max_runs_per_search: int = 30
@@ -186,6 +189,8 @@ class Settings(BaseSettings):
     ai_optimization_interval_minutes: int = 5
     # Imports the auto router's decisions (tier and cause) from LiteLLM's spend logs into Monitoring.
     litellm_telemetry_interval_minutes: int = 10
+    # Judges each model's recent performance and rests the ones past the account's failover thresholds.
+    model_health_interval_minutes: int = 2
     # A posting with no real description cannot be ranked honestly: the model would be scoring a job title.
     # Postings shorter than this (and with no parsed structure) wait instead, and are ranked if a description
     # arrives later. Several boards — Naukri and Bayt in particular — return listings without one.

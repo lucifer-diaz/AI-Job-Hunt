@@ -589,6 +589,7 @@ def cleanup(ctx: JobContext) -> dict[str, Any]:
     with ctx.sessions() as db:
         telemetry = monitoring.prune(db, ctx.now)
         external = external_monitoring.prune(db, ctx.now)
+        external["captured_cleared"] = external_monitoring.clear_captured(db, ctx.now)
         logs = system_log.prune(db, ctx.now)
         retention = {"telemetry": telemetry, "external_api": external, "system_logs": logs}
         if not _is_postgres(db):
@@ -604,6 +605,26 @@ def litellm_telemetry(ctx: JobContext) -> dict[str, Any]:
     if not result["accounts"]:
         return skipped("No auto-router requests waiting for LiteLLM routing details", **result)
     return result
+
+
+def model_health_job(ctx: JobContext) -> dict[str, Any]:
+    """Judge each account's recently used model routes against its failover thresholds. Recommends nothing and
+    edits no configuration: a breaching route is rested (an overlay) and a notification is queued."""
+    from app.services import model_health
+
+    accounts = _account_ids(ctx)
+    summary: dict[str, Any] = {"accounts": len(accounts), "routes": 0, "tripped": 0, "errors": []}
+    for user_id in accounts:
+        try:
+            with _as_user(ctx.sessions(), user_id) as db:
+                result = model_health.evaluate(db, user_id, now=ctx.now)
+            summary["routes"] += result["routes"]
+            summary["tripped"] += result["tripped"]
+        except Exception as exc:  # one account's failure must not stop the others
+            summary["errors"].append(_error(user_id, exc))
+    if not summary["routes"] and not summary["errors"]:
+        return skipped("No model requests in any failover window", **summary)
+    return summary
 
 
 ADVISOR_BATCH = 5
@@ -659,6 +680,8 @@ JOBS: list[JobSpec] = [
             "Analyses LLM usage and writes recommendations; never changes configuration."),
     JobSpec("litellm_telemetry", "LiteLLM routing import", "litellm_telemetry_interval_minutes", litellm_telemetry,
             "Adds the auto router's tier and cause from LiteLLM's spend logs to Monitoring."),
+    JobSpec("model_health", "Model health & failover", "model_health_interval_minutes", model_health_job,
+            "Judges each model's recent performance and rests the ones past the failover thresholds; never edits configuration."),
     JobSpec("cleanup", "Cleanup", "cleanup_interval_minutes", cleanup,
             "Recovers jobs left locked by crashed workers and applies LLM telemetry retention."),
 ]

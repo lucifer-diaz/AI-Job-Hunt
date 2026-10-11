@@ -78,8 +78,12 @@ _capture_cache: dict[int, tuple[float, bool]] = {}
 def capture_payloads(user_id: int | None) -> bool:
     """Whether this call's full prompt and response are stored: LLM_PROMPT_DEBUG for everyone, or the account's own
     switch (Monitoring → LLM requests). Read through a short cache; never raises (telemetry is best effort)."""
-    if get_settings().llm_prompt_debug:
-        return True
+    return get_settings().llm_prompt_debug or account_captures(user_id)
+
+
+def account_captures(user_id: int | None) -> bool:
+    """The account's own capture switch alone (it also covers external API bodies, which LLM_PROMPT_DEBUG does not).
+    Read through a short cache; never raises."""
     if user_id is None:
         return False
     import time
@@ -201,6 +205,7 @@ class Attempt:
     model_group: str | None = None
     routing_tier: str | None = None
     routing_cause: str | None = None
+    failed_over_from: str | None = None  # the model failover moved this request off (app.services.failover)
     fallback_used: bool | None = None
     escalated: bool = False
     escalation_reason: str | None = None
@@ -302,7 +307,9 @@ def _routing(attempt: Attempt) -> dict[str, Any]:
             "configured_model": (attempt.configured_model or "")[:200] or None,
             "config_version": attempt.config_version, "litellm_call_id": (attempt.litellm_call_id or "")[:64] or None,
             "model_group": (attempt.model_group or "")[:200] or None, "routing_tier": attempt.routing_tier,
-            "routing_cause": (attempt.routing_cause or "")[:60] or None, "fallback_used": attempt.fallback_used,
+            "routing_cause": (attempt.routing_cause or "")[:60] or None,
+            "failed_over_from": (attempt.failed_over_from or "")[:200] or None if attempt.routing_cause == "FAILOVER"
+            else None, "fallback_used": attempt.fallback_used,
             "escalated": attempt.escalated, "escalation_reason": attempt.escalation_reason,
             "confidence": attempt.confidence}
 
@@ -346,6 +353,9 @@ def record(attempt: Attempt, *, latency_ms: int, error: BaseException | None = N
         entry = build_entry(attempt, latency_ms=latency_ms, error=error, error_type=error_type)
         persist(entry)
         log_call(entry)
+        from app.services import model_health
+
+        model_health.record_outcome(entry)  # route health: never raises
     except Exception:  # noqa: BLE001  telemetry is best effort by design
         log.warning("could not record LLM telemetry for %s/%s", attempt.provider, attempt.requested_model,
                     exc_info=True)

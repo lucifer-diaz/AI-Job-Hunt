@@ -65,6 +65,8 @@ class User(Base):
     search_profiles: Mapped[list[SearchProfile]] = relationship(back_populates="user", passive_deletes=True)
     saved_searches: Mapped[list[SavedSearch]] = relationship(back_populates="user", passive_deletes=True)
     provider_cooldowns: Mapped[list[ProviderCooldown]] = relationship(back_populates="user", passive_deletes=True)
+    model_route_states: Mapped[list[ModelRouteState]] = relationship(back_populates="user", passive_deletes=True)
+    failover_events: Mapped[list[FailoverEvent]] = relationship(back_populates="user", passive_deletes=True)
     applications: Mapped[list[Application]] = relationship(back_populates="user", passive_deletes=True)
     resume_variants: Mapped[list[ResumeVariant]] = relationship(back_populates="user", passive_deletes=True)
     tailor_tasks: Mapped[list[TailorTask]] = relationship(back_populates="user", passive_deletes=True)
@@ -1625,6 +1627,7 @@ class LLMRequestLog(Base):
     model_group: Mapped[str | None] = mapped_column(String(200), nullable=True)
     routing_tier: Mapped[str | None] = mapped_column(String(30), nullable=True)
     routing_cause: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    failed_over_from: Mapped[str | None] = mapped_column(String(200), nullable=True)  # FAILOVER: the resting model
     # Infrastructure fallback (LiteLLM answered from another model group) and quality escalation (Job Hunt OS asked
     # a stronger model because the first answer was not good enough) are separate facts on purpose.
     fallback_used: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
@@ -1744,6 +1747,9 @@ class ExternalAPIRequestLog(Base):
     cost_source: Mapped[str] = mapped_column(String(20), default="unknown")  # provider_reported | pricing_table | free | unknown
     # Safe, provider-specific facts: actor and run ids, dataset counts, model names. Redacted before it is stored.
     request_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # The redacted request and response ({"request": {...}, "response": {...}}), only when the account turned on
+    # capture or the server set EXTERNAL_API_DEBUG_PAYLOADS; cleared after llm_prompt_debug_retention_days.
+    payload: Mapped[dict[str, Any] | None] = mapped_column(JSON(none_as_null=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
 
@@ -1777,7 +1783,7 @@ class ProviderCooldown(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = _owner("provider_cooldowns")
     user: Mapped[User] = relationship(back_populates="provider_cooldowns")
-    provider: Mapped[str] = mapped_column(String(30))
+    provider: Mapped[str] = mapped_column(String(230))  # a provider, or LITELLM:<model> (external_api.cooldown_provider)
     until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     # Rate limits in a row: the exponent behind the delay. Reset to zero by the next successful call.
     consecutive: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
@@ -2054,6 +2060,14 @@ class AIModel(Base):
     max_context_window: Mapped[int | None] = mapped_column(Integer, nullable=True)
     max_output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     overrides: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # Failover for every worker that uses this model (app.services.failover): the models tried, in order, when it is
+    # rate limited or failing, and how long it rests before it is tried again (NULL = the account's Reliability
+    # setting). Configuration: versioned with the rest.
+    fallback_models: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    rest_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Removed from Job Hunt OS by a person (ai_model_config.remove_model): out of the configuration and every picker,
+    # and a sync leaves it removed. NULL = in use. A discovered model stays in LiteLLM.
+    removed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     managed: Mapped[bool] = mapped_column(Boolean, default=False)
     # Managed models only: the LiteLLM deployment (litellm_params) Job Hunt OS deploys. Never a literal secret —
     # credentials must be LiteLLM `os.environ/NAME` references, which validation enforces.
@@ -2111,6 +2125,8 @@ class WorkerModelConfig(Base):
     primary_model: Mapped[str | None] = mapped_column(String(200), nullable=True)
     tier_name: Mapped[str | None] = mapped_column(String(60), nullable=True)
     fallback_model: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # Further models to try after `fallback_model`, in order (app.services.failover). Part of the versioned config.
+    secondary_models: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     temperature: Mapped[float | None] = mapped_column(Float, nullable=True)
     max_output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     context_window: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -2205,6 +2221,61 @@ class AIConfigAuditEntry(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
     user: Mapped[User] = relationship(back_populates="ai_config_audit")
+
+
+ROUTE_STATES = ("HEALTHY", "DEGRADED", "COOLING")
+FAILOVER_CAUSES = ("RATE_LIMIT", "ERROR_RATE", "LATENCY", "SCHEMA", "MANUAL", "RECOVERED")
+
+
+class ModelRouteState(Base):
+    """The runtime health of one model, overall (worker_type '') or for one worker (app.services.model_health).
+
+    An overlay on the active AI configuration: failover reads it to pick a model and never edits the configuration.
+    """
+
+    __tablename__ = "model_route_states"
+    __table_args__ = (
+        UniqueConstraint("user_id", "worker_type", "model", name="uq_model_route_states_route"),
+        CheckConstraint(f"state IN ({_values(ROUTE_STATES)})", name="ck_model_route_states_state"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("model_route_states")
+    user: Mapped[User] = relationship(back_populates="model_route_states")
+    worker_type: Mapped[str] = mapped_column(String(40), default="", server_default="")
+    model: Mapped[str] = mapped_column(String(200))
+    state: Mapped[str] = mapped_column(String(12), default="HEALTHY", server_default="HEALTHY")
+    score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    stats: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    reason: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    cooling_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    consecutive_failures: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    probe_successes: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    last_changed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+
+class FailoverEvent(Base):
+    """One automatic (or manual) switch away from, or back to, a model. The browser-notification feed."""
+
+    __tablename__ = "failover_events"
+    __table_args__ = (
+        Index("ix_failover_events_user_created", "user_id", "created_at"),
+        CheckConstraint(f"cause IN ({_values(FAILOVER_CAUSES)})", name="ck_failover_events_cause"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("failover_events")
+    user: Mapped[User] = relationship(back_populates="failover_events")
+    worker_type: Mapped[str] = mapped_column(String(40), default="", server_default="")
+    from_model: Mapped[str] = mapped_column(String(200))
+    to_model: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    cause: Mapped[str] = mapped_column(String(16))
+    algorithm: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    message: Mapped[str] = mapped_column(String(400))
+    metrics: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 # Registers the per-user isolation hooks on every session; needs the models above.
