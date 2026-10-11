@@ -40,12 +40,14 @@ SECRET_FIELD_RE = re.compile(
     r"(?i)(?:^|[_\-.])(?:api[_\-]?key|secret|password|passwd|passphrase|authorization|cookie|credentials?|"
     r"private[_\-]?key|(?:access|refresh|id|auth|session|bearer|csrf)[_\-]?token|token|database[_\-]?url|"
     r"db[_\-]?url|dsn|connection[_\-]?string|master[_\-]?key|salt[_\-]?key)(?:$|[_\-.])")
-_SECRET_NAME = (r"[a-z0-9_\-]*(?:api[_\-]?key|secret|password|passwd|authorization|cookie|credential|database[_\-]?url|"
-                r"access[_\-]?token|refresh[_\-]?token|auth[_\-]?token|session[_\-]?token|private[_\-]?key)[a-z0-9_\-]*")
+# The affixes are bounded: an unbounded `[a-z0-9_\-]*` prefix made this pattern quadratic on any long run of word
+# characters (4,000 characters took a second, a captured page minutes) and `re` holds the GIL, freezing every request.
+_SECRET_NAME = (r"[a-z0-9_\-]{0,64}(?:api[_\-]?key|secret|password|passwd|authorization|cookie|credential|database[_\-]?url|"
+                r"access[_\-]?token|refresh[_\-]?token|auth[_\-]?token|session[_\-]?token|private[_\-]?key)[a-z0-9_\-]{0,64}")
 # Secret-shaped strings, redacted wherever they appear in free text (error messages, URLs, payload extracts).
 SECRET_PATTERNS = [
     # A password inside a connection string or URL: scheme://user:PASSWORD@host
-    re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^:/\s@]+:)[^@\s/]+(?=@)"),
+    re.compile(r"(?i)\b([a-z][a-z0-9+.\-]{0,31}://[^:/\s@]+:)[^@\s/]+(?=@)"),
     re.compile(r"eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}"),  # JWTs
     re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|xox[abprs]-[A-Za-z0-9\-]{10,}|AKIA[0-9A-Z]{16})\b"),
     re.compile(r"sk-(?:or-v1-|ant-|proj-)?[A-Za-z0-9_\-]{8,}"),

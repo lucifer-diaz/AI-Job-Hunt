@@ -1564,6 +1564,7 @@ class LLMRequestLog(Base):
         Index("ix_llm_request_logs_model_created", "model", "created_at"),
         Index("ix_llm_request_logs_created_at", "created_at"),
         Index("ix_llm_request_logs_worker_created", "worker_type", "created_at"),
+        Index("ix_llm_request_logs_config_created", "config_version", "created_at"),
         UniqueConstraint("request_id", name="uq_llm_request_logs_request_id"),
     )
 
@@ -1640,6 +1641,18 @@ class LLMRequestLog(Base):
     schema_enforcement: Mapped[str | None] = mapped_column(String(20), nullable=True)
     validation_failure_reason: Mapped[str | None] = mapped_column(String(40), nullable=True)
     context_builder_version: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # Performance facts (app.services.model_performance). Each is NULL unless the provider or gateway reported it or
+    # Job Hunt OS measured it: NULL means unknown, never zero.
+    #   ttft_ms          time to first token; only a streaming adapter can report it (none streams today)
+    #   generation_ms    the model call's own duration as LiteLLM reports it (response duration minus gateway overhead)
+    #   queue_wait_ms    time spent waiting for the worker's max-concurrency slot (measured; NULL when no limit is set)
+    #   gateway_overhead_ms  LiteLLM's own overhead as reported in x-litellm-overhead-duration-ms
+    ttft_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    generation_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    queue_wait_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    gateway_overhead_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reasoning_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    service_tier: Mapped[str | None] = mapped_column(String(30), nullable=True)  # as the provider reported it
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 

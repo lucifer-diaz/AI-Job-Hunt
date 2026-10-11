@@ -52,6 +52,17 @@ async function orchLoadJob(withTrace = true) {
     Object.assign(D, { orchJob: job, orchTrace: trace });
   } catch (e) { toast(e.message, true); o.jobId = null; D.orchJob = D.orchTrace = null; }
 }
+/* Per model that actually answered, per configuration version and over time: the Monitoring comparison, for this stage. */
+function orchModelPerformance(d) {
+  const p = d.performance; if (!p || !p.models.totals.requests) return '';
+  const o = orchState(), dim = o.perfDim || 'overview';
+  const series = p.series.map(g => ({ ...g, label: g.label.slice(p.series_by === 'hour' ? 5 : 0) }));
+  return `<div class="row between wrap gap8 mt14 mb8"><div class="caps-sm">By model that answered</div>${monPerfDimSwitch(dim, 'orch-perf-dim')}</div>
+    ${monPerfTable(p.models.groups, 'Actual model', dim)}
+    ${p.config_versions.length > 1 || p.config_versions[0]?.key !== 'unrecorded' ? `<div class="caps-sm mt14 mb8">By configuration version</div>${monPerfTable(p.config_versions, 'Config', dim)}` : ''}
+    <div class="caps-sm mt14 mb8">Over time (per ${esc(p.series_by)})</div>${monPerfTable(series, p.series_by === 'hour' ? 'Hour' : 'Day', dim)}
+    <div class="xs muted mt8">A dash means the provider did not report it. ${btn('Open Model performance', 'orch-monitoring', { tab: 'models', stage: d.node?.llm_stages?.[0] || '' }, 'sm')}</div>`;
+}
 async function orchLoadNode() {
   const o = orchState(); if (!o.node) return;
   try {
@@ -143,6 +154,8 @@ function orchProcessed(g, id) {
   return out.length ? out.reduce((a, e) => a + (g.edges[e.id].count || 0), 0) : null;
 }
 function orchMetricLine(g, n, rt) {
+  const mh = rt.model_health?.[0];
+  if (mh) return `${mh.model} · ${mh.requests} req · ${monPct(mh.success_rate, 0)} ok · p95 ${monMs(mh.p95_latency_ms)} · ${monPerMin(mh.requests_per_min)}/min · schema ${monPct(mh.schema_pass_rate, 0)} · ${mh.free ? '$0' : mh.cost == null ? 'cost ?' : monUSD(mh.cost)}`;
   if (rt.llm && rt.llm.requests) return `p95 ${monMs(rt.llm.p95_latency_ms)} · ${monPct(rt.llm.success_rate)} ok · ${rt.llm.requests} calls`;
   if (rt.tasks && rt.tasks.tasks) return `${rt.tasks.completed} done${rt.tasks.failed ? ` · ${rt.tasks.failed} failed` : ''} · median ${orchSecs(rt.tasks.median_run_seconds)}`;
   if (rt.external && rt.external.requests) return `${rt.external.requests} calls · ${monPct(rt.external.success_rate)} ok · p95 ${monMs(rt.external.p95_latency_ms)}`;
@@ -396,7 +409,7 @@ function orchNodePerformance(g, n, d) {
       ${orchTile('Timeouts', x.timeouts)}${orchTile('p95', monMs(x.p95_latency_ms))}${orchTile('Cost', x.estimated_cost == null ? 'Unknown' : monUSD(x.estimated_cost))}</div>` : '';
   const q = d.quality, quality = q ? `<div class="caps-sm mt14 mb8">Outcomes stored for this stage${q.low_sample ? ' · small sample' : ''}</div><div class="orch-kvs">${Object.entries(q).filter(([k]) => k !== 'low_sample').map(([k, v]) => orchKV(k.replace(/_/g, ' '), esc(typeof v === 'object' ? Object.entries(v).map(([a, b]) => `${a} ${b}`).join(', ') || '—' : String(k.endsWith('rate') ? monPct(v) : v ?? '—')))).join('')}</div>` : '';
   const methods = d.fetch_methods ? `<div class="caps-sm mt14 mb8">How descriptions were fetched</div><div class="small">${esc(Object.entries(d.fetch_methods).map(([k, v]) => `${k.toLowerCase()} ${v}`).join(' · '))}${d.playwright_used != null ? ` · browser used ${d.playwright_used}×` : ''}</div>` : '';
-  return llm + tasks + ext + quality + methods || '<div class="small muted">Nothing is recorded for this stage in this range.</div>';
+  return llm + orchModelPerformance(d) + tasks + ext + quality + methods || '<div class="small muted">Nothing is recorded for this stage in this range.</div>';
 }
 function orchNodeRouting(g, n, d) {
   const r = d.routing; if (!r) return '<div class="small muted">Not an AI stage.</div>';
@@ -587,6 +600,7 @@ const ORCHESTRATION_ACTIONS = {
       render();
     }
   },
+  'orch-perf-dim': el => { orchState().perfDim = el.dataset.id; render(); },
   'orch-close': () => { Object.assign(orchState(), { node: null, edge: null, traceOpen: false }); render(); },
   'orch-zoom': el => {
     const id = el.dataset.id, canvas = document.querySelector('[data-orch-canvas]');

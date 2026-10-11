@@ -208,6 +208,14 @@ class TailoringResult(Contract):
                                     description="only when SOURCE RESUME has no roles")
     selected_evidence_ids: EvidenceIds = Field(description="every evidence id used anywhere above")
 
+    @field_validator("role_updates", "highlights", mode="before")
+    @classmethod
+    def _null_is_nothing(cls, value: Any) -> Any:
+        """Models answer null for "nothing here" (as they do for summary). That means no rewritten roles or
+        highlights, exactly what an empty list says; it adds nothing, so it is accepted rather than failing a good
+        answer. The not-empty check below still rejects a result that changes nothing."""
+        return [] if value is None else value
+
     @model_validator(mode="after")
     def _not_empty(self) -> TailoringResult:
         if self.summary is None and not self.skills_order and not self.role_updates and not self.highlights:

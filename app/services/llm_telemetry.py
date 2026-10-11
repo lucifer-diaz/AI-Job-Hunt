@@ -173,6 +173,7 @@ class Usage:
     cache_write_tokens: int | None = None
     uncached_input_tokens: int | None = None  # what the base input rate applies to
     reported_cost: float | None = None
+    reasoning_tokens: int | None = None  # only when the provider itemises them
     source: str = "provider_reported"
 
 
@@ -213,6 +214,12 @@ class Attempt:
     context_window: int | None = None  # known from the model registry when the catalog has no entry
     schema_enforcement: str | None = None  # native_schema | json_mode | prompt_only | none
     validation_failure_reason: str | None = None
+    # Performance facts, set only when reported or measured (see LLMRequestLog).
+    ttft_ms: int | None = None
+    generation_ms: int | None = None
+    queue_wait_ms: int | None = None
+    gateway_overhead_ms: int | None = None
+    service_tier: str | None = None
 
 
 _sessions: Callable[[], Session] | None = None
@@ -288,6 +295,10 @@ def build_entry(attempt: Attempt, *, latency_ms: int, error: BaseException | Non
         "schema_enforcement": attempt.schema_enforcement,
         "validation_failure_reason": attempt.validation_failure_reason,
         "context_builder_version": ((call.context_stats or {}).get("context_builder_version") or None),
+        "ttft_ms": attempt.ttft_ms, "generation_ms": attempt.generation_ms, "queue_wait_ms": attempt.queue_wait_ms,
+        "gateway_overhead_ms": attempt.gateway_overhead_ms,
+        "reasoning_tokens": usage.reasoning_tokens if usage else None,
+        "service_tier": (attempt.service_tier or "")[:30] or None,
         "debug_prompt": redaction.redact_text(f"{attempt.system}\n\n{attempt.user}", DEBUG_TEXT_LIMIT) if debug else None,
         "debug_response": redaction.redact_text(attempt.response_text, DEBUG_TEXT_LIMIT)
         if debug and attempt.response_text else None,
