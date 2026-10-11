@@ -413,7 +413,9 @@ def _change(plan: dict[str, Any], last: Any | None, finished: bool = False) -> d
             return {"kind": "ESCALATED", "from": plan.get("primary"), "to": last.model or last.requested_model,
                     "reason": (last.escalation_reason or "").replace("_", " ").lower() or "quality escalation"}
         if last.routing_cause == "FAILOVER":
-            return {"kind": "FAILOVER", "from": plan.get("primary"), "to": last.model or last.requested_model,
+            # the request's own fact; a row from before it was recorded falls back to today's plan only while active
+            source = last.failed_over_from or (None if finished else plan.get("primary"))
+            return {"kind": "FAILOVER", "from": source, "to": last.model or last.requested_model,
                     "reason": "its model was resting"}
         if last.fallback_used:
             return {"kind": "FALLBACK", "from": last.requested_model, "to": last.model,

@@ -99,7 +99,8 @@ These rules keep the model a worker uses a matter of configuration, never of cod
 * **Deleting a model is a soft removal** (`ai_model_config.remove_model`, `AIModel.removed_at`): it leaves the draft,
   every picker and the next version, and `ai_registry.discover` never brings it back; Restore (or a rollback to a version
   that had it) does. It is refused while anything still uses it (`model_references`). Only a deployment Job Hunt OS owns
-  leaves LiteLLM (through the normal apply); a discovered model stays in LiteLLM.
+  leaves LiteLLM (through the normal apply; `managed` is kept, so Restore redeploys it); a discovered model stays in
+  LiteLLM. Undo (`discard_draft`) removes again a model restored since the active version.
 * **Prompts remain under `app/prompts/`.** Prompts say *what* a model is asked to do; worker configuration decides
   *which* model, its generation settings and routing. Never put model selection in a prompt, or a prompt in the
   configuration.
@@ -359,7 +360,8 @@ other static files.
   `source` is `used` from the task's own `llm_request_logs` rows, or `next` from `LLMClient.route_for`) and
   `model_change` (FAILOVER, RESTING, FALLBACK, ESCALATED, CONFIG) to active rows. One bounded query, metadata only, and
   it never raises. Finished rows keep the model their own last request used (`source` `used`, or `none` when the task
-  never called a model) and only that request's change (FAILOVER, FALLBACK, ESCALATED).
+  never called a model) and only that request's change (FAILOVER, FALLBACK, ESCALATED); a failover's origin is the
+  request's own `llm_request_logs.failed_over_from`, never today's configuration.
 * **A paused worker holds its queue, never drops it.** Its claim skips the account's tasks unless `run_now_at` is set
   (ranking: unless the task is forced).
 

@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from app.services import backoff, tracing
-from app.services.redaction import redact_body, redact_headers, redact_text, redact_value
+from app.services.redaction import redact_body, redact_headers, redact_text, redact_url, redact_value
 from app.settings import get_settings
 
 if TYPE_CHECKING:
@@ -307,9 +307,9 @@ def capture_limit(call: ExternalCall) -> int | None:
     prompts) up to EXTERNAL_API_CAPTURE_LIMIT. Never raises."""
     settings = get_settings()
     try:
-        from app.services.llm_telemetry import capture_payloads
+        from app.services.llm_telemetry import account_captures
 
-        if capture_payloads(owner_of(call)):
+        if account_captures(owner_of(call)):  # the account's own switch; LLM_PROMPT_DEBUG covers LLM text only
             return settings.external_api_capture_limit
     except Exception:  # noqa: BLE001  telemetry is best effort
         log.debug("could not read the capture setting", exc_info=True)
@@ -324,7 +324,7 @@ def capture_payload(call: ExternalCall, request: httpx.Request, response: httpx.
         if not limit:
             return
         body = None if request.extensions.get("jobhunt_streamed") else request.content
-        payload: dict[str, Any] = {"request": {"method": request.method, "url": redact_text(str(request.url), 2000),
+        payload: dict[str, Any] = {"request": {"method": request.method, "url": redact_url(str(request.url)),
                                                "headers": redact_headers(request.headers),
                                                "body": redact_body(body, limit)}}
         if response is not None:

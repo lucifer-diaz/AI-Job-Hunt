@@ -1168,7 +1168,9 @@ def remove_model(db: Session, user_id: int, name: str, expected_revision: int | 
         raise ConfigConflict(f"{name} is still used by: {', '.join(references)}. Change those first.",
                              references=references)
     conn = _bump(db, user_id, expected_revision)
-    row.removed_at, row.enabled, row.managed, row.updated_at = utcnow(), False, False, utcnow()
+    # `managed` is kept: the snapshot leaves the model out, so the apply deletes an owned deployment anyway, and a
+    # Restore redeploys it
+    row.removed_at, row.enabled, row.updated_at = utcnow(), False, utcnow()
     db.execute(delete(ModelRouteState).where(ModelRouteState.user_id == user_id, ModelRouteState.model == name))
     audit(db, user_id, "REMOVE", actor=_actor(db, user_id), changes=[{"model": name}])
     db.commit()
@@ -1176,7 +1178,7 @@ def remove_model(db: Session, user_id: int, name: str, expected_revision: int | 
 
 
 def restore_model(db: Session, user_id: int, name: str, expected_revision: int | None = None) -> dict[str, Any]:
-    """Bring a removed model back as an enabled reference (a model that was managed is added again to redeploy)."""
+    """Bring a removed model back, enabled; a model Job Hunt OS managed is redeployed by the apply that follows."""
     row = db.scalar(select(AIModel).where(AIModel.user_id == user_id, AIModel.litellm_model_name == name,
                                           AIModel.removed_at.is_not(None)))
     if row is None:
@@ -1238,7 +1240,7 @@ def write_snapshot_to_draft(db: Session, user_id: int, snapshot: dict[str, Any])
     models = {m.litellm_model_name: m for m in db.scalars(select(AIModel).where(AIModel.user_id == user_id)).all()}
     wanted_models = snapshot.get("models") or {}
     for name, row in models.items():
-        if name not in wanted_models and row.managed:
+        if name not in wanted_models and row.managed and row.removed_at is None:
             row.managed = False  # added after that version: its deployment is removed again
     for name, entry in wanted_models.items():
         row = models.get(name) or AIModel(user_id=user_id, litellm_model_name=name, source="USER",
@@ -1438,10 +1440,23 @@ def discard_draft(db: Session, user_id: int) -> dict[str, Any]:
     active = active_version(db, user_id)
     if active is None:
         raise NotFound("There is no applied configuration to go back to")
-    write_snapshot_to_draft(db, user_id, active.configuration_snapshot or {})
+    snapshot = active.configuration_snapshot or {}
+    write_snapshot_to_draft(db, user_id, snapshot)
+    _unrestore(db, user_id, snapshot, active.created_at)
     db.commit()
     return {"status": "DISCARDED", "active_version": active.version_number,
             "draft_revision": connection_for(db, user_id).draft_revision}
+
+
+def _unrestore(db: Session, user_id: int, snapshot: dict[str, Any], since: datetime | None) -> None:
+    """A model restored after the active version and absent from it is removed again: Undo puts a refused Restore back."""
+    restored = {(c or {}).get("model") for r in db.scalars(select(AIConfigAuditEntry).where(
+        AIConfigAuditEntry.user_id == user_id, AIConfigAuditEntry.action == "RESTORE",
+        *([AIConfigAuditEntry.created_at >= since] if since else []))).all() for c in (r.changes or [])}
+    wanted = snapshot.get("models") or {}
+    for row in db.scalars(select(AIModel).where(AIModel.user_id == user_id, AIModel.removed_at.is_(None))).all():
+        if row.litellm_model_name in restored and row.litellm_model_name not in wanted:
+            row.removed_at, row.enabled, row.updated_at = utcnow(), False, utcnow()
 
 
 def verify(db: Session, user_id: int) -> dict[str, Any]:
@@ -1481,6 +1496,9 @@ def _referenced(snapshot: dict[str, Any]) -> set[str]:
     for config in (snapshot.get("workers") or {}).values():
         names.add(config.get("fallback_model"))
         names.update(config.get("secondary_models") or ())
+    models = snapshot.get("models") or {}
+    for name in [n for n in names if n]:  # a primary's own fallbacks join its chain (ResolvedWorker.chain)
+        names.update((models.get(name) or {}).get("fallback_models") or ())
     return {n for n in names if n}
 
 

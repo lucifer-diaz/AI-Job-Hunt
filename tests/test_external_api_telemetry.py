@@ -394,3 +394,17 @@ def test_a_log_line_shows_the_captured_request_and_response(owner, capture_on):
     shown = detail["external_request"]["payload"]
     assert '"query": "q"' in shown["request"]["body"]
     assert shown["response"]["status"] == 404 and "no such actor" in shown["response"]["body"]
+
+
+def test_captured_urls_lose_their_credential_query_values(owner, capture_on):
+    with client(user_id=owner) as http:
+        http.get("https://api.apify.com/v2/datasets/d/items", params={"q": "x", "code": "4/0AbCdEf", "api_key": "short"})
+    url = only().payload["request"]["url"]
+    assert "4/0AbCdEf" not in url and "short" not in url and "q=x" in url
+
+
+def test_llm_prompt_debug_alone_keeps_no_external_bodies(owner, monkeypatch):
+    monkeypatch.setattr(get_settings(), "llm_prompt_debug", True)  # LLM text only: not third-party bodies
+    with client(user_id=owner) as http:
+        http.post("https://api.apify.com/v2/actors/x~y/runs", json={"query": "q"})
+    assert only().payload is None

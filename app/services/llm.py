@@ -499,6 +499,7 @@ class LLMClient:
                           configured_model=resolved.configured, config_version=resolved.config_version,
                           escalated=escalation is not None, escalation_reason=escalation,
                           routing_cause="FAILOVER" if resolved.failed_over_from and escalation is None else None,
+                          failed_over_from=resolved.failed_over_from if escalation is None else None,
                           context_window=resolved.context_limit(model))
         started = time.monotonic()
         failure: BaseException | None = None

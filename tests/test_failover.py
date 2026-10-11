@@ -279,6 +279,7 @@ def test_a_rate_limited_primary_fails_over_to_a_secondary_model_and_back(gateway
         last = db.scalars(select(LLMRequestLog).where(LLMRequestLog.user_id == uid)
                           .order_by(LLMRequestLog.id.desc())).first()
     assert last.requested_model == "tier-1-fast" and last.routing_cause == "FAILOVER"
+    assert last.failed_over_from == primary  # the request's own fact, read by Running workers for finished tasks
     assert [e.cause for e in events(uid)] == ["RATE_LIMIT"]
     with SessionLocal() as db:  # Running workers reads the same plan: where the next request goes and why
         plan = LLMClient.for_user(db, uid).route_for("RANKER")
@@ -334,3 +335,12 @@ def test_apply_during_a_litellm_cooldown_is_a_429_not_a_server_error(monkeypatch
     monkeypatch.setattr(ai_model_config, "apply", cooling)
     response = client.post("/api/settings/ai/apply", json={})
     assert response.status_code == 429 and "LITELLM" in response.json()["detail"]
+
+
+def test_a_resting_backup_moves_behind_the_healthy_ones_while_the_primary_keeps_its_place(owner):
+    w = resolve(snapshot(RANKER={"mode": "FIXED", "primary_model": "mid", "fallback_model": "fast",
+                                 "secondary_models": ["deep"]}), "RANKER")
+    assert w.chain() == ["fast", "deep"]
+    outcome(owner, model="fast", status="FAILED", error_type="RATE_LIMIT")
+    moved = failover.apply(w, owner)
+    assert moved.model == "mid" and moved.failed_over_from is None and moved.chain() == ["deep", "fast"]

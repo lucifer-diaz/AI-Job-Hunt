@@ -487,6 +487,9 @@ def test_removing_a_model_is_refused_while_used_and_a_sync_does_not_bring_it_bac
     assert any(d["model_name"] == "cloud-mini" for d in litellm.deployments)  # discovered: still in LiteLLM
     account.call("POST", "/models/cloud-mini/restore", json={"revision": account.revision()})
     assert "cloud-mini" in [m["name"] for m in account.get("")["models"]]
+    account.call("POST", "/discard")  # Undo of a refused restore: the model is removed again, not left in the draft
+    assert "cloud-mini" not in [m["name"] for m in account.get("")["models"]]
+    assert [r["name"] for r in account.get("")["removed_models"]] == ["cloud-mini"]
     account.call("POST", "/models/nothing-here/remove", expect=404, json={"revision": account.revision()})
 
 
@@ -499,7 +502,21 @@ def test_removing_a_managed_model_deletes_its_deployment_and_a_rollback_brings_i
     account.call("POST", "/models/local-small/remove", json={"revision": account.revision()})
     account.apply()
     assert not any(d["model_name"] == "local-small" for d in litellm.managed())  # ours: removed from LiteLLM too
+    account.call("POST", "/models/local-small/restore", json={"revision": account.revision()})
+    account.apply()  # still ours: restoring redeploys it
+    assert any(d["model_name"] == "local-small" for d in litellm.managed())
+    account.call("POST", "/models/local-small/remove", json={"revision": account.revision()})
+    account.apply()
     versions = account.get("/versions")["versions"]
     with_model = next(v for v in versions if v["version"] == added["version"])
     account.call("POST", f"/versions/{with_model['id']}/restore", json={"base_version": account.get("")["active_version"]})
     assert "local-small" in [m["name"] for m in account.get("")["models"]]
+
+
+def test_verification_counts_a_primary_models_own_fallbacks():
+    from app.services.ai_model_config import _referenced
+
+    snap = snapshot(RANKER={"mode": "FIXED", "primary_model": "mid"})
+    snap["models"]["mid"]["fallback_models"] = ["deep"]
+    snap["models"]["fast"]["fallback_models"] = ["never-used"]  # not a primary: its fallbacks join no chain
+    assert "deep" in _referenced(snap) and "never-used" not in _referenced(snap)

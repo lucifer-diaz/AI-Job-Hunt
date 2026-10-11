@@ -1627,6 +1627,7 @@ class LLMRequestLog(Base):
     model_group: Mapped[str | None] = mapped_column(String(200), nullable=True)
     routing_tier: Mapped[str | None] = mapped_column(String(30), nullable=True)
     routing_cause: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    failed_over_from: Mapped[str | None] = mapped_column(String(200), nullable=True)  # FAILOVER: the resting model
     # Infrastructure fallback (LiteLLM answered from another model group) and quality escalation (Job Hunt OS asked
     # a stronger model because the first answer was not good enough) are separate facts on purpose.
     fallback_used: Mapped[bool | None] = mapped_column(Boolean, nullable=True)

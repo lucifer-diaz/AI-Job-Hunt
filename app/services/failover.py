@@ -60,8 +60,8 @@ def _key(algorithm: str, user_id: int, worker_type: str, model: str, position: i
 def order(worker: ResolvedWorker, user_id: int, cfg: dict[str, Any]) -> list[str]:
     chain = [worker.model, *worker.chain()]
     healthy = [m for m in chain if not model_health.resting(user_id, m, worker.worker_type)]
-    if worker.model in healthy:
-        return chain  # the primary is healthy: nothing changes
+    if worker.model in healthy:  # the primary keeps its place; a resting backup moves behind the healthy ones
+        return [*healthy, *(m for m in chain if m not in healthy)]
     rest = [m for m in chain if m not in healthy]
     ranked = sorted(healthy, key=lambda m: _key(cfg["algorithm"], user_id, worker.worker_type, m, chain.index(m)))
     return [*ranked, *rest]
@@ -76,8 +76,12 @@ def apply(worker: ResolvedWorker, user_id: int | None) -> ResolvedWorker:
         if not cfg["enabled"]:
             return worker
         ordered = order(worker, user_id, cfg)
-        if ordered[0] == worker.model:
+        if ordered == [worker.model, *worker.chain()]:
             return worker
+        if ordered[0] == worker.model:  # only the backups were reordered: no failover, nothing to note
+            return replace(worker, fallback_model=ordered[1] if len(ordered) > 1 else None,
+                           secondary_models=tuple(ordered[2:]), model_fallbacks=(),
+                           capabilities={**worker.capabilities})
         note = f"failover: {worker.model} is resting; using {ordered[0]}"
         return replace(worker, model=ordered[0], fallback_model=ordered[1] if len(ordered) > 1 else None,
                        secondary_models=tuple(ordered[2:]), model_fallbacks=(), failed_over_from=worker.model,
