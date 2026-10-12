@@ -118,6 +118,16 @@ def worker(kind: str, request: Request, range: str = Query("7d", pattern="^(toda
     return out
 
 
+@router.get("/{kind}/performance")
+def worker_performance(kind: str, range: str = Query("7d", pattern="^(today|7d|30d|90d)$"),  # noqa: A002
+                       user: CurrentUser = Depends(current_user),
+                       db: Session = Depends(get_user_db)) -> dict[str, Any]:
+    """One worker's results and model calls in the selected range, read from its task rows: Clear finished, which
+    only hides the list, never changes them."""
+    begin, finish = monitoring.time_range(range)
+    return _guard(workers.performance, db, user.id, kind, begin, finish)
+
+
 @router.get("/{kind}/activity")
 def worker_activity(kind: str, user: CurrentUser = Depends(current_user),
                     db: Session = Depends(get_user_db)) -> dict[str, Any]:

@@ -217,7 +217,7 @@ def bucket(status: str) -> str:
 # ───────────── clearing the finished list ─────────────
 # "Clear finished" hides finished tasks from a tab's list; nothing is deleted. Each tab keeps the time it was cleared
 # (ranking keeps its own, shared with the ranking tracker); finished tasks from before it stay out of the list, while
-# metrics, the activity chart and each job's history still count them.
+# metrics, the Performance card (performance), the activity chart and each job's history still count them.
 CLEARED_PREFERENCES = "workers_cleared"  # AppSetting.preferences[...]: {kind: ISO time}
 
 
@@ -361,6 +361,123 @@ def _median(values: list[float]) -> float | None:
     ordered = sorted(values)
     mid = len(ordered) // 2
     return round(ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2, 1)
+
+
+# ───────────── performance over a range ─────────────
+# The Performance card of the tabs that had none (JD parsing and JD recovery keep their own metrics). Read from the
+# task rows and llm_request_logs of the selected range, never from the list: clearing the list changes nothing here.
+PERFORMANCE_LIMIT = 5000
+PERFORMANCE_STAGES = {"insights": ("COMPANY_INSIGHTS", "INTERVIEW_INSIGHTS")}  # else the orchestration node's stages
+_DONE = ("COMPLETED", "PARTIAL", "SUCCEEDED")
+_FAILED = ("FAILED", "BLOCKED")
+
+
+def _llm_stages(spec: WorkerKind) -> tuple[str, ...]:
+    from app.services import orchestration_topology
+
+    found = orchestration_topology.node(spec.node_id)
+    return PERFORMANCE_STAGES.get(spec.kind) or (found.llm_stages if found else ())
+
+
+def llm_usage(db: Session, user_id: int, stages: Iterable[str], start: datetime, end: datetime) -> dict[str, Any]:
+    """A worker's model calls in a range, the shape JD parsing's metrics use. Unknown cost and latency stay None."""
+    from app.models import LLMRequestLog as L
+
+    stages = tuple(stages)
+    calls = db.execute(select(L.status, L.error_type, L.model, L.input_tokens, L.output_tokens, L.latency_ms,
+                              L.estimated_cost).where(L.user_id == user_id, L.stage.in_(stages), L.created_at >= start,
+                                                      L.created_at <= end).limit(PERFORMANCE_LIMIT)).all() if stages else []
+    latencies = [c.latency_ms for c in calls if c.latency_ms is not None]
+    costs = [c.estimated_cost for c in calls if c.estimated_cost is not None]
+    by_model: dict[str, int] = {}
+    errors: dict[str, int] = {}
+    for c in calls:
+        by_model[c.model or "unknown"] = by_model.get(c.model or "unknown", 0) + 1
+        if c.status == "FAILED":
+            errors[c.error_type or "OTHER"] = errors.get(c.error_type or "OTHER", 0) + 1
+    return {"requests": len(calls), "failed": sum(1 for c in calls if c.status == "FAILED"),
+            "input_tokens": sum(c.input_tokens or 0 for c in calls),
+            "output_tokens": sum(c.output_tokens or 0 for c in calls),
+            "estimated_cost": float(sum(costs)) if costs else None,
+            "average_latency_ms": round(sum(latencies) / len(latencies)) if latencies else None,
+            "models": dict(sorted(by_model.items(), key=lambda kv: -kv[1])), "errors": errors,
+            "stages": list(stages), "truncated": len(calls) >= PERFORMANCE_LIMIT}
+
+
+def performance(db: Session, user_id: int, kind: str, start: datetime, end: datetime,
+                now: datetime | None = None) -> dict[str, Any]:
+    """One worker's results in a range: the tasks created in it, how they ended, how long they took, the errors they
+    hit and its model calls, plus what that worker decides (ranking decisions, reviewer scores, partial research).
+    Bounded and read only. The list's Clear does not touch any of it."""
+    spec, now = kind_of(kind), now or utcnow()
+    m, ended = spec.model, ("finished_at" if spec.tailor else "completed_at")
+    tasks = list(db.scalars(spec.where(select(m).where(m.user_id == user_id, m.created_at >= start,
+                                                       m.created_at <= end))
+                            .order_by(m.id.desc()).limit(PERFORMANCE_LIMIT)).all())
+    statuses = [_display_status(spec, t, now) for t in tasks]
+    by_status: dict[str, int] = {}
+    for s in statuses:
+        by_status[s] = by_status.get(s, 0) + 1
+    done = sum(by_status.get(s, 0) for s in _DONE)
+    failed = sum(by_status.get(s, 0) for s in _FAILED)
+    durations = [(getattr(t, ended) - t.started_at).total_seconds() * 1000
+                 for t, s in zip(tasks, statuses, strict=True)
+                 if s in _DONE and t.started_at and getattr(t, ended) and getattr(t, ended) >= t.started_at]
+    waits = [(t.started_at - t.created_at).total_seconds() for t in tasks
+             if t.started_at and t.created_at and t.started_at >= t.created_at]
+    errors: dict[str, int] = {}
+    categories: dict[str, int] = {}
+    for t, s in zip(tasks, statuses, strict=True):
+        if s not in _FAILED:
+            continue
+        text = t.error if spec.tailor else t.last_error
+        key = (redaction.redact_text((text or "unknown").split("\n")[0], 160) or "unknown").strip()
+        errors[key] = errors.get(key, 0) + 1
+        if not spec.tailor:
+            category = t.error_category.value if t.error_category else "UNKNOWN"
+            categories[category] = categories.get(category, 0) + 1
+    out: dict[str, Any] = {
+        "kind": spec.kind, "start": _iso(start), "end": _iso(end),
+        "tasks_created": len(tasks), "completed": done, "failed": failed,
+        "stopped": by_status.get("STOPPED", 0),
+        "skipped": by_status.get("SKIPPED", 0) + by_status.get("CANCELLED", 0),
+        "active": sum(by_status.get(s, 0) for s in ("RUNNING", "QUEUED", "RETRYING")),
+        "by_status": dict(sorted(by_status.items(), key=lambda kv: -kv[1])),
+        "success_rate": round(done / (done + failed), 3) if done + failed else None,
+        "average_duration_ms": round(sum(durations) / len(durations)) if durations else None,
+        "median_wait_seconds": _median(waits),
+        "retried": sum(1 for t in tasks if _attempts(spec, t) > 1),
+        "failures_by_category": dict(sorted(categories.items(), key=lambda kv: -kv[1])),
+        "top_errors": [{"error": e, "tasks": n} for e, n in sorted(errors.items(), key=lambda kv: -kv[1])[:5]],
+        "llm": llm_usage(db, user_id, _llm_stages(spec), start, end),
+        "truncated": len(tasks) >= PERFORMANCE_LIMIT,
+    }
+    if spec.kind == "ranking":
+        from app.models import JobRanking
+
+        ranked = db.execute(select(JobRanking.decision, JobRanking.overall_fit_score).where(
+            JobRanking.user_id == user_id, JobRanking.created_at >= start, JobRanking.created_at <= end)
+            .limit(PERFORMANCE_LIMIT)).all()
+        decisions: dict[str, int] = {}
+        for decision, _ in ranked:
+            decisions[decision or "UNKNOWN"] = decisions.get(decision or "UNKNOWN", 0) + 1
+        fits = [float(f) for _, f in ranked if f is not None]
+        out["ranking"] = {"rankings": len(ranked), "decisions": dict(sorted(decisions.items(), key=lambda kv: -kv[1])),
+                          "qualified": decisions.get("QUALIFIED", 0), "archived": decisions.get("ARCHIVED", 0),
+                          "average_fit": round(sum(fits) / len(fits), 1) if fits else None,
+                          "median_fit": _median(fits)}
+    elif spec.kind == "insights":
+        out["insights"] = {"complete": by_status.get("COMPLETED", 0), "partial": by_status.get("PARTIAL", 0)}
+    elif spec.tailor:
+        results = [t.result or {} for t, s in zip(tasks, statuses, strict=True) if s == "SUCCEEDED"]
+        scores = [float(r["reviewer_score"]) for r in results if isinstance(r.get("reviewer_score"), int | float)]
+        out["review"] = {"scored": len(scores), "median_score": _median(scores),
+                         "lowest_score": min(scores) if scores else None,
+                         "highest_score": max(scores) if scores else None,
+                         "auto_approved": sum(1 for r in results if r.get("auto_approved")),
+                         "untailored": sum(1 for r in results if r.get("untailored")),
+                         "skip_mode": sum(1 for t in tasks if t.mode == "skip")}
+    return out
 
 
 def _newer(db: Session, spec: WorkerKind, user_id: int, job_ids: Iterable[int]) -> dict[int, Any]:

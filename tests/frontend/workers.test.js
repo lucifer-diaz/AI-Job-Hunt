@@ -30,6 +30,12 @@ const parsing = () => ({ kind: 'parsing', metrics: { tasks_created: 92, complete
   rows: [row(), row({ task_id: 12, status: 'RETRYING', can_kill: true, can_run_now: true, attempt: 2, next_attempt_at: '2099-01-01T00:00:00', last_error: 'LLMRateLimitError: timed out' }),
     row({ task_id: 13, status: 'FAILED', can_kill: false, can_run_now: true, last_error: 'ValidationError' })] });
 
+const performance = kind => ({ kind, tasks_created: 12, completed: 9, failed: 1, stopped: 1, skipped: 1, active: 0, retried: 2,
+  by_status: { COMPLETED: 9, FAILED: 1 }, success_rate: 0.9, average_duration_ms: 42000, median_wait_seconds: 30,
+  failures_by_category: {}, top_errors: [{ error: 'Model timed out', tasks: 1 }],
+  llm: { requests: 14, failed: 1, input_tokens: 5000, output_tokens: 900, estimated_cost: null, average_latency_ms: 3100, models: { 'gpt-oss:20b': 14 } },
+  ...(kind === 'ranking' ? { ranking: { rankings: 9, decisions: { QUALIFIED: 6, ARCHIVED: 3 }, qualified: 6, archived: 3, average_fit: 71.5, median_fit: 74 } } : {}),
+  ...(kind === 'tailoring' || kind === 'reviewing' ? { review: { scored: 9, median_score: 78, lowest_score: 55, highest_score: 91, auto_approved: 4, untailored: 1, skip_mode: 1 } } : {}) });
 const hours = () => [...Array(24)].map((_, i) => ({ hour: `2026-10-04T${String(i).padStart(2, '0')}:00:00`, queued: i === 23 ? 4 : 0, done: i === 22 ? 6 : 0, failed: i === 23 ? 2 : 0 }));
 const activity = () => ({ kind: 'parsing', hours: hours(), done: 6, failed: 2, queued: 4, success_rate: 0.75, median_run_seconds: 95, median_wait_seconds: 30 });
 const settings = () => ({ application_mode: 'manual_approval', min_review_score: 70, ranking_concurrency: 3, tailoring_concurrency: 2,
@@ -69,6 +75,7 @@ beforeEach(() => {
       : url === '/api/workers' ? routes.summary
       : url === '/api/workers/settings' ? routes.workerSettings
       : url.endsWith('/activity') ? routes.activity
+      : url.includes('/performance?') ? (routes.perfCalls = [...(routes.perfCalls || []), url], performance(url.split('/')[3]))
       : url === '/api/settings' ? routes.settings
       : url.startsWith('/api/workers/parsing') ? routes.parsing
       : url.startsWith('/api/workers/reviewing') ? { kind: 'reviewing', rows: [
@@ -94,7 +101,7 @@ beforeEach(() => {
   ui.stopWkPoll();
   window.history.replaceState(null, '', '#workers/parsing');  // a hash left by an earlier test must not switch tabs
   Object.assign(ui.S, { forms: {}, busy: {}, screen: 'workers', wk: null, rf: { q: '', location: 'all' } });
-  for (const key of ['wk', 'wkData', 'wkAct', 'ranking', 'tasks', 'settings', 'wkSettings']) delete ui.D[key];
+  for (const key of ['wk', 'wkData', 'wkAct', 'wkPerf', 'ranking', 'tasks', 'settings', 'wkSettings']) delete ui.D[key];
   ui.D.summary = { profile: {}, counts: {}, application_mode: 'manual_approval', model: 'm', total_jobs: 1,
     auto_search: { schedule: 'manual', setups: 0, roles: 0, locations: 0, next_run: null, last_run: null } };
 });
@@ -124,13 +131,33 @@ describe('Running workers', () => {
 
   it('shows the tailoring tasks at the review step on a Reviewing tab, with their scores', async () => {
     const v = await open('reviewing');
-    expect(v.textContent).toContain('Median score');
+    expect(v.textContent).toContain('Median reviewer score');
+    expect(v.textContent).toContain('78');
     expect(v.textContent).toContain('runs as the last step of each Tailoring task');
     const rows = [...v.querySelectorAll('.wk-row')];
     expect(rows).toHaveLength(2);
     expect(rows[0].textContent).toContain('reviewing');
     expect(rows[0].querySelector('[data-act="wk-kill"]').dataset.kind).toBe('reviewing');
     expect(rows[1].textContent).toContain('reviewer score 82');
+  });
+
+  it('gives Ranking, Job insights, Tailoring and Reviewing a Performance card from the server, kept through Clear finished', async () => {
+    for (const [tab, extra] of [['ranking', 'Qualified'], ['insights', 'Model calls'], ['tailoring', 'Auto-approved'], ['reviewing', 'Master resume reviewed']]) {
+      const v = await open(tab);
+      const card = [...v.querySelectorAll('.card')].find(c => c.querySelector('.card-title')?.textContent === 'Performance');
+      expect(card, tab).toBeTruthy();
+      expect(card.textContent).toContain(extra);
+      expect(card.textContent).toContain('90%');
+      expect(v.textContent).toContain('gpt-oss:20b');
+      expect(routes.perfCalls.at(-1)).toBe(`/api/workers/${tab}/performance?range=7d`);
+    }
+    // Clearing hides the list only: the card is read again from the server, not from the rows.
+    await ui.A['wk-clear']({ dataset: { tab: 'reviewing', n: 1 } });
+    await flush();
+    expect(view().textContent).toContain('Median reviewer score');
+    ui.A['wk-range']({ dataset: { id: '30d' } });
+    await flush();
+    expect(routes.perfCalls.at(-1)).toBe('/api/workers/reviewing/performance?range=30d');
   });
 
   it('shows the JD parsing metrics that moved from Monitoring, and its tasks with their controls', async () => {
