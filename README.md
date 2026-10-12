@@ -1443,13 +1443,16 @@ Prices and context windows live in one file, `app/model_catalog.json` (override 
 
 ### Monitoring tab and API
 
-Monitoring has six sections, each loading only what it shows:
+Monitoring has seven sections, each loading only what it shows:
 
 - **Overview** — external call volume, success rate and latency next to LLM spend and Apify discovery.
 - **LLM usage** — metric tiles (requests, tokens, estimated cost, average and P95 latency, failures, retry
   rate, average context) and charts: cost and tokens over time, usage by stage, cost by model, latency
   percentiles, context-utilisation buckets and failures by type. Every chart has hover details and a table
   view, and the paginated request list has a metadata-only detail view.
+- **Model performance** — compares models (or providers, workers, stages, prompt versions, config versions,
+  routing tiers, days, hours) across six transparent dimensions: reliability, latency, throughput, cost, quality
+  and context efficiency. There is deliberately no single "AI quality score". See *Model performance* below.
 - **External APIs** — calls, success rate, failed calls, average and P95 latency, retries, rate limits and
   estimated cost; breakdowns by service, operation and workflow; failures by type; calls over time; and a
   filterable, paginated table of individual calls (time, provider, operation, workflow, status, latency,
@@ -1464,7 +1467,48 @@ Monitoring has six sections, each loading only what it shows:
 
 Each account sees its own telemetry; the admin can switch to all accounts.
 
+#### Model performance
+
+Computed by `app/services/model_performance.py` from the raw `llm_request_logs` rows (nothing else is stored, and
+no model or LiteLLM is called to produce it). `GET /api/monitoring/performance?group_by=model|provider|worker|stage|prompt_version|config_version|routing_tier|service_tier|hour|day`
+takes the usual Monitoring filters plus `config_version` and `routing_tier`.
+
+| Dimension | Per group |
+| --- | --- |
+| Reliability | success / failure rate, error types, timeout and rate-limit rate, retry rate, **retry-adjusted success** (succeeded first time: no retry, no schema correction, no escalation), fallback and escalation rate, schema pass rate |
+| Latency | avg, p50, p75, p95, p99, TTFT p50/p95 (with sample count), generation time, queue wait, tokens/sec, ms per output token |
+| Throughput | requests/min and /hour, successful requests/min, input and output tokens/min, peak requests/min, peak concurrency (a sweep over each row's start and latency) |
+| Cost | total, per request, per successful request, **per successful task** (failed attempts included), **per 1K tasks**, unpriced count, share of cost |
+| Quality | schema pass rate, retry-after-invalid-output rate, average model confidence; plus per-worker outcomes people and workers stored: reviewer decisions and score, inbox correction rate, job feedback, application questions handed to a person |
+| Context | context-window use, selected vs available context (and reduction), input/output/cached/reasoning tokens, output/input ratio |
+
+Each group also carries its share of requests, fallbacks, escalations and cost, so a utilisation split across models
+is one call away. **Unknown is never zero**: a metric a provider did not report is a dash, left out of its own
+average, and cost stays `NULL` when no price is known (`unpriced_requests` says how many).
+
+New per-request columns on `llm_request_logs` (migration 0043), all nullable: `ttft_ms`, `generation_ms`,
+`queue_wait_ms`, `gateway_overhead_ms`, `reasoning_tokens`, `service_tier`. Everything else (provider, requested vs
+actual model, tier, worker, stage, prompt version, config version, trace/job IDs, fallback and escalation, schema
+validity, tokens, cache tokens, context, cost) was already recorded and is reused.
+
+Not measured, and why (also returned as `unsupported` by the API and shown in the UI):
+
+- **TTFT** needs a streaming request; no adapter streams today, so it is unknown unless an adapter sets it.
+- **Generation time** comes from LiteLLM's `x-litellm-response-duration-ms` minus `x-litellm-overhead-duration-ms`;
+  direct-provider calls do not report it. Tokens/sec uses it (or TTFT) with provider-reported output tokens and
+  is a per-request median; without either duration it is unknown. When TTFT is unknown it includes prompt processing.
+- **Queue wait** is the wait for a worker's max-concurrency slot; with no limit set there is no queue to measure.
+- **Reasoning tokens** only where the provider itemises them (OpenAI-shaped usage).
+- **Tool-call success**: workers make single-shot structured requests, so there are no tool calls to count.
+- **Quality outcomes per model**: reviewer scores, corrections and feedback are not stored with the model, so they
+  are shown per worker. Answer Resolver edits after the fact are not tracked.
+
+Windowed rates divide by the range (at least one minute, never beyond now); hour/day groupings divide by their
+bucket. Aggregation reads at most 50,000 recent rows; rows older than `LLM_TELEMETRY_RETENTION_DAYS` are rolled up
+into daily totals and no longer available at request level.
+
 ```http
+GET  /api/monitoring/performance            model comparison (group_by=…) + stored outcomes + what is unsupported
 GET  /api/monitoring/dashboard              everything the LLM section shows
 GET  /api/monitoring/summary | stages | models | costs | latency | context | errors
 GET  /api/monitoring/requests               paginated LLM request list
@@ -1566,6 +1610,12 @@ Rejecting is not deleting: the tailored resume is kept. A job whose application 
 cannot be rejected — the tracker owns that outcome, and nothing may rewrite the fact that you applied.
 
 ## 9a. AI Orchestration
+
+Every AI node shows compact **model health** for the model that actually answered (not the configured one):
+requests, success rate, p95 latency, requests/min, schema pass rate and cost (`$0` for free models, `cost ?` when
+unpriced). Clicking a node opens *Performance*, which adds the full per-model comparison, a breakdown by
+configuration version and a time series for that stage (`GET /api/orchestration/nodes/{id}` → `performance`),
+computed from the same raw rows as Monitoring → Model performance.
 
 **AI Orchestration** (sidebar → SYSTEM) is a workspace of its own, next to Monitoring and separate from it:
 

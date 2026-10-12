@@ -408,6 +408,27 @@ Checklist and examples: `docs/prompts.md`. The rules a change must keep:
 * Bump a prompt's `*_PROMPT_VERSION` when its behaviour materially changes; outputs store prompt version, provider,
   model and config version. Add a golden fixture (`tests/fixtures/prompt_golden/`) for a new worker.
 
+## Model performance
+
+`app/services/model_performance.py` turns raw `llm_request_logs` rows into the comparison Monitoring → Model
+performance and the AI Orchestration nodes show. The rules a change has to keep:
+
+* **Aggregates only ever come from the raw request rows.** No second telemetry table, no counters, no call to a model
+  or to LiteLLM, and the browser never talks to LiteLLM. A new metric starts as a nullable column written by
+  `llm_telemetry.build_entry` (from `Attempt`/`Usage`), then an aggregate in `model_performance.block`.
+* **Unknown is None, never 0.** A figure a provider did not report (TTFT, generation time, reasoning tokens, cost)
+  stays NULL and is left out of its own average; add the sample count next to any new rate. Never derive a number from
+  something that is not the same quantity (no tokens/sec from wall-clock latency alone, no guessed price).
+* **Six dimensions, no composite score**: reliability, latency, throughput, cost, quality, context. Do not add a
+  single "AI quality score". Quality uses signals the product really stores; list a missing one in
+  `model_performance.UNSUPPORTED` instead of showing it as zero.
+* **Timing facts are best effort.** Reading gateway headers (`llm._gateway_timings`) and recording them must never
+  fail or slow a request; it catches its own errors like the rest of telemetry.
+* **Distinguish configured from actual**: the model shown on a node or in a table is `llm_request_logs.model` (what
+  answered), with `configured_model` / `requested_model` kept beside it.
+* Aggregation stays in Python over a bounded row set (`monitoring.MAX_ROWS`, `orchestration.LLM_ROW_LIMIT`), so
+  PostgreSQL and SQLite agree; the column lists are `model_performance.COLUMNS` and never include prompt/response text.
+
 ## Telemetry tables and retention
 
 | Table | Written by | Retention |

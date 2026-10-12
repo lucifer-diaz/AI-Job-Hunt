@@ -58,7 +58,7 @@ from app.models import (
     TailorTask,
     WorkflowTransition,
 )
-from app.services import external_monitoring, model_resolution, redaction, worker_settings
+from app.services import external_monitoring, model_performance, model_resolution, redaction, worker_settings
 from app.services import orchestration_topology as topo
 from app.services.ai_workers import WORKERS, worker_for_prompt
 from app.services.ai_workers import label as worker_label
@@ -284,6 +284,9 @@ LLM_COLUMNS = (LLMRequestLog.id, LLMRequestLog.created_at, LLMRequestLog.complet
                LLMRequestLog.context_utilization_percent, LLMRequestLog.workflow_type,
                LLMRequestLog.workflow_entity_id, LLMRequestLog.trace_id, LLMRequestLog.prompt_name,
                LLMRequestLog.prompt_version)
+# Model health on a node and the detail behind it read the same raw rows, with the columns Monitoring's
+# performance view needs (app.services.model_performance), each column once.
+LLM_COLUMNS = tuple({c.key: c for c in (*LLM_COLUMNS, *model_performance.COLUMNS)}.values())
 
 
 def llm_rows(db: Session, scope: Scope, stages: Iterable[str] | None = None, *, start: datetime | None = None,
@@ -604,6 +607,7 @@ def _build_graph(db: Session, scope: Scope) -> dict[str, Any]:
             passed_on[e.source] += edges[e.id]["count"]
             passed_on[e.target] += edges[e.id]["count"]
     nodes: dict[str, Any] = {}
+    window = model_performance.window_seconds(scope.start, scope.end, now)
     for node in topo.NODES:
         if not node.implemented:
             continue
@@ -623,6 +627,7 @@ def _build_graph(db: Session, scope: Scope) -> dict[str, Any]:
             worker_assignments=worker_rows, model_health=model_health)
         llm = llm_metrics(node_rows) if node.is_ai else None
         nodes[node.id] = {
+            "model_health": model_performance.compact(node_rows, window) if node.is_ai else None,
             "status": status, "status_reasons": reasons, "live": live.get(node.id, _blank_live()),
             "assignments": worker_rows, "llm": llm,
             "observed_models": [m for m, _ in Counter(r.model for r in node_rows if r.model).most_common(3)],
@@ -791,6 +796,7 @@ def node_detail(db: Session, scope: Scope, node_id: str) -> dict[str, Any] | Non
     recs = _node_recommendations(node, _recommendations(db, scope.viewer_id))
     out = {"node": node.public(), "scope": scope.public(), **summary, "recommendations": recs,
            "routing": routing_detail(rows, summary["assignments"]) if node.is_ai else None,
+           "performance": _performance(rows, scope) if node.is_ai else None,
            "recent": _recent_activity(db, scope, node, rows)}
     if node.external:
         ext = external_rows(db, scope, node.external)
@@ -931,6 +937,16 @@ def _assignment_at(snapshot: dict[str, Any], worker_type: str) -> dict[str, Any]
     return {"mode": config.get("mode"), "assignment": configured, "model": model,
             "fallback_model": config.get("fallback_model") or None, "enabled": config.get("enabled", True),
             "note": note}
+
+
+def _performance(rows: list[Any], scope: Scope) -> dict[str, Any]:
+    """Per actual model, per configuration version and over time: the same blocks Monitoring compares models with,
+    for this stage's requests only. Raw rows in, aggregates out; nothing here calls a model or LiteLLM."""
+    series = "hour" if (scope.end - scope.start) <= timedelta(days=2) else "day"
+    return {"models": model_performance.compare(rows, "model", scope.start, scope.end),
+            "config_versions": model_performance.compare(rows, "config_version", scope.start, scope.end)["groups"],
+            "series": model_performance.compare(rows, series, scope.start, scope.end)["groups"],
+            "series_by": series, "rows_truncated": len(rows) >= LLM_ROW_LIMIT}
 
 
 def model_history(db: Session, scope: Scope, node_id: str) -> dict[str, Any] | None:

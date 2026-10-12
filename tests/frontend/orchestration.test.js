@@ -348,4 +348,29 @@ describe('AI Orchestration workspace', () => {
     expect(view().querySelector('.orch-packets img')).toBeNull();
     expect(view().querySelector('.orch-packets').textContent).toContain('<img src=x onerror=alert(1)>');
   });
+
+  it('shows compact model health on an AI node and the model comparison in its details', async () => {
+    const group = (key, extra = {}) => ({ key, label: key, requests: 328, low_sample: false, share: { requests: 1 },
+      reliability: { success_rate: 0.987, retry_adjusted_success_rate: 0.95, schema_pass_rate: 0.992 },
+      latency: { p50_ms: 4200, p95_ms: 8100, ttft_p50_ms: null, tokens_per_sec: 42.3 },
+      throughput: {}, tokens: {}, context: {}, quality: {}, cost: { free: true, per_request: 0 }, ...extra });
+    routes.graph.nodes.ranker.model_health = [{ model: 'gpt-oss:20b', requests: 328, success_rate: 0.987, p95_latency_ms: 8100,
+      requests_per_min: 0.5, schema_pass_rate: 0.992, cost: 0, free: true }];
+    routes.node.performance = { series_by: 'day', models: { totals: { requests: 328 }, groups: [group('gpt-oss:20b')] },
+      config_versions: [group('v17')], series: [group('2026-10-04')] };
+    await open();
+    const line = view().querySelector('[data-id="ranker"].orch-node .orch-node-metric').textContent;
+    expect(line).toContain('gpt-oss:20b');
+    expect(line).toContain('99% ok');
+    expect(line).toContain('p95 8.1s');
+    expect(line).toContain('schema 99%');
+    expect(line).toContain('$0');
+    await ui.A['orch-node']({ dataset: { id: 'ranker' } });
+    await ui.A['orch-tab']({ dataset: { id: 'performance' } });
+    const drawer = view().querySelector('.orch-drawer-body').textContent;
+    expect(drawer).toContain('By model that answered');
+    expect(drawer).toContain('42');
+    expect(drawer).toContain('TTFT');
+    expect(drawer).toContain('—');  // TTFT was not reported: a dash, never a zero
+  });
 });

@@ -133,6 +133,8 @@ def litellm_headers(headers: Any) -> dict[str, Any]:
         "attempted_retries": number("x-litellm-attempted-retries", int),
         "response_cost": number("x-litellm-response-cost", float)
         if get("x-litellm-response-cost") is not None else number("x-litellm-response-cost-original", float),
+        "response_duration_ms": number("x-litellm-response-duration-ms", float),
+        "overhead_duration_ms": number("x-litellm-overhead-duration-ms", float),
     }.items() if v is not None}
 
 

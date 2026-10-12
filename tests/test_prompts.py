@@ -498,3 +498,17 @@ def test_services_store_prompt_versions_with_results(monkeypatch):
         assert variant.reviewer_notes["prompt_version"] == prompts.REVIEW_PROMPT_VERSION
         assert variant.reviewer_score == 86 and variant.reviewer_notes["recommendation"] == "PASS"
         assert isinstance(variant.content["skills"], list) and "bullet_evidence" in variant.content
+
+
+def test_tailoring_accepts_null_for_highlights_and_role_updates_but_not_an_empty_result():
+    result = TailoringResult.model_validate({
+        "summary": None, "skills_order": ["Python"], "highlights": None,
+        "role_updates": [{"role_index": 0, "bullets": [{"text": "Built X.", "evidence_ids": [1]}]}],
+        "selected_evidence_ids": [1]})
+    assert result.highlights == [] and len(result.role_updates) == 1
+    only_skills = TailoringResult.model_validate({"skills_order": ["Python"], "role_updates": None, "highlights": None,
+                                                  "selected_evidence_ids": []})
+    assert only_skills.role_updates == []
+    with pytest.raises(ValidationError):
+        TailoringResult.model_validate({"summary": None, "skills_order": [], "role_updates": None,
+                                        "highlights": None, "selected_evidence_ids": []})

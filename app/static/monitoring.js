@@ -13,7 +13,7 @@ const monWorker = w => w ? w.replace(/_/g, ' ').toLowerCase().replace(/^./, c =>
 let monTimer = null;
 
 // Monitoring is one screen with seven sections; each loads only what it shows (loadMonitoring).
-const MON_TABS = [['overview', 'Overview'], ['llm', 'LLM usage'], ['external', 'External APIs'],
+const MON_TABS = [['overview', 'Overview'], ['llm', 'LLM usage'], ['models', 'Model performance'], ['external', 'External APIs'],
                   ['apify', 'Apify'], ['inbox', 'Application inbox'], ['logs', 'Logs'], ['advisor', 'AI optimization']];
 const MON_CATEGORY_TONE = { EXTERNAL_API: 'brand', APIFY: 'brand', LLM: 'muted', SCHEDULER: 'muted',
                             WORKFLOW: 'muted', APPLICATION: 'muted', EMAIL: 'muted', SYSTEM: 'muted' };
@@ -38,7 +38,7 @@ function monSchemaReason(reason) {
 }
 
 function monState() {
-  if (!S.mon) S.mon = { tab: 'overview', range: '7d', provider: '', model: '', stage: '', prompt_version: '', status: '', job_id: '', worker_type: '', all: false, page: 1, tables: new Set(), request: null,
+  if (!S.mon) S.mon = { tab: 'overview', range: '7d', provider: '', model: '', stage: '', prompt_version: '', status: '', job_id: '', worker_type: '', all: false, page: 1, tables: new Set(), request: null, perfBy: 'model', perfDim: 'overview',
     ext: { provider: '', operation: '', workflow: '', status: '', error_type: '', http_status_code: '', error_only: false, page: 1, request: null },
     logs: { category: '', level: '', provider: '', workflow: '', search: '', trace_id: '', page: 1, entry: null } };
   return S.mon;
@@ -72,6 +72,7 @@ async function loadMonitoring() {
     m.tab === 'logs' ? api('/api/monitoring/logs?' + monLogQuery({ page: m.logs.page, per_page: 50 })) : Promise.resolve(D.monLogs),
     m.tab === 'inbox' ? api('/api/monitoring/application-inbox?' + monQuery()) : Promise.resolve(D.monInbox),
   ]);
+  if (m.tab === 'models') D.monPerf = await api('/api/monitoring/performance?' + monQuery({ group_by: m.perfBy }));
   const wasActive = D.monRec?.active;
   Object.assign(D, { mon: dash, monRequests: reqs, monCapture: capture, monRec: rec, monExt: ext, monExtRequests: extReqs, monLogs: logs, monInbox: inbox });
   if (wasActive && !rec.active) {
@@ -103,6 +104,77 @@ function monSelection(sel) {
 const monMs = ms => ms == null ? '—' : ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`;
 const monPct = (r, digits = 1) => r == null ? '—' : `${(r * 100).toFixed(digits)}%`;
 const monStage = s => MON_STAGES[s] || s;
+
+
+/* ───────────── model performance ─────────────
+   Six dimensions, never one score. Every number is an aggregate of raw request rows (/api/monitoring/performance);
+   a dash means the provider did not report it, not zero. */
+const MON_PERF_BY = [['model', 'Model'], ['provider', 'Provider'], ['worker', 'Worker'], ['stage', 'Stage'], ['prompt_version', 'Prompt version'],
+  ['config_version', 'Config version'], ['routing_tier', 'Routing tier'], ['day', 'Day'], ['hour', 'Hour']];
+const monRate = v => v == null ? '—' : v < 10 ? v.toFixed(1) : String(Math.round(v));
+const monPerMin = v => v == null ? '—' : v >= 10 ? v.toFixed(0) : v >= 1 ? v.toFixed(1) : v.toFixed(2);
+const monCost = v => v == null ? 'unknown' : monUSD(v);
+// Column sets per dimension: [header, value of a group, tooltip]
+const MON_PERF_DIMS = {
+  overview: ['Overview', [['Requests', g => g.requests.toLocaleString()], ['Success', g => monPct(g.reliability.success_rate)], ['p50', g => monMs(g.latency.p50_ms)],
+    ['p95', g => monMs(g.latency.p95_ms)], ['TTFT', g => monMs(g.latency.ttft_p50_ms)], ['Tok/s', g => monRate(g.latency.tokens_per_sec)],
+    ['Schema pass', g => monPct(g.reliability.schema_pass_rate)], ['Cost/req', g => g.cost.free ? '$0' : monCost(g.cost.per_request)]]],
+  reliability: ['Reliability', [['Requests', g => g.requests.toLocaleString()], ['Success', g => monPct(g.reliability.success_rate)], ['First-try', g => monPct(g.reliability.retry_adjusted_success_rate)],
+    ['Timeout', g => monPct(g.reliability.timeout_rate)], ['Rate limit', g => monPct(g.reliability.rate_limit_rate)], ['Retried', g => monPct(g.reliability.retry_rate)],
+    ['Fallback', g => monPct(g.reliability.fallback_rate)], ['Escalation', g => monPct(g.reliability.escalation_rate)], ['Schema pass', g => monPct(g.reliability.schema_pass_rate)]]],
+  latency: ['Latency', [['Requests', g => g.requests.toLocaleString()], ['p50', g => monMs(g.latency.p50_ms)], ['p75', g => monMs(g.latency.p75_ms)], ['p95', g => monMs(g.latency.p95_ms)],
+    ['p99', g => monMs(g.latency.p99_ms)], ['TTFT p50', g => monMs(g.latency.ttft_p50_ms)], ['Generation', g => monMs(g.latency.generation_avg_ms)],
+    ['Queue wait p95', g => monMs(g.latency.queue_wait_p95_ms)], ['Tok/s', g => monRate(g.latency.tokens_per_sec)], ['ms / out token', g => g.latency.ms_per_output_token ?? '—']]],
+  throughput: ['Throughput', [['Requests', g => g.requests.toLocaleString()], ['Req/min', g => monPerMin(g.throughput.requests_per_min)], ['Req/hour', g => monPerMin(g.throughput.requests_per_hour)],
+    ['OK req/min', g => monPerMin(g.throughput.successful_requests_per_min)], ['In tok/min', g => monTokens(g.throughput.input_tokens_per_min)], ['Out tok/min', g => monTokens(g.throughput.output_tokens_per_min)],
+    ['Peak req/min', g => g.throughput.peak_requests_per_min ?? '—'], ['Peak concurrency', g => g.throughput.peak_concurrency ?? '—']]],
+  cost: ['Cost', [['Requests', g => g.requests.toLocaleString()], ['Total', g => g.cost.total == null ? 'unknown' : monUSD(g.cost.total)], ['Cost/req', g => g.cost.free ? '$0' : monCost(g.cost.per_request)],
+    ['Cost/OK req', g => g.cost.free ? '$0' : monCost(g.cost.per_successful_request)], ['Cost/OK task', g => g.cost.free ? '$0' : monCost(g.cost.per_successful_task)],
+    ['Per 1K tasks', g => g.cost.free ? '$0' : monCost(g.cost.per_1k_tasks)], ['Unpriced', g => g.cost.unpriced_requests], ['Share of cost', g => monPct(g.share.cost)]]],
+  quality: ['Quality', [['Requests', g => g.requests.toLocaleString()], ['Schema pass', g => monPct(g.quality.schema_pass_rate)], ['Checked', g => g.quality.schema_checked],
+    ['Retry after invalid', g => monPct(g.quality.retry_after_invalid_output_rate)], ['Avg confidence', g => g.quality.avg_confidence ?? '—'], ['Escalation', g => monPct(g.reliability.escalation_rate)]]],
+  context: ['Context & tokens', [['Requests', g => g.requests.toLocaleString()], ['Input', g => monTokens(g.tokens.input)], ['Output', g => monTokens(g.tokens.output)],
+    ['Cached in', g => monTokens(g.tokens.cached_input)], ['Reasoning', g => monTokens(g.tokens.reasoning)], ['Out/in', g => g.tokens.output_input_ratio ?? '—'],
+    ['Context used', g => g.context.avg_utilization_percent == null ? '—' : `${g.context.avg_utilization_percent.toFixed(1)}%`],
+    ['Selected / available', g => g.context.available_tokens ? `${monTokens(g.context.selected_tokens)} / ${monTokens(g.context.available_tokens)}` : '—']]],
+};
+function monPerfTable(groups, labelHeader, dim = 'overview') {
+  const cols = (MON_PERF_DIMS[dim] || MON_PERF_DIMS.overview)[1];
+  if (!groups.length) return '<div class="small muted" style="padding:18px 0">No requests in this range.</div>';
+  return `<div class="mon-table-wrap"><table class="mon-table"><thead><tr><th>${esc(labelHeader)}</th>${cols.map(([h]) => `<th>${esc(h)}</th>`).join('')}<th>Share</th></tr></thead><tbody>
+    ${groups.map(g => `<tr><td class="mono">${esc(g.label)}${g.low_sample ? ' <span class="xs muted" title="Fewer than 20 requests: treat as indicative">·small sample</span>' : ''}</td>${cols.map(([, f]) => `<td>${esc(f(g))}</td>`).join('')}<td>${monPct(g.share.requests, 0)}</td></tr>`).join('')}</tbody></table></div>`;
+}
+const monPerfDimSwitch = (cur, act) => `<div class="seg">${Object.entries(MON_PERF_DIMS).map(([id, [t]]) => `<button class="${cur === id ? 'on' : ''}" data-act="${act}" data-id="${id}">${esc(t)}</button>`).join('')}</div>`;
+function renderMonPerformance() {
+  const m = monState(), d = D.monPerf;
+  if (!d) return loading();
+  const t = d.totals, o = d.outcomes;
+  const by = `<div class="seg">${MON_PERF_BY.map(([id, tx]) => `<button class="${m.perfBy === id ? 'on' : ''}" data-act="mon-perf-by" data-id="${id}">${tx}</button>`).join('')}</div>`;
+  const tiles = `<section class="mon-tiles">
+    ${monTile('Requests', t.requests.toLocaleString(), `${monPerMin(t.throughput.requests_per_min)}/min over the range`)}
+    ${monTile('Success', monPct(t.reliability.success_rate), `${monPct(t.reliability.retry_adjusted_success_rate)} first-try`)}
+    ${monTile('p50 / p95', `${monMs(t.latency.p50_ms)} / ${monMs(t.latency.p95_ms)}`, `p99 ${monMs(t.latency.p99_ms)}`)}
+    ${monTile('Tokens/sec', monRate(t.latency.tokens_per_sec), t.latency.tokens_per_sec_samples ? `median of ${t.latency.tokens_per_sec_samples} requests` : 'not reported')}
+    ${monTile('Schema pass', monPct(t.reliability.schema_pass_rate), `${t.reliability.schema_checked} checked`)}
+    ${monTile('Cost', t.cost.total == null ? 'unknown' : monUSD(t.cost.total), t.cost.unpriced_requests ? `+ ${t.cost.unpriced_requests} unpriced` : 'all priced')}
+    ${monTile('Peak concurrency', t.throughput.peak_concurrency ?? '—', `peak ${t.throughput.peak_requests_per_min ?? '—'} req/min`)}</section>`;
+  const table = monPerfTable(d.groups, (MON_PERF_BY.find(([id]) => id === m.perfBy) || [])[1] || 'Group', m.perfDim);
+  const outcomes = o ? `<section class="card mon-card"><div class="card-title">Outcomes people and workers stored</div>
+    <div class="card-sub">Per worker, not per model. These are real stored signals, not a quality score.</div><div class="orch-kvs mt8">
+    ${[['Reviewer', o.reviewer.available ? `${o.reviewer.reviewed} reviewed · pass ${monPct(o.reviewer.pass_rate)} · re-tailor ${monPct(o.reviewer.retailor_rate)} · median score ${o.reviewer.median_score ?? '—'}` : 'no reviews in range'],
+      ['Inbox corrections', o.inbox_corrections.available ? `${o.inbox_corrections.corrected} of ${o.inbox_corrections.events} corrected (${monPct(o.inbox_corrections.correction_rate)})` : 'no inbox events in range'],
+      ['Job feedback', o.user_feedback.available ? Object.entries(o.user_feedback.actions).map(([k, v]) => `${k.toLowerCase()} ${v}`).join(' · ') : 'none in range'],
+      ['Handed to a person', o.human_answers.available ? `${o.human_answers.asked} application question${o.human_answers.asked === 1 ? '' : 's'}, ${o.human_answers.answered} answered` : 'none in range']]
+      .map(([k, v]) => `<div class="orch-kv"><span class="xs muted">${esc(k)}</span><span class="small">${esc(v)}</span></div>`).join('')}</div></section>` : '';
+  const gaps = `<details class="xs muted mt8"><summary>What is not measured, and why</summary><ul>${Object.values(d.unsupported).map(v => `<li>${esc(v)}</li>`).join('')}</ul></details>`;
+  return `<div class="stack"><section class="card pad16"><div class="row between wrap gap10" style="align-items:center">
+      <div class="row gap10 wrap" style="align-items:center"><span class="xs muted">Group by</span>${by}</div>
+      ${BOOT.user?.is_admin ? `<label class="row gap6 small"><input type="checkbox" data-act-change="mon-all" ${m.all ? 'checked' : ''}> All accounts</label>` : ''}
+      ${btn(label('monRefresh', 'Refresh', 'Refreshing…'), 'mon-refresh', {}, 'sm', isBusy('monRefresh'))}</div>
+      ${d.truncated ? '<div class="xs muted mt8">Showing the most recent 50,000 requests in this range.</div>' : ''}</section>${tiles}
+    <section class="card mon-card"><div class="row between wrap gap10 mb12" style="align-items:center"><div><div class="card-title">Model comparison</div>
+      <div class="card-sub">Computed from raw request rows · a dash is unknown, never zero · cost per task includes failed attempts</div></div>${monPerfDimSwitch(m.perfDim, 'mon-perf-dim')}</div>${table}${gaps}</section>${outcomes}</div>`;
+}
 
 /* ───────────── chart pieces ───────────── */
 // Horizontal bars: one series, value at the bar tip, the whole row is the hover target.
@@ -149,7 +221,7 @@ function renderMonitoring() {
   const tabs = `<section class="card pad12"><div class="row between wrap gap10" style="align-items:center">
     <div class="seg">${MON_TABS.map(([id, t]) => `<button class="${m.tab === id ? 'on' : ''}" data-act="mon-tab" data-id="${id}">${t}</button>`).join('')}</div>
     <div class="seg">${MON_RANGES.map(([id, t]) => `<button class="${m.range === id ? 'on' : ''}" data-act="mon-range" data-id="${id}">${t}</button>`).join('')}</div></div></section>`;
-  const body = m.tab === 'llm' ? renderMonLlm() : m.tab === 'external' ? renderMonExternal()
+  const body = m.tab === 'llm' ? renderMonLlm() : m.tab === 'models' ? renderMonPerformance() : m.tab === 'external' ? renderMonExternal()
     : m.tab === 'apify' ? renderMonApify() : m.tab === 'inbox' ? renderMonInbox() : m.tab === 'logs' ? renderMonLogs()
     : m.tab === 'advisor' ? renderAdvisor() : renderMonOverview();
   return `<div class="stack">${tabs}${body}</div>`;
@@ -682,6 +754,8 @@ function renderMonLogModal() {
 const MONITORING_ACTIONS = {
   'mon-range': el => { Object.assign(monState(), { range: el.dataset.id, page: 1 }); load(); },
   'mon-filter': el => { monState()[el.dataset.key] = el.dataset.key === 'job_id' ? el.value.replace(/\D/g, '') : el.value; monState().page = 1; load(); },
+  'mon-perf-by': el => { monState().perfBy = el.dataset.id; load(); },
+  'mon-perf-dim': el => { monState().perfDim = el.dataset.id; render(); },
   'mon-all': el => { Object.assign(monState(), { all: el.checked, page: 1 }); load(); },
   'mon-reset': () => { Object.assign(monState(), { provider: '', model: '', stage: '', prompt_version: '', status: '', job_id: '', all: false, page: 1 }); load(); },
   'mon-refresh': () => busy('monRefresh', () => loadMonitoring()),
