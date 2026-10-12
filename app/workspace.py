@@ -697,13 +697,41 @@ def _dedupe_key(job: Job) -> str:
 
 # Discovery's date filter: how far back "found" (discovered_at) or "posted" (the employer's date) may be.
 DATE_WINDOWS = {"24h": timedelta(hours=24), "3d": timedelta(days=3), "7d": timedelta(days=7),
-                "15d": timedelta(days=15), "30d": timedelta(days=30)}
+                "15d": timedelta(days=15), "30d": timedelta(days=30), "60d": timedelta(days=60),
+                "90d": timedelta(days=90)}
+# Work mode as the boards state it (app.services.apify_adapters._remote): remote, hybrid, or not stated.
+WORK_MODES = ("remote", "hybrid", "onsite_unknown")
+
+
+def _day(value: str, name: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(422, f"{name} must be a date (YYYY-MM-DD)") from None
+
+
+def _work_mode(job: Job) -> str:
+    mode = (job.remote_type or "").lower()
+    return mode if mode in ("remote", "hybrid") else "onsite_unknown"
+
+
+def _has_salary(job: Job) -> bool:
+    """Only a salary the posting states (or one already extracted for it); never an estimate. The stored envelope
+    (compensation.enrich_compensation) exists for checked jobs without a salary too, so only its `posting` counts."""
+    from app.services.compensation import extract_posting_salary
+
+    stored = job.compensation if isinstance(job.compensation, dict) else {}
+    return bool(stored.get("posting")) or extract_posting_salary(job.raw) is not None
 
 
 @router.get("/api/jobs/search")
-def jobs_search(q: str = "", min_fit: int = 0, board: str = "all", location: str = "all", stage: str = "all",
-                description: str = "all", sort: str = "fit", within: str = "", date_field: str = "found",
-                include_applied: bool = False,
+def jobs_search(q: str = "", min_fit: int = 0, max_fit: int = 0, board: str = "all", location: str = "all",
+                stage: str = "all", description: str = "all", sort: str = "fit", within: str = "",
+                older_than: str = "", date_from: str = "", date_to: str = "", posted_unknown: bool = False,
+                date_field: str = "found", include_applied: bool = False, work_mode: str = "all",
+                job_type: str = "all", has_salary: bool = False, setup_id: int | None = None,
                 page: int = Query(1, ge=1), per_page: int = Query(25, ge=1, le=200), queue: bool = False,
                 hide_agencies: bool = False, hide_reposts: bool = False, keywords: str = "",
                 domain: str = "matching", ids_only: bool = False, db: Session = Depends(get_user_db)):
@@ -711,13 +739,30 @@ def jobs_search(q: str = "", min_fit: int = 0, board: str = "all", location: str
 
     if description not in ("all", "") and description not in job_description.DESCRIPTION_STATES:
         raise HTTPException(422, f"Unknown description filter: {description}")
-    if within and within not in DATE_WINDOWS:
-        raise HTTPException(422, f"Unknown date window: {within}")
+    for window in (within, older_than):
+        if window and window not in DATE_WINDOWS:
+            raise HTTPException(422, f"Unknown date window: {window}")
     if date_field not in ("found", "posted"):
         raise HTTPException(422, "date_field must be found or posted")
     if domain not in ("matching", "not_matching", "all"):
         raise HTTPException(422, "domain must be matching, not_matching or all")
-    cutoff = utcnow() - DATE_WINDOWS[within] if within else None
+    if work_mode not in ("all", "", *WORK_MODES):
+        raise HTTPException(422, "work_mode must be remote, hybrid or onsite_unknown")
+    now = utcnow()
+    newest = now - DATE_WINDOWS[older_than] if older_than else None  # older than: before this moment
+    cutoff = now - DATE_WINDOWS[within] if within else None
+    day_from, day_to = _day(date_from, "date_from"), _day(date_to, "date_to")
+    if day_to is not None:
+        day_to += timedelta(days=1)  # inclusive: the whole of the last day
+    if day_from and day_to and day_from >= day_to:
+        raise HTTPException(422, "date_from must not be after date_to")
+    # Without a posting date a job is unknown for every window; "posted_unknown" lists exactly those.
+    unknown_only = posted_unknown and date_field == "posted"
+    dated = any(x is not None for x in (cutoff, newest, day_from, day_to))
+    setup_runs = None
+    if setup_id is not None:
+        setup_runs = set(db.scalars(select(SearchRun.id).where(SearchRun.saved_search_id == setup_id)).all())
+    job_type_key = (job_type or "all").strip().lower()
     # Jobs you already applied to stay out of Discovery unless you ask for them (the Applied stage, or the box).
     show_applied = include_applied or stage in SUBMITTED_STATUSES
     applied_ids = set() if show_applied else set(db.scalars(
@@ -746,6 +791,8 @@ def jobs_search(q: str = "", min_fit: int = 0, board: str = "all", location: str
             continue
         if min_fit and (job.fit_score or 0) < min_fit:
             continue
+        if max_fit and (job.fit_score is None or job.fit_score > max_fit):
+            continue
         if board != "all" and board_label(job.source) != board:
             continue
         if location not in ("all", "") and location_key(job.location) != location:
@@ -755,11 +802,23 @@ def jobs_search(q: str = "", min_fit: int = 0, board: str = "all", location: str
         if not show_applied and (job.status in SUBMITTED_STATUSES or job.id in applied_ids):
             applied_hidden += 1
             continue
-        if cutoff is not None:
-            # A posting date the board never gave is unknown, so it cannot be "within" any window.
-            when = job.discovered_at if date_field == "found" else job.posted_at
-            if when is None or when < cutoff:
+        when = job.discovered_at if date_field == "found" else job.posted_at
+        if unknown_only and when is not None:
+            continue
+        if dated:
+            # A posting date the board never gave is unknown, so it matches no date window or range.
+            if when is None or (cutoff is not None and when < cutoff) or (newest is not None and when >= newest):
                 continue
+            if (day_from is not None and when < day_from) or (day_to is not None and when >= day_to):
+                continue
+        if work_mode not in ("all", "") and _work_mode(job) != work_mode:
+            continue
+        if job_type_key != "all" and (job.job_type or "").strip().lower() != job_type_key:
+            continue
+        if setup_runs is not None and job.search_run_id not in setup_runs:
+            continue
+        if has_salary and not _has_salary(job):
+            continue
         if stage == "unranked":  # not a status: any job without a fit score yet
             if job.fit_score is not None:
                 continue
@@ -803,7 +862,10 @@ def jobs_search(q: str = "", min_fit: int = 0, board: str = "all", location: str
             "total_all": total_all, "applied_hidden": applied_hidden,
             "domain_counts": {"matching": domain_counts["matching"], "not_matching": domain_counts["not_matching"]},
             "page": page, "pages": pages, "per_page": per_page, "boards": boards,
-            "locations": location_facets([j.location for j in jobs])}
+            "locations": location_facets([j.location for j in jobs]),
+            "job_types": sorted({(j.job_type or "").strip().lower() for j in jobs} - {""}),
+            "work_modes": dict(Counter(_work_mode(j) for j in jobs)),
+            "setups": [[s.id, s.name] for s in db.scalars(select(SavedSearch).order_by(SavedSearch.name)).all()]}
 
 
 class TriageIn(BaseModel):

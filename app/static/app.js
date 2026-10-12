@@ -9,9 +9,27 @@ const attr = esc;
 /* ───────────── state ───────────── */
 // Filters on the Tailor and Approvals screens, sent to /api/tailor/queue and /api/approvals.
 function pfDefaults(kind) { return { q: '', min_fit: 0, min_review: 0, board: 'all', location: 'all', status: 'all', ...(kind === 'approvals' ? { easy_apply: 'all' } : {}), sort: kind === 'tailor' ? 'fit' : 'default' }; }
+// Discovery table filters, sent to /api/jobs/search. The date filter is one of: within (last N), older_than, a
+// date_from–date_to range, or posted_unknown (Posted only); date_field says which date they look at.
+const DEFAULT_FILTERS = { q: '', min_fit: 0, max_fit: 0, board: 'all', location: 'all', stage: 'all', description: 'all', domain: 'matching',
+  date_field: 'found', within: '', older_than: '', date_from: '', date_to: '', posted_unknown: false, include_applied: false,
+  work_mode: 'all', job_type: 'all', setup_id: '', has_salary: false, hide_agencies: false, hide_reposts: false, keywords: [],
+  sort: 'fit', page: 1, per_page: 25 };
+const freshFilters = (keep = {}) => ({ ...DEFAULT_FILTERS, keywords: [], ...keep });
+// The table remembers its filters in this browser, per account (a shared browser never shows another account's
+// searches); a stored value of the wrong type is ignored.
+const FILTERS_KEY = `discoveryFilters:${BOOT.user?.id ?? 'anon'}`;
+function storedFilters() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(FILTERS_KEY) || 'null') || {};
+    const kept = Object.fromEntries(Object.entries(saved).filter(([k, v]) => k in DEFAULT_FILTERS && k !== 'page'
+      && (Array.isArray(DEFAULT_FILTERS[k]) ? Array.isArray(v) : typeof v === typeof DEFAULT_FILTERS[k])));
+    return freshFilters(kept);
+  } catch { return freshFilters(); }
+}
 const S = {
   screen: 'overview', knowledgeSection: 'answers', settingsSection: 'profile', todayVariant: 'focus', discMode: 'triage',
-  filters: { q: '', min_fit: 0, board: 'all', location: 'all', stage: 'all', description: 'all', domain: 'matching', date_field: 'found', within: '', include_applied: false, sort: 'fit', page: 1, per_page: 25 },
+  filters: storedFilters(), datePop: false, dateMode: null, moreFilters: false,
   triage: { min_fit: 0, location: 'all', hide_agencies: true, hide_reposts: true, keywords: [] }, triagedThisSession: 0,
   checked: new Set(), rankedIds: new Set(), selJob: null, jobOpen: null, jobTab: 'description',
   paletteOpen: false, paletteQuery: '', paletteJobs: [],
@@ -257,9 +275,11 @@ async function loadResumeChoices() {
   }
   return D.resumeChoices;
 }
+const tableQuery = (f, extra = {}) => qs({ ...f, min_fit: f.min_fit || '', max_fit: f.max_fit || '', keywords: (f.keywords || []).join(','), ...extra });
 async function loadTable() {
   const f = S.filters;
-  [D.jobs] = await Promise.all([api('/api/jobs/search?' + qs({ ...f, min_fit: f.min_fit || '' })), loadResumeChoices()]);
+  try { localStorage.setItem(FILTERS_KEY, JSON.stringify(f)); } catch { /* storage blocked: filters last this page */ }
+  [D.jobs] = await Promise.all([api('/api/jobs/search?' + tableQuery(f)), loadResumeChoices()]);
   if (!D.jobs.items.some(j => j.id === S.selJob)) S.selJob = (D.jobs.items[0] || {}).id || null;
   D.selDetail = S.selJob ? await api(`/api/jobs/${S.selJob}`) : null;
 }
@@ -760,6 +780,98 @@ function renderTriage() {
 function noteRanked(rows) { rows.forEach(r => r.fit == null ? S.rankedIds.delete(r.id) : S.rankedIds.add(r.id)); }
 const rankedSelection = () => [...S.checked].filter(id => S.rankedIds.has(id));
 
+// ── Discovery table filters ──
+const DATE_WINDOW_NAMES = { '24h': '24 hours', '3d': '3 days', '7d': '7 days', '15d': '15 days', '30d': '30 days', '60d': '60 days', '90d': '90 days' };
+const DATE_KEYS = ['within', 'older_than', 'date_from', 'date_to', 'posted_unknown'];
+const WORK_MODE_NAMES = { remote: 'Remote', hybrid: 'Hybrid', onsite_unknown: 'On-site / not stated' };
+const isoDay = v => { const [y, m, d] = String(v).split('-').map(Number); return new Date(y, m - 1, d).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: y === new Date().getFullYear() ? undefined : 'numeric' }); };
+function dateMode(f) {
+  if (f.posted_unknown && f.date_field === 'posted') return 'unknown';
+  if (f.within) return 'within';
+  if (f.older_than) return 'older';
+  if (f.date_from || f.date_to) return 'between';
+  return S.dateMode === 'between' ? 'between' : 'any';
+}
+function dateLabel(f) {
+  const field = f.date_field === 'posted' ? 'Posted' : 'Found', mode = dateMode(f);
+  if (mode === 'unknown') return 'Posted · no date given';
+  if (mode === 'within') return `${field} · last ${DATE_WINDOW_NAMES[f.within] || f.within}`;
+  if (mode === 'older') return `${field} · older than ${DATE_WINDOW_NAMES[f.older_than] || f.older_than}`;
+  if (f.date_from || f.date_to) return `${field} · ${f.date_from ? isoDay(f.date_from) : 'any'} – ${f.date_to ? isoDay(f.date_to) : 'today'}`;
+  return `${field} · any time`;
+}
+function datePopover(f) {
+  const mode = dateMode(f);
+  const modes = [['any', 'Any time'], ['within', 'In the last'], ['older', 'Older than'], ['between', 'Between dates'], ...(f.date_field === 'posted' ? [['unknown', 'No posting date']] : [])];
+  const windows = key => `<div class="row gap6 wrap">${Object.entries(DATE_WINDOW_NAMES).map(([v, t]) => `<button type="button" class="pickchip ${f[key] === v ? 'on' : ''}" data-act="date-window" data-key="${key}" data-value="${v}">${t}</button>`).join('')}</div>`;
+  return `<div class="date-panel" id="flt-date-panel" role="group" aria-label="Date filter">
+    <div class="xs muted mb6">Filter by the date the job was</div>
+    <div class="seg mb12">${[['found', 'Found'], ['posted', 'Posted']].map(([v, t]) => `<button type="button" class="${f.date_field === v ? 'on' : ''}" data-act="date-field" data-value="${v}" aria-pressed="${f.date_field === v}">${t}</button>`).join('')}</div>
+    <div class="row gap6 wrap mb12" role="radiogroup" aria-label="Date range">${modes.map(([v, t]) => `<button type="button" role="radio" aria-checked="${mode === v}" class="pickchip ${mode === v ? 'on' : ''}" data-act="date-mode" data-mode="${v}">${t}</button>`).join('')}</div>
+    ${mode === 'within' ? windows('within') : mode === 'older' ? windows('older_than')
+      : mode === 'between' ? `<div class="row gap8 wrap"><label class="field xs">From<input class="input" type="date" id="flt-date-from" data-filter="date_from" value="${attr(f.date_from)}" max="${attr(f.date_to || '')}"></label><label class="field xs">To<input class="input" type="date" id="flt-date-to" data-filter="date_to" value="${attr(f.date_to)}" min="${attr(f.date_from || '')}"></label></div><div class="xs faint mt6">Both days included · leave one empty for an open range</div>`
+      : mode === 'unknown' ? '<div class="xs muted">Jobs whose board never gave a posting date. They never match a date range.</div>'
+      : `<div class="xs muted">${f.date_field === 'posted' ? 'Jobs without a posting date only match “No posting date”.' : 'Every job, whenever it was found.'}</div>`}
+    <div class="row mt12"><span class="grow"></span>${btn('Done', 'date-pop', {}, 'sm')}</div></div>`;
+}
+// Every filter that differs from its default, as [keys it resets, label]; "more" marks the ones in the More panel.
+function activeFilters(j) {
+  const f = S.filters, out = [], name = (list, v) => (list.find(([k]) => String(k) === String(v)) || [v, v])[1];
+  const add = (keys, text, more = false) => out.push({ keys, text, more });
+  if (f.q) add(['q'], `“${f.q}”`);
+  if (dateMode(f) !== 'any' && (DATE_KEYS.some(k => f[k]))) add(DATE_KEYS, dateLabel(f));
+  if (f.min_fit) add(['min_fit'], `Fit ≥ ${f.min_fit}`);
+  if (f.stage && f.stage !== 'all') add(['stage'], f.stage === 'unranked' ? 'Unranked' : statusTitle(f.stage));
+  if (f.max_fit) add(['max_fit'], `Fit ≤ ${f.max_fit}`, true);
+  if (f.board && f.board !== 'all') add(['board'], f.board, true);
+  if (f.location && f.location !== 'all') add(['location'], name(locationOptions(j.locations), f.location), true);
+  if (f.domain && f.domain !== 'matching') add(['domain'], f.domain === 'all' ? 'Any domain' : 'Not matching', true);
+  if (f.description && f.description !== 'all') add(['description'], name(j.description_states || [], f.description), true);
+  if (f.work_mode && f.work_mode !== 'all') add(['work_mode'], WORK_MODE_NAMES[f.work_mode] || f.work_mode, true);
+  if (f.job_type && f.job_type !== 'all') add(['job_type'], titleCase(f.job_type), true);
+  if (f.setup_id) add(['setup_id'], `Setup: ${name(j.setups || [], f.setup_id)}`, true);
+  if ((f.keywords || []).length) add(['keywords'], `Mentions ${f.keywords.join(', ')}`, true);
+  if (f.has_salary) add(['has_salary'], 'Salary listed', true);
+  if (f.hide_agencies) add(['hide_agencies'], 'No agencies', true);
+  if (f.hide_reposts) add(['hide_reposts'], 'No reposts', true);
+  if (f.include_applied) add(['include_applied'], 'Applied shown', true);
+  return out;
+}
+const titleCase = s => String(s).replace(/(^|[\s-])(\w)/g, (m, a, b) => a + b.toUpperCase());
+function filterBar(j, opts) {
+  const f = S.filters, active = activeFilters(j), moreCount = active.filter(a => a.more).length;
+  const hasDate = DATE_KEYS.some(k => f[k]);
+  const fitCaps = [[0, 'Any'], [49, 'Below 50'], [69, 'Below 70'], [79, 'Below 80']];
+  const check = (key, text, title = '') => `<label class="check small" ${title ? `title="${attr(title)}"` : ''}><input type="checkbox" id="flt-${key.replace(/_/g, '-')}" data-filter="${key}" ${f[key] ? 'checked' : ''}>${text}</label>`;
+  const field = (text, control) => `<label class="field xs">${text}${control}</label>`;
+  return `<div class="filterbar">
+    <div class="toolbar">
+      <input class="input grow" style="min-width:180px" id="flt-q" data-filter="q" value="${attr(f.q)}" placeholder="Search title, company or location…" aria-label="Search jobs">
+      <button type="button" class="btn sm datebtn ${hasDate ? 'on' : ''}" id="flt-date" data-act="date-pop" aria-expanded="${S.datePop}" aria-controls="flt-date-panel"><span aria-hidden="true">◷</span>${esc(dateLabel(f))}<span class="faint" aria-hidden="true">${S.datePop ? '▴' : '▾'}</span></button>
+      <select class="select" id="flt-min" data-filter="min_fit" aria-label="Minimum fit">${opts([[0, 'Any fit'], [50, 'Fit ≥ 50'], [70, 'Fit ≥ 70'], [80, 'Fit ≥ 80']], f.min_fit)}</select>
+      <select class="select" id="flt-stage" data-filter="stage" aria-label="Stage">${opts([['all', 'All stages'], ['unranked', 'Unranked'], ...['discovered', 'shortlisted', 'maybe', 'archived', 'dismissed', 'tailored', 'needs_retailor', 'pending_approval', 'approved', 'applied'].map(s => [s, statusTitle(s)])], f.stage)}</select>
+      <select class="select" id="flt-sort" data-filter="sort" aria-label="Sort">${opts([['fit', 'Sort: best fit'], ['new', 'Sort: newest found'], ['posted', 'Sort: newest posted'], ['company', 'Sort: company']], f.sort)}</select>
+      <button type="button" class="btn sm ${S.moreFilters || moreCount ? 'soft' : ''}" data-act="toggle-more-filters" aria-expanded="${S.moreFilters}" aria-controls="flt-more">More filters${moreCount ? ` · ${moreCount}` : ''} <span aria-hidden="true">${S.moreFilters ? '▴' : '▾'}</span></button>
+      <span class="grow"></span>
+      ${S.checked.size ? '' : btn(label('rankBatch', 'Rank unranked', 'Queueing…'), 'rank-batch', {}, 'sm', isBusy('rankBatch'))}
+    </div>
+    ${S.datePop ? datePopover(f) : ''}
+    ${S.moreFilters ? `<div class="filter-more" id="flt-more">
+      ${field('Board', `<select class="select" id="flt-board" data-filter="board">${opts([['all', 'All boards'], ...(j.boards || []).map(b => [b, b])], f.board)}</select>`)}
+      ${field('Location', `<select class="select" id="flt-location" data-filter="location">${opts(locationOptions(j.locations || []), f.location)}</select>`)}
+      ${field('Work mode', `<select class="select" id="flt-work-mode" data-filter="work_mode" title="As the board states it: a job that does not say remote or hybrid is “not stated”">${opts([['all', 'Any work mode'], ...Object.entries(WORK_MODE_NAMES).map(([k, t]) => [k, `${t} (${j.work_modes?.[k] ?? 0})`])], f.work_mode)}</select>`)}
+      ${field('Job type', `<select class="select" id="flt-job-type" data-filter="job_type">${opts([['all', 'Any job type'], ...(j.job_types || []).map(t => [t, titleCase(t)])], f.job_type)}</select>`)}
+      ${field('Fit up to', `<select class="select" id="flt-max" data-filter="max_fit">${opts(fitCaps, f.max_fit)}</select>`)}
+      ${field('Search setup', `<select class="select" id="flt-setup" data-filter="setup_id">${opts([['', 'Any setup'], ...(j.setups || [])], f.setup_id)}</select>`)}
+      ${field('Domain', `<select class="select" id="flt-domain" data-filter="domain" title="Jobs outside your domain are hidden at discovery and never ranked (Settings → Domain filter)">${opts([['matching', `Matching (${j.domain_counts?.matching ?? 0})`], ['not_matching', `Not matching (${j.domain_counts?.not_matching ?? 0})`], ['all', 'Any domain']], f.domain || 'matching')}</select>`)}
+      ${field('Description', `<select class="select" id="flt-description" data-filter="description">${opts([['all', 'Any description'], ...(j.description_states || []).map(([k, name, n]) => [k, `${name} (${n})`])], f.description)}</select>`)}
+      <div class="filter-wide"><div class="xs muted mb4">Must mention <span class="faint">· all of them; use / for either</span></div>${tagBox('flt', 'keywords', f.keywords || [], 'Python, Lead/Principal… then Enter', 6)}</div>
+      <div class="filter-wide row gap16 wrap">${check('has_salary', 'Salary listed', 'Only jobs whose posting states a salary')}${check('hide_agencies', 'Hide staffing agencies')}${check('hide_reposts', 'Hide reposts')}${check('include_applied', 'Show applied', 'Jobs you already applied to are hidden from Discovery; the Applied stage always shows them')}</div>
+    </div>` : ''}
+    ${active.length ? `<div class="filter-chips" aria-label="Active filters">${active.map(a => `<span class="chip grey">${esc(a.text)}<button type="button" aria-label="Remove filter ${attr(a.text)}" data-act="clear-filter" data-keys="${a.keys.join(',')}">×</button></span>`).join('')}<a href="#" class="xs" data-act="reset-filters">Clear all</a></div>` : ''}
+  </div>`;
+}
+
 function renderTable() {
   const j = D.jobs; if (!j) return loading();
   noteRanked(j.items);
@@ -772,30 +884,19 @@ function renderTable() {
   const allOnPage = j.items.length && j.items.every(r => S.checked.has(r.id));
   return `<div class="split">
   <section class="card flush c-main">
-    <div class="toolbar">
-      <input class="input grow" style="min-width:180px" id="flt-q" data-filter="q" value="${attr(f.q)}" placeholder="Search title, company or location…">
-      <select class="select" id="flt-min" data-filter="min_fit">${opts([[0, 'Any fit'], [50, 'Fit ≥ 50'], [70, 'Fit ≥ 70'], [80, 'Fit ≥ 80']], f.min_fit)}</select>
-      <select class="select" id="flt-board" data-filter="board">${opts([['all', 'All boards'], ...j.boards.map(b => [b, b])], f.board)}</select>
-      <select class="select" id="flt-location" data-filter="location" aria-label="Location">${opts(locationOptions(j.locations), f.location)}</select>
-      <select class="select" id="flt-date-field" data-filter="date_field" aria-label="Date to filter by">${opts([['found', 'Found'], ['posted', 'Posted']], f.date_field)}</select>
-      <select class="select" id="flt-within" data-filter="within" aria-label="How recent">${opts([['', 'Any time'], ['24h', 'Last 24 hours'], ['3d', 'Last 3 days'], ['7d', 'Last 7 days'], ['15d', 'Last 15 days'], ['30d', 'Last 30 days']], f.within)}</select>
-      <label class="check small" title="Jobs you already applied to are hidden from Discovery; the Applied stage always shows them"><input type="checkbox" id="flt-applied" data-filter="include_applied" ${f.include_applied ? 'checked' : ''}>Show applied</label>
-      <select class="select" id="flt-domain" data-filter="domain" aria-label="Domain" title="Jobs outside your domain are hidden at discovery and never ranked (Settings → Domain filter)">${opts([['matching', `Matching (${j.domain_counts?.matching ?? 0})`], ['not_matching', `Not matching (${j.domain_counts?.not_matching ?? 0})`], ['all', 'Any domain']], f.domain || 'matching')}</select>
-      <select class="select" id="flt-description" data-filter="description" aria-label="Job description">${opts([['all', 'Any description'], ...(j.description_states || []).map(([k, name, n]) => [k, `${name} (${n})`])], f.description)}</select>
-      <select class="select" id="flt-stage" data-filter="stage">${opts([['all', 'All stages'], ['unranked', 'Unranked'], ...['discovered', 'shortlisted', 'maybe', 'archived', 'dismissed', 'tailored', 'needs_retailor', 'pending_approval', 'approved', 'applied'].map(s => [s, statusTitle(s)])], f.stage)}</select>
-      <select class="select" id="flt-sort" data-filter="sort">${opts([['fit', 'Sort: best fit'], ['new', 'Sort: newest found'], ['posted', 'Sort: newest posted'], ['company', 'Sort: company']], f.sort)}</select>
-      ${btn('Reset', 'reset-filters', {}, 'sm')}
-      ${S.checked.size ? '' : btn(label('rankBatch', 'Rank unranked', 'Queueing…'), 'rank-batch', {}, 'sm', isBusy('rankBatch'))}
-      ${S.checked.size ? `<span class="small b" style="color:var(--brand-ink)">${S.checked.size} selected</span>` : ''}
-      ${btn(isBusy('bulkRank') ? esc(S.rankProgress || 'Queueing…') : `Rank${S.checked.size ? ` ${S.checked.size}` : ''}`, 'bulk-rank', {}, 'sm', !S.checked.size || isBusy('bulkRank'))}
-      ${btn(`Shortlist${S.checked.size ? ` ${S.checked.size}` : ''}`, 'bulk', { action: 'shortlist' }, 'sm soft', !S.checked.size)}
+    ${filterBar(j, opts)}
+    ${S.checked.size ? `<div class="selbar" role="toolbar" aria-label="Selected jobs">
+      <span class="small b" style="color:var(--brand-ink)">${S.checked.size} selected</span>
+      ${btn(isBusy('bulkRank') ? esc(S.rankProgress || 'Queueing…') : `Rank ${S.checked.size}`, 'bulk-rank', {}, 'sm', isBusy('bulkRank'))}
+      ${btn(`Shortlist ${S.checked.size}`, 'bulk', { action: 'shortlist' }, 'sm soft')}
       <span title="${attr(unranked ? `${unranked} selected job${unranked === 1 ? ' is' : 's are'} not ranked yet. Rank ${unranked === 1 ? 'it' : 'them'} first: tailoring works from the ranking.` : 'Send the selected ranked jobs to Bulk tailor')}">${btn(label('bulkToTailor', `Bulk tailor${tailorable ? ` ${tailorable}` : ''}`, 'Queueing…'), 'bulk-to-tailor', {}, 'sm primary', !tailorable || isBusy('bulkToTailor'))}</span>
-      ${btn('Archive', 'bulk', { action: 'archive' }, 'sm', !S.checked.size)}
-      ${btn('Dismiss', 'bulk', { action: 'dismiss' }, 'sm', !S.checked.size)}
-      ${btn(label('bulkDelete', `Delete${S.checked.size ? ` ${S.checked.size}` : ''}`, 'Deleting…'), 'bulk-delete', {}, 'sm danger', !S.checked.size || isBusy('bulkDelete'))}
-      ${f.domain !== 'matching' ? btn(label('bulkKeep', `Keep${S.checked.size ? ` ${S.checked.size}` : ''}`, 'Keeping…'), 'bulk-domain-keep', {}, 'sm soft', !S.checked.size || isBusy('bulkKeep')) : ''}
-      ${resumeSelect('bulk-resume', '', { placeholder: 'Use resume…', disabled: !S.checked.size || isBusy('bulkResume'), fill: false })}
-    </div>
+      ${btn('Archive', 'bulk', { action: 'archive' }, 'sm')}
+      ${btn('Dismiss', 'bulk', { action: 'dismiss' }, 'sm')}
+      ${btn(label('bulkDelete', `Delete ${S.checked.size}`, 'Deleting…'), 'bulk-delete', {}, 'sm danger', isBusy('bulkDelete'))}
+      ${f.domain !== 'matching' ? btn(label('bulkKeep', `Keep ${S.checked.size}`, 'Keeping…'), 'bulk-domain-keep', {}, 'sm soft', isBusy('bulkKeep')) : ''}
+      ${resumeSelect('bulk-resume', '', { placeholder: 'Use resume…', disabled: isBusy('bulkResume'), fill: false })}
+      <span class="grow"></span>${btn('Clear selection', 'clear-selection', {}, 'sm ghost')}
+    </div>` : ''}
     <div class="row between wrap" style="padding:9px 14px;border-bottom:1px solid var(--line2);background:#fbfbfe"><span class="small muted">${j.total ? `Showing ${start}–${Math.min(j.page * j.per_page, j.total)} of ${j.total} jobs` : 'No matches'}</span><span class="small muted">Page ${j.page} of ${j.pages} · ${j.total + (j.applied_hidden || 0) === j.total_all ? 'no filters applied' : `${j.total_all - j.total - (j.applied_hidden || 0)} hidden by filters`}${j.applied_hidden ? ` · ${j.applied_hidden} applied job${j.applied_hidden === 1 ? '' : 's'} hidden` : ''}</span></div>
     ${allOnPage && j.total > j.items.length && S.checked.size < j.total ? `<div class="banner" style="border-radius:0;border-width:0 0 1px">All ${j.items.length} on this page are selected. <a href="#" data-act="select-all-matching">${isBusy('selectAll') ? 'Selecting…' : `Select all ${j.total} matching jobs`}</a></div>` : ''}
     ${S.checked.size && S.checked.size >= j.total && j.total > j.items.length ? `<div class="banner" style="border-radius:0;border-width:0 0 1px">All ${S.checked.size} matching jobs are selected. <a href="#" data-act="clear-selection">Clear selection</a></div>` : ''}
@@ -2052,7 +2153,7 @@ const A = {
     e.preventDefault();
     return busy('selectAll', async () => {
       const f = S.filters;
-      const out = await api('/api/jobs/search?' + qs({ ...f, min_fit: f.min_fit || '', ids_only: true }));
+      const out = await api('/api/jobs/search?' + tableQuery(f, { ids_only: true }));
       out.ids.forEach(id => S.checked.add(id));
       const ranked = new Set(out.ranked_ids || []);
       out.ids.forEach(id => ranked.has(id) ? S.rankedIds.add(id) : S.rankedIds.delete(id));
@@ -2081,14 +2182,39 @@ const A = {
     }, out => `Deleted ${out.deleted} job${out.deleted === 1 ? '' : 's'}${out.protected.length ? ` · kept ${out.protected.length} approved or applied` : ''}`);
   },
   'pf-reset': el => { S.pf[el.dataset.kind] = pfDefaults(el.dataset.kind); load(); },
-  'reset-filters': (el, e) => { e.preventDefault(); S.filters = { q: '', min_fit: 0, board: 'all', location: 'all', stage: 'all', description: 'all', domain: 'matching', date_field: 'found', within: '', include_applied: false, sort: 'fit', page: 1, per_page: S.filters.per_page }; load(); },
+  'reset-filters': (el, e) => { e.preventDefault(); S.filters = freshFilters({ per_page: S.filters.per_page }); S.dateMode = null; load(); },
+  'clear-filter': el => {
+    el.dataset.keys.split(',').forEach(k => { S.filters[k] = Array.isArray(DEFAULT_FILTERS[k]) ? [] : DEFAULT_FILTERS[k]; });
+    if (el.dataset.keys.includes('within')) S.dateMode = null;
+    S.filters.page = 1; load();
+  },
+  'toggle-more-filters': () => { S.moreFilters = !S.moreFilters; if (S.moreFilters) S.datePop = false; render(); },
+  'date-pop': () => { S.datePop = !S.datePop; if (S.datePop) S.moreFilters = false; render(); },
+  'date-field': el => {
+    const f = S.filters; if (f.date_field === el.dataset.value) return;
+    f.date_field = el.dataset.value;
+    if (f.date_field === 'found' && f.posted_unknown) { f.posted_unknown = false; S.dateMode = null; }
+    f.page = 1; load();
+  },
+  // Choosing a mode clears the other modes' values: one date filter at a time.
+  'date-mode': el => {
+    const f = S.filters, mode = el.dataset.mode, before = JSON.stringify(f);
+    if (mode === dateMode(f)) return;
+    Object.assign(f, { within: '', older_than: '', date_from: '', date_to: '', posted_unknown: false, page: 1 });
+    if (mode === 'within') f.within = '7d';
+    if (mode === 'older') f.older_than = '7d';
+    if (mode === 'unknown') f.posted_unknown = true;
+    S.dateMode = mode === 'any' ? null : mode;
+    if (JSON.stringify(f) !== before) load(); else render();
+  },
+  'date-window': el => { const f = S.filters; f[el.dataset.key] = el.dataset.value; f.page = 1; load(); },
   page: el => { S.filters.page = Number(el.dataset.page); load(); },
   // setup
   'focus-tag': (el, e) => { if (e.target === el) document.getElementById(el.dataset.target)?.focus(); },
   'tag-remove': (el, e) => {
     e.stopPropagation();
     const { form, key } = el.dataset;
-    if (form === 'triage') { S.triage.keywords.splice(Number(el.dataset.index), 1); load(); return; }
+    if (FILTER_TAGS[form]) { FILTER_TAGS[form]().keywords.splice(Number(el.dataset.index), 1); S.filters.page = 1; load(); return; }
     const list = [...(fv(form, key, tagFallback(form, key)) || [])]; list.splice(Number(el.dataset.index), 1); setF(form, key, list); render();
   },
   'suggest-role': (el, e) => { e.preventDefault(); addTags('sp', 'roles', el.dataset.role, 5, D.searchProfile.profile.roles); render(); },
@@ -2543,7 +2669,7 @@ document.addEventListener('change', e => {
   if (el.dataset.pf && el.dataset.pfkey !== 'q') { const k = el.dataset.pfkey; S.pf[el.dataset.pf][k] = k.startsWith('min_') ? Number(el.value) : el.value; load(); }
   if (el.dataset.rf && el.dataset.rf !== 'q') { S.rf[el.dataset.rf] = el.value; loadRanking().then(render); }
   if (el.dataset.tf && el.dataset.tf !== 'q') { S.tf[el.dataset.tf] = el.dataset.tf === 'min_fit' ? Number(el.value) : el.value; render(); }
-  if (el.dataset.filter && el.dataset.filter !== 'q') { S.filters[el.dataset.filter] = el.type === 'checkbox' ? el.checked : el.dataset.filter === 'per_page' || el.dataset.filter === 'min_fit' ? Number(el.value) : el.value; S.filters.page = 1; load(); }
+  if (el.dataset.filter && el.dataset.filter !== 'q') { S.filters[el.dataset.filter] = el.type === 'checkbox' ? el.checked : ['per_page', 'min_fit', 'max_fit'].includes(el.dataset.filter) ? Number(el.value) : el.value; S.filters.page = 1; load(); }
   if (el.dataset.triage && el.dataset.triage !== 'min_fit') { S.triage[el.dataset.triage] = el.type === 'checkbox' ? el.checked : el.value; load(); }
   if (el.dataset.actChange) A[el.dataset.actChange](el, e);
   if (el.id === 'resume-file' && el.files[0]) { settingsUploadResume(el.files[0]); el.value = ''; }
@@ -2557,9 +2683,15 @@ document.addEventListener('focusout', e => {
     api(`/api/jobs/${id}/notes`, { method: 'PUT', body: { notes: el.value } }).then(() => { if (D.approval) D.approval.notes = el.value; toast('Notes saved'); }).catch(err => toast(err.message, true));
   }
 });
+// "Must mention" keyword boxes that are filters, not forms: Triage's and the Discovery table's.
+const FILTER_TAGS = { triage: () => S.triage, flt: () => S.filters };
 function commitTag(el, redraw = true) {
   const { form, tag } = el.dataset, max = Number(el.dataset.max || 20);
-  if (form === 'triage') { const tmp = { keywords: S.triage.keywords }; S.forms.__t = tmp; addTags('__t', 'keywords', el.value, max, S.triage.keywords); S.triage.keywords = S.forms.__t.keywords; delete S.forms.__t; el.value = ''; load(); return; }
+  if (FILTER_TAGS[form]) {
+    const holder = FILTER_TAGS[form](), list = holder.keywords || [];
+    S.forms.__t = { keywords: list }; addTags('__t', 'keywords', el.value, max, list); holder.keywords = S.forms.__t.keywords; delete S.forms.__t;
+    el.value = ''; S.filters.page = 1; load(); return;
+  }
   addTags(form, tag, el.value, max, tagFallback(form, tag)); el.value = '';
   if (redraw) render();
   else { const box = el.closest('.tagbox'); if (box) { box.querySelectorAll('.chip').forEach(c => c.remove()); el.insertAdjacentHTML('beforebegin', chips(form, tag, tagFallback(form, tag))); } }
@@ -2567,12 +2699,13 @@ function commitTag(el, redraw = true) {
 document.addEventListener('keydown', e => {
   const el = e.target;
   if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); A.palette(); return; }
+  if (e.key === 'Escape' && S.datePop) { S.datePop = false; render(); document.getElementById('flt-date')?.focus(); return; }
   if (e.key === 'Escape') { if (S.boardReview && !S.paletteOpen && !S.jobOpen && !S.kitJob) { S.boardReview = null; render(); return; } if (S.paletteOpen || S.jobOpen || S.kitJob) { S.paletteOpen = false; S.jobOpen = null; S.kitJob = null; render(); } return; }
   if (el.dataset && el.dataset.tag) {
     if (e.key === 'Enter' || (e.key === ',' && el.dataset.split !== 'newline')) { e.preventDefault(); if (el.value.trim()) commitTag(el); return; }
     if (e.key === 'Backspace' && !el.value) {
       const { form, tag } = el.dataset;
-      if (form === 'triage') { S.triage.keywords.pop(); load(); return; }
+      if (FILTER_TAGS[form]) { FILTER_TAGS[form]().keywords.pop(); S.filters.page = 1; load(); return; }
       const list = [...(fv(form, tag, tagFallback(form, tag)) || [])]; list.pop(); setF(form, tag, list); render(); return;
     }
   }
