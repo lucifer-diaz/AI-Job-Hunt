@@ -88,6 +88,10 @@ def test_fit_range_work_mode_job_type_and_salary(tag):
     assert names(tag, work_mode="onsite_unknown") == {"unstated"}
     assert names(tag, job_type="full-time") == {"remote"}
     assert names(tag, has_salary=True) == {"remote"}
+    # A job the compensation check looked at and found no salary in keeps an envelope; that is not a salary.
+    add(tag, "checked", compensation={"status": "not_listed", "posting": None, "glassdoor": {"status": "not_configured"}})
+    add(tag, "enriched", compensation={"status": "found", "posting": {"min": 90000, "max": None, "currency": "EUR"}})
+    assert names(tag, has_salary=True) == {"remote", "enriched"}
     facets = client.get("/api/jobs/search", params={"q": tag}).json()
     assert {"full-time", "contract"} <= set(facets["job_types"])
     assert facets["work_modes"]["remote"] >= 1 and facets["work_modes"]["onsite_unknown"] >= 1

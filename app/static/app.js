@@ -16,10 +16,12 @@ const DEFAULT_FILTERS = { q: '', min_fit: 0, max_fit: 0, board: 'all', location:
   work_mode: 'all', job_type: 'all', setup_id: '', has_salary: false, hide_agencies: false, hide_reposts: false, keywords: [],
   sort: 'fit', page: 1, per_page: 25 };
 const freshFilters = (keep = {}) => ({ ...DEFAULT_FILTERS, keywords: [], ...keep });
-// The table remembers its filters in this browser; a stored value of the wrong type is ignored.
+// The table remembers its filters in this browser, per account (a shared browser never shows another account's
+// searches); a stored value of the wrong type is ignored.
+const FILTERS_KEY = `discoveryFilters:${BOOT.user?.id ?? 'anon'}`;
 function storedFilters() {
   try {
-    const saved = JSON.parse(localStorage.getItem('discoveryFilters') || 'null') || {};
+    const saved = JSON.parse(localStorage.getItem(FILTERS_KEY) || 'null') || {};
     const kept = Object.fromEntries(Object.entries(saved).filter(([k, v]) => k in DEFAULT_FILTERS && k !== 'page'
       && (Array.isArray(DEFAULT_FILTERS[k]) ? Array.isArray(v) : typeof v === typeof DEFAULT_FILTERS[k])));
     return freshFilters(kept);
@@ -276,7 +278,7 @@ async function loadResumeChoices() {
 const tableQuery = (f, extra = {}) => qs({ ...f, min_fit: f.min_fit || '', max_fit: f.max_fit || '', keywords: (f.keywords || []).join(','), ...extra });
 async function loadTable() {
   const f = S.filters;
-  try { localStorage.setItem('discoveryFilters', JSON.stringify(f)); } catch { /* storage blocked: filters last this page */ }
+  try { localStorage.setItem(FILTERS_KEY, JSON.stringify(f)); } catch { /* storage blocked: filters last this page */ }
   [D.jobs] = await Promise.all([api('/api/jobs/search?' + tableQuery(f)), loadResumeChoices()]);
   if (!D.jobs.items.some(j => j.id === S.selJob)) S.selJob = (D.jobs.items[0] || {}).id || null;
   D.selDetail = S.selJob ? await api(`/api/jobs/${S.selJob}`) : null;

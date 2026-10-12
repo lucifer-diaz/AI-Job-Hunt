@@ -718,10 +718,12 @@ def _work_mode(job: Job) -> str:
 
 
 def _has_salary(job: Job) -> bool:
-    """Only a salary the posting states (or one already extracted for it); never an estimate."""
+    """Only a salary the posting states (or one already extracted for it); never an estimate. The stored envelope
+    (compensation.enrich_compensation) exists for checked jobs without a salary too, so only its `posting` counts."""
     from app.services.compensation import extract_posting_salary
 
-    return bool(job.compensation) or extract_posting_salary(job.raw) is not None
+    stored = job.compensation if isinstance(job.compensation, dict) else {}
+    return bool(stored.get("posting")) or extract_posting_salary(job.raw) is not None
 
 
 @router.get("/api/jobs/search")

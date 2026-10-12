@@ -15,7 +15,7 @@ const view = () => { document.getElementById('view').innerHTML = ui.renderTable(
 const tailorButton = root => [...root.querySelectorAll('[data-act="bulk-to-tailor"]')][0];
 
 beforeEach(() => {
-  document.body.innerHTML = '<script id="boot" type="application/json">{"user":{"email":"a@b.c","is_admin":true}}</script><div id="view"></div><div id="toast"></div>';
+  document.body.innerHTML = '<script id="boot" type="application/json">{"user":{"id":7,"email":"a@b.c","is_admin":true}}</script><div id="view"></div><div id="toast"></div>';
   if (!ui) {
     const context = createContext({ document, window, location, history, navigator, URLSearchParams, FormData, File, Intl,
       setTimeout, clearTimeout, setInterval, clearInterval, console, fetch: vi.fn() });
@@ -23,7 +23,7 @@ beforeEach(() => {
       runInContext(readFileSync(`app/static/${file}`, 'utf8'), context, { filename: resolve(`app/static/${file}`) });
     }
     runInContext(appSource, context, { filename: resolve('app/static/app.js') });
-    ui = runInContext('({ S, D, A, renderTable, freshFilters, tableQuery, DEFAULT_FILTERS })', context);
+    ui = runInContext('({ S, D, A, renderTable, freshFilters, tableQuery, DEFAULT_FILTERS, FILTERS_KEY })', context);
     runInContext('load = async () => {}; render = () => {};', context);
   }
   ui.S.checked = new Set(); ui.S.rankedIds = new Set(); ui.S.busy = {}; ui.S.selJob = null; ui.D.selDetail = null;
@@ -139,5 +139,9 @@ describe('Jobs · filter actions', () => {
     A['reset-filters'](null, { preventDefault() {} });
     expect(ui.S.filters).toEqual({ ...ui.DEFAULT_FILTERS, per_page: 50 });
     expect(ui.tableQuery(ui.S.filters)).not.toContain('keywords');
+  });
+
+  it('remembers filters per account, so a shared browser never shows another account\'s searches', () => {
+    expect(ui.FILTERS_KEY).toBe('discoveryFilters:7');
   });
 });
