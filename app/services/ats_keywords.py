@@ -112,8 +112,8 @@ def targets(job: Any, vocabulary: set[str], sources: list[dict[str, Any]], analy
             names: dict[str, str] | None = None) -> dict[str, list]:
     """The posting's keywords (the same list as the ATS score) split by what the candidate can truthfully claim.
 
-        use         every significant word is in `vocabulary` (app.services.tailoring_results.claim_vocabulary, the
-                    set validation accepts), with the posting's spelling, its level and `found_in`: the ids of the
+        use         every significant word is in `vocabulary` (the words of the facts the prompt carries, a part of
+                    what validation accepts), with the posting's spelling, its level and `found_in`: the ids of the
                     `sources` ({"id", "text"}: source bullets, evidence) that mention it, for the bullet to cite
         do_not_use  the rest: requirements the candidate's facts do not cover, which stay gaps
 

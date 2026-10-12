@@ -174,15 +174,6 @@ def _vocabulary(master_text: str, evidence_text: str, profile: CandidateProfile)
                             *(str(s) for s in prefs.get("secondary_skills") or [])])))
 
 
-def claim_vocabulary(db: Session, profile: CandidateProfile, job: Job) -> set[str]:
-    """The words a tailored resume may name for this job: exactly the set validate_tailored_resume accepts, so a
-    keyword built from it (app.services.ats_keywords.targets) never fails validation."""
-    from app.services import resume_verification as rv
-
-    profile = rv.for_job(db, profile, job)
-    return _vocabulary(to_plain(profile.master_resume or ""), _evidence_text(verified_evidence(db, job)), profile)
-
-
 def validate_tailored_resume(db: Session, profile: CandidateProfile, job: Job, data: TailoredResumeIn, *,
                              legacy: bool = False) -> list[dict[str, str]]:
     """Every problem that stops this tailored resume from being stored. Empty means it may be saved.

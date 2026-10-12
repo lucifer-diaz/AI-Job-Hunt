@@ -140,12 +140,17 @@ def supported_keyword_coverage(targets: dict, markdown: str) -> dict:
 
 
 def tailored_highlights(content: dict | None) -> dict:
-    """The validated tailored resume a letter is written beside: its summary and its first role's bullets."""
+    """The validated tailored resume a letter is written beside, as it renders: its summary (when the Tailor wrote
+    one) and the first role's bullets, the Tailor's own or, for a role it left alone, the source bullets the
+    resume shows in its place (`fallback_bullets`, as build_resume_markdown renders them)."""
     if not content:
         return {}
-    sections = sorted(content.get("experience") or [], key=lambda s: s.get("role_index") or 0)
-    bullets = [str(b) for b in (sections[0].get("bullets") if sections else content.get("experience_bullets")) or []
-               if str(b).strip()]
+    patched = {s.get("role_index"): s.get("bullets") or [] for s in content.get("experience") or []}
+    fallback = {int(k): v for k, v in (content.get("fallback_bullets") or {}).items()}
+    roles = sorted(set(patched) | set(fallback), key=lambda i: -1 if i is None else i)
+    first = roles[0] if roles else None
+    bullets = (patched.get(first) or fallback.get(first)) if roles else content.get("experience_bullets")
+    bullets = [str(b) for b in bullets or [] if str(b).strip()]
     return {k: v for k, v in {"summary": content.get("summary"), "top_bullets": bullets[:5]}.items() if v}
 
 
@@ -154,8 +159,7 @@ def write_cover_letter(db: Session, profile: CandidateProfile, job: Job, llm: LL
     """A letter in the candidate's own voice, from its own prompt and context (app.prompts.cover_letter): the
     posting and its company facts, the verified proof points that fit it, and the answers the posting raises.
     `tailored` is the validated tailored content the letter is written beside, so both tell the same story."""
-    context = build_cover_letter_context(db, profile, job)
-    context.tailored = tailored_highlights(tailored)
+    context = build_cover_letter_context(db, profile, job, tailored=tailored_highlights(tailored))
     prompt = build_cover_letter_prompt(context, recruiters=recruiters_of(job.application) if job.application else [])
     result = llm.generate_prompt(prompt, LLMCall(workflow_type="job", entity_id=job.id,
                                                  context_stats=context.call_stats()))

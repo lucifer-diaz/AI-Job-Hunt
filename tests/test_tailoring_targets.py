@@ -2,7 +2,7 @@
 (the Ranker's matched requirements and the ids that prove them), and the validator reading compound names."""
 from types import SimpleNamespace
 
-from app.models import Job
+from app.models import Evidence, Job
 from app.prompts import build_cover_letter_prompt, build_tailoring_prompt
 from app.services import ats_keywords as ats
 from app.services import context_builder as cb
@@ -15,7 +15,7 @@ from app.services.tailoring_results import (
     validate_tailored_resume,
 )
 from app.services.user_settings import profile_for
-from app.services.workflow import supported_keyword_coverage
+from app.services.workflow import supported_keyword_coverage, tailored_highlights
 from tests.test_context_builder import add_job, build, session, verify
 from tests.test_context_builder import user as user  # noqa: PLC0414  the fixture, re-exported
 from tests.test_prompt_architecture import COMPLETED, set_fit
@@ -112,3 +112,56 @@ def test_the_cover_letter_reads_the_parsed_posting_and_the_tailored_resume():
     for label in ("TAILORED RESUME", "JOB REQUIREMENTS", "REQUIREMENT MAP", "KEYWORD TARGETS", "Own Kafka pipelines"):
         assert label in prompt.user, label
     assert "do_not_use" in prompt.system
+
+
+# ───────────── review follow-ups ─────────────
+
+def test_a_keyword_only_unshown_evidence_mentions_is_not_a_use_term():
+    """Support comes from the facts the prompt carries, never from the rest of the Evidence Bank."""
+    posting = SimpleNamespace(structured_description={"required_skills": ["Kafka", "Terraform"]}, skills=[],
+                              fit_analysis={}, description="", structured_description_hash=description_hash(""))
+    targets = cb.keyword_targets(posting, ["Ran Kafka pipelines"], [{"id": 6, "text": "Ran Kafka pipelines"}])
+    assert [t["keyword"] for t in targets["use"]] == ["Kafka"] and targets["do_not_use"] == ["Terraform"]
+
+
+def test_keyword_support_follows_exactly_the_evidence_the_prompt_shows(user):
+    job_id = _ready(user)
+    set_fit(user, job_id, COMPLETED)
+    with session(user) as db:
+        db.add(Evidence(user_id=user, company="Zendrive", role="Lead Engineer", claim="Provisioned Terraform modules",
+                        context="", skills=["Terraform"], tags=[], verified=True, source="manual"))
+        db.commit()
+    context = build(user, cb.build_tailoring_context, job_id)
+    shown = " ".join(e.get("claim", "") for e in context.relevant_evidence)
+    use = {t["keyword"] for t in context.keyword_targets.get("use") or []}
+    assert ("Terraform" in use) == ("Terraform" in shown), "support follows exactly what the prompt shows"
+
+
+def test_a_stale_parse_gives_no_keyword_targets_from_the_old_posting(user):
+    job_id = _ready(user)
+    with session(user) as db:
+        job = db.get(Job, job_id)
+        job.structured_description_hash = "stale"
+        db.commit()
+        targets = cb.keyword_targets(job, ["Kafka Python"], [])
+    assert not targets.get("use") and not targets.get("do_not_use"), "the old parse's keywords are not read"
+
+
+def test_letter_highlights_follow_the_rendered_resume():
+    only_later_role = {"summary": "", "experience": [{"role_index": 1, "bullets": ["Later role bullet"]}],
+                       "fallback_bullets": {"0": ["Newest role, left alone"], "1": ["old"]}}
+    assert tailored_highlights(only_later_role) == {"top_bullets": ["Newest role, left alone"]}
+    patched_first = {"summary": "S", "experience": [{"role_index": 0, "bullets": ["Rewritten"]}],
+                     "fallback_bullets": {"0": ["Source"]}}
+    assert tailored_highlights(patched_first) == {"summary": "S", "top_bullets": ["Rewritten"]}
+    assert tailored_highlights({"summary": "Only the summary", "fallback_bullets": {"0": ["Source"]}}) == \
+        {"summary": "Only the summary", "top_bullets": ["Source"]}
+
+
+def test_the_letter_context_is_measured_with_the_tailored_resume(user):
+    job_id = _ready(user)
+    set_fit(user, job_id, COMPLETED)
+    plain = build(user, cb.build_cover_letter_context, job_id)
+    tailored = build(user, cb.build_cover_letter_context, job_id,
+                     tailored={"summary": "Data platform lead " * 40, "top_bullets": ["Cut incidents by 45%"] * 5})
+    assert tailored.tailored and tailored.stats.selected_context_tokens > plain.stats.selected_context_tokens

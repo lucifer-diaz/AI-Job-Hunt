@@ -641,17 +641,39 @@ def requirement_map(analysis: dict[str, Any] | None, citable: set[int], limit: i
     return rows[:limit]
 
 
-def keyword_targets(db: Session, profile: CandidateProfile, job: Job, sources: list[dict[str, Any]]) -> dict[str, Any]:
-    """The posting's ATS keywords split by what this candidate's facts support (app.services.ats_keywords.targets),
-    judged with the vocabulary tailoring validation itself uses."""
-    from app.services import ats_keywords
-    from app.services.tailoring_results import claim_vocabulary
+def keyword_targets(job: Job, shown: list[str], sources: list[dict[str, Any]]) -> dict[str, Any]:
+    """The posting's ATS keywords split by what this candidate's facts support (app.services.ats_keywords.targets).
 
+    A keyword is supported only by `shown`: the texts the prompt itself carries (its resume facts and selected
+    evidence), never the whole Evidence Bank and never evidence held back for a provenance conflict, so "use" always
+    means a fact in front of the model proves it. Those texts are part of what validation accepts, so a "use" term
+    never fails it. A structured description parsed from an older version of the posting is not read: the keywords
+    then come from the job's skills, as everywhere else a parse is stale."""
+    from types import SimpleNamespace
+
+    from app.services import ats_keywords
+    from app.services.job_description import is_current
+    from app.services.tailoring_results import NAME_PARTS_RE, _words
+
+    if job.structured_description and not is_current(job):
+        job = SimpleNamespace(structured_description=None, skills=job.skills, fit_analysis=job.fit_analysis)
     analysis = job.fit_analysis or {}
     names = {a.get("requirement_id"): a.get("requirement") for a in analysis.get("requirement_assessments") or []
              if isinstance(a, dict) and a.get("requirement_id")}
-    targets = ats_keywords.targets(job, claim_vocabulary(db, profile, job), sources, analysis, names)
+    words = _words(" ".join(str(text) for text in shown if text))
+    vocabulary = words | {part for word in words for part in NAME_PARTS_RE.split(word) if part}
+    targets = ats_keywords.targets(job, vocabulary, sources, analysis, names)
     return {k: v for k, v in targets.items() if v}
+
+
+def _shown_texts(context: TaskContext) -> list[str]:
+    """Every fact text a tailoring or letter prompt carries: the source resume (or the selected resume facts) and
+    the selected evidence."""
+    from app.prompts.common import resume_facts
+
+    resume = context.source_resume or resume_facts(context)
+    return [json.dumps(resume, ensure_ascii=False, default=str)] + [
+        " ".join(str(e.get(k) or "") for k in ("company", "role", "claim")) for e in context.relevant_evidence]
 
 
 def _tailoring_sources(context: TaskContext) -> list[dict[str, Any]]:
@@ -663,7 +685,7 @@ def _tailoring_sources(context: TaskContext) -> list[dict[str, Any]]:
 
 def _attach_targets(db: Session, profile: CandidateProfile, job: Job, context: TaskContext) -> None:
     context.requirement_map = requirement_map(context.fit_analysis, context.citable_ids)
-    context.keyword_targets = keyword_targets(db, profile, job, _tailoring_sources(context))
+    context.keyword_targets = keyword_targets(job, _shown_texts(context), _tailoring_sources(context))
 
 
 def validate_tailoring_context(context: TaskContext, master_role_count: int) -> None:
@@ -807,7 +829,8 @@ def select_knowledge(db: Session, user_id: int, job: Job, terms: JobTerms) -> li
     return [{"question": row.question, "answer": row.answer, "category": row.category} for _, row in chosen]
 
 
-def build_cover_letter_context(db: Session, profile: CandidateProfile, job: Job) -> TaskContext:
+def build_cover_letter_context(db: Session, profile: CandidateProfile, job: Job,
+                               tailored: dict[str, Any] | None = None) -> TaskContext:
     """What a letter needs: the posting and its company facts, the candidate's verified proof points relevant to
     it, and the verified answers the posting raises. Verified facts only, like every other final application text."""
     profile = rv.for_job(db, profile, job)  # the job's resume (else the active one), in the policy's form
@@ -837,7 +860,8 @@ def build_cover_letter_context(db: Session, profile: CandidateProfile, job: Job)
     sources = [{"id": b["evidence_ids"][0], "text": b.get("text")} for unit in
                [*context.relevant_experience, *context.relevant_projects] for b in unit.get("bullets") or []
                if b.get("evidence_ids")] + [{"id": e["id"], "text": e.get("claim")} for e in context.relevant_evidence]
-    context.keyword_targets = keyword_targets(db, profile, job, sources)
+    context.keyword_targets = keyword_targets(job, _shown_texts(context), sources)
+    context.tailored = tailored or {}  # before measuring: the prompt carries it
     context.resume_text = _render(context)
     _measure(context, rv.raw_text(profile), every, job)
     return context

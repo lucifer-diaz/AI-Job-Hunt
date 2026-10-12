@@ -33,7 +33,6 @@ from app.services.tailoring_results import (
     schema_errors,
     to_variant_content,
     validate_tailored_resume,
-    verified_evidence,
 )
 from app.services.user_settings import settings_for
 from app.services.workflow import (
@@ -132,8 +131,11 @@ def _posting_targets(db: Session, profile: Any, job: Job, evidence: list[dict[st
     sources = [{"id": e["id"], "text": e.get("claim") or ""} for e in evidence]
     out = {"job_requirements": {k: v for k, v in parsed.to_dict().items() if k in JOB_FIELDS and v}
            if parsed.structured else {},
-           "requirement_map": requirement_map(job.fit_analysis, set(verified_evidence(db, job))),
-           "keyword_targets": keyword_targets(db, profile, job, sources)}
+           # Only evidence this response carries can be named as proof, and only it can support a keyword.
+           "requirement_map": requirement_map(job.fit_analysis, {e["id"] for e in evidence}),
+           "keyword_targets": keyword_targets(job, [rv.for_job(db, profile, job).master_resume or "",
+                                                   *(" ".join([e.get("claim") or "", *(e.get("skills") or [])])
+                                                     for e in evidence)], sources)}
     return {k: v for k, v in out.items() if v}
 
 
