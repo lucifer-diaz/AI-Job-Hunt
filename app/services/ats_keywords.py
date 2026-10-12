@@ -97,3 +97,39 @@ def score(items: list[dict[str, str]]) -> int | None:
         return None
     points = sum(1 for i in items if i["status"] == "covered") + 0.5 * sum(1 for i in items if i["status"] == "partial")
     return round(100 * points / len(items))
+
+
+def _level(job: Any, word: str) -> str:
+    structured = getattr(job, "structured_description", None) or {}
+    key = normalize(word)
+    for field, level in (("required_skills", "REQUIRED"), ("preferred_skills", "PREFERRED")):
+        if any(normalize(str(w)) == key for w in structured.get(field) or []):
+            return level
+    return "KEYWORD"
+
+
+def targets(job: Any, vocabulary: set[str], sources: list[dict[str, Any]], analysis: dict[str, Any] | None = None,
+            names: dict[str, str] | None = None) -> dict[str, list]:
+    """The posting's keywords (the same list as the ATS score) split by what the candidate can truthfully claim.
+
+        use         every significant word is in `vocabulary` (the words of the facts the prompt carries, a part of
+                    what validation accepts), with the posting's spelling, its level and `found_in`: the ids of the
+                    `sources` ({"id", "text"}: source bullets, evidence) that mention it, for the bullet to cite
+        do_not_use  the rest: requirements the candidate's facts do not cover, which stay gaps
+
+    Deterministic, no model. Matching is per word, so "Node.js" in the resume makes "Node.js" usable."""
+    from app.services.tailoring_results import NAME_PARTS_RE, _words
+
+    known = vocabulary | {part for word in vocabulary for part in NAME_PARTS_RE.split(word) if part}
+    texts = [(item["id"], normalize(item.get("text") or "")) for item in sources if item.get("id") is not None]
+    use, do_not_use = [], []
+    for word in keywords_for(job, analysis, names):
+        parts = [p for w in _words(word) for p in NAME_PARTS_RE.split(w) if p and p not in STOPWORDS]
+        if parts and all(p in known for p in parts):
+            needle = normalize(word)
+            found = list(dict.fromkeys(i for i, text in texts if _contains(text, needle)))[:5]
+            use.append({"keyword": word, "level": _level(job, word), **({"found_in": found} if found else {})})
+        else:
+            do_not_use.append(word)
+    order = {"REQUIRED": 0, "PREFERRED": 1, "KEYWORD": 2}
+    return {"use": sorted(use, key=lambda item: order[item["level"]]), "do_not_use": do_not_use}

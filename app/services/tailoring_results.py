@@ -135,6 +135,21 @@ def _named_terms(text: str) -> set[str]:
     return terms
 
 
+# Separators inside one name ("CI/CD", "Node.js", "Python-based"): each part is a word of its own.
+NAME_PARTS_RE = re.compile(r"[./-]+")
+
+
+def _with_parts(words: set[str]) -> set[str]:
+    """The words, plus the parts of each compound one, so "Node.js" in the resume supports "Node" in a bullet."""
+    return words | {part for word in words for part in NAME_PARTS_RE.split(word) if part}
+
+
+def _term_supported(term: str, supported: set[str]) -> bool:
+    """A named term is supported when the corpus has it, or has every part of it: the resume's "CI/CD" is read as
+    "ci" and "cd", and "Python-based" rests on "python" and "based"."""
+    return term in supported or all(part in supported for part in NAME_PARTS_RE.split(term) if part)
+
+
 def verified_evidence(db: Session, job: Job) -> dict[int, Evidence]:
     """This account's verified evidence, by ID. Evidence of other accounts is never visible."""
     rows = db.scalars(select(Evidence).where(Evidence.user_id == job.user_id, Evidence.verified.is_(True))).all()
@@ -144,6 +159,19 @@ def verified_evidence(db: Session, job: Job) -> dict[int, Evidence]:
 def _same_employer(a: str, b: str) -> bool:
     a, b = (a or "").strip().lower(), (b or "").strip().lower()
     return not a or not b or a in b or b in a
+
+
+def _evidence_text(evidence: dict[int, Evidence]) -> str:
+    return " ".join(f"{e.company} {e.role} {e.claim} {e.context} {' '.join(e.skills or [])} "
+                    f"{' '.join(e.tags or [])}" for e in evidence.values())
+
+
+def _vocabulary(master_text: str, evidence_text: str, profile: CandidateProfile) -> set[str]:
+    """Everything the candidate can be said to have done: the resume, their own profile, and verified evidence."""
+    prefs = profile.search_preferences or {}
+    return _with_parts(_words(" ".join([master_text, evidence_text, profile.headline or "", profile.work_authorization or "",
+                            *(str(s) for s in prefs.get("primary_skills") or []),
+                            *(str(s) for s in prefs.get("secondary_skills") or [])])))
 
 
 def validate_tailored_resume(db: Session, profile: CandidateProfile, job: Job, data: TailoredResumeIn, *,
@@ -171,13 +199,8 @@ def validate_tailored_resume(db: Session, profile: CandidateProfile, job: Job, d
         issues.append(_issue("LAYOUT", "experience_sections",
                              "The master resume has no parsed roles: use resume_bullets instead"))
 
-    prefs = profile.search_preferences or {}
-    evidence_text = " ".join(f"{e.company} {e.role} {e.claim} {e.context} {' '.join(e.skills or [])} "
-                             f"{' '.join(e.tags or [])}" for e in evidence.values())
-    # Everything the candidate can be said to have done: the resume, their own profile, and verified evidence.
-    supported = _words(" ".join([master_text, evidence_text, profile.headline or "", profile.work_authorization or "",
-                                 *(str(s) for s in prefs.get("primary_skills") or []),
-                                 *(str(s) for s in prefs.get("secondary_skills") or [])]))
+    evidence_text = _evidence_text(evidence)
+    supported = _vocabulary(master_text, evidence_text, profile)
 
     def check_bullet(bullet: BulletIn, location: str, candidates: list[str], employer: str) -> None:
         unknown = [i for i in bullet.evidence_ids if i not in evidence]
@@ -201,7 +224,7 @@ def validate_tailored_resume(db: Session, profile: CandidateProfile, job: Job, d
         if invented:
             issues.append(_issue("INVENTED_METRIC", location,
                                  f"Numbers {invented} are not in the cited evidence or the master resume"))
-        unsupported = sorted(term for term in _named_terms(bullet.text) if term not in supported)
+        unsupported = sorted(term for term in _named_terms(bullet.text) if not _term_supported(term, supported))
         if unsupported:
             issues.append(_issue("UNSUPPORTED_TERM", location,
                                  f"{unsupported} appear nowhere in the master resume, your profile or verified evidence"))
@@ -238,7 +261,7 @@ def validate_tailored_resume(db: Session, profile: CandidateProfile, job: Job, d
         if invented:
             issues.append(_issue("INVENTED_METRIC", location,
                                  f"Numbers {invented} are not in the master resume or your verified evidence"))
-        unsupported = sorted(term for term in _named_terms(text) if term not in allowed)
+        unsupported = sorted(term for term in _named_terms(text) if not _term_supported(term, allowed))
         if unsupported:
             issues.append(_issue("UNSUPPORTED_TERM", location,
                                  f"{unsupported} appear nowhere in the master resume, your profile or verified "

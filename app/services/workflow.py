@@ -103,10 +103,8 @@ def tailor_job(db: Session, job: Job, progress: Progress = _no_progress, pages: 
     result = llm.generate_prompt(prompt, LLMCall(workflow_type="job", entity_id=job.id,
                                                  context_stats=context.call_stats()))
     # Citable: the evidence list, and the id of every source bullet and project bullet the context showed.
-    allowed = context.evidence_ids | {bullet["id"] for part in ("roles", "projects")
-                                      for unit in context.source_resume.get(part) or []
-                                      for bullet in unit["bullets"] if "id" in bullet}
-    content = apply_tailoring_patch(db, profile, job, result.validated, allowed_evidence=allowed,
+    content = apply_tailoring_patch(db, profile, job, result.validated,
+                                    allowed_evidence=context.evidence_ids | context.citable_ids,
                                     length_plan=context.length_plan)
     content.update(generation_provenance(prompt.version, result))
     # A role the Tailor left alone shows its first bullets in this order (most relevant first) up to its budget.
@@ -117,7 +115,10 @@ def tailor_job(db: Session, job: Job, progress: Progress = _no_progress, pages: 
                           "fit_analysis": {"ranking_id": context.fit_analysis.get("ranking_id"),
                                            "ranking_version": context.fit_analysis.get("ranking_version")},
                           "allow_unverified_resume_facts": context.policy.get("allow_unverified_resume_facts", False)}
-    content["cover_letter"], content["cover_letter_generation"] = write_cover_letter(db, profile, job, llm)
+    content["keyword_coverage"] = supported_keyword_coverage(context.keyword_targets,
+                                                             build_resume_markdown(profile, content))
+    content["cover_letter"], content["cover_letter_generation"] = write_cover_letter(db, profile, job, llm,
+                                                                                     tailored=content)
     # A last check before anything is saved: a run stopped from Running workers ends here, saving nothing.
     progress("tailoring")
     resume = persist_tailored_resume(db, job, content)
@@ -126,10 +127,39 @@ def tailor_job(db: Session, job: Job, progress: Progress = _no_progress, pages: 
     return resume
 
 
-def write_cover_letter(db: Session, profile: CandidateProfile, job: Job, llm: LLMClient) -> tuple[str, dict]:
+def supported_keyword_coverage(targets: dict, markdown: str) -> dict:
+    """Which posting keywords the candidate's facts support the tailored resume still leaves out. Recorded with the
+    resume and shown beside the ATS score; it never triggers another model call."""
+    from app.services import ats_keywords
+
+    text = ats_keywords.normalize((markdown or "").split("## Source Resume")[0])
+    use = [item["keyword"] for item in (targets or {}).get("use") or []]
+    missing = [word for word in use if not ats_keywords._contains(text, ats_keywords.normalize(word))]
+    return {"supported": use, "missing_supported": missing,
+            "score": round(100 * (len(use) - len(missing)) / len(use)) if use else None}
+
+
+def tailored_highlights(content: dict | None) -> dict:
+    """The validated tailored resume a letter is written beside, as it renders: its summary (when the Tailor wrote
+    one) and the first role's bullets, the Tailor's own or, for a role it left alone, the source bullets the
+    resume shows in its place (`fallback_bullets`, as build_resume_markdown renders them)."""
+    if not content:
+        return {}
+    patched = {s.get("role_index"): s.get("bullets") or [] for s in content.get("experience") or []}
+    fallback = {int(k): v for k, v in (content.get("fallback_bullets") or {}).items()}
+    roles = sorted(set(patched) | set(fallback), key=lambda i: -1 if i is None else i)
+    first = roles[0] if roles else None
+    bullets = (patched.get(first) or fallback.get(first)) if roles else content.get("experience_bullets")
+    bullets = [str(b) for b in bullets or [] if str(b).strip()]
+    return {k: v for k, v in {"summary": content.get("summary"), "top_bullets": bullets[:5]}.items() if v}
+
+
+def write_cover_letter(db: Session, profile: CandidateProfile, job: Job, llm: LLMClient,
+                       tailored: dict | None = None) -> tuple[str, dict]:
     """A letter in the candidate's own voice, from its own prompt and context (app.prompts.cover_letter): the
-    posting and its company facts, the verified proof points that fit it, and the answers the posting raises."""
-    context = build_cover_letter_context(db, profile, job)
+    posting and its company facts, the verified proof points that fit it, and the answers the posting raises.
+    `tailored` is the validated tailored content the letter is written beside, so both tell the same story."""
+    context = build_cover_letter_context(db, profile, job, tailored=tailored_highlights(tailored))
     prompt = build_cover_letter_prompt(context, recruiters=recruiters_of(job.application) if job.application else [])
     result = llm.generate_prompt(prompt, LLMCall(workflow_type="job", entity_id=job.id,
                                                  context_stats=context.call_stats()))

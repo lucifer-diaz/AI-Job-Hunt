@@ -57,13 +57,16 @@ from app.services.llm_telemetry import estimate_tokens
 from app.services.resume_format import parse_resume
 from app.services.user_settings import candidate_policy
 
+# v4: generation tasks (tailoring, cover letters) pick bullets and evidence by the parsed posting's skills,
+# responsibilities and keywords as well as its words; tailoring and letters also carry a requirement map (the Ranker's
+# matched requirements with the ids that prove them) and keyword targets (app.services.ats_keywords.targets).
 # v3: one copy of each fact. The resume (experience and projects) is the single source: each bullet carries one id,
 # the evidence row created from it, and evidence created from the resume is never listed again as evidence. The
 # evidence list holds only verified facts that are not on the resume; copies of resume bullets drop out, and
 # near-identical items collapse to one. Evidence is sent as {id, company, role, claim}.
 # v2: task-specific projections (no search configuration), the Tailor's canonical source resume with evidence ids per
 # bullet, the completed-FitAnalysis gate, provenance exclusion and pre-prompt consistency checks.
-CONTEXT_BUILDER_VERSION = "v3"
+CONTEXT_BUILDER_VERSION = "v4"
 # Two texts state the same fact when this share of their distinctive words overlaps (Jaccard).
 SAME_CLAIM = 0.6
 BULLET_KINDS = {"achievements": "achievement", "responsibilities": "responsibility"}
@@ -91,6 +94,9 @@ TAILOR_EVIDENCE = 20
 REVIEW_EVIDENCE = 30
 LETTER_EVIDENCE = 12
 LETTER_KNOWLEDGE = 6
+# Requirement map: the Ranker's matched requirements the Tailor and the letter are pointed at, REQUIRED first.
+REQUIREMENT_MAP_LIMIT = 15
+LETTER_REQUIREMENTS = 6
 # Answers a letter may raise only because the posting does: the words that show the posting raised them.
 KNOWLEDGE_TRIGGERS = ("visa", "sponsor", "sponsorship", "authorization", "authorisation", "work permit", "relocate",
                       "relocation", "notice", "start date", "availability", "onsite", "on-site", "hybrid", "remote")
@@ -155,6 +161,12 @@ class TaskContext:
     # Tailoring only: the one canonical copy of the source resume the prompt receives (summary, skills, roles with
     # bullets and the evidence ids behind each).
     source_resume: dict[str, Any] = field(default_factory=dict)
+    # Tailoring and letters: the Ranker's MATCH / PARTIAL_MATCH requirements with the citable ids that prove them.
+    requirement_map: list[dict[str, Any]] = field(default_factory=list)
+    # Tailoring and letters: the posting's ATS keywords split into those the facts support ("use") and gaps.
+    keyword_targets: dict[str, Any] = field(default_factory=dict)
+    # Cover letters only: the validated tailored resume the letter accompanies (summary, top bullets).
+    tailored: dict[str, Any] = field(default_factory=dict)
     # Evidence held back from generation because its provenance disagrees with its source ({id, code}).
     excluded_evidence: list[dict[str, Any]] = field(default_factory=list)
     resume_text: str = ""  # a readable rendering of the selected facts (or the raw text when nothing is structured)
@@ -167,6 +179,13 @@ class TaskContext:
         return {item["id"] for item in self.relevant_evidence} | {
             i for unit in [*self.relevant_experience, *self.relevant_projects] for bullet in unit.get("bullets") or []
             for i in bullet.get("evidence_ids") or []}
+
+    @property
+    def citable_ids(self) -> set[int]:
+        """What the Tailor may cite: the evidence list and the id of every source bullet and project bullet."""
+        return {item["id"] for item in self.relevant_evidence} | {
+            bullet["id"] for part in ("roles", "projects") for unit in self.source_resume.get(part) or []
+            for bullet in unit.get("bullets") or [] if "id" in bullet}
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -202,11 +221,13 @@ class JobTerms:
     words: set[str]
     themes: set[str]
     text: str
+    # Words of what the parsed posting asks for (skills, responsibilities, keywords): they count twice.
+    focus: set[str] = field(default_factory=set)
 
     def score(self, text: str) -> int:
         found = tokens(text)
         theme_hits = sum(1 for theme in self.themes if found & set(THEMES[theme]))
-        return len(found & self.words) + 2 * theme_hits
+        return len(found & self.words) + len(found & self.focus) + 2 * theme_hits
 
 
 def job_terms(job: Job) -> JobTerms:
@@ -215,6 +236,19 @@ def job_terms(job: Job) -> JobTerms:
     lowered = set(re.findall(r"[a-z0-9][a-z0-9+#.-]*", text.lower()))
     themes = {name for name, vocab in THEMES.items() if len(lowered & set(vocab)) >= 2}
     return JobTerms(words, themes, text)
+
+
+def generation_terms(job: Job) -> JobTerms:
+    """job_terms, with the parsed posting's required and preferred skills, responsibilities and keywords weighted,
+    so a bullet that answers what the employer asks outranks one that shares words with the advert's boilerplate.
+    Generation tasks only: ranking keeps job_terms, so its context (and its hashes) do not move."""
+    terms = job_terms(job)
+    data = jc._structured(job)
+    focus = " ".join(str(v) for key in ("required_skills", "preferred_skills", "keywords", "responsibilities",
+                                        "technical_domains") for v in data.get(key) or [])
+    terms.focus = tokens(focus) - jc.FILLER
+    terms.text = f"{terms.text} {focus}"
+    return terms
 
 
 def _status(node: dict[str, Any]) -> str:
@@ -411,7 +445,7 @@ def _base(db: Session, profile: CandidateProfile, job: Job, task: str, allowed: 
 
     resume = rv.resume_for(db, profile)
     data = resume.structured_data if resume is not None else {}
-    terms = job_terms(job)
+    terms = generation_terms(job) if task in ("tailoring", "cover_letter") else job_terms(job)
     policy = candidate_policy(db, profile.user_id)
     experience, unverified = _select_experience(data or {}, terms, allowed, caps)
     candidate, unverified_summary = _candidate(profile, data or {}, allowed)
@@ -588,6 +622,72 @@ def source_resume(context: TaskContext, item_evidence: dict[str, list[int]],
     return {k: v for k, v in out.items() if v}
 
 
+def requirement_map(analysis: dict[str, Any] | None, citable: set[int], limit: int = REQUIREMENT_MAP_LIMIT
+                    ) -> list[dict[str, Any]]:
+    """The Ranker's MATCH and PARTIAL_MATCH assessments as the writers read them: the requirement, its level, what the
+    facts support and the citable ids behind it. REQUIRED first. MISSING ones stay out: they are gaps, sent to the
+    Tailor only as gaps_to_preserve. Evidence ids the context cannot cite are dropped, never passed on."""
+    rows = []
+    for item in (analysis or {}).get("requirement_assessments") or []:
+        if not isinstance(item, dict) or item.get("status") not in ("MATCH", "PARTIAL_MATCH"):
+            continue
+        ids = [i for i in item.get("evidence_ids") or [] if isinstance(i, int) and i in citable]
+        rows.append({k: v for k, v in {"id": item.get("requirement_id"), "requirement": item.get("requirement"),
+                                       "level": item.get("level"), "status": item["status"],
+                                       "supported": item.get("supported"), "evidence_ids": ids}.items()
+                     if v not in (None, "", [])})
+    order = {"REQUIRED": 0, "PREFERRED": 1}
+    rows.sort(key=lambda row: (order.get(row.get("level"), 2), row["status"] != "MATCH"))
+    return rows[:limit]
+
+
+def keyword_targets(job: Job, shown: list[str], sources: list[dict[str, Any]]) -> dict[str, Any]:
+    """The posting's ATS keywords split by what this candidate's facts support (app.services.ats_keywords.targets).
+
+    A keyword is supported only by `shown`: the texts the prompt itself carries (its resume facts and selected
+    evidence), never the whole Evidence Bank and never evidence held back for a provenance conflict, so "use" always
+    means a fact in front of the model proves it. Those texts are part of what validation accepts, so a "use" term
+    never fails it. A structured description parsed from an older version of the posting is not read: the keywords
+    then come from the job's skills, as everywhere else a parse is stale."""
+    from types import SimpleNamespace
+
+    from app.services import ats_keywords
+    from app.services.job_description import is_current
+    from app.services.tailoring_results import NAME_PARTS_RE, _words
+
+    if job.structured_description and not is_current(job):
+        job = SimpleNamespace(structured_description=None, skills=job.skills, fit_analysis=job.fit_analysis)
+    analysis = job.fit_analysis or {}
+    names = {a.get("requirement_id"): a.get("requirement") for a in analysis.get("requirement_assessments") or []
+             if isinstance(a, dict) and a.get("requirement_id")}
+    words = _words(" ".join(str(text) for text in shown if text))
+    vocabulary = words | {part for word in words for part in NAME_PARTS_RE.split(word) if part}
+    targets = ats_keywords.targets(job, vocabulary, sources, analysis, names)
+    return {k: v for k, v in targets.items() if v}
+
+
+def _shown_texts(context: TaskContext) -> list[str]:
+    """Every fact text a tailoring or letter prompt carries: the source resume (or the selected resume facts) and
+    the selected evidence."""
+    from app.prompts.common import resume_facts
+
+    resume = context.source_resume or resume_facts(context)
+    return [json.dumps(resume, ensure_ascii=False, default=str)] + [
+        " ".join(str(e.get(k) or "") for k in ("company", "role", "claim")) for e in context.relevant_evidence]
+
+
+def _tailoring_sources(context: TaskContext) -> list[dict[str, Any]]:
+    """Every citable text of a tailoring context, {id, text}: source bullets, project bullets and evidence claims."""
+    bullets = [b for part in ("roles", "projects") for unit in context.source_resume.get(part) or []
+               for b in unit.get("bullets") or [] if "id" in b]
+    return bullets + [{"id": e["id"], "text": e.get("claim") or ""} for e in context.relevant_evidence]
+
+
+def _attach_targets(db: Session, profile: CandidateProfile, job: Job, context: TaskContext) -> None:
+    context.requirement_map = requirement_map(context.fit_analysis, context.citable_ids)
+    context.keyword_targets = keyword_targets(job, _shown_texts(context), _tailoring_sources(context))
+
+
 def validate_tailoring_context(context: TaskContext, master_role_count: int) -> None:
     """Deterministic consistency checks before the Tailor's prompt exists. Raises ContextError."""
     if not context.resume:
@@ -658,6 +758,7 @@ def build_tailoring_context(db: Session, profile: CandidateProfile, job: Job, pl
         _apply_plan(context, profile, plan)
         context.resume_text = _render(context)
         context.source_resume = source_resume(context, {}, None if context.roles else _plain_lines(profile))
+        _attach_targets(db, profile, job, context)
         validate_tailoring_context(context, len(parse_resume(profile.master_resume or "").roles))
         _measure(context, rv.raw_text(profile), every, job)
         return context
@@ -682,6 +783,7 @@ def build_tailoring_context(db: Session, profile: CandidateProfile, job: Job, pl
     context.source_resume = source_resume(context, _item_evidence(db, profile.user_id,
                                                                   {e["id"] for e in context.excluded_evidence}),
                                           _plain_lines(profile) if unstructured else None)
+    _attach_targets(db, profile, job, context)
     validate_tailoring_context(context, len(parse_resume(profile.master_resume or "").roles))
     _measure(context, rv.raw_text(profile), every, job)
     return context
@@ -727,7 +829,8 @@ def select_knowledge(db: Session, user_id: int, job: Job, terms: JobTerms) -> li
     return [{"question": row.question, "answer": row.answer, "category": row.category} for _, row in chosen]
 
 
-def build_cover_letter_context(db: Session, profile: CandidateProfile, job: Job) -> TaskContext:
+def build_cover_letter_context(db: Session, profile: CandidateProfile, job: Job,
+                               tailored: dict[str, Any] | None = None) -> TaskContext:
     """What a letter needs: the posting and its company facts, the candidate's verified proof points relevant to
     it, and the verified answers the posting raises. Verified facts only, like every other final application text."""
     profile = rv.for_job(db, profile, job)  # the job's resume (else the active one), in the policy's form
@@ -749,6 +852,16 @@ def build_cover_letter_context(db: Session, profile: CandidateProfile, job: Job)
                       if getattr(job, field, None)}}
     context.knowledge = select_knowledge(db, profile.user_id, job, job_terms(job))
     context.fit_analysis = job.fit_analysis or {}
+    # The posting as parsed requirements (the raw text still travels, for what it says about the company), the
+    # strongest matched requirements with their proof, and the keywords the facts support.
+    context.job_context = jc.build_tailoring_job_context(db, job).to_dict()
+    citable = {e["id"] for e in context.relevant_evidence} | context.evidence_ids
+    context.requirement_map = requirement_map(context.fit_analysis, citable, LETTER_REQUIREMENTS)
+    sources = [{"id": b["evidence_ids"][0], "text": b.get("text")} for unit in
+               [*context.relevant_experience, *context.relevant_projects] for b in unit.get("bullets") or []
+               if b.get("evidence_ids")] + [{"id": e["id"], "text": e.get("claim")} for e in context.relevant_evidence]
+    context.keyword_targets = keyword_targets(job, _shown_texts(context), sources)
+    context.tailored = tailored or {}  # before measuring: the prompt carries it
     context.resume_text = _render(context)
     _measure(context, rv.raw_text(profile), every, job)
     return context

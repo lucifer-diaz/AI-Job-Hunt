@@ -30,7 +30,8 @@ CRITICAL_LEVELS = (REQUIRED,)
 RANKING_RESPONSIBILITIES = 8
 RANKING_REQUIREMENTS = 25
 TAILOR_REQUIREMENTS = 12
-TAILOR_RESPONSIBILITIES = 6
+# Tailoring addresses the responsibilities in the employer's own order: the first ones are what the role is for.
+TAILOR_RESPONSIBILITIES = 10
 DERIVED_LABEL = "likely / inferred preparation topics, not stated by the employer"
 
 
@@ -253,10 +254,9 @@ def build_tailoring_job_context(db: Session, job: Job, candidate: Any = None) ->
         _stats(job, context)
         return context
     rows = requirements_of(db, job)
-    terms = _tokens(f"{job.title or ''} {job.description or ''}")
     context.required = [requirement_dict(r) for r in rows if r.requirement_level == REQUIRED][:TAILOR_REQUIREMENTS]
     context.preferred = [requirement_dict(r) for r in rows if r.requirement_level == PREFERRED][:TAILOR_REQUIREMENTS]
-    context.responsibilities = _relevant(data.get("responsibilities") or [], terms, TAILOR_RESPONSIBILITIES)
+    context.responsibilities = (data.get("responsibilities") or [])[:TAILOR_RESPONSIBILITIES]
     context.leadership_expectations = data.get("leadership_expectations") or []
     if candidate is not None:
         context.candidate_matches, context.candidate_gaps = candidate_match(context.required + context.preferred,

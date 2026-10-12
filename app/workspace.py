@@ -1711,6 +1711,14 @@ def keyword_coverage(job: Job, resume: ResumeVariant | None) -> list[dict]:
     return ats_keywords.coverage(job, resume.markdown if resume else "", analysis, names, gaps)
 
 
+def missing_supported(coverage: list[dict], resume: ResumeVariant) -> list[str]:
+    """Keywords the candidate's facts support (recorded when the resume was tailored) that the resume, as it reads
+    now, does not cover: wording a person can add without claiming anything new."""
+    supported = {ats_keywords.normalize(w) for w in
+                 ((resume.content or {}).get("keyword_coverage") or {}).get("supported") or []}
+    return [k["word"] for k in coverage if k["status"] != "covered" and ats_keywords.normalize(k["word"]) in supported]
+
+
 # Status filters for the Tailor and Approvals screens: filter name -> test on a row.
 TAILOR_STATUS_FILTERS = {
     "not_tailored": lambda r: not r["has_resume"],
@@ -1813,6 +1821,7 @@ def packet(db: Session, job: Job) -> dict:
         "cover_letter": strip_citations(resume.cover_letter), "cover_words": len(resume.cover_letter.split()),
         "edits": edits, "review": review, "keywords": coverage,
         "ats_pct": ats_keywords.score(coverage),
+        "missing_supported": missing_supported(coverage, resume),
         # The page target it was tailored for (app.services.resume_length) and a rough estimate of its length.
         "length": {"target_pages": ((resume.content or {}).get("length_plan") or {}).get("pages"),
                    "estimated_pages": resume_length.estimate_pages(resume.markdown or "")},

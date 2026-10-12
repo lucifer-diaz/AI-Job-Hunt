@@ -12,9 +12,11 @@ from app.prompts.common import (
     instructions,
 )
 
+# v4: written against the posting: job_requirements, requirement_map and keyword_targets (ATS terms the facts
+# support, and the gaps), with a bullet shape.
 # v3: a length plan (page target, max_bullets per role); the resume is a foundation to select from.
 # v2: tailoring is told it is not ranking, and that the fit analysis's gaps stay gaps.
-MCP_TAILORING_PROMPT_VERSION = "v3"
+MCP_TAILORING_PROMPT_VERSION = "v4"
 
 TAILORING_RULES = (
     ("You are tailoring, not ranking: fit_analysis was computed by Job Hunt OS's Ranker. Use its strong matches, "
@@ -39,6 +41,15 @@ TAILORING_RULES = (
      "pad). A role with max_bullets 0 keeps its heading only: send no bullets for it. Extra bullets are dropped. "
      "Without roles, use resume_bullets."),
     "Keep the summary within length_plan.summary_sentences sentences.",
+    ("Write for the posting: lead each role with the bullets that prove the REQUIRED rows of requirement_map (its "
+     "evidence_ids are the proof), then job_requirements.responsibilities in the order the employer lists them. "
+     "Leave out a bullet that proves nothing the posting asks for before one that does."),
+    ("Each bullet: a strong verb, what was built, run or changed and its scope, how (the technologies its facts "
+     "name) and the outcome, with a number only when the facts have one. One achievement, about 15-30 words."),
+    ("keyword_targets is how an ATS reads the resume. Write its \"use\" terms exactly as spelled; when a fact says "
+     "the same thing in other words, use the posting's term. Put each REQUIRED \"use\" term in the summary or a "
+     "bullet at least once (citing a found_in id when it has them), at most three times, and order skills_order by "
+     "it. Never write a \"do_not_use\" term anywhere: it is a gap."),
     "The master resume is never modified: each save creates a new tailored version.",
     UNTRUSTED_DATA_RULE,
 )

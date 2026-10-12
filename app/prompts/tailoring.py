@@ -34,20 +34,26 @@ from app.prompts.common import (
 )
 from app.prompts.contracts import TailoringResult, describe_fields
 
+# v8: written against the posting: REQUIREMENT MAP (the Ranker's matched requirements and the ids that prove them)
+# decides which bullets lead; KEYWORD TARGETS (deterministic, ATS) says which of the posting's terms the facts
+# support, spelled as the posting spells them, and which stay gaps; a bullet shape; responsibilities in posting order.
 # v7: a page target and a bullet budget per role (LENGTH PLAN): the source resume is the foundation to select from,
 # not a checklist; every budgeted role is returned with at most its max_bullets, and a role with 0 keeps its heading.
 # v6: evidence a source bullet already states is not repeated in RELEVANT EVIDENCE, and the posting arrives
 # without duplicate paragraphs or legal boilerplate.
 # v5: patch output with evidence ids per claim; completed FitAnalysis as read-only input (no score, no empty fields);
 # one canonical source resume instead of roles + resume text + policy; candidate context is name and headline only.
-TAILOR_PROMPT_VERSION = "v7"
+TAILOR_PROMPT_VERSION = "v8"
 TAILOR_MARKER = "TAILOR_RESUME"
 # The FitAnalysis fields the Tailor reads. Scores are deliberately absent: the Tailor does not work with them.
 FIT_ANALYSIS_FIELDS = ("strong_matches", "partial_matches", "resume_gaps", "recommended_resume_focus")
 # The Ranker's gaps, sent only so the Tailor knows what it must not claim.
 GAP_FIELDS = ("missing_requirements", "fatal_gaps")
 # Section labels in the order they appear; the tests hold the prompt to them.
-SECTIONS = ("CANDIDATE", "SOURCE RESUME", "RELEVANT EVIDENCE", "JOB", "JOB REQUIREMENTS", "LENGTH PLAN", "FIT ANALYSIS")
+SECTIONS = ("CANDIDATE", "SOURCE RESUME", "RELEVANT EVIDENCE", "JOB", "JOB REQUIREMENTS", "REQUIREMENT MAP",
+            "KEYWORD TARGETS", "LENGTH PLAN", "FIT ANALYSIS")
+JOB_FIELDS = ("identity", "role_summary", "required", "preferred", "responsibilities", "leadership_expectations",
+              "technical_domains", "experience_requirements")
 
 TAILOR_SYSTEM = instructions(
     "You are the resume-tailoring component of Job Hunt OS. Your only task is to improve how SOURCE RESUME presents "
@@ -71,11 +77,31 @@ one achievement per bullet. Transferable experience may be emphasised; it is nev
 Every summary and bullet lists in evidence_ids the ids it rests on: the id of a SOURCE RESUME bullet or project
 bullet, or of RELEVANT EVIDENCE (verified facts that are not on the resume),
 and uses only numbers that appear in what it cites.""",
+    """WRITE FOR THIS POSTING
+Before writing, work out (without writing it down) which source bullet or evidence proves each REQUIRED row of
+REQUIREMENT MAP and each of the first JOB REQUIREMENTS.responsibilities (they are in the employer's order: the first
+ones are what the role is for). Choose and order bullets by that: a role's first bullets prove REQUIRED rows, then
+PREFERRED ones, then the responsibilities. A bullet that proves nothing the posting asks for is left out before one
+that does.
+Each bullet: a strong past-tense verb (present tense for a current role), what was built, run or changed and its
+scope, how (the technologies its cited facts name), and the outcome, with a number only when a cited fact has one.
+One achievement, about 15-30 words, no "I", "my" or "responsible for", no list of technologies in place of an
+achievement.
+KEYWORD TARGETS is how an applicant tracking system will read this resume. Its "use" terms are supported by the
+candidate's facts: write them exactly as spelled there. When a cited fact describes the same thing in other words
+(the same thing, never a neighbouring skill), use the posting's term: the fact "built deploy pipelines" and the term
+"CI/CD" give "built CI/CD pipelines". Put each REQUIRED "use" term at least once in the summary or a bullet, in a
+bullet citing one of its found_in ids when it has them; keep each term to at most three mentions; never stuff terms into a sentence that does not need them.
+"do_not_use" terms are requirements the facts do not cover: never write them anywhere, not even as "exposure to" or
+"familiar with".
+The summary speaks to the posting's role_summary and first responsibilities and names the top REQUIRED "use" terms,
+with years or scope only when a fact states them; it never gives the candidate the posting's job title. skills_order
+starts with the SOURCE RESUME skills that are "use" terms, in KEYWORD TARGETS order.""",
     UNTRUSTED_DATA_RULE,
     REQUIREMENT_LEVELS_RULE,
     JSON_ONLY_RULE + " Return only the TailoringResult object.",
     describe_fields(TailoringResult),
-    "Use plain ASCII punctuation (- for dashes, x for multipliers). Keep bullets concise and ATS-friendly.",
+    "Use plain ASCII punctuation (- for dashes, x for multipliers).",
 )
 
 
@@ -116,10 +142,14 @@ def build_tailoring_prompt(candidate_profile: Any, job: Any, context: Any) -> Pr
         section("SOURCE RESUME", to_json(source, limit=24000)),
         section("RELEVANT EVIDENCE", to_json(context_value(context, "relevant_evidence", []), limit=24000)),
         section("JOB", to_json(job_facts(job))),
-        *job_sections(context, fields=("identity", "role_summary", "required", "preferred", "responsibilities",
-                                       "leadership_expectations", "technical_domains")),
+        *job_sections(context, fields=JOB_FIELDS),
         "" if job_structured(context) else untrusted("JOB DESCRIPTION", "untrusted_job_description",
                                                      posting_text(context, job), limit=20000),
+        section("REQUIREMENT MAP (the Ranker's matched requirements and the ids that prove them)",
+                to_json(requirement_map, limit=12000)) if (requirement_map := context_value(context, "requirement_map"))
+        else "",
+        section("KEYWORD TARGETS (the posting's ATS keywords, checked against the candidate's facts)",
+                to_json(keywords)) if (keywords := context_value(context, "keyword_targets")) else "",
         section("LENGTH PLAN", to_json(length_plan_input(context_value(context, "length_plan")))),
         section("FIT ANALYSIS (completed by the Ranker; read-only)", to_json(fit_analysis_input(analysis))),
     )

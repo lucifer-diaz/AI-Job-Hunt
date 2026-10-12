@@ -19,7 +19,7 @@ from app.prompts.common import prompt_profile
 from app.prompts.mcp_application import APPLICATION_RULES, MCP_APPLICATION_PROMPT_VERSION
 from app.prompts.mcp_review import MCP_REVIEW_PROMPT_VERSION, REVIEW_RULES
 from app.prompts.mcp_tailoring import MCP_TAILORING_PROMPT_VERSION, TAILORING_RULES
-from app.prompts.tailoring import fit_analysis_input
+from app.prompts.tailoring import JOB_FIELDS, fit_analysis_input
 from app.services import apply_queue, conversation_actions, knowledge
 from app.services import resume_verification as rv
 from app.services.context_builder import ContextError
@@ -120,6 +120,25 @@ def _evidence_for(db: Session, job: Job, cited: list[int]) -> list[dict[str, Any
     return first + relevant
 
 
+def _posting_targets(db: Session, profile: Any, job: Job, evidence: list[dict[str, Any]]) -> dict[str, Any]:
+    """What the posting asks for, in the shape the backend Tailor reads it: the parsed requirements (when the
+    posting has been parsed), the Ranker's matched requirements with the evidence that proves them, and the ATS
+    keywords split into those the candidate's facts support and those that stay gaps."""
+    from app.services import job_context as jc
+    from app.services.context_builder import keyword_targets, requirement_map
+
+    parsed = jc.build_tailoring_job_context(db, job)
+    sources = [{"id": e["id"], "text": e.get("claim") or ""} for e in evidence]
+    out = {"job_requirements": {k: v for k, v in parsed.to_dict().items() if k in JOB_FIELDS and v}
+           if parsed.structured else {},
+           # Only evidence this response carries can be named as proof, and only it can support a keyword.
+           "requirement_map": requirement_map(job.fit_analysis, {e["id"] for e in evidence}),
+           "keyword_targets": keyword_targets(job, [rv.for_job(db, profile, job).master_resume or "",
+                                                   *(" ".join([e.get("claim") or "", *(e.get("skills") or [])])
+                                                     for e in evidence)], sources)}
+    return {k: v for k, v in out.items() if v}
+
+
 def _profile_payload(db: Session) -> tuple[Any, dict[str, Any]]:
     profile = get_profile(db)
     return profile, prompt_profile(profile, include_name=True)  # facts about the person, not search settings
@@ -184,11 +203,13 @@ def get_tailoring_context(db: Session, job_ids: list[int]) -> dict[str, Any]:
         except ContextError as exc:  # the Tailor never works without the Ranker's analysis
             jobs.append({"job_id": job_id, "error": str(exc)})
             continue
+        evidence = _evidence_for(db, job, ranking.relevant_evidence_ids if ranking else [])
         jobs.append({
             "job_id": job.id, "company": job.company, "role": job.title, "location": job.location,
             "job_description": (job.description or "")[:DESCRIPTION_LIMIT],
             "fit_analysis": fit,
-            "relevant_evidence": _evidence_for(db, job, ranking.relevant_evidence_ids if ranking else []),
+            "relevant_evidence": evidence,
+            **_posting_targets(db, profile, job, evidence),
             "recommended_resume_focus": (ranking.recommended_resume_focus if ranking
                                          else analysis.get("recommended_resume_focus") or []),
             "resume_gaps": ranking.resume_gaps if ranking else analysis.get("resume_gaps") or [],
