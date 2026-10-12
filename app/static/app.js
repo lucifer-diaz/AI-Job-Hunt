@@ -656,7 +656,7 @@ function rankTaskDetail(t) {
 // `r` is the tracker, possibly narrowed by Running workers' status filter (wkRankingView).
 function renderRanking(r = D.ranking) {
   if (!r) return loading();
-  const c = r.counts, w = r.worker || {};
+  const c = r.counts, w = r.worker || {}, day = r.day || c;  // the last day's results: Clear finished never resets them
   const tile = ([title, n, hint, tone]) => `<div class="box"><div class="xs muted">${esc(title)}</div>
     <div class="mono bb" style="font-size:24px;line-height:1.3;color:${n ? { brand: 'var(--brand)', warn: 'var(--warn)', good: 'var(--good)', bad: 'var(--bad)' }[tone] || 'var(--ink)' : 'var(--grey)'}">${n}</div>
     <div class="tiny faint">${esc(hint)}</div></div>`;
@@ -665,8 +665,8 @@ function renderRanking(r = D.ranking) {
   const tiles = tileGroup('Pipeline now', [['Filtering', c.filtering, 'hard filters', 'muted'], ['Queued', c.queued, 'next run', 'muted'],
     ['Ranking', c.processing, 'model call', 'brand'], ['Retry / wait', c.retry_scheduled + c.waiting, 'backing off', 'warn'],
     ['No description', c.no_description ?? 0, 'not rankable', 'warn']])
-    + tileGroup('Last 24 hours', [['Qualified', c.qualified, 'kept', 'good'], ['Archived', c.archived, 'by policy', 'muted'],
-      ['Failed', c.failed, 'gave up', 'bad']]);
+    + tileGroup('Last 24 hours', [['Qualified', day.qualified, 'kept', 'good'], ['Archived', day.archived, 'by policy', 'muted'],
+      ['Failed', day.failed, 'gave up', 'bad']]);
   const inFlight = r.active.length, { finished, total } = r.progress;
   const pct = total ? Math.round(100 * finished / total) : 100;
   // Your own cadence when you set one (Running workers → Settings), otherwise the server's own sweep.

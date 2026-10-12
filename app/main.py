@@ -739,7 +739,18 @@ def cancel_tailor_tasks(payload: TailorTasksCancelIn, db: Session = Depends(get_
 
 @app.post("/api/tailor-tasks/clear")
 def clear_tailor_tasks(db: Session = Depends(get_user_db)):
-    return {"cleared": tailor_tasks.clear_finished(db)}
+    """Hide finished tailoring tasks from the lists, as Running workers' Clear finished does. Nothing is deleted, so
+    the job history and the Tailoring and Reviewing performance keep them."""
+    from sqlalchemy import func
+
+    from app.models import TailorTask
+    from app.services import workers
+
+    user_id = require_user_id(db)
+    hidden = db.scalar(select(func.count()).select_from(TailorTask).where(
+        TailorTask.user_id == user_id, TailorTask.status.in_(tailor_tasks.FINISHED))) or 0
+    workers.clear_finished(db, user_id, "tailoring")
+    return {"cleared": hidden}
 
 
 @app.get("/api/jobs/{job_id}/resume.pdf")

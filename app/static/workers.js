@@ -12,6 +12,8 @@
 const WK_KINDS = [['parsing', 'JD parsing'], ['recovery', 'JD recovery'], ['ranking', 'Ranking'], ['insights', 'Job insights'], ['tailoring', 'Tailoring'], ['reviewing', 'Reviewing']];
 // Tabs drawn from the generic task list (/api/workers/{kind}); ranking and tailoring keep their own views.
 const WK_GENERIC = ['parsing', 'recovery', 'insights', 'reviewing'];
+// Tabs whose Performance card comes from /api/workers/{kind}/performance (parsing and recovery bring their own metrics).
+const WK_PERF = ['ranking', 'insights', 'tailoring', 'reviewing'];
 // The worker tabs, then the account's worker settings (processing limits and rate-limit backoff).
 const WK_TABS = [...WK_KINDS, ['settings', 'Settings']];
 // [label, tone, symbol]: a status is always a word and a symbol, never colour alone.
@@ -60,14 +62,16 @@ async function loadWorkers() {
   const f = wkFilter(tab);
   const detail = WK_GENERIC.includes(tab)
     ? api(`/api/workers/${tab}?` + qs({ range: w.range, q: f.q.trim(), status: f.status === 'all' ? '' : f.status })) : null;
-  const [summary, data, act] = await Promise.all([api('/api/workers'), detail,
-    worker ? api(`/api/workers/${tab}/activity`).catch(() => null) : null,
+  const perf = WK_PERF.includes(tab) ? api(`/api/workers/${tab}/performance?` + qs({ range: w.range })).catch(() => null) : null;
+  const [summary, data, act, performance] = await Promise.all([api('/api/workers'), detail,
+    worker ? api(`/api/workers/${tab}/activity`).catch(() => null) : null, perf,
     tab === 'ranking' ? loadRanking() : null, tab === 'tailoring' ? refreshTasks() : null,
     tab === 'settings' ? Promise.all([D.settings ? null : api('/api/settings').then(x => { D.settings = x; }),
       api('/api/workers/settings').then(x => { D.wkSettings = x; })]) : null]);
   D.wk = summary;
   if (data) D.wkData = { ...(D.wkData || {}), [tab]: data };
   if (act) D.wkAct = { ...(D.wkAct || {}), [tab]: act };
+  if (performance) D.wkPerf = { ...(D.wkPerf || {}), [tab]: performance };
   scheduleWkPoll();
 }
 // Every few seconds while anything runs, slowly when idle, never on another screen or in a hidden tab.
@@ -345,13 +349,55 @@ function wkRanked(items, color = 'var(--brand)', emptyText = 'Nothing in this ra
   return `<div class="wk-rank">${items.map(([text, n]) => `<div class="wk-rank-row" data-tip="${attr(`${text}: ${n}`)}"><span class="t">${esc(text)}</span><b>${wkNum(n)} <span class="xs faint" style="font-weight:400">${Math.round(100 * n / sum)}%</span></b>${wkMeter(n / max, color)}</div>`).join('')}</div>`;
 }
 const wkCard = (title, sub, body, extra = '') => `<section class="card"><div class="row between wrap gap10 mb14"><div><div class="card-title">${esc(title)}</div>${sub ? `<div class="card-sub">${esc(sub)}</div>` : ''}</div>${extra}</div>${body}</section>`;
-// Reviewing is the last step of a Tailoring task: the scores of the reviews the list shows (the last day).
-function wkReviewingInsights(data) {
-  const scores = (data.rows || []).map(r => r.reviewer_score).filter(v => v != null).sort((a, b) => a - b);
-  const mid = scores.length >> 1, median = !scores.length ? null : scores.length % 2 ? scores[mid] : Math.round((scores[mid - 1] + scores[mid]) / 2);
-  return `<section class="card"><div class="wk-tiles">${wkTile('Reviewed', wkNum(scores.length), 'scored packets in this list')}
-    ${wkTile('Median score', median == null ? '—' : String(median), scores.length ? `range ${scores[0]}–${scores[scores.length - 1]}` : 'no scores yet')}
-    ${wkTile('Runs inside Tailoring', 'Same task', 'Kill, Run now and settings act on its Tailoring task')}</div></section>`;
+// Ranking, Job insights, Tailoring and Reviewing: read from the task rows and model calls of the range, so Clear finished
+// (which only hides the list) never empties it.
+const WK_PERF_TEXT = {
+  ranking: ['Ranking results and its model calls in the selected range', 'RANKER', 'per ranking, end to end'],
+  insights: ['Research runs and the model calls that organise them in the selected range', 'company and interview insights', 'per research run'],
+  tailoring: ['Tailoring runs (tailor, then review) and the tailor’s model calls in the selected range', 'TAILOR', 'per run, tailor and review'],
+  reviewing: ['Reviews of tailored packets and the reviewer’s model calls in the selected range', 'REVIEWER', 'per Tailoring task that reached review'],
+};
+function wkPerfTiles(tab, x) {
+  if (tab === 'ranking' && x.ranking) {
+    const r = x.ranking;
+    return [wkTile('Qualified', wkNum(r.qualified), 'kept by policy', r.qualified ? 'good' : ''),
+      wkTile('Archived', wkNum(r.archived), 'archived by policy'),
+      wkTile('Average fit', r.average_fit == null ? '—' : String(r.average_fit), r.median_fit == null ? `${wkNum(r.rankings)} rankings` : `median ${r.median_fit} · ${wkNum(r.rankings)} rankings`)];
+  }
+  if (tab === 'insights' && x.insights) return [wkTile('Complete · partial', `${wkNum(x.insights.complete)} · ${wkNum(x.insights.partial)}`, 'partial: some sources failed or were not configured', x.insights.partial ? 'warn' : '')];
+  if (x.review) {
+    const v = x.review;
+    return [wkTile('Median reviewer score', v.median_score == null ? '—' : String(Math.round(v.median_score)), v.scored ? `range ${v.lowest_score}–${v.highest_score} · ${wkNum(v.scored)} scored` : 'no scores yet'),
+      wkTile('Auto-approved', wkNum(v.auto_approved), 'passed review and your auto-approve rule', v.auto_approved ? 'good' : ''),
+      wkTile(tab === 'reviewing' ? 'Master resume reviewed' : 'Skip tailoring', wkNum(tab === 'reviewing' ? v.untailored : v.skip_mode), tab === 'reviewing' ? 'sent unchanged, scored by the reviewer' : 'runs that only reviewed the master resume')];
+  }
+  return [];
+}
+function wkPerformanceInsights(tab, x) {
+  if (!x) return `<section class="card">${loading()}</section>`;
+  const llm = x.llm || {}, [sub, stage, per] = WK_PERF_TEXT[tab] || ['Results in the selected range', '', 'per task'];
+  const tokens = `${monTokens(llm.input_tokens || 0)} · ${monTokens(llm.output_tokens || 0)}`;
+  const tiles = `<div class="wk-tiles">
+    ${wkTile('Tasks', wkNum(x.tasks_created), `created in range${x.active ? ` · ${wkNum(x.active)} still active` : ''}`)}
+    ${wkTile('Done', wkNum(x.completed), [x.skipped ? `${wkNum(x.skipped)} skipped` : '', x.stopped ? `${wkNum(x.stopped)} stopped` : '', x.retried ? `${wkNum(x.retried)} needed a retry` : ''].filter(Boolean).join(' · ') || 'finished successfully')}
+    ${wkTile('Success rate', wkPct(x.success_rate), `${wkNum(x.failed)} failed`, wkTone(x.success_rate), x.success_rate == null ? '' : wkMeter(x.success_rate, x.success_rate >= 0.9 ? WK_COLORS.done : x.success_rate >= 0.7 ? 'var(--amber)' : WK_COLORS.failed))}
+    ${wkTile('Average time', monMs(x.average_duration_ms), per)}
+    ${wkTile('Median wait', wkDur(x.median_wait_seconds), 'from queued to started')}
+    ${wkPerfTiles(tab, x).join('')}
+    ${wkTile('Model calls', wkNum(llm.requests), `${wkNum(llm.failed)} failed${llm.requests ? ` · ${wkPct((llm.failed || 0) / llm.requests)}` : ''}`, llm.failed ? 'warn' : '')}
+    ${wkTile('Model latency', monMs(llm.average_latency_ms), 'average per call')}
+    ${wkTile('Tokens in · out', tokens, `${(llm.input_tokens || 0).toLocaleString()} in · ${(llm.output_tokens || 0).toLocaleString()} out`)}
+    ${wkTile('Cost', llm.estimated_cost == null ? '—' : monUSD(llm.estimated_cost), llm.estimated_cost == null ? 'not reported' : 'estimated by the provider')}</div>
+    ${x.truncated || llm.truncated ? '<div class="xs faint mt8">Counted over the most recent 5,000 rows of this range.</div>' : ''}`;
+  const models = Object.entries(llm.models || {}).sort((a, b) => b[1] - a[1]);
+  const errors = (x.top_errors || []).map(e => [e.error, e.tasks]);
+  const categories = Object.entries(x.failures_by_category || {}).sort((a, b) => b[1] - a[1]);
+  const decisions = tab === 'ranking' && x.ranking ? wkCard('Decisions', 'How code decided on the rankings made in this range', wkRanked(Object.entries(x.ranking.decisions || {}).map(([k, n]) => [wkHumanize(k), n]), 'var(--brand)', 'No rankings in this range.')) : '';
+  const outcomes = wkCard('Outcomes', 'How the tasks created in this range ended (or stand now)', wkRanked(Object.entries(x.by_status || {}).map(([k, n]) => [wkHumanize(k), n]), 'var(--brand)', 'No tasks in this range.'));
+  return `${wkCard('Performance', sub, tiles, wkRangeSeg())}
+    <div class="wk-grid">${wkCard('Models used', `Calls per model, from LLM usage${stage ? ` (${stage} stage)` : ''}`, wkRanked(models, 'var(--brand)', 'No model calls in this range.'))}
+      ${wkCard('Why tasks failed', categories.length ? categories.map(([k, n]) => `${wkHumanize(k)} ${n}`).join(' · ') : 'Most common errors in the selected range', wkRanked(errors, WK_COLORS.failed, 'No failed tasks in this range.'))}
+      ${decisions || outcomes}</div>`;
 }
 function wkParsingInsights(data) {
   const x = data.metrics, llm = x.llm || {}, job = x.scheduler;
@@ -637,15 +683,16 @@ function renderWorkers() {
   if (w.tab === 'ranking') {
     const ranking = wkRankingView();
     filterCounts = ranking.counts;
-    body = wkFilterBar(w.tab, filterCounts) + wkBulkBar(w.tab) + renderRanking(ranking.view);
+    body = wkPerformanceInsights(w.tab, (D.wkPerf || {}).ranking) + wkFilterBar(w.tab, filterCounts) + wkBulkBar(w.tab) + renderRanking(ranking.view);
   } else if (w.tab === 'tailoring') {
     const tailoring = wkTailoringView();
     filterCounts = tailoring.counts;
-    body = wkFilterBar(w.tab, filterCounts) + wkBulkBar(w.tab) + (renderTaskStack(tailoring.tasks, tailoring.all) || `<section class="card">${empty('No tailoring tasks', 'Tasks you queue from the Tailor screen run here in the background.', btn('Open Tailor', 'go', { screen: 'tailor' }, 'primary'))}</section>`);
+    body = wkPerformanceInsights(w.tab, (D.wkPerf || {}).tailoring) + wkFilterBar(w.tab, filterCounts) + wkBulkBar(w.tab) + (renderTaskStack(tailoring.tasks, tailoring.all) || `<section class="card">${empty('No tailoring tasks', 'Tasks you queue from the Tailor screen run here in the background.', btn('Open Tailor', 'go', { screen: 'tailor' }, 'primary'))}</section>`);
   } else {
     filterCounts = data?.status_counts || null;
     // The filters narrow the task list, not the metrics, so they sit right above the list.
-    const insights = { parsing: wkParsingInsights, recovery: wkRecoveryInsights, reviewing: wkReviewingInsights }[w.tab];
+    const insights = { parsing: wkParsingInsights, recovery: wkRecoveryInsights }[w.tab]
+      || (WK_PERF.includes(w.tab) ? () => wkPerformanceInsights(w.tab, (D.wkPerf || {})[w.tab]) : null);
     body = !data ? loading() : `${insights ? insights(data) : ''}${wkFilterBar(w.tab, filterCounts)}${wkBulkBar(w.tab)}${wkTable(w.tab, data)}`;
   }
   return `<div class="stack">${top}${wkCooldowns(s.cooldowns)}${wkHero(w.tab, spec, act)}${wkActivity(act)}${body}</div>`;
@@ -686,7 +733,7 @@ const WORKERS_ACTIONS = {
   'wk-tab': el => { wkState().tab = el.dataset.id; go('workers'); },
   'wk-clear': el => {
     const tab = el.dataset.tab, n = Number(el.dataset.n) || 0, name = wkSpec(tab)?.label || tab;
-    if (!confirm(`Clear ${n} finished ${name} task${n === 1 ? '' : 's'} from this list? Nothing is deleted: job history, metrics and the 24-hour chart keep them, and Show cleared brings them back.`)) return;
+    if (!confirm(`Clear ${n} finished ${name} task${n === 1 ? '' : 's'} from this list? Nothing is deleted: job history, the Performance figures and the 24-hour chart keep them, and Show cleared brings them back.`)) return;
     return busy('wkClear' + tab, async () => {
       await api(`/api/workers/${tab}/clear`, { method: 'POST' });
       wkSel(tab).clear();
@@ -711,7 +758,7 @@ const WORKERS_ACTIONS = {
   },
   'wk-set-reset': el => { setF('workers', el.dataset.key, el.dataset.value === 'true' ? true : el.dataset.value === 'false' ? false : el.dataset.value); render(); },
   'wk-set-jump': (el, e) => { e?.preventDefault?.(); document.getElementById(`wk-set-${el.dataset.id}`)?.scrollIntoView?.({ behavior: 'smooth', block: 'start' }); },
-  'wk-range': el => { wkState().range = el.dataset.id; wkApplyFilters(wkState().tab); },
+  'wk-range': el => { wkState().range = el.dataset.id; wkReload().then(render).catch(err => toast(err.message, true)); },
   'wk-open': el => { wkState().tab = el.dataset.tab || wkState().tab; if (S.orch) Object.assign(S.orch, { node: null, edge: null }); go('workers'); },
   'wk-refresh': () => busy('wkRefresh', wkReload),
   // A browser setting, not an account one: it applies at once and needs a click for the browser's permission prompt.

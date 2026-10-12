@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 
 from app import auth
 from app.auth import CurrentUser
@@ -515,6 +515,58 @@ def test_clear_finished_hides_the_list_only_and_can_be_undone(user_id, signed_in
     with SessionLocal() as db:
         assert ranker.finished_cleared_at(db, user_id) is not None
     assert client.post("/api/workers/nope/clear").status_code == 404
+
+
+def test_performance_counts_the_range_and_clear_finished_never_changes_it(user_id, signed_in):
+    from app.models import LLMRequestLog
+
+    now = utcnow()
+    with SessionLocal() as db:
+        jobs = [add_job(db, user_id) for _ in range(4)]
+        db.add_all([
+            TailorTask(user_id=user_id, job_id=jobs[0].id, status="succeeded", stage="reviewing", attempts=1,
+                       result={"reviewer_score": 80, "auto_approved": True}, created_at=now - timedelta(hours=2),
+                       started_at=now - timedelta(hours=2), finished_at=now - timedelta(hours=1)),
+            TailorTask(user_id=user_id, job_id=jobs[1].id, status="succeeded", stage="reviewing", attempts=1,
+                       result={"reviewer_score": 60}, created_at=now - timedelta(hours=2),
+                       started_at=now - timedelta(hours=2), finished_at=now - timedelta(minutes=30)),
+            TailorTask(user_id=user_id, job_id=jobs[2].id, status="failed", stage="tailoring", attempts=2,
+                       error="Model timed out", created_at=now - timedelta(hours=2), finished_at=now - timedelta(hours=1)),
+            JobRankingTask(user_id=user_id, job_id=jobs[3].id, status="FAILED", attempt_count=3, last_error="boom",
+                           created_at=now - timedelta(hours=3), completed_at=now - timedelta(hours=2)),
+            LLMRequestLog(request_id=str(uuid.uuid4()), user_id=user_id, provider="litellm", stage="REVIEWER",
+                          model="m-review", status="SUCCEEDED", input_tokens=100, output_tokens=20, latency_ms=900,
+                          created_at=now - timedelta(hours=1)),
+        ])
+        db.commit()
+    client = signed_in(user_id)
+
+    def perf(kind):
+        out = client.get(f"/api/workers/{kind}/performance", params={"range": "7d"}).json()
+        return {k: v for k, v in out.items() if k not in ("start", "end")}
+
+    before = {kind: perf(kind) for kind in ("tailoring", "reviewing", "ranking", "insights")}
+    tailoring = before["tailoring"]
+    assert (tailoring["tasks_created"], tailoring["completed"], tailoring["failed"]) == (3, 2, 1)
+    assert tailoring["review"]["median_score"] == 70 and tailoring["review"]["auto_approved"] == 1
+    assert tailoring["top_errors"] == [{"error": "Model timed out", "tasks": 1}]
+    reviewing = before["reviewing"]
+    assert reviewing["completed"] == 2 and reviewing["failed"] == 0  # the failed run never reached review
+    assert reviewing["llm"]["requests"] == 1 and reviewing["llm"]["models"] == {"m-review": 1}
+    assert before["ranking"]["failed"] == 1 and before["ranking"]["ranking"]["rankings"] == 0
+    assert before["insights"]["tasks_created"] == 0 and before["insights"]["llm"]["stages"] == [
+        "COMPANY_INSIGHTS", "INTERVIEW_INSIGHTS"]
+    day = client.get("/api/ranking/tracker").json()["day"]
+    assert day["failed"] == 1
+
+    for kind in ("tailoring", "reviewing", "ranking", "insights"):
+        client.post(f"/api/workers/{kind}/clear").raise_for_status()
+    assert {kind: perf(kind) for kind in before} == before  # clearing the list keeps every figure
+    assert client.get("/api/ranking/tracker").json()["day"] == day  # and the tracker's last-day tiles
+    client.post("/api/tailor-tasks/clear").raise_for_status()  # the old Tailor clear hides too, never deletes
+    with SessionLocal() as db:
+        assert db.scalar(select(func.count()).select_from(TailorTask).where(TailorTask.user_id == user_id)) == 3
+    assert client.get("/api/workers/nope/performance").status_code == 404
 
 
 # ───────────── nudge forward ─────────────

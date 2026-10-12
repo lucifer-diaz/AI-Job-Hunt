@@ -78,8 +78,10 @@ def test_tasks_queue_run_in_the_background_and_report_progress(monkeypatch):
     assert client.post("/api/tailor-tasks", json={"ids": [first]}).json()["skipped"][0]["reason"] == "already has a packet"
     assert len(client.post("/api/tailor-tasks", json={"ids": [first], "regenerate": True}).json()["queued"]) == 1
     assert client.post("/api/tailor-tasks/cancel", json={}).json() == {"cancelled": 1}
+    # Clearing hides finished tasks (Running workers → Tailoring); it never deletes them, so performance keeps them.
     assert client.post("/api/tailor-tasks/clear").json()["cleared"] == 5
-    assert client.get("/api/tailor-tasks").json() == []
+    assert len(client.get("/api/tailor-tasks").json()) == 5
+    assert next(w for w in client.get("/api/workers").json()["workers"] if w["kind"] == "tailoring")["cleared_at"]
 
 
 def test_interrupted_task_is_requeued_then_failed():

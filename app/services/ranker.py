@@ -1380,6 +1380,16 @@ def tracker(db: Session, user_id: int, now: datetime | None = None, *, q: str = 
         "failed": count(JobRankingTask.status == FAILED, JobRankingTask.completed_at >= since),
         "skipped": count(JobRankingTask.status == SKIPPED, JobRankingTask.completed_at >= since),
     }
+    # The last day's results, whatever the list shows: clearing the finished list never resets them.
+    day = {"completed": count(JobRankingTask.status == COMPLETED, JobRankingTask.completed_at >= window),
+           "failed": count(JobRankingTask.status == FAILED, JobRankingTask.completed_at >= window),
+           "skipped": count(JobRankingTask.status == SKIPPED, JobRankingTask.completed_at >= window),
+           **{d.lower(): n for d, n in db.execute(
+               select(JobRanking.decision, func.count()).select_from(JobRankingTask)
+               .join(JobRanking, JobRanking.id == JobRankingTask.ranking_id)
+               .where(JobRankingTask.user_id == user_id, JobRankingTask.status == COMPLETED,
+                      JobRankingTask.completed_at >= window, JobRanking.decision.in_(("QUALIFIED", "ARCHIVED")))
+               .group_by(JobRanking.decision)).all()}}
     rows = db.execute(
         select(JobRankingTask, Job.title, Job.company, Job.state, JobRanking, Job.location)
         .join(Job, Job.id == JobRankingTask.job_id)
@@ -1433,17 +1443,17 @@ def tracker(db: Session, user_id: int, now: datetime | None = None, *, q: str = 
                                                  key=active_order))]
     recent = [row_dict(*row) for row in rows if row[0].status not in ACTIVE_RANKING_TASK_STATUSES]
     locations = location_facets([item["location"] for item in {i["job_id"]: i for i in active + recent}.values()])
-    decisions = Counter(r["ranking"]["decision"] for r in recent[:TRACKER_LIMIT] if r["ranking"])
     active = [item for item in active if wanted(item)][:TRACKER_LIMIT]
     recent = [item for item in recent if wanted(item)][:TRACKER_LIMIT]
     _attach_models(db, user_id, active + recent)
     in_flight = counts["queued"] + counts["retry_scheduled"] + counts["waiting"] + counts["processing"]
-    finished = counts["completed"] + counts["failed"] + counts["skipped"]
+    finished = day["completed"] + day["failed"] + day["skipped"]
     return {
         "generated_at": now.isoformat(),
         "blocked": readiness(db, user_id),
         "auto_rank": auto_rank_on(db, user_id),
-        "counts": {**counts, "qualified": decisions.get("QUALIFIED", 0), "archived": decisions.get("ARCHIVED", 0)},
+        "counts": {**counts, "qualified": day.get("qualified", 0), "archived": day.get("archived", 0)},
+        "day": {"qualified": 0, "archived": 0, **day},
         "progress": {"finished": finished, "total": finished + in_flight},
         "concurrency": limit,
         "interval_minutes": limits["ranking_interval_minutes"],
