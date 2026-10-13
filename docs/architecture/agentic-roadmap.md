@@ -40,7 +40,7 @@ The main branch already includes these capabilities, according to repository cod
 | LLM gateway | app/services/llm.py, model_resolution, ai_workers, AIConfigVersion, LiteLLM | **Retain** as one authorized model route |
 | Telemetry | LLMRequestLog, ExternalAPIRequestLog, system logs | **Extend/correlate** rather than duplicate |
 | Orchestration UI | app/services/orchestration.py and orchestration_topology.py | **Retain** read-only graph projection, distinguish planned and implemented nodes |
-| Application submission | Approved Apply Kit and manual submission | **Not autonomous yet**; must pass separate safety milestones |
+| Application submission | Approved Apply Kit, existing Claude Desktop/MCP submission-assistance workflow (`app/services/apply_queue.py`, `app/mcp/tools.py`), and manual outcome recording | **Reuse** its readiness, duplicate, blocker, locking and recording safeguards; autonomous browser/API submission is **not yet implemented** |
 
 Read AGENTS.md before implementation. This roadmap does not supersede repository-specific invariants or source code. Re-audit immediately before each phase because the baseline will evolve.
 
@@ -51,6 +51,7 @@ Read AGENTS.md before implementation. This roadmap does not supersede repository
 - External HTTP/SDK requests use app/services/external_api.py instrumentation; costs unknown to the provider stay NULL.
 - Prompts live in app/prompts/ and untrusted external text is data, not instructions.
 - AI Orchestration is a read-only projection of canonical records, not a second workflow database.
+- **Existing MCP application path is a first-class integration:** `apply_queue.ready_to_apply`, `not_ready_reason`, `approved_resume`, `applied_duplicate`, `open_blocker`, `lock_application`, and `record_submission`/`workflow.mark_applied` provide established controls; `app/mcp/tools.py` exposes packet retrieval, knowledge lookup, human-answer requests, blocked outcomes and submission-result recording. New automation must reuse shared services or migrate callers atomically rather than bypass these checks. Existing MCP outcome recording is not evidence that browser/API submission is implemented.
 - A user-pinned resume or approved resume version must not be silently swapped.
 - Source-backed Job Insights distinguish employer pay from third-party estimates, company values from sentiment, and reported interview questions from generated preparation.
 - Gmail Inbox is read-only; ambiguous email/application matches wait for review.
@@ -95,9 +96,9 @@ flowchart LR
     D["Discovery"] --> Q["Qualification"]
     Q -->|"Qualified"| R["Resume preparation"]
     Q -->|"Not qualified"| X["Archive / skip"]
-    R --> I["Job Insights"]
-    I --> G{"Approval / candidate policy"}
+    R --> G{"Approval / candidate policy"}
     G -->|"Approved"| A["Application execution"]
+    G -->|"enqueue async after approval"| I["Job Insights (non-blocking)"]
     G -->|"Revision"| R
     A -->|"Confirmed"| P["Post-application"]
     A -->|"Human required"| H["Human handoff"]
@@ -108,7 +109,7 @@ flowchart LR
 - **DiscoveryGraph:** existing scheduled searches → Apify runs → ingestion/deduplication → per-job qualification work. A single search may fan out into many jobs.
 - **QualificationGraph:** JD validation/recovery → structured requirements → deterministic hard filters → candidate retrieval → existing Ranker → verified qualification decision.
 - **ResumePreparationGraph:** pinned resume selection → context retrieval → Tailor → evidence check → Reviewer → bounded revision/approval.
-- **JobInsightsGraph:** approved-job source collection → normalized observations → grounded synthesis → provenance validation → interview preparation.
+- **JobInsightsGraph:** started **after approval**, via the existing `workflow.approve_job` → `job_insights.tasks.on_approved` enqueue path → scheduled source collection → normalized observations → grounded synthesis → provenance validation → optional interview preparation. It runs **asynchronously and never blocks approval or the ApplicationGraph**. When insight data is not yet available, downstream consumers proceed with available verified context or omit the optional insights; they never fabricate research.
 - **ApplicationGraph:** route detection → form inspection → answer resolution → fill/step → policy gate → guarded submission → confirmation or human handoff.
 - **PostApplicationGraph:** Gmail events → deterministic matching/policy → tracker update or review → follow-up/interview preparation as new events arrive.
 
@@ -128,6 +129,8 @@ A graph node should wrap the existing service API where possible. It must not in
 | ADR-008 | Existing UI remains primary; browser-use WebUI is optional development tooling | Preserve auth, workflow and familiar operations | Approved frontend migration |
 | ADR-009 | Prefer flags, shadow validation and reversible slices | Avoid full-workflow regression and unsafe releases | None without explicit architecture review |
 | ADR-010 | Orchestration remains observational, backed by existing facts | No duplicated packet state or invented metrics | A new immutable fact genuinely lacks an owning table |
+| ADR-011 | Existing MCP/apply-queue readiness, duplicate, blocker and result-recording services remain the shared application boundary | Prevent competing manual/MCP/agentic submission policies and inconsistent results | A verified atomic migration preserves all callers and invariants |
+| ADR-012 | Authenticated application browsing requires a separate explicit session abstraction; anonymous `BrowserService` retains isolated contexts | Avoid leaking sessions into JD recovery or violating the current browser isolation contract | A reviewed browser security contract and comprehensive regression tests approve an evolution |
 
 Record accepted changes to these decisions with an appended rationale, date, PR, and consequences. Do not silently edit previously accepted decision history.
 
@@ -159,7 +162,9 @@ Record accepted changes to these decisions with an appended rationale, date, PR,
 
 ### Proposed application execution model (Phase 5+, not currently shipped)
 
-ApplicationExecution (tenant-owned) references a Job, approved resume version/hash, approval record, execution mode, route, status, lease, attempt and timing. ApplicationExecutionAttempt and a small audit/event representation may be introduced only if existing rows cannot satisfy the invariant.
+ApplicationExecution (tenant-owned) references a Job, approved resume version/hash, approval record, execution mode, route, status, lease, attempt and timing. ApplicationExecutionAttempt and a small audit/event representation may be introduced only if existing rows cannot satisfy the invariant. **It adds durable browser/API attempt state; it does not replace the existing approved Application, MCP apply queue or recorded submission.**
+
+**Shared application compatibility contract:** before enqueue/fill, call the same readiness and approved-packet checks currently used by `apply_queue`/MCP (including review score, `approved_resume_id`, apply URL, duplicate detection, active blocker and outstanding human answers). Preserve account-level locking/duplicate-posting semantics from `apply_queue.lock_application`; do not weaken them to a per-job-only lock. Introduce any new state behind an adapter shared by MCP, Apply Kit and automated workers, and keep existing tools callable. On confirmed automatic submission, use a single shared transaction/outcome-recording path consistent with `apply_queue.record_submission` / `workflow.mark_applied`; existing MCP `record_application_result` remains a manual/external result reporting path, **not** the proof required by automated ConfirmationVerifier. Do not auto-mark APPLIED from an unconfirmed click. Document and test the handoff between both paths, including simultaneous MCP and automated attempts.
 
 Execution-level states are distinct from canonical job states:
 
@@ -260,11 +265,11 @@ Approved application
 
 Public ATS job-listing APIs do not imply public applicant-side application-submission rights. An API route is supported only with documented, authorized credentials and validated protocol behavior.
 
-**Playwright:** deterministic form inspection, accessible locators, controlled page navigation, file uploads and confirmation inspection. Use the existing BrowserService interface; JD-recovery browser contexts remain anonymous and ephemeral.
+**Playwright:** deterministic form inspection, accessible locators, controlled page navigation, file uploads and confirmation inspection. Reuse safe low-level URL-validation, telemetry and browser-management utilities as appropriate, **without changing the existing `BrowserService` isolated-context contract**. `app.infrastructure.browser.get_browser_service()` continues to give JD recovery isolated, credential-free contexts; application authentication must never be injected into these contexts.
 
 **browser-use:** bounded page reasoning for unfamiliar multi-step interfaces. Its output is a proposed typed action (e.g., CLICK, FILL, SELECT, UPLOAD, WAIT, REQUEST_HUMAN, STOP), not raw executable JavaScript. Enforce domain allowlists and policy validation before each action. A browser-use WebUI may be used in an isolated development environment; it is not the production frontend or authorization boundary.
 
-**Persistent application sessions:** distinct per-account browser profiles, encrypted/restricted storage, single-owner profile locks and protected manual login. Do not use the person's normal Chrome profile. Do not send browser cookies, passwords, OTPs, session storage or authentication credentials to an LLM.
+**Persistent application sessions (proposed, separate security boundary):** implement an explicit `AuthenticatedApplicationBrowser` / `ApplicationSessionManager` abstraction for authenticated application workflows, **not a silent extension of the current anonymous `BrowserService`**. Define its own lifecycle, scoped per-user/per-ATS profile, secure at-rest session storage, ownership/lease locking, explicit login/human takeover and strict no-sharing with JD recovery. Share only audited browser-agnostic safeguards (URL/redirect checks, telemetry/redaction, safe action contracts). A Phase 5 ADR/security review must approve this interface and update `AGENTS.md` before authenticated-session code is introduced; tests must prove JD recovery never sees application cookies or credentials. If such a boundary cannot be implemented safely, keep sessions ephemeral and pause for human login after restart. Do not use a person's normal Chrome profile or send cookies, passwords, OTPs, session storage or authentication material to an LLM.
 
 **Answer resolution:** deterministic profile + current CandidatePolicy → verified Answer Bank → canonical/semantic retrieval for suggestions → evidence-grounded LLM only for permitted narrative questions → NEEDS_INPUT for unsupported required facts. Generated writing is not verified truth.
 
@@ -294,7 +299,7 @@ Human completion triggers page re-observation and policy revalidation. It is nev
 
 **Monitoring** remains Job Hunt OS's operational observability system; **LangSmith** is optional evaluation and trace tooling. The same call must not be double-counted as separate token/cost events.
 
-Correlate only safe identifiers: trace ID, graph thread ID, job ID, execution ID, worker, prompt version, actual/requested/configured model, routing reason, configuration version and adapter version. Use pseudonymized user identifiers for external traces, with opt-in and redaction. Hosted traces must not contain resume bodies, application answers, legal/demographic inputs, credentials, cookies, Gmail bodies or browser dumps by default.
+Correlate only safe identifiers: trace ID, graph thread ID, job ID, execution ID, worker, prompt version, actual/requested/configured model, routing reason, configuration version and adapter version. Use pseudonymized user identifiers for external traces, with opt-in and redaction. **Credentials and authentication material (including passwords, OTPs, API/OAuth tokens, authorization headers, browser cookies, session storage and browser profiles) MUST NEVER be exported to hosted traces, under any opt-in, debug or capture setting.** Enforce redaction/suppression **before** trace serialization/export and test it. Other sensitive content (resume bodies, application answers, legal/demographic inputs, Gmail bodies, browser dumps) is excluded from hosted traces by default; exporting it requires a separately reviewed privacy policy and explicit granular consent, never a generic debug switch.
 
 | Area | Metrics | Quality interpretation |
 | --- | --- | --- |
@@ -316,6 +321,7 @@ Create offline LangSmith-compatible datasets for each stage and gated comparison
 - Require explicit user authorization for auto-submit with revocation effective before the next action.
 - Retain only necessary debug artifacts; implement expiration, per-account deletion, audit and profile cleanup.
 - Use least-privilege access for Gmail (read-only), Apify, model keys and browser profile storage.
+- **Never export credentials or authentication material to hosted traces under any capture or opt-in mode.** Redact at the export boundary before instrumentation, including framework callbacks and browser-use agent traces.
 - Never bypass CAPTCHAs, login walls, anti-bot systems, paywalls or access restrictions.
 - Keep third-party cost and tracing failures nonfatal for domain workflows unless a necessary business operation failed.
 - Changes to legal/sensitive answers require direct user confirmation; demographic information is never inferred.
@@ -330,12 +336,12 @@ Every phase starts from updated main, uses an isolated branch, produces tests/do
 | 2. RAG knowledge | feat/rag-knowledge-layer | pgvector indexing, hybrid retrieval, context packs, citation validator and eval dataset | Source-backed recall evaluation, no cross-tenant/stale retrieval, baseline regression parity |
 | 3. Discovery/qualification graphs | feat/langgraph-qualification | Existing Apify/JD/ranker wrapped in graph nodes, safe branches, shadow mode | Qualified/archive parity, no duplicate work or paid calls |
 | 4. Preparation/insights graphs | feat/langgraph-preparation | Resume selection/review graph and grounded company research graph | Resume lineage intact; unsupported claims blocked; insights provenance preserved |
-| 5. Application execution | feat/application-execution | Durable execution, CandidatePolicy, AnswerResolver, typed form schema, Playwright observe/assist | Safe fill and restart; **no final automated submission** |
-| 6. Guarded browser submission | feat/agentic-browser-apply | Generic form engine, browser-use fallback, pre-submit policy, intent, confirm/reconcile, human takeover | Crash/retry never blindly re-submits; authorization and protected actions tested |
+| 5. Application execution | feat/application-execution | Reuse MCP/apply_queue readiness/locking; durable attempts, CandidatePolicy, AnswerResolver, typed form schema and a separately approved application-browser abstraction | Shared MCP/agentic safeguards, safe fill and restart; **no final automated submission** |
+| 6. Guarded browser submission | feat/agentic-browser-apply | Generic form engine, browser-use fallback, pre-submit policy, intent, confirm/reconcile, human takeover; single shared result path with MCP/apply_queue | Crash/retry never blindly re-submits; existing MCP and browser flows agree on duplicate/outcome guards |
 | 7. Evaluation/feedback | feat/agent-evaluation-feedback | LangSmith datasets, Gmail event correlation, question memory, graph UI and monitoring improvements | End-to-end trace fidelity, deterministic metric sourcing, privacy checks |
 | 8. Production hardening | feat/agentic-production-hardening | Fault injection, load, worker supervision, security, retention, rollout controls and runbooks | Full regression, failure recovery, security review, signed GO/NO-GO |
 
-Phase plans are elaborated in the accompanying Claude Code implementation prompts. All prospective modules/APIs/tables remain **proposed** until an associated PR is merged. Never mark a phase complete based solely on having written a prompt or plan.
+Phase instructions, acceptance tests, and the reusable independent-review/merge checklist are version-controlled in [Claude Code implementation prompts](implementation-prompts.md). Use the prompts alongside **this roadmap and the current AGENTS.md**, and check for repository drift before each phase. All prospective modules/APIs/tables remain **proposed** until an associated PR is merged. Never mark a phase complete based solely on having written a prompt or plan.
 
 ### Phase details and deliverables
 
@@ -361,18 +367,22 @@ Phase plans are elaborated in the accompanying Claude Code implementation prompt
 
 #### Phase 4: Resume preparation and job insights
 - Implement bounded tailor/reviewer revision and human approval interrupts.
+- Trigger Job Insights **only after approval**, through the existing asynchronous on-approved queue; do not make approval depend on insight completion.
 - Extend source-grounded company research using existing Job Insights/Apify adapters; do not invent provider schemas.
 - **Exit demonstration:** immutable pinned resume; all factual claims source-checked; employer and market pay remain separate.
 - **Rollback:** keep existing workflow services and Job Insights endpoints active.
 
 #### Phase 5: Application execution
-- Add durable execution-level state, normalized form, answer resolution and browser session layer.
+- First audit and **reuse or explicitly adapt** existing `apply_queue`/MCP readiness, approved packet, resume score, account-level locking, duplicate-posting protection, human-answer blockers and result recording; preserve backwards compatibility.
+- Add durable execution-level state, normalized form and answer resolution, without a competing readiness/status authority.
+- Propose and separately approve an authenticated application-session abstraction; update `AGENTS.md` and test that anonymous JD-recovery sessions remain credential-free.
 - Test a single known ATS adapter in OBSERVE/ASSIST.
 - **Exit demonstration:** inspect/fill to READY_TO_SUBMIT and resume after process crash; no submit action is reachable.
 - **Rollback:** revert to approved Apply Kit/manual submission.
 
 #### Phase 6: Guarded submission and agentic fallback
 - Implement pre-submit validator, authorized SubmissionIntent, confirmation verifier and reconciliation.
+- Reuse the existing `apply_queue`/MCP locking, duplicate check, blocker/human-answer semantics and common application-result recording. Test a concurrent MCP/manual result and browser execution; no second source of APPLIED truth.
 - Guard browser-use action proposals; never give it direct submission authority.
 - **Exit demonstration:** controlled ATS sandbox handles success, uncertainty, duplicate, legal/OTP and browser-crash cases correctly.
 - **Rollback:** disable guarded submission, preserve uncertain executions for manual reconciliation.
