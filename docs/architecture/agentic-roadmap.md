@@ -131,6 +131,12 @@ A graph node should wrap the existing service API where possible. It must not in
 | ADR-010 | Orchestration remains observational, backed by existing facts | No duplicated packet state or invented metrics | A new immutable fact genuinely lacks an owning table |
 | ADR-011 | Existing MCP/apply-queue readiness, duplicate, blocker and result-recording services remain the shared application boundary | Prevent competing manual/MCP/agentic submission policies and inconsistent results | A verified atomic migration preserves all callers and invariants |
 | ADR-012 | Authenticated application browsing requires a separate explicit session abstraction; anonymous `BrowserService` retains isolated contexts | Avoid leaking sessions into JD recovery or violating the current browser isolation contract | A reviewed browser security contract and comprehensive regression tests approve an evolution |
+| ADR-013 | A durable **pre-submit claim** spans MCP/manual/automated clients and duplicate postings, acquired **before** any first-party external submission | Database locks used only when recording outcomes cannot prevent parallel external submits | Shared claimant/lease protocol passes race and crash testing |
+| ADR-014 | Approval-time packet digest/snapshot is mandatory; edits revoke authorization or create a new reviewable version | Current `approved_resume_id` alone cannot detect in-place edits | Reviewed immutable packet versioning removes need for separate digest |
+| ADR-015 | Shared approval/submission service advances `Job.state` through validated `work_queue.transition` calls as well as legacy status fields | Avoid canonical lifecycle / tracker disagreement | An explicitly approved canonical state migration supersedes this |
+| ADR-016 | Embeddings use a centrally configured and instrumented embedding gateway with model/dimension/version metadata | Prompt-only LLMClient cannot safely be repurposed or bypassed | A reviewed supported local embedding adapter meets the same contract |
+| ADR-017 | Domain/search-scope admission runs before any JD recovery or model work; RAG only sees the job's selected resume plus independent global evidence | Respect existing discovery and resume pinning | User explicitly changes admission or evidence policy |
+| ADR-018 | Application execution worker must join Running Workers and AI Orchestration in Phase 5 | Queued work requires visible lease, retry, kill and tenant-scoped controls from first use | A reviewed worker registry replacement offers identical controls |
 
 Record accepted changes to these decisions with an appended rationale, date, PR, and consequences. Do not silently edit previously accepted decision history.
 
@@ -152,6 +158,8 @@ Record accepted changes to these decisions with an appended rationale, date, PR,
 
 **Business state invariant:** an LLM result or graph checkpoint cannot on its own transition a Job to APPLIED, change verified user facts, approve a legal attestation, or authorize submission.
 
+**Canonical state synchronization:** the existing `workflow.approve_job` and `workflow.mark_applied` currently update legacy `Job.status` / `Application.status` without advancing `Job.state`. Phase 4 must reconcile the approval path to `READY_TO_APPLY` via validated `work_queue.transition`; Phase 5/6 must advance `READY_TO_APPLY → APPLYING → APPLIED` through the **shared** domain service with atomic status/event updates. Respect existing intermediate states: reconcile legacy rows using an explicit audited migration/reconciliation plan rather than fabricating completed stages or invalid direct transitions. On failure, neither canonical state nor legacy status may be partially committed. Tests cover MCP, UI, automation, retries and orchestration/worker projections.
+
 **Replay invariant:** LangGraph may retry or replay code. Every side effect must have an idempotency key, safe reconciliation, or a guard that requires human review when its outcome is uncertain.
 
 **Transactional dispatch:** if a domain transaction requires a subsequent graph run, prefer a transactional outbox plus idempotent consumer. Do not commit an application state and independently publish an in-memory event whose loss can strand it.
@@ -164,7 +172,11 @@ Record accepted changes to these decisions with an appended rationale, date, PR,
 
 ApplicationExecution (tenant-owned) references a Job, approved resume version/hash, approval record, execution mode, route, status, lease, attempt and timing. ApplicationExecutionAttempt and a small audit/event representation may be introduced only if existing rows cannot satisfy the invariant. **It adds durable browser/API attempt state; it does not replace the existing approved Application, MCP apply queue or recorded submission.**
 
-**Shared application compatibility contract:** before enqueue/fill, call the same readiness and approved-packet checks currently used by `apply_queue`/MCP (including review score, `approved_resume_id`, apply URL, duplicate detection, active blocker and outstanding human answers). Preserve account-level locking/duplicate-posting semantics from `apply_queue.lock_application`; do not weaken them to a per-job-only lock. Introduce any new state behind an adapter shared by MCP, Apply Kit and automated workers, and keep existing tools callable. On confirmed automatic submission, use a single shared transaction/outcome-recording path consistent with `apply_queue.record_submission` / `workflow.mark_applied`; existing MCP `record_application_result` remains a manual/external result reporting path, **not** the proof required by automated ConfirmationVerifier. Do not auto-mark APPLIED from an unconfirmed click. Document and test the handoff between both paths, including simultaneous MCP and automated attempts.
+**Shared application compatibility contract:** before enqueue/fill, call the same readiness and approved-packet checks currently used by `apply_queue`/MCP (including review score, `approved_resume_id`, apply URL, duplicate detection, active blocker and outstanding human answers). Preserve existing `apply_queue.lock_application` account-level locking when recording the result; do not confuse its **transaction-scoped post-submit lock** with pre-submit exclusion. Introduce new durable reservations behind a shared adapter consumed by MCP, Apply Kit and automated workers; keep their entry points functional while migrating external-submit flows to the common claim. On confirmed automatic submission, use a single atomic shared transaction/outcome-recording path consistent with `apply_queue.record_submission` / `workflow.mark_applied` **and** validated canonical `Job.state` transitions. MCP `record_application_result` remains a manual/external result reporting path, **not** proof required by automated ConfirmationVerifier. Never auto-mark APPLIED from an unconfirmed click.
+
+**Approval-time content integrity (Phase 4 prerequisite):** compute and persist an immutable approved application-packet snapshot/digest **inside `workflow.approve_job`**, covering the exact recruiter-facing resume output and cover letter (plus any other explicitly approved attachments/content), normalized with a documented deterministic serializer and version. Retain `approved_resume_id`, but it is not a substitute for content integrity: today's resume edit and cover-letter endpoints can mutate the same `ResumeVariant` after approval. Post-approval edits must create a new version requiring review/reapproval **or** atomically revoke the prior approval and invalidate its digest. Re-check the approval-time digest against the actual export/artifact bytes (or canonical source and renderer version) at packet issuance, fill, and immediately before submit. Mismatches pause/require reapproval; do not recompute a new "approved" hash at execution start. Test edits before execution, between fill and submit, alternate file formats and resume-version changes.
+
+**Durable pre-submit claim (Phase 5 prerequisite, enforced in Phase 6):** introduce a shared first-party `begin_submission`/claim API that `MCP`, Apply Kit assisted/manual starts, and browser/API workers must call **before any external submit is initiated**. Under an account-level DB lock/transaction, derive a canonical posting identity covering dedupe keys and known URL aliases, check existing applied records and active/uncertain claims, and atomically reserve the target with a unique active claim keyed by `(user_id, canonical_posting_identity)` (not merely `execution_id`/attempt). Return a claimant token/authorization bound to the user/job/approved packet; enforce it when recording or completing outcomes. Do not hold a database transaction across the browser. An expired worker lease is **not** automatic permission to submit again: after any possibly executed submit, freeze to `SUBMISSION_UNCERTAIN` pending reconciliation/human review. Controlled retries require proof of no prior submission. Legacy MCP callers must adopt the pre-submit claim protocol before Phase 6 enables guarded auto-submit, or guarded auto-submit must remain disabled for jobs/accounts that can still initiate unclaimed external submissions. A manually submitted application **entirely outside** Job Hunt OS cannot be serialized by this system; warn users and reconcile unknown outcomes rather than claiming impossible exactly-once semantics. Test two MCP/browser workers starting together, duplicate Job rows, differing URL aliases, stale claims and crash immediately after click.
 
 Execution-level states are distinct from canonical job states:
 
@@ -178,7 +190,7 @@ NEEDS_INPUT, NEEDS_HUMAN, RETRYING, BLOCKED,
 SUBMISSION_UNCERTAIN, FAILED, CANCELLED.
 ~~~
 
-The domain transition to APPLIED is allowed only after sufficiently strong confirmation, via the existing lifecycle policy. An inconclusive click is not a successful application.
+The domain transition to APPLIED is allowed only after sufficiently strong confirmation, via the existing lifecycle policy and a durable claim. An inconclusive click is not a successful application. Manual MCP/user reports retain their distinct provenance and must pass shared duplicate/claim checks; do not treat them as automatically verified. Follow the canonical `READY_TO_APPLY → APPLYING → APPLIED` route through the shared domain service, including the necessary reviewed compatibility reconciliation for already-approved legacy rows.
 
 Persist SubmissionIntent *before* an irreversible action, using a unique key for the execution/attempt. A crash after SUBMITTING requires confirmation reconciliation; never blindly click Submit again.
 
@@ -212,7 +224,9 @@ typed query
 Requirements:
 
 - Retrieval applies user/account filters **before** ranking; caches are tenant-scoped.
-- The embedding record keeps a source ID, content hash, verification status, embedding model/version, and source version; it does not supersede the underlying row.
+- **Selected-resume scope is mandatory for job-specific RAG:** resolve `resume_verification.for_job(db, profile, job)` first, derive the selected resume ID and allowed resume-derived source/evidence IDs, and restrict retrieval to those IDs **before keyword/vector scoring**, plus explicitly verified **resume-independent, profile-global** evidence permitted by current CandidatePolicy. Do not return verified but unrelated units derived from another resume belonging to the same user. User/setup-pinned resume choices must outrank embedding similarity. Test two resumes with contradictory/overlapping skills and a pinned job.
+- The embedding record keeps a source ID, content hash, verification status, embedding model/version, **vector dimensions**, and source version; it does not supersede the underlying row.
+- **Configured embedding gateway is a Phase 2 entry requirement:** current `LLMClient.generate_prompt` is for generation, not embeddings. Implement `EmbeddingService.embed_documents/embed_query` behind a centralized, versioned embedding-model configuration and instrumentation route (using the existing external API wrapper for provider SDK/HTTP calls). Validate model capability, vector dimensions and credential ownership; avoid hardcoded models/direct service clients. Record actual model, per-call latency/errors/usage and attributable costs where reported; unknown costs stay NULL. On embedding model/dimension changes, build a separate index namespace or versioned column/table, backfill before flipping retrieval, and never compare incompatible vectors. If no provider can meet this contract, keep Phase 2 vector RAG disabled and ship deterministic full-text retrieval only until ready.
 - Invalidate or reindex on edit, verification change, source deletion, account deletion and embedding-model change.
 - Canonical work-authorization/visa/eligibility questions must never be decided from vector similarity alone.
 - A semantic result can be suggested for review; it does not automatically convert a sensitive answer into a verified one.
@@ -333,11 +347,11 @@ Every phase starts from updated main, uses an isolated branch, produces tests/do
 | Phase | Branch | Deliverables | Merge gate |
 | --- | --- | --- | --- |
 | 1. LangGraph foundation | feat/langgraph-foundation | Graph runtime, PostgreSQL checkpointer, compatible LLM adapter, optional LangSmith pilot and flags | Checkpoint survives restart; tenant isolation; existing model routing unaffected |
-| 2. RAG knowledge | feat/rag-knowledge-layer | pgvector indexing, hybrid retrieval, context packs, citation validator and eval dataset | Source-backed recall evaluation, no cross-tenant/stale retrieval, baseline regression parity |
-| 3. Discovery/qualification graphs | feat/langgraph-qualification | Existing Apify/JD/ranker wrapped in graph nodes, safe branches, shadow mode | Qualified/archive parity, no duplicate work or paid calls |
-| 4. Preparation/insights graphs | feat/langgraph-preparation | Resume selection/review graph and grounded company research graph | Resume lineage intact; unsupported claims blocked; insights provenance preserved |
-| 5. Application execution | feat/application-execution | Reuse MCP/apply_queue readiness/locking; durable attempts, CandidatePolicy, AnswerResolver, typed form schema and a separately approved application-browser abstraction | Shared MCP/agentic safeguards, safe fill and restart; **no final automated submission** |
-| 6. Guarded browser submission | feat/agentic-browser-apply | Generic form engine, browser-use fallback, pre-submit policy, intent, confirm/reconcile, human takeover; single shared result path with MCP/apply_queue | Crash/retry never blindly re-submits; existing MCP and browser flows agree on duplicate/outcome guards |
+| 2. RAG knowledge | feat/rag-knowledge-layer | Configured/instrumented embedding gateway, dimension/version-safe pgvector indexing, job-resume-scoped hybrid retrieval, context packs and evals | Source-backed recall evaluation, model/dimension compatibility, pinned resume isolation and no cross-tenant/stale retrieval |
+| 3. Discovery/qualification graphs | feat/langgraph-qualification | Existing Apify/domain admission/JD/ranker wrapped in graph nodes, safe branches, shadow mode | Hidden jobs never reach JD/LLM; qualification parity, no duplicate paid calls |
+| 4. Preparation/insights graphs | feat/langgraph-preparation | Resume selection/review, **approval-time packet digest**, canonical approval transition, asynchronous Job Insights | Post-approval edits revoke approval or trigger reapproval; domain state consistent; insights nonblocking |
+| 5. Application execution | feat/application-execution | Shared durable **pre-submit claim** for MCP/UI/browser paths, WorkerKind + AI Orchestration node, attempts, typed form and separate authenticated-browser security review | Atomic pre-submit claim, correct Running Workers visibility, safe fill/restart and **no final automated submission** |
+| 6. Guarded browser submission | feat/agentic-browser-apply | Generic/browser-use actions, validated consent, shared claim/SubmissionIntent, canonical transitions, confirmation/reconciliation and human takeover | Competing MCP/browser starts never both submit; canonical + legacy states agree, no blind retry |
 | 7. Evaluation/feedback | feat/agent-evaluation-feedback | LangSmith datasets, Gmail event correlation, question memory, graph UI and monitoring improvements | End-to-end trace fidelity, deterministic metric sourcing, privacy checks |
 | 8. Production hardening | feat/agentic-production-hardening | Fault injection, load, worker supervision, security, retention, rollout controls and runbooks | Full regression, failure recovery, security review, signed GO/NO-GO |
 
@@ -353,20 +367,22 @@ Phase instructions, acceptance tests, and the reusable independent-review/merge 
 - **Rollback:** turn off graph flag; old production services remain unchanged.
 
 #### Phase 2: Candidate RAG and ATS answer retrieval
-- Add PostgreSQL vector extension/migrations, derived index lifecycle and hybrid retrieval.
-- Reuse Evidence/KnowledgeAnswer and current context builders.
+- First implement a centrally configured/instrumented `EmbeddingService` with explicit model, vector dimensions, credentials, usage, deployment/retention and index-version migration policy.
+- Add PostgreSQL vector extension/migrations, derived index lifecycle and hybrid retrieval; never mix incompatible embedding dimensions.
+- Reuse Evidence/KnowledgeAnswer and current context builders; enforce `resume_verification.for_job` selection and disallow other-resume-derived facts in job-scoped retrieval.
 - Establish labeled retrieval benchmarks and a non-vector fallback for unsupported development databases.
 - **Exit demonstration:** one JD receives a correctly attributed, bounded verified evidence pack; stale/other-tenant evidence is excluded.
 - **Rollback:** disable retrieval flag and use existing deterministic context builders.
 
 #### Phase 3: Qualification migration
-- Implement graph nodes around existing discovery/JD recovery/parser/filter/ranker.
+- Implement graph nodes around existing discovery/JD recovery/parser/filter/ranker. Enforce deterministic domain/search-scope admission **before** checking description or queueing JD recovery/parsing; hidden `NOT_MATCHING` jobs terminate with no network/model side effects.
 - Use shadow mode with deterministic fixtures before any production traffic cutover.
 - **Exit demonstration:** qualified/archive decisions and state history agree with the current path on representative cases.
 - **Rollback:** route work to the current scheduler/service implementation.
 
 #### Phase 4: Resume preparation and job insights
-- Implement bounded tailor/reviewer revision and human approval interrupts.
+- Implement bounded tailor/reviewer revision and human approval interrupts; persist **approval-time** resume/cover-letter packet digest or immutable approved snapshot in `workflow.approve_job`. Post-approval edits either create a new reviewed version or revoke approval, never silently change the approved artifact.
+- Align `workflow.approve_job` with canonical `READY_TO_APPLY` via validated `work_queue.transition` calls and audit-compatible legacy-state reconciliation; do not forge completed intermediate stages.
 - Trigger Job Insights **only after approval**, through the existing asynchronous on-approved queue; do not make approval depend on insight completion.
 - Extend source-grounded company research using existing Job Insights/Apify adapters; do not invent provider schemas.
 - **Exit demonstration:** immutable pinned resume; all factual claims source-checked; employer and market pay remain separate.
@@ -374,14 +390,17 @@ Phase instructions, acceptance tests, and the reusable independent-review/merge 
 
 #### Phase 5: Application execution
 - First audit and **reuse or explicitly adapt** existing `apply_queue`/MCP readiness, approved packet, resume score, account-level locking, duplicate-posting protection, human-answer blockers and result recording; preserve backwards compatibility.
-- Add durable execution-level state, normalized form and answer resolution, without a competing readiness/status authority.
+- Build and migrate a durable **pre-external-submit claim** across MCP, in-app assisted/manual, and automated entry points: account/posting identity, active/uncertain uniqueness and explicit user claim tokens. Today's `lock_application` acts only when recording a result; it is **not** a pre-submit lock. Do not enable automated submit while any first-party client bypasses this.
+- Add durable execution-level state, normalized form and answer resolution, without a competing readiness/status authority; validate the **approval-time** packet digest before fill.
+- Register an `ApplicationExecution` `WorkerKind` in `app/services/workers.py`, scheduler job with lease-aware controls, and implemented node/edges in `orchestration_topology.NODES`. Preserve Running Workers kill/retry/run-now and tenant ownership from the start; Phase 7 may enrich metrics but must not be the first stage that makes executions visible.
 - Propose and separately approve an authenticated application-session abstraction; update `AGENTS.md` and test that anonymous JD-recovery sessions remain credential-free.
 - Test a single known ATS adapter in OBSERVE/ASSIST.
 - **Exit demonstration:** inspect/fill to READY_TO_SUBMIT and resume after process crash; no submit action is reachable.
 - **Rollback:** revert to approved Apply Kit/manual submission.
 
 #### Phase 6: Guarded submission and agentic fallback
-- Implement pre-submit validator, authorized SubmissionIntent, confirmation verifier and reconciliation.
+- Implement pre-submit validator, authorized SubmissionIntent, confirmation verifier and reconciliation. Require the **Phase 5 shared pre-submit claim before any external click**, including MCP and automated paths, and never clear uncertainty merely because a worker lease expired.
+- Route confirmed results through one atomic domain service that writes `Application`, legacy `Job.status`, and canonical `Job.state` `READY_TO_APPLY → APPLYING → APPLIED` via `work_queue.transition`, with audit events and duplicate guard; no silent skipped transitions.
 - Reuse the existing `apply_queue`/MCP locking, duplicate check, blocker/human-answer semantics and common application-result recording. Test a concurrent MCP/manual result and browser execution; no second source of APPLIED truth.
 - Guard browser-use action proposals; never give it direct submission authority.
 - **Exit demonstration:** controlled ATS sandbox handles success, uncertainty, duplicate, legal/OTP and browser-crash cases correctly.
@@ -463,7 +482,7 @@ To move from ASSIST to GUARDED_AUTO or AUTONOMOUS requires separate, explicit au
 | Multi-framework complexity grows | Reuse current queue, browser service, UI and model config | Tech lead |
 | Provider/API availability changes | Capability registry, graceful unsupported state, human handoff | Integrations |
 
-**Open design questions before relevant phases:** supported embedding model and dimensions; vector extension availability in all environments; acceptable LangSmith deployment/privacy posture; ATS priority by observed Job Hunt OS volume; local vs remote human browser handoff; confirmation-strength thresholds; retention rules for artifacts; production autonomy eligibility and applicable website terms.
+**Open design questions before relevant phases:** supported centrally configured embedding model and dimensions; embedding index backfill/migration policy; vector extension availability in all environments; selected resume/global-evidence provenance classification; legacy `Job.state` reconciliation; approval-time packet hash serializer/version and edit invalidation; shared pre-submit claim identity/alias canonicalization and claim takeover; how to migrate existing MCP clients to claim-before-submit without blocking all user work; acceptable LangSmith deployment/privacy posture; ATS priority by observed Job Hunt OS volume; local vs remote human browser handoff; confirmation-strength thresholds; retention rules for artifacts; production autonomy eligibility and applicable website terms.
 
 Do not silently resolve any of these by assuming a framework provides a capability or that a site's public API permits submission.
 
