@@ -81,3 +81,39 @@ def test_every_migrated_integration_goes_through_the_layer(module):
     """The integrations that existed before this layer did now use it."""
     source = (ROOT / module).read_text()
     assert "app.services.external_api" in source or "external_client" in source or "apify_client" in source
+
+
+# ───────────── trace export (LangSmith) ─────────────
+
+# The one module that may build a LangSmith client or tracer: its client sends through the instrumented session and
+# applies the export policy (app.agents.export_policy). Anywhere else, a tracer would export unpoliced payloads.
+TRACE_EXPORT_BOUNDARY = "app/agents/tracing_boundary.py"
+TRACE_EXPORTERS = {"Client", "LangChainTracer", "RunTree", "traceable", "tracing_context"}
+
+
+def trace_exporters(source: str) -> list[str]:
+    found = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] in ("langsmith", "langchain_core"):
+            names = {a.name for a in node.names}
+            if (node.module or "").startswith("langsmith") or "LangChainTracer" in names:
+                found += [f"from {node.module} import {n}" for n in sorted(names & TRACE_EXPORTERS)]
+        elif isinstance(node, ast.Import):
+            found += [f"import {a.name}" for a in node.names if a.name.split(".")[0] == "langsmith"]
+    return found
+
+
+def test_only_the_tracing_boundary_builds_a_langsmith_exporter():
+    offenders = {}
+    for path in sorted(APP.rglob("*.py")):
+        relative = str(path.relative_to(ROOT))
+        if relative == TRACE_EXPORT_BOUNDARY:
+            continue
+        if hits := trace_exporters(path.read_text()):
+            offenders[relative] = hits
+    assert offenders == {}, f"LangSmith exporters belong in {TRACE_EXPORT_BOUNDARY} only: {offenders}"
+    assert trace_exporters("from langsmith import Client") == ["from langsmith import Client"]
+    assert trace_exporters("from langchain_core.tracers import LangChainTracer") == [
+        "from langchain_core.tracers import LangChainTracer"]
+    assert trace_exporters("import langsmith") == ["import langsmith"]
+    assert trace_exporters("from langchain_core.messages import AIMessage") == []

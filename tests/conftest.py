@@ -21,6 +21,12 @@ for key in ("APIFY_API_TOKEN", "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPI
     os.environ[key] = ""
 # No real Gmail: the inbox tests turn the worker on and serve Google from tests/gmail_fake.py.
 os.environ["APPLICATION_INBOX_ENABLED"] = "false"
+# Agent graphs and their LangSmith export are off; the agent tests turn them on and never reach LangSmith.
+os.environ["AGENT_GRAPHS_ENABLED"] = "false"
+os.environ["AGENT_LANGSMITH_EXPORT_ENABLED"] = "false"
+os.environ["AGENT_LANGSMITH_API_KEY"] = ""
+for key in ("LANGSMITH_TRACING", "LANGCHAIN_TRACING_V2", "LANGSMITH_API_KEY", "LANGCHAIN_API_KEY"):
+    os.environ.pop(key, None)
 
 import pytest  # noqa: E402
 from sqlalchemy import create_engine, select, text  # noqa: E402

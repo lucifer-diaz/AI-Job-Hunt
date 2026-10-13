@@ -67,6 +67,8 @@ class User(Base):
     provider_cooldowns: Mapped[list[ProviderCooldown]] = relationship(back_populates="user", passive_deletes=True)
     model_route_states: Mapped[list[ModelRouteState]] = relationship(back_populates="user", passive_deletes=True)
     failover_events: Mapped[list[FailoverEvent]] = relationship(back_populates="user", passive_deletes=True)
+    agent_threads: Mapped[list[AgentThread]] = relationship(back_populates="user", passive_deletes=True)
+    agent_effects: Mapped[list[AgentEffect]] = relationship(back_populates="user", passive_deletes=True)
     applications: Mapped[list[Application]] = relationship(back_populates="user", passive_deletes=True)
     resume_variants: Mapped[list[ResumeVariant]] = relationship(back_populates="user", passive_deletes=True)
     tailor_tasks: Mapped[list[TailorTask]] = relationship(back_populates="user", passive_deletes=True)
@@ -2289,6 +2291,76 @@ class FailoverEvent(Base):
     metrics: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
     acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+AGENT_THREAD_STATUSES = ("QUEUED", "RUNNING", "INTERRUPTED", "COMPLETED", "FAILED", "STOPPED")
+ACTIVE_AGENT_THREAD_STATUSES = ("QUEUED", "RUNNING")
+
+
+class AgentThread(Base):
+    """One LangGraph thread (app.agents): who owns it, where it stands, and who holds it.
+
+    The graph's resumable state lives in the LangGraph checkpoint tables under `thread_id`; this row is the owner and
+    the lease. The thread id is built on the server (app.agents.threads.thread_id_for) and never taken from a caller,
+    and every checkpointer access first loads this row through the account's own session. A checkpoint is
+    computation state only: it never decides a job's state, an application or an approval.
+    """
+
+    __tablename__ = "agent_threads"
+    __table_args__ = (
+        UniqueConstraint("thread_id", name="uq_agent_threads_thread_id"),
+        UniqueConstraint("user_id", "graph", "subject", name="uq_agent_threads_subject"),
+        CheckConstraint(f"status IN ({_values(AGENT_THREAD_STATUSES)})", name="ck_agent_threads_status"),
+        CheckConstraint("attempt_count >= 0", name="ck_agent_threads_attempt_count"),
+        Index("ix_agent_threads_claim", "status", "lock_expires_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("agent_threads")
+    user: Mapped[User] = relationship(back_populates="agent_threads")
+    thread_id: Mapped[str] = mapped_column(String(200))
+    graph: Mapped[str] = mapped_column(String(60))
+    graph_version: Mapped[str] = mapped_column(String(20))
+    subject: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(20), default="QUEUED", server_default="QUEUED")
+    # The graph's input, kept until the first checkpoint exists (ids, enums and counts only; checked like a checkpoint).
+    input: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # What a person is asked while the thread waits (metadata only), cleared on resume.
+    interrupt: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    trace_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    locked_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    lock_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lock_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    checkpoint_pruned_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class AgentEffect(Base):
+    """A side effect a graph has made, recorded once (app.agents.effects.once).
+
+    LangGraph may run a node again after a crash; the unique key makes the second run find the first one's record
+    instead of repeating the effect.
+    """
+
+    __tablename__ = "agent_effects"
+    __table_args__ = (
+        UniqueConstraint("agent_thread_id", "effect_key", name="uq_agent_effects_key"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("agent_effects")
+    user: Mapped[User] = relationship(back_populates="agent_effects")
+    agent_thread_id: Mapped[int] = mapped_column(
+        ForeignKey("agent_threads.id", ondelete="CASCADE", name="fk_agent_effects_agent_thread_id"), index=True)
+    effect_key: Mapped[str] = mapped_column(String(120))
+    summary: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
 
 # Registers the per-user isolation hooks on every session; needs the models above.

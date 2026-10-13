@@ -140,6 +140,13 @@ A graph node should wrap the existing service API where possible. It must not in
 
 Record accepted changes to these decisions with an appended rationale, date, PR, and consequences. Do not silently edit previously accepted decision history.
 
+**Proposed in Phase 1 (2026-10-13, branch `feat/langgraph-foundation`; accepted only when the Phase 1 PR is approved):**
+
+| ID | Decision | Reason / consequences | Revisit if |
+| --- | --- | --- | --- |
+| ADR-019 | LangSmith export uses the LangSmith SDK's tracer through one boundary (`app/agents/tracing_boundary.py`). Its client applies allowlist hooks, a run-field allowlist, error class names only and keyed thread pseudonyms. It sends through an instrumented `requests` session (`external_api.requests_session`) that refuses any unreadable, compressed, credential-named or secret-shaped body. No setting widens it. | Reuses the SDK's protocol while keeping a wire-level, fail-closed guarantee and Monitoring telemetry. Consequence: the hooks depend on SDK internals (`_run_transform`, `update_run`, `_hide_run_error`); versions are pinned exactly and the leak tests run against them. | An SDK upgrade changes those hooks, or a self-hosted trace store is required |
+| ADR-020 | The Phase 1 pilot graph is not a `WorkerKind` or an orchestration node. The first production graph (Phase 3) registers through its own task table, like every queued worker. | `WorkerKind` and Running workers are job-bound (`job_id`, job-state transitions on kill); the pilot has no job and no production effect. Consequence: pilot threads are visible only through `/api/agents/runs`. | A graph does production work, or Running workers gains non-job tasks |
+
 ## 5. Core data and durability contracts
 
 ### Authority boundaries
@@ -492,7 +499,7 @@ This section is intended to change after *each approved phase merge*. Initial en
 
 | Phase | Status | PR | Merge SHA | Evaluation / test evidence | Production flag |
 | --- | --- | --- | --- | --- | --- |
-| 1. LangGraph foundation | NOT_STARTED | — | — | — | OFF |
+| 1. LangGraph foundation | IN_REVIEW | feat/langgraph-foundation (PR pending review) | — | 2026-10-13 note below | OFF (`AGENT_GRAPHS_ENABLED=false`) |
 | 2. RAG knowledge layer | NOT_STARTED | — | — | — | OFF |
 | 3. Qualification graphs | NOT_STARTED | — | — | — | OFF |
 | 4. Preparation / insights graphs | NOT_STARTED | — | — | — | OFF |
@@ -502,6 +509,50 @@ This section is intended to change after *each approved phase merge*. Initial en
 | 8. Production hardening | NOT_STARTED | — | — | — | OFF |
 
 Allowed status: NOT_STARTED, PLANNING, IN_PROGRESS, IN_REVIEW, MERGED, BLOCKED, ROLLED_BACK. Update only with evidence. Prefer a new dated progress note below to explain scope, deferrals and decisions rather than overwriting history.
+
+### 2026-10-13 — Phase 1: LangGraph foundation
+- **Branch / PR:** `feat/langgraph-foundation`. One PR to `main`, not merged.
+- **Base / merge SHA:** base `26e4562`; no merge.
+- **What shipped:**
+  - **`app/agents/` runtime:**
+    - `threads`: server-built, tenant-scoped thread ids, with ownership checked on start, resume and every checkpointer access.
+    - `checkpoint`: `PostgresSaver`, plus `GuardedSerializer`, which refuses credential fields, secret-shaped text and oversize state.
+    - `effects.once`: lease-checked, once-per-thread side effects.
+    - `runtime`: lease, execute, interrupt and resume, stop, crash recovery and retention.
+  - **Pilot graph:** a deterministic graph (`pilot`) that branches (auto or review), interrupts and survives restart.
+  - **`GatewayChatModel`:** a LangChain chat-model interface over `LLMClient.generate_prompt` only.
+  - **LangSmith boundary:** an opt-in `tracing_boundary` and `export_policy` (ADR-019).
+  - **API and scheduler:** flagged `/api/agents/*` endpoints, the `agent_graphs` recovery job, and checkpoint pruning in `cleanup`.
+- **New migrations, flags, APIs:**
+  - **Migration:** `0044_agent_threads` (`agent_threads`, `agent_effects`; additive, downgradable). LangGraph creates its own `checkpoint*` tables through `setup()`, and Alembic ignores them.
+  - **Flags:** `AGENT_GRAPHS_ENABLED`, `AGENT_*` limits and retention, `AGENT_LANGSMITH_*`. All are off or safe by default.
+  - **Dependencies:** `langgraph==1.2.12`, `langgraph-checkpoint==4.2.0`, `langgraph-checkpoint-postgres==3.1.2`, `langchain-core==1.6.5`, `langsmith==0.14.1`.
+- **Architectural decisions and deviations:**
+  - **ADR-019:** LangSmith goes through the SDK tracer with allowlist hooks and a fail-closed wire check.
+  - **ADR-020:** the pilot is not a `WorkerKind` or an orchestration node.
+  - **No parallel queue or router.**
+  - **Production unchanged:** discovery, ranking, tailoring and application paths are untouched.
+- **Test/evaluation evidence** (local, PostgreSQL 16, `jobhunt` conda env):
+  - **New tests:** `tests/test_agents_runtime.py`, `test_agents_tracing.py`, `test_agents_llm.py` and `test_agents_postgres.py`. Together they cover:
+    - a SIGKILLed worker process resuming from its PostgreSQL checkpoint;
+    - a crash after the effect, with no duplicate effect;
+    - an interrupt that survives a restart and resumes with credential decryption disabled;
+    - tenant A versus B on execute, list, resume and stop;
+    - LangSmith off, on and down (connection refused, timeout, 503);
+    - synthetic tokens absent from the exported bytes with every debug switch on;
+    - routing and telemetry parity, including failover.
+  - **Full suite:** `pytest` passes on SQLite (1918 passed, 95 skipped). With `TEST_DATABASE_URL` it gives 2004 passed and 7 failed. The same 7 fail on untouched `main`, so they are pre-existing.
+  - **Not run in this environment:** `tests/test_mcp*.py`. The env has `mcp` 2.x, but `requirements.txt` pins `<2`.
+  - **Lint:** `ruff check app tests` is level with `main` at 227 findings (ruff 0.16 default rules). The new files are clean.
+  - **Disposable-DB migration check:** upgrade to 0044, downgrade to 0043, upgrade to head; the metadata diff is empty.
+- **Known gaps:**
+  - The adapter is JSON-only (no tool calls).
+  - LangSmith export rows may lack a trace id (SDK background thread).
+  - The pilot is not in Running workers or Orchestration.
+  - The SDK hooks rely on pinned internals.
+- **Reviewer / approval:** pending independent review.
+- **Production activation and rollback:** OFF. Rollback means leaving `AGENT_GRAPHS_ENABLED=false` and `AGENT_LANGSMITH_EXPORT_ENABLED=false`. Optionally, downgrade 0044 and drop the LangGraph `checkpoint*` tables.
+- **Next dependency:** Phase 2 needs this PR approved and merged.
 
 ### Phase update template
 
