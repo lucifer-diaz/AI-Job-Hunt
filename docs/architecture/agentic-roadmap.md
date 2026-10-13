@@ -499,7 +499,7 @@ This section is intended to change after *each approved phase merge*. Initial en
 
 | Phase | Status | PR | Merge SHA | Evaluation / test evidence | Production flag |
 | --- | --- | --- | --- | --- | --- |
-| 1. LangGraph foundation | IN_REVIEW | feat/langgraph-foundation (PR pending review) | — | 2026-10-13 note below | OFF (`AGENT_GRAPHS_ENABLED=false`) |
+| 1. LangGraph foundation | IN_REVIEW | [#72](https://github.com/triump0870/AI-Job-Hunt/pull/72) | — | 2026-10-13 note below | OFF (`AGENT_GRAPHS_ENABLED=false`) |
 | 2. RAG knowledge layer | NOT_STARTED | — | — | — | OFF |
 | 3. Qualification graphs | NOT_STARTED | — | — | — | OFF |
 | 4. Preparation / insights graphs | NOT_STARTED | — | — | — | OFF |
@@ -511,7 +511,7 @@ This section is intended to change after *each approved phase merge*. Initial en
 Allowed status: NOT_STARTED, PLANNING, IN_PROGRESS, IN_REVIEW, MERGED, BLOCKED, ROLLED_BACK. Update only with evidence. Prefer a new dated progress note below to explain scope, deferrals and decisions rather than overwriting history.
 
 ### 2026-10-13 — Phase 1: LangGraph foundation
-- **Branch / PR:** `feat/langgraph-foundation`. One PR to `main`, not merged.
+- **Branch / PR:** `feat/langgraph-foundation`. [#72](https://github.com/triump0870/AI-Job-Hunt/pull/72) to `main`, not merged.
 - **Base / merge SHA:** base `26e4562`; no merge.
 - **What shipped:**
   - **`app/agents/` runtime:**
