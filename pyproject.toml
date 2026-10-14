@@ -26,7 +26,12 @@ dependencies = [
   "tzdata>=2024.1",
   "mcp>=1.12,<2",
   "pyyaml>=6.0,<7",
-  "playwright>=1.49,<2"
+  "playwright>=1.49,<2",
+  "langgraph==1.2.12",
+  "langgraph-checkpoint==4.2.0",
+  "langgraph-checkpoint-postgres==3.1.2",
+  "langchain-core==1.6.5",
+  "langsmith==0.14.1"
 ]
 
 [project.optional-dependencies]

@@ -592,9 +592,41 @@ def cleanup(ctx: JobContext) -> dict[str, Any]:
         external["captured_cleared"] = external_monitoring.clear_captured(db, ctx.now)
         logs = system_log.prune(db, ctx.now)
         retention = {"telemetry": telemetry, "external_api": external, "system_logs": logs}
+    if get_settings().agent_graphs_enabled:  # graph checkpoints (app.agents); LangGraph is not loaded otherwise
+        from app.agents import runtime as agent_runtime
+
+        try:
+            retention["agent_checkpoints"] = agent_runtime.prune(ctx.sessions, ctx.now)
+        except Exception as exc:  # noqa: BLE001  checkpoint retention must not stop the rest of cleanup
+            retention["agent_checkpoints"] = {"error": f"{type(exc).__name__}"}
+    with ctx.sessions() as db:
         if not _is_postgres(db):
             return skipped("Lease recovery needs PostgreSQL", **retention)
         return {"recovered_leases": wq.recover_expired_leases(db), **retention}
+
+
+AGENT_RECOVERY_BATCH = 5
+
+
+async def agent_graphs(ctx: JobContext) -> dict[str, Any]:
+    """Continue agent graph runs whose worker died (lease expired) or that never started, from their last checkpoint.
+
+    Off unless AGENT_GRAPHS_ENABLED. A run's effects are recorded once (app.agents.effects), so continuing a run that
+    had already made one never repeats it."""
+    if not get_settings().agent_graphs_enabled:
+        return skipped("Agent graphs are off (AGENT_GRAPHS_ENABLED)")
+    with ctx.sessions() as db:
+        if not _is_postgres(db):
+            return skipped("Agent graphs need PostgreSQL")
+    from app.agents import runtime as agent_runtime
+
+    runs = await threads.run_io(agent_runtime.claim_stale, ctx.sessions, ctx.worker_id, AGENT_RECOVERY_BATCH)
+    if not runs:
+        return skipped("No agent graph run to recover")
+    outcomes: Counter = Counter()
+    for run in runs:
+        outcomes[await threads.run_work(agent_runtime.execute, ctx.sessions, run)] += 1
+    return {"recovered": len(runs), **outcomes}
 
 
 def litellm_telemetry(ctx: JobContext) -> dict[str, Any]:
@@ -682,6 +714,9 @@ JOBS: list[JobSpec] = [
             "Adds the auto router's tier and cause from LiteLLM's spend logs to Monitoring."),
     JobSpec("model_health", "Model health & failover", "model_health_interval_minutes", model_health_job,
             "Judges each model's recent performance and rests the ones past the failover thresholds; never edits configuration."),
+    JobSpec("agent_graphs", "Agent graph recovery", "agent_recovery_interval_minutes", agent_graphs,
+            "Continues agent graph runs (LangGraph pilot) left by a crashed worker from their last checkpoint; "
+            "off unless AGENT_GRAPHS_ENABLED."),
     JobSpec("cleanup", "Cleanup", "cleanup_interval_minutes", cleanup,
             "Recovers jobs left locked by crashed workers and applies LLM telemetry retention."),
 ]

@@ -69,6 +69,10 @@ or leaves the metric out rather than guessing.
 Designed-but-not-built stages are registered with `implemented=False`: they are listed in the legend as planned and
 never drawn as if they ran.
 
+The LangGraph pilot (`app/agents/pilot.py`, README §9c) is not a stage. It has no job and no production effect, so it
+has no node and no `WorkerKind` (ADR-020 in `docs/architecture/agentic-roadmap.md`). A graph that does production
+work joins the topology the same way as any other stage: its node, its edges, and its task table as a `TaskTable`.
+
 ## Models & routing
 
 AI Orchestration has two workspaces: **Pipeline** (the graph above) and **Models & routing** (`#orchestration/models`,

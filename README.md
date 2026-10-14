@@ -1793,6 +1793,56 @@ LiteLLM or Ollama still holds its slot until it times out. A model call already 
 stored as `run_now_at` on the task (migration 0032) and cleared by the claim that takes it; the scheduler job is
 nudged at once when it is free. Every control acts on your own tasks only.
 
+## 9c. Agent graphs (experimental, off by default)
+
+`app/agents/` is the LangGraph foundation from the [agentic roadmap](docs/architecture/agentic-roadmap.md) (Phase 1).
+Today it runs one **pilot graph** with no production side effect. The pilot branches (auto or review), pauses for a
+person's decision, and continues after a worker crash from its last PostgreSQL checkpoint. Discovery, ranking,
+tailoring and applications do not use it.
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `AGENT_GRAPHS_ENABLED` | `false` | Turns the `/api/agents/*` endpoints, the `agent_graphs` recovery job and checkpoint retention on. Off: the endpoints answer 404 and nothing opens a checkpointer. Needs PostgreSQL. |
+| `AGENT_RECOVERY_MINUTES` | `5` | How often the recovery pass continues runs whose worker died (lease expired). |
+| `AGENT_LEASE_SECONDS` / `AGENT_MAX_ATTEMPTS` | `300` / `3` | A run's lease (renewed while it runs), and how many times recovery retries it. |
+| `AGENT_CHECKPOINT_MAX_BYTES` | `65536` | A larger checkpoint is refused, and so is one with a credential field or a secret-shaped string. |
+| `AGENT_CHECKPOINT_RETENTION_DAYS` / `AGENT_INTERRUPT_EXPIRY_DAYS` | `14` / `30` | Checkpoints of finished runs are deleted, and a run left waiting for a person expires. |
+| `AGENT_LANGSMITH_EXPORT_ENABLED` + `AGENT_LANGSMITH_API_KEY` | off | Optional LangSmith traces, metadata only (below). `AGENT_LANGSMITH_ENDPOINT` and `AGENT_LANGSMITH_PROJECT` choose where they go. |
+
+```text
+POST /api/agents/pilot/runs        {"kind": "auto" | "review", "items": 1-20, "idempotency_key": "…"}
+GET  /api/agents/runs              your runs (metadata only)
+GET  /api/agents/runs/{id}
+POST /api/agents/runs/{id}/resume  {"decision": "approve" | "reject"}
+POST /api/agents/runs/{id}/stop
+```
+
+**State and ownership.** A run is an `agent_threads` row (migration 0044): its owner, its status, and the lease that
+a worker holds while it runs. Its server-built thread id names the owner, and every checkpointer access checks both.
+LangGraph keeps the run's resumable state in its own checkpoint tables, created by `PostgresSaver.setup()` on first
+use. Effects a graph makes are recorded once (`agent_effects`), so a node that runs again after a crash never repeats
+them. Checkpoints are computation only: they never decide a job's state, an approval or an application.
+
+**Models.** A graph calls a model only through `app.agents.llm.GatewayChatModel`, a LangChain chat-model interface
+over `LLMClient.generate_prompt`. The worker's configured model, failover, escalation, schema validation and
+Monitoring rows are exactly the same as for any other call.
+
+**LangSmith.** Export is off unless both settings are set. When on, a trace carries:
+- the graph, node, step and status;
+- counts and the trace id;
+- the worker and the prompt's name and version;
+- the configured, requested and actual model.
+
+Thread ids become keyed pseudonyms. Inputs, prompts, responses and error messages are left out; an error is reduced
+to its class name. Every request body is checked before it is sent, and one that looks like it holds a credential is
+not sent at all. No debug or capture setting changes this. A LangSmith outage is a failed row in Monitoring →
+External APIs (provider `LANGSMITH`) and changes nothing else. These are our own setting names: the SDK's
+`LANGSMITH_TRACING` / `LANGCHAIN_TRACING_V2` variables have no effect on graph runs.
+
+**Rollback.** Set `AGENT_GRAPHS_ENABLED=false` (and `AGENT_LANGSMITH_EXPORT_ENABLED=false`). Migration 0044 is
+additive and can be downgraded. LangGraph's checkpoint tables can be dropped by hand: `checkpoints`,
+`checkpoint_blobs`, `checkpoint_writes` and `checkpoint_migrations`.
+
 ## Application Inbox Agent
 
 Job Hunt OS reads your Gmail — read-only — for replies about the applications you actually submitted, and turns them

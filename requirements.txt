@@ -24,3 +24,10 @@ pyyaml>=6.0,<7
 #   python -m playwright install chromium          (local)
 #   python -m playwright install --with-deps chromium   (Debian/Ubuntu servers, installs system libraries)
 playwright>=1.49,<2
+# Agent graphs (app.agents): LangGraph with its PostgreSQL checkpointer, and LangChain's model/tracer interfaces.
+# Pinned exactly: the export policy and the checkpoint guard are tested against these versions.
+langgraph==1.2.12
+langgraph-checkpoint==4.2.0
+langgraph-checkpoint-postgres==3.1.2
+langchain-core==1.6.5
+langsmith==0.14.1

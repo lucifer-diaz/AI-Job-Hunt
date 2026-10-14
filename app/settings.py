@@ -327,6 +327,24 @@ class Settings(BaseSettings):
     jobhunt_mcp_token: str | None = None
     # Required header value (X-Admin-Token) for POST /api/admin/scheduler/{job}/run. Unset disables the triggers.
     admin_token: str | None = None
+    # Agent graphs (app.agents, LangGraph): off by default. Off means the /api/agents endpoints answer 404, the
+    # agent_graphs scheduler job is skipped and no checkpointer is opened. PostgreSQL only (durable checkpoints).
+    agent_graphs_enabled: bool = False
+    agent_recovery_minutes: int = 5
+    agent_lease_seconds: int = 300
+    agent_max_attempts: int = 3
+    # A checkpoint bigger than this, or holding anything secret-shaped, is refused before it is written.
+    agent_checkpoint_max_bytes: int = 65536
+    # Checkpoints of finished threads are deleted after this; a thread waiting for a person expires after the other.
+    agent_checkpoint_retention_days: int = 14
+    agent_interrupt_expiry_days: int = 30
+    # Optional LangSmith export (app.agents.tracing_boundary): off by default, metadata only, never credentials.
+    # Own names (not LANGSMITH_*) so the SDK's environment auto-tracing never picks them up on its own.
+    agent_langsmith_export_enabled: bool = False
+    agent_langsmith_api_key: str | None = None
+    agent_langsmith_endpoint: str = "https://api.smith.langchain.com"
+    agent_langsmith_project: str = "job-hunt-os"
+    agent_langsmith_timeout_ms: int = 3000
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
@@ -334,6 +352,11 @@ class Settings(BaseSettings):
     def application_inbox_interval_minutes(self) -> int:
         """The scheduler interval of the inbox job: 0 (off) unless APPLICATION_INBOX_ENABLED."""
         return max(0, self.application_inbox_interval_hours) * 60 if self.application_inbox_enabled else 0
+
+    @property
+    def agent_recovery_interval_minutes(self) -> int:
+        """The scheduler interval of the agent graph recovery pass: 0 (off) unless AGENT_GRAPHS_ENABLED."""
+        return max(0, self.agent_recovery_minutes) if self.agent_graphs_enabled else 0
 
     @property
     def gmail_oauth_configured(self) -> bool:

@@ -8,6 +8,12 @@ from app.settings import get_settings
 
 config = context.config
 target_metadata = Base.metadata
+# LangGraph's PostgresSaver creates and migrates its own tables (app.agents.checkpoint); Alembic leaves them alone.
+LIBRARY_TABLES = ("checkpoints", "checkpoint_blobs", "checkpoint_writes", "checkpoint_migrations")
+
+
+def include_object(obj, name, type_, reflected, compare_to) -> bool:
+    return not (type_ == "table" and name in LIBRARY_TABLES)
 
 
 def _configure(connection) -> None:
@@ -17,6 +23,7 @@ def _configure(connection) -> None:
         # SQLite can only change constraints by rebuilding a table.
         render_as_batch=connection.dialect.name == "sqlite",
         compare_type=True,
+        include_object=include_object,
     )
     with context.begin_transaction():
         context.run_migrations()

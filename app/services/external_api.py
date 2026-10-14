@@ -20,6 +20,7 @@ Every failure in here is swallowed: telemetry must never turn a working API call
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 import time
 import uuid
@@ -541,6 +542,62 @@ def external_operation(provider: str, *, service: str = "", operation: str = "",
                status_code=_status_of(exc) or call.http_status_code, error=exc)
         raise
     record(call, started_at=started, completed_at=_finished(started, clock))
+
+
+class ExportBlocked(Exception):
+    """A request a `pre_send` policy refused: it was never sent."""
+
+
+def requests_session(provider: str, *, service: str = "", operation: str = "",
+                     pre_send: Callable[[bytes | None], str | None] | None = None) -> Any:
+    """A `requests.Session` for a vendor SDK that only accepts one (LangSmith), measured like `external_client`.
+
+    `Session.send` is the funnel for every request the SDK makes, whatever adapters it mounts, so nothing gets past:
+    `pre_send(body)` may refuse a request by returning a reason (the request is not sent; the SDK gets a 400 and
+    the refusal is recorded as a CLIENT_ERROR with `blocked_by`); a transport failure is recorded and answered with a 503 instead of raising,
+    so an outage of the provider never reaches the code that called the SDK. Bodies are never stored.
+    """
+    import requests
+
+    class InstrumentedSession(requests.Session):
+        def send(self, request: Any, **kwargs: Any) -> Any:
+            call = ExternalCall(provider=provider, service=service, operation=operation)
+            started, clock = utcnow(), time.monotonic()
+            body = request.body.encode() if isinstance(request.body, str) else request.body
+            size = len(body) if isinstance(body, bytes) else None
+            measured = {"method": request.method, "url": redact_url(request.url or ""), "request_bytes": size}
+            try:
+                reason = None
+                if pre_send is not None:
+                    # A streamed body (a file, a generator, a multipart encoder) cannot be checked: refuse it.
+                    readable = body is None or isinstance(body, (bytes, bytearray))
+                    reason = pre_send(bytes(body) if body is not None else None) if readable else "unreadable body"
+                if reason:
+                    call.note(blocked_by="pre_send_policy")
+                    record(call, started_at=started, completed_at=_finished(started, clock),
+                           error=ExportBlocked(reason), error_type="CLIENT_ERROR", **measured)
+                    return _synthetic(request, 400, "blocked by the Job Hunt OS export policy")
+                hold_off(call, method=request.method, url=measured["url"])
+                response = super().send(request, **kwargs)
+            except Exception as exc:  # noqa: BLE001  an outage must not reach the SDK's caller
+                record(call, started_at=started, completed_at=_finished(started, clock), error=exc, **measured)
+                return _synthetic(request, 503, "provider unavailable")
+            record(call, started_at=started, completed_at=_finished(started, clock), status_code=response.status_code,
+                   response_bytes=len(response.content or b""), headers=response.headers, **measured)
+            return response
+
+    return InstrumentedSession()
+
+
+def _synthetic(request: Any, status: int, message: str) -> Any:
+    import requests
+
+    response = requests.Response()
+    response.status_code, response.request, response.url = status, request, request.url
+    response.reason = message
+    response._content = json.dumps({"detail": message}).encode()
+    response.headers["content-type"] = "application/json"
+    return response
 
 
 def _status_of(exc: BaseException) -> int | None:

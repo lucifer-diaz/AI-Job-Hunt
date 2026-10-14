@@ -365,6 +365,53 @@ other static files.
 * **A paused worker holds its queue, never drops it.** Its claim skips the account's tasks unless `run_now_at` is set
   (ranking: unless the task is forced).
 
+## Agent graphs (LangGraph)
+
+`app/agents/` is a small LangGraph runtime (README: Agent graphs; `docs/architecture/agentic-roadmap.md` Phase 1).
+Only a no-side-effect pilot graph uses it so far, and everything is off unless `AGENT_GRAPHS_ENABLED`. The rules a
+change has to keep:
+
+* **A checkpoint is computation, never business state.** Job states, approvals, applications and candidate facts stay
+  in their own tables and change only through their services (`work_queue.transition`, `workflow`, `apply_queue`). A
+  graph node calls those services; it never writes a lifecycle column itself.
+* **Graph state is small and secret-free.** Keep it to ids, enums, counts and short codes; no document, resume, page,
+  email body, prompt or answer. `checkpoint.GuardedSerializer` refuses a credential-named field, anything
+  secret-shaped and anything over `AGENT_CHECKPOINT_MAX_BYTES` before it is written. Do not widen that check to make a
+  graph fit.
+* **Thread ids are built on the server** (`threads.thread_id_for`: `graph:u<user>:<subject>:v<n>`) and never taken
+  from a caller. A caller names a run by its `agent_threads.id`. **Ownership is checked before every checkpointer
+  access, on start and on every resume** (`threads.owned`: the account's session, plus the owner in the thread id).
+  Listing reads `agent_threads` only, never the checkpointer.
+* **Every side effect goes through `effects.once(db, run, key, summary)`.** LangGraph replays a node whose checkpoint
+  was not written, so a node never just "does" something. `once` checks the lease in the same transaction and records
+  the effect under a key that is unique per thread. A run that lost its lease (it was stopped, or taken over after its
+  lease expired) raises `LeaseLost` and writes nothing.
+* **The existing scheduler dispatches.** API starts and resumes claim the thread's lease (`runtime.claim`, a guarded
+  UPDATE on `lock_token`) and run as background tasks. The `agent_graphs` job continues runs whose lease expired from
+  their last checkpoint. No other queue. Before a graph does production work it registers its `WorkerKind` and
+  orchestration node like any queued worker. The pilot is exempt (ADR-020).
+* **LLM calls go only through `app.agents.llm.GatewayChatModel`**, which is `LLMClient.generate_prompt` behind
+  LangChain's interface. It is bound to one registered `app/prompts` prompt and refuses any other messages. It has no
+  `model` argument and records nothing itself, so routing, failover, escalation, validation and telemetry are exactly
+  the gateway's. Never put a provider chat model (ChatOpenAI, ChatAnthropic, …) in a graph.
+* **LangSmith goes only through `app/agents/tracing_boundary.py`** (`tests/test_external_api_guard.py` enforces it).
+  Its client sends through `external_api.requests_session` and applies `app/agents/export_policy.py`:
+  * allowlist hooks for inputs, outputs and metadata;
+  * error class names only;
+  * a final allowlist of run fields;
+  * a fail-closed wire check on the bytes sent.
+
+  Thread ids are exported as keyed pseudonyms. **No setting widens the export**, including `LLM_PROMPT_DEBUG`, the
+  capture switches and `EXTERNAL_API_DEBUG_PAYLOADS`. Passwords, OTPs, cookies, tokens, authorization headers,
+  browser profiles and session storage never leave the process. A graph's `EXPORT_FIELDS` names the state keys a trace
+  may show; only add plain ids, enums and counts. Each run happens inside `tracing_boundary.export(...)`, so
+  environment tracing variables (`LANGSMITH_TRACING`) cannot add an unpoliced tracer. An export failure never changes
+  a run.
+* **Retention:** the cleanup job deletes checkpoints of finished threads after `AGENT_CHECKPOINT_RETENTION_DAYS`,
+  expires threads waiting for a person after `AGENT_INTERRUPT_EXPIRY_DAYS`, and removes checkpoints whose account is
+  gone. LangGraph owns its checkpoint tables (`PostgresSaver.setup()`); Alembic ignores them (`app/migrations/env.py`).
+  Never hold a database transaction open while opening a saver: its setup builds indexes concurrently.
+
 ## Traces
 
 `app/services/tracing.py` holds an ambient correlation ID. Scheduler jobs and HTTP requests open one; nested
