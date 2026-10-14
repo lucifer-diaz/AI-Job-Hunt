@@ -3,7 +3,7 @@ import uuid
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app import auth
 from app.auth import CurrentUser
@@ -311,6 +311,80 @@ def test_a_failed_or_stopped_parse_of_this_wording_never_holds_ranking_back(user
         db.commit()
         assert len(db.scalars(select(JobDescriptionParseTask)
                               .where(JobDescriptionParseTask.job_id == job_id)).all()) == 1, "never queued again"
+
+
+def test_a_parse_stopped_by_a_person_is_never_queued_again_even_for_newer_wording(user):
+    job_id = add_job(user)
+    with session(user) as db:
+        job = db.get(Job, job_id)
+        jd.queue_parse(db, job)
+        db.commit()
+        db.execute(JobDescriptionParseTask.__table__.update().where(JobDescriptionParseTask.job_id == job_id)
+                   .values(status="FAILED", last_error=STOPPED_BY_USER, description_hash="an older wording"))
+        db.commit()
+        assert jd.hold_for_parse(db, job) is None
+        db.commit()
+        assert db.scalar(select(func.count()).select_from(JobDescriptionParseTask)
+                         .where(JobDescriptionParseTask.job_id == job_id)) == 1
+
+
+def test_a_failure_counts_for_the_wording_the_attempt_read_not_the_one_queued(user, monkeypatch):
+    """The text changed while its parse was queued: the task parsed the new text, so its failure covers it."""
+    from app.services.llm import LLMClient, LLMTimeoutError
+
+    job_id = add_job(user)
+    with session(user) as db:
+        job = db.get(Job, job_id)
+        jd.queue_parse(db, job)
+        db.commit()
+        job.description = JD_HTML + "<p>Rust is required.</p>"  # the active task is reused for the new text
+        assert jd.queue_parse(db, job, reason="description_changed") is not None
+        db.commit()
+    monkeypatch.setattr(LLMClient, "generate_prompt_json",
+                        lambda self, prompt, call=None: (_ for _ in ()).throw(LLMTimeoutError("down")))
+    for _ in range(get_settings().jd_parse_max_attempts):
+        jd.process(SessionLocal, claim_for(job_id))
+    with session(user) as db:
+        job = db.get(Job, job_id)
+        task, = db.scalars(select(JobDescriptionParseTask).where(JobDescriptionParseTask.job_id == job_id)).all()
+        assert task.status == "FAILED" and task.description_hash == jd.description_hash(job.description)
+        assert jd.hold_for_parse(db, job) is None, "its attempts are used up: no fresh round behind its back"
+
+
+def test_ranking_leaves_a_stub_being_recovered_to_recovery(user):
+    """Discovery chose recovery over parsing an unusable stub: ranking waits without queueing a parse of it."""
+    from app.models import JobDescriptionFetchTask
+
+    job_id = add_job(user)
+    with session(user) as db:
+        job = db.get(Job, job_id)
+        db.add(JobDescriptionFetchTask(user_id=user, job_id=job_id, status="PENDING", reason="auto",
+                                       attempt_count=0, created_at=jd.utcnow()))
+        assert jd.hold_for_parse(db, job) == jd.PARSE_AFTER_RECOVERY
+        db.commit()
+        assert jd.hold_for_parse(db, job) == jd.PARSE_AFTER_RECOVERY
+        db.commit()
+        assert db.scalar(select(JobDescriptionParseTask).where(JobDescriptionParseTask.job_id == job_id)) is None
+
+
+def test_queueing_a_parse_for_ranking_wakes_the_parser_once_it_is_committed(user):
+    from app import scheduler_hooks
+
+    job_ids = [add_job(user), add_job(user)]
+    woken = []
+    scheduler_hooks.register("jd_parsing", lambda: woken.append("jd_parsing"))
+    try:
+        with session(user) as db:
+            for job_id in job_ids:
+                jd.hold_for_parse(db, db.get(Job, job_id))
+            assert woken == [], "not before the task is committed"
+            db.commit()
+            assert woken == ["jd_parsing"], "once per transaction"
+            jd.hold_for_parse(db, db.get(Job, job_ids[0]))  # already queued: nothing new, no nudge
+            db.commit()
+            assert woken == ["jd_parsing"]
+    finally:
+        scheduler_hooks.unregister("jd_parsing")
 
 
 def test_existing_jobs_are_picked_up_in_batches(user):

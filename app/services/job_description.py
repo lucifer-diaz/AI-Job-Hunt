@@ -28,7 +28,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import desc, func, or_, select, update
+from sqlalchemy import desc, event, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -874,6 +874,12 @@ def process(sessions: Any, claim: ParseClaim) -> str:
             db.commit()
             return outcome
         job_id, parsed_hash = job.id, description_hash(job.description or "")
+        # The wording this attempt reads, not the one the task was queued for: a failure (or a kill) is then judged
+        # against the text it really was about, and ranking never queues the same wording again (hold_for_parse).
+        if task.description_hash != parsed_hash:
+            task.description_hash = parsed_hash
+            db.commit()
+            job = db.get(Job, job_id)
         try:
             with backoff.bypass(claim.run_now):
                 parsed = parse_job_description(db, job, user_id=task.user_id)
@@ -956,6 +962,7 @@ def parse_now(db: Session, job: Job) -> ParsedJobDescription:
 
 PARSE_RUNNING = "The job description is still being parsed"
 PARSE_NOT_QUEUED = "The job description is waiting to be parsed"
+PARSE_AFTER_RECOVERY = "The job description is being recovered before it is parsed"
 
 
 def _parse_wait(db: Session, job: Job) -> str | None:
@@ -970,11 +977,40 @@ def _parse_wait(db: Session, job: Job) -> str | None:
         # Queued or running, including its final attempt. Every task ends COMPLETED or FAILED (lease recovery fails a
         # task that used its last attempt), so this wait always ends.
         return PARSE_RUNNING
+    if task is not None and task.status == FAILED and task.last_error == STOPPED_BY_USER:
+        return None  # a person stopped it: never queued again behind their back (Retry, Run now or re-parse do)
     if task is not None and task.status == FAILED and task.description_hash == description_hash(job.description or ""):
-        # Its attempts ran out, or a person stopped it, for this very wording: ranking falls back to the raw text and
-        # a stopped parse is never queued again behind the person's back.
+        # Its attempts ran out for this very wording (the hash `process` read): ranking falls back to the raw text.
         return None
+    if _recovering(db, job):
+        # Discovery chose recovery over parsing an unusable stub; recovery queues the parse once the real text arrives.
+        return PARSE_AFTER_RECOVERY
     return PARSE_NOT_QUEUED  # never queued, or only for an older wording of the posting
+
+
+def _recovering(db: Session, job: Job) -> bool:
+    if any(isinstance(task, JobDescriptionFetchTask) and task.job_id == job.id
+           and task.status in ACTIVE_JD_FETCH_STATUSES for task in db.new):
+        return True
+    return db.scalar(select(JobDescriptionFetchTask.id).where(
+        JobDescriptionFetchTask.job_id == job.id, JobDescriptionFetchTask.status.in_(ACTIVE_JD_FETCH_STATUSES))
+        .limit(1)) is not None
+
+
+def _wake_parser_after_commit(db: Session) -> None:
+    """Start the parse worker once the task it should claim is committed (a nudge before then could find nothing).
+    Only a hint: a rolled-back transaction leaves at most one spare nudge on the session's next commit."""
+    if db.info.get("jd_parsing_nudge"):
+        return
+    db.info["jd_parsing_nudge"] = True
+
+    def wake(session: Session) -> None:
+        session.info.pop("jd_parsing_nudge", None)
+        from app import scheduler_hooks
+
+        scheduler_hooks.nudge("jd_parsing")
+
+    event.listen(db, "after_commit", wake, once=True)
 
 
 def waiting_reason(db: Session, job: Job) -> str | None:
@@ -994,6 +1030,7 @@ def hold_for_parse(db: Session, job: Job, *, now: datetime | None = None) -> str
     found the job — discovery, a board import, a person, the backlog — ranking starts only after the parse."""
     reason = _parse_wait(db, job)
     if reason == PARSE_NOT_QUEUED and queue_parse(db, job, reason="ranking", now=now) is not None:
+        _wake_parser_after_commit(db)  # a ranking someone asked for now must not wait for the parser's next tick
         return PARSE_RUNNING
     return reason
 

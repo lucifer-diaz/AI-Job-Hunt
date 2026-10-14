@@ -744,12 +744,19 @@ def kill(db: Session, user_id: int, kind: str, task_ids: list[int] | None = None
     if task_ids is not None and not tasks:
         raise WorkerError("That task has already finished", 409)
     running = stopped = 0
+    stopped_jobs = []
     for task in tasks:
         if task.status != spec.running and _display_status(spec, task, now) != "RETRYING":
             continue  # a task still waiting its first turn is not stopped by Kill (Remove takes it out)
         running += _stop(db, spec, task, user_id, now)
         stopped += 1
+        stopped_jobs.append(task.job_id)
     db.commit()
+    if spec.kind == "parsing":
+        from app.services import job_description
+
+        for job_id in stopped_jobs:  # a stopped parse no longer holds ranking back: it reads the raw text, now
+            job_description.hand_to_ranking(db, job_id)
     cleared = backoff.reset(db, user_id) if task_ids is None else []
     return {"kind": spec.kind, "stopped": stopped, "running": running, "cooldowns_cleared": cleared}
 

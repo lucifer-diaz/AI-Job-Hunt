@@ -139,6 +139,24 @@ def test_killing_a_running_parse_stops_it_for_good_and_the_old_run_cannot_write(
     assert client.post("/api/workers/parsing/retry", json={"task_ids": [task_id]}).json()["retried"]
 
 
+def test_killing_a_parse_lets_the_ranking_waiting_for_it_run_now(user_id, signed_in, monkeypatch):
+    monkeypatch.setattr(get_settings(), "jd_parse_enabled", True)
+    with SessionLocal() as db:
+        job = add_job(db, user_id)
+        # Running, as a claim leaves it (claiming a batch could pick other accounts' leftover tasks first).
+        task = parse_task(db, user_id, job, attempt_count=1, status="PROCESSING", locked_by="w1",
+                          lock_token=uuid.uuid4().hex,
+                          lock_expires_at=utcnow() + timedelta(minutes=5))
+        db.commit()
+        task_id, job_id = task.id, job.id
+    released = []
+    monkeypatch.setattr(ranker, "release_parked", lambda db, job_id: released.append(job_id) or 1)
+    assert signed_in(user_id).post(f"/api/workers/parsing/tasks/{task_id}/kill").json()["stopped"] == 1
+    assert released == [job_id]
+    with SessionLocal() as db:  # and ranking reads the raw text instead of queueing the stopped parse again
+        assert job_description.hold_for_parse(db, db.get(Job, job_id)) is None
+
+
 def test_killing_a_running_ranking_takes_the_job_out_of_the_queue(user_id, signed_in):
     with SessionLocal() as db:
         job = add_job(db, user_id, state="RANKING", previous_state="RANK_PENDING")
