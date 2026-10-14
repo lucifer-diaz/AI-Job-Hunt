@@ -12,6 +12,7 @@ from app.main import app
 from app.models import Job, JobDescriptionParseTask, JobRequirementEvidence
 from app.services import job_context as jc
 from app.services import job_description as jd
+from app.services.lifecycle import STOPPED_BY_USER
 from app.settings import get_settings
 from tests.conftest import make_user
 
@@ -265,13 +266,51 @@ def test_ranking_waits_only_while_a_parse_is_still_possible(user):
     job_id = add_job(user)
     with session(user) as db:
         job = db.get(Job, job_id)
-        assert jd.waiting_reason(db, job) is None, "nothing queued yet: ranking goes ahead"
-        jd.queue_parse(db, job)
+        # Nothing queued yet: ranking never reads an unparsed posting, so it waits and queues the parse itself.
+        assert jd.waiting_reason(db, job) == "The job description is waiting to be parsed"
+        assert jd.hold_for_parse(db, job) == "The job description is still being parsed"
+        assert jd.hold_for_parse(db, job) == "The job description is still being parsed"
         db.commit()
+        tasks = db.scalars(select(JobDescriptionParseTask).where(JobDescriptionParseTask.job_id == job_id)).all()
+        assert [(t.status, t.reason) for t in tasks] == [("PENDING", "ranking")], "queued once"
         assert jd.waiting_reason(db, job) == "The job description is still being parsed"
         jd.parse_now(db, job)
         db.commit()
         assert jd.waiting_reason(db, job) is None
+        assert jd.hold_for_parse(db, job) is None
+
+
+def test_ranking_waits_for_a_parse_of_the_current_wording(user):
+    """A parse that finished for an older wording does not count: the new text is parsed before ranking."""
+    job_id = add_job(user)
+    with session(user) as db:
+        job = db.get(Job, job_id)
+        jd.queue_parse(db, job)
+        db.commit()
+        db.execute(JobDescriptionParseTask.__table__.update().where(JobDescriptionParseTask.job_id == job_id)
+                   .values(status="COMPLETED"))
+        job.description = JD_HTML + "<p>Rust is required.</p>"
+        db.commit()
+        assert jd.hold_for_parse(db, job) == "The job description is still being parsed"
+        db.commit()
+        assert db.scalar(select(JobDescriptionParseTask).where(JobDescriptionParseTask.job_id == job_id,
+                                                               JobDescriptionParseTask.status == "PENDING"))
+
+
+@pytest.mark.parametrize("error", ["TimeoutError: down", STOPPED_BY_USER])
+def test_a_failed_or_stopped_parse_of_this_wording_never_holds_ranking_back(user, error):
+    job_id = add_job(user)
+    with session(user) as db:
+        job = db.get(Job, job_id)
+        jd.queue_parse(db, job)
+        db.commit()
+        db.execute(JobDescriptionParseTask.__table__.update().where(JobDescriptionParseTask.job_id == job_id)
+                   .values(status="FAILED", last_error=error))
+        db.commit()
+        assert jd.hold_for_parse(db, job) is None
+        db.commit()
+        assert len(db.scalars(select(JobDescriptionParseTask)
+                              .where(JobDescriptionParseTask.job_id == job_id)).all()) == 1, "never queued again"
 
 
 def test_existing_jobs_are_picked_up_in_batches(user):
@@ -558,6 +597,24 @@ def test_ranking_keeps_waiting_through_the_final_attempt(user):
     with session(user) as db:
         task = db.scalar(select(JobDescriptionParseTask).where(JobDescriptionParseTask.job_id == job_id))
         assert task.status == "FAILED" and jd.waiting_reason(db, db.get(Job, job_id)) is None
+
+
+def test_a_parse_given_up_on_by_lease_recovery_hands_the_job_to_ranking(user, monkeypatch):
+    from app.services import ranker
+
+    job_id = add_job(user)
+    with session(user) as db:
+        jd.queue_parse(db, db.get(Job, job_id))
+        db.commit()
+        db.execute(JobDescriptionParseTask.__table__.update().where(JobDescriptionParseTask.job_id == job_id)
+                   .values(status="PROCESSING", attempt_count=get_settings().jd_parse_max_attempts,
+                           lock_expires_at=jd.utcnow().replace(year=2000)))
+        db.commit()
+    released = []
+    monkeypatch.setattr(ranker, "release_parked", lambda db, job_id: released.append(job_id) or 1)
+    with SessionLocal() as db:
+        jd.recover_expired(db)
+    assert job_id in released
 
 
 def test_a_worker_that_lost_its_lease_cannot_write(user):

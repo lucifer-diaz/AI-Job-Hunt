@@ -16,7 +16,7 @@ from app.models import Job, TailorTask
 from app.services import auto_tailor, ranker, tailor_tasks
 from app.services import scheduled_jobs as sj
 from app.services.user_settings import auto_tailor_for, settings_for
-from tests.test_ranker import FakeModel, add_jobs, add_owner, ctx, rank, utcnow
+from tests.test_ranker import FakeModel, add_jobs, add_owner, ctx, no_parsing, rank, utcnow  # noqa: F401  no_parsing is autouse
 
 
 def turn_on(sessions, user_id, *, min_fit_score=None, since=None, execution_mode="backend"):

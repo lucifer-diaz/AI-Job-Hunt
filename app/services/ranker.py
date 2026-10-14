@@ -346,6 +346,9 @@ def enqueue(db: Session, job: Job, *, reason: str = "new", force: bool = False,
         if force and not active.force:
             active.force, active.reason = True, reason
         return active
+    # Ranking reads a parsed description: a posting nobody has queued a parse for gets one now, in this transaction,
+    # so claim() leaves the ranking task alone until the parse ends (_description_pending), whichever path queued it.
+    job_description.hold_for_parse(db, job, now=now)
     task = JobRankingTask(user_id=job.user_id, job_id=job.id, status=PENDING, reason=reason, force=force,
                           attempt_count=0, created_at=now or utcnow(),
                           candidate_profile_id=db.scalar(select(CandidateProfile.id)
@@ -982,7 +985,8 @@ def _process(db: Session, claimed: TaskClaim, clock: Callable[[], datetime]) -> 
         jd_recovery,  # local import: jd_recovery queues ranking through this module
     )
 
-    waiting = jd_recovery.waiting_reason(db, job) or job_description.waiting_reason(db, job)
+    # A task queued before its parse was (or one whose posting changed since) queues that parse and waits for it.
+    waiting = jd_recovery.waiting_reason(db, job) or job_description.hold_for_parse(db, job)
     if waiting:  # the posting is being recovered or parsed; the task waits without using an attempt
         return _wait(db, claimed, waiting, clock())
     snapshot = resume_snapshot(db, profile)
