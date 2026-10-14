@@ -215,6 +215,20 @@ def test_a_refused_body_is_never_sent_and_is_recorded(wire, monkeypatch):
     assert S["anthropic"] not in (rows[0].error_message or "")
 
 
+def test_a_body_the_check_cannot_read_is_never_sent(wire):
+    """A streamed body (LangSmith streams multipart batches over its inline limit) fails closed."""
+    from app.services.external_api import requests_session
+
+    before = last_log_id()
+    session = requests_session("LANGSMITH", service="runs", operation="trace_export",
+                               pre_send=export_policy.wire_check)
+    response = session.post("https://api.smith.langchain.com/runs/multipart",
+                            data=iter([json.dumps({"note": S["anthropic"]}).encode()]))
+    assert response.status_code == 400 and wire.bodies == []
+    rows = export_rows(before)
+    assert len(rows) == 1 and rows[0].request_metadata == {"blocked_by": "pre_send_policy"}
+
+
 # ───────────── unavailable ─────────────
 
 @pytest.mark.parametrize("mode", ["down", "timeout", "503"])

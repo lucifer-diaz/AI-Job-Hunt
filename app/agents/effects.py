@@ -22,6 +22,8 @@ from sqlalchemy.orm import Session
 from app.agents import safety
 from app.models import AgentEffect, AgentThread
 
+KEY_LIMIT = 120  # agent_effects.effect_key
+
 
 class LeaseLost(RuntimeError):
     """This run no longer holds the thread: it must stop without writing."""
@@ -48,6 +50,8 @@ def _locked(db: Session, run: RunHandle) -> AgentThread:
 
 def once(db: Session, run: RunHandle, key: str, summary: dict[str, Any] | None = None) -> tuple[AgentEffect, bool]:
     """Record the effect `key` for this thread once. Returns (record, created). Commits."""
+    if not key or len(key) > KEY_LIMIT:
+        raise ValueError(f"an effect key is 1 to {KEY_LIMIT} characters")  # never truncated: two keys must not merge
     if safety.problem(summary):
         raise ValueError("an effect summary must not carry credentials")
     _locked(db, run)
@@ -56,7 +60,7 @@ def once(db: Session, run: RunHandle, key: str, summary: dict[str, Any] | None =
     if existing is not None:
         db.commit()
         return existing, False
-    record = AgentEffect(user_id=run.user_id, agent_thread_id=run.thread_pk, effect_key=key[:120], summary=summary)
+    record = AgentEffect(user_id=run.user_id, agent_thread_id=run.thread_pk, effect_key=key, summary=summary)
     db.add(record)
     try:
         db.commit()

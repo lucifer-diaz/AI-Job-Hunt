@@ -266,6 +266,26 @@ def test_effects_need_the_lease(two_accounts):
         effects.once(db, runtime.RunHandle(pk, a, "someone-else"), "test.other")
     with SessionLocal() as db, pytest.raises(ValueError):
         effects.once(db, run, "test.secret", {"password": support.SECRETS["password"]})
+    with SessionLocal() as db, pytest.raises(ValueError):  # never truncated into another key
+        effects.once(db, run, "test." + "x" * effects.KEY_LIMIT)
+
+
+def test_stop_never_relabels_a_run_that_finished_meanwhile(two_accounts, monkeypatch):
+    a, _ = two_accounts
+    pk = support.start(SessionLocal, a)
+    support.claim(SessionLocal, a, pk)
+    read = threads.owned
+
+    def finishes_right_after_it_is_read(db, thread_pk):
+        thread = read(db, thread_pk)  # stop() sees the run as RUNNING ...
+        with SessionLocal() as other:  # ... and its worker completes it before stop() writes
+            other.get(AgentThread, thread_pk).status = "COMPLETED"
+            other.commit()
+        return thread
+    monkeypatch.setattr(threads, "owned", finishes_right_after_it_is_read)
+    with support.as_user(SessionLocal, a) as db, pytest.raises(runtime.ThreadBusy):
+        runtime.stop(db, pk)
+    assert support.thread(SessionLocal, pk).status == "COMPLETED"
 
 
 # ───────────── checkpoint guard ─────────────

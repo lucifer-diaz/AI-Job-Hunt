@@ -567,7 +567,11 @@ def requests_session(provider: str, *, service: str = "", operation: str = "",
             size = len(body) if isinstance(body, bytes) else None
             measured = {"method": request.method, "url": redact_url(request.url or ""), "request_bytes": size}
             try:
-                reason = pre_send(body if isinstance(body, bytes) or body is None else None) if pre_send else None
+                reason = None
+                if pre_send is not None:
+                    # A streamed body (a file, a generator, a multipart encoder) cannot be checked: refuse it.
+                    readable = body is None or isinstance(body, (bytes, bytearray))
+                    reason = pre_send(bytes(body) if body is not None else None) if readable else "unreadable body"
                 if reason:
                     call.note(blocked_by="pre_send_policy")
                     record(call, started_at=started, completed_at=_finished(started, clock),

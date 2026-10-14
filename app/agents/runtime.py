@@ -260,12 +260,20 @@ def _clear_interrupt(db: Session, run: RunHandle) -> None:
 
 def stop(db: Session, thread_pk: int) -> AgentThread:
     """Stop one of the account's threads. A run in progress loses its lease and writes nothing more."""
+    active = ("QUEUED", "RUNNING", "INTERRUPTED")
     thread = threads.owned(db, thread_pk)
-    if thread.status not in ("QUEUED", "RUNNING", "INTERRUPTED"):
+    if thread.status not in active:
         raise ThreadBusy(f"this run is already {thread.status.lower()}")
-    thread.status, thread.last_error, thread.completed_at = "STOPPED", STOPPED_BY_USER, utcnow()
-    thread.lock_token, thread.lock_expires_at, thread.interrupt = None, None, None
+    # Guarded on the status, so a run that finished meanwhile is never relabelled as stopped.
+    now = utcnow()
+    won = db.execute(update(AgentThread).where(AgentThread.id == thread.id, AgentThread.status.in_(active))
+                     .values(status="STOPPED", last_error=STOPPED_BY_USER, completed_at=now, updated_at=now,
+                             lock_token=None, lock_expires_at=None, interrupt=None)
+                     .execution_options(synchronize_session=False)).rowcount
     db.commit()
+    db.refresh(thread)
+    if not won:
+        raise ThreadBusy(f"this run is already {thread.status.lower()}")
     return thread
 
 
