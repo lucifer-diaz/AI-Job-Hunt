@@ -9,7 +9,8 @@ from app.settings import get_settings
 config = context.config
 target_metadata = Base.metadata
 # LangGraph's PostgresSaver creates and migrates its own tables (app.agents.checkpoint); Alembic leaves them alone.
-LIBRARY_TABLES = ("checkpoints", "checkpoint_blobs", "checkpoint_writes", "checkpoint_migrations")
+# The RAG vector table is created by app.services.vector_store.setup() when pgvector is available (derived data).
+LIBRARY_TABLES = ("checkpoints", "checkpoint_blobs", "checkpoint_writes", "checkpoint_migrations", "rag_vectors")
 
 
 def include_object(obj, name, type_, reflected, compare_to) -> bool:

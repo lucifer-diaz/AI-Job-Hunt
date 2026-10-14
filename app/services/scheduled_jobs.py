@@ -599,6 +599,13 @@ def cleanup(ctx: JobContext) -> dict[str, Any]:
             retention["agent_checkpoints"] = agent_runtime.prune(ctx.sessions, ctx.now)
         except Exception as exc:  # noqa: BLE001  checkpoint retention must not stop the rest of cleanup
             retention["agent_checkpoints"] = {"error": f"{type(exc).__name__}"}
+    from app.services import rag_index
+
+    try:
+        with ctx.sessions() as db:
+            retention["retired_rag_indexes"] = rag_index.purge_retired(db, ctx.now)
+    except Exception as exc:  # noqa: BLE001  index retention must not stop the rest of cleanup
+        retention["retired_rag_indexes"] = {"error": f"{type(exc).__name__}"}
     with ctx.sessions() as db:
         if not _is_postgres(db):
             return skipped("Lease recovery needs PostgreSQL", **retention)
@@ -627,6 +634,36 @@ async def agent_graphs(ctx: JobContext) -> dict[str, Any]:
     for run in runs:
         outcomes[await threads.run_work(agent_runtime.execute, ctx.sessions, run)] += 1
     return {"recovered": len(runs), **outcomes}
+
+
+async def rag_index_job(ctx: JobContext) -> dict[str, Any]:
+    """Embed each account's verified evidence and saved answers into its retrieval index (app.services.rag_index).
+
+    Off unless RAG_VECTOR_ENABLED. An account without a usable embedding model (none assigned to the Embedder, or not
+    in LiteLLM gateway mode) is skipped with the reason; a provider failure stops that account's pass and its entries
+    are retried later. A new model is built beside the serving index and replaces it only when complete."""
+    if not get_settings().rag_vector_enabled:
+        return skipped("Vector retrieval is off (RAG_VECTOR_ENABLED)")
+    from app.services import rag_index
+
+    accounts = _account_ids(ctx)
+    summary: dict[str, Any] = {"accounts": len(accounts), "embedded": 0, "failed": 0, "skipped": {}, "errors": []}
+    for user_id in accounts:
+        try:
+            result = await threads.run_work(rag_index.run_account, ctx.sessions, user_id, at=ctx.now)
+        except Exception as exc:  # noqa: BLE001  one account's failure must not stop the others
+            summary["errors"].append(_error(user_id, exc))
+            continue
+        if result.get("skipped"):
+            summary["skipped"][result["skipped"]] = summary["skipped"].get(result["skipped"], 0) + 1
+            continue
+        summary["embedded"] += result.get("embedded", 0)
+        summary["failed"] += result.get("failed", 0)
+        if result.get("error"):
+            summary["errors"].append({"user_id": user_id, "error": result["error"]})
+    if not summary["embedded"] and not summary["failed"] and not summary["errors"] and summary["skipped"]:
+        return skipped("No account has an embedding index to build", **summary)
+    return summary
 
 
 def litellm_telemetry(ctx: JobContext) -> dict[str, Any]:
@@ -717,6 +754,9 @@ JOBS: list[JobSpec] = [
     JobSpec("agent_graphs", "Agent graph recovery", "agent_recovery_interval_minutes", agent_graphs,
             "Continues agent graph runs (LangGraph pilot) left by a crashed worker from their last checkpoint; "
             "off unless AGENT_GRAPHS_ENABLED."),
+    JobSpec("rag_index", "Retrieval index", "rag_index_interval_minutes", rag_index_job,
+            "Embeds verified evidence and saved answers for retrieval, builds a new index beside the old one when the "
+            "embedding model changes, and retires the old one once it is complete; off unless RAG_VECTOR_ENABLED."),
     JobSpec("cleanup", "Cleanup", "cleanup_interval_minutes", cleanup,
             "Recovers jobs left locked by crashed workers and applies LLM telemetry retention."),
 ]

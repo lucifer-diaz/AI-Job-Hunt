@@ -347,6 +347,19 @@ def _payload_extract(raw: bytes | None) -> str | None:
     return redact_text(raw[:limit].decode("utf-8", "replace"), limit)
 
 
+def _report_response(request: httpx.Request, response: httpx.Response, call: ExternalCall) -> None:
+    """Let the caller add provider-reported facts (cost header, model that answered) to the call before it is stored:
+    `extensions={"on_response": fn}`, where fn(response, call) may call `call.note` / `call.record_usage`. Telemetry
+    only: an error in it is logged and never changes the response."""
+    hook = (request.extensions or {}).get("on_response")
+    if not callable(hook):
+        return
+    try:
+        hook(response, call)
+    except Exception:  # telemetry must not change an outcome
+        log.warning("on_response telemetry hook failed for %s/%s", call.provider, call.operation, exc_info=True)
+
+
 class InstrumentedClient(httpx.Client):
     """An httpx.Client that records every request it makes.
 
@@ -395,6 +408,7 @@ class InstrumentedClient(httpx.Client):
                       response_payload=_payload_extract(response.content),
                       request_headers=_debug_headers(request.headers))
             capture_payload(call, request, response)
+        _report_response(request, response, call)
         self.last_request_id = record(
             call, started_at=started, completed_at=_finished(started, clock), method=request.method,
             url=str(request.url), status_code=response.status_code, request_bytes=request_bytes,

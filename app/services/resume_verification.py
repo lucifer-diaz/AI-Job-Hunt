@@ -30,6 +30,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import CandidateProfile, Evidence, Resume, ResumeDataChange, ResumeDocument
+from app.services import evidence_tags
 from app.services import structured_resume as sr
 from app.services.structured_resume import (
     REVIEWED,
@@ -314,6 +315,7 @@ def delete_version(db: Session, resume: Resume) -> dict[str, int]:
             setups += 1
     for change in db.scalars(select(ResumeDataChange).where(ResumeDataChange.resume_id == resume.id)).all():
         db.delete(change)  # PostgreSQL cascades these; SQLite does not
+    evidence_tags.forget_resume(db, resume.id)  # its evidence tags (cascaded on PostgreSQL)
     profile_id = resume.candidate_profile_id
     db.delete(resume)
     db.flush()
@@ -330,6 +332,7 @@ def delete_version(db: Session, resume: Resume) -> dict[str, int]:
         if source is not None:
             row.resume_id, row.structured_item_id = source[0].id, source[1]
             row.context = f"Verified from resume v{source[0].version}"
+            evidence_tags.sync_auto_links(db, source[0], {row.id} | _auto_linked(db, source[0]))
         elif row.verified:
             row.verified, row.context = False, "Its resume version was deleted"
             retired += 1
@@ -588,6 +591,7 @@ def sync_evidence(db: Session, resume: Resume) -> dict[str, int]:
                                              Evidence.resume_id == resume.id)).all()
     by_item = {row.structured_item_id: row for row in rows}
     created = updated = retired = 0
+    linked: list[Evidence] = []
     for item_id, fact in wanted.items():
         key = fact_key(fact["company"], fact["claim"])
         row = by_item.get(item_id) or db.scalar(select(Evidence).where(
@@ -604,12 +608,24 @@ def sync_evidence(db: Session, resume: Resume) -> dict[str, int]:
         row.verified, row.resume_id, row.structured_item_id = True, resume.id, item_id
         row.source_file_hash, row.fact_key = resume.source_file_hash, key
         row.context = f"Verified from resume v{resume.version}"
+        linked.append(row)
     for row in rows:
         if row.structured_item_id not in wanted and row.verified:
             row.verified = False
             retired += 1
     db.flush()
+    # The evidence this version verifies is tagged to it (AUTO); a person's own tags and removals stay as they are.
+    evidence_tags.sync_auto_links(db, resume, {row.id for row in linked})
+    db.flush()
     return {"created": created, "updated": updated, "retired": retired}
+
+
+def _auto_linked(db: Session, resume: Resume) -> set[int]:
+    from app.models import EvidenceResumeLink
+
+    return set(db.scalars(select(EvidenceResumeLink.evidence_id).where(
+        EvidenceResumeLink.resume_id == resume.id, EvidenceResumeLink.origin == "AUTO",
+        EvidenceResumeLink.excluded.is_(False))).all())
 
 
 # ───────────── re-parse: a comparison, never an overwrite ─────────────

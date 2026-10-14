@@ -35,6 +35,11 @@ class Worker:
     default_tier: str  # the tier used in TIER mode, and by AUTO_ROUTER workers while the auto router is off
     legacy_stage: str | None = None  # the pre-existing stage model (Settings / RANK_MODEL …) this worker inherits
     description: str = ""
+    # CHAT workers send prompts through LLMClient; EMBEDDING workers turn text into vectors (app.services.embeddings)
+    # and may only be given an EMBEDDING model, which in turn no CHAT worker may use.
+    capability: str = "CHAT"
+    # An optional worker is seeded switched off: with no model it is simply not used (it never blocks an Apply).
+    optional: bool = False
 
 
 WORKERS: dict[str, Worker] = {w.worker_type: w for w in (
@@ -76,7 +81,12 @@ WORKERS: dict[str, Worker] = {w.worker_type: w for w in (
            description="Normalises scraped job fields"),
     Worker("EVIDENCE_EXTRACTION", "Evidence Extraction", ("evidence_extraction",), True, 8192, "TIER",
            PRIMARY_REASONING, "tailor", description="Extracts verifiable claims from the master resume"),
+    # Candidate knowledge retrieval (app.services.embeddings / rag_index): embeds verified evidence and saved answers
+    # so retrieval can find them by meaning. Sends no prompt; off until a person assigns an EMBEDDING model.
+    Worker("EMBEDDER", "Embedder", (), False, 0, "FIXED", PRIMARY_REASONING, capability="EMBEDDING", optional=True,
+           description="Turns verified evidence and saved answers into vectors for retrieval (never generates text)"),
 )}
+EMBEDDING_WORKERS = tuple(w.worker_type for w in WORKERS.values() if w.capability == "EMBEDDING")
 WORKER_BY_PROMPT = {prompt: w.worker_type for w in WORKERS.values() for prompt in w.prompts}
 # The Monitoring stage (llm_request_logs.stage) each worker's requests have always been recorded under.
 MONITORING_STAGE = {"RESUME_PARSER": "RESUME_PARSER", "EVIDENCE_EXTRACTION": "RESUME_PARSER", "RANKER": "RANKER",

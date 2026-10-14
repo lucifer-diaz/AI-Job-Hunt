@@ -922,7 +922,8 @@ FastAPI interactive docs are available at `/docs`.
 
 ## 5. Cheap production architecture
 
-For one user, do **not** start with Redis, Celery, Kafka, a vector database, or a dedicated browser worker.
+For one user, do **not** start with Redis, Celery, Kafka, a separate vector database, or a dedicated browser worker.
+(Candidate retrieval keeps its optional vectors inside PostgreSQL with pgvector; see section 9d.)
 
 - Web/API: one small Render or Railway service
 - DB: Neon Free or Railway Postgres
@@ -1842,6 +1843,90 @@ External APIs (provider `LANGSMITH`) and changes nothing else. These are our own
 **Rollback.** Set `AGENT_GRAPHS_ENABLED=false` (and `AGENT_LANGSMITH_EXPORT_ENABLED=false`). Migration 0044 is
 additive and can be downgraded. LangGraph's checkpoint tables can be dropped by hand: `checkpoints`,
 `checkpoint_blobs`, `checkpoint_writes` and `checkpoint_migrations`.
+
+## 9d. Candidate knowledge retrieval (RAG, off by default)
+
+Phase 2 of the [agentic roadmap](docs/architecture/agentic-roadmap.md). It retrieves a job's evidence, which today's
+context builders select by keyword overlap across **every** verified fact of the account. Retrieval reads only the
+facts of the resume the job uses, ranks them, and hands the prompt a bounded pack cited by real Evidence ids. With it
+off (the default) nothing changes.
+
+**Which facts a job may use (decided before any scoring).** The job's resume comes from `resume_verification.for_job`:
+the job's own pin (USER, SETUP, AUTO), else the active resume. Then:
+
+| Evidence | Used for a job on resume R when |
+| --- | --- |
+| Tagged to R (Evidence bank → Resumes) | always, unless a person removed the tag |
+| Verified on a resume (`source = resume`) | R itself verifies the same fact; never because another resume did |
+| Tagged to other resumes only | never |
+| Manual or extracted, with no tag | always: untagged evidence applies to every resume |
+
+Verifying a resume's facts tags them to it (AUTO); extracting evidence tags it to the active resume. In the Evidence
+bank each fact shows its resumes, **Resumes** edits them, a selection can be tagged in bulk, the filter shows what one
+resume's jobs may use, and new evidence defaults to the active resume. A tag a person removes is never added back by
+automation. So a fact verified only on your backend resume can never reach a job pinned to your data resume, however
+similar it is.
+
+**Ranking.** Within that scope:
+- BM25 keyword scoring over the in-scope facts;
+- PostgreSQL full-text (`ts_rank_cd`);
+- the posting's required skills that a fact names exactly;
+- with vectors on, cosine similarity (pgvector) to the posting.
+
+The lists are fused by reciprocal rank and packed into `RAG_CONTEXT_TOKEN_BUDGET`. A vector is used only while its
+content hash equals the live fact's, so an edited fact is never answered with its old vector.
+
+**Saved answers.** With RAG on, `knowledge.search` (MCP `search_application_knowledge`) also lists saved answers to
+similar questions as `suggestions`, each `authoritative: false`. A suggestion never changes the status or the
+answer. For work authorization, visa or sponsorship questions no suggested answer text is shown at all.
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `RAG_RETRIEVAL_MODE` | `off` | `off`: the deterministic builder, unchanged. `shadow`: unchanged too, but retrieval runs beside it and the difference (ids only) goes to Monitoring → Logs (`rag_shadow`). `on`: job contexts take their evidence from retrieval, and fall back to the old builder if retrieval fails. |
+| `RAG_VECTOR_ENABLED` | `false` | Adds embeddings: the `rag_index` job and vector similarity. Without it retrieval is keyword and full-text only. |
+| `RAG_CONTEXT_TOKEN_BUDGET` / `RAG_MAX_CANDIDATES` | `1200` / `50` | The pack's token budget, and how many candidates each signal contributes. |
+| `RAG_INDEX_MINUTES`, `RAG_EMBED_BATCH_SIZE`, `RAG_INDEX_MAX_ENTRIES_PER_RUN`, `RAG_INDEX_MAX_ATTEMPTS` | `10`, `32`, `500`, `5` | The index job's cadence, batch, per-run cap and retries. |
+| `RAG_BACKFILL_MIN_COVERAGE` | `1.0` | Share of eligible facts a new index must cover before it replaces the old one. |
+| `RAG_RETIRED_RETENTION_DAYS` | `7` | Replaced indexes are deleted by `cleanup` after this. |
+
+**Embeddings.** The model is configuration: in AI Orchestration → Models & routing, give the **Embedder** worker an
+EMBEDDING model. It is seeded off.
+- **Vector size.** Discovery reads it from LiteLLM (`output_vector_size`); a model test measures it, or you can set it.
+  A model of unknown size, a chat model on the Embedder, or an embedding model on a chat worker is refused at Apply.
+- **Gateway only.** Requests go to LiteLLM's `/v1/embeddings` through the instrumented client. Every call is a row in
+  Monitoring → External APIs (`LITELLM / embedding`) with the model that answered and the cost LiteLLM reported;
+  when it reports none, the cost stays empty. Text and vectors are never logged.
+- **Other providers.** Outside gateway mode there are no embeddings, and retrieval runs on full-text alone.
+- **Sensitive answers.** These are embedded by their question only.
+
+**The index** (`rag_index_versions`, `rag_index_entries`, migration 0045; vectors in `rag_vectors`):
+- **What it is.** It is derived, and it is rebuilt from the Evidence and KnowledgeAnswer rows.
+- **Keeping up with edits.** Editing, un-verifying or deleting a fact updates its entries in the same transaction:
+  it is re-embedded, deactivated or removed. The `rag_index` job embeds what is pending, and a sweep repairs anything
+  missed.
+- **New model or size.** A new embedding model or vector size builds a new index version beside the serving one. It
+  replaces it only once complete, and queries are embedded with the serving version's own model, so vectors of
+  different models or sizes are never compared.
+- **Deleting an account** deletes all of it.
+- **Vector table.** `rag_vectors` is created at runtime when the PostgreSQL server has the pgvector extension (the
+  Compose file uses `pgvector/pgvector:pg17`; `brew install pgvector` locally). Without the extension the app starts
+  normally and retrieval stays full-text. On SQLite it is a JSON table, with similarity computed in Python.
+
+```text
+GET  /api/rag/status                 retrieval mode, embedding availability, index versions and coverage
+GET  /api/rag/preview?job_id=…       the evidence pack a job would get (keyword only; no model call)
+GET  /api/evidence/resumes           resumes to tag evidence with, and how many facts each one's jobs may use
+PUT  /api/evidence/{id}/resumes      {"resume_ids": [...]}  (empty: manual evidence applies to every resume)
+POST /api/evidence/bulk-resumes      {"evidence_ids": [...], "add": [...], "remove": [...]}
+```
+
+**Measuring it.** `python scripts/rag_eval.py` runs the labelled benchmark in `tests/fixtures/rag_eval/` in a
+throwaway database. It reports Recall@5/10, Precision@k, citation correctness, cross-resume leaks, latency and token
+reduction. Add `--litellm-url … --model … --dimensions …` (key in `LITELLM_API_KEY`) to measure a real embedding
+model.
+
+**Rollback.** Set `RAG_RETRIEVAL_MODE=off` and `RAG_VECTOR_ENABLED=false`; the builders are exactly as before. Migration
+0045 is additive and can be downgraded; its downgrade also drops `rag_vectors`. Evidence tags stay unless you downgrade.
 
 ## Application Inbox Agent
 

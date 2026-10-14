@@ -359,6 +359,55 @@ def select_evidence(db: Session, user_id: int, terms: JobTerms, limit: int,
     return sorted(projected, key=lambda e: e["id"]), every
 
 
+def retrieved_evidence(db: Session, profile: Any, job: Job, task: str, terms: JobTerms, limit: int,
+                       deterministic: list[dict[str, Any]], held_back: set[int], resume_items: set[str]
+                       ) -> list[dict[str, Any]]:
+    """The evidence a job context carries, by RAG_RETRIEVAL_MODE:
+
+        off      `deterministic` (select_evidence), exactly as before — the default and the rollback
+        shadow   `deterministic`; retrieval runs beside it and the difference (ids only) goes to Monitoring → Logs
+        on       retrieval (app.services.rag_retrieval): only the job's own resume's evidence and untagged evidence,
+                 relevance-ranked, within the token budget; on any retrieval error, `deterministic`
+
+    Retrieval honours the same exclusions: evidence held back for a provenance conflict, and evidence created from a
+    bullet the context already carries as that bullet."""
+    from app.settings import get_settings
+
+    mode = get_settings().rag_mode
+    if mode == "off" or getattr(job, "id", None) is None:
+        return deterministic
+    from app.services import rag_retrieval, system_log
+
+    shown = set(db.scalars(select(Evidence.id).where(
+        Evidence.user_id == profile.user_id, Evidence.source == "resume",
+        Evidence.structured_item_id.in_(sorted(resume_items)))).all()) if resume_items else set()
+    try:
+        pack = rag_retrieval.retrieve_evidence(db, profile, job, terms=terms, exclude=held_back | shown,
+                                               limit=limit)
+    except Exception as exc:  # noqa: BLE001  the deterministic builder is the fallback
+        system_log.log_event(message=f"Retrieval failed for job {job.id}; the deterministic context was used",
+                             category="WORKFLOW", level="WARNING", operation="rag_retrieval", user_id=profile.user_id,
+                             entity_type="job", entity_id=job.id, status="FALLBACK",
+                             details={"task": task, "error": type(exc).__name__})
+        return deterministic
+    if mode == "shadow":
+        old, new = {e["id"] for e in deterministic}, set(pack.evidence_ids)
+        system_log.log_event(
+            message=f"Retrieval shadow comparison for job {job.id} ({task})", category="WORKFLOW",
+            operation="rag_shadow", user_id=profile.user_id, entity_type="job", entity_id=job.id,
+            status="SAME" if old == new else "DIFFERENT", duration_ms=pack.latency_ms,
+            details={"task": task, "only_deterministic": sorted(old - new), "only_retrieval": sorted(new - old),
+                     "outside_resume_scope": sorted(old - pack_scope(db, profile, job)), **pack.metadata()})
+        return deterministic
+    return pack.projected()
+
+
+def pack_scope(db: Session, profile: Any, job: Job) -> set[int]:
+    from app.services import rag_retrieval
+
+    return rag_retrieval.scope(db, profile, job)[1]
+
+
 def same_claim(a: str, b: str) -> bool:
     """Whether two texts state the same fact in different words (typos and small rewordings included)."""
     left, right = tokens(a), tokens(b)
@@ -453,6 +502,8 @@ def _base(db: Session, profile: CandidateProfile, job: Job, task: str, allowed: 
     resume_items = {unit.item_id for unit in sr.iter_units(data or {})}
     relevant, every = select_evidence(db, profile.user_id, terms, evidence_limit, exclude=set(held_back),
                                       resume_items=resume_items)
+    relevant = retrieved_evidence(db, profile, job, task, terms, evidence_limit, relevant, set(held_back),
+                                  resume_items)
     projects = _select_projects(data or {}, terms, allowed)
     education_fields = ("degree", "field_of_study", "institution", "university", "grade", "end_date",
                         "raw_end_date")

@@ -23,8 +23,10 @@ const aimModel = name => aimModels().find(m => m.name === name);
 const aimTokens = n => n == null ? 'unknown' : n >= 1000 ? `${Math.round(n / 1024 * 10) / 10}K`.replace('.0K', 'K') : String(n);
 const aimYes = v => v === true ? 'yes' : v === false ? 'no' : 'unknown';
 const aimOpt = (value, label, selected) => `<option value="${attr(value)}" ${String(value) === String(selected ?? '') ? 'selected' : ''}>${esc(label)}</option>`;
+// Chat pickers (tiers, backups, router) never offer an embedding model; the Embedder offers nothing else.
+const aimFits = (m, capability = 'CHAT') => capability === 'EMBEDDING' ? m.model_type === 'EMBEDDING' : m.model_type !== 'EMBEDDING';
 function aimModelOptions(selected, blank = 'Not set') {
-  const names = aimModels().filter(m => m.enabled).map(m => m.name);
+  const names = aimModels().filter(m => m.enabled && aimFits(m)).map(m => m.name);
   if (selected && !names.includes(selected)) names.push(selected);
   return aimOpt('', blank, selected) + names.map(n => aimOpt(n, n, selected)).join('');
 }
@@ -37,11 +39,16 @@ function aimTarget(c) {
   if (c?.mode === 'AUTO_ROUTER') return 'auto';
   return c?.tier ? `tier:${c.tier}` : '';
 }
-function aimTargetOptions(selected) {
-  const d = aimData(), tiers = Object.entries(d.tiers || {}), router = d.routing?.auto_router_enabled;
-  const models = aimModels().filter(m => m.enabled).map(m => m.name);
+function aimTargetOptions(selected, capability = 'CHAT') {
+  const d = aimData(), embedding = capability === 'EMBEDDING';
+  const tiers = embedding ? [] : Object.entries(d.tiers || {}), router = !embedding && d.routing?.auto_router_enabled;
+  const models = aimModels().filter(m => m.enabled && aimFits(m, capability)).map(m => m.name);
   const [kind, name] = String(selected || '').split(/:(.*)/s);
   if (kind === 'model' && name && !models.includes(name)) models.push(name);
+  if (embedding) return aimOpt('', 'Off (full-text retrieval only)', selected) + models.map(n => {
+    const m = aimModel(n), size = m?.embedding_dimensions;
+    return aimOpt(`model:${n}`, `${n}${size ? ` · ${size} dims` : ' · size unknown'}`, selected);
+  }).join('');
   return aimOpt('', 'Choose a model', selected)
     + (tiers.length ? `<optgroup label="Tiers">${tiers.map(([t, x]) => aimOpt(`tier:${t}`, `${t}${x.model ? ` · ${x.model}` : ''}`, selected)).join('')}</optgroup>` : '')
     + (models.length ? `<optgroup label="Models">${models.map(n => aimOpt(`model:${n}`, n, selected)).join('')}</optgroup>` : '')
@@ -162,7 +169,7 @@ function aimWorkers() {
     const short = m && m.context_window && m.context_window < w.min_context_tokens;
     return `<tr class="${c.enabled === false ? 'off' : ''}">
       <td><div class="aim-wk" style="--h:${aimHue(w.worker_type)}"><span class="aim-wk-mono" aria-hidden="true">${esc(aimMonogram(w.label))}</span><div class="aim-wk-name"><b>${esc(w.label)}</b>${w.has_prompt ? '' : '<span class="aim-wk-tag">reserved</span>'}<small title="${attr(w.description || '')}">${esc(w.description || '')}</small>${short ? `<small class="aim-wk-warn">▲ ${esc(m.name)} has less context than it needs</small>` : ''}</div></div></td>
-      <td><select class="select aim-inline" aria-label="Model for ${attr(w.label)}" data-act-change="aim-worker-target" data-worker="${attr(w.worker_type)}">${aimTargetOptions(aimTarget(c))}</select></td>
+      <td><select class="select aim-inline" aria-label="Model for ${attr(w.label)}" data-act-change="aim-worker-target" data-worker="${attr(w.worker_type)}">${aimTargetOptions(aimTarget(c?.enabled === false ? {} : c), w.capability)}</select></td>
       <td>${aimBackupChain(aimBackups(c))}</td>
       <td>${aimHealth(w)}</td>
       <td class="aim-wk-act">${btn('Edit', 'aim-worker', { worker: w.worker_type }, 'sm')}</td></tr>${test ? `<tr class="aim-wk-test"><td colspan="5">${aimTestResult(test)}</td></tr>` : ''}`;
@@ -257,7 +264,7 @@ function aimModelCard(m, labels, d) {
   const caps = AIM_CAPS.map(([n, key, icon]) => { const v = m[key]; return `<span class="aim-cap ${v === true ? 'yes' : v === false ? 'no' : 'unk'}" title="${attr(`${n}: ${aimYes(v)}`)}"><i aria-hidden="true">${icon}</i>${n}<b aria-hidden="true">${v === true ? '✓' : v === false ? '✗' : '?'}</b></span>`; }).join('');
   const stat = (k, v, hint = '') => `<div><dt>${k}</dt><dd>${v}${hint ? `<small>${hint}</small>` : ''}</dd></div>`;
   const tags = [m.managed ? pill('Managed', 'brand') : '', m.present_in_litellm ? '' : pill('Not in LiteLLM', 'warn'), m.enabled ? '' : pill('Disabled', 'muted'), m.model_type && m.model_type !== 'CUSTOM' ? pill(m.model_type.replace('_', ' ').toLowerCase(), 'plain') : ''].join('');
-  const more = open ? `<div class="aim-mcard-more"><label class="field" for="aim-type-${attr(m.name)}"><span>Type</span><select class="select" id="aim-type-${attr(m.name)}" data-act-change="aim-model-type" data-name="${attr(m.name)}">${(d.options?.model_types || []).map(t => aimOpt(t, t.replace('_', ' ').toLowerCase(), m.model_type)).join('')}</select></label>${m.managed ? btn('Stop managing', 'aim-model-unmanage', { name: m.name }, 'sm') : ''}${btn(isBusy('aim-model-remove') ? 'Deleting…' : 'Delete model', 'aim-model-remove', { name: m.name, managed: m.managed ? '1' : '' }, 'sm danger', isBusy('aim-model-remove'))}</div>` : '';
+  const more = open ? `<div class="aim-mcard-more"><label class="field" for="aim-type-${attr(m.name)}"><span>Type</span><select class="select" id="aim-type-${attr(m.name)}" data-act-change="aim-model-type" data-name="${attr(m.name)}">${(d.options?.model_types || []).map(t => aimOpt(t, t.replace('_', ' ').toLowerCase(), m.model_type)).join('')}</select></label>${m.model_type === 'EMBEDDING' ? `<label class="field" for="aim-dims-${attr(m.name)}"><span>Vector size (dimensions)</span><input class="input" type="number" min="1" max="65536" id="aim-dims-${attr(m.name)}" value="${attr(m.embedding_dimensions ?? '')}" placeholder="${attr(m.discovered?.embedding_dimensions ? `Discovered: ${m.discovered.embedding_dimensions}` : 'Unknown — run Test')}" data-act-change="aim-model-dims" data-name="${attr(m.name)}"></label>` : ''}${m.managed ? btn('Stop managing', 'aim-model-unmanage', { name: m.name }, 'sm') : ''}${btn(isBusy('aim-model-remove') ? 'Deleting…' : 'Delete model', 'aim-model-remove', { name: m.name, managed: m.managed ? '1' : '' }, 'sm danger', isBusy('aim-model-remove'))}</div>` : '';
   const refs = AIM.refs?.[m.name];
   return `<article class="card aim-mcard ${m.enabled ? '' : 'off'}" style="--h:${aimHue(m.name)}">
     <header class="aim-mcard-head"><span class="aim-mcard-mono" aria-hidden="true">${esc(aimMonogram(m.name))}</span>
@@ -384,11 +391,17 @@ const AI_MODELS_ACTIONS = {
   },
   'aim-worker-target': el => {
     const w = aimWorkerByType(el.dataset.worker);
-    return aimSave('aim-worker-target', () => api(`/api/settings/ai/workers/${encodeURIComponent(w.worker_type)}`, { method: 'PUT', body: { revision: aimRev(), ...aimTargetFields(el.value, w.config) } }), `${w.label} now uses ${el.value.replace(/^(model|tier):/, '') || 'its default'}`);
+    // An embedding worker is on exactly while it has a model (it is seeded off and never borrows a chat tier).
+    const extra = w.capability === 'EMBEDDING' ? { enabled: !!el.value, model_mode: 'FIXED' } : {};
+    return aimSave('aim-worker-target', () => api(`/api/settings/ai/workers/${encodeURIComponent(w.worker_type)}`, { method: 'PUT', body: { revision: aimRev(), ...aimTargetFields(el.value, w.config), ...extra } }), `${w.label} now uses ${el.value.replace(/^(model|tier):/, '') || (w.capability === 'EMBEDDING' ? 'nothing (off)' : 'its default')}`);
   },
   'aim-worker-test': el => { const w = el.dataset.worker; return busy(`aim-wtest-${w}`, async () => { AIM.tests[`worker:${w}`] = await api(`/api/settings/ai/workers/${encodeURIComponent(w)}/test`, { method: 'POST', body: { configuration: 'draft' } }); }); },
   'aim-model-test': el => { const n = el.dataset.name; return busy(`aim-mtest-${n}`, async () => { AIM.tests[`model:${n}`] = await api(`/api/settings/ai/models/${encodeURIComponent(n)}/test`, { method: 'POST' }); await aimLoad(); }); },
   'aim-model-toggle': el => aimSave('aim-model', () => api(`/api/settings/ai/models/${encodeURIComponent(el.dataset.name)}`, { method: 'PUT', body: { revision: aimRev(), enabled: !!el.dataset.on } }), `${el.dataset.name} ${el.dataset.on ? 'enabled' : 'disabled'}`),
+  'aim-model-dims': el => {
+    const m = aimModel(el.dataset.name) || {}, size = el.value === '' ? null : Number(el.value);
+    return aimSave('aim-model', () => api(`/api/settings/ai/models/${encodeURIComponent(el.dataset.name)}`, { method: 'PUT', body: { revision: aimRev(), overrides: { ...(m.overrides || {}), embedding_dimensions: size } } }), 'Vector size saved');
+  },
   'aim-model-type': el => aimSave('aim-model', () => api(`/api/settings/ai/models/${encodeURIComponent(el.dataset.name)}`, { method: 'PUT', body: { revision: aimRev(), model_type: el.value } }), 'Model type saved'),
   'aim-model-unmanage': el => { if (!confirm(`Stop managing ${el.dataset.name}? Its deployment is removed from LiteLLM.`)) return; return aimSave('aim-model', () => api(`/api/settings/ai/models/${encodeURIComponent(el.dataset.name)}?revision=${aimRev()}`, { method: 'DELETE' }), `${el.dataset.name} no longer managed`); },
   'aim-sync': () => aimSave('aim-sync', async () => { AIM.tests.sync = await api('/api/settings/ai/models/sync', { method: 'POST' }); }, () => { const s = AIM.tests.sync || {}; return `${s.models ?? 0} models discovered${s.added?.length ? `, ${s.added.length} new` : ''}`; }),

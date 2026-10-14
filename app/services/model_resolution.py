@@ -26,7 +26,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from app.services.ai_workers import WORKERS
+from app.services.ai_workers import EMBEDDING_WORKERS, WORKERS
 from app.settings import get_settings
 
 if TYPE_CHECKING:
@@ -125,6 +125,8 @@ def router_active(snapshot: dict[str, Any]) -> bool:
 def resolve_model(snapshot: dict[str, Any], worker_type: str) -> tuple[str | None, str | None, str | None]:
     """(model, configured, note) for one worker. `model` is None when nothing usable is configured."""
     config = (snapshot.get("workers") or {}).get(worker_type)
+    if worker_type in EMBEDDING_WORKERS and (config is None or not config.get("enabled", True)):
+        return None, None, "not configured"  # an embedding worker never borrows a chat tier
     if config is None:
         model, note = tier_model(snapshot, DEFAULT_TIER)
         return model, DEFAULT_TIER, note
@@ -169,7 +171,8 @@ def escalation_model(snapshot: dict[str, Any], policy: dict[str, Any] | None) ->
 def _capabilities(snapshot: dict[str, Any], name: str | None) -> dict[str, Any]:
     entry = (snapshot.get("models") or {}).get(name or "") or {}
     return {key: entry.get(key) for key in ("supports_structured_output", "supports_reasoning", "supports_tools",
-                                            "supports_vision", "context_window", "max_output_tokens", "model_type")}
+                                            "supports_vision", "context_window", "max_output_tokens", "model_type",
+                                            "embedding_dimensions")}
 
 
 def resolve(snapshot: dict[str, Any], worker_type: str | None, version: int | None = None) -> ResolvedWorker:

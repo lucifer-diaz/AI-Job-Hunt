@@ -1,0 +1,58 @@
+{
+  "about": "Hand-labelled retrieval benchmark for candidate evidence (Phase 2 RAG). Two resumes of one candidate with overlapping and conflicting experience (the same employer, Acme, under different titles), untagged manual facts, a fact a person tagged to one resume, and jobs pinned in every way a job can be (USER, SETUP, ACTIVE, AUTO). `relevant` lists the facts a reviewer expects in the job's evidence pack; `forbidden` lists facts that must never appear (another resume's). Facts are named by label and resolved to Evidence ids at run time.",
+  "resumes": {
+    "backend": {"filename": "backend.txt", "active": true, "text": "# Jane Doe\nSenior Backend Engineer\n\n## Summary\nBackend engineer building reliable distributed systems.\n\n## Skills\n- Languages: Go, Python\n- Platforms: Kafka, Kubernetes, AWS, PostgreSQL\n\n## Experience\n### Senior Backend Engineer | Acme | Bengaluru | Jan 2021 - Oct 2025\n- Reduced production incidents by 45% across Kafka event pipelines\n- Built gRPC payment services in Go handling 2,000 requests per second\n- Migrated a Python monolith to Kubernetes microservices\n- Cut AWS infrastructure cost by 35% through autoscaling\n\n### Software Engineer | Globex | Pune | Jun 2017 - Dec 2020\n- Led an on-call rotation of 6 engineers and wrote the incident runbooks\n- Designed PostgreSQL schemas for the billing ledger\n\n## Education\nB.Tech Computer Science, IIT Delhi, 2013 - 2017\n"},
+    "data": {"filename": "data.txt", "active": false, "text": "# Jane Doe\nMachine Learning Engineer\n\n## Summary\nML engineer shipping models to production.\n\n## Skills\n- Languages: Python, SQL\n- Platforms: Spark, Kafka, XGBoost, Airflow\n\n## Experience\n### Data Engineer | Acme | Bengaluru | Jan 2021 - Oct 2025\n- Built Kafka streaming pipelines feeding the machine learning feature store\n- Orchestrated nightly Spark jobs with Airflow\n\n### Data Scientist | Initech | Mumbai | Jun 2017 - Dec 2020\n- Trained churn prediction models with XGBoost lifting retention by 8%\n- Built a feature store on Spark used by 4 product teams\n- Designed an A/B testing framework for pricing experiments\n\n## Education\nB.Tech Computer Science, IIT Delhi, 2013 - 2017\n"}
+  },
+  "facts": {
+    "kafka_incidents": {"resume": "backend", "claim": "Reduced production incidents by 45% across Kafka event pipelines"},
+    "grpc_go": {"resume": "backend", "claim": "Built gRPC payment services in Go handling 2,000 requests per second"},
+    "k8s_migration": {"resume": "backend", "claim": "Migrated a Python monolith to Kubernetes microservices"},
+    "aws_cost": {"resume": "backend", "claim": "Cut AWS infrastructure cost by 35% through autoscaling"},
+    "oncall": {"resume": "backend", "claim": "Led an on-call rotation of 6 engineers and wrote the incident runbooks"},
+    "billing_schema": {"resume": "backend", "claim": "Designed PostgreSQL schemas for the billing ledger"},
+    "kafka_feature_store": {"resume": "data", "claim": "Built Kafka streaming pipelines feeding the machine learning feature store"},
+    "airflow_spark": {"resume": "data", "claim": "Orchestrated nightly Spark jobs with Airflow"},
+    "churn": {"resume": "data", "claim": "Trained churn prediction models with XGBoost lifting retention by 8%"},
+    "feature_store": {"resume": "data", "claim": "Built a feature store on Spark used by 4 product teams"},
+    "ab_testing": {"resume": "data", "claim": "Designed an A/B testing framework for pricing experiments"},
+    "mentoring": {"manual": true, "claim": "Mentored 5 junior engineers through a formal mentorship program", "company": "Acme", "skills": ["mentoring", "leadership"]},
+    "pycon_talk": {"manual": true, "claim": "Spoke at PyCon India 2023 on Python performance profiling", "skills": ["python", "performance"]},
+    "uplift_paper": {"manual": true, "tagged": ["data"], "claim": "Published a paper on causal uplift modelling for marketing", "skills": ["causal inference", "machine learning"]}
+  },
+  "jobs": [
+    {"key": "backend_kafka", "title": "Senior Backend Engineer", "pin": "USER", "resume": "backend",
+     "description": "Own Kafka event pipelines and production reliability. Build Go gRPC services and run them on Kubernetes. Reduce incidents.",
+     "relevant": ["kafka_incidents", "grpc_go", "k8s_migration"], "forbidden": ["kafka_feature_store", "churn", "feature_store", "ab_testing", "airflow_spark", "uplift_paper"]},
+    {"key": "ml_churn", "title": "Machine Learning Engineer", "pin": "USER", "resume": "data",
+     "description": "Train churn prediction models with XGBoost, maintain the Spark feature store and run A/B testing.",
+     "relevant": ["churn", "feature_store", "ab_testing"], "forbidden": ["kafka_incidents", "grpc_go", "k8s_migration", "aws_cost", "oncall", "billing_schema"]},
+    {"key": "data_kafka_conflict", "title": "Data Engineer", "pin": "USER", "resume": "data",
+     "description": "Reduce incidents in production Kafka event pipelines and build streaming data for machine learning.",
+     "relevant": ["kafka_feature_store"], "forbidden": ["kafka_incidents", "grpc_go", "k8s_migration", "aws_cost", "oncall", "billing_schema"]},
+    {"key": "eng_manager", "title": "Engineering Manager", "pin": "ACTIVE", "resume": null,
+     "description": "Lead and mentor engineers, own the on-call rotation and incident runbooks, grow junior engineers.",
+     "relevant": ["oncall", "mentoring"], "forbidden": ["kafka_feature_store", "churn", "feature_store", "ab_testing", "airflow_spark", "uplift_paper"]},
+    {"key": "python_perf", "title": "Python Performance Engineer", "pin": "AUTO", "resume": null,
+     "description": "Profile Python services for performance and speak about Python performance at conferences.",
+     "relevant": ["pycon_talk"], "forbidden": ["kafka_feature_store", "churn", "feature_store", "ab_testing", "uplift_paper"]},
+    {"key": "data_platform_setup", "title": "Data Platform Engineer", "pin": "SETUP", "resume": "data",
+     "description": "Schedule Spark jobs with Airflow and build feature stores for product teams.",
+     "relevant": ["airflow_spark", "feature_store"], "forbidden": ["kafka_incidents", "grpc_go", "k8s_migration", "aws_cost", "oncall", "billing_schema"]},
+    {"key": "attrition_semantic", "title": "Customer Attrition Scientist", "pin": "USER", "resume": "data",
+     "description": "Forecast customer attrition and design causal marketing experiments.",
+     "relevant": ["churn", "uplift_paper"], "forbidden": ["kafka_incidents", "grpc_go", "k8s_migration", "aws_cost", "oncall", "billing_schema"]},
+    {"key": "cloud_cost", "title": "Cloud Platform Engineer", "pin": "USER", "resume": "backend",
+     "description": "Lower cloud spend with autoscaling and migrate services to Kubernetes.",
+     "relevant": ["aws_cost", "k8s_migration"], "forbidden": ["kafka_feature_store", "churn", "feature_store", "ab_testing", "airflow_spark", "uplift_paper"]}
+  ],
+  "concepts": {
+    "_about": "A controlled stand-in for an embedding model in the hybrid evaluation: words in one group share a meaning. It is synthetic and only shows that the fusion uses meaning when a model supplies it; real-model quality is measured by scripts/rag_eval.py against a configured model.",
+    "churn": ["churn", "attrition", "retention", "turnover"],
+    "experiment": ["experiment", "experiments", "a/b", "testing", "uplift", "causal"],
+    "marketing": ["marketing", "pricing", "customer"],
+    "cost": ["cost", "spend", "autoscaling", "cheaper"],
+    "streaming": ["kafka", "streaming", "event", "pipelines"],
+    "leadership": ["lead", "led", "mentor", "mentored", "mentorship", "junior", "grow"]
+  }
+}

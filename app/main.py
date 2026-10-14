@@ -33,6 +33,7 @@ from sqlalchemy.orm import Session
 
 from app import auth
 from app.agents_api import router as agents_router
+from app.rag_api import router as rag_router
 from app.ai_models_api import router as ai_models_router
 from app.failover_api import router as failover_router
 from app.application_inbox_api import router as application_inbox_router
@@ -85,6 +86,7 @@ from app.security import SecretsUnavailable
 from app.services import (
     backoff,
     context_builder,
+    evidence_tags,
     feedback_learning,
     mcp_tokens,
     ranker,
@@ -188,6 +190,7 @@ app.include_router(failover_router)
 app.include_router(application_inbox_router)
 app.include_router(setup_guide_router)
 app.include_router(agents_router)
+app.include_router(rag_router)
 
 # Reachable without signing in. Cron and admin routes are protected by their own secrets.
 PUBLIC_PATHS = {"/health", "/login", "/signup", "/api/auth/login", "/api/auth/signup", "/api/auth/logout"}
@@ -976,14 +979,23 @@ def resume_download(db: Session = Depends(get_user_db)):
 @app.get("/api/evidence")
 def evidence_get(db: Session = Depends(get_user_db)):
     items = db.scalars(select(Evidence).order_by(desc(Evidence.id))).all()
+    resumes = evidence_tags.describe(db, db.info["user_id"], list(items)) if db.info.get("user_id") else {}
     return [{"id": e.id, "company": e.company, "role": e.role, "claim": e.claim,
-             "context": e.context, "skills": e.skills, "tags": e.tags, "verified": e.verified} for e in items]
+             "context": e.context, "skills": e.skills, "tags": e.tags, "verified": e.verified, "source": e.source,
+             **resumes.get(e.id, {"resumes": [], "all_resumes": e.source != "resume"})} for e in items]
 
 
 @app.post("/api/evidence")
 def evidence_post(payload: EvidenceIn, db: Session = Depends(get_user_db)):
-    e = Evidence(**payload.model_dump())
+    e = Evidence(**payload.model_dump(exclude={"resume_ids"}))
     db.add(e)
+    db.flush()
+    if payload.resume_ids:  # the resumes it belongs to; none = every resume
+        try:
+            evidence_tags.set_resumes(db, db.info["user_id"], e.id, payload.resume_ids)
+        except evidence_tags.TagError as exc:
+            db.rollback()
+            raise HTTPException(404, str(exc)) from exc
     db.commit()
     db.refresh(e)
     return {"id": e.id}

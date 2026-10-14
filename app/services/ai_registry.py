@@ -30,7 +30,7 @@ from app.services.redaction import redact_text
 from app.settings import get_settings
 
 FACTS = ("provider", "underlying_model", "supports_structured_output", "supports_tools", "supports_reasoning",
-         "supports_vision", "context_window", "max_context_window", "max_output_tokens")
+         "supports_vision", "context_window", "max_context_window", "max_output_tokens", "embedding_dimensions")
 JSON_TYPES = {"string": str, "number": (int, float), "array": list, "object": dict, "boolean": bool}
 
 
@@ -68,6 +68,8 @@ def _describe_one(deployment: dict[str, Any], ollama: dict[str, dict[str, dict[s
         "context_window": _int(params.get("num_ctx")) or _int(info.get("max_input_tokens")),
         "max_context_window": _int(info.get("max_input_tokens")),
         "max_output_tokens": _int(info.get("max_output_tokens")),
+        # LiteLLM's model map states an embedding model's vector size; nothing else is taken as its size.
+        "embedding_dimensions": _int(info.get("output_vector_size")),
         "model_type": None,
     }
     if model.startswith("auto_router/"):
@@ -146,6 +148,8 @@ def discover(db: Session, user_id: int) -> dict[str, Any]:
             rows[name] = row
             added.append(name)
         for key in FACTS:
+            if key == "embedding_dimensions" and facts.get(key) is None and row.embedding_dimensions:
+                continue  # measured by an explicit model test; LiteLLM not stating a size does not unlearn it
             setattr(row, key, facts.get(key))
         if facts.get("model_type") and row.source == "DISCOVERED":
             row.model_type = facts["model_type"]
@@ -183,9 +187,45 @@ def discover(db: Session, user_id: int) -> dict[str, Any]:
 TEST_MAX_TOKENS = 512
 
 
+# A fixed, fictional input for an embedding model's test: no account data is ever sent.
+EMBEDDING_TEST_INPUT = "Job Hunt OS embedding test"
+
+
+def test_embedding_model(db: Session, user_id: int, name: str, row: AIModel | None) -> dict[str, Any]:
+    """Embed one fixed sentence; records health and the vector size the model actually returned."""
+    result: dict[str, Any] = {"model": name, "success": False, "latency_ms": None, "model_group": None,
+                              "underlying_model": None, "embedding_dimensions": None, "error": None}
+    clock = time.monotonic()
+    try:
+        with config.api_for(db, user_id, service="embedding") as api:
+            answer = api.embeddings(name, [EMBEDDING_TEST_INPUT], operation="model_test",
+                                    timeout=int(get_settings().rag_embed_timeout_seconds or 60))
+        if not answer.vectors or not answer.vectors[0]:
+            raise config.AIConfigError("The model returned no vector; it may not be an embedding model")
+        size = len(answer.vectors[0])
+        result.update(success=True, latency_ms=answer.latency_ms, embedding_dimensions=size,
+                      model_group=answer.litellm.get("model_group"),
+                      underlying_model=answer.litellm.get("model_name") or answer.model)
+        if row is not None:
+            row.embedding_dimensions = size  # measured, not guessed
+    except (LiteLLMError, config.AIConfigError) as exc:
+        result.update(error=redact_text(str(exc), 500), latency_ms=int((time.monotonic() - clock) * 1000))
+    if row is not None:
+        row.health_status = "HEALTHY" if result["success"] else "UNHEALTHY"
+        row.health_checked_at, row.health_latency_ms, row.health_error = config.utcnow(), result["latency_ms"], \
+            result["error"]
+    config.audit(db, user_id, "MODEL_TEST", actor=config._actor(db, user_id),
+                 result="SUCCEEDED" if result["success"] else "FAILED", changes=[{"model": name}],
+                 error=result["error"])
+    db.commit()
+    return result
+
+
 def test_model(db: Session, user_id: int, name: str) -> dict[str, Any]:
     """A tiny, safe request straight to one model. Records the model's health; no account data is sent."""
     row = db.scalar(select(AIModel).where(AIModel.user_id == user_id, AIModel.litellm_model_name == name))
+    if row is not None and row.model_type == "EMBEDDING":
+        return test_embedding_model(db, user_id, name, row)
     prompt = build_model_health_prompt()
     structured = row is None or row.supports_structured_output is not False
     # The same model timeout as real requests (LLM_REQUEST_TIMEOUT_SECONDS): a slow or cold-loading local model
@@ -256,6 +296,18 @@ def test_worker(db: Session, user_id: int, worker_type: str, *, use_draft: bool 
     config.ensure_seeded(db, user_id)
     active = config.active_version(db, user_id)
     snapshot = config.draft_snapshot(db, user_id) if use_draft else (active.configuration_snapshot if active else {})
+    if WORKERS[worker_type].capability == "EMBEDDING":
+        model, _assigned, note = model_resolution.resolve_model(snapshot, worker_type)
+        if model is None:
+            return {"worker_type": worker_type, "configuration": "draft" if use_draft else "active", "model": None,
+                    "success": False, "error": f"No embedding model is assigned ({note})"}
+        row = db.scalar(select(AIModel).where(AIModel.user_id == user_id, AIModel.litellm_model_name == model))
+        out = test_embedding_model(db, user_id, model, row)
+        expected = ((snapshot.get("models") or {}).get(model) or {}).get("embedding_dimensions")
+        if out["success"] and expected and out["embedding_dimensions"] != expected:
+            out.update(success=False, error=f"{model} returned {out['embedding_dimensions']}-dimension vectors; "
+                                            f"the configuration says {expected}")
+        return {"worker_type": worker_type, "configuration": "draft" if use_draft else "active", **out}
     resolved = model_resolution.resolve(snapshot, worker_type, None if use_draft else active.version_number)
     prompt, expected = build_worker_test_prompt(worker_type)
     client = LLMClient(overrides={"llm_provider": "litellm"}, user_id=user_id,

@@ -9,6 +9,7 @@ Only endpoints that exist in LiteLLM 1.102 (checked against its OpenAPI schema) 
     GET  /router/settings            router settings as the proxy runs them
     GET  /health/latest              results of LiteLLM's own background health checks, when it runs them
     POST /v1/chat/completions        inference, and the small model test
+    POST /v1/embeddings              embeddings (app.services.embeddings), and the embedding model test
     POST /model/new                  create a deployment        ─┐ these three require STORE_MODEL_IN_DB=True
     PATCH /model/{id}/update         change a deployment         │ on the proxy; LiteLLM answers otherwise with
     POST /model/delete               remove a deployment        ─┘ an error naming that setting
@@ -112,6 +113,16 @@ class ChatResult:
     litellm: dict[str, Any] = field(default_factory=dict)  # facts read from x-litellm-* headers
 
 
+@dataclass
+class EmbeddingResult:
+    vectors: list[list[float]]
+    model: str | None  # the model the answer names (what answered), when it names one
+    input_tokens: int | None
+    latency_ms: int
+    request_id: str | None = None
+    litellm: dict[str, Any] = field(default_factory=dict)
+
+
 def litellm_headers(headers: Any) -> dict[str, Any]:
     """The routing facts LiteLLM puts on every response. Absent headers are absent, never guessed."""
     def get(name: str) -> str | None:
@@ -173,6 +184,11 @@ class LiteLLMAPI:
             raise LiteLLMUnavailable(f"LiteLLM did not answer in time ({type(exc).__name__})") from exc
         except httpx.HTTPError as exc:
             raise LiteLLMUnavailable(f"LiteLLM is unreachable at {self.base_url}: {type(exc).__name__}") from exc
+        self._check(response, method, path)
+        return response
+
+    @staticmethod
+    def _check(response: httpx.Response, method: str, path: str) -> None:
         if response.status_code in (401, 403):
             raise LiteLLMAuthError(f"LiteLLM refused the API key: {_error_message(response)}",
                                    http_status=response.status_code)
@@ -183,7 +199,6 @@ class LiteLLMAPI:
                                      http_status=response.status_code)
         if response.status_code >= 400:
             raise LiteLLMRejected(_error_message(response), http_status=response.status_code)
-        return response
 
     def _json(self, method: str, path: str, operation: str, **kwargs: Any) -> Any:
         response = self._send(method, path, operation, **kwargs)
@@ -243,6 +258,46 @@ class LiteLLMAPI:
             raise LiteLLMError("LiteLLM returned a non-JSON completion") from exc
         return ChatResult(parsed, dict(response.headers), latency, response.extensions.get("jobhunt_request_id"),
                           litellm_headers(response.headers))
+
+    def embeddings(self, model: str, inputs: list[str], *, operation: str = "embed_documents",
+                   timeout: float | None = None, metadata: dict[str, Any] | None = None) -> EmbeddingResult:
+        """Vectors for `inputs`, in order. The cost LiteLLM reports (x-litellm-response-cost) is recorded on the call's
+        telemetry row; without it the cost stays unknown (NULL). Inputs and vectors are never logged."""
+        def report(response: httpx.Response, call: Any) -> None:
+            facts = litellm_headers(response.headers)
+            call.note(answered_model=facts.get("model_name"), model_group=facts.get("model_group"),
+                      inputs=len(inputs))
+            if response.status_code < 400:
+                call.record_usage(cost=facts.get("response_cost"), source="provider_reported")
+
+        started = time.monotonic()
+        extensions: dict[str, Any] = {"operation": operation, "on_response": report,
+                                      "metadata": {"model": model, **(metadata or {})}}
+        try:
+            response = self.client.request("POST", "/v1/embeddings", json={"model": model, "input": inputs},
+                                           extensions=extensions, **({"timeout": timeout} if timeout else {}))
+        except RateLimitedCooldown:
+            raise
+        except httpx.TimeoutException as exc:
+            raise LiteLLMUnavailable(f"LiteLLM did not answer in time ({type(exc).__name__})") from exc
+        except httpx.HTTPError as exc:
+            raise LiteLLMUnavailable(f"LiteLLM is unreachable at {self.base_url}: {type(exc).__name__}") from exc
+        self._check(response, "POST", "/v1/embeddings")
+        latency = int((time.monotonic() - started) * 1000)
+        try:
+            parsed = response.json()
+        except ValueError as exc:
+            raise LiteLLMError("LiteLLM returned a non-JSON embedding answer") from exc
+        rows = sorted((r for r in (parsed.get("data") or []) if isinstance(r, dict)),
+                      key=lambda r: r.get("index", 0))
+        vectors = [[float(x) for x in (r.get("embedding") or [])] for r in rows]
+        if len(vectors) != len(inputs):
+            raise LiteLLMError(f"LiteLLM returned {len(vectors)} vectors for {len(inputs)} inputs")
+        usage = parsed.get("usage") if isinstance(parsed.get("usage"), dict) else {}
+        return EmbeddingResult(vectors=vectors, model=str(parsed.get("model") or "") or None,
+                               input_tokens=usage.get("prompt_tokens") if isinstance(usage.get("prompt_tokens"), int)
+                               else None, latency_ms=latency, request_id=response.extensions.get("jobhunt_request_id"),
+                               litellm=litellm_headers(response.headers))
 
     # ───────────── writes (STORE_MODEL_IN_DB) ─────────────
 

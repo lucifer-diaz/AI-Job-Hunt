@@ -15,6 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import CandidateProfile, Evidence, Job, KnowledgeAnswer
+from app.settings import get_settings
 
 ANSWER_TYPES = ("text", "boolean", "choice", "number")
 # A saved question this close (Jaccard over content words) is shown as similar, never used as the answer:
@@ -145,10 +146,28 @@ def search(db: Session, question: str, limit: int = 5) -> dict[str, Any]:
         status, answer, source = "SUPPORTED", None, None
     else:
         status, answer, source = "UNKNOWN", None, None
-    return {"status": status, "answer": answer, "answer_source": source, "knowledge_answers": answered[:limit],
-            "sensitive_answers": sensitive[:limit], "pending_questions": pending[:limit],
-            "similar_questions": similar[:limit], "profile_facts": facts,
-            "evidence": evidence}
+    out = {"status": status, "answer": answer, "answer_source": source, "knowledge_answers": answered[:limit],
+           "sensitive_answers": sensitive[:limit], "pending_questions": pending[:limit],
+           "similar_questions": similar[:limit], "profile_facts": facts,
+           "evidence": evidence}
+    if get_settings().rag_mode != "off" and db.info.get("user_id") is not None:
+        out["suggestions"] = _suggestions(db, question, wanted, {a["id"] for a in [*answered, *sensitive, *similar]})
+    return out
+
+
+def _suggestions(db: Session, question: str, wanted: set[str], shown: set[int]) -> list[dict[str, Any]]:
+    """Retrieval suggestions (RAG on): saved answers to related questions for a person to look at. They never change
+    the status above and are never an answer; for a work-authorization, visa or sponsorship question no suggested
+    answer text is shown at all, because only the person's own verified answer or profile may answer it."""
+    from app.services.rag_retrieval import suggest_answers
+
+    try:
+        found = suggest_answers(db, db.info["user_id"], question, exclude=shown)
+    except Exception:  # noqa: BLE001  suggestions are optional; the deterministic answer above stands
+        return []
+    if wanted & PROFILE_ANSWERS["work_authorization"][0]:
+        found = [{**item, "answer": None} for item in found]
+    return found
 
 
 def _clean_options(options: Any) -> list[str]:

@@ -412,6 +412,51 @@ change has to keep:
   gone. LangGraph owns its checkpoint tables (`PostgresSaver.setup()`); Alembic ignores them (`app/migrations/env.py`).
   Never hold a database transaction open while opening a saver: its setup builds indexes concurrently.
 
+## Candidate knowledge retrieval (RAG)
+
+`app/services/embeddings.py`, `evidence_tags.py`, `rag_index.py`, `rag_retrieval.py`, `vector_store.py` and
+`rag_eval.py` back retrieval (README §9d). The rules a change has to keep:
+
+* **Embeddings go through `EmbeddingService`, never `LLMClient`.** `LLMClient.generate_prompt` is for generation. An
+  embedding call goes through `EmbeddingService.embed_documents/embed_query`, which uses the LiteLLM gateway's
+  `/v1/embeddings` through the instrumented client. Never call a provider's embedding API from a service.
+* **The embedding model is configuration.** It is the EMBEDDER worker's FIXED model (`ai_workers`, capability
+  `EMBEDDING`, seeded off), changed through draft → apply.
+  * Apply refuses an embedding model of unknown size, a chat model on the Embedder, and an embedding model on a chat
+    worker.
+  * An embedder has no fallbacks: vectors of another model cannot be compared.
+  * Never hard-code a model or a vector size outside tests.
+* **Never guess an embedding cost.** The cost is what LiteLLM reports (`x-litellm-response-cost`), recorded on the
+  external call row; when it reports none, the cost stays NULL. Embedding calls do not write `llm_request_logs`.
+  Text and vectors are never logged.
+* **Never compare incompatible vectors.** An index version is one model × vector size × document format
+  (`EmbeddingModel.identity_hash`; bump `RAG_DOC_FORMAT_VERSION` when `rag_index.evidence_text/answer_text` change).
+  * A new identity builds a new version beside the SERVING one and replaces it only at full coverage.
+  * Queries are embedded with the serving version's own model (`EmbeddingService.for_version`).
+  * Every vector is checked against the configured size before it is stored.
+* **Scope before scoring, for every job.** Resolve the job's resume with `resume_verification.for_job`, then take
+  `evidence_tags.allowed_evidence_ids` for it, before any keyword or vector work.
+  * A fact verified only on another resume is never a candidate, however similar it is.
+  * A person's pin and a person's tags beat similarity.
+  * Do not add a retrieval path that starts from the account's whole evidence bank.
+* **Resume tags: the person's choice wins.** Automation writes AUTO links only (`sync_evidence`, extraction) and never
+  recreates a link a person excluded. Only `evidence_tags` writes `evidence_resume_links`.
+* **The index is derived and never authoritative.**
+  * Retrieval reads the live Evidence row every time, and uses a vector only while its `content_hash` equals the live
+    text's.
+  * The flush listener in `rag_index` keeps entries in step with edits, verification changes and deletions. It does
+    metadata-only writes and never calls a model in a request; a sweep repairs anything missed.
+  * Index writes after the model call are lease-guarded.
+* **Explicit `user_id` in raw SQL.** Vector and full-text queries are `text()` SQL, which tenancy does not filter, so
+  every one names the account. The rag tables cascade on account deletion.
+* **Sensitive answers.** Semantic matches are suggestions, never answers: `knowledge.search` suggestions are
+  `authoritative: false`, never change its status, and show no answer text for work-authorization, visa or
+  sponsorship questions. A sensitive saved answer is embedded by its question only.
+* **The deterministic builder is the fallback.** With `RAG_RETRIEVAL_MODE=off` the context builders must stay
+  byte-identical to the old builders (a test checks this). In `on` mode a retrieval error falls back to them.
+* **`rag_vectors` is created at runtime, not by Alembic** (`vector_store.setup`). A server without pgvector must still
+  start; retrieval then stays full-text. There is no ANN index until a measured account needs one.
+
 ## Traces
 
 `app/services/tracing.py` holds an ambient correlation ID. Scheduler jobs and HTTP requests open one; nested
@@ -500,7 +545,9 @@ grounded in the aggregates; add advisor instructions to `app/prompts/ai_optimiza
 
 Every user-owned table carries `user_id` and is registered in `app/tenancy.py::OWNED_MODELS`, which filters
 every ORM query by the session's account. The AI model configuration tables (`litellm_connections`, `ai_models`, `model_tiers`, `worker_model_configs`,
-`ai_routing_configs`, `ai_config_versions`, `ai_config_audit`) are owned and in that list. The two telemetry tables
+`ai_routing_configs`, `ai_config_versions`, `ai_config_audit`) are owned and in that list, and so are the retrieval tables
+(`evidence_resume_links`, `rag_index_versions`, `rag_index_entries`; the runtime `rag_vectors` table carries `user_id`
+with an ON DELETE CASCADE and is filtered explicitly). The two telemetry tables
 are deliberately not in that list — a call
 can belong to no account — so `app/services/monitoring.py` and `app/services/external_monitoring.py` filter by
 `user_id` explicitly in every query.

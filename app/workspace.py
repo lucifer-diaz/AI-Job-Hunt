@@ -41,7 +41,7 @@ from app.models import (
 )
 from app.prompts import build_evidence_extraction_prompt
 from app.scheduler_hooks import run_soon
-from app.services import ats_keywords, feedback_learning, ranker, resume_length, resume_verification
+from app.services import ats_keywords, evidence_tags, feedback_learning, ranker, resume_length, resume_verification
 from app.services.actors import (
     ACTOR_GROUPS,
     BUILTIN,
@@ -2399,15 +2399,21 @@ def parse_evidence(db: Session = Depends(get_user_db)):
         raise HTTPException(400, str(exc)) from exc
     existing = {e.claim.strip().lower() for e in db.scalars(select(Evidence)).all()}
     added = 0
+    extracted: list[Evidence] = []
     for item in result.get("claims") or []:
         claim = str(item.get("claim", "")).strip() if isinstance(item, dict) else ""
         if not claim or claim.lower() in existing:
             continue
-        # Parsed claims start unverified: only a human can make them eligible for tailoring.
-        db.add(Evidence(claim=claim[:2000], company=str(item.get("company", ""))[:200], role=str(item.get("role", ""))[:200],
-                        skills=[str(s) for s in item.get("skills") or []][:12], verified=False))
+        # Parsed claims start unverified: only a human can make them eligible for tailoring. They come from the
+        # active resume's text, so they are that resume's evidence (an AUTO tag the person can change).
+        row = Evidence(claim=claim[:2000], company=str(item.get("company", ""))[:200], role=str(item.get("role", ""))[:200],
+                       skills=[str(s) for s in item.get("skills") or []][:12], verified=False,
+                       source="llm_extraction")
+        db.add(row)
+        extracted.append(row)
         existing.add(claim.lower())
         added += 1
+    evidence_tags.link_extracted(db, resume_verification.active_resume(db, profile, create=False), extracted)
     db.commit()
     return {"added": added}
 

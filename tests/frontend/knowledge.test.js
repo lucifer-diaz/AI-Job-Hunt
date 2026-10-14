@@ -4,7 +4,7 @@ import { createContext, runInContext } from 'node:vm';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const scripts = ['settings', 'resume_data', 'job_data', 'monitoring', 'orchestration', 'workers', 'knowledge', 'inbox', 'guide', 'job_insights', 'app'].map(name => ({ source: readFileSync(`app/static/${name}.js`, 'utf8').split('/* ───────────── boot ───────────── */')[0], filename: resolve(`app/static/${name}.js`) }));
-const names = ['S', 'D', 'A', 'render', 'readHash', 'setHash', 'knowledgeNavigate', 'knowledgeState', 'knowledgeFiltered', 'knowledgeOpen', 'knowledgeSave', 'loadKnowledge', 'knowledgeCancel', 'knowledgeCopy', 'setF'];
+const names = ['S', 'D', 'A', 'render', 'evidenceTagEvent', 'readHash', 'setHash', 'knowledgeNavigate', 'knowledgeState', 'knowledgeFiltered', 'knowledgeOpen', 'knowledgeSave', 'loadKnowledge', 'knowledgeCancel', 'knowledgeCopy', 'setF'];
 let ui, context, fetchMock, writeText, confirm;
 const response = (data, status = 200) => ({ ok: status < 400, status, text: async () => JSON.stringify(data) });
 const answers = () => [
@@ -132,7 +132,7 @@ describe('Knowledge bank workspace', () => {
   it('saves evidence with trimmed skills and verified semantics', async () => {
     ui.knowledgeNavigate('evidence'); ui.knowledgeOpen(); input('ev-claim', ' Built reliable APIs '); input('ev-skills', ' Python, AWS, '); input('ev-company', 'Acme');
     await ui.knowledgeSave(); expect(fetchMock.mock.calls[0][0]).toBe('/api/evidence');
-    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ claim: 'Built reliable APIs', company: 'Acme', role: '', skills: ['Python', 'AWS'], verified: true });
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ claim: 'Built reliable APIs', company: 'Acme', role: '', skills: ['Python', 'AWS'], verified: true, resume_ids: [] });
     expect(ui.S.forms.ev).toBeUndefined();
   });
   it('opens evidence for a job gap, without discarding existing claim input', async () => {
@@ -186,5 +186,48 @@ describe('Knowledge bank workspace', () => {
     ui.D.knowledge[0].question = '<img src=x onerror=alert(1)>'; ui.D.evidence[0].claim = '<script>alert(1)</script>';
     ui.knowledgeState().errors.answers = '<iframe src=x>'; ui.render(); expect(document.querySelector('#view img, #view iframe')).toBeNull();
     ui.knowledgeNavigate('evidence'); expect(document.querySelector('#view script')).toBeNull();
+  });
+});
+
+describe('Evidence ↔ resume tags', () => {
+  const resumes = () => [{ id: 11, name: 'Backend', version: 1, is_active: true, evidence_in_scope: 3 },
+                         { id: 12, name: 'Data', version: 2, is_active: false, evidence_in_scope: 1 }];
+  beforeEach(() => {
+    ui.D.evidenceResumes = resumes();
+    ui.D.evidence = [
+      { id: 4, claim: 'Built Kafka pipelines', company: 'Acme', role: 'Engineer', skills: [], verified: true, source: 'resume', resumes: [{ id: 11, name: 'Backend', version: 1, origin: 'AUTO' }], all_resumes: false },
+      { id: 5, claim: 'Mentored interns', company: '', role: '', skills: [], verified: true, source: 'manual', resumes: [], all_resumes: true },
+      { id: 6, claim: 'Trained churn models', company: 'Initech', role: 'DS', skills: [], verified: true, source: 'manual', resumes: [{ id: 12, name: 'Data', version: 2, origin: 'USER' }], all_resumes: false },
+    ];
+    ui.knowledgeNavigate('evidence');
+  });
+  it('shows which resume each fact belongs to, auto or the person\'s own, and untagged as all resumes', () => {
+    expect(text()).toContain('Backend · v1 · auto'); expect(text()).toContain('Data · v2'); expect(text()).toContain('All resumes');
+  });
+  it('filters the evidence a resume\'s jobs may use', () => {
+    filter('resume', '12');
+    expect(ui.knowledgeFiltered('evidence').map(e => e.id)).toEqual([5, 6]);
+    filter('resume', 'untagged'); expect(ui.knowledgeFiltered('evidence').map(e => e.id)).toEqual([5]);
+  });
+  it('edits a fact\'s resumes and saves exactly the chosen ones', async () => {
+    await action('ev-tags', 4);
+    const box = document.querySelector('[data-ev-tag="12"]'); box.checked = true; ui.evidenceTagEvent(box);
+    const own = document.querySelector('[data-ev-tag="11"]'); own.checked = false; ui.evidenceTagEvent(own);
+    await action('ev-tags-save', 4);
+    const call = fetchMock.mock.calls.find(c => c[0] === '/api/evidence/4/resumes');
+    expect(call[1].method).toBe('PUT'); expect(JSON.parse(call[1].body)).toEqual({ resume_ids: [12] });
+  });
+  it('tags many facts at once', async () => {
+    for (const id of [5, 6]) { const box = document.querySelector(`[data-ev-select="${id}"]`); box.checked = true; ui.evidenceTagEvent(box); }
+    expect(text()).toContain('2 selected');
+    document.getElementById('ev-bulk-resume').value = '11';
+    await ui.A['ev-bulk']({ dataset: { mode: 'add' } });
+    const call = fetchMock.mock.calls.find(c => c[0] === '/api/evidence/bulk-resumes');
+    expect(JSON.parse(call[1].body)).toEqual({ evidence_ids: [5, 6], add: [11], remove: [] });
+  });
+  it('defaults new evidence to the active resume', async () => {
+    ui.knowledgeOpen(); input('ev-claim', 'Shipped a feature');
+    await ui.knowledgeSave();
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).resume_ids).toEqual([11]);
   });
 });
