@@ -98,6 +98,25 @@ class FakeModel:
                 self.active -= 1
 
 
+@pytest.fixture(autouse=True)
+def no_parsing(monkeypatch):
+    """Ranking only reads parsed descriptions. These tests rank postings directly, so parsing is off unless a test
+    is about waiting for it (and turns it on)."""
+    monkeypatch.setattr(get_settings(), "jd_parse_enabled", False)
+
+
+def mark_parsed(db, job_id):
+    """What a finished parse leaves behind: the parse task COMPLETED and the posting parsed in its current wording."""
+    from app.models import JobDescriptionParseTask
+    from app.services import job_description
+
+    job = db.get(Job, job_id)
+    db.execute(update(JobDescriptionParseTask).where(JobDescriptionParseTask.job_id == job_id)
+               .values(status="COMPLETED"))
+    job.structured_description_status = "PARSED"
+    job.structured_description_hash = job_description.description_hash(job.description or "")
+
+
 @pytest.fixture
 def model(monkeypatch):
     fake = FakeModel()
@@ -261,8 +280,7 @@ def test_a_job_still_being_parsed_is_not_claimed_and_takes_no_batch_slot(pg_sess
     ready = add_jobs(pg_sessions, 1, owner)[0]
     with pg_sessions() as db:
         ranker.sweep(db)
-        db.add(JobDescriptionParseTask(user_id=owner, job_id=waiting, description_hash="h", status="PENDING",
-                                       reason="new", attempt_count=0))
+        mark_parsed(db, ready)
         db.commit()
     with pg_sessions() as db:  # one slot: the older job is not ready, so the ready one gets it
         claimed = ranker.claim(db, worker_id="w", limit=1, ready_accounts=[owner], auto_rank_accounts=[owner])
@@ -271,12 +289,51 @@ def test_a_job_still_being_parsed_is_not_claimed_and_takes_no_batch_slot(pg_sess
         task, = tasks_of(db, waiting)
         assert task.status == "PENDING" and task.attempt_count == 0 and task.next_attempt_at is None
         assert db.get(Job, waiting).state is S.RANK_PENDING  # untouched: never moved to RANKING and parked
-        db.execute(update(JobDescriptionParseTask).where(JobDescriptionParseTask.job_id == waiting)
-                   .values(status="COMPLETED"))
+        mark_parsed(db, waiting)
         db.commit()
     with pg_sessions() as db:  # the parse finished: claimable at once
         again = ranker.claim(db, worker_id="w", limit=1, ready_accounts=[owner], auto_rank_accounts=[owner])
     assert [c.job_id for c in again] == [waiting]
+
+
+def test_queueing_a_ranking_queues_the_parse_it_waits_for(pg_sessions, owner, model, monkeypatch):
+    """Whichever path found the job (discovery, an import, a person), ranking never starts on an unparsed posting."""
+    from app.models import JobDescriptionParseTask
+
+    monkeypatch.setattr(get_settings(), "jd_parse_enabled", True)
+    job_id = add_jobs(pg_sessions, 1, owner)[0]
+    with pg_sessions() as db:
+        ranker.sweep(db)
+        parse, = db.scalars(select(JobDescriptionParseTask).where(JobDescriptionParseTask.job_id == job_id)).all()
+        assert parse.status == "PENDING" and parse.reason == "ranking"
+        assert len(tasks_of(db, job_id)) == 1
+    with pg_sessions() as db:
+        assert ranker.claim(db, worker_id="w", limit=5, ready_accounts=[owner], auto_rank_accounts=[owner]) == []
+        assert db.get(Job, job_id).state is S.RANK_PENDING
+    with pg_sessions() as db:  # a parse that failed for good never holds ranking back: it reads the raw text
+        db.execute(update(JobDescriptionParseTask).where(JobDescriptionParseTask.job_id == job_id)
+                   .values(status="FAILED"))
+        db.commit()
+    with pg_sessions() as db:
+        claimed = ranker.claim(db, worker_id="w", limit=5, ready_accounts=[owner], auto_rank_accounts=[owner])
+    assert [c.job_id for c in claimed] == [job_id]
+
+
+def test_a_ranking_queued_before_its_parse_queues_it_and_waits(pg_sessions, owner, model, monkeypatch):
+    """A task from before the gate (or whose posting changed since) is parked, not ranked on the raw text."""
+    from app.models import JobDescriptionParseTask
+
+    job_id = add_jobs(pg_sessions, 1, owner)[0]
+    with pg_sessions() as db:
+        ranker.sweep(db)  # parsing off: no parse is queued
+    monkeypatch.setattr(get_settings(), "jd_parse_enabled", True)
+    assert rank(pg_sessions)["waiting"] == 1 and model.calls == []
+    with pg_sessions() as db:
+        task, = tasks_of(db, job_id)
+        assert task.status == "PENDING" and task.last_error == "The job description is still being parsed"
+        assert db.scalar(select(JobDescriptionParseTask.status).where(JobDescriptionParseTask.job_id == job_id)) \
+            == "PENDING"
+        assert db.get(Job, job_id).state is S.RANK_PENDING
 
 
 def test_finishing_a_parse_releases_a_ranking_parked_for_it_and_wakes_the_ranker(pg_sessions, owner, model, monkeypatch):

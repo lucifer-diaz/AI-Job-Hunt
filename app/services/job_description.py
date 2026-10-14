@@ -28,7 +28,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import desc, func, or_, select, update
+from sqlalchemy import desc, event, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -804,14 +804,18 @@ def recover_expired(db: Session, now: datetime | None = None) -> int:
     rows = db.scalars(select(JobDescriptionParseTask).where(
         JobDescriptionParseTask.status == PROCESSING, JobDescriptionParseTask.lock_expires_at < now)).all()
     message = "Interrupted: the worker stopped while parsing this description"
+    failed = []
     for task in rows:
         if task.attempt_count >= worker_settings.get(db, task.user_id, "parsing", "max_attempts"):
             _finish(task, FAILED, now, message, ErrorCategory.LEASE_EXPIRED)
             _mark_unparsed(db.get(Job, task.job_id))
+            failed.append(task.job_id)
             continue
         task.status, task.locked_by, task.lock_token, task.lock_expires_at = PENDING, None, None, None
         task.last_error, task.error_category = message, ErrorCategory.LEASE_EXPIRED
     db.commit()
+    for job_id in failed:  # given up on: ranking falls back to the raw text, and starts now
+        hand_to_ranking(db, job_id)
     return len(rows)
 
 
@@ -870,6 +874,12 @@ def process(sessions: Any, claim: ParseClaim) -> str:
             db.commit()
             return outcome
         job_id, parsed_hash = job.id, description_hash(job.description or "")
+        # The wording this attempt reads, not the one the task was queued for: a failure (or a kill) is then judged
+        # against the text it really was about, and ranking never queues the same wording again (hold_for_parse).
+        if task.description_hash != parsed_hash:
+            task.description_hash = parsed_hash
+            db.commit()
+            job = db.get(Job, job_id)
         try:
             with backoff.bypass(claim.run_now):
                 parsed = parse_job_description(db, job, user_id=task.user_id)
@@ -950,21 +960,79 @@ def parse_now(db: Session, job: Job) -> ParsedJobDescription:
 
 # ───────────── waiting, for the ranker ─────────────
 
-def waiting_reason(db: Session, job: Job) -> str | None:
-    """Why ranking should wait for this job's description to be parsed, or None to go ahead.
+PARSE_RUNNING = "The job description is still being parsed"
+PARSE_NOT_QUEUED = "The job description is waiting to be parsed"
+PARSE_AFTER_RECOVERY = "The job description is being recovered before it is parsed"
 
-    Ranking waits only while a parse is queued or running. A failed parse never holds a job back: the ranker
-    falls back to the raw description.
+
+def _parse_wait(db: Session, job: Job) -> str | None:
+    """PARSE_RUNNING, PARSE_NOT_QUEUED (needs a parse that nobody has queued) or None (ranking may go ahead)."""
+    if not get_settings().jd_parse_enabled or not needs_parse(job) or job.domain_match == "NOT_MATCHING":
+        return None
+    queued = next((task for task in db.new
+                   if isinstance(task, JobDescriptionParseTask) and task.job_id == job.id), None)
+    task = queued or db.scalar(select(JobDescriptionParseTask).where(JobDescriptionParseTask.job_id == job.id)
+                               .order_by(desc(JobDescriptionParseTask.id)).limit(1))
+    if task is not None and task.status in ACTIVE_JD_PARSE_STATUSES:
+        # Queued or running, including its final attempt. Every task ends COMPLETED or FAILED (lease recovery fails a
+        # task that used its last attempt), so this wait always ends.
+        return PARSE_RUNNING
+    if task is not None and task.status == FAILED and task.last_error == STOPPED_BY_USER:
+        return None  # a person stopped it: never queued again behind their back (Retry, Run now or re-parse do)
+    if task is not None and task.status == FAILED and task.description_hash == description_hash(job.description or ""):
+        # Its attempts ran out for this very wording (the hash `process` read): ranking falls back to the raw text.
+        return None
+    if _recovering(db, job):
+        # Discovery chose recovery over parsing an unusable stub; recovery queues the parse once the real text arrives.
+        return PARSE_AFTER_RECOVERY
+    return PARSE_NOT_QUEUED  # never queued, or only for an older wording of the posting
+
+
+def _recovering(db: Session, job: Job) -> bool:
+    if any(isinstance(task, JobDescriptionFetchTask) and task.job_id == job.id
+           and task.status in ACTIVE_JD_FETCH_STATUSES for task in db.new):
+        return True
+    return db.scalar(select(JobDescriptionFetchTask.id).where(
+        JobDescriptionFetchTask.job_id == job.id, JobDescriptionFetchTask.status.in_(ACTIVE_JD_FETCH_STATUSES))
+        .limit(1)) is not None
+
+
+def _wake_parser_after_commit(db: Session) -> None:
+    """Start the parse worker once the task it should claim is committed (a nudge before then could find nothing).
+    Only a hint: a rolled-back transaction leaves at most one spare nudge on the session's next commit."""
+    if db.info.get("jd_parsing_nudge"):
+        return
+    db.info["jd_parsing_nudge"] = True
+
+    def wake(session: Session) -> None:
+        session.info.pop("jd_parsing_nudge", None)
+        from app import scheduler_hooks
+
+        scheduler_hooks.nudge("jd_parsing")
+
+    event.listen(db, "after_commit", wake, once=True)
+
+
+def waiting_reason(db: Session, job: Job) -> str | None:
+    """Why ranking should wait for this job's description to be parsed, or None to go ahead. Read only.
+
+    Ranking only ever reads a parsed description: it waits while the parse is queued or running, and for a posting
+    that needs a parse nobody has queued yet (`hold_for_parse` queues it). A failed parse of the current wording
+    never holds a job back: the ranker falls back to the raw description.
     """
-    if not get_settings().jd_parse_enabled or not needs_parse(job):
-        return None
-    task = db.scalar(select(JobDescriptionParseTask).where(JobDescriptionParseTask.job_id == job.id)
-                     .order_by(desc(JobDescriptionParseTask.id)).limit(1))
-    if task is None or task.status in (COMPLETED, FAILED):
-        return None
-    # Queued or running, including its final attempt. Every task ends COMPLETED or FAILED (lease recovery fails a
-    # task that used its last attempt), so this wait always ends.
-    return "The job description is still being parsed"
+    return _parse_wait(db, job)
+
+
+def hold_for_parse(db: Session, job: Job, *, now: datetime | None = None) -> str | None:
+    """`waiting_reason`, queueing the parse ranking is waiting for when there is none. Does not commit.
+
+    Called wherever a ranking is queued (app.services.ranker.enqueue) and again before one runs, so whichever path
+    found the job — discovery, a board import, a person, the backlog — ranking starts only after the parse."""
+    reason = _parse_wait(db, job)
+    if reason == PARSE_NOT_QUEUED and queue_parse(db, job, reason="ranking", now=now) is not None:
+        _wake_parser_after_commit(db)  # a ranking someone asked for now must not wait for the parser's next tick
+        return PARSE_RUNNING
+    return reason
 
 
 # ───────────── where a posting's parse stands, for lists and filters ─────────────
