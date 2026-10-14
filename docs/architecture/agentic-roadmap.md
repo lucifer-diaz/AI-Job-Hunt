@@ -503,7 +503,7 @@ This section is intended to change after *each approved phase merge*. Initial en
 | Phase | Status | PR | Merge SHA | Evaluation / test evidence | Production flag |
 | --- | --- | --- | --- | --- | --- |
 | 1. LangGraph foundation | IN_REVIEW | [#72](https://github.com/triump0870/AI-Job-Hunt/pull/72) | — | 2026-10-13 note below | OFF (`AGENT_GRAPHS_ENABLED=false`) |
-| 2. RAG knowledge layer | IN_REVIEW | `feat/rag-knowledge-layer` | — | 2026-10-15 note below | OFF (`RAG_RETRIEVAL_MODE=off`, `RAG_VECTOR_ENABLED=false`) |
+| 2. RAG knowledge layer | IN_REVIEW | [#74](https://github.com/triump0870/AI-Job-Hunt/pull/74) | — | 2026-10-15 note below | OFF (`RAG_RETRIEVAL_MODE=off`, `RAG_VECTOR_ENABLED=false`) |
 | 3. Qualification graphs | NOT_STARTED | — | — | — | OFF |
 | 4. Preparation / insights graphs | NOT_STARTED | — | — | — | OFF |
 | 5. Application execution | NOT_STARTED | — | — | — | OBSERVE only (planned) |
@@ -558,7 +558,7 @@ Allowed status: NOT_STARTED, PLANNING, IN_PROGRESS, IN_REVIEW, MERGED, BLOCKED, 
 - **Next dependency:** Phase 2 needs this PR approved and merged.
 
 ### 2026-10-15 — Phase 2: RAG knowledge layer
-- **Branch / PR:** `feat/rag-knowledge-layer`, PR to `main`, not merged.
+- **Branch / PR:** `feat/rag-knowledge-layer`, [#74](https://github.com/triump0870/AI-Job-Hunt/pull/74) to `main`, not merged.
 - **Base:** `37bebe2` (Phase 1 #72 and #73 merged).
 - **What shipped:**
   - **`EmbeddingService`** (`app/services/embeddings.py`):
