@@ -317,10 +317,17 @@ def capture_limit(call: ExternalCall) -> int | None:
     return settings.external_api_payload_limit if settings.external_api_debug_payloads else None
 
 
+# A request whose bodies must never be kept, whatever capture says (`extensions={NO_CAPTURE: True}`): the bodies are
+# candidate text or numbers no redaction can recognise, such as embedding inputs and vectors.
+NO_CAPTURE = "jobhunt_no_capture"
+
+
 def capture_payload(call: ExternalCall, request: httpx.Request, response: httpx.Response | None = None,
                     error: BaseException | None = None) -> None:
     """Keep the redacted request and response on the call when capture is on. Never raises."""
     try:
+        if request.extensions.get(NO_CAPTURE):
+            return
         limit = capture_limit(call)
         if not limit:
             return
@@ -403,7 +410,7 @@ class InstrumentedClient(httpx.Client):
                                           method=request.method, url=str(request.url), request_bytes=request_bytes,
                                           error=exc)
             raise
-        if not kwargs.get("stream"):
+        if not kwargs.get("stream") and not request.extensions.get(NO_CAPTURE):
             call.note(request_payload=_payload_extract(request.content),
                       response_payload=_payload_extract(response.content),
                       request_headers=_debug_headers(request.headers))

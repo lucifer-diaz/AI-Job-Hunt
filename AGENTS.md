@@ -424,14 +424,17 @@ change has to keep:
   `EMBEDDING`, seeded off), changed through draft → apply.
   * Apply refuses an embedding model of unknown size, a chat model on the Embedder, and an embedding model on a chat
     worker.
-  * An embedder has no fallbacks: vectors of another model cannot be compared.
+  * An embedder has no fallbacks: vectors of another model cannot be compared. The other way round, no chat slot
+    (primary, `fallback_model`, `secondary_models`, a model's own `fallback_models`) may hold an embedding model.
   * Never hard-code a model or a vector size outside tests.
 * **Never guess an embedding cost.** The cost is what LiteLLM reports (`x-litellm-response-cost`), recorded on the
   external call row; when it reports none, the cost stays NULL. Embedding calls do not write `llm_request_logs`.
-  Text and vectors are never logged.
+  Text and vectors are never logged: the request is sent with `external_api.NO_CAPTURE`, so neither an account's
+  payload capture nor `EXTERNAL_API_DEBUG_PAYLOADS` keeps its bodies.
 * **Never compare incompatible vectors.** An index version is one model × vector size × document format
   (`EmbeddingModel.identity_hash`; bump `RAG_DOC_FORMAT_VERSION` when `rag_index.evidence_text/answer_text` change).
-  * A new identity builds a new version beside the SERVING one and replaces it only at full coverage.
+  * A new identity builds a new version beside the SERVING one and replaces it only at full coverage, counted
+    against the rows as they are when it is promoted (a re-sweep), never a count taken before the embedding calls.
   * Queries are embedded with the serving version's own model (`EmbeddingService.for_version`).
   * Every vector is checked against the configured size before it is stored.
 * **Scope before scoring, for every job.** Resolve the job's resume with `resume_verification.for_job`, then take
@@ -439,7 +442,8 @@ change has to keep:
   * A fact verified only on another resume is never a candidate, however similar it is.
   * A person's pin and a person's tags beat similarity.
   * Do not add a retrieval path that starts from the account's whole evidence bank.
-  * In `on` mode, citations are checked against the same scope (`tailoring_results.verified_evidence`).
+  * In `on` mode, citations are checked against the same scope (`tailoring_results.verified_evidence`), and so is
+    the evidence the verified-facts gate counts (`context_builder.scoped_evidence`).
 * **Resume tags: the person's choice wins.** Automation writes AUTO links only (`sync_evidence`, extraction) and never
   recreates a link a person excluded. Only `evidence_tags` writes `evidence_resume_links`.
 * **The index is derived and never authoritative.**

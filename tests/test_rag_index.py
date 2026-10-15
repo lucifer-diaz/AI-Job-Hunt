@@ -228,6 +228,29 @@ def _pack(data, key):
         return rag_retrieval.retrieve_evidence(db, profile, job)
 
 
+def test_a_fact_added_while_a_version_builds_keeps_it_from_serving_until_covered(data):
+    inner = rs.ConceptBackend()
+
+    class AddsAFact:
+        """Embeds normally; during the first call a person verifies a new fact (the build is mid-run)."""
+        added = False
+
+        def embed(self, model, texts, operation):
+            if not self.added:
+                self.added = True
+                with rs.session_for(SessionLocal, data.user_id) as db:
+                    db.add(Evidence(user_id=data.user_id, claim="Led a payments migration", verified=True,
+                                    source="manual"))
+                    db.commit()
+            return inner.embed(model, texts, operation)
+
+    first = run(data, AddsAFact())
+    assert first["status"] == "BUILDING" and first["eligible"] == len(data.facts) + 1
+    assert first["covered"] == len(data.facts)  # the new fact is pending, so the version does not serve yet
+    second = run(data)
+    assert second["status"] == "SERVING" and second["covered"] == second["eligible"] == len(data.facts) + 1
+
+
 def test_vectors_of_different_sizes_are_never_compared(data):
     run(data)
     with rs.session_for(SessionLocal, data.user_id) as db:

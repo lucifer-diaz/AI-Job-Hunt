@@ -616,12 +616,22 @@ Allowed status: NOT_STARTED, PLANNING, IN_PROGRESS, IN_REVIEW, MERGED, BLOCKED, 
   - Un-verifying a fact deletes its vector immediately, also from a process that never set the vector store up; the
     sweep removes any left behind.
   - With `on`, tailoring citations are checked against the job's resume scope.
+- **Code review fixes (2026-10-16):**
+  - Embedding requests are sent with `external_api.NO_CAPTURE`. Before, an account's payload capture or
+    `EXTERNAL_API_DEBUG_PAYLOADS` kept candidate evidence text and vectors in external-call telemetry.
+  - Apply refuses an embedding model in any chat failover slot (`fallback_model`, `secondary_models`, a text model's
+    own `fallback_models`), not only as the primary.
+  - A version is promoted only after a re-sweep: a fact verified or added while it was building now keeps it from
+    serving until that fact is embedded.
+  - With `on`, the verified-facts gate of tailoring and cover letters counts only evidence of the job's own resume.
+  - Not changed: the indexer is still not a `WorkerKind` (ADR-023). Running workers is job-bound, so this is a
+    separate follow-up, needed before vectors are turned on in production.
 - **Tests** (the reviewer's runs on head with the review fixes: PostgreSQL 16.8 + pgvector 0.8.7, `jobhunt` conda env,
   `mcp` 1.30 on `PYTHONPATH` because the env has 2.x):
   - **New suites:** `test_embeddings.py`, `test_rag_index.py`, `test_rag_retrieval.py`, `test_rag_eval.py` and
-    `test_rag_postgres.py`, plus Evidence-bank tag tests in vitest. On PostgreSQL with `test_migrations.py`: 70 passed.
-  - **SQLite:** 2050 passed, 102 skipped, 1 failed (`test_mcp` stdio server, which fails on `main` too).
-  - **PostgreSQL:** 2143 passed, 2 skipped, 8 failed: the same 8 tests fail on untouched `main`.
+    `test_rag_postgres.py`, plus Evidence-bank tag tests in vitest. On PostgreSQL with `test_migrations.py`: 75 passed.
+  - **SQLite:** 2057 passed, 102 skipped, 1 failed (`test_mcp` stdio server, which fails on `main` too).
+  - **PostgreSQL:** 2150 passed, 2 skipped, 8 failed: the same 8 tests fail on untouched `main`.
   - **vitest:** 320 passed, 2 failed (`overview_outcomes`, which fails on `main` too).
   - **Migrations:** `test_migrations.py` on PostgreSQL covers upgrade, downgrade to baseline and back, and an empty
     metadata diff. A manual upgrade → `rag_vectors` setup → downgrade to 0044 → upgrade cycle left no rag table behind.

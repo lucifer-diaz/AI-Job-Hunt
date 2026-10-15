@@ -89,6 +89,22 @@ def test_validation_keeps_embedding_and_chat_models_apart(account, litellm):
                for e in errors)
 
 
+def test_no_chat_failover_slot_may_hold_an_embedding_model(account, litellm):
+    litellm.deployments.append(embedding_deployment("embed-other", "openai/other", 16))
+    configure(account, litellm, apply=False)
+    # A chat primary with an embedding model as its fallback or a secondary: failover would send it a chat request.
+    account.worker("RANKER", model_mode="FIXED", primary_model="tier-1-fast", fallback_model="embed-small",
+                   secondary_models=["embed-other"])
+    errors = account.call("POST", "/preview")["validation"]["errors"]
+    paths = {e["path"] for e in errors if "embedding model" in e["message"]}
+    assert {"workers.RANKER.fallback_model", "workers.RANKER.secondary_models.0"} <= paths
+    account.worker("RANKER", fallback_model=None, secondary_models=[])
+    account.call("PUT", "/models/tier-1-fast", json={"revision": account.revision(), "fallback_models": ["embed-small"]})
+    errors = account.call("POST", "/preview")["validation"]["errors"]
+    assert any(e["path"] == "models.tier-1-fast.fallback_models.0" and "embedding model" in e["message"]
+               for e in errors)
+
+
 def test_an_embedding_model_of_unknown_size_cannot_be_applied_until_a_test_measures_it(account, litellm):
     configure(account, litellm, name="embed-nosize", size=None, apply=False)
     errors = account.call("POST", "/preview")["validation"]["errors"]
@@ -121,6 +137,23 @@ def test_embeddings_go_through_litellm_with_reported_cost_and_no_text_in_telemet
     assert meta["model"] == "embed-small" and meta["answered_model"] == "openai/text-embedding-3-small"
     stored = json.dumps({"meta": row.request_metadata, "payload": row.payload, "error": row.error_message})
     assert "confidential phrasing" not in stored
+
+
+@pytest.mark.parametrize("switch", ["account", "server"])
+def test_payload_capture_never_keeps_embedding_text_or_vectors(account, litellm, monkeypatch, switch):
+    from app.services import llm_telemetry
+
+    if switch == "account":  # the account's own capture switch (Monitoring → Logs)
+        monkeypatch.setattr(llm_telemetry, "account_captures", lambda user_id: True)
+    else:  # EXTERNAL_API_DEBUG_PAYLOADS, for every account
+        monkeypatch.setattr(get_settings(), "external_api_debug_payloads", True)
+    configure(account, litellm)
+    service(account.user_id).embed_documents([SECRET_TEXT])
+    [row] = rows(account.user_id)
+    assert row.status == "SUCCEEDED" and row.payload is None and (row.request_size_bytes or 0) > 0
+    meta = row.request_metadata or {}
+    assert "request_payload" not in meta and "response_payload" not in meta
+    assert "confidential phrasing" not in json.dumps({"meta": meta, "payload": row.payload}, default=str)
 
 
 def test_unreported_cost_stays_unknown(account, litellm):

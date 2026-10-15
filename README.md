@@ -1895,7 +1895,8 @@ EMBEDDING model. It is seeded off.
   A model of unknown size, a chat model on the Embedder, or an embedding model on a chat worker is refused at Apply.
 - **Gateway only.** Requests go to LiteLLM's `/v1/embeddings` through the instrumented client. Every call is a row in
   Monitoring → External APIs (`LITELLM / embedding`) with the model that answered and the cost LiteLLM reported;
-  when it reports none, the cost stays empty. Text and vectors are never logged.
+  when it reports none, the cost stays empty. Text and vectors are never logged, even with payload capture or
+  `EXTERNAL_API_DEBUG_PAYLOADS` on: only sizes, status and cost are recorded.
 - **Other providers.** Outside gateway mode there are no embeddings, and retrieval runs on full-text alone.
 - **Sensitive answers.** These are embedded by their question only.
 

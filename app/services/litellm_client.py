@@ -28,7 +28,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from app.services.external_api import RateLimitedCooldown, external_client
+from app.services.external_api import NO_CAPTURE, RateLimitedCooldown, external_client
 from app.services.redaction import redact_text, redact_value
 from app.settings import get_settings
 
@@ -271,7 +271,9 @@ class LiteLLMAPI:
                 call.record_usage(cost=facts.get("response_cost"), source="provider_reported")
 
         started = time.monotonic()
-        extensions: dict[str, Any] = {"operation": operation, "on_response": report,
+        # NO_CAPTURE: the inputs are candidate evidence and the answer is vectors, so neither is kept even when an
+        # account's payload capture or EXTERNAL_API_DEBUG_PAYLOADS is on; sizes, status and cost are still recorded.
+        extensions: dict[str, Any] = {"operation": operation, "on_response": report, NO_CAPTURE: True,
                                       "metadata": {"model": model, **(metadata or {})}}
         try:
             response = self.client.request("POST", "/v1/embeddings", json={"model": model, "input": inputs},

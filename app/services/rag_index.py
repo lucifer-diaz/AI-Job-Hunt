@@ -392,7 +392,7 @@ def run_account(sessions, user_id: int, *, at: datetime | None = None,
 
         evidence_tags.backfill(db, user_id)
         version = ensure_version(db, user_id, service.identity)
-        eligible = sweep(db, user_id, version)
+        sweep(db, user_id, version)
         version_id, dimensions = version.id, version.dimensions
         db.commit()
     totals: dict[str, Any] = {"user_id": user_id, "index_version": version_id, "embedded": 0, "reused": 0,
@@ -418,7 +418,9 @@ def run_account(sessions, user_id: int, *, at: datetime | None = None,
     with sessions() as db:
         db.info["user_id"] = user_id
         version = db.get(RagIndexVersion, version_id)
-        refresh_counts(db, version, eligible)
+        # Coverage is judged against the rows as they are now, not as they were before the embedding calls: a fact
+        # verified or added meanwhile gets its PENDING entry here and keeps an incomplete version from serving.
+        refresh_counts(db, version, sweep(db, user_id, version))
         if error:
             version.last_error = error
         totals["serving"] = maybe_serve(db, user_id, version) or version.status == "SERVING"
