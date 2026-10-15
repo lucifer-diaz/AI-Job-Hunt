@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text
 
 from app import auth
 from app.auth import CurrentUser
@@ -242,6 +242,36 @@ def test_a_killed_tailoring_run_stops_for_good_and_can_never_save(user_id, signe
         assert db.scalar(select(ResumeVariant).where(ResumeVariant.job_id == job_id)) is None
         assert db.get(TailorTask, fresh).status == "cancelled"
         assert db.get(TailorTask, fresh).run_now_at is None  # the run-now marker was used once and cleared
+        db.execute(delete(TailorTask))
+        db.commit()
+
+
+def test_a_savepoint_in_a_tailoring_run_never_locks_its_task(user_id, signed_in, monkeypatch):
+    """A savepoint released mid-run (retrieval does one) must not lock the task row: on PostgreSQL the lock would last
+    until the run's real commit, so the next progress() and any Kill — other connections writing that row — would
+    wait for it forever."""
+    with SessionLocal() as db:
+        db.execute(delete(TailorTask))
+        job = add_job(db, user_id, status="shortlisted")
+        db.add(TailorTask(user_id=user_id, job_id=job.id, status="queued", stage="queued", attempts=0))
+        db.commit()
+    task_id = tailor_tasks.claim_next(SessionLocal, "worker-1", 900)
+    client = signed_in(user_id)
+
+    def tailor(db, job, progress, pages=None):
+        with db.begin_nested():
+            db.get(Job, job.id)
+        with SessionLocal() as other:  # what Kill does to the row, but failing fast instead of waiting forever
+            if other.get_bind().dialect.name == "postgresql":
+                other.execute(text("SET LOCAL lock_timeout = '2s'"))
+            other.execute(select(TailorTask.id).where(TailorTask.id == task_id).with_for_update()).first()
+            other.rollback()
+        progress("tailoring")
+        client.post(f"/api/workers/tailoring/tasks/{task_id}/kill").raise_for_status()
+    monkeypatch.setattr(tailor_tasks, "tailor_job", tailor)
+    assert tailor_tasks.run_task(SessionLocal, task_id, "worker-1", 900) == "failed"  # the stub saves no packet
+    with SessionLocal() as db:
+        assert (db.get(TailorTask, task_id).status, db.get(TailorTask, task_id).error) == ("cancelled", "Stopped by you")
         db.execute(delete(TailorTask))
         db.commit()
 
