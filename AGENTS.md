@@ -439,13 +439,15 @@ change has to keep:
   * A fact verified only on another resume is never a candidate, however similar it is.
   * A person's pin and a person's tags beat similarity.
   * Do not add a retrieval path that starts from the account's whole evidence bank.
+  * In `on` mode, citations are checked against the same scope (`tailoring_results.verified_evidence`).
 * **Resume tags: the person's choice wins.** Automation writes AUTO links only (`sync_evidence`, extraction) and never
   recreates a link a person excluded. Only `evidence_tags` writes `evidence_resume_links`.
 * **The index is derived and never authoritative.**
   * Retrieval reads the live Evidence row every time, and uses a vector only while its `content_hash` equals the live
     text's.
   * The flush listener in `rag_index` keeps entries in step with edits, verification changes and deletions. It does
-    metadata-only writes and never calls a model in a request; a sweep repairs anything missed.
+    metadata-only writes and never calls a model in a request; a sweep repairs anything missed. Un-verifying a fact
+    deletes its vector at once: a withdrawn fact keeps no vector.
   * Index writes after the model call are lease-guarded.
 * **Explicit `user_id` in raw SQL.** Vector and full-text queries are `text()` SQL, which tenancy does not filter, so
   every one names the account. The rag tables cascade on account deletion.

@@ -80,7 +80,7 @@ def test_a_first_build_covers_every_verified_row_and_serves(data):
     assert run(data)["embedded"] == 0  # nothing changed: no model call
 
 
-def test_an_edit_is_reembedded_and_an_unchanged_reverify_reuses_the_vector(data):
+def test_an_edit_is_reembedded_and_an_unverified_fact_keeps_no_vector(data):
     run(data)
     spy = Spy()
     with rs.session_for(SessionLocal, data.user_id) as db:
@@ -92,13 +92,27 @@ def test_an_edit_is_reembedded_and_an_unchanged_reverify_reuses_the_vector(data)
     with rs.session_for(SessionLocal, data.user_id) as db:  # un-verify, then verify again without an edit
         db.get(Evidence, data.facts["pycon_talk"]).verified = False
         db.commit()
-    assert entries(data, source_id=data.facts["pycon_talk"])[0].status == "DEACTIVATED"
+    entry = entries(data, source_id=data.facts["pycon_talk"])[0]
+    assert entry.status == "DEACTIVATED" and entry.content_hash is None
+    with SessionLocal() as db:  # the withdrawn fact's vector is gone at once, not left for retention
+        assert db.execute(text("SELECT COUNT(*) FROM rag_vectors WHERE entry_id = :e"), {"e": entry.id}).scalar() == 0
     with rs.session_for(SessionLocal, data.user_id) as db:
         db.get(Evidence, data.facts["pycon_talk"]).verified = True
         db.commit()
     spy = Spy()
     summary = run(data, spy)
-    assert summary["reused"] == 1 and summary["embedded"] == 0 and spy.texts == []
+    assert summary["embedded"] == 1 and summary["reused"] == 0 and len(spy.texts) == 1
+
+
+def test_the_sweep_removes_a_vector_left_behind_by_a_missed_unverify(data):
+    run(data)
+    with rs.session_for(SessionLocal, data.user_id) as db:  # a bulk UPDATE: no flush listener sees it
+        db.execute(update(Evidence).where(Evidence.id == data.facts["pycon_talk"]).values(verified=False))
+        db.commit()
+    before = vectors(data)
+    run(data)
+    entry = entries(data, source_id=data.facts["pycon_talk"])[0]
+    assert entry.status == "DEACTIVATED" and vectors(data) == before - 1
 
 
 def test_a_deletion_removes_its_entries_vectors_and_tags(data):

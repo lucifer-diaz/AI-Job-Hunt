@@ -1882,7 +1882,7 @@ answer. For work authorization, visa or sponsorship questions no suggested answe
 
 | Setting | Default | What it does |
 | --- | --- | --- |
-| `RAG_RETRIEVAL_MODE` | `off` | `off`: the deterministic builder, unchanged. `shadow`: unchanged too, but retrieval runs beside it and the difference (ids only) goes to Monitoring → Logs (`rag_shadow`). `on`: job contexts take their evidence from retrieval, and fall back to the old builder if retrieval fails. |
+| `RAG_RETRIEVAL_MODE` | `off` | `off`: the deterministic builder, unchanged. `shadow`: unchanged too, but retrieval runs beside it and the difference (ids only) goes to Monitoring → Logs (`rag_shadow`). `on`: job contexts take their evidence from retrieval, and fall back to the old builder if retrieval fails; a tailored resume or cover letter may then cite only evidence of the job's own resume. |
 | `RAG_VECTOR_ENABLED` | `false` | Adds embeddings: the `rag_index` job and vector similarity. Without it retrieval is keyword and full-text only. |
 | `RAG_CONTEXT_TOKEN_BUDGET` / `RAG_MAX_CANDIDATES` | `1200` / `50` | The pack's token budget, and how many candidates each signal contributes. |
 | `RAG_INDEX_MINUTES`, `RAG_EMBED_BATCH_SIZE`, `RAG_INDEX_MAX_ENTRIES_PER_RUN`, `RAG_INDEX_MAX_ATTEMPTS` | `10`, `32`, `500`, `5` | The index job's cadence, batch, per-run cap and retries. |
@@ -1902,8 +1902,8 @@ EMBEDDING model. It is seeded off.
 **The index** (`rag_index_versions`, `rag_index_entries`, migration 0045; vectors in `rag_vectors`):
 - **What it is.** It is derived, and it is rebuilt from the Evidence and KnowledgeAnswer rows.
 - **Keeping up with edits.** Editing, un-verifying or deleting a fact updates its entries in the same transaction:
-  it is re-embedded, deactivated or removed. The `rag_index` job embeds what is pending, and a sweep repairs anything
-  missed.
+  it is re-embedded, deactivated or removed. An un-verified fact's vector is deleted at once, not kept until a
+  retention pass. The `rag_index` job embeds what is pending, and a sweep repairs anything missed.
 - **New model or size.** A new embedding model or vector size builds a new index version beside the serving one. It
   replaces it only once complete, and queries are embedded with the serving version's own model, so vectors of
   different models or sizes are never compared.
@@ -1911,6 +1911,10 @@ EMBEDDING model. It is seeded off.
 - **Vector table.** `rag_vectors` is created at runtime when the PostgreSQL server has the pgvector extension (the
   Compose file uses `pgvector/pgvector:pg17`; `brew install pgvector` locally). Without the extension the app starts
   normally and retrieval stays full-text. On SQLite it is a JSON table, with similarity computed in Python.
+- **Existing Compose volumes.** The image used to be `postgres:17-alpine`. Both are PostgreSQL 17, so an existing data
+  volume starts, but Alpine (musl) and the Debian-based pgvector image (glibc) sort text differently. If PostgreSQL
+  warns about a collation version mismatch, run `REINDEX DATABASE jobhunt;` and then
+  `ALTER DATABASE jobhunt REFRESH COLLATION VERSION;` once.
 
 ```text
 GET  /api/rag/status                 retrieval mode, embedding availability, index versions and coverage

@@ -169,10 +169,23 @@ def delete_entries(conn: Connection | Session, entry_ids: list[int]) -> None:
     if not entry_ids:
         return
     bind = conn.get_bind() if isinstance(conn, Session) else conn
-    if not _state.get(_key(bind), (False,))[0]:
+    known = _state.get(_key(bind))
+    if known is None:  # this process has not set the store up (a web request): look, without creating anything
+        if not _table_exists(conn):
+            return
+    elif not known[0]:
         return
     for chunk in _chunks(entry_ids):
         conn.execute(text(f"DELETE FROM {TABLE} WHERE entry_id IN ({_marks(chunk)})"), _binds(chunk))
+
+
+def _table_exists(conn: Connection | Session) -> bool:
+    bind = conn.get_bind() if isinstance(conn, Session) else conn
+    if bind.dialect.name == "postgresql":
+        query = text(f"SELECT to_regclass('{TABLE}') IS NOT NULL")
+    else:
+        query = text(f"SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = '{TABLE}'")
+    return bool(conn.execute(query).scalar())
 
 
 def search(db: Session, *, user_id: int, index_version_id: int, dimensions: int, query: list[float],

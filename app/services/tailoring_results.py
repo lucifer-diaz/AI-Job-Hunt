@@ -21,6 +21,7 @@ deterministic, and the same checks run for both paths:
 """
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
 
@@ -31,6 +32,9 @@ from sqlalchemy.orm import Session
 from app.models import CandidateProfile, Evidence, Job
 from app.services.resume_format import parse_resume, to_plain
 from app.services.workflow import _best_match
+from app.settings import get_settings
+
+log = logging.getLogger("jobhunt.tailoring_results")
 
 # A bullet without evidence must restate a master resume bullet at least this closely (share of its words).
 RESTATEMENT_THRESHOLD = 0.6
@@ -151,9 +155,29 @@ def _term_supported(term: str, supported: set[str]) -> bool:
 
 
 def verified_evidence(db: Session, job: Job) -> dict[int, Evidence]:
-    """This account's verified evidence, by ID. Evidence of other accounts is never visible."""
+    """This account's verified evidence, by ID. Evidence of other accounts is never visible. With
+    RAG_RETRIEVAL_MODE=on, only the evidence the job's own resume may use (app.services.evidence_tags), the same scope
+    its context was built from, so a citation of another resume's fact is refused like an unknown one."""
     rows = db.scalars(select(Evidence).where(Evidence.user_id == job.user_id, Evidence.verified.is_(True))).all()
-    return {e.id: e for e in rows}
+    evidence = {e.id: e for e in rows}
+    scope = _resume_scope(db, job)
+    return evidence if scope is None else {i: e for i, e in evidence.items() if i in scope}
+
+
+def _resume_scope(db: Session, job: Job) -> set[int] | None:
+    if get_settings().rag_mode != "on":
+        return None
+    from app.services import rag_retrieval
+
+    profile = db.scalar(select(CandidateProfile).where(CandidateProfile.user_id == job.user_id))
+    if profile is None:
+        return None
+    try:
+        return rag_retrieval.scope(db, profile, job)[1]
+    except Exception:  # like retrieval itself: on error, the account-wide check of the deterministic path
+        log.warning("resume scope for job %s could not be read; checking against all verified evidence", job.id,
+                    exc_info=True)
+        return None
 
 
 def _same_employer(a: str, b: str) -> bool:
@@ -206,7 +230,8 @@ def validate_tailored_resume(db: Session, profile: CandidateProfile, job: Job, d
         unknown = [i for i in bullet.evidence_ids if i not in evidence]
         if unknown:
             issues.append(_issue("UNKNOWN_EVIDENCE", location,
-                                 f"Evidence IDs {unknown} are not verified evidence of this account"))
+                                 f"Evidence IDs {unknown} are not verified evidence of this account"
+                                 + (" that this job's resume may use" if get_settings().rag_mode == "on" else "")))
         cited = [evidence[i] for i in bullet.evidence_ids if i in evidence]
         for item in cited:
             if not _same_employer(item.company, employer):

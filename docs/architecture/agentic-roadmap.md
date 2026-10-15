@@ -572,12 +572,14 @@ Allowed status: NOT_STARTED, PLANNING, IN_PROGRESS, IN_REVIEW, MERGED, BLOCKED, 
       embedder fallbacks.
     - Discovery reads `output_vector_size`; model and worker tests measure it.
   - **Evidence ↔ resume tags** (`evidence_resume_links`, ADR-022), in the backend and the Evidence bank UI:
-    - AUTO from verification and extraction; USER from the person, with removals kept.
+    - AUTO from verification and extraction; USER from the person. A person's removal of a resume fact's tag is kept
+      (`excluded`) so verification never re-adds it; for manual or extracted evidence, removing a tag deletes the link.
     - Per-row editor, bulk tagging, a resume filter, and new evidence defaulting to the active resume.
   - **Derived index:**
     - `rag_index_versions` and `rag_index_entries` (migration 0045); `rag_vectors` is created at runtime when pgvector
       exists (ADR-023).
     - A flush listener handles edits, verification changes and deletions; a sweep repairs anything missed.
+      Un-verifying a fact deletes its vector at once.
     - Claims and writes are lease-guarded; the backfill is versioned and switches over at full coverage.
     - Retired versions are purged by `cleanup`.
     - The `rag_index` scheduler job runs only when `RAG_VECTOR_ENABLED`.
@@ -591,6 +593,8 @@ Allowed status: NOT_STARTED, PLANNING, IN_PROGRESS, IN_REVIEW, MERGED, BLOCKED, 
       Shadow writes id-only comparisons to Monitoring → Logs.
     - `knowledge.search` gains non-authoritative `suggestions`, with answer text withheld for
       work-authorization/visa/sponsorship questions.
+    - With `on`, `tailoring_results.verified_evidence` checks citations against the job's resume scope, so a tailored
+      resume or letter citing another resume's fact is refused.
   - **Evaluation:** `rag_eval.py`, `scripts/rag_eval.py`, and a labelled benchmark (`tests/fixtures/rag_eval/`, 8 jobs,
     14 facts, 2 resumes with conflicting Acme experience, all pin types).
 - **Measurements** (benchmark; the concept embedder is a synthetic stand-in, not a model):
@@ -603,25 +607,38 @@ Allowed status: NOT_STARTED, PLANNING, IN_PROGRESS, IN_REVIEW, MERGED, BLOCKED, 
 
   Real-model recall was **not measured**: no reachable embedding model with credentials in this environment. Run
   `scripts/rag_eval.py --litellm-url … --model … --dimensions …` before turning vectors on.
-- **Tests** (local, PostgreSQL 16 + pgvector 0.8.7 built for PG16, `jobhunt` conda env):
+- **Review fixes (2026-10-16, independent review):**
+  - Re-verifying a resume no longer deletes the AUTO tag extraction gave evidence extracted from it. Before, that
+    evidence became untagged and reached every resume's jobs.
+  - Clearing every tag on manual or extracted evidence now makes it apply to every resume, as the Evidence bank shows.
+    Before, the resume it came from stayed excluded.
+  - Resume names (by default the uploaded file name) are escaped in the new-evidence form.
+  - Un-verifying a fact deletes its vector immediately, also from a process that never set the vector store up; the
+    sweep removes any left behind.
+  - With `on`, tailoring citations are checked against the job's resume scope.
+- **Tests** (the reviewer's runs on head with the review fixes: PostgreSQL 16.8 + pgvector 0.8.7, `jobhunt` conda env,
+  `mcp` 1.30 on `PYTHONPATH` because the env has 2.x):
   - **New suites:** `test_embeddings.py`, `test_rag_index.py`, `test_rag_retrieval.py`, `test_rag_eval.py` and
-    `test_rag_postgres.py`, plus Evidence-bank tag tests in vitest.
-  - **SQLite:** 1984 passed, 102 skipped, 1 failed. The failure is
-    `test_agents_tracing[error]`, which is flaky on `main` too.
-  - **PostgreSQL:** 2078 passed, 8 failed. Seven are the same failures as on untouched `main`. The eighth,
-    `test_agents_postgres` API, passes 3/3 in isolation (timing).
-  - **vitest:** 319 passed, 2 failed (`overview_outcomes`, which fails on `main` too).
+    `test_rag_postgres.py`, plus Evidence-bank tag tests in vitest. On PostgreSQL with `test_migrations.py`: 70 passed.
+  - **SQLite:** 2050 passed, 102 skipped, 1 failed (`test_mcp` stdio server, which fails on `main` too).
+  - **PostgreSQL:** 2143 passed, 2 skipped, 8 failed: the same 8 tests fail on untouched `main`.
+  - **vitest:** 320 passed, 2 failed (`overview_outcomes`, which fails on `main` too).
   - **Migrations:** `test_migrations.py` on PostgreSQL covers upgrade, downgrade to baseline and back, and an empty
-    metadata diff.
-  - **Lint:** ruff is level with `main` (229).
+    metadata diff. A manual upgrade → `rag_vectors` setup → downgrade to 0044 → upgrade cycle left no rag table behind.
+  - **Lint:** ruff is level with `main` (229); the changed files are clean.
 - **Known gaps:**
   - Pack-level relevance cut-off is by budget and candidates only.
   - Company intelligence and application-history collections are deferred to Phase 4.
   - Existing untagged manual evidence applies to every resume until tagged.
-  - `tailoring_results.verified_evidence` still validates against the account's verified evidence (citations are
-    bounded by the context's allowed ids).
+  - With `off` or `shadow`, tailoring still checks citations against the account's verified evidence, as on `main`.
+  - The indexer is not a `WorkerKind` (ADR-023): no kill, run-now or retry in Running workers, and embedding calls do
+    not appear in Model performance.
+  - With `shadow` and vectors on, every context build embeds one query (cached per account); follow the rollout order.
 - **Rollback:** `RAG_RETRIEVAL_MODE=off`, `RAG_VECTOR_ENABLED=false`. Optionally downgrade 0045, which also drops
   `rag_vectors`.
+- **Compose upgrade:** the image changes from `postgres:17-alpine` to `pgvector/pgvector:pg17` (same major version,
+  glibc instead of musl). On an existing volume, if PostgreSQL warns about a collation version mismatch, run
+  `REINDEX DATABASE jobhunt;` and `ALTER DATABASE jobhunt REFRESH COLLATION VERSION;` once.
 - **Next dependency:** Phase 3 needs this PR approved and merged.
 
 ### Phase update template

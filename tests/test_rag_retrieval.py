@@ -292,3 +292,26 @@ def test_the_mcp_evidence_selection_follows_the_same_scope_when_on(monkeypatch, 
     assert selected() & forbidden  # off: account-wide, as before
     monkeypatch.setattr(get_settings(), "rag_retrieval_mode", "on")
     assert selected() and not selected() & forbidden
+
+
+def test_on_tailoring_refuses_a_citation_of_another_resumes_fact(monkeypatch, data):
+    from app.services.tailoring_results import (
+        BulletIn,
+        TailoredResumeIn,
+        validate_tailored_resume,
+        verified_evidence,
+    )
+
+    case = next(c for c in data.cases if c.key == "ml_churn")
+    other = min(case.forbidden)  # verified, but only on the backend resume; the job uses the data resume
+
+    def unknown_evidence():
+        with rs.session_for(SessionLocal, data.user_id) as db:
+            profile, job = rs.profile_and_job(db, data.jobs["ml_churn"])
+            issues = validate_tailored_resume(db, profile, job, TailoredResumeIn(
+                job_id=job.id, resume_bullets=[BulletIn(text="Built event pipelines", evidence_ids=[other])]))
+            return [i for i in issues if i["code"] == "UNKNOWN_EVIDENCE"], other in verified_evidence(db, job)
+    assert unknown_evidence() == ([], True)  # off: the account-wide check, as before
+    monkeypatch.setattr(get_settings(), "rag_retrieval_mode", "on")
+    issues, known = unknown_evidence()
+    assert not known and len(issues) == 1 and "this job's resume" in issues[0]["message"]

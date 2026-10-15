@@ -159,12 +159,16 @@ def apply_changes(conn: Any, pending: dict[str, set]) -> None:
             conn.execute(delete(links).where(links.c.evidence_id == source_id))
     for status, keys in (("PENDING", pending["edited"]), ("DEACTIVATED", pending["unverified"])):
         for user_id, source_type, source_id in keys:
+            where = (entries.c.user_id == user_id, entries.c.source_type == source_type,
+                     entries.c.source_id == source_id)
+            values: dict[str, Any] = {}
+            if status == "DEACTIVATED":  # a withdrawn fact keeps no vector made from its text
+                vector_store.delete_entries(conn, list(conn.execute(select(entries.c.id).where(*where)).scalars()))
+                values = {"content_hash": None, "embedded_at": None}
             # Clearing the lease makes an indexer that read the old text unable to store its vector.
-            conn.execute(update(entries).where(
-                entries.c.user_id == user_id, entries.c.source_type == source_type, entries.c.source_id == source_id)
-                .values(status=status, lock_token=None, lock_expires_at=None, next_attempt_at=None,
-                        attempt_count=0, deactivated_at=stamp if status == "DEACTIVATED" else None,
-                        updated_at=stamp))
+            conn.execute(update(entries).where(*where).values(
+                status=status, lock_token=None, lock_expires_at=None, next_attempt_at=None, attempt_count=0,
+                deactivated_at=stamp if status == "DEACTIVATED" else None, updated_at=stamp, **values))
     if pending["resumes"]:
         links = EvidenceResumeLink.__table__
         conn.execute(delete(links).where(links.c.resume_id.in_(list(pending["resumes"]))))
@@ -213,16 +217,21 @@ def sweep(db: Session, user_id: int, version: RagIndexVersion) -> int:
         elif entry.status in ("ACTIVE", "DEACTIVATED") and entry.content_hash != content_hash(body):
             entry.status, entry.sensitive, entry.verification_status = "PENDING", sensitive, "VERIFIED"
             entry.deactivated_at, entry.attempt_count, entry.updated_at = None, 0, stamp
-    gone = []
+    gone, withdrawn = [], []
     for key, entry in entries.items():
         if key in live:
             continue
         exists = db.get(Evidence if key[0] == EVIDENCE else KnowledgeAnswer, key[1]) is not None
         if not exists:
             gone.append(entry.id)
-        elif entry.status != "DEACTIVATED":
-            entry.status, entry.verification_status = "DEACTIVATED", "UNVERIFIED"
-            entry.deactivated_at, entry.updated_at = stamp, stamp
+        else:
+            withdrawn.append(entry.id)  # also repairs a deactivation whose vector was left behind
+            if entry.status != "DEACTIVATED":
+                entry.status, entry.verification_status = "DEACTIVATED", "UNVERIFIED"
+                entry.deactivated_at, entry.updated_at = stamp, stamp
+            entry.content_hash, entry.embedded_at = None, None
+    if withdrawn:
+        vector_store.delete_entries(db, withdrawn)
     if gone:
         vector_store.delete_entries(db, gone)
         db.execute(delete(RagIndexEntry).where(RagIndexEntry.id.in_(gone)))
@@ -283,8 +292,10 @@ def process(sessions, user_id: int, service: EmbeddingService, version_id: int, 
             if found is None:
                 exists = db.get(Evidence if source_type == EVIDENCE else KnowledgeAnswer, source_id) is not None
                 if exists:
-                    out["deactivated"] += _guarded(db, entry_id, claimed.token, status="DEACTIVATED",
-                                                   verification_status="UNVERIFIED", deactivated_at=now())
+                    if _guarded(db, entry_id, claimed.token, status="DEACTIVATED", verification_status="UNVERIFIED",
+                                deactivated_at=now(), content_hash=None, embedded_at=None):
+                        vector_store.delete_entries(db, [entry_id])
+                        out["deactivated"] += 1
                 else:
                     vector_store.delete_entries(db, [entry_id])
                     db.execute(delete(RagIndexEntry).where(RagIndexEntry.id == entry_id,
