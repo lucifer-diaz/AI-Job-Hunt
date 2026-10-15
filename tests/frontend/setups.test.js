@@ -227,7 +227,8 @@ describe('actor picker', () => {
     ui.D.actors.placeholders = ['role', 'is_remote', 'seniority'];
     ui.S.addActor = true;
     ui.setF('ca', 'input_template', '{\n  "remote": false\n}');
-    ui.S.caFields = [{ name: 'seniority', type: 'array', suggested: '{{seniority}}' }, { name: 'note', type: 'string', suggested: '' }];
+    ui.S.caFields = [{ name: 'seniority', type: 'array', suggested: '{{seniority}}' }, { name: 'note', type: 'string', suggested: '' },
+      { name: 'skill', type: 'array', suggested: ['{{skill}}'] }];
     ui.render();
     const box = document.getElementById('ca-input_template');
     box.selectionStart = box.value.indexOf('false'); box.selectionEnd = box.selectionStart + 5;
@@ -235,6 +236,10 @@ describe('actor picker', () => {
     expect(JSON.parse(document.getElementById('ca-input_template').value)).toEqual({ remote: '{{is_remote}}' });
     document.querySelector('[data-act="insert-actor-field"][data-name="seniority"]').dispatchEvent(new MouseEvent('click', { bubbles: true }));
     expect(JSON.parse(document.getElementById('ca-input_template').value)).toEqual({ remote: '{{is_remote}}', seniority: '{{seniority}}' });
+    const skill = document.querySelector('[data-act="insert-actor-field"][data-name="skill"]');
+    expect(skill.textContent).toContain('[{{skill}}]');
+    skill.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    expect(JSON.parse(document.getElementById('ca-input_template').value).skill).toEqual(['{{skill}}']);
   });
 
   it('labels the primary skill placeholders and shows a template that reads them on its card', () => {

@@ -244,8 +244,19 @@ def test_more_than_25_actors_from_before_sharing_are_kept_and_still_save():
 
 
 def test_an_actors_skill_fields_are_suggested_the_primary_skill_placeholders():
-    from app.workspace import GUESSES
+    from app.workspace import guess_placeholder
 
-    guess = lambda name: next((value for pattern, value in GUESSES if pattern.match(name)), "")  # noqa: E731
-    assert [guess(n) for n in ("skill", "primarySkill", "skills", "techStack", "skillsTerms")] == \
+    assert [guess_placeholder(n) for n in ("skill", "primarySkill", "skills", "techStack", "skillsTerms")] == \
         ["{{skill}}", "{{skill}}", "{{skills}}", "{{skills}}", "{{skills}}"]
+
+
+def test_a_suggested_placeholder_fits_the_fields_declared_type():
+    from app.workspace import guess_placeholder
+
+    assert guess_placeholder("skills", {"type": "string"}) == "{{skill}}", "a string field gets one value, not a list"
+    assert guess_placeholder("searchTerms", {"type": "string"}) == "{{role}}"
+    assert guess_placeholder("sites", {"type": "string"}) == "", "no one-value form: no guess rather than a wrong type"
+    assert guess_placeholder("skill", {"type": "array"}) == ["{{skill}}"], "an array field gets a list"
+    assert guess_placeholder("location", {"type": "array"}) == ["{{location}}"]
+    assert guess_placeholder("skills", {"type": "array"}) == "{{skills}}"
+    assert guess_placeholder("maxItems", {"type": "integer"}) == "{{max_results}}"

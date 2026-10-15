@@ -1362,6 +1362,24 @@ GUESSES = [(re.compile(r"^(search_?term|keywords?|query|search|search_?keywords?
            (re.compile(r"^(has_?salary|salary_?only)$", re.I), "{{salary_only}}"),
            (re.compile(r"^(skill|primary_?skill|main_?skill)$", re.I), "{{skill}}"),
            (re.compile(r"^(skills|primary_?skills|skills?_?terms|tech_?stack|technologies)$", re.I), "{{skills}}")]
+# Placeholders that fill in a list, and the one-value form of each that has one.
+LIST_PLACEHOLDERS = {"roles", "locations", "skills", "sites", "seniority", "exclude_keywords", "linkedin_company_ids",
+                     "yc_batches", "remote_platforms"}
+ONE_OF = {"roles": "role", "locations": "location", "skills": "skill"}
+
+
+def guess_placeholder(name: str, prop: dict | None = None) -> str | list[str]:
+    """The placeholder for an actor input field, guessed from its name and fitted to its declared type: a value that
+    is only a placeholder keeps its own type, so a string field gets the one-value form and an array field a list."""
+    guess = next((value for pattern, value in GUESSES if pattern.match(name)), "")
+    kind, placeholder = (prop or {}).get("type"), guess[2:-2]
+    if not guess:
+        return ""
+    if kind == "string" and placeholder in LIST_PLACEHOLDERS:
+        return f"{{{{{ONE_OF[placeholder]}}}}}" if placeholder in ONE_OF else ""
+    if kind == "array" and placeholder not in LIST_PLACEHOLDERS:
+        return [guess]
+    return guess
 
 
 @router.post("/api/search/actors/lookup")
@@ -1391,18 +1409,16 @@ def lookup_actor(payload: ActorLookupIn, db: Session = Depends(get_user_db)):
     properties = (schema or {}).get("properties") or {}
     template = {}
     for name, prop in properties.items():
-        guess = next((value for pattern, value in GUESSES if pattern.match(name)), None)
+        guess = guess_placeholder(name, prop)
         if guess:
             template[name] = guess
         elif name in (schema.get("required") or []) and "prefill" in prop:
             template[name] = prop["prefill"]
-    def suggest(name: str) -> str:
-        return next((value for pattern, value in GUESSES if pattern.match(name)), "")
 
     return {"id": f"{info.get('username', payload.id.split('/')[0])}/{info.get('name', payload.id.split('/')[-1])}",
             "name": info.get("title") or info.get("name") or payload.id,
             "summary": (info.get("description") or "")[:300],
-            "fields": [{"name": n, "type": p.get("type", ""), "title": p.get("title", ""), "required": n in (schema.get("required") or []), "suggested": suggest(n),
+            "fields": [{"name": n, "type": p.get("type", ""), "title": p.get("title", ""), "required": n in (schema.get("required") or []), "suggested": guess_placeholder(n, p),
                         **{k: p[k] for k in ("default", "prefill") if k in p}}
                        for n, p in properties.items()],
             "input_template": template}
