@@ -272,7 +272,14 @@ def run_task(sessions: SessionFactory, task_id: int, worker_id: str, lease_secon
 
         def still_held(session: Session) -> None:
             """Every commit of this run (the packet, the review, the job's status) checks, inside the same
-            transaction, that this run still holds its task: a run stopped from Running workers can never save."""
+            transaction, that this run still holds its task: a run stopped from Running workers can never save.
+
+            SQLAlchemy fires before_commit on a savepoint release too. Locking the task row there would keep it
+            locked by this open transaction, and the next progress() (another connection writing that row) would
+            wait for it forever — the run hangs and Kill hangs behind it. A savepoint saves nothing; only the real
+            commit is checked."""
+            if session.in_nested_transaction():
+                return
             held = session.execute(select(TailorTask.id).where(TailorTask.id == task_id, TailorTask.status == "running",
                                                                TailorTask.locked_by == worker_id)
                                    .with_for_update()).first()

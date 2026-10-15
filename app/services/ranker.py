@@ -284,13 +284,14 @@ REMOVED_BY_USER = "Removed from ranking by you"
 
 
 def removed_by_user(db: Session, job: Job) -> bool:
-    """True when the job is SKIPPED because the user took it out of the ranking queue (remove_from_ranking)."""
+    """True when the job is SKIPPED because the user took it out of the ranking queue (remove_from_ranking) or
+    stopped its ranking from Running workers (workers.kill)."""
     if job.state is not S.SKIPPED or job.previous_state not in (S.NORMALIZED, S.FILTERED, S.RANK_PENDING):
         return False
     reason = db.scalar(select(WorkflowTransition.reason).where(WorkflowTransition.job_id == job.id,
                                                                WorkflowTransition.to_state == S.SKIPPED)
                        .order_by(desc(WorkflowTransition.id)).limit(1))
-    return reason == REMOVED_BY_USER
+    return reason in (REMOVED_BY_USER, STOPPED_BY_USER)
 
 
 def remove_from_ranking(db: Session, job_ids: Iterable[int], *, actor: str,
