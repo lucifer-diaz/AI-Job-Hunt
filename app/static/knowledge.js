@@ -151,7 +151,7 @@ function knowledgeEvidenceFields() {
   return `${knowledgeField('ev', 'claim', 'Achievement or factual claim', S.evidencePrefill || '', 'For example: Cut cloud spend by 35% in 2024.', true)}
     <div class="knowledge-field-grid">${knowledgeField('ev', 'company', 'Company', '')}${knowledgeField('ev', 'role', 'Role', '')}</div>
     ${knowledgeField('ev', 'skills', 'Skills', '', 'Separate skills with commas, for example: Python, AWS.')}
-    ${evidenceResumes().length ? `<fieldset class="knowledge-field"><legend>Belongs to</legend>${evidenceResumes().map(r => checkF('ev', `resume_${r.id}`, evidenceDefaultResume(r), evidenceResumeName(r))).join('')}<p class="xs muted">Jobs only use evidence of the resume they are matched to. Leave all unchecked for evidence that applies to every resume.</p></fieldset>` : ''}
+    ${evidenceResumes().length ? `<fieldset class="knowledge-field"><legend>Belongs to</legend>${evidenceResumes().map(r => checkF('ev', `resume_${r.id}`, evidenceDefaultResume(r), esc(evidenceResumeName(r)))).join('')}<p class="xs muted">Jobs only use evidence of the resume they are matched to. Leave all unchecked for evidence that applies to every resume.</p></fieldset>` : ''}
     <p class="knowledge-verification small">By saving, you confirm this claim is accurate. Verified evidence can be cited in tailored resumes.</p>`;
 }
 function knowledgeEditor(section) {

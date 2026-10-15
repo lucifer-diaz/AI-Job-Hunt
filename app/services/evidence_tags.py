@@ -1,8 +1,9 @@
 """Which resume a piece of evidence belongs to (evidence_resume_links), and which evidence a job may use.
 
     AUTO links    written when a resume's facts are verified (resume_verification.sync_evidence) or extracted from it
-    USER links    a person's own tags (Evidence Bank); a person's removal of an AUTO link is kept as `excluded`, so
-                  automation never adds it back — the same rule as resume pins: a person's choice wins
+    USER links    a person's own tags (Evidence Bank); a person's removal of a resume fact's link is kept as `excluded`,
+                  so verification never adds it back — the same rule as resume pins: a person's choice wins. Other
+                  evidence is linked by automation only once (extraction), so removing its tag just deletes the link
 
 The scope rule job-specific retrieval applies before any scoring (`allowed_evidence_ids`), for one resume R:
 
@@ -86,16 +87,21 @@ def allowed_evidence_ids(db: Session, user_id: int, resume: Resume | None) -> se
 
 def sync_auto_links(db: Session, resume: Resume, evidence_ids: set[int]) -> None:
     """After a resume's facts were (re)verified: AUTO-link the evidence it verifies, and drop AUTO links of this resume
-    to evidence it no longer verifies. USER links and a person's exclusions are left exactly as they are."""
+    to resume evidence it no longer verifies. USER links, a person's exclusions and the AUTO links of evidence
+    extracted from the resume (not a verified fact of it) are left exactly as they are."""
     existing = {link.evidence_id: link for link in db.scalars(select(EvidenceResumeLink).where(
         EvidenceResumeLink.user_id == resume.user_id, EvidenceResumeLink.resume_id == resume.id)).all()}
     for evidence_id in evidence_ids:
         if evidence_id not in existing:
             db.add(EvidenceResumeLink(user_id=resume.user_id, evidence_id=evidence_id, resume_id=resume.id,
                                       origin=AUTO, excluded=False, created_at=now(), updated_at=now()))
-    for evidence_id, link in existing.items():
-        if link.origin == AUTO and not link.excluded and evidence_id not in evidence_ids:
-            db.delete(link)
+    stale = [evidence_id for evidence_id, link in existing.items()
+             if link.origin == AUTO and not link.excluded and evidence_id not in evidence_ids]
+    if stale:
+        from_resume = set(db.scalars(select(Evidence.id).where(
+            Evidence.user_id == resume.user_id, Evidence.source == "resume", Evidence.id.in_(stale))).all())
+        for evidence_id in from_resume:
+            db.delete(existing[evidence_id])
 
 
 def link_extracted(db: Session, resume: Resume | None, evidence: list[Evidence]) -> None:
@@ -155,9 +161,10 @@ def _evidence(db: Session, user_id: int, evidence_id: int) -> Evidence:
 
 
 def set_resumes(db: Session, user_id: int, evidence_id: int, resume_ids: list[int]) -> dict[str, Any]:
-    """Make `resume_ids` exactly the resumes this evidence belongs to. Resumes it leaves keep a record of the person's
-    removal when automation had linked them (`excluded`), so a later verification does not add them back. An empty
-    list makes manual evidence apply to every resume again; resume evidence then applies to none."""
+    """Make `resume_ids` exactly the resumes this evidence belongs to. For resume evidence, resumes it leaves keep a
+    record of the person's removal when verification had linked them (`excluded`), so a later verification does not
+    add them back; for other evidence the link is simply removed. An empty list makes manual or extracted evidence
+    apply to every resume again; resume evidence then applies to none."""
     row = _evidence(db, user_id, evidence_id)
     wanted = _owned_resumes(db, user_id, resume_ids)
     links = {link.resume_id: link for link in _links(db, user_id, [evidence_id])}
@@ -174,8 +181,8 @@ def set_resumes(db: Session, user_id: int, evidence_id: int, resume_ids: list[in
         if link is None:  # a fact_key match without a stored link yet: record the person's removal
             db.add(EvidenceResumeLink(user_id=user_id, evidence_id=row.id, resume_id=resume_id, origin=USER,
                                       excluded=True, created_at=now(), updated_at=now()))
-        elif link.origin == USER and not link.excluded and resume_id not in derived:
-            db.delete(link)
+        elif row.source != "resume" or (link.origin == USER and not link.excluded and resume_id not in derived):
+            db.delete(link)  # nothing re-adds it: only a resume's verified facts are linked again automatically
         else:
             link.excluded, link.origin, link.updated_at = True, USER, now()
     db.flush()

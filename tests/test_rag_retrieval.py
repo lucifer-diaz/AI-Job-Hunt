@@ -266,6 +266,18 @@ def test_extracted_evidence_belongs_to_the_resume_it_was_extracted_from(data):
         assert [(link.resume_id, link.origin) for link in links] == [(active.id, "AUTO")]
         data_resume = db.get(rs.Resume, data.resumes["data"])
         assert row.id not in evidence_tags.allowed_evidence_ids(db, data.user_id, data_resume)
+        # Re-verifying the resume it came from keeps the tag (it is not one of that resume's verified facts).
+        from app.services import resume_verification
+
+        resume_verification.sync_evidence(db, active)
+        db.commit()
+        assert [link.resume_id for link in db.scalars(select(EvidenceResumeLink).where(
+            EvidenceResumeLink.evidence_id == row.id)).all()] == [active.id]
+        assert row.id not in evidence_tags.allowed_evidence_ids(db, data.user_id, data_resume)
+        # Clearing its tags makes it apply to every resume, the one it came from included, as the Evidence Bank says.
+        assert evidence_tags.set_resumes(db, data.user_id, row.id, [])["all_resumes"] is True
+        db.commit()
+        assert all(row.id in evidence_tags.allowed_evidence_ids(db, data.user_id, r) for r in (active, data_resume))
         db.execute(update(Evidence).where(Evidence.id == row.id).values(verified=False))
         db.commit()
 

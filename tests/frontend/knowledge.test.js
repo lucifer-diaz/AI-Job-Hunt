@@ -230,4 +230,11 @@ describe('Evidence ↔ resume tags', () => {
     await ui.knowledgeSave();
     expect(JSON.parse(fetchMock.mock.calls[0][1].body).resume_ids).toEqual([11]);
   });
+  it('escapes resume names (an uploaded file name) everywhere they are shown', () => {
+    ui.D.evidenceResumes[0].name = '<img src=x onerror=alert(1)>';
+    ui.D.evidence[0].resumes[0].name = '<img src=x onerror=alert(1)>';
+    ui.render(); ui.knowledgeOpen();
+    expect(document.querySelector('#view img')).toBeNull();
+    expect(text()).toContain('<img src=x onerror=alert(1)> · v1 (active)');
+  });
 });
