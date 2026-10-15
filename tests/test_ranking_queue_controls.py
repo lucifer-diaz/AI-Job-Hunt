@@ -114,6 +114,23 @@ def test_asking_to_rank_a_removed_job_puts_it_back_in_the_queue(owner):
     assert next(t for t in tracker()["recent"] if t["job_id"] == job_id)["removed"] is False
 
 
+def test_asking_to_rank_a_stopped_job_puts_it_back_in_the_queue(owner):
+    """A ranking stopped from Running workers leaves the job SKIPPED; ranking it from its own screen works again."""
+    job_id = queued(owner, "Lead Engineer", "Singapore", status="PROCESSING")
+    with SessionLocal() as db:
+        task_id = db.scalar(select(JobRankingTask.id).where(JobRankingTask.job_id == job_id))
+    assert client.post(f"/api/workers/ranking/tasks/{task_id}/kill").status_code == 200
+    with SessionLocal() as db:
+        assert db.get(Job, job_id).state is S.SKIPPED
+    response = client.post(f"/api/jobs/{job_id}/rank")
+    assert response.status_code == 202, response.text
+    with SessionLocal() as db:
+        assert db.get(Job, job_id).state is S.RANK_PENDING
+        tasks = db.scalars(select(JobRankingTask).where(JobRankingTask.job_id == job_id)
+                           .order_by(JobRankingTask.id)).all()
+    assert [t.status for t in tasks] == ["SKIPPED", "PENDING"]
+
+
 def test_only_a_skip_the_user_made_can_be_undone(owner):
     """A job skipped for any other reason (here: dismissed in triage) stays skipped when ranking is asked for."""
     job_id = queued(owner, "Lead Engineer", "Singapore")
