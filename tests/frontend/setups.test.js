@@ -131,6 +131,20 @@ describe('saved search setups', () => {
     expect(other.actors).toEqual(['openclawai/job-board-scraper']);
   });
 
+  it('sends only what was done to your own actors, and says which schedules a removal paused', async () => {
+    const mine = { id: 'me/jobs', name: 'Mine', fan_out: 'role', input_template: {} };
+    ui.setF('sp', 'custom_actors', [mine]); ui.setF('sp', 'actors', ['me/jobs']);
+    ui.render();
+    document.querySelector('[data-act="remove-actor"][data-actor="me/jobs"]').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    expect([ui.setupPayload().removed_actors, ui.setupPayload().changed_actors]).toEqual([['me/jobs'], []]);
+    ui.D.setups[1].settings = { ...ui.D.setups[1].settings, custom_actors: [mine], actors: ['me/jobs'] };
+    fetchMock.mockImplementation(async () => response({ setup: setup(1, 'Remote AI'), paused_setups: ['Mumbai leadership'] }));
+    await ui.A['save-search']();
+    expect(document.getElementById('toast').textContent).toContain('schedule paused for “Mumbai leadership”');
+    expect(ui.D.setups[1]).toMatchObject({ enabled: false, settings: { custom_actors: [], actors: [] } });
+    expect(ui.setupPayload().removed_actors).toEqual([]);  // the saved form starts clean
+  });
+
   it('runs the selected setup after saving it', async () => {
     const calls = [];
     fetchMock.mockImplementation(async (url, opts) => {
@@ -204,6 +218,7 @@ describe('actor picker', () => {
     ui.A['add-actor']();
     const saved = ui.S.forms.sp.custom_actors;
     expect(saved.map(c => c.id)).toEqual(['me/jobs', 'me/other']);
+    expect(ui.setupPayload().changed_actors).toEqual(['me/jobs']);
     expect(saved[0]).toMatchObject({ name: 'Renamed', fan_out: 'role', input_template: { q: '{{role}}', limit: '{{max_results}}' } });
     expect(ui.S.editActor).toBeNull();
   });

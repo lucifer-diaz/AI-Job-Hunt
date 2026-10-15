@@ -1246,8 +1246,9 @@ class SearchProfileIn(BaseModel):
     # Python, Java…: the first is added to each role's search, and imported jobs must mention one of them.
     primary_skills: list[str] = Field(default_factory=list, max_length=3)
     actors: list[str] = Field(default_factory=lambda: list(DEFAULT_ACTORS), max_length=10)
-    # Shared by every setup of the account (share_custom_actors), so the limit is the account's.
-    custom_actors: list[CustomActorIn] = Field(default_factory=list, max_length=25)
+    # Shared by every setup of the account (share_custom_actors), which holds additions to MAX_CUSTOM_ACTORS; this bound
+    # only keeps a payload sane, so a library from before sharing that is a little over the cap can still be saved.
+    custom_actors: list[CustomActorIn] = Field(default_factory=list, max_length=100)  # PAYLOAD_ACTOR_LIMIT
     sites: list[str] = Field(default_factory=lambda: ["linkedin", "indeed", "glassdoor"])
     remote_platforms: list[str] = Field(default_factory=lambda: list(REMOTE_PLATFORMS))
     remoteok_url: str = "https://remoteok.com/remote-jobs"
@@ -1482,6 +1483,10 @@ MIGRATED_KEY = "search_profile_migrated"
 class SavedSearchIn(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     settings: SearchProfileIn
+    # What the person did to their own actors in this form (added or edited; removed). Only these change the account's
+    # shared actors: one merely missing from, older in or still left in a stale form is never taken for a change.
+    changed_actors: list[str] = Field(default_factory=list, max_length=100)
+    removed_actors: list[str] = Field(default_factory=list, max_length=100)
     schedule_kind: str = "manual"
     every_hours: int = Field(default=24, ge=1, le=168)
     time_of_day: str = Field(default="07:00", max_length=5)
@@ -1528,32 +1533,53 @@ def apply_saved_search(setup: SavedSearch, payload: SavedSearchIn) -> SavedSearc
     return setup
 
 
-def share_custom_actors(db: Session, saved: SavedSearch | None = None, before: list[dict] | None = None) -> None:
+MAX_CUSTOM_ACTORS = 25
+PAYLOAD_ACTOR_LIMIT = 100  # SearchProfileIn.custom_actors
+
+
+def share_custom_actors(db: Session, saved: SavedSearch | None = None, changed: list[str] | tuple = (),
+                        removed: list[str] | tuple = (), before: list[dict] | None = None) -> list[str]:
     """Actors a person adds belong to the account, not to one setup: every setup lists the same ones.
 
-    `saved` is the setup just written, whose entries win; ids it had `before` and no longer has were removed, so they
-    leave every setup (and its selection). Ticking an actor stays per setup: a shared actor arrives unticked.
+    `saved` is the setup just written. Its actors join (or replace) the shared copy only when named in `changed`, the
+    ones the person added or edited in that form; ids in `removed` leave every setup and its selection. Anything else
+    in the saved form is ignored, so a stale form never undoes, brings back or deletes another setup's change. Ticking stays per setup: a shared actor
+    arrives unticked. Returns the names of scheduled setups whose last ticked actor was removed; their schedule is
+    paused, since a setup with nothing ticked has nothing to run.
     """
     setups = list(db.scalars(select(SavedSearch).order_by(SavedSearch.id)).all())
-    mine = {c["id"]: c for c in ((saved.settings or {}).get("custom_actors") or [])} if saved else {}
-    removed = {c.get("id") for c in before or []} - set(mine)
+    removed = set(removed)
     library: dict[str, dict] = {}
-    for setup in setups:
-        if setup is saved:
-            continue
-        for entry in (setup.settings or {}).get("custom_actors") or []:
-            if entry.get("id") and entry["id"] not in removed:
-                library[entry["id"]] = entry
-    library.update(mine)
-    shared = list(library.values())
+    for entry in [*(before or []), *(e for s in setups if s is not saved for e in (s.settings or {}).get("custom_actors") or [])]:
+        if entry.get("id") and entry["id"] not in removed:
+            library.setdefault(entry["id"], entry)
+    known = set(library)
+    for entry in ((saved.settings or {}).get("custom_actors") or []) if saved else []:
+        if entry["id"] in changed and entry["id"] not in removed:
+            library[entry["id"]] = entry
+    added = set(library) - known
+    if added and len(library) > MAX_CUSTOM_ACTORS:
+        raise HTTPException(422, f"You can add up to {MAX_CUSTOM_ACTORS} of your own actors across your setups; "
+                                 "remove one before adding another")
+    if len(library) > PAYLOAD_ACTOR_LIMIT:
+        return []  # older setups with this many between them could not be saved at all; leave each its own
+    shared, paused = list(library.values()), []
     for setup in setups:
         settings = dict(setup.settings or {})
         if (settings.get("custom_actors") or []) != shared:
             settings["custom_actors"] = shared
-        if removed & set(settings.get("actors") or []):  # an absent selection means the defaults; leave it so
-            settings["actors"] = [a for a in settings["actors"] if a not in removed]
+        selection = settings.get("actors")  # absent means the defaults; leave it so
+        if selection is not None:
+            # A tick on a user-added actor that is no longer shared (removed here, or elsewhere after a form loaded).
+            kept = [a for a in selection if a in BUILTIN or a in library]
+            if kept != selection:
+                settings["actors"] = kept
+                if not kept and setup.enabled and setup.schedule_kind != "manual":
+                    setup.enabled = False  # nothing left to run; plan_runs refuses an empty selection too
+                    paused.append(setup.name)
         if settings != (setup.settings or {}):
             setup.settings = settings
+    return paused
 
 
 def ensure_saved_searches(db: Session) -> list[SavedSearch]:
@@ -1606,9 +1632,9 @@ def saved_search_create(payload: SavedSearchIn, db: Session = Depends(get_user_d
     setup = apply_saved_search(SavedSearch(), payload)
     db.add(setup)
     db.flush()
-    share_custom_actors(db, setup)
+    paused = share_custom_actors(db, setup, payload.changed_actors, payload.removed_actors)
     db.commit()
-    return {"setup": saved_search_card(setup)}
+    return {"setup": saved_search_card(setup), "paused_setups": paused}
 
 
 @router.put("/api/search/setups/{setup_id}")
@@ -1624,7 +1650,7 @@ def saved_search_update(setup_id: int, payload: SavedSearchIn, request: Request,
     before = discovery.setup_choice(setup)
     actors_before = list((setup.settings or {}).get("custom_actors") or [])
     apply_saved_search(setup, payload)
-    share_custom_actors(db, setup, actors_before)
+    paused = share_custom_actors(db, setup, payload.changed_actors, payload.removed_actors, actors_before)
     moved = None
     if discovery.setup_choice(setup) != before:
         db.flush()
@@ -1632,7 +1658,8 @@ def saved_search_update(setup_id: int, payload: SavedSearchIn, request: Request,
     db.commit()
     if moved and moved["ranking_queued"]:
         run_soon(background, request.app, "ranking")
-    return {"setup": saved_search_card(setup), **({"resume_jobs": moved} if moved is not None else {})}
+    return {"setup": saved_search_card(setup), "paused_setups": paused,
+            **({"resume_jobs": moved} if moved is not None else {})}
 
 
 @router.delete("/api/search/setups/{setup_id}")

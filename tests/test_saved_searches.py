@@ -140,24 +140,76 @@ def test_one_account_cannot_see_or_run_anothers_setup():
     assert client.post(f"/api/search/setups/{other_id}/duplicate").status_code == 404
 
 
+def actor(actor_id, **extra):
+    return {"id": actor_id, "name": actor_id, "fan_out": "role", "input_template": {}, **extra}
+
+
+def by_name():
+    return {s["name"]: s for s in listed()}
+
+
 def test_actors_a_person_adds_are_listed_in_every_setup():
-    mine = {"id": "me/jobs", "name": "Mine", "fan_out": "role", "input_template": {"q": "{{role}} {{skill}}"}}
-    first = client.post("/api/search/setups", json=setup_body("Remote AI", settings={"custom_actors": [mine], "actors": ["me/jobs"]})).json()["setup"]
+    mine = actor("me/jobs", input_template={"q": "{{role}} {{skill}}"})
+    first = client.post("/api/search/setups", json=setup_body("Remote AI", changed_actors=["me/jobs"], settings={
+        "custom_actors": [mine], "actors": ["me/jobs"]})).json()["setup"]
     second = client.post("/api/search/setups", json=setup_body("Mumbai")).json()["setup"]
     assert second["settings"]["custom_actors"] == [mine], "a new setup lists the actors already added"
     assert "me/jobs" not in second["settings"]["actors"], "a shared actor arrives unticked"
 
-    edited = {**mine, "name": "Renamed"}
-    other = {"id": "me/other", "name": "Other", "fan_out": "role", "input_template": {}}
-    client.put(f"/api/search/setups/{second['id']}", json=setup_body("Mumbai", settings={"custom_actors": [edited, other]}))
-    by_id = {s["id"]: s["settings"] for s in listed()}
-    assert by_id[first["id"]]["custom_actors"] == [edited, other], "an edit and an addition reach every setup"
-    assert by_id[first["id"]]["actors"] == ["me/jobs"], "ticking stays per setup"
+    edited, other = {**mine, "name": "Renamed"}, actor("me/other")
+    client.put(f"/api/search/setups/{second['id']}", json=setup_body(
+        "Mumbai", changed_actors=["me/jobs", "me/other"], settings={"custom_actors": [edited, other]}))
+    assert by_name()["Remote AI"]["settings"]["custom_actors"] == [edited, other], "an edit and an addition reach every setup"
+    assert by_name()["Remote AI"]["settings"]["actors"] == ["me/jobs"], "ticking stays per setup"
 
-    client.put(f"/api/search/setups/{second['id']}", json=setup_body("Mumbai", settings={"custom_actors": [other]}))
-    by_id = {s["id"]: s["settings"] for s in listed()}
-    assert by_id[first["id"]]["custom_actors"] == [other], "a removal reaches every setup"
-    assert "me/jobs" not in by_id[first["id"]]["actors"]
+    client.put(f"/api/search/setups/{second['id']}", json=setup_body(
+        "Mumbai", removed_actors=["me/jobs"], settings={"custom_actors": [other]}))
+    assert by_name()["Remote AI"]["settings"]["custom_actors"] == [other], "a removal reaches every setup"
+    assert by_name()["Remote AI"]["settings"]["actors"] == []
+    assert first["id"]
+
+
+def test_a_stale_form_neither_deletes_brings_back_nor_reverts_an_actor():
+    a, b = actor("me/a"), actor("me/b")
+    one = client.post("/api/search/setups", json=setup_body("One", changed_actors=["me/a"], settings={"custom_actors": [a]})).json()["setup"]
+    two = client.post("/api/search/setups", json=setup_body("Two")).json()["setup"]
+    stale_two = two["settings"]  # loaded now: lists a, not b
+    client.put(f"/api/search/setups/{one['id']}", json=setup_body("One", changed_actors=["me/b", "me/a"], settings={
+        "custom_actors": [{**a, "name": "A2"}, b]}))
+    client.put(f"/api/search/setups/{two['id']}", json=setup_body("Two", settings={**stale_two, "roles": ["ML Engineer"]}))
+    assert by_name()["One"]["settings"]["custom_actors"] == [{**a, "name": "A2"}, b], "the stale save changed nothing"
+
+    client.put(f"/api/search/setups/{one['id']}", json=setup_body("One", removed_actors=["me/a"], settings={"custom_actors": [b]}))
+    client.put(f"/api/search/setups/{two['id']}", json=setup_body("Two", settings={**stale_two, "actors": ["openclawai/job-board-scraper", "me/a"]}))
+    setups = by_name()
+    assert setups["Two"]["settings"]["custom_actors"] == [b], "a stale form does not bring a removed actor back"
+    assert setups["Two"]["settings"]["actors"] == ["openclawai/job-board-scraper"], "nor keeps it ticked"
+
+
+def test_removing_the_last_ticked_actor_pauses_that_setups_schedule_and_never_runs_the_defaults():
+    from app.services.actors import plan_runs
+
+    a = actor("me/a")
+    one = client.post("/api/search/setups", json=setup_body("One", changed_actors=["me/a"], settings={"custom_actors": [a]})).json()["setup"]
+    two = client.post("/api/search/setups", json=setup_body("Two", schedule_kind="daily", settings={"custom_actors": [a], "actors": ["me/a"]})).json()["setup"]
+    assert two["enabled"] and two["settings"]["actors"] == ["me/a"]
+    out = client.put(f"/api/search/setups/{one['id']}", json=setup_body("One", removed_actors=["me/a"])).json()
+    assert out["paused_setups"] == ["Two"]
+    paused = by_name()["Two"]
+    assert paused["enabled"] is False and paused["settings"]["actors"] == []
+    with pytest.raises(ValueError, match="at least one Apify actor"):
+        plan_runs(paused["settings"])
+
+
+def test_the_account_holds_at_most_25_of_its_own_actors():
+    many = [actor(f"me/a{n}") for n in range(25)]
+    one = client.post("/api/search/setups", json=setup_body("One", changed_actors=[a["id"] for a in many],
+                                                            settings={"custom_actors": many})).json()["setup"]
+    refused = client.post("/api/search/setups", json=setup_body("Two", changed_actors=["me/extra"],
+                                                                 settings={"custom_actors": [actor("me/extra")]}))
+    assert refused.status_code == 422 and "up to 25" in refused.json()["detail"]
+    assert {s["name"] for s in listed()} == {"One"}, "nothing was saved"
+    assert client.put(f"/api/search/setups/{one['id']}", json=setup_body("One · renamed", settings={"custom_actors": many})).status_code == 200
 
 
 def test_setups_saved_before_sharing_get_each_others_actors():
@@ -174,6 +226,21 @@ def test_setups_saved_before_sharing_get_each_others_actors():
     setups = {s["name"]: s["settings"] for s in listed()}
     assert setups["One"]["custom_actors"] == setups["Two"]["custom_actors"] == [a, b]
     assert setups["One"]["actors"] == ["me/a"] and setups["Two"]["actors"] == ["me/b"]
+
+
+def test_more_than_25_actors_from_before_sharing_are_kept_and_still_save():
+    base = {"roles": ["AI Engineer"], "locations": ["Remote"], "sites": ["linkedin"]}
+    with SessionLocal() as db:
+        db.info["user_id"] = ensure_test_user().id
+        for n in range(3):
+            db.add(SavedSearch(name=f"Old {n}", settings={**base, "custom_actors": [actor(f"me/{n}-{i}") for i in range(10)]},
+                               schedule_kind="manual", every_hours=24, time_of_day="07:00", weekdays=[], timezone="UTC", enabled=True))
+        db.commit()
+    setups = listed()
+    assert all(len(s["settings"]["custom_actors"]) == 30 for s in setups), "none is dropped"
+    first = setups[0]
+    body = setup_body(first["name"], settings={**first["settings"], "roles": ["ML Engineer"]})
+    assert client.put(f"/api/search/setups/{first['id']}", json=body).status_code == 200, "an unrelated change still saves"
 
 
 def test_an_actors_skill_fields_are_suggested_the_primary_skill_placeholders():

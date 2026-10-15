@@ -1940,6 +1940,8 @@ function setupPayload() {
     weekdays: setupField('weekdays', []),
     timezone: setupField('timezone', localZone()),
     enabled: !!setupField('enabled', true),
+    // Only what was done to your own actors in this form reaches the other setups (the server ignores the rest).
+    changed_actors: fv('sp', 'changed_actors', []), removed_actors: fv('sp', 'removed_actors', []),
   };
 }
 // Text still sitting in a tag input counts as typed — save it rather than dropping it.
@@ -1951,16 +1953,23 @@ function flushTagDrafts() {
 }
 // Actors a person adds are shared by every setup (the server keeps them in step), so the other setups follow too:
 // they list the same actors, and one removed here is no longer ticked there.
-function shareActors(other, setup) {
+function shareActors(other, setup, paused) {
   const customs = setup.settings.custom_actors || [], keep = new Set(customs.map(c => c.id));
   const gone = new Set((other.settings.custom_actors || []).map(c => c.id).filter(id => !keep.has(id)));
-  return { ...other, settings: { ...other.settings, custom_actors: customs, actors: (other.settings.actors || []).filter(a => !gone.has(a)) } };
+  const settings = { ...other.settings, custom_actors: customs };
+  if (other.settings.actors) settings.actors = other.settings.actors.filter(a => !gone.has(a));
+  return { ...other, settings, ...(paused.includes(other.name) ? { enabled: false } : {}) };
 }
-function adoptSetup(setup) {
-  const others = (D.setups || []).map(x => x.id === setup.id ? setup : shareActors(x, setup));
+// A scheduled setup whose last ticked actor was removed has nothing to run, so the server paused its schedule.
+// Said with the save's own message (one toast replaces another).
+const withPaused = (message, setup) => setup?.paused?.length
+  ? `${message} · schedule paused for ${setup.paused.map(n => `“${n}”`).join(', ')}: no actor is ticked there any more` : message;
+function adoptSetup(setup, paused = []) {
+  const others = (D.setups || []).map(x => x.id === setup.id ? setup : shareActors(x, setup, paused));
   D.setups = others.some(x => x.id === setup.id) ? others : [...others, setup];
   S.setupSel = setup.id; delete S.forms.sp;
   D.searchProfile.profile = setup.settings;
+  if (paused.length) setup = { ...setup, paused };
   S.triage.hide_agencies = setup.settings.skip_agencies; S.triage.hide_reposts = setup.settings.skip_agencies;
   return setup;
 }
@@ -1972,12 +1981,12 @@ async function saveSetup() {
   // A changed resume: the jobs this setup found follow it (not the ones you pinned yourself, approved or applied).
   const moved = out.resume_jobs?.changed?.length || 0;
   if (moved) toast(`${moved} job${moved === 1 ? '' : 's'} from this setup now use${moved === 1 ? 's' : ''} its resume${out.resume_jobs.ranking_queued?.length ? ` · ${out.resume_jobs.ranking_queued.length} queued for ranking again` : ''}`);
-  return adoptSetup(out.setup);
+  return adoptSetup(out.setup, out.paused_setups || []);
 }
 async function createSetup(body) {
   if (!body) flushTagDrafts();
   const out = await api('/api/search/setups', { method: 'POST', body: body || { ...setupPayload(), name: nextSetupName() } });
-  return adoptSetup(out.setup);
+  return adoptSetup(out.setup, out.paused_setups || []);
 }
 function nextSetupName(preferred) {
   const taken = new Set((D.setups || []).map(x => x.name.toLowerCase()));
@@ -2272,7 +2281,9 @@ const A = {
     const p = D.searchProfile.profile, id = el.dataset.actor;
     setF('sp', 'custom_actors', fv('sp', 'custom_actors', p.custom_actors || []).filter(c => c.id !== id));
     setF('sp', 'actors', fv('sp', 'actors', p.actors || []).filter(a => a !== id));
-    render(); toast('Actor removed — save the profile to keep the change');
+    setF('sp', 'changed_actors', fv('sp', 'changed_actors', []).filter(a => a !== id));
+    setF('sp', 'removed_actors', [...new Set([...fv('sp', 'removed_actors', []), id])]);
+    render(); toast('Actor removed from every setup once you save');
   },
   'lookup-actor': () => busy('lookup', async () => {
     const id = (fv('ca', 'id', '') || '').trim();
@@ -2299,12 +2310,14 @@ const A = {
     setF('sp', 'custom_actors', customs);
     const selected = fv('sp', 'actors', p.actors || []);
     if (!selected.includes(id)) setF('sp', 'actors', [...selected, id]);
+    setF('sp', 'changed_actors', [...new Set([...fv('sp', 'changed_actors', []), id])]);
+    setF('sp', 'removed_actors', fv('sp', 'removed_actors', []).filter(a => a !== id));
     const edited = !!S.editActor;
     delete S.forms.ca; S.addActor = false; S.editActor = null; S.caFields = null;
     render(); toast(edited ? 'Actor updated — save the profile to keep it' : 'Actor added — save the profile to keep it');
   },
-  'save-search': () => busy('saveSp', saveSetup, setup => `“${setup.name}” saved`),
-  'save-as-new': () => busy('saveAsNew', () => createSetup(), setup => `Saved as “${setup.name}”`),
+  'save-search': () => busy('saveSp', saveSetup, setup => withPaused(`“${setup.name}” saved`, setup)),
+  'save-as-new': () => busy('saveAsNew', () => createSetup(), setup => withPaused(`Saved as “${setup.name}”`, setup)),
   'select-setup': el => useSetup(Number(el.dataset.id)),
   'open-setup': el => { S.setupSel = Number(el.dataset.id); delete S.forms.sp; go('discovery', { discMode: 'setup' }); },
   'new-setup': () => busy('newSetup', async () => {
