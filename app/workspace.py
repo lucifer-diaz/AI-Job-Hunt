@@ -1246,7 +1246,8 @@ class SearchProfileIn(BaseModel):
     # Python, Java…: the first is added to each role's search, and imported jobs must mention one of them.
     primary_skills: list[str] = Field(default_factory=list, max_length=3)
     actors: list[str] = Field(default_factory=lambda: list(DEFAULT_ACTORS), max_length=10)
-    custom_actors: list[CustomActorIn] = Field(default_factory=list, max_length=10)
+    # Shared by every setup of the account (share_custom_actors), so the limit is the account's.
+    custom_actors: list[CustomActorIn] = Field(default_factory=list, max_length=25)
     sites: list[str] = Field(default_factory=lambda: ["linkedin", "indeed", "glassdoor"])
     remote_platforms: list[str] = Field(default_factory=lambda: list(REMOTE_PLATFORMS))
     remoteok_url: str = "https://remoteok.com/remote-jobs"
@@ -1358,7 +1359,8 @@ GUESSES = [(re.compile(r"^(search_?term|keywords?|query|search|search_?keywords?
            (re.compile(r"^(visa_?sponsorship|sponsorship)$", re.I), "{{visa_sponsorship}}"),
            (re.compile(r"^(remove_?agency|skip_?agencies)$", re.I), "{{skip_agencies}}"),
            (re.compile(r"^(has_?salary|salary_?only)$", re.I), "{{salary_only}}"),
-           (re.compile(r"^(skills?_?terms)$", re.I), "{{skills}}")]
+           (re.compile(r"^(skill|primary_?skill|main_?skill)$", re.I), "{{skill}}"),
+           (re.compile(r"^(skills|primary_?skills|skills?_?terms|tech_?stack|technologies)$", re.I), "{{skills}}")]
 
 
 @router.post("/api/search/actors/lookup")
@@ -1526,12 +1528,43 @@ def apply_saved_search(setup: SavedSearch, payload: SavedSearchIn) -> SavedSearc
     return setup
 
 
+def share_custom_actors(db: Session, saved: SavedSearch | None = None, before: list[dict] | None = None) -> None:
+    """Actors a person adds belong to the account, not to one setup: every setup lists the same ones.
+
+    `saved` is the setup just written, whose entries win; ids it had `before` and no longer has were removed, so they
+    leave every setup (and its selection). Ticking an actor stays per setup: a shared actor arrives unticked.
+    """
+    setups = list(db.scalars(select(SavedSearch).order_by(SavedSearch.id)).all())
+    mine = {c["id"]: c for c in ((saved.settings or {}).get("custom_actors") or [])} if saved else {}
+    removed = {c.get("id") for c in before or []} - set(mine)
+    library: dict[str, dict] = {}
+    for setup in setups:
+        if setup is saved:
+            continue
+        for entry in (setup.settings or {}).get("custom_actors") or []:
+            if entry.get("id") and entry["id"] not in removed:
+                library[entry["id"]] = entry
+    library.update(mine)
+    shared = list(library.values())
+    for setup in setups:
+        settings = dict(setup.settings or {})
+        if (settings.get("custom_actors") or []) != shared:
+            settings["custom_actors"] = shared
+        if removed & set(settings.get("actors") or []):  # an absent selection means the defaults; leave it so
+            settings["actors"] = [a for a in settings["actors"] if a not in removed]
+        if settings != (setup.settings or {}):
+            setup.settings = settings
+
+
 def ensure_saved_searches(db: Session) -> list[SavedSearch]:
     """This account's setups, moving its one older search profile into a setup the first time."""
     setups = list(db.scalars(select(SavedSearch).order_by(SavedSearch.id)).all())
     profile = get_profile(db)
     prefs = dict(profile.search_preferences or {})
     if setups or prefs.get(MIGRATED_KEY):
+        share_custom_actors(db)  # setups saved before actors were shared each kept their own
+        if db.dirty:
+            db.commit()
         return setups
     legacy = get_search_profile(db)
     daily = legacy.get("schedule") == "daily"
@@ -1572,6 +1605,8 @@ def saved_search_create(payload: SavedSearchIn, db: Session = Depends(get_user_d
     reject_duplicate_name(db, payload.name)
     setup = apply_saved_search(SavedSearch(), payload)
     db.add(setup)
+    db.flush()
+    share_custom_actors(db, setup)
     db.commit()
     return {"setup": saved_search_card(setup)}
 
@@ -1587,7 +1622,9 @@ def saved_search_update(setup_id: int, payload: SavedSearchIn, request: Request,
     validate_saved_search(payload)
     reject_duplicate_name(db, payload.name, keep=setup.id)
     before = discovery.setup_choice(setup)
+    actors_before = list((setup.settings or {}).get("custom_actors") or [])
     apply_saved_search(setup, payload)
+    share_custom_actors(db, setup, actors_before)
     moved = None
     if discovery.setup_choice(setup) != before:
         db.flush()

@@ -138,3 +138,47 @@ def test_one_account_cannot_see_or_run_anothers_setup():
     assert client.delete(f"/api/search/setups/{other_id}").status_code == 404
     assert client.post(f"/api/search/setups/{other_id}/run").status_code == 404
     assert client.post(f"/api/search/setups/{other_id}/duplicate").status_code == 404
+
+
+def test_actors_a_person_adds_are_listed_in_every_setup():
+    mine = {"id": "me/jobs", "name": "Mine", "fan_out": "role", "input_template": {"q": "{{role}} {{skill}}"}}
+    first = client.post("/api/search/setups", json=setup_body("Remote AI", settings={"custom_actors": [mine], "actors": ["me/jobs"]})).json()["setup"]
+    second = client.post("/api/search/setups", json=setup_body("Mumbai")).json()["setup"]
+    assert second["settings"]["custom_actors"] == [mine], "a new setup lists the actors already added"
+    assert "me/jobs" not in second["settings"]["actors"], "a shared actor arrives unticked"
+
+    edited = {**mine, "name": "Renamed"}
+    other = {"id": "me/other", "name": "Other", "fan_out": "role", "input_template": {}}
+    client.put(f"/api/search/setups/{second['id']}", json=setup_body("Mumbai", settings={"custom_actors": [edited, other]}))
+    by_id = {s["id"]: s["settings"] for s in listed()}
+    assert by_id[first["id"]]["custom_actors"] == [edited, other], "an edit and an addition reach every setup"
+    assert by_id[first["id"]]["actors"] == ["me/jobs"], "ticking stays per setup"
+
+    client.put(f"/api/search/setups/{second['id']}", json=setup_body("Mumbai", settings={"custom_actors": [other]}))
+    by_id = {s["id"]: s["settings"] for s in listed()}
+    assert by_id[first["id"]]["custom_actors"] == [other], "a removal reaches every setup"
+    assert "me/jobs" not in by_id[first["id"]]["actors"]
+
+
+def test_setups_saved_before_sharing_get_each_others_actors():
+    a = {"id": "me/a", "name": "A", "fan_out": "role", "input_template": {}}
+    b = {"id": "me/b", "name": "B", "fan_out": "role", "input_template": {}}
+    with SessionLocal() as db:
+        db.info["user_id"] = ensure_test_user().id
+        base = {"roles": ["AI Engineer"], "locations": ["Remote"], "sites": ["linkedin"]}
+        db.add_all([SavedSearch(name="One", settings={**base, "custom_actors": [a], "actors": ["me/a"]}, schedule_kind="manual",
+                                every_hours=24, time_of_day="07:00", weekdays=[], timezone="UTC", enabled=True),
+                    SavedSearch(name="Two", settings={**base, "custom_actors": [b], "actors": ["me/b"]}, schedule_kind="manual",
+                                every_hours=24, time_of_day="07:00", weekdays=[], timezone="UTC", enabled=True)])
+        db.commit()
+    setups = {s["name"]: s["settings"] for s in listed()}
+    assert setups["One"]["custom_actors"] == setups["Two"]["custom_actors"] == [a, b]
+    assert setups["One"]["actors"] == ["me/a"] and setups["Two"]["actors"] == ["me/b"]
+
+
+def test_an_actors_skill_fields_are_suggested_the_primary_skill_placeholders():
+    from app.workspace import GUESSES
+
+    guess = lambda name: next((value for pattern, value in GUESSES if pattern.match(name)), "")  # noqa: E731
+    assert [guess(n) for n in ("skill", "primarySkill", "skills", "techStack", "skillsTerms")] == \
+        ["{{skill}}", "{{skill}}", "{{skills}}", "{{skills}}", "{{skills}}"]

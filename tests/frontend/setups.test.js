@@ -118,6 +118,19 @@ describe('saved search setups', () => {
     expect(ui.S.forms.sp).toBeUndefined();
   });
 
+  it('a saved setup shares its own actors with the other setups, unticking one it removed', async () => {
+    const mine = { id: 'me/jobs', name: 'Mine', fan_out: 'role', input_template: {} };
+    const gone = { id: 'me/old', name: 'Old', fan_out: 'role', input_template: {} };
+    ui.D.setups[1].settings = { ...ui.D.setups[1].settings, custom_actors: [gone], actors: ['me/old', 'openclawai/job-board-scraper'] };
+    const saved = setup(1, 'Remote AI');
+    saved.settings = { ...saved.settings, custom_actors: [mine], actors: ['me/jobs'] };
+    fetchMock.mockImplementation(async () => response({ setup: saved }));
+    await ui.A['save-search']();
+    const other = ui.D.setups.find(x => x.id === 2).settings;
+    expect(other.custom_actors).toEqual([mine]);
+    expect(other.actors).toEqual(['openclawai/job-board-scraper']);
+  });
+
   it('runs the selected setup after saving it', async () => {
     const calls = [];
     fetchMock.mockImplementation(async (url, opts) => {
@@ -207,6 +220,17 @@ describe('actor picker', () => {
     expect(JSON.parse(document.getElementById('ca-input_template').value)).toEqual({ remote: '{{is_remote}}' });
     document.querySelector('[data-act="insert-actor-field"][data-name="seniority"]').dispatchEvent(new MouseEvent('click', { bubbles: true }));
     expect(JSON.parse(document.getElementById('ca-input_template').value)).toEqual({ remote: '{{is_remote}}', seniority: '{{seniority}}' });
+  });
+
+  it('labels the primary skill placeholders and shows a template that reads them on its card', () => {
+    ui.D.actors.placeholders = ['role', 'skill', 'skills'];
+    ui.S.addActor = true;
+    ui.setF('sp', 'custom_actors', [{ id: 'me/jobs', name: 'Mine', fan_out: 'role', input_template: { q: '{{role}} {{skill}}' } }]);
+    ui.render();
+    const button = document.querySelector('[data-act="insert-placeholder"][data-name="skill"]');
+    expect(button.textContent).toContain('primary skill');
+    expect(button.title).toBe('First primary skill');
+    expect(document.querySelector('label[for="actor-me-jobs"] .actor-uses').textContent).toContain('Primary skills');
   });
 
   it('sends the startup settings with the search', () => {
