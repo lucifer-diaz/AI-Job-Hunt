@@ -315,3 +315,38 @@ def test_on_tailoring_refuses_a_citation_of_another_resumes_fact(monkeypatch, da
     monkeypatch.setattr(get_settings(), "rag_retrieval_mode", "on")
     issues, known = unknown_evidence()
     assert not known and len(issues) == 1 and "this job's resume" in issues[0]["message"]
+
+
+def test_on_the_verified_facts_gate_counts_only_the_jobs_own_resume(monkeypatch):
+    """A job on a resume with no verified facts cannot pass the gate on another resume's verified facts."""
+    import uuid
+
+    from app.services import resume_verification
+    from app.services.user_settings import profile_for
+
+    data = rs.DATASET["resumes"]
+    user_id = make_user(SessionLocal)
+    with rs.session_for(SessionLocal, user_id) as db:
+        profile = profile_for(db)
+        verified = resume_verification.record_version(db, profile, data["backend"]["text"], name="backend",
+                                                      activate=True)
+        resume_verification.verify_section(db, verified, "experience")
+        bare = resume_verification.record_version(db, profile, data["data"]["text"], name="data")  # nothing verified
+        job = Job(user_id=user_id, source="manual", source_ref=f"rag-{uuid.uuid4().hex[:10]}",
+                  title="Machine Learning Engineer", company="Hiring Co", status="shortlisted",
+                  description="Train churn models with XGBoost.", resume_id=bare.id, resume_choice="USER")
+        db.add(job)
+        db.commit()
+        job_id = job.id
+
+    policy = cb.candidate_policy  # the gate applies when unverified resume facts are not allowed
+    monkeypatch.setattr(cb, "candidate_policy",
+                        lambda db, uid: {**policy(db, uid), "allow_unverified_resume_facts": False})
+
+    def letter():
+        with rs.session_for(SessionLocal, user_id) as db:
+            return cb.build_cover_letter_context(db, profile_for(db), db.get(Job, job_id))
+    letter()  # off: the account-wide gate, as before — the backend resume's facts satisfy it
+    monkeypatch.setattr(get_settings(), "rag_retrieval_mode", "on")
+    with pytest.raises(cb.UnverifiedResumeError):
+        letter()

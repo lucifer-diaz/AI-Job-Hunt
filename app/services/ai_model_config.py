@@ -654,6 +654,12 @@ def validate(snapshot: dict[str, Any], *, live: LiveState | None = None, gateway
             errors.append(_issue(path, f"{what} {name} is not served by LiteLLM"))
         return entry
 
+    def not_for_chat(path: str, entry: dict[str, Any] | None, name: str, worker_type: str) -> None:
+        """A chat worker's fallback or secondary model must write text: failover sends it the same chat request."""
+        if (entry or {}).get("model_type") == "EMBEDDING":
+            errors.append(_issue(path, f"{name} is an embedding model; {label(worker_type)} needs a model that writes "
+                                       "text"))
+
     for name, tier in tiers.items():
         if not TIER_NAME.match(name):
             errors.append(_issue(f"tiers.{name}", "Tier names are upper-case letters, digits and underscores"))
@@ -700,7 +706,10 @@ def validate(snapshot: dict[str, Any], *, live: LiveState | None = None, gateway
             if target == name:
                 errors.append(_issue(path, "A model cannot fall back to itself"))
             else:
-                check_model(path, target, what="fallback model")
+                found = check_model(path, target, what="fallback model")
+                if entry.get("model_type") != "EMBEDDING" and (found or {}).get("model_type") == "EMBEDDING":
+                    errors.append(_issue(path, f"{target} is an embedding model; {name} writes text, so it cannot "
+                                               "fall back to it"))
         rest = entry.get("rest_seconds")
         if rest is not None and not _in_range(rest, "rest_seconds"):
             low, high = LIMITS["rest_seconds"]
@@ -748,7 +757,8 @@ def validate(snapshot: dict[str, Any], *, live: LiveState | None = None, gateway
             if fallback == model:
                 errors.append(_issue(f"{base}.fallback_model", "The fallback model cannot be the primary model"))
             else:
-                check_model(f"{base}.fallback_model", fallback, what="fallback model")
+                not_for_chat(f"{base}.fallback_model", check_model(f"{base}.fallback_model", fallback,
+                                                                   what="fallback model"), fallback, worker_type)
                 cycle = _fallback_cycle(model, {**fallback_edges, model: {*fallback_edges.get(model, set()), fallback}})
                 if cycle:
                     errors.append(_issue(f"{base}.fallback_model", "Circular fallback: " + " → ".join(cycle)))
@@ -759,7 +769,7 @@ def validate(snapshot: dict[str, Any], *, live: LiveState | None = None, gateway
                 errors.append(_issue(path, "A model can appear only once in the primary, fallback and secondary models"))
                 continue
             seen.add(extra)
-            check_model(path, extra, what="secondary model")
+            not_for_chat(path, check_model(path, extra, what="secondary model"), extra, worker_type)
         for name in ("temperature", "max_output_tokens", "context_window", "timeout_seconds", "retry_count",
                      "max_concurrency"):
             value = config.get(name)

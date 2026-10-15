@@ -442,7 +442,6 @@ class AccountPass:
     service: EmbeddingService
     version_id: int
     dimensions: int
-    eligible: int
     budget: int
     totals: dict[str, Any]
     error: str | None = None
@@ -466,12 +465,12 @@ def prepare(sessions, user_id: int, *, service: EmbeddingService | None = None) 
 
         evidence_tags.backfill(db, user_id)
         version = ensure_version(db, user_id, service.identity)
-        eligible = sweep(db, user_id, version)
+        sweep(db, user_id, version)
         version_id, dimensions = version.id, version.dimensions
         db.commit()
     totals: dict[str, Any] = {"user_id": user_id, "index_version": version_id, "embedded": 0, "reused": 0,
                               "deactivated": 0, "removed": 0, "failed": 0, "lost_lease": 0}
-    return AccountPass(user_id, service, version_id, dimensions, eligible,
+    return AccountPass(user_id, service, version_id, dimensions,
                        max(1, server_settings.value("rag_index_max_entries_per_run")), totals)
 
 
@@ -508,7 +507,9 @@ def finish(sessions, run: AccountPass) -> dict[str, Any]:
     with sessions() as db:
         db.info["user_id"] = run.user_id
         version = db.get(RagIndexVersion, run.version_id)
-        refresh_counts(db, version, run.eligible)
+        # Coverage is judged against the rows as they are now, not as they were before the embedding calls: a fact
+        # verified or added meanwhile gets its PENDING entry here and keeps an incomplete version from serving.
+        refresh_counts(db, version, sweep(db, run.user_id, version))
         if run.error:
             version.last_error = run.error
         totals = dict(run.totals)
