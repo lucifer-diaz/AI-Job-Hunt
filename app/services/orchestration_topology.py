@@ -182,6 +182,13 @@ NODES: tuple[Node, ...] = (
          external=(ExternalMatch("APIFY", "glassdoor_"), ExternalMatch("APIFY", "payscale_"),
                    ExternalMatch("WEB", "official_company_page")),
          monitoring_tab="external", workers_tab="insights", screen="approvals"),
+    # The retrieval indexer (app.services.rag_index): embeds verified evidence and saved answers. An embedding model
+    # makes vectors, not text, and sends no prompt, so this is not an AI node; the call is an external one.
+    Node("retrieval_index", "Retrieval index", (ASYNC, EXT), "Embeds your verified evidence and saved answers through "
+         "the LiteLLM embeddings endpoint, so retrieval can find them by meaning. Off unless RAG_VECTOR_ENABLED; it "
+         "never generates text, and what a job may use is still decided in code.", "support", (4, -1),
+         external=(ExternalMatch("LITELLM", "embed_documents"),), monitoring_tab="external", workers_tab="indexing",
+         screen="knowledge"),
     Node("interview_insights", "Interview preparation", (AI,), "Writes interview preparation from the posting, the "
          "fit analysis and verified evidence, always labelled as generated (never as questions the company asks).",
          "support", (4, 2), workers=("INTERVIEW_INSIGHTS",), llm_stages=("INTERVIEW_INSIGHTS",),
@@ -218,6 +225,8 @@ EDGES: tuple[Edge, ...] = (
     Edge("interview", "outcome", "offer", measure="tracker moves to offer or negotiating (application_events "
          "kind=stage)"),
     Edge("resume_parser", "ranker", "verified evidence", kind="support"),
+    Edge("resume_parser", "retrieval_index", "verified evidence", kind="support"),
+    Edge("retrieval_index", "ranker", "retrieval", kind="support"),
     Edge("compensation", "discovery", "salary enrichment", kind="support"),
     Edge("approval", "company_insights", "research", kind="support", measure="insight tasks created "
          "(job_insight_tasks.created_at)", timed=True),

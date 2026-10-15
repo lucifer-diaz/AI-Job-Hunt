@@ -22,12 +22,13 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
+import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import delete, event, func, or_, select, text, update
+from sqlalchemy import and_, delete, event, func, or_, select, text, update
 from sqlalchemy.orm import Session, attributes
 
 from app.models import (
@@ -39,18 +40,20 @@ from app.models import (
     Resume,
     now,
 )
-from app.services import vector_store
+from app.services import backoff, server_settings, vector_store, worker_settings
 from app.services.embeddings import (
     EmbeddingError,
     EmbeddingModel,
     EmbeddingService,
     EmbeddingUnavailable,
 )
+from app.services.lifecycle import STOPPED_BY_USER
 from app.settings import get_settings
 
 log = logging.getLogger("jobhunt.rag_index")
 
 EVIDENCE, ANSWER = "evidence", "knowledge_answer"
+KIND = "indexing"  # its Running workers kind (app.services.workers) and worker settings (app.services.worker_settings)
 COLLECTION = {EVIDENCE: "CANDIDATE_EVIDENCE", ANSWER: "ATS_ANSWER"}
 LEASE_SECONDS = 300
 # The fields whose change changes what a source says; anything else (use counts, timestamps) is not an edit.
@@ -144,6 +147,10 @@ def _apply(session: Session, _flush_context) -> None:
         log.warning("could not update the retrieval index after a change", exc_info=True)
 
 
+def _not_stopped(columns: Any) -> Any:
+    return or_(columns.last_error.is_(None), columns.last_error != STOPPED_BY_USER)
+
+
 def apply_changes(conn: Any, pending: dict[str, set]) -> None:
     stamp = now()
     entries = RagIndexEntry.__table__
@@ -159,16 +166,19 @@ def apply_changes(conn: Any, pending: dict[str, set]) -> None:
             conn.execute(delete(links).where(links.c.evidence_id == source_id))
     for status, keys in (("PENDING", pending["edited"]), ("DEACTIVATED", pending["unverified"])):
         for user_id, source_type, source_id in keys:
-            where = (entries.c.user_id == user_id, entries.c.source_type == source_type,
-                     entries.c.source_id == source_id)
+            where = [entries.c.user_id == user_id, entries.c.source_type == source_type,
+                     entries.c.source_id == source_id]
             values: dict[str, Any] = {}
             if status == "DEACTIVATED":  # a withdrawn fact keeps no vector made from its text
                 vector_store.delete_entries(conn, list(conn.execute(select(entries.c.id).where(*where)).scalars()))
                 values = {"content_hash": None, "embedded_at": None}
+            else:  # an entry a person stopped stays stopped until they retry it (Running workers)
+                where.append(_not_stopped(entries.c))
             # Clearing the lease makes an indexer that read the old text unable to store its vector.
             conn.execute(update(entries).where(*where).values(
                 status=status, lock_token=None, lock_expires_at=None, next_attempt_at=None, attempt_count=0,
-                deactivated_at=stamp if status == "DEACTIVATED" else None, updated_at=stamp, **values))
+                deactivated_at=stamp if status == "DEACTIVATED" else None,
+                completed_at=stamp if status == "DEACTIVATED" else None, updated_at=stamp, **values))
     if pending["resumes"]:
         links = EvidenceResumeLink.__table__
         conn.execute(delete(links).where(links.c.resume_id.in_(list(pending["resumes"]))))
@@ -217,6 +227,7 @@ def sweep(db: Session, user_id: int, version: RagIndexVersion) -> int:
         elif entry.status in ("ACTIVE", "DEACTIVATED") and entry.content_hash != content_hash(body):
             entry.status, entry.sensitive, entry.verification_status = "PENDING", sensitive, "VERIFIED"
             entry.deactivated_at, entry.attempt_count, entry.updated_at = None, 0, stamp
+            entry.next_attempt_at = entry.completed_at = None
     gone, withdrawn = [], []
     for key, entry in entries.items():
         if key in live:
@@ -228,7 +239,8 @@ def sweep(db: Session, user_id: int, version: RagIndexVersion) -> int:
             withdrawn.append(entry.id)  # also repairs a deactivation whose vector was left behind
             if entry.status != "DEACTIVATED":
                 entry.status, entry.verification_status = "DEACTIVATED", "UNVERIFIED"
-                entry.deactivated_at, entry.updated_at = stamp, stamp
+                entry.deactivated_at, entry.completed_at, entry.updated_at = stamp, stamp, stamp
+                entry.lock_token = entry.lock_expires_at = entry.next_attempt_at = None
             entry.content_hash, entry.embedded_at = None, None
     if withdrawn:
         vector_store.delete_entries(db, withdrawn)
@@ -240,35 +252,73 @@ def sweep(db: Session, user_id: int, version: RagIndexVersion) -> int:
 
 
 # ───────────── embedding work ─────────────
+# The indexer's queue is a Running workers kind ("indexing", app.services.workers): a failure waits as PENDING with a
+# retry time (RETRYING) until the account's attempts run out (FAILED); Kill ends an entry FAILED with
+# lifecycle.STOPPED_BY_USER, and nothing claims it again until a person retries it; Run now (run_now_at) is claimed
+# first, past the retry wait, and its calls skip the provider cooldown (backoff.bypass); an account that paused the
+# worker only has its run-now entries claimed. Every write after the model call is lease-guarded (`_guarded`).
 
 @dataclass
 class Claimed:
     token: str
     entries: list[tuple[int, str, int]]  # (entry id, source type, source id)
+    run_now: bool = False
+
+    @property
+    def task_id(self) -> str:
+        """How scheduled_jobs.run_live tells claims apart: the batch's lease token."""
+        return self.token
 
 
 def claim(db: Session, user_id: int, version_id: int, limit: int, *, at: datetime) -> Claimed | None:
-    max_attempts = int(get_settings().rag_index_max_attempts or 5)
-    due = or_(RagIndexEntry.status == "PENDING",
-              (RagIndexEntry.status == "FAILED") & (RagIndexEntry.attempt_count < max_attempts)
-              & or_(RagIndexEntry.next_attempt_at.is_(None), RagIndexEntry.next_attempt_at <= at),
-              (RagIndexEntry.status == "PROCESSING") & (RagIndexEntry.lock_expires_at < at))
-    query = (select(RagIndexEntry.id).where(RagIndexEntry.user_id == user_id,
-                                            RagIndexEntry.index_version_id == version_id, due)
-             .order_by(RagIndexEntry.id).limit(limit))
-    if db.get_bind().dialect.name == "postgresql":
-        query = query.with_for_update(skip_locked=True)
-    ids = list(db.scalars(query).all())
-    if not ids:
-        return None
-    token = str(uuid.uuid4())
-    db.execute(update(RagIndexEntry).where(RagIndexEntry.id.in_(ids), due).values(
-        status="PROCESSING", lock_token=token, lock_expires_at=at + timedelta(seconds=LEASE_SECONDS),
-        attempt_count=RagIndexEntry.attempt_count + 1, updated_at=at).execution_options(synchronize_session=False))
-    rows = db.execute(select(RagIndexEntry.id, RagIndexEntry.source_type, RagIndexEntry.source_id)
-                      .where(RagIndexEntry.lock_token == token)).all()
+    """Lease up to `limit` due entries of one index version. Run-now entries go first, in a batch of their own."""
+    E = RagIndexEntry
+    own = worker_settings.for_user(db, user_id, KIND)
+    base = (E.user_id == user_id, E.index_version_id == version_id)
+    abandoned = and_(E.status == "PROCESSING", E.lock_expires_at < at)
+    # A run that died with the entry's last attempt: it is failed, not tried again.
+    db.execute(update(E).where(*base, abandoned, E.attempt_count >= own["max_attempts"]).values(
+        status="FAILED", lock_token=None, lock_expires_at=None, completed_at=at, updated_at=at,
+        last_error="LEASE_EXPIRED: the indexer stopped before this entry finished")
+        .execution_options(synchronize_session=False))
+    urgent = and_(E.run_now_at.is_not(None), or_(E.status == "PENDING", abandoned))
+    normal = or_(and_(E.status == "PENDING", or_(E.next_attempt_at.is_(None), E.next_attempt_at <= at)), abandoned)
+    for due, run_now in ((urgent, True), (normal, False)):
+        if not run_now and not own["auto"]:
+            break  # paused: the queue waits, nothing is dropped
+        query = select(E.id).where(*base, due).order_by(E.id).limit(limit)
+        if db.get_bind().dialect.name == "postgresql":
+            query = query.with_for_update(skip_locked=True)
+        ids = list(db.scalars(query).all())
+        if not ids:
+            continue
+        token = str(uuid.uuid4())
+        db.execute(update(E).where(E.id.in_(ids), due).values(
+            status="PROCESSING", lock_token=token, lock_expires_at=at + timedelta(seconds=LEASE_SECONDS),
+            attempt_count=E.attempt_count + 1, started_at=at, completed_at=None, run_now_at=None, updated_at=at)
+            .execution_options(synchronize_session=False))
+        rows = db.execute(select(E.id, E.source_type, E.source_id).where(E.lock_token == token)).all()
+        db.commit()
+        if rows:
+            return Claimed(token, [(r[0], r[1], r[2]) for r in rows], run_now)
     db.commit()
-    return Claimed(token, [(r[0], r[1], r[2]) for r in rows]) if rows else None
+    return None
+
+
+def renew(sessions, claims: list[Claimed]) -> set[str]:
+    """A scheduled_jobs.run_live heartbeat: extend the lease of every batch still held; returns their tokens. A batch
+    whose entries were all stopped (Kill) or edited is no longer held, so the pass stops waiting for it."""
+    held: set[str] = set()
+    until = now() + timedelta(seconds=LEASE_SECONDS)
+    with sessions() as db:
+        for c in claims:
+            won = db.execute(update(RagIndexEntry).where(RagIndexEntry.lock_token == c.token,
+                                                         RagIndexEntry.status == "PROCESSING")
+                             .values(lock_expires_at=until).execution_options(synchronize_session=False))
+            if won.rowcount:
+                held.add(c.token)
+        db.commit()
+    return held
 
 
 def _guarded(db: Session, entry_id: int, token: str, **values: Any) -> bool:
@@ -293,7 +343,7 @@ def process(sessions, user_id: int, service: EmbeddingService, version_id: int, 
                 exists = db.get(Evidence if source_type == EVIDENCE else KnowledgeAnswer, source_id) is not None
                 if exists:
                     if _guarded(db, entry_id, claimed.token, status="DEACTIVATED", verification_status="UNVERIFIED",
-                                deactivated_at=now(), content_hash=None, embedded_at=None):
+                                deactivated_at=now(), completed_at=now(), content_hash=None, embedded_at=None):
                         vector_store.delete_entries(db, [entry_id])
                         out["deactivated"] += 1
                 else:
@@ -305,14 +355,16 @@ def process(sessions, user_id: int, service: EmbeddingService, version_id: int, 
             digest = content_hash(found[0])
             if stored.get(entry_id) == digest:  # e.g. re-verified without an edit: the vector is still right
                 out["reused"] += _guarded(db, entry_id, claimed.token, status="ACTIVE", content_hash=digest,
-                                          verification_status="VERIFIED", deactivated_at=None, last_error=None)
+                                          verification_status="VERIFIED", deactivated_at=None, last_error=None,
+                                          next_attempt_at=None, completed_at=now())
                 continue
             todo.append((entry_id, found[0], digest))
         db.commit()
     if not todo:
         return out
     try:
-        result = service.embed_documents([body for _, body, _ in todo])
+        with backoff.bypass(claimed.run_now):  # a person's Run now skips the provider cooldown for this one batch
+            result = service.embed_documents([body for _, body, _ in todo])
     except EmbeddingError as exc:
         _fail(sessions, user_id, claimed.token, [e for e, _, _ in todo], exc)
         out["failed"] += len(todo)
@@ -326,24 +378,33 @@ def process(sessions, user_id: int, service: EmbeddingService, version_id: int, 
         rows = []
         for (entry_id, _body, digest), vector in zip(todo, result.vectors, strict=True):
             if _guarded(db, entry_id, claimed.token, status="ACTIVE", content_hash=digest, embedded_at=now(),
-                        verification_status="VERIFIED", deactivated_at=None, last_error=None):
+                        verification_status="VERIFIED", deactivated_at=None, last_error=None, next_attempt_at=None,
+                        completed_at=now()):
                 rows.append({"entry_id": entry_id, "user_id": user_id, "index_version_id": version_id,
                              "dimensions": dimensions, "content_hash": digest, "embedding": vector})
                 out["embedded"] += 1
             else:
-                out["lost_lease"] += 1  # edited, deleted or reclaimed meanwhile: the new text gets its own turn
+                out["lost_lease"] += 1  # edited, deleted, stopped or reclaimed meanwhile
         vector_store.upsert(db, rows)
         db.commit()
     return out
 
 
 def _fail(sessions, user_id: int, token: str, entry_ids: list[int], exc: EmbeddingError) -> None:
+    """Back off and retry while the account's attempts last (PENDING with a retry time), then FAILED."""
+    error = f"{exc.code}: {exc}"[:300]
     with sessions() as db:
         db.info["user_id"] = user_id
+        own = worker_settings.for_user(db, user_id, KIND)
         for entry_id in entry_ids:
             attempts = db.scalar(select(RagIndexEntry.attempt_count).where(RagIndexEntry.id == entry_id)) or 1
-            _guarded(db, entry_id, token, status="FAILED", last_error=f"{exc.code}: {exc}"[:300],
-                     next_attempt_at=now() + timedelta(seconds=min(3600, 30 * 2 ** min(attempts, 7))))
+            if attempts >= own["max_attempts"]:
+                _guarded(db, entry_id, token, status="FAILED", last_error=error, next_attempt_at=None,
+                         completed_at=now())
+            else:
+                wait = min(3600, own["retry_seconds"] * 2 ** min(attempts - 1, 7))
+                _guarded(db, entry_id, token, status="PENDING", last_error=error,
+                         next_attempt_at=now() + timedelta(seconds=wait))
         db.commit()
 
 
@@ -373,11 +434,24 @@ def maybe_serve(db: Session, user_id: int, version: RagIndexVersion) -> bool:
     return True
 
 
-def run_account(sessions, user_id: int, *, at: datetime | None = None,
-                service: EmbeddingService | None = None) -> dict[str, Any]:
-    """One indexing pass for one account. Never raises for an embedding failure: the summary says what happened."""
-    at = at or now()
-    settings = get_settings()
+@dataclass
+class AccountPass:
+    """One account's indexing pass: what `prepare` found, what is left of its budget, and what it did so far."""
+
+    user_id: int
+    service: EmbeddingService
+    version_id: int
+    dimensions: int
+    eligible: int
+    budget: int
+    totals: dict[str, Any]
+    error: str | None = None
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+
+def prepare(sessions, user_id: int, *, service: EmbeddingService | None = None) -> AccountPass | dict[str, Any]:
+    """Sweep the account's entries into line with its rows (metadata only, also while the worker is paused: the queue
+    is kept, never dropped). A dict says why the account has nothing to index."""
     with sessions() as db:
         db.info["user_id"] = user_id
         if service is None:
@@ -397,36 +471,66 @@ def run_account(sessions, user_id: int, *, at: datetime | None = None,
         db.commit()
     totals: dict[str, Any] = {"user_id": user_id, "index_version": version_id, "embedded": 0, "reused": 0,
                               "deactivated": 0, "removed": 0, "failed": 0, "lost_lease": 0}
-    budget = int(settings.rag_index_max_entries_per_run or 500)
-    batch = max(1, int(settings.rag_embed_batch_size or 32))
-    error: str | None = None
-    while budget > 0:
+    return AccountPass(user_id, service, version_id, dimensions, eligible,
+                       max(1, server_settings.value("rag_index_max_entries_per_run")), totals)
+
+
+def take(sessions, run: AccountPass) -> Claimed | None:
+    """The account's next batch, or None once its budget is spent, the provider failed or nothing is due."""
+    with run._lock:
+        if run.error or run.budget <= 0:
+            return None
+        size = min(max(1, server_settings.value("rag_embed_batch_size")), run.budget)
         with sessions() as db:
-            db.info["user_id"] = user_id
-            claimed = claim(db, user_id, version_id, min(batch, budget), at=at)
-        if claimed is None:
-            break
-        budget -= len(claimed.entries)
-        try:
-            for key, value in process(sessions, user_id, service, version_id, dimensions, claimed).items():
-                totals[key] += value
-        except EmbeddingError as exc:  # the provider is unavailable for now: stop, the entries are retried later
-            for key, value in getattr(exc, "partial", {}).items():
-                totals[key] += value
-            error = f"{exc.code}: {exc}"[:300]
-            break
+            db.info["user_id"] = run.user_id
+            claimed = claim(db, run.user_id, run.version_id, size, at=now())
+        if claimed is not None:
+            run.budget -= len(claimed.entries)
+        return claimed
+
+
+def work(sessions, run: AccountPass, claimed: Claimed) -> str:
+    """Embed one batch of the pass. A provider failure stops the pass's further claims; its entries back off."""
+    try:
+        done = process(sessions, run.user_id, run.service, run.version_id, run.dimensions, claimed)
+        outcome = "embedded"
+    except EmbeddingError as exc:  # the provider is unavailable for now: stop, the entries are retried later
+        done, outcome = getattr(exc, "partial", {}), "provider_error"
+        with run._lock:
+            run.error = run.error or f"{exc.code}: {exc}"[:300]
+    with run._lock:
+        for key, value in done.items():
+            run.totals[key] += value
+    return outcome
+
+
+def finish(sessions, run: AccountPass) -> dict[str, Any]:
     with sessions() as db:
-        db.info["user_id"] = user_id
-        version = db.get(RagIndexVersion, version_id)
-        refresh_counts(db, version, eligible)
-        if error:
-            version.last_error = error
-        totals["serving"] = maybe_serve(db, user_id, version) or version.status == "SERVING"
+        db.info["user_id"] = run.user_id
+        version = db.get(RagIndexVersion, run.version_id)
+        refresh_counts(db, version, run.eligible)
+        if run.error:
+            version.last_error = run.error
+        totals = dict(run.totals)
+        totals["serving"] = maybe_serve(db, run.user_id, version) or version.status == "SERVING"
         totals.update(status=version.status, eligible=version.eligible_count, covered=version.embedded_count)
         db.commit()
-    if error:
-        totals["error"] = error
+    if run.error:
+        totals["error"] = run.error
     return totals
+
+
+def run_account(sessions, user_id: int, *, at: datetime | None = None,
+                service: EmbeddingService | None = None) -> dict[str, Any]:
+    """One indexing pass for one account, one batch at a time (the scheduler runs passes side by side through
+    scheduled_jobs.run_live with the same pieces). Never raises for an embedding failure: the summary says what
+    happened. `at` is accepted for callers that pass the scheduler's time; claims use the clock."""
+    run = prepare(sessions, user_id, service=service)
+    if isinstance(run, dict):
+        return run
+    while (claimed := take(sessions, run)) is not None:
+        work(sessions, run, claimed)
+    return finish(sessions, run)
 
 
 # ───────────── retention and status ─────────────

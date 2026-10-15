@@ -6,6 +6,11 @@
     Job insights job_insight_tasks              scheduler job job_insights
     Tailoring    tailor_tasks (tailor → review)  the in-process tailor worker
     Reviewing    tailor_tasks at the review step  a view of Tailoring: the same rows, settings and controls
+    Indexing     rag_index_entries              scheduler job rag_index (no job: an Evidence or saved-answer row)
+
+Most queues hold one task per job. The retrieval indexer's entries belong to an account and a source row instead, so a
+kind may describe tasks without a job (`WorkerKind.subject`): how a row is labelled, what a search matches and how a
+finished task is queued again (`requeue`, the same row back to waiting). Its rows carry `job_id` None.
 
 Two controls, both acting on the signed-in account's own tasks only:
 
@@ -37,6 +42,8 @@ from app.models import (
     JobDescriptionParseTask,
     JobInsightTask,
     JobRankingTask,
+    RagIndexEntry,
+    RagIndexVersion,
     TailorTask,
 )
 from app.services import backoff, redaction, worker_settings
@@ -83,6 +90,14 @@ class WorkerKind:
     # worker's settings, and left out of totals and Kill all so no task is counted or stopped twice.
     scope: Callable[[Any], Any] | None = None
     view_of: str | None = None
+    # Tasks that belong to no job: `subject(db, user_id, tasks)` labels them ({task id: {"title", "company", ...}}),
+    # `search(model, text)` is what the search box matches, `requeue(db, task, user_id)` puts a failed or stopped
+    # task back in the queue (the same row) for Retry and Run now.
+    subject: Callable[[Session, int, list[Any]], dict[int, dict[str, Any]]] | None = None
+    search: Callable[[Any, str], Any] | None = None
+    requeue: Callable[[Session, Any, int], Any] | None = None
+    shown: tuple[tuple[str, str], ...] = ()  # a raw finished status → the word every worker uses for it
+    stopped_status: str = "SKIPPED"  # what Kill leaves (with lifecycle.STOPPED_BY_USER as the error)
 
     @property
     def active(self) -> tuple[str, str]:
@@ -91,6 +106,10 @@ class WorkerKind:
     @property
     def tailor(self) -> bool:
         return self.model is TailorTask
+
+    @property
+    def job_bound(self) -> bool:
+        return self.subject is None
 
     @property
     def settings_kind(self) -> str:
@@ -117,10 +136,55 @@ def _reviewing(m: Any) -> Any:
                and_(m.status.in_(("succeeded", "failed", "cancelled")), m.stage == "reviewing"))
 
 
+def _index_scope(m: Any) -> Any:
+    """Entries of a retired index are left out: they are never worked again and are purged with it."""
+    return m.index_version_id.in_(select(RagIndexVersion.id).where(RagIndexVersion.status != "RETIRED"))
+
+
+def _index_subjects(db: Session, user_id: int, tasks: list[Any]) -> dict[int, dict[str, Any]]:
+    """"Evidence #12 · index v3", and the embedding model of that index version. Metadata only: never the fact's or
+    the answer's text."""
+    ids = {t.index_version_id for t in tasks}
+    versions = {v.id: v for v in db.scalars(select(RagIndexVersion).where(
+        RagIndexVersion.user_id == user_id, RagIndexVersion.id.in_(ids))).all()} if ids else {}
+    out = {}
+    for t in tasks:
+        v = versions.get(t.index_version_id)
+        route = (v.provider or "").upper() if v else ""
+        out[t.id] = {
+            "title": f"{'Evidence' if t.source_type == 'evidence' else 'Saved answer'} #{t.source_id}",
+            "company": f"index v{t.index_version_id}" + (f" ({v.status.lower()})" if v else ""),
+            "subject": {"type": t.source_type, "id": t.source_id, "index_version": t.index_version_id,
+                        "collection": t.collection, "sensitive": bool(t.sensitive)},
+            # The model is the index version's own (an index never mixes models), never a guess.
+            "model": {"model": v.model, "route": route, "route_label": _route_label(route) if route else None,
+                      "via": None, "source": "used" if t.embedded_at else "next", "backups": []} if v else None,
+            "model_change": None}
+    return out
+
+
+def _index_search(m: Any, text: str) -> Any:
+    """`#12` is the source row's id; words match its kind (evidence, answer) or collection."""
+    if text.lstrip("#").isdigit():
+        return m.source_id == int(text.lstrip("#"))
+    like = f"%{text.lower()[:100]}%"
+    return or_(func.lower(m.source_type).like(like), func.lower(m.collection).like(like))
+
+
+def _index_requeue(db: Session, task: Any, user_id: int) -> Any:
+    """A failed or stopped entry goes back to waiting, fresh. The indexer reads the live row when it runs it."""
+    if task.status != "FAILED":
+        raise WorkerError("Only a failed or stopped entry can be indexed again")
+    task.status, task.attempt_count, task.next_attempt_at = "PENDING", 0, None
+    task.last_error = task.completed_at = task.lock_token = task.lock_expires_at = None
+    db.flush()
+    return task
+
+
 KINDS: dict[str, WorkerKind] = {k.kind: k for k in (
     WorkerKind("parsing", "JD parsing", "Parses each posting into structured requirements (JD parser model).",
                JobDescriptionParseTask, "jd_parsing", "PENDING", "PROCESSING", ("COMPLETED", "FAILED", "SKIPPED"),
-               lambda: get_settings().jd_parse_max_attempts, "jd_parser"),
+               lambda: get_settings().jd_parse_max_attempts, "jd_parser", stopped_status="FAILED"),
     WorkerKind("recovery", "JD recovery", "Reads a description from the posting URL when the board sent none: HTTP, "
                "then the browser, a model only on ambiguous pages.", JobDescriptionFetchTask, "jd_recovery",
                "PENDING", "PROCESSING", ("COMPLETED", "FAILED", "BLOCKED", "SKIPPED"),
@@ -138,6 +202,12 @@ KINDS: dict[str, WorkerKind] = {k.kind: k for k in (
                "SKIP; code decides. It runs as the last step of a Tailoring task: Kill and Run now act on that task, "
                "and a retry tailors the job again.", TailorTask, None, "queued", "running",
                ("succeeded", "failed", "cancelled"), _tailor_max, "reviewer", scope=_reviewing, view_of="tailoring"),
+    WorkerKind("indexing", "Indexing", "Embeds your verified evidence and saved answers for retrieval (the Embedder "
+               "model, through LiteLLM). It never generates text, and an entry you stop stays out of the index until "
+               "you retry it.", RagIndexEntry, "rag_index", "PENDING", "PROCESSING",
+               ("ACTIVE", "FAILED", "DEACTIVATED"), lambda: get_settings().rag_index_max_attempts, "retrieval_index",
+               scope=_index_scope, subject=_index_subjects, search=_index_search, requeue=_index_requeue,
+               shown=(("ACTIVE", "COMPLETED"), ("DEACTIVATED", "SKIPPED")), stopped_status="FAILED"),
 )}
 
 
@@ -166,25 +236,28 @@ def _display_status(spec: WorkerKind, task: Any, now: datetime) -> str:
         if (waiting is not None and waiting > now) or ((_attempts(spec, task) or 0) > 0 and not spec.tailor):
             return "RETRYING"
         return "QUEUED"
-    return status.upper()
+    return dict(spec.shown).get(status, status).upper()
 
 
 def _attempts(spec: WorkerKind, task: Any) -> int:
     return (task.attempts if spec.tailor else task.attempt_count) or 0
 
 
-def row(spec: WorkerKind, task: Any, job: tuple[str, str] | None, now: datetime,
+def row(spec: WorkerKind, task: Any, label: dict[str, Any] | None, now: datetime,
         max_attempts: int | None = None) -> dict[str, Any]:
-    """One task as Running workers shows it. Metadata only. `max_attempts` is the account's own limit."""
+    """One task as Running workers shows it. Metadata only. `label` is its job's title and company (or, for a task
+    without a job, what `subject` says); `max_attempts` is the account's own limit."""
     tailoring = spec.tailor
     status = _display_status(spec, task, now)
     error = task.error if tailoring else task.last_error
-    category = None if tailoring else (task.error_category.value if task.error_category else None)
+    code = None if tailoring else getattr(task, "error_category", None)
+    category = code.value if code else None
+    label = label or {}
     finished_at = task.finished_at if tailoring else getattr(task, "completed_at", None)
     waiting = None if tailoring else task.next_attempt_at
     active = task.status in spec.active
-    return {"task_id": task.id, "job_id": task.job_id, "title": job[0] if job else None,
-            "company": job[1] if job else None, "kind": spec.kind, "status": status, "raw_status": task.status,
+    return {"task_id": task.id, "job_id": getattr(task, "job_id", None), "title": label.get("title"),
+            "company": label.get("company"), "kind": spec.kind, "status": status, "raw_status": task.status,
             "stage": (task.stage if active else "done") if tailoring else ("running" if status == "RUNNING" else status.lower()),
             "mode": task.mode if tailoring else None, "reason": getattr(task, "reason", None),
             "attempt": _attempts(spec, task), "max_attempts": max_attempts or spec.max_attempts(),
@@ -197,7 +270,8 @@ def row(spec: WorkerKind, task: Any, job: tuple[str, str] | None, now: datetime,
             "can_run_now": status in ("QUEUED", "RETRYING") or status in STATUS_FILTERS["failed"],
             "retried_by": None,  # set by rows() when a newer task of the same job exists
             "can_remove": active and status != "RUNNING" and spec.kind in ("ranking", "tailoring"),
-            **({"reviewer_score": (task.result or {}).get("reviewer_score")} if spec.kind == "reviewing" else {})}
+            **({"reviewer_score": (task.result or {}).get("reviewer_score")} if spec.kind == "reviewing" else {}),
+            **{k: v for k, v in label.items() if k not in ("title", "company")}}
 
 
 # Status filters, the same for every worker: what a task is doing, in the words the screen uses.
@@ -286,7 +360,9 @@ def rows(db: Session, user_id: int, kind: str, now: datetime | None = None, *, q
     query = spec.where(select(m).where(m.user_id == user_id, or_(m.status.in_(spec.active), finished_column > shown_from)
                                        if since else or_(m.status.in_(spec.active), finished_column >= shown_from)))
     text = (q or "").strip()
-    if text.lstrip("#").isdigit():
+    if text and spec.search is not None:
+        query = query.where(spec.search(m, text))
+    elif text.lstrip("#").isdigit():
         query = query.where(m.job_id == int(text.lstrip("#")))
     elif text:
         like = f"%{text.lower()[:100]}%"
@@ -294,9 +370,9 @@ def rows(db: Session, user_id: int, kind: str, now: datetime | None = None, *, q
             func.lower(Job.title).like(like), func.lower(Job.company).like(like)))
     tasks = list(db.scalars(query.order_by((m.status != spec.running), (m.status != spec.pending),
                                            m.run_now_at.is_(None), m.id).limit(SCAN_LIMIT)).all())
-    labels = _labels(db, [t.job_id for t in tasks], user_id)
+    labels = _labels_for(db, spec, user_id, tasks)
     limit = worker_settings.get(db, user_id, spec.settings_kind, "max_attempts")
-    found = [row(spec, t, labels.get(t.job_id), now, limit) for t in tasks]
+    found = [row(spec, t, labels.get(t.id), now, limit) for t in tasks]
     _mark_retried(db, spec, user_id, found, now)
     counts = {name: sum(r["status"] in members for r in found) for name, members in STATUS_FILTERS.items()}
     counts["all"] = len(found)
@@ -434,7 +510,8 @@ def performance(db: Session, user_id: int, kind: str, start: datetime, end: date
         key = (redaction.redact_text((text or "unknown").split("\n")[0], 160) or "unknown").strip()
         errors[key] = errors.get(key, 0) + 1
         if not spec.tailor:
-            category = t.error_category.value if t.error_category else "UNKNOWN"
+            code = getattr(t, "error_category", None)
+            category = code.value if code else "UNKNOWN"
             categories[category] = categories.get(category, 0) + 1
     out: dict[str, Any] = {
         "kind": spec.kind, "start": _iso(start), "end": _iso(end),
@@ -483,7 +560,7 @@ def performance(db: Session, user_id: int, kind: str, start: datetime, end: date
 def _newer(db: Session, spec: WorkerKind, user_id: int, job_ids: Iterable[int]) -> dict[int, Any]:
     """The latest task of each job: a failed task that has a newer one was already run again."""
     ids = list(set(job_ids))
-    if not ids:
+    if not ids or not spec.job_bound:  # a task without a job is retried in place: there is never a newer one
         return {}
     m = spec.model
     latest = db.execute(select(func.max(m.id)).where(m.user_id == user_id, m.job_id.in_(ids)).group_by(m.job_id)).scalars()
@@ -641,6 +718,14 @@ def _labels(db: Session, job_ids: list[int], user_id: int) -> dict[int, tuple[st
                                                   .where(Job.id.in_(set(job_ids)), Job.user_id == user_id)).all()}
 
 
+def _labels_for(db: Session, spec: WorkerKind, user_id: int, tasks: list[Any]) -> dict[int, dict[str, Any]]:
+    """Each task's label by task id: its job's title and company, or what the kind's `subject` says."""
+    if not spec.job_bound:
+        return spec.subject(db, user_id, tasks) if tasks else {}
+    jobs = _labels(db, [t.job_id for t in tasks], user_id)
+    return {t.id: {"title": jobs[t.job_id][0], "company": jobs[t.job_id][1]} for t in tasks if t.job_id in jobs}
+
+
 def counts(db: Session, user_id: int, now: datetime | None = None) -> dict[str, dict[str, int]]:
     """Running, queued and retrying tasks per worker: the tab badges and the sidebar count."""
     now = now or utcnow()
@@ -682,11 +767,12 @@ def _requeue_fresh(db: Session, spec: WorkerKind, task: Any, user_id: int, now: 
         task.error = None
         return was_running
     task.status = spec.pending
-    task.locked_by = task.lock_token = task.lock_expires_at = None
-    if hasattr(task, "locked_at"):
-        task.locked_at = None
+    task.lock_token = task.lock_expires_at = None
+    for column in ("locked_by", "locked_at", "error_category"):
+        if hasattr(task, column):
+            setattr(task, column, None)
     task.attempt_count, task.next_attempt_at = 0, None
-    task.last_error, task.error_category = KILLED_NOTE, None
+    task.last_error = KILLED_NOTE
     if spec.kind == "ranking" and was_running:
         # The ranker moved the job to RANKING when it claimed the task; it waits for ranking again now.
         from app.services.work_queue import transition
@@ -716,9 +802,9 @@ def _stop(db: Session, spec: WorkerKind, task: Any, user_id: int, now: datetime)
         if job is not None:
             job.auto_tailor_status = DECLINED  # automatic tailoring never queues it again on its own
         return was_running
-    task.status = "FAILED" if spec.kind == "parsing" else "SKIPPED"
+    task.status = spec.stopped_status
     task.completed_at, task.next_attempt_at = now, None
-    task.last_error, task.error_category = STOPPED_BY_USER, None
+    task.last_error = STOPPED_BY_USER
     if spec.kind == "recovery":
         task.result_code = "STOPPED_BY_USER"
     if spec.kind == "ranking":
@@ -750,7 +836,7 @@ def kill(db: Session, user_id: int, kind: str, task_ids: list[int] | None = None
             continue  # a task still waiting its first turn is not stopped by Kill (Remove takes it out)
         running += _stop(db, spec, task, user_id, now)
         stopped += 1
-        stopped_jobs.append(task.job_id)
+        stopped_jobs.append(getattr(task, "job_id", None))
     db.commit()
     if spec.kind == "parsing":
         from app.services import job_description
@@ -769,7 +855,10 @@ def kill_all(db: Session, user_id: int, now: datetime | None = None) -> dict[str
 
 
 def _requeue_finished(db: Session, spec: WorkerKind, task: Any, user_id: int) -> Any:
-    """A failed or blocked task gets a new one through the path that normally queues it."""
+    """A failed or blocked task gets a new one through the path that normally queues it (a task without a job: the
+    same row, through its kind's `requeue`)."""
+    if spec.requeue is not None:
+        return spec.requeue(db, task, user_id)
     job = db.scalar(select(Job).where(Job.id == task.job_id, Job.user_id == user_id))
     if job is None:
         raise WorkerError("The job no longer exists", 404)
@@ -835,7 +924,7 @@ def retry(db: Session, user_id: int, kind: str, task_ids: list[int], now: dateti
         if shown not in STATUS_FILTERS["failed"]:
             skipped.append({"task_id": task_id, "reason": f"Not failed ({shown.lower()})"})
             continue
-        latest = _newer(db, spec, user_id, [task.job_id]).get(task.job_id)
+        latest = _newer(db, spec, user_id, [getattr(task, "job_id", None)]).get(getattr(task, "job_id", None))
         if latest is not None and latest.id != task.id:
             skipped.append({"task_id": task_id, "reason": f"Already run again as task #{latest.id}"})
             continue
@@ -846,7 +935,7 @@ def retry(db: Session, user_id: int, kind: str, task_ids: list[int], now: dateti
             db.rollback()
             skipped.append({"task_id": task_id, "reason": str(exc)})
             continue
-        retried.append({"task_id": task_id, "new_task_id": fresh.id, "job_id": task.job_id})
+        retried.append({"task_id": task_id, "new_task_id": fresh.id, "job_id": getattr(task, "job_id", None)})
     return {"kind": spec.kind, "retried": retried, "skipped": skipped}
 
 
@@ -859,8 +948,9 @@ def run_now(db: Session, user_id: int, kind: str, task_id: int, now: datetime | 
         raise WorkerError("This task is running right now")
     if task.status not in spec.active:
         if _display_status(spec, task, now) not in STATUS_FILTERS["failed"]:
-            raise WorkerError("This task already finished; queue the job again from its screen")
-        latest = _newer(db, spec, user_id, [task.job_id]).get(task.job_id)
+            raise WorkerError("This task already finished; queue the job again from its screen" if spec.job_bound
+                              else "This entry already finished; nothing is waiting to run")
+        latest = _newer(db, spec, user_id, [getattr(task, "job_id", None)]).get(getattr(task, "job_id", None))
         if latest is not None and latest.id != task.id:
             raise WorkerError(f"Already run again as task #{latest.id} "
                               f"({_display_status(spec, latest, now).lower()}); use Run now on that one")
@@ -871,8 +961,8 @@ def run_now(db: Session, user_id: int, kind: str, task_id: int, now: datetime | 
     if spec.kind == "ranking":
         task.force = True  # a ranking the person asked for: the cadence never holds it back
     db.commit()
-    labels = _labels(db, [task.job_id], user_id)
-    return row(spec, task, labels.get(task.job_id), now, worker_settings.get(db, user_id, spec.settings_kind, "max_attempts"))
+    labels = _labels_for(db, spec, user_id, [task])
+    return row(spec, task, labels.get(task.id), now, worker_settings.get(db, user_id, spec.settings_kind, "max_attempts"))
 
 
 def run_queued_now(db: Session, user_id: int, kind: str, now: datetime | None = None) -> dict[str, Any]:
