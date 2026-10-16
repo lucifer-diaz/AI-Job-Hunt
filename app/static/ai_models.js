@@ -187,7 +187,9 @@ function aimTestResult(t) {
 /* ── the worker drawer: model, backups, on/off; generation and escalation folded away ── */
 function aimWorkerBaseline(w) {
   const c = w.config || {}, e = c.escalation || {}, backups = aimBackups(c);
-  return { target: aimTarget(c), ...Object.fromEntries(Array.from({ length: AIM_BACKUPS }, (_, i) => [`backup_${i}`, backups[i] || ''])), temperature: c.temperature ?? '', max_output_tokens: c.max_output_tokens ?? '', context_window: c.context_window ?? '', reasoning_effort: c.reasoning_effort || '', timeout_seconds: c.timeout_seconds ?? '', retry_count: c.retry_count ?? '', max_concurrency: c.max_concurrency ?? '', use_structured_output: c.use_structured_output !== false, enabled: c.enabled !== false, esc_target: e.model ? `model:${e.model}` : e.tier ? `tier:${e.tier}` : '', esc_threshold: e.confidence_threshold ?? '', ...Object.fromEntries(Object.keys(AIM_CONDITIONS).map(k => [`esc_${k}`, (e.conditions || []).includes(k)])) };
+  // An embedding worker is on exactly while it has a model: switched off, it shows Off whatever model it last had.
+  const target = w.capability === 'EMBEDDING' && c.enabled === false ? '' : aimTarget(c);
+  return { target, ...Object.fromEntries(Array.from({ length: AIM_BACKUPS }, (_, i) => [`backup_${i}`, backups[i] || ''])), temperature: c.temperature ?? '', max_output_tokens: c.max_output_tokens ?? '', context_window: c.context_window ?? '', reasoning_effort: c.reasoning_effort || '', timeout_seconds: c.timeout_seconds ?? '', retry_count: c.retry_count ?? '', max_concurrency: c.max_concurrency ?? '', use_structured_output: c.use_structured_output !== false, enabled: c.enabled !== false, esc_target: e.model ? `model:${e.model}` : e.tier ? `tier:${e.tier}` : '', esc_threshold: e.confidence_threshold ?? '', ...Object.fromEntries(Object.keys(AIM_CONDITIONS).map(k => [`esc_${k}`, (e.conditions || []).includes(k)])) };
 }
 function aimDrawerValues(w) { const base = aimWorkerBaseline(w); return Object.fromEntries(Object.keys(base).map(k => [k, fv('aiw', k, base[k])])); }
 const aimDrawerBackups = v => Array.from({ length: AIM_BACKUPS }, (_, i) => v[`backup_${i}`]).filter(Boolean);
@@ -204,6 +206,7 @@ function aimWarnings(w, v) {
 function aimDrawer() {
   const w = (aimData().workers || []).find(x => x.worker_type === AIM.drawer);
   if (!w) return '';
+  if (w.capability === 'EMBEDDING') return aimEmbedderDrawer(w);
   const v = aimDrawerValues(w), model = aimModel(aimTargetModel(v.target)), d = aimData(), warnings = aimWarnings(w, v);
   const f = (key, label, extra = '') => `<label class="field" for="aiw-${key}"><span>${label}</span>${inputF('aiw', key, v[key], extra)}</label>`;
   // Filled backups plus one empty slot, so the list grows as you fill it.
@@ -222,7 +225,24 @@ function aimDrawer() {
     ${settingsDetails('aim-escalation', 'Quality escalation', `<p class="settings-help">When an answer is not good enough, ask a stronger model once. Separate from backups, which handle outages.</p><div class="settings-grid"><label class="field" for="aiw-esc_target"><span>Escalate to</span><select class="select" id="aiw-esc_target" data-form="aiw" data-field="esc_target">${escTargets}</select></label>${f('esc_threshold', 'Confidence threshold', 'type="number" min="0" max="1" step="0.05" placeholder="e.g. 0.85"')}</div><div class="settings-checks">${conditions}</div>`)}
     <footer class="row gap8 mt14">${btn(isBusy('aim-worker-save') ? 'Saving…' : 'Save', 'aim-worker-save', { worker: w.worker_type }, 'primary', isBusy('aim-worker-save'))}${btn(isBusy(`aim-wtest-${w.worker_type}`) ? 'Testing…' : 'Test', 'aim-worker-test', { worker: w.worker_type }, '', isBusy(`aim-wtest-${w.worker_type}`))}</footer>${AIM.tests[`worker:${w.worker_type}`] ? aimTestResult(AIM.tests[`worker:${w.worker_type}`]) : ''}</aside>`;
 }
+// An embedding worker (the Embedder): one fixed EMBEDDING model or Off. No tiers, backups, generation settings or
+// escalation — vectors of another model cannot be compared, and Apply refuses them anyway.
+function aimEmbedderDrawer(w) {
+  const v = aimDrawerValues(w), m = aimModel(aimTargetModel(v.target));
+  const available = aimModels().some(x => x.enabled && aimFits(x, 'EMBEDDING'));
+  const size = m ? (m.embedding_dimensions ? `${m.embedding_dimensions} dimensions` : 'unknown — press Test on the model in Models, or set its vector size there') : '';
+  return `<aside class="aim-drawer" role="dialog" aria-modal="false" aria-labelledby="aim-drawer-title"><header class="row between"><h3 id="aim-drawer-title">${esc(w.label)}</h3>${btn('Close', 'aim-drawer-close', {}, 'sm')}</header><p class="settings-help">${esc(w.description || '')}</p>
+    ${available ? '' : '<div class="settings-notice" role="status"><p>No embedding models yet. Sync from LiteLLM in Models, and set a model\'s type to Embedding if discovery did not.</p></div>'}
+    <label class="field" for="aiw-target"><span>Model</span><select class="select" id="aiw-target" data-form="aiw" data-field="target" data-live="1">${aimTargetOptions(v.target, 'EMBEDDING')}</select></label>
+    ${m ? `<p class="settings-help">Vector size: ${esc(size)}</p>` : ''}
+    <p class="settings-help">One fixed embedding model, with no backups, generation settings or escalation: vectors of another model cannot be compared. Off keeps retrieval on keyword and full-text search. A new model is indexed beside the current one and takes over once it covers everything.</p>
+    <footer class="row gap8 mt14">${btn(isBusy('aim-worker-save') ? 'Saving…' : 'Save', 'aim-worker-save', { worker: w.worker_type }, 'primary', isBusy('aim-worker-save'))}${btn(isBusy(`aim-wtest-${w.worker_type}`) ? 'Testing…' : 'Test', 'aim-worker-test', { worker: w.worker_type }, '', isBusy(`aim-wtest-${w.worker_type}`))}</footer>${AIM.tests[`worker:${w.worker_type}`] ? aimTestResult(AIM.tests[`worker:${w.worker_type}`]) : ''}</aside>`;
+}
 function aimWorkerPayload(w) {
+  if (w.capability === 'EMBEDDING') {
+    const [kind, name] = String(aimDrawerValues(w).target || '').split(/:(.*)/s), model = kind === 'model' ? name : null;
+    return { revision: aimRev(), model_mode: 'FIXED', primary_model: model, tier_name: null, fallback_model: null, secondary_models: [], escalation: null, enabled: !!model };
+  }
   const v = aimDrawerValues(w), num = x => x === '' || x == null ? null : Number(x);
   const [kind, name] = String(v.esc_target || '').split(/:(.*)/s);
   const conditions = Object.keys(AIM_CONDITIONS).filter(k => v[`esc_${k}`]);
