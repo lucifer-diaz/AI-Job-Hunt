@@ -2480,6 +2480,11 @@ class RagIndexEntry(Base):
     last_error: Mapped[str | None] = mapped_column(String(300), nullable=True)
     embedded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     deactivated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Running workers (app.services.workers, kind "indexing"): when the latest attempt started and the entry last
+    # finished (ACTIVE, DEACTIVATED or FAILED), and a person's Run now (claimed first, past cooldowns, then cleared).
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    run_now_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
 

@@ -335,6 +335,15 @@ other static files.
 
 * **Every queued worker registers a `WorkerKind`** (task model, statuses, max attempts, scheduler job, orchestration
   node). The screen renders whatever the registry returns.
+* **A queue without a job is still a `WorkerKind`.** The retrieval indexer's entries (`rag_index_entries`, kind
+  `indexing`) belong to an account and a source row: the kind sets `subject` (a row's label — ids and the index version,
+  never the source's text — and the embedding model), `search`, `requeue` (Retry and Run now put the same row back;
+  there is never a newer task), `stopped_status` and `shown` (its finished statuses in the shared words). Its rows carry
+  `job_id` None, so never key a control on `task.job_id` without checking `WorkerKind.job_bound`. Edits and sweeps
+  leave a stopped entry stopped; un-verifying or deleting its source still deactivates or removes it.
+* **A claim may be a batch.** The indexer leases one embedding request's entries under one token; `Claimed.task_id` is
+  that token and `rag_index.renew` is its `run_live` heartbeat. Run-now entries are claimed in a batch of their own, so
+  only they skip the cooldown.
 * **A worker's claim honours `run_now_at`:** order run-now tasks first, clear the column on claim, carry `run_now` on the
   claim, and run that task inside `backoff.bypass(claim.run_now)`. Never bypass a cooldown any other way.
 * **Every write a worker makes after its model or network call stays lease-guarded** (a lock token or a per-claim holder

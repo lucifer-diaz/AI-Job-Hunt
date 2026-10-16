@@ -356,6 +356,8 @@ class Settings(BaseSettings):
     rag_embed_batch_size: int = 32
     rag_index_max_entries_per_run: int = 500
     rag_index_max_attempts: int = 5
+    rag_index_retry_seconds: int = 30  # the first retry wait; doubles per attempt, at most an hour
+    rag_index_concurrency: int = 2  # embedding batches in flight at once, across accounts
     rag_max_candidates: int = 50
     rag_context_token_budget: int = 1200
     rag_backfill_min_coverage: float = 1.0

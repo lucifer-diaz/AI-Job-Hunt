@@ -52,6 +52,8 @@ from app.models import (
     JobRanking,
     JobRankingTask,
     LLMRequestLog,
+    RagIndexEntry,
+    RagIndexVersion,
     ResumeVariant,
     SearchRun,
     SystemLogEntry,
@@ -428,6 +430,20 @@ def live_counts(db: Session, user_id: int | None, now: datetime | None = None) -
         ).where(or_(status.in_(t.pending + t.running), t.finished >= recent)), m.user_id, user_id)).first()
         c = counts[t.node_id]
         c["queued"], c["retrying"], c["running"], c["failed_recent"], c["blocked_recent"] = (int(v or 0) for v in row)
+    # The retrieval indexer's entries belong to no job: counted at its node, never placed as a job's packet.
+    e = RagIndexEntry
+    waiting = e.status == "PENDING"
+    row = db.execute(_owned(select(
+        func.sum(case((and_(waiting, e.attempt_count == 0), 1), else_=0)),
+        func.sum(case((and_(waiting, e.attempt_count > 0), 1), else_=0)),
+        func.sum(case((e.status == "PROCESSING", 1), else_=0)),
+        func.sum(case((and_(e.status == "FAILED", e.completed_at >= recent), 1), else_=0)),
+    ).where(or_(e.status.in_(("PENDING", "PROCESSING")), e.completed_at >= recent),
+            e.index_version_id.in_(select(RagIndexVersion.id).where(RagIndexVersion.status != "RETIRED"))),
+        e.user_id, user_id)).first()
+    if "retrieval_index" in counts:
+        c = counts["retrieval_index"]
+        c["queued"], c["retrying"], c["running"], c["failed_recent"] = (int(v or 0) for v in row)
     # Tailoring runs one task through tailor → review; the task's stage says which worker holds it.
     rows = db.execute(_owned(select(TailorTask.status, TailorTask.stage, TailorTask.attempts, func.count())
                              .where(or_(TailorTask.status.in_(("queued", "running")),

@@ -199,7 +199,7 @@ LIVE_CHECK_SECONDS = 5.0  # how often a run re-reads "side by side" and "tasks p
 _ABANDONED: set[asyncio.Task] = set()
 
 
-async def run_live(*, concurrency: str, batch: str, claim: Callable[[int], list[Any]],
+async def run_live(*, concurrency: str, batch: str | None, claim: Callable[[int], list[Any]],
                    process: Callable[[Any], Awaitable[str]],
                    heartbeat: Callable[[list[Any]], set[int]] | None = None) -> tuple[int, Counter]:
     """Run one scheduler pass of a queued worker. Returns (claimed, outcomes).
@@ -215,14 +215,17 @@ async def run_live(*, concurrency: str, batch: str, claim: Callable[[int], list[
     stopped from Running workers lost its lease, so the pass stops waiting for it at once: its slot is free for other
     work and the pass is not held open by a call nobody wants any more.
 
+    `batch` None leaves the size of the pass to `claim` (the retrieval indexer, whose budget is per account).
+
     `process` must not raise: each worker's own processing turns a failure into an outcome."""
     outcomes: Counter = Counter()
     running: dict[asyncio.Task, Any] = {}
     missing: dict[asyncio.Task, float] = {}  # tasks no longer held, since when
     claimed, exhausted = 0, False
     while True:
-        room = min(max(1, server_settings.value(concurrency)) - len(running),
-                   max(1, server_settings.value(batch)) - claimed)
+        room = max(1, server_settings.value(concurrency)) - len(running)
+        if batch is not None:
+            room = min(room, max(1, server_settings.value(batch)) - claimed)
         if room > 0 and not exhausted:
             fresh = await threads.run_io(claim, room)
             claimed += len(fresh)
@@ -639,29 +642,74 @@ async def agent_graphs(ctx: JobContext) -> dict[str, Any]:
 async def rag_index_job(ctx: JobContext) -> dict[str, Any]:
     """Embed each account's verified evidence and saved answers into its retrieval index (app.services.rag_index).
 
-    Off unless RAG_VECTOR_ENABLED. An account without a usable embedding model (none assigned to the Embedder, or not
-    in LiteLLM gateway mode) is skipped with the reason; a provider failure stops that account's pass and its entries
-    are retried later. A new model is built beside the serving index and replaces it only when complete."""
+    Off unless RAG_VECTOR_ENABLED. Every account is swept first (its queue is kept while it is paused); then batches
+    are claimed round-robin across accounts and embedded `rag_index_concurrency` at a time (live, run_live), each
+    account up to `rag_index_max_entries_per_run` entries. An account without a usable embedding model (none assigned
+    to the Embedder, or not in LiteLLM gateway mode) is skipped with the reason; a provider failure stops that
+    account's pass and its entries are retried later. A new model is built beside the serving index and replaces it
+    only when complete."""
     if not get_settings().rag_vector_enabled:
         return skipped("Vector retrieval is off (RAG_VECTOR_ENABLED)")
     from app.services import rag_index
 
     accounts = _account_ids(ctx)
-    summary: dict[str, Any] = {"accounts": len(accounts), "embedded": 0, "failed": 0, "skipped": {}, "errors": []}
+    summary: dict[str, Any] = {"accounts": len(accounts), "claimed": 0, "embedded": 0, "failed": 0, "skipped": {},
+                               "errors": []}
+    passes: list[rag_index.AccountPass] = []
     for user_id in accounts:
         try:
-            result = await threads.run_work(rag_index.run_account, ctx.sessions, user_id, at=ctx.now)
+            prepared = await threads.run_work(rag_index.prepare, ctx.sessions, user_id)
         except Exception as exc:  # noqa: BLE001  one account's failure must not stop the others
             summary["errors"].append(_error(user_id, exc))
             continue
-        if result.get("skipped"):
-            summary["skipped"][result["skipped"]] = summary["skipped"].get(result["skipped"], 0) + 1
+        if isinstance(prepared, dict):
+            summary["skipped"][prepared["skipped"]] = summary["skipped"].get(prepared["skipped"], 0) + 1
+        else:
+            passes.append(prepared)
+    owner: dict[str, rag_index.AccountPass] = {}
+    open_passes = list(passes)
+
+    def claim(limit: int) -> list[rag_index.Claimed]:
+        out: list[rag_index.Claimed] = []
+        while len(out) < limit and open_passes:  # one batch per account per round: no account starves the others
+            for run in list(open_passes):
+                if len(out) >= limit:
+                    break
+                try:
+                    claimed = rag_index.take(ctx.sessions, run)
+                except Exception as exc:  # noqa: BLE001
+                    summary["errors"].append(_error(run.user_id, exc))
+                    claimed = None
+                if claimed is None:
+                    open_passes.remove(run)
+                    continue
+                owner[claimed.token] = run
+                out.append(claimed)
+        return out
+
+    async def process(claimed: rag_index.Claimed) -> str:
+        run = owner[claimed.token]
+        try:
+            return await threads.run_work(rag_index.work, ctx.sessions, run, claimed)
+        except Exception as exc:  # noqa: BLE001  the lease expires and the entries are claimed again
+            summary["errors"].append(_error(run.user_id, exc))
+            return "error"
+
+    if passes:
+        claimed, _ = await run_live(concurrency="rag_index_concurrency", batch=None, claim=claim, process=process,
+                                    heartbeat=lambda claims: rag_index.renew(ctx.sessions, claims))
+        summary["claimed"] = claimed
+    for run in passes:
+        try:
+            result = await threads.run_io(rag_index.finish, ctx.sessions, run)
+        except Exception as exc:  # noqa: BLE001
+            summary["errors"].append(_error(run.user_id, exc))
             continue
         summary["embedded"] += result.get("embedded", 0)
         summary["failed"] += result.get("failed", 0)
         if result.get("error"):
-            summary["errors"].append({"user_id": user_id, "error": result["error"]})
-    if not summary["embedded"] and not summary["failed"] and not summary["errors"] and summary["skipped"]:
+            summary["errors"].append({"user_id": run.user_id, "error": result["error"]})
+    if not passes and not summary["errors"] and summary["skipped"]:
         return skipped("No account has an embedding index to build", **summary)
     return summary
 

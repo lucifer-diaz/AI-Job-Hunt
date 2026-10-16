@@ -54,6 +54,15 @@ EDITABLE: dict[str, Editable] = {e.name: e for e in (
     Editable("ranking_batch_size", "ranking", "Tasks per run", "How many ranking tasks one run claims.", 1, 500),
     Editable("ranking_concurrency", "ranking", "Most per account",
              "The most rankings one account may run at once (each account picks up to this).", 1, 64),
+    Editable("rag_index_interval_minutes", "indexing", "Run every (minutes)",
+             "How often the retrieval indexer looks for work. 0 turns it off for every account; it never runs while "
+             "RAG_VECTOR_ENABLED is off.", 0, 1440, "rag_index"),
+    Editable("rag_embed_batch_size", "indexing", "Entries per batch",
+             "How many facts or answers go to the embedding model in one request.", 1, 256),
+    Editable("rag_index_max_entries_per_run", "indexing", "Entries per account per run",
+             "The most entries one run embeds for one account.", 1, 5000),
+    Editable("rag_index_concurrency", "indexing", "Side by side",
+             "How many embedding batches are in flight at once, across accounts.", 1, 16),
 )}
 
 _lock = threading.Lock()

@@ -184,8 +184,9 @@ def test_an_edit_while_embedding_never_stores_the_old_texts_vector(data):
 def test_a_provider_failure_keeps_the_entries_for_a_later_retry(data):
     summary = run(data, Spy(fail="UNAVAILABLE"))
     assert summary["error"].startswith("UNAVAILABLE") and summary["status"] == "BUILDING"
-    failed = entries(data, status="FAILED")
-    assert failed and all(e.next_attempt_at is not None and e.attempt_count == 1 for e in failed)
+    waiting = entries(data, status="PENDING")  # retrying (Running workers): attempts are left
+    assert waiting and all(e.next_attempt_at is not None and e.attempt_count == 1 and e.last_error for e in waiting)
+    assert not entries(data, status="FAILED")
     with rs.session_for(SessionLocal, data.user_id) as db:  # the backoff passes
         db.execute(update(RagIndexEntry).where(RagIndexEntry.user_id == data.user_id)
                    .values(next_attempt_at=None))

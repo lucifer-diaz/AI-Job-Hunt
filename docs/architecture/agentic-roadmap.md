@@ -149,6 +149,7 @@ Record accepted changes to these decisions with an appended rationale, date, PR,
 | ADR-021 | Phase 2 embeddings are served only through the LiteLLM gateway (`/v1/embeddings` via the instrumented client), configured as the EMBEDDER worker's FIXED EMBEDDING model with a known vector size. Other provider modes get keyword/full-text retrieval only. | One credential, routing and telemetry path (ADR-016) with provider-reported cost; Ollama and hosted embedding models are both reachable as LiteLLM deployments. Consequence: no embeddings in direct OpenAI/Anthropic/Gemini mode. | A reviewed direct adapter meets the same contract (size check, telemetry, NULL unknown cost) |
 | ADR-022 | Job-scoped retrieval is scoped by explicit evidence ↔ resume tags (`evidence_resume_links`, AUTO from verification or extraction, USER from the person, removals kept) plus the selected resume's own verified `fact_key`s. Untagged manual or extracted evidence applies to every resume; resume-sourced evidence is never global. | `Evidence.resume_id` follows whichever resume synced a shared fact last, so it cannot say which resumes own a fact. Explicit tags let a person decide and the scope rule stays deterministic (ADR-017). Consequence: existing manual evidence stays usable by every resume until tagged. | A person needs a per-job evidence override |
 | ADR-023 | Vectors live in a runtime-created `rag_vectors` table (pgvector `vector` with no fixed size, rows carry `dimensions`). Exact cosine search runs over the pre-filtered scope; there is no ANN index. The embedding indexer is account-level and is not a `WorkerKind` or orchestration node. | An install without pgvector must still start, which Alembic cannot express. Scope filtering leaves tens to hundreds of rows per query, so exact search is correct and fast. `WorkerKind` is job-bound (ADR-020). Consequence: index progress shows in `/api/rag/status` and Monitoring → External APIs, not Running workers. | A measured account makes exact search too slow, or Running workers gains non-job tasks |
+| ADR-023 (amended 2026-10-16) | The embedding indexer **is** now a `WorkerKind` (`indexing`) and an orchestration node (`retrieval_index`, types ASYNC_WORKER + EXTERNAL: an embedding call makes vectors, not text, so it is not an AI node). `WorkerKind` gained a non-job variant: `subject` labels a row (Evidence #12 · index v3), `search`, `requeue` (Retry and Run now put the same row back), `stopped_status`, `shown`. Entries record `started_at` / `completed_at` / `run_now_at` (migration 0046). A retryable failure is PENDING with a retry time until the account's attempts (`worker_settings` `indexing`) run out, then FAILED; Kill ends an entry FAILED with `STOPPED_BY_USER`, and neither sweeps nor edits revive it. The `rag_index` job sweeps every account, then runs batches through `scheduled_jobs.run_live` (round-robin across accounts, `rag_index_concurrency` in flight, a batch's token as its claim id, `rag_index.renew` as heartbeat); interval, batch size, per-account budget and concurrency are `server_settings.EDITABLE`. Run-now entries are claimed first in a batch of their own under `backoff.bypass`; a paused account's queue is swept and held. | The revisit trigger fired: vectors must not be turned on in production without Kill, Retry, Run now and pause on the queue that spends embedding calls. ADR-020's trigger ("Running workers gains non-job tasks") fired too; the pilot graph stays outside the registry because it still has no production effect. Consequence: index progress shows in Running workers → Indexing as well as `/api/rag/status`. | A non-job queue needs per-row controls `requeue` cannot express (e.g. a row that must be recreated rather than reset) |
 
 ## 5. Core data and durability contracts
 
@@ -624,8 +625,8 @@ Allowed status: NOT_STARTED, PLANNING, IN_PROGRESS, IN_REVIEW, MERGED, BLOCKED, 
   - A version is promoted only after a re-sweep: a fact verified or added while it was building now keeps it from
     serving until that fact is embedded.
   - With `on`, the verified-facts gate of tailoring and cover letters counts only evidence of the job's own resume.
-  - Not changed: the indexer is still not a `WorkerKind` (ADR-023). Running workers is job-bound, so this is a
-    separate follow-up, needed before vectors are turned on in production.
+  - The indexer in Running workers was a separate follow-up, done the same day (ADR-023 amendment: Running workers →
+    Indexing).
 - **Tests** (the reviewer's runs on head with the review fixes: PostgreSQL 16.8 + pgvector 0.8.7, `jobhunt` conda env,
   `mcp` 1.30 on `PYTHONPATH` because the env has 2.x):
   - **New suites:** `test_embeddings.py`, `test_rag_index.py`, `test_rag_retrieval.py`, `test_rag_eval.py` and
@@ -641,8 +642,9 @@ Allowed status: NOT_STARTED, PLANNING, IN_PROGRESS, IN_REVIEW, MERGED, BLOCKED, 
   - Company intelligence and application-history collections are deferred to Phase 4.
   - Existing untagged manual evidence applies to every resume until tagged.
   - With `off` or `shadow`, tailoring still checks citations against the account's verified evidence, as on `main`.
-  - The indexer is not a `WorkerKind` (ADR-023): no kill, run-now or retry in Running workers, and embedding calls do
-    not appear in Model performance.
+  - ~~The indexer is not a `WorkerKind` (ADR-023): no kill, run-now or retry in Running workers~~ — resolved
+    2026-10-16 (ADR-023 amendment: Running workers → Indexing). Embedding calls still do not appear in Model
+    performance (they are not LLM requests).
   - With `shadow` and vectors on, every context build embeds one query (cached per account); follow the rollout order.
 - **Rollback:** `RAG_RETRIEVAL_MODE=off`, `RAG_VECTOR_ENABLED=false`. Optionally downgrade 0045, which also drops
   `rag_vectors`.
