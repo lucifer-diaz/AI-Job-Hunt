@@ -118,6 +118,33 @@ describe('saved search setups', () => {
     expect(ui.S.forms.sp).toBeUndefined();
   });
 
+  it('a saved setup shares its own actors with the other setups, unticking one it removed', async () => {
+    const mine = { id: 'me/jobs', name: 'Mine', fan_out: 'role', input_template: {} };
+    const gone = { id: 'me/old', name: 'Old', fan_out: 'role', input_template: {} };
+    ui.D.setups[1].settings = { ...ui.D.setups[1].settings, custom_actors: [gone], actors: ['me/old', 'openclawai/job-board-scraper'] };
+    const saved = setup(1, 'Remote AI');
+    saved.settings = { ...saved.settings, custom_actors: [mine], actors: ['me/jobs'] };
+    fetchMock.mockImplementation(async () => response({ setup: saved }));
+    await ui.A['save-search']();
+    const other = ui.D.setups.find(x => x.id === 2).settings;
+    expect(other.custom_actors).toEqual([mine]);
+    expect(other.actors).toEqual(['openclawai/job-board-scraper']);
+  });
+
+  it('sends only what was done to your own actors, and says which schedules a removal paused', async () => {
+    const mine = { id: 'me/jobs', name: 'Mine', fan_out: 'role', input_template: {} };
+    ui.setF('sp', 'custom_actors', [mine]); ui.setF('sp', 'actors', ['me/jobs']);
+    ui.render();
+    document.querySelector('[data-act="remove-actor"][data-actor="me/jobs"]').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    expect([ui.setupPayload().removed_actors, ui.setupPayload().changed_actors]).toEqual([['me/jobs'], []]);
+    ui.D.setups[1].settings = { ...ui.D.setups[1].settings, custom_actors: [mine], actors: ['me/jobs'] };
+    fetchMock.mockImplementation(async () => response({ setup: setup(1, 'Remote AI'), paused_setups: ['Mumbai leadership'] }));
+    await ui.A['save-search']();
+    expect(document.getElementById('toast').textContent).toContain('schedule paused for “Mumbai leadership”');
+    expect(ui.D.setups[1]).toMatchObject({ enabled: false, settings: { custom_actors: [], actors: [] } });
+    expect(ui.setupPayload().removed_actors).toEqual([]);  // the saved form starts clean
+  });
+
   it('runs the selected setup after saving it', async () => {
     const calls = [];
     fetchMock.mockImplementation(async (url, opts) => {
@@ -191,6 +218,7 @@ describe('actor picker', () => {
     ui.A['add-actor']();
     const saved = ui.S.forms.sp.custom_actors;
     expect(saved.map(c => c.id)).toEqual(['me/jobs', 'me/other']);
+    expect(ui.setupPayload().changed_actors).toEqual(['me/jobs']);
     expect(saved[0]).toMatchObject({ name: 'Renamed', fan_out: 'role', input_template: { q: '{{role}}', limit: '{{max_results}}' } });
     expect(ui.S.editActor).toBeNull();
   });
@@ -199,7 +227,8 @@ describe('actor picker', () => {
     ui.D.actors.placeholders = ['role', 'is_remote', 'seniority'];
     ui.S.addActor = true;
     ui.setF('ca', 'input_template', '{\n  "remote": false\n}');
-    ui.S.caFields = [{ name: 'seniority', type: 'array', suggested: '{{seniority}}' }, { name: 'note', type: 'string', suggested: '' }];
+    ui.S.caFields = [{ name: 'seniority', type: 'array', suggested: '{{seniority}}' }, { name: 'note', type: 'string', suggested: '' },
+      { name: 'skill', type: 'array', suggested: ['{{skill}}'] }];
     ui.render();
     const box = document.getElementById('ca-input_template');
     box.selectionStart = box.value.indexOf('false'); box.selectionEnd = box.selectionStart + 5;
@@ -207,6 +236,21 @@ describe('actor picker', () => {
     expect(JSON.parse(document.getElementById('ca-input_template').value)).toEqual({ remote: '{{is_remote}}' });
     document.querySelector('[data-act="insert-actor-field"][data-name="seniority"]').dispatchEvent(new MouseEvent('click', { bubbles: true }));
     expect(JSON.parse(document.getElementById('ca-input_template').value)).toEqual({ remote: '{{is_remote}}', seniority: '{{seniority}}' });
+    const skill = document.querySelector('[data-act="insert-actor-field"][data-name="skill"]');
+    expect(skill.textContent).toContain('[{{skill}}]');
+    skill.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    expect(JSON.parse(document.getElementById('ca-input_template').value).skill).toEqual(['{{skill}}']);
+  });
+
+  it('labels the primary skill placeholders and shows a template that reads them on its card', () => {
+    ui.D.actors.placeholders = ['role', 'skill', 'skills'];
+    ui.S.addActor = true;
+    ui.setF('sp', 'custom_actors', [{ id: 'me/jobs', name: 'Mine', fan_out: 'role', input_template: { q: '{{role}} {{skill}}' } }]);
+    ui.render();
+    const button = document.querySelector('[data-act="insert-placeholder"][data-name="skill"]');
+    expect(button.textContent).toContain('primary skill');
+    expect(button.title).toBe('First primary skill');
+    expect(document.querySelector('label[for="actor-me-jobs"] .actor-uses').textContent).toContain('Primary skills');
   });
 
   it('sends the startup settings with the search', () => {

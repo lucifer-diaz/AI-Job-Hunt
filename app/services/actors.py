@@ -630,7 +630,8 @@ def plan_runs(sp: dict) -> tuple[list[dict], list[str]]:
     locations = [loc.strip() for loc in sp.get("locations") or [] if loc.strip()]
     if not roles:
         raise ValueError("Add at least one role to the search profile")
-    selected = [a for a in sp.get("actors") or DEFAULT_ACTORS]
+    # Only an absent selection means the defaults: an empty one (its last actor removed) runs nothing.
+    selected = list(DEFAULT_ACTORS if sp.get("actors") is None else sp["actors"])
     specs = catalog(sp)
     missing = [a for a in selected if a not in specs]
     if missing:
