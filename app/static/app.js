@@ -929,7 +929,7 @@ function renderSetup() {
   const suggestions = (D.summary && D.profileRoles || []).filter(r => !roles.includes(r)).slice(0, 3);
   const actors = fv(F, 'actors', p.actors || []), customs = fv(F, 'custom_actors', p.custom_actors || []);
   const catalogList = [...(D.actors?.actors || []).filter(a => !a.custom).map(a => ({ ...a, group: a.group || 'Job boards' })),
-    ...customs.map(c => ({ ...c, name: c.name || c.id, summary: 'Added by you', cost: "see the actor's pricing", custom: true, group: 'Your actors' }))];
+    ...customs.map(c => ({ ...c, name: c.name || c.id, summary: 'Added by you · listed in every setup', cost: "see the actor's pricing", custom: true, group: 'Your actors' }))];
   const on = id => actors.includes(id);
   const startup = Object.fromEntries(Object.entries(STARTUP_ACTORS).map(([k, id]) => [k, on(id)]));
   const platforms = fv(F, 'remote_platforms', p.remote_platforms || []), seniority = fv(F, 'seniority', p.seniority || []);
@@ -950,7 +950,7 @@ function renderSetup() {
         <div class="helper">Press Enter to add each role · Backspace removes the last one${suggestions.length ? ` · Suggested from your profile: ${suggestions.map(s => `<a href="#" data-act="suggest-role" data-role="${attr(s)}">${esc(s)}</a>`).join(' · ')}` : ''}</div></div>
       <div><div class="small b mb8">Primary skills <span class="faint" style="font-weight:400">· optional, up to 3</span></div>
         ${tagBox(F, 'primary_skills', p.primary_skills || [], 'Python, Java… then press Enter', 3)}
-        <div class="helper">The first skill is added to each role's search (Backend Engineer Python) · jobs that mention none of them are hidden as Not matching</div></div>
+        <div class="helper">The first skill is added to each role's search (Backend Engineer Python) · jobs that mention none of them are hidden as Not matching · your own actors read them as <span class="mono">{{skill}}</span> and <span class="mono">{{skills}}</span></div></div>
       <div><div class="small b mb8">Locations <span class="faint" style="font-weight:400">· up to 5, one search each</span></div>
         <div class="tagbox" data-tag-input="locations" data-act="focus-tag" data-target="sp-locations">${chips(F, 'locations', p.locations)}<input id="sp-locations" data-tag="locations" data-form="sp" data-max="5" data-split="newline" autocomplete="off" placeholder="Type a city or Remote, then press Enter"></div>
         <div class="helper">Press Enter to add each location — commas stay part of it (New York, NY) · leave empty to search anywhere</div></div>
@@ -1819,10 +1819,10 @@ async function pollRuns() {
 }
 const FANOUT = { role_location: 'one run per role × location', location: 'one run per location', role: 'one run per role', once: 'one run for everything' };
 // What each `supports` key of an actor means on screen, so a card can say which of the settings it reads.
-const ACTOR_USES = { boards: 'Boards', location: 'Location', distance: 'Radius', country: 'Country', remote: 'Remote only', job_type: 'Job type', hours: 'Posted within', easy_apply: 'Easy Apply', fetch_description: 'Full descriptions', annual_salary: 'Annual salary', linkedin_company_ids: 'Company IDs', seniority: 'Seniority', salary_only: 'Salary listed', visa_sponsorship: 'Visa sponsorship', exclude_keywords: 'Exclude', skip_agencies: 'Skip agencies', remote_platforms: 'Boards', remoteok_url: 'Start page', yc_batches: 'YC batches', startup_details: 'Company details', hn_month: 'Thread month', min_salary: 'Min salary' };
+const ACTOR_USES = { boards: 'Boards', location: 'Location', distance: 'Radius', country: 'Country', remote: 'Remote only', job_type: 'Job type', hours: 'Posted within', easy_apply: 'Easy Apply', fetch_description: 'Full descriptions', annual_salary: 'Annual salary', linkedin_company_ids: 'Company IDs', seniority: 'Seniority', salary_only: 'Salary listed', visa_sponsorship: 'Visa sponsorship', exclude_keywords: 'Exclude', skip_agencies: 'Skip agencies', remote_platforms: 'Boards', remoteok_url: 'Start page', yc_batches: 'YC batches', startup_details: 'Company details', hn_month: 'Thread month', min_salary: 'Min salary', skills: 'Primary skills' };
 const STARTUP_ACTORS = { waas: 'antishock/workatastartup-jobs-scraper', yc: 'automation-lab/ycombinator-jobs-scraper', hn: 'parseforge/hn-whoishiring-scraper', wellfound: 'blackfalcondata/wellfound-scraper' };
 // A user-added actor reads whichever filters its input template names.
-const TEMPLATE_USES = { hours_old: 'hours', days_old: 'hours', is_remote: 'remote', job_type: 'job_type', location: 'location', locations: 'location', sites: 'boards', country: 'country',
+const TEMPLATE_USES = { skill: 'skills', skills: 'skills', hours_old: 'hours', days_old: 'hours', is_remote: 'remote', job_type: 'job_type', location: 'location', locations: 'location', sites: 'boards', country: 'country',
   seniority: 'seniority', distance: 'distance', easy_apply: 'easy_apply', fetch_description: 'fetch_description', enforce_annual_salary: 'annual_salary', salary_only: 'salary_only',
   visa_sponsorship: 'visa_sponsorship', exclude_keywords: 'exclude_keywords', linkedin_company_ids: 'linkedin_company_ids', skip_agencies: 'skip_agencies', min_salary: 'min_salary',
   yc_batches: 'yc_batches', hn_month: 'hn_month', startup_details: 'startup_details', remote_platforms: 'remote_platforms', remoteok_url: 'remoteok_url' };
@@ -1864,6 +1864,8 @@ function usedCheck(list, on, key, field, value, text) {
   return `<span class="${used ? '' : 'filter-unused'}" title="${attr(usedBy(list, on, key))}">${checkF('sp', field, value, text + (used ? '' : ' <span class="tiny">(not used)</span>'))}</span>`;
 }
 const COUNTRIES = ['usa', 'uk', 'canada', 'australia', 'india', 'singapore', 'uae', 'germany', 'france', 'netherlands', 'ireland', 'spain', 'italy', 'japan', 'brazil', 'mexico', 'south africa', 'new zealand'];
+// What a placeholder fills in, shown on its button; the setup's primary skills are the ones easiest to miss.
+const PLACEHOLDER_HINTS = { role: 'One role', roles: 'Every role (list)', location: 'One location', locations: 'Every location (list)', skill: 'First primary skill', skills: 'Every primary skill (list)' };
 const DEFAULT_TEMPLATE = JSON.stringify({ searchTerm: '{{role}}', location: '{{location}}', maxItems: '{{max_results}}' }, null, 2);
 function addActorForm() {
   const editing = S.editActor, f = S.forms.ca || {};
@@ -1873,9 +1875,9 @@ function addActorForm() {
     ${inputF('ca', 'name', '', 'placeholder="Display name"')}
     <label class="field mt8">Runs${selectF('ca', 'fan_out', 'role_location', Object.entries(FANOUT).map(([k, v]) => [k, v[0].toUpperCase() + v.slice(1)]))}</label>
     <label class="field mt8">Input template (JSON)${textareaF('ca', 'input_template', DEFAULT_TEMPLATE, 'style="font-family:var(--mono);font-size:11.5px;min-height:130px"')}</label>
-    <div class="helper" role="group" aria-label="Placeholders">Placeholders — select a value in the template (or place the cursor) and click one to insert it: <span class="row gap6 wrap mt4">${(D.actors?.placeholders || []).map(x => `<button type="button" class="btn sm" data-act="insert-placeholder" data-name="${attr(x)}"><span class="mono">{{${x}}}</span></button>`).join('')}</span> A value that is only a placeholder keeps its type (number, list, true/false).</div>
+    <div class="helper" role="group" aria-label="Placeholders">Placeholders — select a value in the template (or place the cursor) and click one to insert it: <span class="row gap6 wrap mt4">${(D.actors?.placeholders || []).map(x => `<button type="button" class="btn sm" data-act="insert-placeholder" data-name="${attr(x)}"${PLACEHOLDER_HINTS[x] ? ` title="${attr(PLACEHOLDER_HINTS[x])}"` : ''}><span class="mono">{{${x}}}</span>${x === 'skill' || x === 'skills' ? ` <span class="tiny faint">${esc(x === 'skill' ? 'primary skill' : 'primary skills')}</span>` : ''}</button>`).join('')}</span> A value that is only a placeholder keeps its type (number, list, true/false).</div>
     ${S.caFields ? `<div class="xs muted mt8" role="group" aria-label="Input schema">This actor accepts — click a field to add it with the matching placeholder:
-      <div class="row gap6 wrap mt4">${S.caFields.map(x => `<button type="button" class="btn sm" data-act="insert-actor-field" data-name="${attr(x.name)}" title="${attr([x.type, x.title, x.suggested && `fills with ${x.suggested}`].filter(Boolean).join(' · '))}"><span class="mono">${esc(x.name)}${x.required ? '*' : ''}</span>${x.suggested ? ` <span class="tiny mono" style="color:var(--brand)">${esc(x.suggested)}</span>` : x.type ? ` <span class="tiny faint">${esc(x.type)}</span>` : ''}</button>`).join('') || 'no documented inputs'}</div></div>` : ''}
+      <div class="row gap6 wrap mt4">${S.caFields.map(x => { const fill = Array.isArray(x.suggested) ? `[${x.suggested.join(', ')}]` : x.suggested; return `<button type="button" class="btn sm" data-act="insert-actor-field" data-name="${attr(x.name)}" title="${attr([x.type, x.title, fill && `fills with ${fill}`].filter(Boolean).join(' · '))}"><span class="mono">${esc(x.name)}${x.required ? '*' : ''}</span>${fill ? ` <span class="tiny mono" style="color:var(--brand)">${esc(fill)}</span>` : x.type ? ` <span class="tiny faint">${esc(x.type)}</span>` : ''}</button>`; }).join('') || 'no documented inputs'}</div></div>` : ''}
     <div class="row gap8 mt10">${btn(editing ? 'Save changes' : 'Add actor', 'add-actor', {}, 'primary sm')}${editing ? btn('Cancel', 'toggle-add-actor', {}, 'ghost sm') : ''}</div></div>`;
 }
 const setupResumeValue = p => p.resume_mode === 'fixed' || (!p.resume_mode && p.resume_id) ? String(p.resume_id) : (p.resume_mode || 'auto');
@@ -1938,6 +1940,8 @@ function setupPayload() {
     weekdays: setupField('weekdays', []),
     timezone: setupField('timezone', localZone()),
     enabled: !!setupField('enabled', true),
+    // Only what was done to your own actors in this form reaches the other setups (the server ignores the rest).
+    changed_actors: fv('sp', 'changed_actors', []), removed_actors: fv('sp', 'removed_actors', []),
   };
 }
 // Text still sitting in a tag input counts as typed — save it rather than dropping it.
@@ -1947,10 +1951,25 @@ function flushTagDrafts() {
     if (pending) addTags('sp', key, pending, key === 'primary_skills' ? 3 : 5, D.searchProfile.profile[key]);
   }
 }
-function adoptSetup(setup) {
-  D.setups = (D.setups || []).some(x => x.id === setup.id) ? D.setups.map(x => x.id === setup.id ? setup : x) : [...(D.setups || []), setup];
+// Actors a person adds are shared by every setup (the server keeps them in step), so the other setups follow too:
+// they list the same actors, and one removed here is no longer ticked there.
+function shareActors(other, setup, paused) {
+  const customs = setup.settings.custom_actors || [], keep = new Set(customs.map(c => c.id));
+  const gone = new Set((other.settings.custom_actors || []).map(c => c.id).filter(id => !keep.has(id)));
+  const settings = { ...other.settings, custom_actors: customs };
+  if (other.settings.actors) settings.actors = other.settings.actors.filter(a => !gone.has(a));
+  return { ...other, settings, ...(paused.includes(other.name) ? { enabled: false } : {}) };
+}
+// A scheduled setup whose last ticked actor was removed has nothing to run, so the server paused its schedule.
+// Said with the save's own message (one toast replaces another).
+const withPaused = (message, setup) => setup?.paused?.length
+  ? `${message} · schedule paused for ${setup.paused.map(n => `“${n}”`).join(', ')}: no actor is ticked there any more` : message;
+function adoptSetup(setup, paused = []) {
+  const others = (D.setups || []).map(x => x.id === setup.id ? setup : shareActors(x, setup, paused));
+  D.setups = others.some(x => x.id === setup.id) ? others : [...others, setup];
   S.setupSel = setup.id; delete S.forms.sp;
   D.searchProfile.profile = setup.settings;
+  if (paused.length) setup = { ...setup, paused };
   S.triage.hide_agencies = setup.settings.skip_agencies; S.triage.hide_reposts = setup.settings.skip_agencies;
   return setup;
 }
@@ -1962,12 +1981,12 @@ async function saveSetup() {
   // A changed resume: the jobs this setup found follow it (not the ones you pinned yourself, approved or applied).
   const moved = out.resume_jobs?.changed?.length || 0;
   if (moved) toast(`${moved} job${moved === 1 ? '' : 's'} from this setup now use${moved === 1 ? 's' : ''} its resume${out.resume_jobs.ranking_queued?.length ? ` · ${out.resume_jobs.ranking_queued.length} queued for ranking again` : ''}`);
-  return adoptSetup(out.setup);
+  return adoptSetup(out.setup, out.paused_setups || []);
 }
 async function createSetup(body) {
   if (!body) flushTagDrafts();
   const out = await api('/api/search/setups', { method: 'POST', body: body || { ...setupPayload(), name: nextSetupName() } });
-  return adoptSetup(out.setup);
+  return adoptSetup(out.setup, out.paused_setups || []);
 }
 function nextSetupName(preferred) {
   const taken = new Set((D.setups || []).map(x => x.name.toLowerCase()));
@@ -2262,7 +2281,9 @@ const A = {
     const p = D.searchProfile.profile, id = el.dataset.actor;
     setF('sp', 'custom_actors', fv('sp', 'custom_actors', p.custom_actors || []).filter(c => c.id !== id));
     setF('sp', 'actors', fv('sp', 'actors', p.actors || []).filter(a => a !== id));
-    render(); toast('Actor removed — save the profile to keep the change');
+    setF('sp', 'changed_actors', fv('sp', 'changed_actors', []).filter(a => a !== id));
+    setF('sp', 'removed_actors', [...new Set([...fv('sp', 'removed_actors', []), id])]);
+    render(); toast('Actor removed from every setup once you save');
   },
   'lookup-actor': () => busy('lookup', async () => {
     const id = (fv('ca', 'id', '') || '').trim();
@@ -2289,12 +2310,14 @@ const A = {
     setF('sp', 'custom_actors', customs);
     const selected = fv('sp', 'actors', p.actors || []);
     if (!selected.includes(id)) setF('sp', 'actors', [...selected, id]);
+    setF('sp', 'changed_actors', [...new Set([...fv('sp', 'changed_actors', []), id])]);
+    setF('sp', 'removed_actors', fv('sp', 'removed_actors', []).filter(a => a !== id));
     const edited = !!S.editActor;
     delete S.forms.ca; S.addActor = false; S.editActor = null; S.caFields = null;
     render(); toast(edited ? 'Actor updated — save the profile to keep it' : 'Actor added — save the profile to keep it');
   },
-  'save-search': () => busy('saveSp', saveSetup, setup => `“${setup.name}” saved`),
-  'save-as-new': () => busy('saveAsNew', () => createSetup(), setup => `Saved as “${setup.name}”`),
+  'save-search': () => busy('saveSp', saveSetup, setup => withPaused(`“${setup.name}” saved`, setup)),
+  'save-as-new': () => busy('saveAsNew', () => createSetup(), setup => withPaused(`Saved as “${setup.name}”`, setup)),
   'select-setup': el => useSetup(Number(el.dataset.id)),
   'open-setup': el => { S.setupSel = Number(el.dataset.id); delete S.forms.sp; go('discovery', { discMode: 'setup' }); },
   'new-setup': () => busy('newSetup', async () => {
