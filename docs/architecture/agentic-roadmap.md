@@ -151,6 +151,14 @@ Record accepted changes to these decisions with an appended rationale, date, PR,
 | ADR-023 | Vectors live in a runtime-created `rag_vectors` table (pgvector `vector` with no fixed size, rows carry `dimensions`). Exact cosine search runs over the pre-filtered scope; there is no ANN index. The embedding indexer is account-level and is not a `WorkerKind` or orchestration node. | An install without pgvector must still start, which Alembic cannot express. Scope filtering leaves tens to hundreds of rows per query, so exact search is correct and fast. `WorkerKind` is job-bound (ADR-020). Consequence: index progress shows in `/api/rag/status` and Monitoring → External APIs, not Running workers. | A measured account makes exact search too slow, or Running workers gains non-job tasks |
 | ADR-023 (amended 2026-10-16) | The embedding indexer **is** now a `WorkerKind` (`indexing`) and an orchestration node (`retrieval_index`, types ASYNC_WORKER + EXTERNAL: an embedding call makes vectors, not text, so it is not an AI node). `WorkerKind` gained a non-job variant: `subject` labels a row (Evidence #12 · index v3), `search`, `requeue` (Retry and Run now put the same row back), `stopped_status`, `shown`. Entries record `started_at` / `completed_at` / `run_now_at` (migration 0046). A retryable failure is PENDING with a retry time until the account's attempts (`worker_settings` `indexing`) run out, then FAILED; Kill ends an entry FAILED with `STOPPED_BY_USER`, and neither sweeps nor edits revive it. The `rag_index` job sweeps every account, then runs batches through `scheduled_jobs.run_live` (round-robin across accounts, `rag_index_concurrency` in flight, a batch's token as its claim id, `rag_index.renew` as heartbeat); interval, batch size, per-account budget and concurrency are `server_settings.EDITABLE`. Run-now entries are claimed first in a batch of their own under `backoff.bypass`; a paused account's queue is swept and held. | The revisit trigger fired: vectors must not be turned on in production without Kill, Retry, Run now and pause on the queue that spends embedding calls. ADR-020's trigger ("Running workers gains non-job tasks") fired too; the pilot graph stays outside the registry because it still has no production effect. Consequence: index progress shows in Running workers → Indexing as well as `/api/rag/status`. | A non-job queue needs per-row controls `requeue` cannot express (e.g. a row that must be recreated rather than reset) |
 
+**Proposed in Phase 3 (2026-10-17, branch `feat/langgraph-qualification`; accepted only when the Phase 3 PR is approved):**
+
+| ID | Decision | Reason / consequences | Revisit if |
+| --- | --- | --- | --- |
+| ADR-024 | The qualification graph is a **conductor** over the existing task rows. Each node calls the service that owns its step (`domain_match` / `search_scope` admission, `jd_recovery.enqueue`, `job_description.queue_parse`, `ranker.prepare`, `rag_retrieval.scope`, `ranker.queue_job`) and then waits for that task with a LangGraph interrupt. The recovery, parsing and ranking workers keep doing the HTTP, browser and model work; the ranker keeps deciding (`ranker.qualify` → `work_queue.transition`). Its queue is `job_qualification_tasks` (migration 0047), claimed by a `qualification` scheduler job through `run_live`; a task is not claimable while its job has an active recovery, parse or ranking task, so waiting costs no polling and no attempt. Modes: `QUALIFICATION_GRAPH_MODE` off (default) / shadow (read-only comparison, budgeted, no paid call by default) / on. | Running the services' `process()` inline would duplicate leases, tie the async BrowserService to a worker thread and break the task-row facts AI Orchestration and Running workers count. As a conductor, the graph's task rows, transitions and LLM telemetry are the same rows the current path writes, and duplicate paid work is prevented by the same unique active-task indexes plus `effects.within` keys. Consequence: a qualification takes a few scheduler hops longer (nudged), and the graph itself never calls a model. | A step needs a decision the services cannot express, or hop latency matters |
+| ADR-020 (amended 2026-10-17) | The first production graph is registered like every queued worker: `WorkerKind` `qualification` (Kill also stops the thread; Retry and Run now create a new task and thread) and orchestration node `qualification` (ASYNC_WORKER + DETERMINISTIC, not AI). Its threads are worker-owned (`GraphSpec.api_resumable=False`): the agents API cannot resume them and `runtime.claim_stale` never continues them. `GraphSpec.context` replaces the pilot's hard-coded run context. | ADR-020's revisit trigger fired ("a graph does production work"). A worker-owned thread continued without its task row would run without the task's lease and mode. | A graph needs a person to resume it mid-run |
+| ADR-017 (clarified 2026-10-17) | In mode `on`, the backlog sweeps (`ranker.sweep`, `jd_recovery.sweep`, `job_description.sweep`) leave pre-rank jobs to the graph, whose first node is admission. The current path's parse backlog parses a never-admitted old job before `ranker.sweep` screens it, and a stub whose recovery failed; the graph does neither. | Admission before any paid work, for old jobs too. | — |
+
 ## 5. Core data and durability contracts
 
 ### Authority boundaries
@@ -503,9 +511,9 @@ This section is intended to change after *each approved phase merge*. Initial en
 
 | Phase | Status | PR | Merge SHA | Evaluation / test evidence | Production flag |
 | --- | --- | --- | --- | --- | --- |
-| 1. LangGraph foundation | IN_REVIEW | [#72](https://github.com/triump0870/AI-Job-Hunt/pull/72) | — | 2026-10-13 note below | OFF (`AGENT_GRAPHS_ENABLED=false`) |
-| 2. RAG knowledge layer | IN_REVIEW | [#74](https://github.com/triump0870/AI-Job-Hunt/pull/74) | — | 2026-10-15 note below | OFF (`RAG_RETRIEVAL_MODE=off`, `RAG_VECTOR_ENABLED=false`) |
-| 3. Qualification graphs | NOT_STARTED | — | — | — | OFF |
+| 1. LangGraph foundation | MERGED | [#72](https://github.com/triump0870/AI-Job-Hunt/pull/72) | `74930e5` | 2026-10-13 note below | OFF (`AGENT_GRAPHS_ENABLED=false`) |
+| 2. RAG knowledge layer | MERGED | [#74](https://github.com/triump0870/AI-Job-Hunt/pull/74) | `a2f0b30` | 2026-10-15 note below | OFF (`RAG_RETRIEVAL_MODE=off`, `RAG_VECTOR_ENABLED=false`) |
+| 3. Qualification graphs | IN_REVIEW | (this branch) | — | 2026-10-17 note below | OFF (`QUALIFICATION_GRAPH_MODE=off`) |
 | 4. Preparation / insights graphs | NOT_STARTED | — | — | — | OFF |
 | 5. Application execution | NOT_STARTED | — | — | — | OBSERVE only (planned) |
 | 6. Guarded agentic submission | NOT_STARTED | — | — | — | OFF |
@@ -652,6 +660,98 @@ Allowed status: NOT_STARTED, PLANNING, IN_PROGRESS, IN_REVIEW, MERGED, BLOCKED, 
   glibc instead of musl). On an existing volume, if PostgreSQL warns about a collation version mismatch, run
   `REINDEX DATABASE jobhunt;` and `ALTER DATABASE jobhunt REFRESH COLLATION VERSION;` once.
 - **Next dependency:** Phase 3 needs this PR approved and merged.
+
+### 2026-10-17 — Phase 3: Qualification graph
+- **Branch / PR:** `feat/langgraph-qualification` to `main`, not merged.
+- **Base:** `a2f0b30`. Phase 1 (#72, merge `74930e5`) and Phase 2 (#74, merge `a2f0b30`; #77) are merged.
+- **What shipped:**
+  - **Qualification graph** (`app/agents/qualification.py`), with this node order:
+    `VALIDATE_JOB → DOMAIN_AND_SEARCH_SCOPE_ADMISSION → CHECK_JD → RECOVER_JD_IF_NEEDED → PARSE_JD →
+    QUALIFICATION_HARD_FILTER → RETRIEVE_VERIFIED_JOB_RESUME_EVIDENCE → RANK → VALIDATE → QUALIFY/ARCHIVE`.
+    - It is a conductor over the existing services and task rows (ADR-024).
+    - Waits are interrupts; graph-side writes go through `effects.within` (lease check, effect key and business
+      write in one transaction).
+    - SHADOW runs take the same nodes read-only.
+  - **Queue** `job_qualification_tasks` (migration 0047, owned, in `OWNED_MODELS`) and `app/services/qualification.py`:
+    dispatch, claim (SKIP LOCKED and guarded UPDATE; a job with active recovery, parse or ranking work is skipped),
+    run and settle, recover expired leases, shadow sweep and parity, hand-back.
+  - **Scheduler job** `qualification` (through `run_live`), nudged by the recovery, parse and ranking passes.
+  - **Running workers → Qualification:** Kill stops the thread; Retry and Run now create a new task and thread.
+  - **Orchestration node** `qualification` (ASYNC_WORKER + DETERMINISTIC); `validate()` stays empty.
+  - **Runtime:** `GraphSpec.context` and `api_resumable`; worker-owned threads are left out of `claim_stale`.
+  - **Cutover hooks**, active only in mode `on`: `discovery.admit`, `hunter._save`, the `ranker.sweep` pre-rank
+    branch, the `jd_recovery` and `job_description` backlogs, `jd_recovery.apply_recovered`, `domain_match.keep`,
+    `job_removal.delete_job`.
+  - **Parity report:** `scripts/qualification_parity.py`.
+- **New flags:**
+  - `QUALIFICATION_GRAPH_MODE=off` (default).
+  - `QUALIFICATION_MINUTES`, `_BATCH_SIZE`, `_CONCURRENCY`, `_MAX_ATTEMPTS`, `_RETRY_SECONDS`, `_LEASE_SECONDS`.
+  - `QUALIFICATION_SHADOW_DAILY_LIMIT=50` and `QUALIFICATION_SHADOW_PAID_DAILY_LIMIT=0`.
+  - Interval, batch, concurrency and both shadow budgets are `server_settings.EDITABLE`. Attempts and retry wait are
+    per-account `worker_settings`.
+- **Old vs new** (`scripts/qualification_parity.py`, PostgreSQL 16, mock parser, scripted ranking answers; history
+  compared as (from, to, reason), with the current path's description wait left out):
+
+  | Case | Current path | Graph | Graph run | Same state | Same history | Model calls old/new | Parses old/new |
+  | --- | --- | --- | --- | --- | --- | --- | --- |
+  | qualified | QUALIFIED | QUALIFIED | QUALIFIED | yes | yes | 1/1 | 1/1 |
+  | archived: low score | ARCHIVED | ARCHIVED | ARCHIVED | yes | yes | 1/1 | 1/1 |
+  | archived: fatal gap | ARCHIVED | ARCHIVED | ARCHIVED | yes | yes | 1/1 | 1/1 |
+  | qualified: non-fatal gaps | QUALIFIED | QUALIFIED | QUALIFIED | yes | yes | 1/1 | 1/1 |
+  | archived: low confidence | ARCHIVED | ARCHIVED | ARCHIVED | yes | yes | 1/1 | 1/1 |
+  | hidden: outside the domain | SKIPPED | SKIPPED | hidden at import | yes | yes | 0/0 | 0/0 |
+  | recovered description | QUALIFIED | QUALIFIED | QUALIFIED | yes | yes | 1/1 | 1/1 |
+  | blocked description | SKIPPED | SKIPPED | BLOCKED | yes | yes | 0/0 | **1/0** |
+  | removed posting | deleted | deleted | (deleted with the job) | yes | yes | 0/0 | 0/0 |
+  | failed model | FAILED | FAILED | FAILED | yes | yes | 3/3 | 1/1 |
+  | invalid JSON | FAILED | FAILED | FAILED | yes | yes | 3/3 | 1/1 |
+
+  11 of 11 cases agree. The one difference is spend: on a blocked stub, the current path's parse backlog parses text
+  the ranker then refuses to rank; the graph does not (ADR-017 clarification).
+- **Two current-path behaviours found while testing:**
+  - Its parse backlog (`job_description.sweep`) parses a never-admitted old job before `ranker.sweep` screens it.
+  - `ranker.sweep` does not apply the search scope to old jobs.
+
+  In mode `on` the graph admits first in both cases. Mode `off` is unchanged.
+- **Tests:**
+  - **New suite:** `tests/test_qualification_graph.py` (29 tests, PostgreSQL):
+    - golden parity: qualified, archived and gap cases, and a hard filter;
+    - hidden jobs, new, old and scope-hidden, with zero recovery, parse, browser or model calls;
+    - recovered, blocked and removed postings;
+    - pinned resume;
+    - concurrent claims;
+    - a killed worker (exit after a committed effect, and SIGKILL while waiting), continued with one task and one
+      call per step;
+    - failed model and invalid JSON;
+    - Kill and Retry;
+    - duplicate delivery and dispatch;
+    - tenant isolation, and the API refusing a worker-owned resume;
+    - equal orchestration edges, node task counts and live counts for both paths;
+    - shadow: no writes, no paid call by default, daily and paid budgets;
+    - mode off hand-back;
+    - the parity report.
+  - **Full runs** (jobhunt conda env, `mcp` 1.30 on `PYTHONPATH`), each next to an untouched `main` run:
+    - SQLite: 2082 passed, 128 skipped, 1 failed (`test_mcp` stdio, fails on `main` too). `main`: 2078 passed,
+      2 failed.
+    - PostgreSQL (final run on head): 2202 passed, 2 skipped, 8 failed: the same 8 tests fail on untouched `main`.
+    - One intermittent failure is not this branch's: an earlier full PostgreSQL run had a ninth failure,
+      `test_rag_index::test_the_scheduler_job_is_off_unless_vector_retrieval_is_on`. It is a PostgreSQL deadlock
+      inside `rag_index.renew` (Phase 2 code, untouched here). It failed 1 of 13 file-level reruns on the branch and
+      0 of 15 on `main`; isolated, it passed 16 of 16 on both.
+  - **vitest:** 326 passed, 2 failed (`overview_outcomes`, fails on `main` too).
+  - **Migrations:** `test_migrations.py` on PostgreSQL (upgrade, downgrade, empty metadata diff) passes.
+  - **Lint:** ruff level with `main`.
+- **Known gaps:**
+  - Re-ranks (`resume_changed`, `_queue_stale`, `_recheck_salary`, `follow_setup`) stay on the existing services.
+  - The graph adds a scheduler hop per step; nudges make it immediate when the scheduler runs in-process.
+  - The orchestration edges `qualification → domain_filter` and `qualification → ranker` are unmeasured support
+    edges: every count stays with the existing nodes, which are the facts.
+  - The RETRIEVE step reports the job's resume and its evidence scope (ids and counts). The ranker builds its own
+    context from the same scope; the graph does not hand the ranker a pack.
+  - No real provider was called: parity uses the mock parser and scripted ranking answers.
+- **Rollback:** `QUALIFICATION_GRAPH_MODE=off`. The next pass ends waiting ON runs `ROUTED_TO_LEGACY`, and the current
+  path takes their jobs on. Optionally, downgrade 0047.
+- **Next dependency:** Phase 4 needs this PR reviewed and merged. Stop here.
 
 ### Phase update template
 

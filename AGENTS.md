@@ -421,6 +421,44 @@ change has to keep:
   gone. LangGraph owns its checkpoint tables (`PostgresSaver.setup()`); Alembic ignores them (`app/migrations/env.py`).
   Never hold a database transaction open while opening a saver: its setup builds indexes concurrently.
 
+## Qualification graph (Phase 3)
+
+`app/agents/qualification.py` (the graph) and `app/services/qualification.py` (its queue, shadow comparison and
+hand-back) qualify a job when `QUALIFICATION_GRAPH_MODE=on` (README §9c). The rules a change has to keep:
+
+* **The graph conducts; it does not reimplement.**
+  * Every node calls the service that owns the step: `domain_match.screen`, `search_scope.screen`,
+    `jd_recovery.enqueue`, `job_description.queue_parse`, `ranker.prepare`, `rag_retrieval.scope`, `ranker.queue_job`.
+  * The existing workers do the HTTP, browser and model work under their own task rows and leases. The ranker still
+    decides (`ranker.qualify` through `work_queue.transition`).
+  * A graph node never calls a model, a browser or Apify, and never writes a lifecycle column. The one exception is
+    a shadow run's budgeted re-ranking, through the ranker's own `LLMClient` and never saved.
+* **Admission first, for every job.** The admission node runs before recovery, parsing, the browser or any model,
+  including old jobs from `ranker.sweep`. A hidden job (`NOT_MATCHING`) ends the run with no task created. In mode
+  `on`, `discovery.admit` dispatches to the graph instead of queueing recovery or a parse. The backlog sweeps
+  (`jd_recovery.sweep`, `job_description.sweep`, `ranker.sweep`) leave pre-rank jobs to the graph, and also jobs it
+  has run (`qualification.untouched`). `jd_recovery.apply_recovered` leaves a job the graph holds
+  (`qualification.owns`) to the graph.
+* **Waiting is an interrupt, not a poll.** A node that queued work returns `waiting_for`; the `wait` node
+  interrupts, and the task goes back to PENDING without using an attempt. The claim skips a job with an active
+  recovery, parse or ranking task (`qualification._busy`). The recovery, parse and ranking passes nudge
+  `qualification` when they end.
+* **Every graph-side write is lease-guarded and recorded once.** `effects.within` locks the thread row, records
+  the effect key and makes the business write in one transaction (`recovery.enqueue:<job>`, `parse.enqueue:<job>:<hash>`,
+  `rank.enqueue:<job>`). The task is settled under its own lock token. A stopped or taken-over run writes nothing.
+* **Worker-owned threads.** The qualification graph is `api_resumable=False`. `/api/agents/runs/{id}/resume` refuses
+  it, and `runtime.claim_stale` never continues it: only its task's worker does (`runtime.WORKER_OWNED`). A thread key
+  carries the task's id, creation time and attempt.
+* **Shadow never writes and never pays by default.** A shadow session refuses to commit and is rolled back.
+  Predictions use the deterministic functions and the latest stored ranking. A paid re-ranking needs
+  `qualification_shadow_paid_daily_limit > 0`, reserved per account under a transaction lock.
+* **Kill stops; nothing revives it.** Kill ends the task with `STOPPED_BY_USER` and stops its thread. `dispatch`
+  never creates a new run for a job a person stopped unless they ask (Retry and Run now create a new task).
+* **Off is the old path.** With mode `off` every hook calls exactly what it called before. Leftover ON tasks are
+  ended `ROUTED_TO_LEGACY` by the next pass.
+* Re-ranks (`resume_changed`, `_queue_stale`, `_recheck_salary`, `follow_setup`) stay on the existing services in
+  Phase 3.
+
 ## Candidate knowledge retrieval (RAG)
 
 `app/services/embeddings.py`, `evidence_tags.py`, `rag_index.py`, `rag_retrieval.py`, `vector_store.py` and

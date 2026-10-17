@@ -1188,9 +1188,8 @@ def sweep(db: Session, *, now: datetime | None = None, limit: int | None = None)
         return policies[user_id]
 
     # Jobs created by any path (manual, from a URL, Lever, Greenhouse, older imports) are filtered and queued here.
-    from app.services import domain_match  # local import: domain_match reads ranker's queueing
-
-    from app.services import qualification
+    # Local imports: domain_match reads ranker's queueing, qualification reads both.
+    from app.services import domain_match, qualification
 
     graph = qualification.routes(db)  # QUALIFICATION_GRAPH_MODE=on: the graph qualifies these jobs
     rules: dict = {}

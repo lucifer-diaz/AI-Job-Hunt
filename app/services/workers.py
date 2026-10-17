@@ -250,6 +250,10 @@ def _display_status(spec: WorkerKind, task: Any, now: datetime) -> str:
     return dict(spec.shown).get(status, status).upper()
 
 
+def _started_graph_run(spec: WorkerKind, task: Any) -> bool:
+    return spec.kind == "qualification" and getattr(task, "agent_thread_id", None) is not None
+
+
 def _attempts(spec: WorkerKind, task: Any) -> int:
     return (task.attempts if spec.tailor else task.attempt_count) or 0
 
@@ -262,7 +266,7 @@ def row(spec: WorkerKind, task: Any, label: dict[str, Any] | None, now: datetime
     status = _display_status(spec, task, now)
     error = task.error if tailoring else task.last_error
     code = None if tailoring else getattr(task, "error_category", None)
-    category = code.value if code else None
+    category = getattr(code, "value", code) if code else None
     label = label or {}
     finished_at = task.finished_at if tailoring else getattr(task, "completed_at", None)
     waiting = None if tailoring else task.next_attempt_at
@@ -277,7 +281,9 @@ def row(spec: WorkerKind, task: Any, label: dict[str, Any] | None, now: datetime
             "last_error": redaction.redact_text(error, ERROR_LIMIT) if error and status != "COMPLETED" else None,
             "error_category": category, "run_now": task.run_now_at is not None,
             "result_code": getattr(task, "result_code", None),
-            "can_kill": status in ("RUNNING", "RETRYING"),
+            # A graph run between steps has started (it waits for recovery, a parse or a ranking): it can be stopped.
+            "can_kill": status in ("RUNNING", "RETRYING") or (active and _started_graph_run(spec, task)),
+            "waiting_for": getattr(task, "waiting_for", None),
             "can_run_now": status in ("QUEUED", "RETRYING") or status in STATUS_FILTERS["failed"],
             "retried_by": None,  # set by rows() when a newer task of the same job exists
             "can_remove": active and status != "RUNNING" and spec.kind in ("ranking", "tailoring"),
@@ -848,8 +854,8 @@ def kill(db: Session, user_id: int, kind: str, task_ids: list[int] | None = None
     stopped_jobs = []
     for task in tasks:
         # A graph run between steps (waiting for recovery, a parse or a ranking) has started: Kill stops it too.
-        started = spec.kind == "qualification" and task.agent_thread_id is not None
-        if task.status != spec.running and _display_status(spec, task, now) != "RETRYING" and not started:
+        if task.status != spec.running and _display_status(spec, task, now) != "RETRYING" \
+                and not _started_graph_run(spec, task):
             continue  # a task still waiting its first turn is not stopped by Kill (Remove takes it out)
         running += _stop(db, spec, task, user_id, now)
         stopped += 1

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -181,7 +182,7 @@ def search_run(sessions, user_id: int, roles: list[str]) -> int:
 def transitions(db, job_id: int) -> list[tuple[str, str, str]]:
     rows = db.scalars(select(WorkflowTransition).where(WorkflowTransition.job_id == job_id)
                       .order_by(WorkflowTransition.id)).all()
-    value = lambda s: getattr(s, "value", s)  # noqa: E731
+    value = lambda s: getattr(s, "value", s)
     return [(value(r.from_state), value(r.to_state), r.reason) for r in rows]
 
 
@@ -233,3 +234,87 @@ def thread_of(sessions, task: JobQualificationTask) -> AgentThread | None:
 
 
 __all__ = ["qualification"]
+
+
+# ───────────── the parity report (tests and scripts/qualification_parity.py) ─────────────
+
+@dataclass(frozen=True)
+class Case:
+    """One job built the same way in both accounts, with the ranking model's answer for it."""
+
+    name: str
+    answer: Any = None  # a FakeModel reply (dict of overrides, an exception, or ("raw", data)); None: the default
+    title: str = "Engineering Manager"
+    description: str = POSTING
+    path: str | None = None  # a page of the local posting server: the job's URL
+
+
+CASES = (
+    Case("qualified"),
+    Case("archived: low score", {"overall_fit_score": 40}),
+    Case("archived: fatal gap", {"fatal_gaps": ["Requires an active security clearance"]}),
+    Case("qualified: non-fatal gaps", {"missing_requirements": ["Go", "Rust"]}),
+    Case("archived: low confidence", {"confidence": 0.2}),
+    Case("hidden: outside the domain", title="Account Executive"),
+    Case("recovered description", title="Platform Engineering Manager", description=STUB, path="posting.html"),
+    Case("blocked description", title="Platform Engineering Manager", description=STUB, path="login.html"),
+    Case("removed posting", title="Platform Engineering Manager", description=STUB, path="gone"),
+    Case("failed model", "provider_error"),
+    Case("invalid JSON", ("raw", {"job_id": 0, "not": "a ranking"})),
+)
+
+
+def _answer(case: Case) -> Any:
+    from app.services.llm import LLMResponseError
+
+    return LLMResponseError("provider returned an empty answer") if case.answer == "provider_error" else case.answer
+
+
+def report(sessions, set_mode: Callable[[str], None], model: Any, parses: Counters, server: Any,
+           browser_factory: Callable[[], Any], cases: tuple[Case, ...] = CASES) -> list[dict[str, Any]]:
+    """Run every case through the current path and the graph, each in its own pair of accounts. One row per case."""
+    from tests.test_ranker import add_owner
+
+    rows = []
+    for case in cases:
+        ids, titles = {}, {}
+        for mode in ("off", "on"):
+            user_id = add_owner(sessions)
+            set_mode(mode)
+            title = f"{case.title} {user_id}" if case.path else case.title
+            job_id = new_job(sessions, user_id, title=title, description=case.description,
+                             url=server.url(case.path) if case.path else "")
+            if case.answer is not None:
+                model.answer(job_id, _answer(case))
+            ids[mode], titles[mode] = job_id, title
+            drive(sessions, browser=browser_factory())
+        old, new = (facts(sessions, ids[m], title=titles[m]) for m in ("off", "on"))
+        runs = qualification_tasks(sessions, ids["on"])
+        outcome = runs[-1].outcome if runs else ("HIDDEN at import" if new.get("domain_match") == "NOT_MATCHING"
+                                                 else None)
+        same = {key: old.get(key) == new.get(key) for key in ("deleted", "state", "domain_match", "history")}
+        rows.append({
+            "case": case.name, "current": "deleted" if old["deleted"] else old["state"],
+            "graph": "deleted" if new["deleted"] else new["state"], "graph_outcome": outcome,
+            "same_state": same["deleted"] and same["state"] and same["domain_match"],
+            "same_history": same["history"],
+            "model_calls": (model.calls.count(ids["off"]), model.calls.count(ids["on"])),
+            "parses": (parses.parses.count(ids["off"]), parses.parses.count(ids["on"])),
+            "recovery_fetches": (len(old.get("tasks", {}).get("recovery", [])),
+                                 len(new.get("tasks", {}).get("recovery", []))) if not old["deleted"] else ("-", "-"),
+        })
+    return rows
+
+
+def no_more_paid_work(row: dict[str, Any]) -> bool:
+    """The graph spends at most what the current path spent, per kind of paid call."""
+    return all(new <= old for old, new in (row["model_calls"], row["parses"]))
+
+
+def markdown(rows: list[dict[str, Any]]) -> str:
+    head = ("| Case | Current path | Graph | Graph run outcome | Same state | Same history | Model calls old/new "
+            "| Parses old/new |\n|---|---|---|---|---|---|---|---|")
+    lines = [f"| {r['case']} | {r['current']} | {r['graph']} | {r['graph_outcome'] or '—'} | "
+             f"{'yes' if r['same_state'] else 'NO'} | {'yes' if r['same_history'] else 'NO'} | "
+             f"{r['model_calls'][0]}/{r['model_calls'][1]} | {r['parses'][0]}/{r['parses'][1]} |" for r in rows]
+    return "\n".join([head, *lines])

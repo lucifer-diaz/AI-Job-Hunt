@@ -207,9 +207,7 @@ def sweep(db: Session, limit: int | None = None, *, now: datetime | None = None)
     if not get_settings().jd_fetch_enabled:
         return {"assessed": 0, "queued": 0}
     limit = max(1, limit or get_settings().jd_fetch_enqueue_batch_size)
-    from app.services import domain_match
-
-    from app.services import qualification
+    from app.services import domain_match, qualification
 
     backlog = select(Job).where(Job.description_quality.is_(None), Job.user_id.is_not(None))
     if qualification.routes(db):

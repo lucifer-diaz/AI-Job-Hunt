@@ -645,15 +645,15 @@ async def agent_graphs(ctx: JobContext) -> dict[str, Any]:
 
 
 def _prepare_qualification(ctx: JobContext, mode: str) -> dict[str, Any]:
-    """Take back leases of crashed runs, then: off → hand ON tasks back to the current path; shadow → queue the day's
-    shadow runs. Never calls a model."""
+    """Take back leases of crashed runs, then: off or shadow → hand ON tasks back to the current path; shadow → queue
+    the day's shadow runs. Never calls a model."""
     from app.services import qualification
 
     with ctx.sessions() as db:
         details: dict[str, Any] = {"mode": mode, "expired_leases": qualification.recover_expired(db, ctx.now)}
-        if mode == "off":
+        if mode != "on":  # the current path qualifies again: runs left from mode on go back to it
             details["released"] = qualification.release(db, ctx.now)
-        elif mode == "shadow":
+        if mode == "shadow":
             details["shadow"] = qualification.shadow_sweep(db, ctx.now)
     return details
 

@@ -7,16 +7,14 @@ and the paid work done for each.
 """
 from __future__ import annotations
 
-import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from sqlalchemy import func, select, update
 
-from app.agents import checkpoint, effects
+from app.agents import checkpoint, runtime
 from app.agents import qualification as graph
-from app.agents import runtime
 from app.infrastructure.browser import set_browser_service
 from app.models import (
     AgentEffect,
@@ -31,7 +29,6 @@ from app.models import (
     Resume,
 )
 from app.services import orchestration, qualification, ranker, resume_matching, workers
-from app.services import scheduled_jobs as sj
 from app.services.lifecycle import STOPPED_BY_USER
 from app.services.llm import LLMResponseError
 from tests import qualification_support as qs
@@ -361,6 +358,10 @@ def test_a_stopped_run_stays_stopped_until_retried(sessions, model, parses):
     assert (task.status, task.waiting_for) == ("PENDING", "JD_PARSE")
     with sessions() as db:
         db.info["user_id"] = user_id
+        shown = workers.rows(db, user_id, "qualification")["rows"][0]
+        assert shown["can_kill"] and shown["waiting_for"] == "JD_PARSE"
+    with sessions() as db:
+        db.info["user_id"] = user_id
         workers.kill(db, user_id, "qualification", [task.id])
     stopped = qs.qualification_tasks(sessions, job_id)[-1]
     assert (stopped.status, stopped.last_error, stopped.outcome) == ("SKIPPED", STOPPED_BY_USER, "STOPPED")
@@ -554,3 +555,13 @@ def test_graph_state_exported_is_ids_enums_and_counts_only():
     assert graph.summary({"job_id": 1, "outcome": "QUALIFIED", "description": "x" * 50}) == {"job_id": 1,
                                                                                             "outcome": "QUALIFIED"}
     assert runtime.WORKER_OWNED == (graph.GRAPH,)
+
+
+# ───────────── the old-vs-new report (scripts/qualification_parity.py) ─────────────
+
+def test_the_parity_report_agrees_on_every_case_and_never_spends_more(sessions, monkeypatch, model, parses, server):
+    rows = qs.report(sessions, lambda mode: qs.set_mode(monkeypatch, mode), model, parses, server, FakeBrowser)
+    assert len(rows) == len(qs.CASES)
+    for row in rows:
+        assert row["same_state"] and row["same_history"], row
+        assert qs.no_more_paid_work(row), row
