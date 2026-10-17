@@ -1885,7 +1885,9 @@ representative cases through both paths, their states, histories and paid calls.
 
 **Rollback.** Set `QUALIFICATION_GRAPH_MODE=off`. The next `qualification` pass hands waiting runs back to the
 current path (`ROUTED_TO_LEGACY`). The recovery, parse and ranking tasks the graph queued are ordinary tasks, and
-their workers finish them. Migration 0047 is additive and can be downgraded.
+their workers finish them. Keep `AGENT_GRAPHS_ENABLED` on until that pass has run: with it off the pass does not run,
+and leftover runs stay listed as queued (inert: the current path still takes their jobs). Migration 0047 is additive
+and can be downgraded.
 
 ## 9d. Candidate knowledge retrieval (RAG, off by default)
 

@@ -379,6 +379,28 @@ def test_a_stopped_run_stays_stopped_until_retried(sessions, model, parses):
     assert len(tasks) == 2 and tasks[-1].outcome == "QUALIFIED" and tasks[-1].agent_thread_id != stopped.agent_thread_id
 
 
+def test_a_run_that_fails_its_attempts_is_not_started_again_until_retried(sessions, monkeypatch, model, parses):
+    def broken(state, runtime):
+        raise RuntimeError("a bug in a node")
+
+    working = graph.check_jd
+    monkeypatch.setattr(graph, "check_jd", broken)
+    user_id = add_owner(sessions)
+    job_id = qs.new_job(sessions, user_id)
+    qs.drive(sessions, rounds=12, settle=False)  # ranker.sweep runs every round: it must not start another run
+    tasks = qs.qualification_tasks(sessions, job_id)
+    assert [(t.status, t.attempt_count) for t in tasks] == [("FAILED", 3)]
+    assert qs.facts(sessions, job_id)["state"] == "DISCOVERED" and model.calls == []
+    monkeypatch.setattr(graph, "check_jd", working)
+    with sessions() as db:
+        db.info["user_id"] = user_id
+        assert workers.retry(db, user_id, "qualification", [tasks[0].id])["retried"]
+    qs.drive(sessions)
+    tasks = qs.qualification_tasks(sessions, job_id)
+    assert len(tasks) == 2 and tasks[-1].outcome == "QUALIFIED"
+    assert qs.facts(sessions, job_id)["state"] == "QUALIFIED"
+
+
 # ───────────── duplicates: delivery, dispatch, replay ─────────────
 
 def test_a_duplicate_delivery_and_a_repeated_dispatch_make_one_run_and_one_call(sessions, model, parses):

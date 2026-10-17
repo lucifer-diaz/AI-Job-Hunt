@@ -28,7 +28,7 @@ from typing import Any
 
 from sqlalchemy import and_, exists, func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from app.models import (
     ACTIVE_JD_FETCH_STATUSES,
@@ -79,12 +79,19 @@ def routes(db: Session) -> bool:
     return mode() == "on" and _postgres(db)
 
 
+def _held_until_asked() -> Any:
+    """The job's latest ON run ended where only a person moves it on: stopped by them, or failed its attempts. A
+    sweep never starts another run behind it (that would make the attempt limit unbounded); Retry and Run now do."""
+    q, newer = JobQualificationTask, aliased(JobQualificationTask)
+    latest = ~exists().where(newer.job_id == q.job_id, newer.mode == ON, newer.id > q.id)
+    return and_(latest, or_(q.status == FAILED, and_(q.status == SKIPPED, q.last_error == STOPPED_BY_USER)))
+
+
 def _owned_clause(job_id: Any) -> Any:
-    """An ON task that holds the job: one still running, or one a person stopped (it stays stopped)."""
+    """An ON task that holds the job: one still running, or the latest one a person stopped or that failed."""
     q = JobQualificationTask
     return exists().where(q.job_id == job_id, q.mode == ON,
-                          or_(q.status.in_(ACTIVE_QUALIFICATION_TASK_STATUSES),
-                              and_(q.status == SKIPPED, q.last_error == STOPPED_BY_USER)))
+                          or_(q.status.in_(ACTIVE_QUALIFICATION_TASK_STATUSES), _held_until_asked()))
 
 
 def unowned(job_id: Any = Job.id) -> Any:
@@ -118,8 +125,8 @@ def active_task(db: Session, job_id: int, task_mode: str = ON) -> JobQualificati
 
 def dispatch(db: Session, job: Job, *, reason: str = "new", force: bool = False,
              now: datetime | None = None) -> JobQualificationTask | None:
-    """Queue the job for the graph, or return its active task. Never revives a run a person stopped unless they ask
-    again (`force`). Flushes in a savepoint, does not commit."""
+    """Queue the job for the graph, or return its active task. Never revives a run a person stopped, or one that
+    failed its attempts, unless they ask again (`force`). Flushes in a savepoint, does not commit."""
     if not routes(db) and not force:
         return None
     existing = active_task(db, job.id)
@@ -127,9 +134,8 @@ def dispatch(db: Session, job: Job, *, reason: str = "new", force: bool = False,
         return existing
     q = JobQualificationTask
     if not force:
-        stopped = db.scalar(select(q.id).where(q.job_id == job.id, q.mode == ON, q.status == SKIPPED,
-                                               q.last_error == STOPPED_BY_USER).limit(1))
-        if stopped is not None:
+        held = db.scalar(select(q.id).where(q.job_id == job.id, q.mode == ON, _held_until_asked()).limit(1))
+        if held is not None:
             return None
     now = now or utcnow()
     task = q(user_id=job.user_id, job_id=job.id, mode=ON, status=PENDING, reason=reason[:40], attempt_count=0,

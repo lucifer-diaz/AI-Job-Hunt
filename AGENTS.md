@@ -453,7 +453,9 @@ hand-back) qualify a job when `QUALIFICATION_GRAPH_MODE=on` (README §9c). The r
   Predictions use the deterministic functions and the latest stored ranking. A paid re-ranking needs
   `qualification_shadow_paid_daily_limit > 0`, reserved per account under a transaction lock.
 * **Kill stops; nothing revives it.** Kill ends the task with `STOPPED_BY_USER` and stops its thread. `dispatch`
-  never creates a new run for a job a person stopped unless they ask (Retry and Run now create a new task).
+  never creates a new run for a job whose latest run a person stopped, or that failed its attempts, unless they ask
+  (Retry and Run now create a new task); otherwise every `ranker.sweep` would start another run and the attempt limit
+  would bound nothing.
 * **Off is the old path.** With mode `off` every hook calls exactly what it called before. Leftover ON tasks are
   ended `ROUTED_TO_LEGACY` by the next pass.
 * Re-ranks (`resume_changed`, `_queue_stale`, `_recheck_salary`, `follow_setup`) stay on the existing services in
