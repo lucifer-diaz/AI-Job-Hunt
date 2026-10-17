@@ -41,6 +41,7 @@ from app.models import (
     JobDescriptionFetchTask,
     JobDescriptionParseTask,
     JobInsightTask,
+    JobQualificationTask,
     JobRankingTask,
     RagIndexEntry,
     RagIndexVersion,
@@ -136,6 +137,11 @@ def _reviewing(m: Any) -> Any:
                and_(m.status.in_(("succeeded", "failed", "cancelled")), m.stage == "reviewing"))
 
 
+def _qualification_scope(m: Any) -> Any:
+    """Shadow runs only compare (Monitoring); Running workers lists the runs that drive jobs."""
+    return m.mode == "ON"
+
+
 def _index_scope(m: Any) -> Any:
     """Entries of a retired index are left out: they are never worked again and are purged with it."""
     return m.index_version_id.in_(select(RagIndexVersion.id).where(RagIndexVersion.status != "RETIRED"))
@@ -192,6 +198,11 @@ KINDS: dict[str, WorkerKind] = {k.kind: k for k in (
     WorkerKind("ranking", "Ranking", "Scores each job's fit; code decides qualified or archived.", JobRankingTask,
                "ranking", "PENDING", "PROCESSING", ("COMPLETED", "FAILED", "SKIPPED"),
                lambda: get_settings().ranking_max_attempts, "ranker"),
+    WorkerKind("qualification", "Qualification", "Takes each new job through admission, description recovery, "
+               "parsing, hard filters, evidence and ranking, in that order (LangGraph). It never calls a model itself: "
+               "it hands each step to its worker and waits.", JobQualificationTask, "qualification", "PENDING",
+               "PROCESSING", ("COMPLETED", "FAILED", "SKIPPED"), lambda: get_settings().qualification_max_attempts,
+               "qualification", scope=_qualification_scope),
     WorkerKind("insights", "Job insights", "Researches approved jobs (posting, company site, Glassdoor and PayScale "
                "when configured), then a model organises what was found.", JobInsightTask, "job_insights", "PENDING",
                "PROCESSING", ("COMPLETED", "PARTIAL", "FAILED", "SKIPPED"),
@@ -807,6 +818,10 @@ def _stop(db: Session, spec: WorkerKind, task: Any, user_id: int, now: datetime)
     task.last_error = STOPPED_BY_USER
     if spec.kind == "recovery":
         task.result_code = "STOPPED_BY_USER"
+    if spec.kind == "qualification":
+        from app.services import qualification
+
+        qualification.on_stopped(db, task, now)  # its graph thread stops too, so no node writes again
     if spec.kind == "ranking":
         from app.services.work_queue import transition
 
@@ -832,7 +847,9 @@ def kill(db: Session, user_id: int, kind: str, task_ids: list[int] | None = None
     running = stopped = 0
     stopped_jobs = []
     for task in tasks:
-        if task.status != spec.running and _display_status(spec, task, now) != "RETRYING":
+        # A graph run between steps (waiting for recovery, a parse or a ranking) has started: Kill stops it too.
+        started = spec.kind == "qualification" and task.agent_thread_id is not None
+        if task.status != spec.running and _display_status(spec, task, now) != "RETRYING" and not started:
             continue  # a task still waiting its first turn is not stopped by Kill (Remove takes it out)
         running += _stop(db, spec, task, user_id, now)
         stopped += 1
@@ -880,6 +897,10 @@ def _requeue_finished(db: Session, spec: WorkerKind, task: Any, user_id: int) ->
         if jd_recovery.enqueue(db, job, reason="user_request", force=True) is None:
             raise WorkerError("This job has no posting URL to recover from")
         db.commit()
+    elif spec.kind == "qualification":
+        from app.services import qualification
+
+        return qualification.requeue(db, task, user_id)
     elif spec.kind == "insights":
         from app.services.job_insights import tasks as insight_tasks
 

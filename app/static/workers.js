@@ -1,5 +1,5 @@
-/* Running workers: the account's background queues — JD parsing, JD recovery, ranking, tailoring and its review step, and
-   the retrieval indexer — in one screen,
+/* Running workers: the account's background queues — JD parsing, JD recovery, ranking, the qualification graph,
+   tailoring and its review step, and the retrieval indexer — in one screen,
    with the controls to unstick them. Loaded before app.js; uses the workspace helpers (api, esc, btn, pill, render, go)
    and reuses the views each queue already had: the JD parsing and recovery panels (monitoring.js), the ranking tracker
    and the tailoring task list (app.js).
@@ -10,9 +10,9 @@
    ranking cadence and any provider cooldown. Every number and row comes from /api/workers/* (app.services.workers). */
 'use strict';
 
-const WK_KINDS = [['parsing', 'JD parsing'], ['recovery', 'JD recovery'], ['ranking', 'Ranking'], ['insights', 'Job insights'], ['tailoring', 'Tailoring'], ['reviewing', 'Reviewing'], ['indexing', 'Indexing']];
+const WK_KINDS = [['parsing', 'JD parsing'], ['recovery', 'JD recovery'], ['ranking', 'Ranking'], ['qualification', 'Qualification'], ['insights', 'Job insights'], ['tailoring', 'Tailoring'], ['reviewing', 'Reviewing'], ['indexing', 'Indexing']];
 // Tabs drawn from the generic task list (/api/workers/{kind}); ranking and tailoring keep their own views.
-const WK_GENERIC = ['parsing', 'recovery', 'insights', 'reviewing', 'indexing'];
+const WK_GENERIC = ['parsing', 'recovery', 'qualification', 'insights', 'reviewing', 'indexing'];
 // Tabs whose Performance card comes from /api/workers/{kind}/performance (parsing and recovery bring their own metrics).
 const WK_PERF = ['ranking', 'insights', 'tailoring', 'reviewing'];
 // The worker tabs, then the account's worker settings (processing limits and rate-limit backoff).
@@ -256,7 +256,7 @@ function wkLimits(tab) {
 }
 // Rank / run everything that is waiting, now, in bulk (not for tailoring, which has no wait).
 function wkRunQueuedButton(tab, spec) {
-  if (!['parsing', 'recovery', 'ranking', 'insights', 'indexing'].includes(tab)) return '';
+  if (!['parsing', 'recovery', 'ranking', 'qualification', 'insights', 'indexing'].includes(tab)) return '';
   const c = spec.counts || {}, n = (c.queued || 0) + (c.retrying || 0), key = 'wkRunQueued' + tab;
   const verb = tab === 'ranking' ? 'Rank' : 'Run';
   return `<span title="${attr(n ? `${verb} the ${n} queued or waiting task${n === 1 ? '' : 's'} now: no retry wait${tab === 'ranking' ? ', no cadence' : ''}. A provider cooldown still applies.` : 'Nothing is queued')}">${btn(label(key, `${verb} ${n || ''} queued now`.replace('  ', ' '), 'Starting…'), 'wk-run-queued', { kind: tab, n }, 'sm', !n || isBusy(key))}</span>`;
@@ -478,7 +478,7 @@ async function wkSaveExtra(changes) {
   if (Object.keys(server).length) D.wkSettings.server = (await api('/api/workers/server-settings', { method: 'PUT', body: { values: server } })).server;
 }
 const wkSecs = s => s < 60 ? `${s}s` : s < 3600 ? `${Math.round(s / 6) / 10}m`.replace('.0m', 'm') : `${Math.round(s / 360) / 10}h`.replace('.0h', 'h');
-const WK_SET_ICONS = { parsing: '▤', recovery: '⟲', ranking: '★', insights: '◈', tailoring: '✎', indexing: '⌕', approvals: '✓', backoff: '⏱' };
+const WK_SET_ICONS = { parsing: '▤', recovery: '⟲', ranking: '★', qualification: '⇶', insights: '◈', tailoring: '✎', indexing: '⌕', approvals: '✓', backoff: '⏱' };
 // The unit beside a number, and how its default reads, from the setting's name.
 function wkUnit(name) {
   if (/seconds/.test(name)) return ['sec', v => wkSecs(Number(v))];
@@ -564,7 +564,7 @@ function wkSettings() {
       <div class="wk-scol server"><div class="wk-scol-head"><span class="wk-scol-icon" aria-hidden="true">↗</span><div><b>Waits after 429s in a row</b><small>Worked out from the values on the left.</small></div></div><div class="wk-pad">${ladder}<p class="settings-help mt12">A provider's own <code>Retry-After</code> wins when it asks for longer. Model calls and Apify calls back off separately; the first normal answer resets it. Kill all and Reset backoff clear a wait that is running now.</p></div></div></div>`
     : '<div class="wk-paused-note">Off: every queued task calls the provider again straight away, even while it is refusing them.</div>'}</section>`;
   const auto = id => !!fv('workers', wkAKey(id, 'auto'), D.wkSettings.account[id].values.auto);
-  const nav = [['parsing', 'JD parsing'], ['recovery', 'JD recovery'], ['ranking', 'Ranking'], ['insights', 'Job insights'], ['tailoring', 'Tailoring'], ['indexing', 'Indexing'], ['approvals', 'Approvals'], ['backoff', 'Rate limits']]
+  const nav = [['parsing', 'JD parsing'], ['recovery', 'JD recovery'], ['ranking', 'Ranking'], ['qualification', 'Qualification'], ['insights', 'Job insights'], ['tailoring', 'Tailoring'], ['indexing', 'Indexing'], ['approvals', 'Approvals'], ['backoff', 'Rate limits']]
     .filter(([id]) => id === 'backoff' || id === 'approvals' || D.wkSettings.account[id])
     .map(([id, t]) => `<a href="#wk-set-${id}" data-act="wk-set-jump" data-id="${id}"><span class="wk-set-icon sm" aria-hidden="true">${WK_SET_ICONS[id]}</span><span class="grow">${t}</span>${id === 'backoff' ? (backoffOn ? '<i class="wk-state on">On</i>' : '<i class="wk-state">Off</i>') : id === 'approvals' ? (fv(form, 'application_mode', b.application_mode) === 'automatic' ? '<i class="wk-state on">Auto</i>' : '<i class="wk-state">Manual</i>') : auto(id) ? '<i class="wk-state on">Auto</i>' : '<i class="wk-state paused">Paused</i>'}</a>`).join('');
   return `<form id="settings-editor" class="wk-settings" data-form="workers" novalidate><fieldset ${isBusy('settings-workers') ? 'disabled' : ''}>
@@ -572,7 +572,7 @@ function wkSettings() {
         <div class="wk-legend-box mt12"><div><span aria-hidden="true">👤</span> <b>Your account</b> only your tasks</div><div><span aria-hidden="true">${D.wkSettings.server_editable ? '⚙' : '🔒'}</span> <b>Server</b> ${D.wkSettings.server_editable ? 'every account (admin)' : 'set by your admin'}</div><div><span class="wk-dot" aria-hidden="true"></span> <b>Custom</b> differs from the default</div></div>
 </nav>
       <div class="stack" style="min-width:0"><div id="settings-error" class="settings-error" role="alert" ${SETTING_ERRORS.workers ? '' : 'hidden'}>${esc(SETTING_ERRORS.workers || '')}</div>
-        ${wkSettingsCard('parsing', 'JD parsing')}${wkSettingsCard('recovery', 'JD recovery')}${wkSettingsCard('ranking', 'Ranking', ranking)}${wkSettingsCard('insights', 'Job insights')}${wkSettingsCard('tailoring', 'Tailoring', tailoringExtra)}${wkSettingsCard('indexing', 'Indexing')}${wkApprovalsCard(b)}${backoff}
+        ${wkSettingsCard('parsing', 'JD parsing')}${wkSettingsCard('recovery', 'JD recovery')}${wkSettingsCard('ranking', 'Ranking', ranking)}${wkSettingsCard('qualification', 'Qualification')}${wkSettingsCard('insights', 'Job insights')}${wkSettingsCard('tailoring', 'Tailoring', tailoringExtra)}${wkSettingsCard('indexing', 'Indexing')}${wkApprovalsCard(b)}${backoff}
         <div class="wk-set-footer">${settingsFooter('workers')}</div></div></div></fieldset></form>`;
 }
 
@@ -673,10 +673,16 @@ function wkTailoringView() {
 }
 
 /* ───────────── screen ───────────── */
+// The qualification graph is optional (QUALIFICATION_GRAPH_MODE): its tab shows once it is scheduled or has work.
+function wkShown(id) {
+  if (id !== 'qualification') return true;
+  const spec = wkSpec(id);
+  return !!spec && (!!spec.scheduler?.enabled || wkCount(spec.counts) > 0);
+}
 function renderWorkers() {
   const w = wkState(), s = D.wk;
   if (!s) return loading();
-  const tabs = `<div class="seg" role="tablist" aria-label="Workers">${WK_TABS.map(([id, text]) => {
+  const tabs = `<div class="seg" role="tablist" aria-label="Workers">${WK_TABS.filter(([id]) => wkShown(id)).map(([id, text]) => {
     const n = wkCount(wkSpec(id)?.counts);
     return `<button role="tab" aria-selected="${w.tab === id}" class="${w.tab === id ? 'on' : ''}" data-act="wk-tab" data-id="${id}">${id === 'settings' ? '<span aria-hidden="true">⚙</span> ' : ''}${text}${n ? ` <span class="wk-badge">${n}</span>` : ''}</button>`;
   }).join('')}</div>`;

@@ -209,8 +209,13 @@ def sweep(db: Session, limit: int | None = None, *, now: datetime | None = None)
     limit = max(1, limit or get_settings().jd_fetch_enqueue_batch_size)
     from app.services import domain_match
 
-    jobs = db.scalars(select(Job).where(Job.description_quality.is_(None), Job.user_id.is_not(None))
-                      .order_by(Job.id.desc()).limit(limit)).all()
+    from app.services import qualification
+
+    backlog = select(Job).where(Job.description_quality.is_(None), Job.user_id.is_not(None))
+    if qualification.routes(db):
+        # The graph recovers the jobs it qualifies (after admitting them); jobs before ranking are its to take.
+        backlog = backlog.where(qualification.untouched(), Job.state.not_in(ranker.PRE_RANK_STATES))
+    jobs = db.scalars(backlog.order_by(Job.id.desc()).limit(limit)).all()
     assessed = queued = 0
     rules: dict = {}
     for job in jobs:
@@ -805,6 +810,10 @@ def apply_recovered(db: Session, job: Job, task: JobDescriptionFetchTask, outcom
     # Ranking waits for the parse (job_description.waiting_reason); queueing is all this worker does.
     if ranker.removed_by_user(db, job):
         return "recovered"  # the person took this job out of ranking; a description does not put it back
+    from app.services import qualification
+
+    if qualification.owns(db, job):
+        return "recovered"  # the qualification graph waits for this recovery and takes the job on itself
     try:
         with db.begin_nested():
             ranker.reopen_for_description(db, job, actor="jd_recovery", now=now)

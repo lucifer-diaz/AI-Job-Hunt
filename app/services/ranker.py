@@ -1190,12 +1190,22 @@ def sweep(db: Session, *, now: datetime | None = None, limit: int | None = None)
     # Jobs created by any path (manual, from a URL, Lever, Greenhouse, older imports) are filtered and queued here.
     from app.services import domain_match  # local import: domain_match reads ranker's queueing
 
+    from app.services import qualification
+
+    graph = qualification.routes(db)  # QUALIFICATION_GRAPH_MODE=on: the graph qualifies these jobs
     rules: dict = {}
-    for job_id in db.scalars(select(Job.id).where(Job.state.in_(PRE_RANK_STATES), Job.user_id.is_not(None))
-                             .order_by(Job.id).limit(limit)).all():
+    waiting = select(Job.id).where(Job.state.in_(PRE_RANK_STATES), Job.user_id.is_not(None))
+    if graph:
+        waiting = waiting.where(qualification.unowned())
+    for job_id in db.scalars(waiting.order_by(Job.id).limit(limit)).all():
         job = _lock_job(db, job_id)
         if job is None or job.state not in PRE_RANK_STATES:
             db.rollback()
+            continue
+        if graph:
+            # Admission is the graph's first step, so an old job is screened before anything is spent on it.
+            task = qualification.dispatch(db, job, reason="sweep", now=now)
+            counts["queued"] += int(_commit(db) and task is not None)
             continue
         if not domain_match.screen(db, job, rules, actor="ranker", now=now):
             counts["not_matching"] += _commit(db)  # hidden before any model is asked about it

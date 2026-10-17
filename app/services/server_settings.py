@@ -54,6 +54,20 @@ EDITABLE: dict[str, Editable] = {e.name: e for e in (
     Editable("ranking_batch_size", "ranking", "Tasks per run", "How many ranking tasks one run claims.", 1, 500),
     Editable("ranking_concurrency", "ranking", "Most per account",
              "The most rankings one account may run at once (each account picks up to this).", 1, 64),
+    Editable("qualification_interval_minutes", "qualification", "Run every (minutes)",
+             "How often the qualification graph looks for work. 0 turns it off for every account; it never runs while "
+             "AGENT_GRAPHS_ENABLED is off.", 0, 1440, "qualification"),
+    Editable("qualification_batch_size", "qualification", "Tasks per run", "How many graph runs one pass claims.",
+             1, 500),
+    Editable("qualification_concurrency", "qualification", "Side by side",
+             "How many graph runs advance at once. A run only hands work to the other workers, so this is cheap.",
+             1, 32),
+    Editable("qualification_shadow_daily_limit", "qualification", "Shadow runs per account per day",
+             "In shadow mode: how many decided jobs per account a day are compared with the graph (read-only).",
+             0, 5000),
+    Editable("qualification_shadow_paid_daily_limit", "qualification", "Shadow model calls per account per day",
+             "In shadow mode: how many jobs without a ranking may be ranked again by the model, only to compare. "
+             "0 (the default) never spends a model call on shadow runs.", 0, 500),
     Editable("rag_index_interval_minutes", "indexing", "Run every (minutes)",
              "How often the retrieval indexer looks for work. 0 turns it off for every account; it never runs while "
              "RAG_VECTOR_ENABLED is off.", 0, 1440, "rag_index"),

@@ -359,7 +359,10 @@ def _save(db: Session, run: SearchRun, ctx: RunContext, job: dict[str, Any], pol
         if discovery.admit(db, record, search_run_id=run.id, rules_cache=rules_cache) == "not_matching":
             db.commit()
             return "not_matching"
-        reason = ranker.queue_job(db, record, policy=policy, actor="hunter")
+        from app.services import qualification
+
+        # With the qualification graph on, admit() queued the graph's run: it ranks the job after its description.
+        reason = None if qualification.routes(db) else ranker.queue_job(db, record, policy=policy, actor="hunter")
         db.commit()
     except IntegrityError:  # another sync saved the same posting a moment ago
         db.rollback()

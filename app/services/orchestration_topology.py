@@ -189,6 +189,14 @@ NODES: tuple[Node, ...] = (
          "never generates text, and what a job may use is still decided in code.", "support", (4, -1),
          external=(ExternalMatch("LITELLM", "embed_documents"),), monitoring_tab="external", workers_tab="indexing",
          screen="knowledge"),
+    # The qualification graph (app.agents.qualification, QUALIFICATION_GRAPH_MODE): a conductor over the intake row.
+    # It admits a job first, then hands it to recovery, parsing and ranking through their own task rows and waits;
+    # it never calls a model, so it is not an AI node. A job it waits on is shown at the worker doing the step.
+    Node("qualification", "Qualification graph", (ASYNC, DET), "Takes each new job through admission, description "
+         "recovery, parsing, hard filters, evidence scope and ranking in that order (LangGraph), through the same "
+         "workers; a job outside your domain stops at admission with nothing spent. Off unless "
+         "QUALIFICATION_GRAPH_MODE is on (or shadow, which only compares).", "support", (2, -1),
+         workers_tab="qualification", screen="discovery"),
     Node("interview_insights", "Interview preparation", (AI,), "Writes interview preparation from the posting, the "
          "fit analysis and verified evidence, always labelled as generated (never as questions the company asks).",
          "support", (4, 2), workers=("INTERVIEW_INSIGHTS",), llm_stages=("INTERVIEW_INSIGHTS",),
@@ -228,6 +236,8 @@ EDGES: tuple[Edge, ...] = (
     Edge("resume_parser", "retrieval_index", "verified evidence", kind="support"),
     Edge("retrieval_index", "ranker", "retrieval", kind="support"),
     Edge("compensation", "discovery", "salary enrichment", kind="support"),
+    Edge("qualification", "domain_filter", "admits first", kind="support"),
+    Edge("qualification", "ranker", "hands to ranking", kind="support"),
     Edge("approval", "company_insights", "research", kind="support", measure="insight tasks created "
          "(job_insight_tasks.created_at)", timed=True),
     Edge("company_insights", "interview_insights", "researched", kind="support", measure="research runs that saved "

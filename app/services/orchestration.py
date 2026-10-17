@@ -49,6 +49,7 @@ from app.models import (
     JobDescriptionFetchTask,
     JobDescriptionParseTask,
     JobInsightTask,
+    JobQualificationTask,
     JobRanking,
     JobRankingTask,
     LLMRequestLog,
@@ -389,6 +390,10 @@ class TaskTable:
 
 
 TASK_TABLES = (
+    # First: a job the graph waits on is placed at the worker doing its step, which the later tables override with.
+    TaskTable("qualification", JobQualificationTask, ("PENDING",), ("PROCESSING",), ("FAILED",), (), ("COMPLETED",),
+              JobQualificationTask.attempt_count, JobQualificationTask.started_at,
+              JobQualificationTask.completed_at),
     TaskTable("jd_recovery", JobDescriptionFetchTask, ("PENDING",), ("PROCESSING",), ("FAILED",), ("BLOCKED",),
               ("COMPLETED",), JobDescriptionFetchTask.attempt_count, JobDescriptionFetchTask.started_at,
               JobDescriptionFetchTask.completed_at),
@@ -403,7 +408,7 @@ TASK_TABLES = (
 )
 TASK_BY_NODE = {t.node_id: t for t in TASK_TABLES}
 # The Running workers kind (app.services.worker_settings) behind each task table, for its attempt limit.
-WORKER_KIND_BY_NODE = {"jd_recovery": "recovery", "jd_parser": "parsing", "company_insights": "insights",
+WORKER_KIND_BY_NODE = {"qualification": "qualification", "jd_recovery": "recovery", "jd_parser": "parsing", "company_insights": "insights",
                        "ranker": "ranking"}
 
 
@@ -1454,7 +1459,8 @@ def live(db: Session, scope: Scope) -> dict[str, Any]:
                          "attempt": attempt, "max_attempts": limit, "task": task, "task_id": task_id}
 
     own = {kind: worker_settings.get(db, owner, kind, "max_attempts") for kind in ("recovery", "parsing", "ranking",
-                                                                                  "insights", "tailoring")}
+                                                                                  "insights", "tailoring",
+                                                                                  "qualification")}
     for t in TASK_TABLES:
         limit = own[WORKER_KIND_BY_NODE[t.node_id]]
         m = t.model

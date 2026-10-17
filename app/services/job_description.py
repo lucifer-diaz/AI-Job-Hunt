@@ -734,12 +734,20 @@ def sweep(db: Session, limit: int | None = None) -> dict[str, int]:
     # A parse a person stopped from Running workers stays stopped until they ask again (Retry, Run now, re-parse).
     stopped = select(JobDescriptionParseTask.job_id).where(JobDescriptionParseTask.status == FAILED,
                                                           JobDescriptionParseTask.last_error == STOPPED_BY_USER)
-    candidates = db.scalars(
-        select(Job)
-        .where(Job.description.is_not(None), Job.description != "",
-               Job.structured_description_status.in_((RAW, NORMALIZED)), Job.id.not_in(active),
-               Job.id.not_in(recovering), Job.id.not_in(stopped), Job.domain_match.is_distinct_from("NOT_MATCHING"))
-        .order_by(Job.id).limit(max(1, limit))).all()
+    backlog = (select(Job)
+               .where(Job.description.is_not(None), Job.description != "",
+                      Job.structured_description_status.in_((RAW, NORMALIZED)), Job.id.not_in(active),
+                      Job.id.not_in(recovering), Job.id.not_in(stopped),
+                      Job.domain_match.is_distinct_from("NOT_MATCHING")))
+    from app.services import qualification
+
+    if qualification.routes(db):
+        # The qualification graph parses the jobs it qualifies, after admitting them: jobs before ranking are its.
+        from app.services.lifecycle import WorkflowState as S
+
+        backlog = backlog.where(qualification.untouched(),
+                                Job.state.not_in((S.DISCOVERED, S.NORMALIZED, S.FILTERED)))
+    candidates = db.scalars(backlog.order_by(Job.id).limit(max(1, limit))).all()
     queued = 0
     for job in candidates:
         if not needs_parse(job):
@@ -944,6 +952,7 @@ def hand_to_ranking(db: Session, job_id: int) -> None:
 
         ranker.release_parked(db, job_id)
         scheduler_hooks.nudge("ranking")
+        scheduler_hooks.nudge("qualification")  # a graph run waiting for this parse may go on
     except Exception:  # noqa: BLE001
         db.rollback()
         log.warning("could not hand job %s to ranking", job_id, exc_info=True)
