@@ -513,7 +513,7 @@ This section is intended to change after *each approved phase merge*. Initial en
 | --- | --- | --- | --- | --- | --- |
 | 1. LangGraph foundation | MERGED | [#72](https://github.com/triump0870/AI-Job-Hunt/pull/72) | `74930e5` | 2026-10-13 note below | OFF (`AGENT_GRAPHS_ENABLED=false`) |
 | 2. RAG knowledge layer | MERGED | [#74](https://github.com/triump0870/AI-Job-Hunt/pull/74) | `a2f0b30` | 2026-10-15 note below | OFF (`RAG_RETRIEVAL_MODE=off`, `RAG_VECTOR_ENABLED=false`) |
-| 3. Qualification graphs | IN_REVIEW | (this branch) | — | 2026-10-17 note below | OFF (`QUALIFICATION_GRAPH_MODE=off`) |
+| 3. Qualification graphs | IN_REVIEW | [#78](https://github.com/triump0870/AI-Job-Hunt/pull/78) | — | 2026-10-17 note below | OFF (`QUALIFICATION_GRAPH_MODE=off`) |
 | 4. Preparation / insights graphs | NOT_STARTED | — | — | — | OFF |
 | 5. Application execution | NOT_STARTED | — | — | — | OBSERVE only (planned) |
 | 6. Guarded agentic submission | NOT_STARTED | — | — | — | OFF |
@@ -662,7 +662,7 @@ Allowed status: NOT_STARTED, PLANNING, IN_PROGRESS, IN_REVIEW, MERGED, BLOCKED, 
 - **Next dependency:** Phase 3 needs this PR approved and merged.
 
 ### 2026-10-17 — Phase 3: Qualification graph
-- **Branch / PR:** `feat/langgraph-qualification` to `main`, not merged.
+- **Branch / PR:** `feat/langgraph-qualification`, [#78](https://github.com/triump0870/AI-Job-Hunt/pull/78) to `main`, not merged.
 - **Base:** `a2f0b30`. Phase 1 (#72, merge `74930e5`) and Phase 2 (#74, merge `a2f0b30`; #77) are merged.
 - **What shipped:**
   - **Qualification graph** (`app/agents/qualification.py`), with this node order:
