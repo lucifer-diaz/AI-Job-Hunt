@@ -30,6 +30,8 @@ class EvidenceIn(BaseModel):
     skills: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
     verified: bool = True
+    # The resumes this evidence belongs to (Evidence Bank tags); none = it applies to every resume.
+    resume_ids: list[int] | None = None
 
 
 class ManualJobIn(BaseModel):

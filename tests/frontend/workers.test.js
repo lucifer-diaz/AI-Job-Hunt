@@ -17,7 +17,8 @@ const summary = (over = {}) => ({
     { kind: 'recovery', label: 'JD recovery', description: 'Reads postings', counts: counts(), scheduler: { enabled: true, interval_minutes: 2 } },
     { kind: 'ranking', label: 'Ranking', description: 'Scores fit', counts: counts(0, 1), scheduler: { enabled: true, interval_minutes: 2 } },
     { kind: 'tailoring', label: 'Tailoring', description: 'Tailors packets', counts: counts(), scheduler: { enabled: true, poll_seconds: 2, concurrency: 2 } },
-    { kind: 'reviewing', label: 'Reviewing', description: 'Checks packets', view_of: 'tailoring', counts: counts(1), scheduler: { enabled: true, poll_seconds: 2, concurrency: 2 } }],
+    { kind: 'reviewing', label: 'Reviewing', description: 'Checks packets', view_of: 'tailoring', counts: counts(1), scheduler: { enabled: true, poll_seconds: 2, concurrency: 2 } },
+    { kind: 'indexing', label: 'Indexing', description: 'Embeds verified evidence', counts: counts(), scheduler: { enabled: true, interval_minutes: 10 } }],
   ...over });
 const row = (over = {}) => ({ task_id: 11, job_id: 7, title: 'Staff SWE', company: 'Canva', kind: 'parsing', status: 'RUNNING',
   stage: 'running', attempt: 1, max_attempts: 3, started_at: '2026-10-04T10:00:00', next_attempt_at: null, last_error: null,
@@ -81,6 +82,11 @@ beforeEach(() => {
       : url.startsWith('/api/workers/reviewing') ? { kind: 'reviewing', rows: [
         row({ task_id: 51, job_id: 8, kind: 'reviewing', stage: 'reviewing', title: 'Backend Lead', company: 'Stripe' }),
         row({ task_id: 52, job_id: 9, kind: 'reviewing', status: 'SUCCEEDED', stage: 'done', can_kill: false, reviewer_score: 82, finished_at: '2026-10-04T11:00:00' })] }
+      : url.startsWith('/api/workers/indexing') ? (routes.indexingUrl = url, { kind: 'indexing', status_counts: { all: 2 }, rows: [
+        row({ task_id: 61, job_id: null, kind: 'indexing', title: 'Evidence #12', company: 'index v3 (building)', subject: { type: 'evidence', id: 12, index_version: 3, sensitive: false },
+          model: { model: 'text-embedding-3-small', route: 'LITELLM', route_label: 'LiteLLM', source: 'next', backups: [] } }),
+        row({ task_id: 62, job_id: null, kind: 'indexing', status: 'STOPPED', title: 'Saved answer #4', company: 'index v3 (building)', can_kill: false, can_run_now: true,
+          last_error: 'Stopped by you', subject: { type: 'knowledge_answer', id: 4, index_version: 3, sensitive: true } })] })
       : url.startsWith('/api/workers/recovery') ? { kind: 'recovery', rows: [], metrics: { by_result: {} }, diagnostics: { http: {}, playwright: {}, llm: {}, settings: {} } }
       : url.startsWith('/api/ranking/tracker') ? { counts: { filtering: 0, queued: 1, processing: 0, retry_scheduled: 0, waiting: 0, completed: 0, failed: 0, skipped: 0, qualified: 0, archived: 0 },
         progress: { finished: 0, total: 1 }, concurrency: 2, interval_minutes: 5, active: [{ id: 31, job_id: 9, title: 'AI Engineer', company: 'Grab', status: 'PENDING', attempt_count: 0, max_attempts: 3, reason: 'new' }],
@@ -122,7 +128,7 @@ describe('Running workers', () => {
   it('has a tab per worker with its queue size, kept in the URL', async () => {
     await open();
     const tabs = [...view().querySelectorAll('[data-act="wk-tab"]')].map(b => b.textContent.trim());
-    expect(tabs).toEqual(['JD parsing 3', 'JD recovery', 'Ranking 1', 'Job insights', 'Tailoring', 'Reviewing 1', '⚙ Settings']);
+    expect(tabs).toEqual(['JD parsing 3', 'JD recovery', 'Ranking 1', 'Job insights', 'Tailoring', 'Reviewing 1', 'Indexing', '⚙ Settings']);
     ui.A['wk-tab']({ dataset: { id: 'recovery' } });
     expect(location.hash).toBe('#workers/recovery');
     await flush();
@@ -219,6 +225,21 @@ describe('Running workers', () => {
     expect(document.getElementById('toast').textContent).toContain('backoff cleared for openrouter');
     await ui.A['wk-kill-everything']();
     expect(posts()).toContain('/api/workers/kill-all');
+  });
+
+  it('lists the retrieval indexer’s entries, which have no job, with the same controls', async () => {
+    const v = await open('indexing');
+    const rows = [...v.querySelectorAll('.wk-row')];
+    expect(rows.map(r => r.querySelector('.small.b').textContent.trim())).toEqual(['Evidence #12 · index v3 (building)', 'Saved answer #4 · index v3 (building) question only']);
+    expect(rows.every(r => !r.querySelector('[data-act="open-job"]'))).toBe(true);
+    expect(rows[0].querySelector('[data-act="wk-kill"]')).not.toBeNull();
+    expect(rows[0].textContent).toContain('text-embedding-3-small');
+    expect(rows[1].querySelector('[data-act="wk-run-now"]')).not.toBeNull();
+    expect(rows[1].querySelector('[data-wk-select="indexing"]')).not.toBeNull();  // a stopped entry can be retried in bulk
+    expect(v.querySelector('#wk-q-indexing').getAttribute('placeholder')).toContain('#source id');
+    expect(routes.indexingUrl).toMatch(/^\/api\/workers\/indexing\?/);
+    await ui.A['wk-kill']({ dataset: { kind: 'indexing', id: '61' } });
+    expect(posts()).toContain('/api/workers/indexing/tasks/61/kill');
   });
 
   it('runs a task now and says it is first in line', async () => {

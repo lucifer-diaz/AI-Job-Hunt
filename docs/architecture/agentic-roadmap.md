@@ -146,6 +146,10 @@ Record accepted changes to these decisions with an appended rationale, date, PR,
 | --- | --- | --- | --- |
 | ADR-019 | LangSmith export uses the LangSmith SDK's tracer through one boundary (`app/agents/tracing_boundary.py`). Its client applies allowlist hooks, a run-field allowlist, error class names only and keyed thread pseudonyms. It sends through an instrumented `requests` session (`external_api.requests_session`) that refuses any unreadable, compressed, credential-named or secret-shaped body. No setting widens it. | Reuses the SDK's protocol while keeping a wire-level, fail-closed guarantee and Monitoring telemetry. Consequence: the hooks depend on SDK internals (`_run_transform`, `update_run`, `_hide_run_error`); versions are pinned exactly and the leak tests run against them. | An SDK upgrade changes those hooks, or a self-hosted trace store is required |
 | ADR-020 | The Phase 1 pilot graph is not a `WorkerKind` or an orchestration node. The first production graph (Phase 3) registers through its own task table, like every queued worker. | `WorkerKind` and Running workers are job-bound (`job_id`, job-state transitions on kill); the pilot has no job and no production effect. Consequence: pilot threads are visible only through `/api/agents/runs`. | A graph does production work, or Running workers gains non-job tasks |
+| ADR-021 | Phase 2 embeddings are served only through the LiteLLM gateway (`/v1/embeddings` via the instrumented client), configured as the EMBEDDER worker's FIXED EMBEDDING model with a known vector size. Other provider modes get keyword/full-text retrieval only. | One credential, routing and telemetry path (ADR-016) with provider-reported cost; Ollama and hosted embedding models are both reachable as LiteLLM deployments. Consequence: no embeddings in direct OpenAI/Anthropic/Gemini mode. | A reviewed direct adapter meets the same contract (size check, telemetry, NULL unknown cost) |
+| ADR-022 | Job-scoped retrieval is scoped by explicit evidence ↔ resume tags (`evidence_resume_links`, AUTO from verification or extraction, USER from the person, removals kept) plus the selected resume's own verified `fact_key`s. Untagged manual or extracted evidence applies to every resume; resume-sourced evidence is never global. | `Evidence.resume_id` follows whichever resume synced a shared fact last, so it cannot say which resumes own a fact. Explicit tags let a person decide and the scope rule stays deterministic (ADR-017). Consequence: existing manual evidence stays usable by every resume until tagged. | A person needs a per-job evidence override |
+| ADR-023 | Vectors live in a runtime-created `rag_vectors` table (pgvector `vector` with no fixed size, rows carry `dimensions`). Exact cosine search runs over the pre-filtered scope; there is no ANN index. The embedding indexer is account-level and is not a `WorkerKind` or orchestration node. | An install without pgvector must still start, which Alembic cannot express. Scope filtering leaves tens to hundreds of rows per query, so exact search is correct and fast. `WorkerKind` is job-bound (ADR-020). Consequence: index progress shows in `/api/rag/status` and Monitoring → External APIs, not Running workers. | A measured account makes exact search too slow, or Running workers gains non-job tasks |
+| ADR-023 (amended 2026-10-16) | The embedding indexer **is** now a `WorkerKind` (`indexing`) and an orchestration node (`retrieval_index`, types ASYNC_WORKER + EXTERNAL: an embedding call makes vectors, not text, so it is not an AI node). `WorkerKind` gained a non-job variant: `subject` labels a row (Evidence #12 · index v3), `search`, `requeue` (Retry and Run now put the same row back), `stopped_status`, `shown`. Entries record `started_at` / `completed_at` / `run_now_at` (migration 0046). A retryable failure is PENDING with a retry time until the account's attempts (`worker_settings` `indexing`) run out, then FAILED; Kill ends an entry FAILED with `STOPPED_BY_USER`, and neither sweeps nor edits revive it. The `rag_index` job sweeps every account, then runs batches through `scheduled_jobs.run_live` (round-robin across accounts, `rag_index_concurrency` in flight, a batch's token as its claim id, `rag_index.renew` as heartbeat); interval, batch size, per-account budget and concurrency are `server_settings.EDITABLE`. Run-now entries are claimed first in a batch of their own under `backoff.bypass`; a paused account's queue is swept and held. | The revisit trigger fired: vectors must not be turned on in production without Kill, Retry, Run now and pause on the queue that spends embedding calls. ADR-020's trigger ("Running workers gains non-job tasks") fired too; the pilot graph stays outside the registry because it still has no production effect. Consequence: index progress shows in Running workers → Indexing as well as `/api/rag/status`. | A non-job queue needs per-row controls `requeue` cannot express (e.g. a row that must be recreated rather than reset) |
 
 ## 5. Core data and durability contracts
 
@@ -500,7 +504,7 @@ This section is intended to change after *each approved phase merge*. Initial en
 | Phase | Status | PR | Merge SHA | Evaluation / test evidence | Production flag |
 | --- | --- | --- | --- | --- | --- |
 | 1. LangGraph foundation | IN_REVIEW | [#72](https://github.com/triump0870/AI-Job-Hunt/pull/72) | — | 2026-10-13 note below | OFF (`AGENT_GRAPHS_ENABLED=false`) |
-| 2. RAG knowledge layer | NOT_STARTED | — | — | — | OFF |
+| 2. RAG knowledge layer | IN_REVIEW | [#74](https://github.com/triump0870/AI-Job-Hunt/pull/74) | — | 2026-10-15 note below | OFF (`RAG_RETRIEVAL_MODE=off`, `RAG_VECTOR_ENABLED=false`) |
 | 3. Qualification graphs | NOT_STARTED | — | — | — | OFF |
 | 4. Preparation / insights graphs | NOT_STARTED | — | — | — | OFF |
 | 5. Application execution | NOT_STARTED | — | — | — | OBSERVE only (planned) |
@@ -553,6 +557,101 @@ Allowed status: NOT_STARTED, PLANNING, IN_PROGRESS, IN_REVIEW, MERGED, BLOCKED, 
 - **Reviewer / approval:** pending independent review.
 - **Production activation and rollback:** OFF. Rollback means leaving `AGENT_GRAPHS_ENABLED=false` and `AGENT_LANGSMITH_EXPORT_ENABLED=false`. Optionally, downgrade 0044 and drop the LangGraph `checkpoint*` tables.
 - **Next dependency:** Phase 2 needs this PR approved and merged.
+
+### 2026-10-15 — Phase 2: RAG knowledge layer
+- **Branch / PR:** `feat/rag-knowledge-layer`, [#74](https://github.com/triump0870/AI-Job-Hunt/pull/74) to `main`, not merged.
+- **Base:** `37bebe2` (Phase 1 #72 and #73 merged).
+- **What shipped:**
+  - **`EmbeddingService`** (`app/services/embeddings.py`):
+    - Configured as the EMBEDDER worker's FIXED EMBEDDING model (seeded off).
+    - Served through LiteLLM `/v1/embeddings` via the instrumented client.
+    - Records the model that answered, input tokens and latency on the external call row, plus the cost LiteLLM
+      reported (NULL when none).
+    - Checks every vector's size.
+  - **Configuration checks:**
+    - Apply refuses an unknown vector size, a chat model on the Embedder, an embedding model on a chat worker, and
+      embedder fallbacks.
+    - Discovery reads `output_vector_size`; model and worker tests measure it.
+  - **Evidence ↔ resume tags** (`evidence_resume_links`, ADR-022), in the backend and the Evidence bank UI:
+    - AUTO from verification and extraction; USER from the person. A person's removal of a resume fact's tag is kept
+      (`excluded`) so verification never re-adds it; for manual or extracted evidence, removing a tag deletes the link.
+    - Per-row editor, bulk tagging, a resume filter, and new evidence defaulting to the active resume.
+  - **Derived index:**
+    - `rag_index_versions` and `rag_index_entries` (migration 0045); `rag_vectors` is created at runtime when pgvector
+      exists (ADR-023).
+    - A flush listener handles edits, verification changes and deletions; a sweep repairs anything missed.
+      Un-verifying a fact deletes its vector at once.
+    - Claims and writes are lease-guarded; the backfill is versioned and switches over at full coverage.
+    - Retired versions are purged by `cleanup`.
+    - The `rag_index` scheduler job runs only when `RAG_VECTOR_ENABLED`.
+  - **Hybrid retrieval** (`rag_retrieval.py`):
+    - Scope comes first: the account, `resume_verification.for_job`, then `evidence_tags.allowed_evidence_ids`.
+    - Signals: BM25, PostgreSQL full-text, canonical required-skill matches, and pgvector cosine (stale-hash guarded).
+    - The lists are fused by RRF into a token-budgeted `ContextPack` cited by real Evidence ids, with
+      `verify_citations`.
+  - **Integration:**
+    - `context_builder._base` and `ranker.relevant_evidence` (MCP) follow `RAG_RETRIEVAL_MODE` (off / shadow / on).
+      Shadow writes id-only comparisons to Monitoring → Logs.
+    - `knowledge.search` gains non-authoritative `suggestions`, with answer text withheld for
+      work-authorization/visa/sponsorship questions.
+    - With `on`, `tailoring_results.verified_evidence` checks citations against the job's resume scope, so a tailored
+      resume or letter citing another resume's fact is refused.
+  - **Evaluation:** `rag_eval.py`, `scripts/rag_eval.py`, and a labelled benchmark (`tests/fixtures/rag_eval/`, 8 jobs,
+    14 facts, 2 resumes with conflicting Acme experience, all pin types).
+- **Measurements** (benchmark; the concept embedder is a synthetic stand-in, not a model):
+
+  | Variant | Recall@5 | Recall@10 | P@3 | P@5 | R-precision | Citation correctness | Cross-resume leaks | p95 ms | Token reduction |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | Keyword (BM25 + full-text) | 1.0 | 1.0 | 0.58 | 0.41 | 0.90 | 1.0 | 0 | 6 | 54% |
+  | Hybrid (concept stand-in) | 1.0 | 1.0 | 0.58 | 0.40 | 0.90 | 1.0 | 0 | 8 | 47% |
+  | Deterministic builder (today) | — | 1.0 over all sent | — | — | — | — | **26** across 8 jobs | — | — |
+
+  Real-model recall was **not measured**: no reachable embedding model with credentials in this environment. Run
+  `scripts/rag_eval.py --litellm-url … --model … --dimensions …` before turning vectors on.
+- **Review fixes (2026-10-16, independent review):**
+  - Re-verifying a resume no longer deletes the AUTO tag extraction gave evidence extracted from it. Before, that
+    evidence became untagged and reached every resume's jobs.
+  - Clearing every tag on manual or extracted evidence now makes it apply to every resume, as the Evidence bank shows.
+    Before, the resume it came from stayed excluded.
+  - Resume names (by default the uploaded file name) are escaped in the new-evidence form.
+  - Un-verifying a fact deletes its vector immediately, also from a process that never set the vector store up; the
+    sweep removes any left behind.
+  - With `on`, tailoring citations are checked against the job's resume scope.
+- **Code review fixes (2026-10-16):**
+  - Embedding requests are sent with `external_api.NO_CAPTURE`. Before, an account's payload capture or
+    `EXTERNAL_API_DEBUG_PAYLOADS` kept candidate evidence text and vectors in external-call telemetry.
+  - Apply refuses an embedding model in any chat failover slot (`fallback_model`, `secondary_models`, a text model's
+    own `fallback_models`), not only as the primary.
+  - A version is promoted only after a re-sweep: a fact verified or added while it was building now keeps it from
+    serving until that fact is embedded.
+  - With `on`, the verified-facts gate of tailoring and cover letters counts only evidence of the job's own resume.
+  - The indexer in Running workers was a separate follow-up, done the same day (ADR-023 amendment: Running workers →
+    Indexing).
+- **Tests** (the reviewer's runs on head with the review fixes: PostgreSQL 16.8 + pgvector 0.8.7, `jobhunt` conda env,
+  `mcp` 1.30 on `PYTHONPATH` because the env has 2.x):
+  - **New suites:** `test_embeddings.py`, `test_rag_index.py`, `test_rag_retrieval.py`, `test_rag_eval.py` and
+    `test_rag_postgres.py`, plus Evidence-bank tag tests in vitest. On PostgreSQL with `test_migrations.py`: 75 passed.
+  - **SQLite:** 2057 passed, 102 skipped, 1 failed (`test_mcp` stdio server, which fails on `main` too).
+  - **PostgreSQL:** 2150 passed, 2 skipped, 8 failed: the same 8 tests fail on untouched `main`.
+  - **vitest:** 320 passed, 2 failed (`overview_outcomes`, which fails on `main` too).
+  - **Migrations:** `test_migrations.py` on PostgreSQL covers upgrade, downgrade to baseline and back, and an empty
+    metadata diff. A manual upgrade → `rag_vectors` setup → downgrade to 0044 → upgrade cycle left no rag table behind.
+  - **Lint:** ruff is level with `main` (229); the changed files are clean.
+- **Known gaps:**
+  - Pack-level relevance cut-off is by budget and candidates only.
+  - Company intelligence and application-history collections are deferred to Phase 4.
+  - Existing untagged manual evidence applies to every resume until tagged.
+  - With `off` or `shadow`, tailoring still checks citations against the account's verified evidence, as on `main`.
+  - ~~The indexer is not a `WorkerKind` (ADR-023): no kill, run-now or retry in Running workers~~ — resolved
+    2026-10-16 (ADR-023 amendment: Running workers → Indexing). Embedding calls still do not appear in Model
+    performance (they are not LLM requests).
+  - With `shadow` and vectors on, every context build embeds one query (cached per account); follow the rollout order.
+- **Rollback:** `RAG_RETRIEVAL_MODE=off`, `RAG_VECTOR_ENABLED=false`. Optionally downgrade 0045, which also drops
+  `rag_vectors`.
+- **Compose upgrade:** the image changes from `postgres:17-alpine` to `pgvector/pgvector:pg17` (same major version,
+  glibc instead of musl). On an existing volume, if PostgreSQL warns about a collation version mismatch, run
+  `REINDEX DATABASE jobhunt;` and `ALTER DATABASE jobhunt REFRESH COLLATION VERSION;` once.
+- **Next dependency:** Phase 3 needs this PR approved and merged.
 
 ### Phase update template
 

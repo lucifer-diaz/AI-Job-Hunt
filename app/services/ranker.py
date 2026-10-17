@@ -548,9 +548,12 @@ def _tokens(text: str) -> set[str]:
 def relevant_evidence(db: Session, user_id: int, job: Job, limit: int) -> list[dict[str, Any]]:
     """Verified evidence that shares vocabulary with the posting, most overlapping first, capped at `limit`."""
     wanted = _tokens(" ".join([job.title or "", job.description or "", " ".join(job.skills or [])]))
+    in_scope = _resume_scope(db, user_id, job)
     scored = []
     for item in db.scalars(select(Evidence).where(Evidence.user_id == user_id, Evidence.verified.is_(True))
                            .order_by(Evidence.id)).all():
+        if in_scope is not None and item.id not in in_scope:
+            continue
         words = _tokens(" ".join([item.claim or "", item.context or "", item.role or "",
                                   " ".join(item.skills or []), " ".join(item.tags or [])]))
         overlap = len(words & wanted)
@@ -560,6 +563,18 @@ def relevant_evidence(db: Session, user_id: int, job: Job, limit: int) -> list[d
     chosen = sorted((item for _, item in scored[:max(0, limit)]), key=lambda item: item.id)
     return [{"id": e.id, "company": e.company, "role": e.role, "claim": e.claim, "context": e.context,
              "skills": e.skills or [], "tags": e.tags or []} for e in chosen]
+
+
+def _resume_scope(db: Session, user_id: int, job: Job) -> set[int] | None:
+    """With RAG_RETRIEVAL_MODE=on, the evidence the job's own resume may use (app.services.evidence_tags); otherwise
+    None, and the selection is account-wide exactly as before."""
+    if get_settings().rag_mode != "on":
+        return None
+    from app.models import CandidateProfile
+    from app.services import rag_retrieval
+
+    profile = db.scalar(select(CandidateProfile).where(CandidateProfile.user_id == user_id))
+    return rag_retrieval.scope(db, profile, job)[1] if profile is not None else None
 
 
 # ───────────── structured output and qualification ─────────────

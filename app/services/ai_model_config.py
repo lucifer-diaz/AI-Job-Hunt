@@ -66,7 +66,7 @@ MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+\-]{0,199}$")
 PLUGIN_PATH = re.compile(r"^[A-Za-z_]\w*(\.[A-Za-z_]\w*)+$")
 LIMITS = {"temperature": (0.0, 2.0), "max_output_tokens": (1, 200_000), "context_window": (512, 2_000_000),
           "timeout_seconds": (1, 3600), "retry_count": (0, 10), "max_concurrency": (1, 100),
-          "rest_seconds": (10, 604_800)}
+          "rest_seconds": (10, 604_800), "embedding_dimensions": (1, 65_536)}
 MAX_MODEL_FALLBACKS = 4
 WORKER_FIELDS = ("model_mode", "primary_model", "tier_name", "fallback_model", "secondary_models", "temperature", "max_output_tokens",
                  "context_window", "reasoning_effort", "timeout_seconds", "retry_count", "max_concurrency",
@@ -74,7 +74,7 @@ WORKER_FIELDS = ("model_mode", "primary_model", "tier_name", "fallback_model", "
 ROUTING_FIELDS = ("auto_router_enabled", "auto_router_model_name", "manage_auto_router", "classifier",
                   "classifier_model", "classifier_plugin", "tier_models", "default_model", "send_metadata")
 CAPABILITIES = ("supports_structured_output", "supports_tools", "supports_reasoning", "supports_vision")
-OVERRIDABLE = (*CAPABILITIES, "context_window", "max_output_tokens")
+OVERRIDABLE = (*CAPABILITIES, "context_window", "max_output_tokens", "embedding_dimensions")
 FIELD_LABELS = {"mode": "mode", "primary_model": "model", "tier": "tier", "fallback_model": "fallback model", "secondary_models": "secondary models",
                 "fallback_models": "model fallbacks", "rest_seconds": "rest time",
                 "temperature": "temperature", "max_output_tokens": "max output tokens",
@@ -386,9 +386,9 @@ def ensure_seeded(db: Session, user_id: int) -> bool:
             else:
                 mode, primary = worker.default_mode, None
             db.add(WorkerModelConfig(user_id=user_id, worker_type=worker.worker_type, model_mode=mode,
-                                     primary_model=primary, tier_name=worker.default_tier,
-                                     use_structured_output=True, enabled=True, created_at=utcnow(),
-                                     updated_at=utcnow()))
+                                     primary_model=primary, tier_name=None if worker.optional else worker.default_tier,
+                                     use_structured_output=worker.capability == "CHAT",
+                                     enabled=not worker.optional, created_at=utcnow(), updated_at=utcnow()))
         known = set(db.scalars(select(AIModel.litellm_model_name).where(AIModel.user_id == user_id)).all())
         for name in sorted(referenced - known):
             db.add(AIModel(user_id=user_id, display_name=name, litellm_model_name=name, source="SEED",
@@ -602,6 +602,29 @@ def _router_fallback_edges(router_settings: dict[str, Any] | None) -> dict[str, 
     return edges
 
 
+def _validate_embedder(base: str, config: dict[str, Any], model: str | None, models: dict[str, Any], check_model,
+                       errors: list[dict[str, str]], warnings: list[dict[str, str]]) -> None:
+    """An embedding worker: one FIXED embedding model of known vector size. Nothing else applies to it (no tiers,
+    fallbacks or generation settings: a fallback of another size would make vectors that cannot be compared)."""
+    if config.get("mode") != "FIXED":
+        errors.append(_issue(f"{base}.mode", "An embedding worker uses one fixed model (FIXED mode)"))
+        return
+    if model is None:
+        errors.append(_issue(f"{base}.primary_model", "Choose an embedding model, or switch the worker off"))
+        return
+    for name in ("fallback_model", "secondary_models", "escalation"):
+        if config.get(name):
+            errors.append(_issue(f"{base}.{name}", "An embedding worker has no fallback or escalation models: "
+                                                   "vectors of another model cannot be compared"))
+    entry = check_model(f"{base}.primary_model", model) or models.get(model) or {}
+    if entry and entry.get("model_type") != "EMBEDDING":
+        errors.append(_issue(f"{base}.primary_model", f"{model} is not an embedding model (set its type to "
+                                                      "EMBEDDING if it is one)"))
+    elif not entry.get("embedding_dimensions"):
+        errors.append(_issue(f"{base}.primary_model", f"The vector size of {model} is unknown: run model "
+                             "discovery, test the model, or set its embedding dimensions"))
+
+
 def validate(snapshot: dict[str, Any], *, live: LiveState | None = None, gateway: bool = True,
              connection_ready: bool = True) -> dict[str, Any]:
     """Errors block an Apply; warnings are shown and allowed. Hard blocks only where correctness requires them."""
@@ -630,6 +653,12 @@ def validate(snapshot: dict[str, Any], *, live: LiveState | None = None, gateway
         if live.known and name not in live.names and name not in managed_names:
             errors.append(_issue(path, f"{what} {name} is not served by LiteLLM"))
         return entry
+
+    def not_for_chat(path: str, entry: dict[str, Any] | None, name: str, worker_type: str) -> None:
+        """A chat worker's fallback or secondary model must write text: failover sends it the same chat request."""
+        if (entry or {}).get("model_type") == "EMBEDDING":
+            errors.append(_issue(path, f"{name} is an embedding model; {label(worker_type)} needs a model that writes "
+                                       "text"))
 
     for name, tier in tiers.items():
         if not TIER_NAME.match(name):
@@ -677,7 +706,10 @@ def validate(snapshot: dict[str, Any], *, live: LiveState | None = None, gateway
             if target == name:
                 errors.append(_issue(path, "A model cannot fall back to itself"))
             else:
-                check_model(path, target, what="fallback model")
+                found = check_model(path, target, what="fallback model")
+                if entry.get("model_type") != "EMBEDDING" and (found or {}).get("model_type") == "EMBEDDING":
+                    errors.append(_issue(path, f"{target} is an embedding model; {name} writes text, so it cannot "
+                                               "fall back to it"))
         rest = entry.get("rest_seconds")
         if rest is not None and not _in_range(rest, "rest_seconds"):
             low, high = LIMITS["rest_seconds"]
@@ -708,18 +740,25 @@ def validate(snapshot: dict[str, Any], *, live: LiveState | None = None, gateway
                                                        f"{config['tier']} until it is on"))
         model, _configured, note = model_resolution.resolve_model(snapshot, worker_type)
         resolved[worker_type] = model
+        if worker is not None and worker.capability == "EMBEDDING":
+            _validate_embedder(base, config, model, models, check_model, errors, warnings)
+            continue
         if model is None:
             (errors if gateway else warnings).append(
                 _issue(f"{base}.mode", f"{label(worker_type)} has no usable model ({note or 'nothing assigned'})"))
             continue
         entry = check_model(f"{base}.primary_model" if mode == "FIXED" else f"{base}.tier", model)
         caps = entry or {}
+        if caps.get("model_type") == "EMBEDDING":
+            errors.append(_issue(f"{base}.primary_model" if mode == "FIXED" else f"{base}.tier",
+                                 f"{model} is an embedding model; {label(worker_type)} needs a model that writes text"))
         fallback = config.get("fallback_model")
         if fallback:
             if fallback == model:
                 errors.append(_issue(f"{base}.fallback_model", "The fallback model cannot be the primary model"))
             else:
-                check_model(f"{base}.fallback_model", fallback, what="fallback model")
+                not_for_chat(f"{base}.fallback_model", check_model(f"{base}.fallback_model", fallback,
+                                                                   what="fallback model"), fallback, worker_type)
                 cycle = _fallback_cycle(model, {**fallback_edges, model: {*fallback_edges.get(model, set()), fallback}})
                 if cycle:
                     errors.append(_issue(f"{base}.fallback_model", "Circular fallback: " + " → ".join(cycle)))
@@ -730,7 +769,7 @@ def validate(snapshot: dict[str, Any], *, live: LiveState | None = None, gateway
                 errors.append(_issue(path, "A model can appear only once in the primary, fallback and secondary models"))
                 continue
             seen.add(extra)
-            check_model(path, extra, what="secondary model")
+            not_for_chat(path, check_model(path, extra, what="secondary model"), extra, worker_type)
         for name in ("temperature", "max_output_tokens", "context_window", "timeout_seconds", "retry_count",
                      "max_concurrency"):
             value = config.get(name)
@@ -889,7 +928,9 @@ def update_worker(db: Session, user_id: int, worker_type: str, changes: dict[str
     if row is None:
         worker = WORKERS[worker_type]
         row = WorkerModelConfig(user_id=user_id, worker_type=worker_type, model_mode=worker.default_mode,
-                                tier_name=worker.default_tier, created_at=utcnow(), updated_at=utcnow())
+                                tier_name=None if worker.optional else worker.default_tier,
+                                use_structured_output=worker.capability == "CHAT",
+                                created_at=utcnow(), updated_at=utcnow())
         db.add(row)
     for name, value in changes.items():
         if name not in WORKER_FIELDS:
@@ -1086,8 +1127,7 @@ def update_model(db: Session, user_id: int, name: str, changes: dict[str, Any],
             for k, v in value.items():
                 if v in (None, ""):
                     continue
-                clean[k] = bool(v) if k in CAPABILITIES else _number(v, "context_window" if k == "context_window"
-                                                                        else "max_output_tokens", int)
+                clean[k] = bool(v) if k in CAPABILITIES else _number(v, k, int)
             row.overrides = clean or None
         elif key == "fallback_models":
             if value in (None, ""):
@@ -1601,6 +1641,7 @@ def overview(db: Session, user_id: int) -> dict[str, Any]:
         "workers": [{"worker_type": w.worker_type, "label": w.label, "description": w.description,
                      "structured_output_required": w.structured_output_required,
                      "min_context_tokens": w.min_context_tokens, "has_prompt": bool(w.prompts),
+                     "capability": w.capability, "optional": w.optional,
                      "config": draft["workers"].get(w.worker_type),
                      "resolved": dict(zip(("model", "assignment", "note"),
                                           model_resolution.resolve_model(draft, w.worker_type), strict=True))}

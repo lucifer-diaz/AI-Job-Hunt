@@ -2,7 +2,7 @@
 
 It implements only the LiteLLM 1.102 routes Job Hunt OS uses, with the same shapes the real proxy returns
 (checked against a running 1.102.1 proxy): /health/readiness/details, /v1/models, /model/info, /router/settings,
-/health/latest, /v1/chat/completions with x-litellm-* headers, /model/new|delete|{id}/update (refused unless
+/health/latest, /v1/chat/completions with x-litellm-* headers, /v1/embeddings, /model/new|delete|{id}/update (refused unless
 STORE_MODEL_IN_DB), /auto_router/validate_complexity_router_config and /spend/logs.
 """
 from __future__ import annotations
@@ -17,6 +17,11 @@ import httpx
 BASE = "http://litellm.test"
 OLLAMA = "http://ollama.test:11434"
 MASTER_KEY = "sk-test-master-key-123456"
+
+
+def embedding_deployment(name: str, model: str, size: int | None = 16) -> dict[str, Any]:
+    info = {"mode": "embedding", **({"output_vector_size": size} if size else {})}
+    return deployment(name, model, info=info)
 
 
 def deployment(name: str, model: str, *, model_id: str | None = None, info: dict[str, Any] | None = None,
@@ -51,6 +56,9 @@ class FakeLiteLLM:
         self.calls: list[tuple[str, str, Any]] = []
         self.chat_bodies: list[dict[str, Any]] = []
         self.hide_new_models = False  # accept /model/new but never show the result (verification failure)
+        self.embed_bodies: list[dict[str, Any]] = []
+        self.embed_cost: str | None = "0.00002"  # x-litellm-response-cost of an embedding call (None: not reported)
+        self.embed_size_override: int | None = None  # answer with vectors of this size (a misconfigured model)
 
     # ───────────── helpers ─────────────
 
@@ -96,6 +104,7 @@ class FakeLiteLLM:
                                                                     "fields": []}),
             ("GET", "/health/latest"): lambda _: self._error(404, "not found"),
             ("POST", "/v1/chat/completions"): self._chat,
+            ("POST", "/v1/embeddings"): self._embed,
             ("POST", "/model/new"): self._new,
             ("POST", "/model/delete"): self._delete,
             ("POST", "/auto_router/validate_complexity_router_config"): self._validate,
@@ -131,6 +140,28 @@ class FakeLiteLLM:
         if self.reject_router:
             return self._error(400, self.reject_router)
         return self._json(200, {"valid": True})
+
+    def _embed(self, body: dict[str, Any]) -> httpx.Response:
+        from app.services.embeddings import hashed_vector
+
+        self.embed_bodies.append(body)
+        name = body["model"]
+        by_name = {d["model_name"]: d for d in self.deployments}
+        if name in self.rate_limited:
+            return self._error(429, "Rate limit reached")
+        if name not in by_name or by_name[name]["model_info"].get("mode") != "embedding":
+            return self._error(400, f"Invalid model name passed in model={name}")
+        size = self.embed_size_override or by_name[name]["model_info"].get("output_vector_size") or 8
+        inputs = body["input"] if isinstance(body["input"], list) else [body["input"]]
+        headers = {"x-litellm-model-group": name, "x-litellm-model-name": by_name[name]["litellm_params"]["model"],
+                   "x-litellm-call-id": str(uuid.uuid4())}
+        if self.embed_cost is not None:
+            headers["x-litellm-response-cost"] = self.embed_cost
+        return self._json(200, {"object": "list", "model": name,
+                                "data": [{"object": "embedding", "index": i, "embedding": hashed_vector(t, size)}
+                                         for i, t in enumerate(inputs)],
+                                "usage": {"prompt_tokens": 7 * len(inputs), "total_tokens": 7 * len(inputs)}},
+                          headers=headers)
 
     def _chat(self, body: dict[str, Any]) -> httpx.Response:
         self.chat_bodies.append(body)

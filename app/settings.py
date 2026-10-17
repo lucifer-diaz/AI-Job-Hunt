@@ -345,6 +345,27 @@ class Settings(BaseSettings):
     agent_langsmith_endpoint: str = "https://api.smith.langchain.com"
     agent_langsmith_project: str = "job-hunt-os"
     agent_langsmith_timeout_ms: int = 3000
+    # Candidate knowledge retrieval (RAG, app.services.rag_retrieval). RAG_RETRIEVAL_MODE: off (default; the context
+    # builders select evidence exactly as before), shadow (they still do, and the retrieval result is computed beside
+    # it and compared in Monitoring → Logs, ids only), on (job contexts take their evidence from retrieval, scoped to
+    # the job's own resume). RAG_VECTOR_ENABLED adds embeddings (the configured EMBEDDER model, through LiteLLM) to
+    # the keyword search and runs the rag_index job; without it retrieval is full-text only.
+    rag_retrieval_mode: str = "off"
+    rag_vector_enabled: bool = False
+    rag_index_minutes: int = 10
+    rag_embed_batch_size: int = 32
+    rag_index_max_entries_per_run: int = 500
+    rag_index_max_attempts: int = 5
+    rag_index_retry_seconds: int = 30  # the first retry wait; doubles per attempt, at most an hour
+    rag_index_concurrency: int = 2  # embedding batches in flight at once, across accounts
+    rag_max_candidates: int = 50
+    rag_context_token_budget: int = 1200
+    rag_backfill_min_coverage: float = 1.0
+    rag_retired_retention_days: int = 7
+    rag_query_cache_size: int = 512
+    rag_embed_timeout_seconds: int = 60
+    # Vector size of the built-in test embedder used only when LLM_PROVIDER=mock (tests and offline development).
+    rag_mock_dimensions: int = 64
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
@@ -357,6 +378,16 @@ class Settings(BaseSettings):
     def agent_recovery_interval_minutes(self) -> int:
         """The scheduler interval of the agent graph recovery pass: 0 (off) unless AGENT_GRAPHS_ENABLED."""
         return max(0, self.agent_recovery_minutes) if self.agent_graphs_enabled else 0
+
+    @property
+    def rag_index_interval_minutes(self) -> int:
+        """The scheduler interval of the embedding index job: 0 (off) unless RAG_VECTOR_ENABLED."""
+        return max(0, self.rag_index_minutes) if self.rag_vector_enabled else 0
+
+    @property
+    def rag_mode(self) -> str:
+        mode = (self.rag_retrieval_mode or "off").strip().lower()
+        return mode if mode in ("off", "shadow", "on") else "off"
 
     @property
     def gmail_oauth_configured(self) -> bool:

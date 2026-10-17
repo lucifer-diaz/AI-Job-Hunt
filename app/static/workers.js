@@ -1,4 +1,5 @@
-/* Running workers: the account's background queues — JD parsing, JD recovery, ranking, tailoring and its review step — in one screen,
+/* Running workers: the account's background queues — JD parsing, JD recovery, ranking, tailoring and its review step, and
+   the retrieval indexer — in one screen,
    with the controls to unstick them. Loaded before app.js; uses the workspace helpers (api, esc, btn, pill, render, go)
    and reuses the views each queue already had: the JD parsing and recovery panels (monitoring.js), the ranking tracker
    and the tailoring task list (app.js).
@@ -9,9 +10,9 @@
    ranking cadence and any provider cooldown. Every number and row comes from /api/workers/* (app.services.workers). */
 'use strict';
 
-const WK_KINDS = [['parsing', 'JD parsing'], ['recovery', 'JD recovery'], ['ranking', 'Ranking'], ['insights', 'Job insights'], ['tailoring', 'Tailoring'], ['reviewing', 'Reviewing']];
+const WK_KINDS = [['parsing', 'JD parsing'], ['recovery', 'JD recovery'], ['ranking', 'Ranking'], ['insights', 'Job insights'], ['tailoring', 'Tailoring'], ['reviewing', 'Reviewing'], ['indexing', 'Indexing']];
 // Tabs drawn from the generic task list (/api/workers/{kind}); ranking and tailoring keep their own views.
-const WK_GENERIC = ['parsing', 'recovery', 'insights', 'reviewing'];
+const WK_GENERIC = ['parsing', 'recovery', 'insights', 'reviewing', 'indexing'];
 // Tabs whose Performance card comes from /api/workers/{kind}/performance (parsing and recovery bring their own metrics).
 const WK_PERF = ['ranking', 'insights', 'tailoring', 'reviewing'];
 // The worker tabs, then the account's worker settings (processing limits and rate-limit backoff).
@@ -221,6 +222,12 @@ function wkModelChange(r) {
 function wkModelCells(t) {
   return t?.model?.model || t?.model?.source === 'none' ? `<div class="wk-cells">${wkModel(t)}${wkModelChange(t)}</div>` : '';
 }
+// A task's name: its job (title · company #id), or, for a task without a job (the retrieval indexer), what the server
+// labels it — "Evidence #12 · index v3" — never the fact's text.
+function wkTaskName(r) {
+  if (r.job_id == null) return `${esc(r.title || `Task #${r.task_id}`)} <span class="muted" style="font-weight:400">· ${esc(r.company || '')}</span>${r.subject?.sensitive ? ' <span class="orch-chip muted" title="Only the question is embedded">question only</span>' : ''}`;
+  return `${esc(r.title || `Job #${r.job_id}`)} <span class="muted" style="font-weight:400">· ${esc(r.company || '')}</span> <span class="xs faint mono" style="font-weight:400">#${r.job_id}</span>`;
+}
 function wkTable(kind, data) {
   const rows = data?.rows || [], f = wkFilter(kind), filtered = f.q.trim() || f.status !== 'all';
   if (!rows.length) {
@@ -234,10 +241,10 @@ function wkTable(kind, data) {
       <div><div class="card-title" style="font-size:16px">Tasks${filtered ? ' matching your filters' : ''}</div><div class="card-sub">${active} waiting, running or retrying · ${rows.length - active} finished in the last day${shown}</div></div>${wkShownNudge(kind, rows)}</div>
     <div style="max-height:560px;overflow:auto" data-scroll-key="wk-${kind}"><div class="wk-head" aria-hidden="true"><div></div><div>Status</div><div>Task</div><div>Last run</div><div>Model &amp; route</div><div>Change</div><div></div></div>${rows.map(r => `<div class="wk-row ${r.status === 'RUNNING' ? 'running' : ''} ${wkSel(kind).has(r.task_id) ? 'picked' : ''}">
       <div>${['FAILED', 'BLOCKED', 'STOPPED'].includes(r.status) && !r.retried_by ? wkSelectBox(kind, r.task_id, r.title) : ''}</div><div>${wkChip(r.status)}</div>
-      <div style="min-width:0"><div class="small b ellipsis">${esc(r.title || `Job #${r.job_id}`)} <span class="muted" style="font-weight:400">· ${esc(r.company || '')}</span> <span class="xs faint mono" style="font-weight:400">#${r.job_id}</span></div>
+      <div style="min-width:0"><div class="small b ellipsis">${wkTaskName(r)}</div>
         <div class="wk-detail xs ${['FAILED', 'BLOCKED'].includes(r.status) ? 'orch-bad' : 'muted'}"><span class="ellipsis" title="${attr(wkDetail(r))}">${wkTries(r)}${esc(wkDetail(r))}</span>${wkRowWhy(r)}</div></div>
       ${wkLastRun(r)}${wkModel(r)}${wkModelChange(r)}
-      <div class="wk-row-actions">${r.retried_by ? `<span class="orch-chip muted" title="${attr(`A newer task (#${r.retried_by.task_id}) is handling this job`)}">↻ Run again</span>` : ''}${wkButtons(kind, r.task_id, { kill: r.can_kill, runNow: r.can_run_now })}${wkRowNudge(kind, r.job_id, r.status)}${btn('Job', 'open-job', { id: r.job_id }, 'sm')}</div></div>`).join('')}</div></section>`;
+      <div class="wk-row-actions">${r.retried_by ? `<span class="orch-chip muted" title="${attr(`A newer task (#${r.retried_by.task_id}) is handling this job`)}">↻ Run again</span>` : ''}${wkButtons(kind, r.task_id, { kill: r.can_kill, runNow: r.can_run_now })}${wkRowNudge(kind, r.job_id, r.status)}${r.job_id != null ? btn('Job', 'open-job', { id: r.job_id }, 'sm') : ''}</div></div>`).join('')}</div></section>`;
 }
 
 /* ───────────── overview: hero, queue and the last 24 hours ───────────── */
@@ -249,7 +256,7 @@ function wkLimits(tab) {
 }
 // Rank / run everything that is waiting, now, in bulk (not for tailoring, which has no wait).
 function wkRunQueuedButton(tab, spec) {
-  if (!['parsing', 'recovery', 'ranking', 'insights'].includes(tab)) return '';
+  if (!['parsing', 'recovery', 'ranking', 'insights', 'indexing'].includes(tab)) return '';
   const c = spec.counts || {}, n = (c.queued || 0) + (c.retrying || 0), key = 'wkRunQueued' + tab;
   const verb = tab === 'ranking' ? 'Rank' : 'Run';
   return `<span title="${attr(n ? `${verb} the ${n} queued or waiting task${n === 1 ? '' : 's'} now: no retry wait${tab === 'ranking' ? ', no cadence' : ''}. A provider cooldown still applies.` : 'Nothing is queued')}">${btn(label(key, `${verb} ${n || ''} queued now`.replace('  ', ' '), 'Starting…'), 'wk-run-queued', { kind: tab, n }, 'sm', !n || isBusy(key))}</span>`;
@@ -471,12 +478,13 @@ async function wkSaveExtra(changes) {
   if (Object.keys(server).length) D.wkSettings.server = (await api('/api/workers/server-settings', { method: 'PUT', body: { values: server } })).server;
 }
 const wkSecs = s => s < 60 ? `${s}s` : s < 3600 ? `${Math.round(s / 6) / 10}m`.replace('.0m', 'm') : `${Math.round(s / 360) / 10}h`.replace('.0h', 'h');
-const WK_SET_ICONS = { parsing: '▤', recovery: '⟲', ranking: '★', insights: '◈', tailoring: '✎', approvals: '✓', backoff: '⏱' };
+const WK_SET_ICONS = { parsing: '▤', recovery: '⟲', ranking: '★', insights: '◈', tailoring: '✎', indexing: '⌕', approvals: '✓', backoff: '⏱' };
 // The unit beside a number, and how its default reads, from the setting's name.
 function wkUnit(name) {
   if (/seconds/.test(name)) return ['sec', v => wkSecs(Number(v))];
   if (/minutes/.test(name)) return ['min', v => Number(v) ? `${v} min` : 'off'];
   if (/attempts/.test(name)) return ['tries', v => `${v}`];
+  if (/^rag_/.test(name) && /batch_size|entries/.test(name)) return ['entries', v => `${v}`];
   if (/batch_size/.test(name)) return ['tasks', v => `${v}`];
   if (/concurrency/.test(name)) return ['at once', v => `${v}`];
   if (/multiplier/.test(name)) return ['×', v => `×${v}`];
@@ -556,7 +564,7 @@ function wkSettings() {
       <div class="wk-scol server"><div class="wk-scol-head"><span class="wk-scol-icon" aria-hidden="true">↗</span><div><b>Waits after 429s in a row</b><small>Worked out from the values on the left.</small></div></div><div class="wk-pad">${ladder}<p class="settings-help mt12">A provider's own <code>Retry-After</code> wins when it asks for longer. Model calls and Apify calls back off separately; the first normal answer resets it. Kill all and Reset backoff clear a wait that is running now.</p></div></div></div>`
     : '<div class="wk-paused-note">Off: every queued task calls the provider again straight away, even while it is refusing them.</div>'}</section>`;
   const auto = id => !!fv('workers', wkAKey(id, 'auto'), D.wkSettings.account[id].values.auto);
-  const nav = [['parsing', 'JD parsing'], ['recovery', 'JD recovery'], ['ranking', 'Ranking'], ['insights', 'Job insights'], ['tailoring', 'Tailoring'], ['approvals', 'Approvals'], ['backoff', 'Rate limits']]
+  const nav = [['parsing', 'JD parsing'], ['recovery', 'JD recovery'], ['ranking', 'Ranking'], ['insights', 'Job insights'], ['tailoring', 'Tailoring'], ['indexing', 'Indexing'], ['approvals', 'Approvals'], ['backoff', 'Rate limits']]
     .filter(([id]) => id === 'backoff' || id === 'approvals' || D.wkSettings.account[id])
     .map(([id, t]) => `<a href="#wk-set-${id}" data-act="wk-set-jump" data-id="${id}"><span class="wk-set-icon sm" aria-hidden="true">${WK_SET_ICONS[id]}</span><span class="grow">${t}</span>${id === 'backoff' ? (backoffOn ? '<i class="wk-state on">On</i>' : '<i class="wk-state">Off</i>') : id === 'approvals' ? (fv(form, 'application_mode', b.application_mode) === 'automatic' ? '<i class="wk-state on">Auto</i>' : '<i class="wk-state">Manual</i>') : auto(id) ? '<i class="wk-state on">Auto</i>' : '<i class="wk-state paused">Paused</i>'}</a>`).join('');
   return `<form id="settings-editor" class="wk-settings" data-form="workers" novalidate><fieldset ${isBusy('settings-workers') ? 'disabled' : ''}>
@@ -564,7 +572,7 @@ function wkSettings() {
         <div class="wk-legend-box mt12"><div><span aria-hidden="true">👤</span> <b>Your account</b> only your tasks</div><div><span aria-hidden="true">${D.wkSettings.server_editable ? '⚙' : '🔒'}</span> <b>Server</b> ${D.wkSettings.server_editable ? 'every account (admin)' : 'set by your admin'}</div><div><span class="wk-dot" aria-hidden="true"></span> <b>Custom</b> differs from the default</div></div>
 </nav>
       <div class="stack" style="min-width:0"><div id="settings-error" class="settings-error" role="alert" ${SETTING_ERRORS.workers ? '' : 'hidden'}>${esc(SETTING_ERRORS.workers || '')}</div>
-        ${wkSettingsCard('parsing', 'JD parsing')}${wkSettingsCard('recovery', 'JD recovery')}${wkSettingsCard('ranking', 'Ranking', ranking)}${wkSettingsCard('insights', 'Job insights')}${wkSettingsCard('tailoring', 'Tailoring', tailoringExtra)}${wkApprovalsCard(b)}${backoff}
+        ${wkSettingsCard('parsing', 'JD parsing')}${wkSettingsCard('recovery', 'JD recovery')}${wkSettingsCard('ranking', 'Ranking', ranking)}${wkSettingsCard('insights', 'Job insights')}${wkSettingsCard('tailoring', 'Tailoring', tailoringExtra)}${wkSettingsCard('indexing', 'Indexing')}${wkApprovalsCard(b)}${backoff}
         <div class="wk-set-footer">${settingsFooter('workers')}</div></div></div></fieldset></form>`;
 }
 
@@ -636,7 +644,7 @@ function wkFilterBar(tab, counts) {
   const f = wkFilter(tab), ranking = tab === 'ranking';
   const search = ranking
     ? `<input class="input grow" style="min-width:200px;margin-top:0" id="rf-q" data-rf="q" value="${attr(S.rf.q)}" placeholder="Search title, company or location…" aria-label="Search ranking tasks">`
-    : `<input class="input grow" style="min-width:200px;margin-top:0" id="wk-q-${tab}" data-wk-search="${tab}" value="${attr(f.q)}" placeholder="Search job title, company or #job id…" aria-label="Search tasks">`;
+    : `<input class="input grow" style="min-width:200px;margin-top:0" id="wk-q-${tab}" data-wk-search="${tab}" value="${attr(f.q)}" placeholder="${tab === 'indexing' ? 'Search evidence, answer or #source id…' : 'Search job title, company or #job id…'}" aria-label="Search tasks">`;
   const status = `<select class="select" style="width:auto;margin-top:0" id="wk-status-${tab}" data-wk-status="${tab}" aria-label="Status">${WK_FILTERS.map(([id, text]) =>
     `<option value="${id}" ${f.status === id ? 'selected' : ''}>${esc(text)}${counts && counts[id] != null ? ` (${counts[id]})` : ''}</option>`).join('')}</select>`;
   const location = ranking && D.ranking ? `<select class="select" style="width:auto;margin-top:0" id="rf-location" data-rf="location" aria-label="Location">${locationOptions(D.ranking.locations).map(([v, t]) =>

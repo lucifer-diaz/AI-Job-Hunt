@@ -69,6 +69,10 @@ class User(Base):
     failover_events: Mapped[list[FailoverEvent]] = relationship(back_populates="user", passive_deletes=True)
     agent_threads: Mapped[list[AgentThread]] = relationship(back_populates="user", passive_deletes=True)
     agent_effects: Mapped[list[AgentEffect]] = relationship(back_populates="user", passive_deletes=True)
+    evidence_resume_links: Mapped[list[EvidenceResumeLink]] = relationship(back_populates="user",
+                                                                           passive_deletes=True)
+    rag_index_versions: Mapped[list[RagIndexVersion]] = relationship(back_populates="user", passive_deletes=True)
+    rag_index_entries: Mapped[list[RagIndexEntry]] = relationship(back_populates="user", passive_deletes=True)
     applications: Mapped[list[Application]] = relationship(back_populates="user", passive_deletes=True)
     resume_variants: Mapped[list[ResumeVariant]] = relationship(back_populates="user", passive_deletes=True)
     tailor_tasks: Mapped[list[TailorTask]] = relationship(back_populates="user", passive_deletes=True)
@@ -2074,6 +2078,9 @@ class AIModel(Base):
     context_window: Mapped[int | None] = mapped_column(Integer, nullable=True)
     max_context_window: Mapped[int | None] = mapped_column(Integer, nullable=True)
     max_output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # EMBEDDING models only: the length of the vectors it returns (LiteLLM model_info.output_vector_size, or measured
+    # by an explicit model test). NULL = unknown, and an embedding model of unknown size cannot be applied.
+    embedding_dimensions: Mapped[int | None] = mapped_column(Integer, nullable=True)
     overrides: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     # Failover for every worker that uses this model (app.services.failover): the models tried, in order, when it is
     # rate limited or failing, and how long it rests before it is tried again (NULL = the account's Reliability
@@ -2363,5 +2370,126 @@ class AgentEffect(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
 
-# Registers the per-user isolation hooks on every session; needs the models above.
+# ───────────── Candidate knowledge retrieval (RAG, app.services.rag_*) ─────────────
+# Evidence ↔ resume tags are a person's (and the verifier's) statement of which resume a fact belongs to; retrieval
+# for a job only ever considers the evidence of the job's own resume. The index tables are *derived*: they never
+# supersede the Evidence / KnowledgeAnswer rows they describe and can be dropped and rebuilt at any time. The vectors
+# themselves live in `rag_vectors`, created by app.services.vector_store.setup() (pgvector), not by Alembic.
+
+EVIDENCE_LINK_ORIGINS = ("AUTO", "USER")
+RAG_COLLECTIONS = ("CANDIDATE_EVIDENCE", "ATS_ANSWER")
+RAG_SOURCE_TYPES = ("evidence", "knowledge_answer")
+RAG_INDEX_STATUSES = ("BUILDING", "SERVING", "RETIRED")
+RAG_ENTRY_STATUSES = ("PENDING", "PROCESSING", "ACTIVE", "FAILED", "DEACTIVATED")
+
+
+class EvidenceResumeLink(Base):
+    """Which resume a piece of evidence belongs to. AUTO links come from verifying a resume's facts
+    (resume_verification.sync_evidence) or from extracting them from one; USER links are a person's own. A person's
+    removal of an AUTO link is kept (`excluded`) so automation never re-adds it. Evidence without any link that is not
+    excluded applies to every resume."""
+
+    __tablename__ = "evidence_resume_links"
+    __table_args__ = (
+        UniqueConstraint("evidence_id", "resume_id", name="uq_evidence_resume_links_pair"),
+        CheckConstraint(f"origin IN ({_values(EVIDENCE_LINK_ORIGINS)})", name="ck_evidence_resume_links_origin"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("evidence_resume_links")
+    user: Mapped[User] = relationship(back_populates="evidence_resume_links")
+    evidence_id: Mapped[int] = mapped_column(
+        ForeignKey("evidence.id", ondelete="CASCADE", name="fk_evidence_resume_links_evidence_id"), index=True)
+    resume_id: Mapped[int] = mapped_column(
+        ForeignKey("resumes.id", ondelete="CASCADE", name="fk_evidence_resume_links_resume_id"), index=True)
+    origin: Mapped[str] = mapped_column(String(10), default="AUTO", server_default="AUTO")
+    excluded: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+
+class RagIndexVersion(Base):
+    """One embedding index of an account: one embedding model at one vector size and one document format.
+
+    Changing any of them makes a new version that is built (BUILDING) beside the one in use, and replaces it
+    (SERVING) only once it covers every eligible source; vectors of different versions are never compared."""
+
+    __tablename__ = "rag_index_versions"
+    __table_args__ = (
+        UniqueConstraint("user_id", "identity_hash", name="uq_rag_index_versions_identity"),
+        CheckConstraint(f"status IN ({_values(RAG_INDEX_STATUSES)})", name="ck_rag_index_versions_status"),
+        CheckConstraint("dimensions > 0", name="ck_rag_index_versions_dimensions"),
+        Index("uq_rag_index_versions_serving", "user_id", unique=True,
+              postgresql_where=text("status = 'SERVING'"), sqlite_where=text("status = 'SERVING'")),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("rag_index_versions")
+    user: Mapped[User] = relationship(back_populates="rag_index_versions")
+    identity_hash: Mapped[str] = mapped_column(String(64))
+    provider: Mapped[str] = mapped_column(String(30))
+    model: Mapped[str] = mapped_column(String(200))
+    underlying_model: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    dimensions: Mapped[int] = mapped_column(Integer)
+    doc_format_version: Mapped[str] = mapped_column(String(20))
+    status: Mapped[str] = mapped_column(String(20), default="BUILDING", server_default="BUILDING")
+    eligible_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    embedded_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    failed_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+    serving_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class RagIndexEntry(Base):
+    """One source row (an Evidence or KnowledgeAnswer row) in one index version, and its embedding work.
+
+    `content_hash` is the hash of the text the stored vector was made from; retrieval uses a vector only while it still
+    equals the live row's hash, so an edit is never answered with the old text's vector. No text is stored here."""
+
+    __tablename__ = "rag_index_entries"
+    __table_args__ = (
+        UniqueConstraint("index_version_id", "source_type", "source_id", name="uq_rag_index_entries_source"),
+        CheckConstraint(f"status IN ({_values(RAG_ENTRY_STATUSES)})", name="ck_rag_index_entries_status"),
+        CheckConstraint(f"collection IN ({_values(RAG_COLLECTIONS)})", name="ck_rag_index_entries_collection"),
+        CheckConstraint(f"source_type IN ({_values(RAG_SOURCE_TYPES)})", name="ck_rag_index_entries_source_type"),
+        CheckConstraint("attempt_count >= 0", name="ck_rag_index_entries_attempt_count"),
+        Index("ix_rag_index_entries_claim", "status", "next_attempt_at"),
+        Index("ix_rag_index_entries_lookup", "user_id", "source_type", "source_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("rag_index_entries")
+    user: Mapped[User] = relationship(back_populates="rag_index_entries")
+    index_version_id: Mapped[int] = mapped_column(
+        ForeignKey("rag_index_versions.id", ondelete="CASCADE", name="fk_rag_index_entries_index_version_id"),
+        index=True)
+    collection: Mapped[str] = mapped_column(String(30))
+    source_type: Mapped[str] = mapped_column(String(30))
+    source_id: Mapped[int] = mapped_column(Integer)
+    verification_status: Mapped[str] = mapped_column(String(20), default="VERIFIED")
+    sensitive: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="PENDING", server_default="PENDING")
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    lock_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lock_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    embedded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    deactivated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Running workers (app.services.workers, kind "indexing"): when the latest attempt started and the entry last
+    # finished (ACTIVE, DEACTIVATED or FAILED), and a person's Run now (claimed first, past cooldowns, then cleared).
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    run_now_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+
+# Registers the per-user isolation hooks on every session, and keeps the derived retrieval index in step with evidence
+# and answers on every flush (app.services.rag_index); both need the models above.
 from app import tenancy  # noqa: E402,F401
+from app.services import rag_index  # noqa: F401

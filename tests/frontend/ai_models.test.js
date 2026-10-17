@@ -155,6 +155,28 @@ describe('AI Orchestration → Models & routing', () => {
     expect(document.getElementById('toast').textContent).toBe('Ranker saved · v5');
   });
 
+  it('gives the Embedder its own dialog: embedding models only, no tiers, backups or generation settings', async () => {
+    const embedder = worker('EMBEDDER', 'Embedder', { mode: 'FIXED', primary_model: null, tier: null, enabled: false }, null,
+      { capability: 'EMBEDDING', optional: true, structured_output_required: false, min_context_tokens: 0 });
+    routes['GET /api/settings/ai'] = () => ({ ...overview(), workers: [...overview().workers, embedder],
+      models: [...overview().models, model('nomic-embed-text', { model_type: 'EMBEDDING', embedding_dimensions: 768 }),
+        model('qwen3-embedding:0.6b', { model_type: 'EMBEDDING', embedding_dimensions: 1024 })] });
+    routes['PUT /api/settings/ai/workers/EMBEDDER'] = () => ({ worker: {}, draft_revision: 8 });
+    routes['POST /api/settings/ai/apply'] = () => ({ status: 'SYNCED', version: 5 });
+    await open('workers');
+    ui.A['aim-worker']({ dataset: { worker: 'EMBEDDER' } });
+    const options = [...document.querySelectorAll('#aiw-target option')].map(o => o.textContent);
+    expect(options).toEqual(['Off (full-text retrieval only)', 'nomic-embed-text · 768 dims', 'qwen3-embedding:0.6b · 1024 dims']);
+    for (const id of ['aiw-backup_0', 'aiw-temperature', 'aiw-esc_target', 'aiw-use_structured_output', 'aiw-enabled']) {
+      expect(document.getElementById(id)).toBeNull();
+    }
+    ui.setF('aiw', 'target', 'model:qwen3-embedding:0.6b'); ui.render();
+    expect(text()).toContain('Vector size: 1024 dimensions');
+    await ui.A['aim-worker-save']({ dataset: { worker: 'EMBEDDER' } });
+    expect(body('PUT', '/api/settings/ai/workers/EMBEDDER')).toEqual({ revision: 7, model_mode: 'FIXED', primary_model: 'qwen3-embedding:0.6b',
+      tier_name: null, fallback_model: null, secondary_models: [], escalation: null, enabled: true });
+  });
+
   it('changes a worker’s model from its row, mapping the choice to mode, model and tier', async () => {
     routes['PUT /api/settings/ai/workers/REVIEWER'] = () => ({});
     routes['PUT /api/settings/ai/workers/RANKER'] = () => ({});

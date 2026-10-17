@@ -16,7 +16,7 @@ The dashboard is a single-page workspace served from `app/static/app.js`; every 
 | Today | "Do this next" (approve → tailor → follow up), follow-ups due, weekly pace; run-sheet variant | `GET /api/workspace/today` |
 | Discovery · triage | One job at a time with fit reasons; keys `S` shortlist, `M` maybe, `X` skip, `⏎` shortlist & tailor | `GET /api/jobs/search?queue=true`, `POST /api/jobs/{id}/triage` |
 | Discovery · table | Filter, sort, paginate and bulk-shortlist the whole pipeline. The stage filter includes "Unranked" (`stage=unranked`: jobs without a fit score) | `GET /api/jobs/search`, `POST /api/jobs/bulk-triage` |
-| Running workers | Every background queue of your account in one place, a tab each: JD parsing, JD recovery, Ranking (the ranking tracker that used to be in Discovery: filtering, queue position and ETA, retry waits, finished rankings, Queue unranked jobs, Remove) and Tailoring (the background task list that used to be on the Tailor screen), each with a 24-hour activity chart; every task shows its model and route (the model in use, the one its next request goes to, or for a finished task the one its last request used, or "No model call") and, beside it, what moved it off its model (failover, a backup while its model rests, LiteLLM fallback, quality escalation, or a model changed since its last request); plus a Settings tab for processing limits and rate-limit backoff. Kill stops a task and requeues it fresh; Run now puts one first in line past its retry wait, the ranking cadence and any rate-limit backoff; the rate-limit backoff can be reset | `GET /api/workers`, `GET /api/workers/{kind}`, `GET /api/workers/{kind}/activity`, `POST /api/workers/{kind}/tasks/{id}/kill`, `POST /api/workers/{kind}/tasks/{id}/run-now`, `POST /api/workers/{kind}/kill-all`, `POST /api/workers/kill-all`, `POST /api/workers/cooldowns/reset` |
+| Running workers | Every background queue of your account in one place, a tab each: JD parsing, JD recovery, Ranking (the ranking tracker that used to be in Discovery: filtering, queue position and ETA, retry waits, finished rankings, Queue unranked jobs, Remove), Tailoring (the background task list that used to be on the Tailor screen) and Indexing (the retrieval indexer's embedding queue, one row per fact or saved answer), each with a 24-hour activity chart; every task shows its model and route (the model in use, the one its next request goes to, or for a finished task the one its last request used, or "No model call") and, beside it, what moved it off its model (failover, a backup while its model rests, LiteLLM fallback, quality escalation, or a model changed since its last request); plus a Settings tab for processing limits and rate-limit backoff. Kill stops a task and requeues it fresh; Run now puts one first in line past its retry wait, the ranking cadence and any rate-limit backoff; the rate-limit backoff can be reset | `GET /api/workers`, `GET /api/workers/{kind}`, `GET /api/workers/{kind}/activity`, `POST /api/workers/{kind}/tasks/{id}/kill`, `POST /api/workers/{kind}/tasks/{id}/run-now`, `POST /api/workers/{kind}/kill-all`, `POST /api/workers/kill-all`, `POST /api/workers/cooldowns/reset` |
 | Discovery · setup | Saved search setups (named roles × locations × boards, each with its own schedule), run history with what each run searched and pulled, add a job from a URL, an uploaded PDF/DOCX/TXT description or pasted text | `GET/POST /api/search/setups`, `PUT/DELETE /api/search/setups/{id}`, `POST /api/search/setups/{id}/run`, `POST /api/search/setups/{id}/duplicate`, `GET /api/search/apify/runs/{id}/detail`, `POST /api/jobs/from-url`, `POST /api/jobs/read-file`, `POST /api/jobs/from-text` |
 | Tailor | Before → after edits with the evidence each one cites; edit, accept or revert; cover letter; keyword coverage; PDF/DOCX/TXT exports. "Skip tailoring" sends the master resume unchanged (still reviewed) for postings that need no tailoring. The "Bulk tailor" view tailors or skips tailoring for many queued jobs one at a time, with progress and stop | `GET /api/tailor/{job_id}`, `PATCH /api/resumes/{id}/edits/{n}`, `POST /api/jobs/{id}/tailor`, `POST /api/jobs/{id}/skip-tailoring`, `POST /api/jobs/bulk-tailor` |
 | Approvals | Pre-submit checklist, resume preview, reusable answers, notes; approve opens the apply kit, send a packet back for another tailoring pass, or reject the job outright with an optional reason | `GET /api/approvals/{job_id}`, `POST /api/jobs/{id}/revision`, `POST /api/jobs/{id}/reject` |
@@ -922,7 +922,8 @@ FastAPI interactive docs are available at `/docs`.
 
 ## 5. Cheap production architecture
 
-For one user, do **not** start with Redis, Celery, Kafka, a vector database, or a dedicated browser worker.
+For one user, do **not** start with Redis, Celery, Kafka, a separate vector database, or a dedicated browser worker.
+(Candidate retrieval keeps its optional vectors inside PostgreSQL with pgvector; see section 9d.)
 
 - Web/API: one small Render or Railway service
 - DB: Neon Free or Railway Postgres
@@ -1722,6 +1723,12 @@ already showed elsewhere: the JD parsing and JD recovery metrics (formerly Monit
 here while work runs). Each task shows its status (running, queued, retrying, done, failed, blocked — a word and a
 symbol), attempt *n of max* (as dots), when it retries and its last error (redacted).
 
+The **Indexing** tab is the retrieval indexer's queue (§9d): one row per fact or saved answer in an index version, labelled
+like *Evidence #12 · index v3 (building)* — never the fact's text — with the embedding model of that version. Its entries
+belong to no job, so a row has no Job button and its search matches `#source id`, `evidence` or `answer`. Kill, Run now,
+Retry, Kill all, pause and the 24-hour chart work as on every other tab: a stopped entry stays out of the index (an edit to
+the fact does not revive it) until you retry it, and an entry of a retired index is not listed.
+
 Each worker tab opens with an overview: whether it is working, waiting or idle, its schedule and limits, four tiles
 (running, queued, retrying, finished in the last 24 hours), a bar of the queue right now, and a **Last 24 hours** chart —
 tasks finished done and failed each hour, with what was queued behind them — next to the success rate, throughput,
@@ -1736,9 +1743,10 @@ The **Settings** tab holds every worker setting, one card per worker, saved toge
 | --- | --- | --- |
 | Your account, every worker | **Run automatically** (off = the queue waits; Run now still runs one task), attempts per task, wait before a retry | `AppSetting.preferences["workers"]` (`app/services/worker_settings.py`), `GET/PUT /api/workers/settings` |
 | Your account, JD recovery | Use the browser when HTTP finds nothing; ask a model on ambiguous pages | same |
+| Your account, indexing | Attempts per entry and the first retry wait (it doubles, up to an hour) | same |
 | Your account, ranking and tailoring | Jobs ranked at once, *rank at most every N minutes*, packets tailored at once (Running workers → Settings); ranking's first and longest retry wait | `PATCH /api/settings` and the table above |
 | Your account, rate limits | Back off after a 429: first wait, multiplier, longest wait (Running workers → Settings) | `PATCH /api/settings` |
-| The server (admins edit; others see them read-only) | Per scheduler job: run every N minutes (0 = off), tasks per run, side by side; ranking's most-per-account ceiling | `server_settings` table (migration 0033, `app/services/server_settings.py`), `PUT /api/workers/server-settings` |
+| The server (admins edit; others see them read-only) | Per scheduler job: run every N minutes (0 = off), tasks per run, side by side; ranking's most-per-account ceiling; indexing's entries per batch and per account per run | `server_settings` table (migration 0033, `app/services/server_settings.py`), `PUT /api/workers/server-settings` |
 
 A value you never change follows the server, so an account that never opens the tab behaves as before; saving the server
 default again stores "follow the server". A server override applies without a restart, even to a run already in progress: each
@@ -1842,6 +1850,102 @@ External APIs (provider `LANGSMITH`) and changes nothing else. These are our own
 **Rollback.** Set `AGENT_GRAPHS_ENABLED=false` (and `AGENT_LANGSMITH_EXPORT_ENABLED=false`). Migration 0044 is
 additive and can be downgraded. LangGraph's checkpoint tables can be dropped by hand: `checkpoints`,
 `checkpoint_blobs`, `checkpoint_writes` and `checkpoint_migrations`.
+
+## 9d. Candidate knowledge retrieval (RAG, off by default)
+
+Phase 2 of the [agentic roadmap](docs/architecture/agentic-roadmap.md). It retrieves a job's evidence, which today's
+context builders select by keyword overlap across **every** verified fact of the account. Retrieval reads only the
+facts of the resume the job uses, ranks them, and hands the prompt a bounded pack cited by real Evidence ids. With it
+off (the default) nothing changes.
+
+**Which facts a job may use (decided before any scoring).** The job's resume comes from `resume_verification.for_job`:
+the job's own pin (USER, SETUP, AUTO), else the active resume. Then:
+
+| Evidence | Used for a job on resume R when |
+| --- | --- |
+| Tagged to R (Evidence bank → Resumes) | always, unless a person removed the tag |
+| Verified on a resume (`source = resume`) | R itself verifies the same fact; never because another resume did |
+| Tagged to other resumes only | never |
+| Manual or extracted, with no tag | always: untagged evidence applies to every resume |
+
+Verifying a resume's facts tags them to it (AUTO); extracting evidence tags it to the active resume. In the Evidence
+bank each fact shows its resumes, **Resumes** edits them, a selection can be tagged in bulk, the filter shows what one
+resume's jobs may use, and new evidence defaults to the active resume. A tag a person removes is never added back by
+automation. So a fact verified only on your backend resume can never reach a job pinned to your data resume, however
+similar it is.
+
+**Ranking.** Within that scope:
+- BM25 keyword scoring over the in-scope facts;
+- PostgreSQL full-text (`ts_rank_cd`);
+- the posting's required skills that a fact names exactly;
+- with vectors on, cosine similarity (pgvector) to the posting.
+
+The lists are fused by reciprocal rank and packed into `RAG_CONTEXT_TOKEN_BUDGET`. A vector is used only while its
+content hash equals the live fact's, so an edited fact is never answered with its old vector.
+
+**Saved answers.** With RAG on, `knowledge.search` (MCP `search_application_knowledge`) also lists saved answers to
+similar questions as `suggestions`, each `authoritative: false`. A suggestion never changes the status or the
+answer. For work authorization, visa or sponsorship questions no suggested answer text is shown at all.
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `RAG_RETRIEVAL_MODE` | `off` | `off`: the deterministic builder, unchanged. `shadow`: unchanged too, but retrieval runs beside it and the difference (ids only) goes to Monitoring → Logs (`rag_shadow`). `on`: job contexts take their evidence from retrieval, and fall back to the old builder if retrieval fails; a tailored resume or cover letter may then cite only evidence of the job's own resume. |
+| `RAG_VECTOR_ENABLED` | `false` | Adds embeddings: the `rag_index` job and vector similarity. Without it retrieval is keyword and full-text only. |
+| `RAG_CONTEXT_TOKEN_BUDGET` / `RAG_MAX_CANDIDATES` | `1200` / `50` | The pack's token budget, and how many candidates each signal contributes. |
+| `RAG_INDEX_MINUTES`, `RAG_EMBED_BATCH_SIZE`, `RAG_INDEX_MAX_ENTRIES_PER_RUN`, `RAG_INDEX_CONCURRENCY` | `10`, `32`, `500`, `2` | The index job's cadence, entries per embedding request, per-account cap per run, and requests in flight at once (across accounts). Defaults: an admin can override each in Running workers → Settings → Indexing. |
+| `RAG_INDEX_MAX_ATTEMPTS`, `RAG_INDEX_RETRY_SECONDS` | `5`, `30` | Attempts per entry and the first retry wait (doubling, at most an hour). Defaults: each account can set its own. |
+| `RAG_BACKFILL_MIN_COVERAGE` | `1.0` | Share of eligible facts a new index must cover before it replaces the old one. |
+| `RAG_RETIRED_RETENTION_DAYS` | `7` | Replaced indexes are deleted by `cleanup` after this. |
+
+**Embeddings.** The model is configuration: in AI Orchestration → Models & routing, give the **Embedder** worker an
+EMBEDDING model. It is seeded off.
+- **Vector size.** Discovery reads it from LiteLLM (`output_vector_size`); a model test measures it, or you can set it.
+  A model of unknown size, a chat model on the Embedder, or an embedding model on a chat worker is refused at Apply.
+- **Gateway only.** Requests go to LiteLLM's `/v1/embeddings` through the instrumented client. Every call is a row in
+  Monitoring → External APIs (`LITELLM / embedding`) with the model that answered and the cost LiteLLM reported;
+  when it reports none, the cost stays empty. Text and vectors are never logged, even with payload capture or
+  `EXTERNAL_API_DEBUG_PAYLOADS` on: only sizes, status and cost are recorded.
+- **Other providers.** Outside gateway mode there are no embeddings, and retrieval runs on full-text alone.
+- **Sensitive answers.** These are embedded by their question only.
+
+**The index** (`rag_index_versions`, `rag_index_entries`, migration 0045; vectors in `rag_vectors`):
+- **What it is.** It is derived, and it is rebuilt from the Evidence and KnowledgeAnswer rows.
+- **Keeping up with edits.** Editing, un-verifying or deleting a fact updates its entries in the same transaction:
+  it is re-embedded, deactivated or removed. An un-verified fact's vector is deleted at once, not kept until a
+  retention pass. The `rag_index` job embeds what is pending, and a sweep repairs anything missed.
+- **Running workers → Indexing** (migration 0046 adds `started_at`, `completed_at`, `run_now_at` to the entries). The
+  job sweeps every account first, then claims batches round-robin across accounts and embeds them side by side through
+  `scheduled_jobs.run_live`, renewing each batch's lease while it runs. A failed request backs off (the entry is
+  *retrying*) until the account's attempts run out (*failed*). Kill ends an entry *stopped* and takes its lease, so a
+  vector the model returns afterwards is never stored; Run now is claimed first, in a batch of its own, past the provider
+  cooldown; a paused account's entries are swept and kept, and only Run now embeds one.
+- **New model or size.** A new embedding model or vector size builds a new index version beside the serving one. It
+  replaces it only once complete, and queries are embedded with the serving version's own model, so vectors of
+  different models or sizes are never compared.
+- **Deleting an account** deletes all of it.
+- **Vector table.** `rag_vectors` is created at runtime when the PostgreSQL server has the pgvector extension (the
+  Compose file uses `pgvector/pgvector:pg17`; `brew install pgvector` locally). Without the extension the app starts
+  normally and retrieval stays full-text. On SQLite it is a JSON table, with similarity computed in Python.
+- **Existing Compose volumes.** The image used to be `postgres:17-alpine`. Both are PostgreSQL 17, so an existing data
+  volume starts, but Alpine (musl) and the Debian-based pgvector image (glibc) sort text differently. If PostgreSQL
+  warns about a collation version mismatch, run `REINDEX DATABASE jobhunt;` and then
+  `ALTER DATABASE jobhunt REFRESH COLLATION VERSION;` once.
+
+```text
+GET  /api/rag/status                 retrieval mode, embedding availability, index versions and coverage
+GET  /api/rag/preview?job_id=…       the evidence pack a job would get (keyword only; no model call)
+GET  /api/evidence/resumes           resumes to tag evidence with, and how many facts each one's jobs may use
+PUT  /api/evidence/{id}/resumes      {"resume_ids": [...]}  (empty: manual evidence applies to every resume)
+POST /api/evidence/bulk-resumes      {"evidence_ids": [...], "add": [...], "remove": [...]}
+```
+
+**Measuring it.** `python scripts/rag_eval.py` runs the labelled benchmark in `tests/fixtures/rag_eval/` in a
+throwaway database. It reports Recall@5/10, Precision@k, citation correctness, cross-resume leaks, latency and token
+reduction. Add `--litellm-url … --model … --dimensions …` (key in `LITELLM_API_KEY`) to measure a real embedding
+model.
+
+**Rollback.** Set `RAG_RETRIEVAL_MODE=off` and `RAG_VECTOR_ENABLED=false`; the builders are exactly as before. Migration
+0045 is additive and can be downgraded; its downgrade also drops `rag_vectors`. Evidence tags stay unless you downgrade.
 
 ## Application Inbox Agent
 
