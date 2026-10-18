@@ -34,6 +34,8 @@ from app.prompts.common import (
 )
 from app.prompts.contracts import TailoringResult, describe_fields
 
+# v9: the output contract fits a real resume: selected_evidence_ids is optional and derived from the cited units, a
+# summary may run to 1500 characters, and a role returned with no bullets is no update instead of an error.
 # v8: written against the posting: REQUIREMENT MAP (the Ranker's matched requirements and the ids that prove them)
 # decides which bullets lead; KEYWORD TARGETS (deterministic, ATS) says which of the posting's terms the facts
 # support, spelled as the posting spells them, and which stay gaps; a bullet shape; responsibilities in posting order.
@@ -43,7 +45,7 @@ from app.prompts.contracts import TailoringResult, describe_fields
 # without duplicate paragraphs or legal boilerplate.
 # v5: patch output with evidence ids per claim; completed FitAnalysis as read-only input (no score, no empty fields);
 # one canonical source resume instead of roles + resume text + policy; candidate context is name and headline only.
-TAILOR_PROMPT_VERSION = "v8"
+TAILOR_PROMPT_VERSION = "v9"
 TAILOR_MARKER = "TAILOR_RESUME"
 # The FitAnalysis fields the Tailor reads. Scores are deliberately absent: the Tailor does not work with them.
 FIT_ANALYSIS_FIELDS = ("strong_matches", "partial_matches", "resume_gaps", "recommended_resume_focus")

@@ -182,11 +182,24 @@ class RankingResult(Contract):
 
 # ───────────── Tailor ─────────────
 
+# A tailored resume cites a fact per bullet, so its id lists are longer than one assessment's: a summary drawing on
+# a whole career, or seven roles of bullets, cites more than 20 distinct facts. The limits are sanity bounds only.
+ClaimEvidenceIds = Annotated[list[int], BeforeValidator(_ids), Field(default_factory=list, max_length=40)]
+PatchEvidenceIds = Annotated[list[int], BeforeValidator(_ids), Field(default_factory=list, max_length=200)]
+
+
 class Claim(Contract):
     """One generated factual unit and the evidence that supports it."""
 
     text: str = Field(min_length=1, max_length=600)
-    evidence_ids: EvidenceIds = Field(description="ids of the source bullets or RELEVANT EVIDENCE it rests on")
+    evidence_ids: ClaimEvidenceIds = Field(description="ids of the source bullets or RELEVANT EVIDENCE it rests on")
+
+
+class SummaryClaim(Claim):
+    """The rewritten summary: a few sentences, so longer than a bullet (the stored summary allows 1500
+    characters, app.services.tailoring_results.TailoredResumeIn)."""
+
+    text: str = Field(min_length=1, max_length=1500, description="at most 1500 characters")
 
 
 class RoleUpdate(Contract):
@@ -200,13 +213,16 @@ class TailoringResult(Contract):
 
     worker: ClassVar[str] = "TAILOR"
 
-    summary: Claim | None = Field(default=None, description="null keeps the source summary")
+    summary: SummaryClaim | None = Field(default=None, description="null keeps the source summary")
     skills_order: Phrases = Field(description="skills copied from SOURCE RESUME, most relevant first")
     role_updates: list[RoleUpdate] = Field(default_factory=list, max_length=20,
                                            description="rewritten bullets for SOURCE RESUME roles")
     highlights: list[Claim] = Field(default_factory=list, max_length=30,
                                     description="only when SOURCE RESUME has no roles")
-    selected_evidence_ids: EvidenceIds = Field(description="every evidence id used anywhere above")
+    # Derived from the units above (app.services.tailoring_results stores the ids of the units it keeps); what a
+    # model lists here is added, never required, so a long resume is not rejected for citing many facts.
+    selected_evidence_ids: PatchEvidenceIds = Field(
+        description="optional; every evidence id used anywhere above, derived from them when omitted")
 
     @field_validator("role_updates", "highlights", mode="before")
     @classmethod
@@ -216,11 +232,26 @@ class TailoringResult(Contract):
         answer. The not-empty check below still rejects a result that changes nothing."""
         return [] if value is None else value
 
+    @field_validator("role_updates", mode="before")
+    @classmethod
+    def _no_bullets_is_no_update(cls, value: Any) -> Any:
+        """The prompt tells the model to return no bullets for a role with max_bullets 0, and models do so as
+        {"role_index": 3, "bullets": []}. A role without bullets is no update (the renderer skips it either way), so
+        it is left out rather than failing the whole answer."""
+        if not isinstance(value, list):
+            return value
+        return [u for u in value if not (isinstance(u, dict) and "bullets" in u and not u["bullets"])]
+
     @model_validator(mode="after")
     def _not_empty(self) -> TailoringResult:
         if self.summary is None and not self.skills_order and not self.role_updates and not self.highlights:
             raise ValueError("a tailoring result must change at least one of summary, skills_order, role_updates "
                              "or highlights")
+        return self
+
+    @model_validator(mode="after")
+    def _derive_selected(self) -> TailoringResult:
+        self.selected_evidence_ids = sorted(self.cited_ids())
         return self
 
     def cited_ids(self) -> set[int]:
