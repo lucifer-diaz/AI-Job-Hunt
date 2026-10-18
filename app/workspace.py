@@ -41,7 +41,16 @@ from app.models import (
 )
 from app.prompts import build_evidence_extraction_prompt
 from app.scheduler_hooks import run_soon
-from app.services import ats_keywords, evidence_tags, feedback_learning, ranker, resume_length, resume_verification
+from app.services import (
+    approval,
+    ats_keywords,
+    evidence_tags,
+    feedback_learning,
+    ranker,
+    resume_length,
+    resume_verification,
+)
+from app.services.approval import ApprovalRefused
 from app.services.actors import (
     ACTOR_GROUPS,
     BUILTIN,
@@ -1928,7 +1937,10 @@ def edit_resume(resume_id: int, index: int, payload: EditIn, db: Session = Depen
         raise HTTPException(422, "Status must be accepted, review or reverted")
     if index < 0 or index >= len(resume_edits(db, resume)):
         raise HTTPException(404, "Edit not found")
-    update_resume_edit(db, resume, index, payload.status, payload.text)
+    try:
+        update_resume_edit(db, resume, index, payload.status, payload.text)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
     return packet(db, resume.job)
 
 
@@ -1937,6 +1949,10 @@ def edit_cover_letter(resume_id: int, payload: EditIn, db: Session = Depends(get
     resume = db.get(ResumeVariant, resume_id)
     if not resume:
         raise HTTPException(404, "Resume not found")
+    try:
+        approval.guard_edit(db, resume, "The cover letter")  # an approved packet loses its approval with this edit
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
     resume.cover_letter = (payload.text or "").strip()
     db.commit()
     return {"ok": True}
@@ -2066,6 +2082,9 @@ def reject_one(db: Session, job: Job, reason: str, notes: str) -> None:
     application = job.application
     if application is not None and application.applied_at is None:
         application.status = "rejected"
+    from app.services import preparation
+
+    preparation.on_decision(db, job, "rejected")
 
 
 @router.post("/api/jobs/{job_id}/reject")
@@ -2099,6 +2118,9 @@ def send_back_one(db: Session, job: Job, notes: str | None) -> None:
     if notes is not None:
         app.notes = notes
     job.status = "pending_approval"
+    from app.services import preparation
+
+    preparation.on_decision(db, job, "revise")  # a waiting preparation graph run tailors again (bounded)
 
 
 @router.post("/api/jobs/{job_id}/revision")
@@ -2150,7 +2172,10 @@ def bulk_approval(payload: BulkApprovalIn, db: Session = Depends(get_user_db)):
                 if latest.reviewer_score < min_score:
                     raise HTTPException(400, f"Reviewer scored {latest.reviewer_score:.0f}, below your minimum of "
                                              f"{min_score}; approve it on its own to waive the minimum")
-                approve_job(db, job)
+                try:
+                    approve_job(db, job)
+                except ApprovalRefused as exc:
+                    raise HTTPException(409, str(exc)) from exc
                 feedback_learning.record(db, job, "APPROVED")
             db.commit()
             done.append(job_id)
@@ -2180,6 +2205,14 @@ def packet_names(db: Session, job: Job, resume: ResumeVariant | None) -> dict[st
     slug = packet_slug(get_profile(db).name, job.company)
     version = resume.version if resume else 1
     return {kind: packet_filename(slug, kind, version) for kind in ("pdf", "docx", "cover_letter")}
+
+
+def check_export(db: Session, job_id: int) -> None:
+    """An approved packet downloads only as it was approved (app.services.approval)."""
+    try:
+        approval.check_export(db, job_id)
+    except approval.PacketChanged as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 def download_headers(filename: str) -> dict[str, str]:
@@ -2231,6 +2264,7 @@ def resume_docx(job_id: int, db: Session = Depends(get_user_db)):
     resume = latest_resume(db, job_id)
     if not resume:
         raise HTTPException(404, "No tailored resume for this job")
+    check_export(db, job_id)
     return Response(markdown_to_docx(resume.markdown), media_type=DOCX_MEDIA_TYPE,
                     headers=download_headers(packet_download_name(db, job_id, "docx")))
 
@@ -2240,6 +2274,7 @@ def cover_letter_txt(job_id: int, db: Session = Depends(get_user_db)):
     resume = latest_resume(db, job_id)
     if not resume:
         raise HTTPException(404, "No tailored resume for this job")
+    check_export(db, job_id)
     # Letters saved before citations were stripped on write still download clean.
     return Response(strip_citations(resume.cover_letter), media_type="text/plain; charset=utf-8",
                     headers=download_headers(packet_download_name(db, job_id, "cover_letter")))

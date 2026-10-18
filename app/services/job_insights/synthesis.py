@@ -44,6 +44,29 @@ class Synthesis:
     evidence_labels: dict[int, str] = field(default_factory=dict)
 
 
+def to_stage(result: Synthesis) -> dict[str, Any]:
+    """A validated synthesis as JSON, to keep on the task row between two graph steps (never in a checkpoint)."""
+    return {"company": result.company.model_dump(mode="json") if result.company is not None else None,
+            "interview": result.interview.model_dump(mode="json") if result.interview is not None else None,
+            "model": result.model, "prompt_versions": dict(result.prompt_versions), "errors": list(result.errors),
+            "dropped": list(result.dropped), "requirement_labels": dict(result.requirement_labels),
+            "evidence_labels": {str(k): v for k, v in result.evidence_labels.items()}}
+
+
+def from_stage(data: dict[str, Any] | None) -> Synthesis:
+    """`to_stage` read back. The answers were validated before they were staged; they are parsed again here."""
+    from app.prompts.contracts import CompanyInsightSynthesis, InterviewPrepResult
+
+    data = data or {}
+    return Synthesis(
+        company=CompanyInsightSynthesis.model_validate(data["company"]) if data.get("company") else None,
+        interview=InterviewPrepResult.model_validate(data["interview"]) if data.get("interview") else None,
+        model=data.get("model"), prompt_versions=dict(data.get("prompt_versions") or {}),
+        errors=list(data.get("errors") or []), dropped=list(data.get("dropped") or []),
+        requirement_labels=dict(data.get("requirement_labels") or {}),
+        evidence_labels={int(k): v for k, v in (data.get("evidence_labels") or {}).items()})
+
+
 def research_view(observations: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """What the company worker reads: accepted, non-compensation observations with their ids. No salary ever."""
     out = []

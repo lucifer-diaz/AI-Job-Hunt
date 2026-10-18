@@ -34,6 +34,9 @@ from app.prompts.common import (
 )
 from app.prompts.contracts import TailoringResult, describe_fields
 
+# v9: an optional PREVIOUS REVIEW section on a revision pass (the resume preparation graph's bounded loop): what the
+# last review and the deterministic evidence checks found, to fix without inventing anything. Absent on a first pass,
+# where the prompt is byte-identical to v8.
 # v8: written against the posting: REQUIREMENT MAP (the Ranker's matched requirements and the ids that prove them)
 # decides which bullets lead; KEYWORD TARGETS (deterministic, ATS) says which of the posting's terms the facts
 # support, spelled as the posting spells them, and which stay gaps; a bullet shape; responsibilities in posting order.
@@ -43,7 +46,7 @@ from app.prompts.contracts import TailoringResult, describe_fields
 # without duplicate paragraphs or legal boilerplate.
 # v5: patch output with evidence ids per claim; completed FitAnalysis as read-only input (no score, no empty fields);
 # one canonical source resume instead of roles + resume text + policy; candidate context is name and headline only.
-TAILOR_PROMPT_VERSION = "v8"
+TAILOR_PROMPT_VERSION = "v9"
 TAILOR_MARKER = "TAILOR_RESUME"
 # The FitAnalysis fields the Tailor reads. Scores are deliberately absent: the Tailor does not work with them.
 FIT_ANALYSIS_FIELDS = ("strong_matches", "partial_matches", "resume_gaps", "recommended_resume_focus")
@@ -52,6 +55,9 @@ GAP_FIELDS = ("missing_requirements", "fatal_gaps")
 # Section labels in the order they appear; the tests hold the prompt to them.
 SECTIONS = ("CANDIDATE", "SOURCE RESUME", "RELEVANT EVIDENCE", "JOB", "JOB REQUIREMENTS", "REQUIREMENT MAP",
             "KEYWORD TARGETS", "LENGTH PLAN", "FIT ANALYSIS")
+# A revision pass only: the previous version's review. Its findings are corrections to make, never facts to add.
+REVISION_SECTION = ("PREVIOUS REVIEW (this is a revision: remove or correct what it found; never fix a finding by "
+                    "adding a fact SOURCE RESUME and RELEVANT EVIDENCE do not state)")
 JOB_FIELDS = ("identity", "role_summary", "required", "preferred", "responsibilities", "leadership_expectations",
               "technical_domains", "experience_requirements")
 
@@ -152,5 +158,7 @@ def build_tailoring_prompt(candidate_profile: Any, job: Any, context: Any) -> Pr
                 to_json(keywords)) if (keywords := context_value(context, "keyword_targets")) else "",
         section("LENGTH PLAN", to_json(length_plan_input(context_value(context, "length_plan")))),
         section("FIT ANALYSIS (completed by the Ranker; read-only)", to_json(fit_analysis_input(analysis))),
+        section(REVISION_SECTION, to_json(feedback, limit=8000))
+        if (feedback := context_value(context, "revision_feedback")) else "",
     )
     return Prompt("tailoring", TAILOR_PROMPT_VERSION, TAILOR_MARKER, TAILOR_SYSTEM, user, TailoringResult)

@@ -1808,7 +1808,8 @@ nudged at once when it is free. Every control acts on your own tasks only.
 `app/agents/` is the LangGraph foundation from the [agentic roadmap](docs/architecture/agentic-roadmap.md) (Phase 1).
 It runs a **pilot graph** with no production side effect. The pilot branches (auto or review), pauses for a person's
 decision, and continues after a worker crash from its last PostgreSQL checkpoint. Since Phase 3 it also runs the
-optional **qualification graph** (below, off by default). Tailoring and applications do not use graphs.
+optional **qualification graph**, and since Phase 4 the **resume preparation** and **Job Insights** graphs (below, all off by
+default). Applications do not use graphs.
 
 | Setting | Default | What it does |
 | --- | --- | --- |
@@ -1890,6 +1891,86 @@ current path (`ROUTED_TO_LEGACY`). The recovery, parse and ranking tasks the gra
 their workers finish them. Keep `AGENT_GRAPHS_ENABLED` on until that pass has run: with it off the pass does not run,
 and leftover runs stay listed as queued (inert: the current path still takes their jobs). Migration 0047 is additive
 and can be downgraded.
+
+### The resume preparation graph (Phase 4, off by default)
+
+`app/agents/preparation.py` takes a qualified job from its resume to your approval:
+
+```text
+SELECT_RESUME → LOAD_FIT_ANALYSIS → RETRIEVE_VERIFIED_EVIDENCE → BUILD_TAILOR_CONTEXT → TAILOR → VALIDATE_FACTS
+  → REVIEW → DECIDE_PASS_OR_REVISION ─┬→ AWAIT_APPROVAL (you decide)
+                                      └→ TAILOR again (at most MAX_REVISIONS more passes)
+```
+
+It is a conductor, like the qualification graph. The job's resume comes from `resume_verification.for_job` and the
+Ranker's completed analysis from `context_builder.completed_fit_analysis`. Without an analysis, or with one made from
+another resume, the run ends: **the graph never ranks**. The tailor worker does each tailoring pass and its review
+under its own task row: the model calls, dropping units the evidence does not support, saving a new version and the
+Reviewer. The graph then checks the saved version in code: its lineage (the selected resume, the loaded ranking) and
+every unit against the job's verified, in-scope evidence. `review_results` decides PASS, RETAILOR or NEEDS_HUMAN. An
+unsupported claim or a broken lineage is a revision **whatever the reviewer said**. A revision pass gets the previous
+review to fix (tailoring prompt v9, `PREVIOUS REVIEW`; never new facts). Past `MAX_REVISIONS` the packet waits for
+you, and it never passes by running out of tries. You approve, reject or send it back in the usual screens; the
+waiting run reads what you did. The source resume is only read; every pass is a new version.
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `PREPARATION_GRAPH_MODE` | `off` | `off`: automatic tailoring queues the tailor worker as before. `shadow`: it still does; each day a bounded number of reviewed packets per account are re-checked by the graph read-only (never a model call) and the decision compared. `on`: automatic tailoring hands qualified jobs to the graph. Needs `AGENT_GRAPHS_ENABLED` and PostgreSQL. |
+| `PREPARATION_MAX_REVISIONS` | `2` | Tailoring passes after the first, per run (also per account in Running workers → Preparation → Settings, 0-3). |
+| `PREPARATION_MINUTES` / `PREPARATION_SHADOW_DAILY_LIMIT` | `1` / `50` | The `preparation` scheduler job's interval (nudged when a tailoring pass ends), and shadow runs per account per day. |
+
+Runs are `job_preparation_tasks` rows (migration 0049), shown in Running workers → Preparation with Kill, Retry and
+Run now. Kill also stops the tailoring pass the run queued. Waiting for tailoring or for you uses no attempt. The AI
+Orchestration node `preparation` counts them.
+
+### The Job Insights graph (Phase 4, off by default)
+
+`app/agents/job_insights.py` runs one research task for an approved job:
+
+```text
+LOAD_JOB_CONTEXT → COLLECT_AVAILABLE_SOURCES → NORMALIZE_COMPENSATION → RETRIEVE_COMPANY_FACTS
+  → RETRIEVE_INTERVIEW_REPORTS → SYNTHESIZE_INSIGHTS → VALIDATE_PROVENANCE → PERSIST_INSIGHTS
+```
+
+It runs the same steps as the current research path (`job_insights.service`) on the same task row and claim, so the
+API, Running workers → Job insights, Kill and Run now are unchanged. Research still starts only from approval, and
+approval never waits for it. What it adds:
+- Each step is recorded once, so a replay never calls the sources or the model twice.
+- Its state between steps is counts only. The observations live in their table and the validated synthesis on the
+  task row, never in a checkpoint.
+- A provenance check runs in code before anything is saved: employer pay only from the posting, market figures only
+  from market sources, official values only from the company, culture only from employees, reported questions only
+  from reports, and generated questions never attributed. An item that breaks a rule is dropped, never relabelled.
+
+`JOB_INSIGHTS_GRAPH_MODE` (`off` by default) is `on` to run research as graph threads. `shadow` keeps the current path
+and re-checks each finished run with the graph's deterministic steps (compensation, provenance), read-only.
+
+### The approved packet (Phase 4, always on)
+
+Approving a packet (`workflow.approve_job`) now also:
+- **moves the job to READY_TO_APPLY**, through validated transitions backed by stored facts. A saved version stands
+  for TAILORING and TAILORED, its stored review for REVIEWED. They are recorded as `reconcile`, with the version and
+  when it was saved. A job whose state has no such path (being ranked again, archived, skipped, failed) **cannot be
+  approved**: the API answers 409 and nothing is written. Re-rank or restore it first.
+  `scripts/reconcile_approved_state.py` lists (and with `--apply` reconciles) approvals made before this change.
+- **keeps an immutable snapshot** of what was approved, and its digest (`approved_packets`, serializer v1: the resume
+  as rendered, the letter, and the attachment identity, as canonical JSON).
+
+Editing the resume or the letter of an approved packet revokes the approval in the same transaction: back to the
+approval queue (READY_TO_APPLY → REVIEWED), the snapshot kept as it was approved. A submitted packet cannot be edited.
+Downloads, the apply queue and MCP packet issuance check the packet against the approved digest. A packet changed any
+other way is refused until you approve it again; a new digest is never made for it. Approvals from before this change
+have no snapshot and keep working as before.
+
+`python scripts/preparation_parity.py --database-url <disposable PostgreSQL>` prints the old-vs-new table for
+tailoring and review decisions. `python scripts/preparation_eval.py` runs the evaluation cases
+(`tests/fixtures/preparation_eval/dataset.json`, LangSmith Example shape; `--jsonl` for a manual import).
+
+**Rollback.** Set `PREPARATION_GRAPH_MODE=off` and `JOB_INSIGHTS_GRAPH_MODE=off`. The next `preparation` pass hands
+waiting runs back (`ROUTED_TO_LEGACY`). A tailoring pass the graph queued is an ordinary task the tailor worker
+finishes, and the packet stays in the Tailor and Approve screens. Research falls back to `service.process` at once.
+The approval rules above are not behind a flag; reverting them is a code revert. Migration 0049 is additive and can be
+downgraded.
 
 ## 9d. Candidate knowledge retrieval (RAG, off by default)
 

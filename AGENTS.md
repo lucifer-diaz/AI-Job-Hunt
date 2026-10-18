@@ -463,6 +463,53 @@ hand-back) qualify a job when `QUALIFICATION_GRAPH_MODE=on` (README §9c). The r
 * Re-ranks (`resume_changed`, `_queue_stale`, `_recheck_salary`, `follow_setup`) stay on the existing services in
   Phase 3.
 
+## Preparation and insights graphs (Phase 4)
+
+`app/agents/preparation.py` / `app/services/preparation.py` (resume preparation, `PREPARATION_GRAPH_MODE`),
+`app/agents/job_insights.py` / `app/services/job_insights/graph.py` (research, `JOB_INSIGHTS_GRAPH_MODE`) and
+`app/services/approval.py` (the approved packet) (README §9c). The rules a change has to keep:
+
+* **The preparation graph conducts; it never tailors, reviews or ranks itself.** TAILOR queues `tailor_tasks.enqueue`
+  (option `conducted`, and `revise_from` on a revision) and waits; the tailor worker makes the model calls, drops
+  unsupported units and saves a new version. A graph node never calls a model, never queues a ranking (no analysis,
+  or one made from another resume, ends the run) and never writes `Resume`.
+* **An evidence problem always beats the reviewer.** VALIDATE_FACTS re-runs `tailoring_results.validate_tailored_resume`
+  on the saved version and checks its lineage (`lineage_matches`). Any unsupported unit or a broken lineage is
+  RETAILOR whatever the reviewer recommended (`overrule`, recorded as disagreement). The decision itself is
+  `review_results.decide_review` / `apply_review`, the same rules Claude Desktop's reviews go through.
+* **The revision loop is bounded and never passes by exhaustion** (`next_step`): RETAILOR goes back to TAILOR while
+  `revision < max_revisions` (per account, `worker_settings` `preparation`), then waits for a person as NEEDS_HUMAN. A
+  person's send-back counts toward the same bound. A revision pass gets the previous review
+  (`review_results.retailor_feedback`), never new facts.
+* **A person decides at AWAIT_APPROVAL, in the existing screens.** `approve_job`, `reject_one` and `send_back_one` call
+  `preparation.on_decision` (savepoint, never fails the person's action); the claim skips a run waiting for a person
+  until then. The graph is worker-owned (`api_resumable=False`). Auto-approval in automatic mode happens only on a
+  PASS, in DECIDE; a conducted tailor task never auto-approves.
+* **Approval moves the canonical state, or is refused.** `approval.reconcile_to_ready` walks only transitions a
+  stored fact backs (a saved version → TAILORING, TAILORED; its review → REVIEWED; then READY_TO_APPLY), recorded as
+  `reconcile` with the fact. No such path → `ApprovalRefused` (409) with nothing written. Never forge a stage without
+  its fact, and never set `Job.state` around `work_queue.transition`.
+* **The approved packet is immutable.** `approval.snapshot` stores the content and its digest (`canonical`,
+  `SERIALIZER_VERSION`; bump the version for any format change) inside `approve_job`. An edit of an approved packet
+  goes through `approval.guard_edit` in the same transaction (revoke: READY_TO_APPLY → REVIEWED, back to the approval
+  queue); a submitted packet cannot be edited. Export, the apply queue and MCP packet issuance use `approval.verify` /
+  `check_export`: a mismatch needs a new approval, never a new digest. A new in-place edit path must call
+  `guard_edit`.
+* **The insights graph runs the research service's own steps** (`service.load`, `collect`, `store`, `synthesis.run`,
+  `settle`) on the same task row and claim (`InsightClaim`); every write stays lease-guarded by the claim's token.
+  Research starts only from `tasks.on_approved`. Step records commit with the step's write (`store` / `settle`
+  `within=`), the validated synthesis waits on `job_insight_tasks.staged`, and nothing but counts enters the
+  checkpoint (the snapshot holds the Apify token).
+* **VALIDATE_PROVENANCE drops, never relabels** (`job_insights.provenance.enforce`). Its rules: employer pay only from
+  EMPLOYER / JOB_DESCRIPTION, market only from `MARKET_SOURCES`, official values only from OFFICIAL_COMPANY, culture
+  only from employees, REPORTED questions only cite INTERVIEW_QUESTION observations, GENERATED items carry no source.
+  Off mode is `service.process` exactly; `settle`'s new arguments default to the old behaviour.
+* **Shadow never writes and never pays.** Preparation shadow runs only the deterministic nodes in a session that
+  refuses to commit; insights shadow runs on an in-memory checkpoint after the current path finished.
+* **Evaluations are hand-labelled and run on mock providers** (`app/services/preparation_eval.py`,
+  `tests/fixtures/preparation_eval/dataset.json`). Targets call the graphs' own pure rules and the real checks, never a
+  stand-in. Nothing uploads to LangSmith; `--jsonl` is for a manual import.
+
 ## Candidate knowledge retrieval (RAG)
 
 `app/services/embeddings.py`, `evidence_tags.py`, `rag_index.py`, `rag_retrieval.py`, `vector_store.py` and

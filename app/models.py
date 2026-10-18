@@ -71,6 +71,8 @@ class User(Base):
     agent_effects: Mapped[list[AgentEffect]] = relationship(back_populates="user", passive_deletes=True)
     qualification_tasks: Mapped[list[JobQualificationTask]] = relationship(back_populates="user",
                                                                            passive_deletes=True)
+    preparation_tasks: Mapped[list[JobPreparationTask]] = relationship(back_populates="user", passive_deletes=True)
+    approved_packets: Mapped[list[ApprovedPacket]] = relationship(back_populates="user", passive_deletes=True)
     evidence_resume_links: Mapped[list[EvidenceResumeLink]] = relationship(back_populates="user",
                                                                            passive_deletes=True)
     rag_index_versions: Mapped[list[RagIndexVersion]] = relationship(back_populates="user", passive_deletes=True)
@@ -557,6 +559,8 @@ class Job(Base):
                                                                       passive_deletes=True)
     qualification_tasks: Mapped[list[JobQualificationTask]] = relationship(
         back_populates="job", cascade="all, delete-orphan", passive_deletes=True)
+    preparation_tasks: Mapped[list[JobPreparationTask]] = relationship(
+        back_populates="job", cascade="all, delete-orphan", passive_deletes=True)
     insight_tasks: Mapped[list[JobInsightTask]] = relationship(back_populates="job", cascade="all, delete-orphan",
                                                                passive_deletes=True)
     insight: Mapped[JobInsight | None] = relationship(back_populates="job", uselist=False, cascade="all, delete-orphan",
@@ -801,6 +805,12 @@ class JobInsightTask(Base):
     lock_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     # Asked to run now from Running workers (app.services.workers): claimed first, without waiting. Cleared on claim.
     run_now_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # JOB_INSIGHTS_GRAPH_MODE=on (app.agents.job_insights): the graph thread running this task, and the validated
+    # synthesis between SYNTHESIZE_INSIGHTS and PERSIST_INSIGHTS (kept out of the checkpoint; cleared on settle).
+    agent_thread_id: Mapped[int | None] = mapped_column(
+        ForeignKey("agent_threads.id", ondelete="SET NULL", name="fk_job_insight_tasks_agent_thread_id"),
+        nullable=True, index=True)
+    staged: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -2433,6 +2443,104 @@ class JobQualificationTask(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+PREPARATION_TASK_STATUSES = QUALIFICATION_TASK_STATUSES
+ACTIVE_PREPARATION_TASK_STATUSES = ACTIVE_QUALIFICATION_TASK_STATUSES
+PREPARATION_MODES = QUALIFICATION_MODES
+
+
+class JobPreparationTask(Base):
+    """One run of the resume preparation graph (app.agents.preparation) for one job, claimed like every queued worker.
+
+    The graph conducts the existing tailor worker (tailor_tasks), the deterministic evidence checks and the review
+    decision (review_results), then waits for a person's approval. `revision` counts tailoring passes after the
+    first (bounded by the account's `max_revisions`); `decision` is the last review decision; `person_decision` is
+    what a person chose while the run waited (approved, rejected, revise). ON runs drive the job; SHADOW runs only
+    compare. A job has at most one active task per mode (uq_job_preparation_tasks_active_job).
+    """
+
+    __tablename__ = "job_preparation_tasks"
+    __table_args__ = (
+        CheckConstraint(f"status IN ({_values(PREPARATION_TASK_STATUSES)})", name="ck_job_preparation_tasks_status"),
+        CheckConstraint(f"mode IN ({_values(PREPARATION_MODES)})", name="ck_job_preparation_tasks_mode"),
+        CheckConstraint("attempt_count >= 0", name="ck_job_preparation_tasks_attempt_count"),
+        CheckConstraint("revision >= 0", name="ck_job_preparation_tasks_revision"),
+        Index("uq_job_preparation_tasks_active_job", "job_id", "mode", unique=True,
+              postgresql_where=text(f"status IN ({_values(ACTIVE_PREPARATION_TASK_STATUSES)})"),
+              sqlite_where=text(f"status IN ({_values(ACTIVE_PREPARATION_TASK_STATUSES)})")),
+        Index("ix_job_preparation_tasks_claim", "status", "next_attempt_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("job_preparation_tasks")
+    user: Mapped[User] = relationship(back_populates="preparation_tasks")
+    job_id: Mapped[int] = mapped_column(
+        ForeignKey("jobs.id", ondelete="CASCADE", name="fk_job_preparation_tasks_job_id"), index=True)
+    job: Mapped[Job] = relationship(back_populates="preparation_tasks")
+    agent_thread_id: Mapped[int | None] = mapped_column(
+        ForeignKey("agent_threads.id", ondelete="SET NULL", name="fk_job_preparation_tasks_agent_thread_id"),
+        nullable=True, index=True)
+    mode: Mapped[str] = mapped_column(String(10), default="ON")
+    status: Mapped[str] = mapped_column(String(20), default="PENDING")
+    reason: Mapped[str] = mapped_column(String(40), default="new")
+    step: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    waiting_for: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    # APPROVED, REJECTED, AWAITING, NEEDS_HUMAN, REMOVED, TRIAGED, STOPPED, FAILED, SKIPPED, BLOCKED
+    outcome: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    result_code: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    revision: Mapped[int] = mapped_column(Integer, default=0)
+    decision: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    person_decision: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    variant_id: Mapped[int | None] = mapped_column(
+        ForeignKey("resume_variants.id", ondelete="SET NULL", name="fk_job_preparation_tasks_variant_id"),
+        nullable=True)
+    parity: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    locked_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    lock_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lock_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    run_now_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class ApprovedPacket(Base):
+    """The exact packet a person approved (app.services.approval): an immutable snapshot and its digest.
+
+    Written once inside workflow.approve_job and never updated, except to record that the approval was revoked
+    (`revoked_at`, `revoked_reason`) because the packet was edited afterwards or approved again. The live approval of
+    an application is its newest row with `revoked_at` NULL. Export, packet issuance and application compare the
+    packet they are about to use against `digest`; a mismatch needs a new approval, never a new digest.
+    """
+
+    __tablename__ = "approved_packets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("approved_packets")
+    user: Mapped[User] = relationship(back_populates="approved_packets")
+    application_id: Mapped[int] = mapped_column(
+        ForeignKey("applications.id", ondelete="CASCADE", name="fk_approved_packets_application_id"), index=True)
+    job_id: Mapped[int] = mapped_column(
+        ForeignKey("jobs.id", ondelete="CASCADE", name="fk_approved_packets_job_id"), index=True)
+    job: Mapped[Job] = relationship()
+    variant_id: Mapped[int | None] = mapped_column(
+        ForeignKey("resume_variants.id", ondelete="SET NULL", name="fk_approved_packets_variant_id"), nullable=True)
+    variant_version: Mapped[int] = mapped_column(Integer)
+    serializer_version: Mapped[int] = mapped_column(Integer)
+    digest: Mapped[str] = mapped_column(String(64))
+    # {resume_markdown, cover_letter, attachments}: what the recruiter receives, as approved.
+    content: Mapped[dict[str, Any]] = mapped_column(JSON)
+    reviewer_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    override: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    revoked_reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
 
 
 # ───────────── Candidate knowledge retrieval (RAG, app.services.rag_*) ─────────────

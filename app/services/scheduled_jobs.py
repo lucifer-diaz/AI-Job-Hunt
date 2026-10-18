@@ -435,6 +435,7 @@ async def job_insights(ctx: JobContext) -> dict[str, Any]:
 
     Each run reads the posting, the recruiter's notes, the company's site and the configured Apify actors side by
     side, then the model organises what was found. A source failing never fails the run or another job."""
+    from app.services.job_insights import graph as insight_graph
     from app.services.job_insights import service as insight_service
 
     if not get_settings().job_insights_enabled:
@@ -443,7 +444,8 @@ async def job_insights(ctx: JobContext) -> dict[str, Any]:
     claimed, outcomes = await run_live(
         concurrency="job_insights_max_concurrency", batch="job_insights_batch_size",
         claim=lambda n: _claim_job_insights(ctx, n),
-        process=lambda c: threads.run_work(insight_service.process, ctx.sessions, c),
+        # JOB_INSIGHTS_GRAPH_MODE picks the path (off: service.process exactly as before)
+        process=lambda c: threads.run_work(insight_graph.run, ctx.sessions, c),
         heartbeat=renew(ctx.sessions, JobInsightTask, get_settings().job_insights_lease_seconds))
     summary = {"claimed": claimed, **{name: outcomes.get(name, 0) for name in insight_service.OUTCOMES}, **details}
     if not claimed and not details["queue"]["queued"] and not details["expired_leases"]:
@@ -695,6 +697,57 @@ async def qualification_job(ctx: JobContext) -> dict[str, Any]:
     return summary
 
 
+def _prepare_preparation(ctx: JobContext, mode: str) -> dict[str, Any]:
+    """Take back leases of crashed runs, then: off or shadow → hand ON tasks back to the current path; shadow → queue
+    the day's shadow runs. Never calls a model."""
+    from app.services import preparation
+
+    with ctx.sessions() as db:
+        details: dict[str, Any] = {"mode": mode, "expired_leases": preparation.recover_expired(db, ctx.now)}
+        if mode != "on":
+            details["released"] = preparation.release(db, ctx.now)
+        if mode == "shadow":
+            details["shadow"] = preparation.shadow_sweep(db, ctx.now)
+    return details
+
+
+def _claim_preparation(ctx: JobContext, limit: int, task_mode: str) -> list[Any]:
+    from app.services import preparation
+
+    with ctx.sessions() as db:
+        return preparation.claim(db, worker_id=ctx.worker_id, limit=limit, task_mode=task_mode)
+
+
+async def preparation_job(ctx: JobContext) -> dict[str, Any]:
+    """Advance resume preparation graph runs (app.agents.preparation): each claimed task's thread runs until its packet
+    is decided or it waits for the tailor worker or for a person. Shadow runs only read.
+
+    Off unless AGENT_GRAPHS_ENABLED; in mode off it only hands tasks left from mode on back to the current path."""
+    if not get_settings().agent_graphs_enabled:
+        return skipped("Agent graphs are off (AGENT_GRAPHS_ENABLED)")
+    with ctx.sessions() as db:
+        if not _is_postgres(db):
+            return skipped("The preparation graph needs PostgreSQL")
+    from app.services import preparation
+
+    mode = preparation.mode()
+    details = await threads.run_io(_prepare_preparation, ctx, mode)
+    if mode == "off":
+        if not details.get("released") and not details.get("expired_leases"):
+            return skipped("The preparation graph is off (PREPARATION_GRAPH_MODE)", **details)
+        return details
+    task_mode = preparation.ON if mode == "on" else preparation.SHADOW
+    claimed, outcomes = await run_live(
+        concurrency="preparation_concurrency", batch="preparation_batch_size",
+        claim=lambda n: _claim_preparation(ctx, n, task_mode),
+        process=lambda c: threads.run_work(preparation.process, ctx.sessions, c),
+        heartbeat=preparation.renew(ctx.sessions))
+    summary = {"claimed": claimed, **{name: outcomes.get(name, 0) for name in preparation.OUTCOMES}, **details}
+    if not claimed and not (details.get("shadow") or {}).get("queued"):
+        return skipped("No preparation runs waiting", **summary)
+    return summary
+
+
 async def rag_index_job(ctx: JobContext) -> dict[str, Any]:
     """Embed each account's verified evidence and saved answers into its retrieval index (app.services.rag_index).
 
@@ -862,6 +915,11 @@ JOBS: list[JobSpec] = [
             "Runs the LangGraph qualification graph (admission, description, parse, hard filters, evidence, ranking) "
             "over the existing workers, or compares it read-only with the current path in shadow mode; off unless "
             "AGENT_GRAPHS_ENABLED and QUALIFICATION_GRAPH_MODE."),
+    JobSpec("preparation", "Preparation graph", "preparation_interval_minutes", preparation_job,
+            "Runs the LangGraph resume preparation graph (resume, analysis, evidence, tailoring, evidence checks, "
+            "review decision, bounded revisions, your approval) over the existing tailor worker, or compares it "
+            "read-only with the current path in shadow mode; off unless AGENT_GRAPHS_ENABLED and "
+            "PREPARATION_GRAPH_MODE."),
     JobSpec("rag_index", "Retrieval index", "rag_index_interval_minutes", rag_index_job,
             "Embeds verified evidence and saved answers for retrieval, builds a new index beside the old one when the "
             "embedding model changes, and retires the old one once it is complete; off unless RAG_VECTOR_ENABLED."),

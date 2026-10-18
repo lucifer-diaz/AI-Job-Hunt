@@ -69,13 +69,27 @@ def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value else None
 
 
-def packet_outcome(db: Session, job: Job, resume: ResumeVariant) -> dict[str, Any]:
+def _revision_feedback(db: Session, job: Job, variant_id: int | None) -> dict[str, Any] | None:
+    """The review a revision pass fixes: the named version of this job, else none."""
+    from app.services.review_results import retailor_feedback
+
+    variant = db.get(ResumeVariant, variant_id) if variant_id else None
+    return retailor_feedback(variant) or None if variant is not None and variant.job_id == job.id else None
+
+
+def packet_outcome(db: Session, job: Job, resume: ResumeVariant, *, auto_approve: bool = True) -> dict[str, Any]:
     """Auto-approve a finished packet when the account allows it, and summarise the packet."""
+    from app.services.approval import ApprovalRefused
+
     auto_approved = False
     app_setting = settings_for(db)
-    if app_setting.application_mode == "automatic" and (resume.reviewer_score or 0) >= app_setting.min_review_score:
-        approve_job(db, job)
-        auto_approved = True
+    if auto_approve and app_setting.application_mode == "automatic" \
+            and (resume.reviewer_score or 0) >= app_setting.min_review_score:
+        try:
+            approve_job(db, job)
+            auto_approved = True
+        except ApprovalRefused:  # the job's state cannot reach ready-to-apply: a person decides
+            db.rollback()
     return {"resume_id": resume.id, "version": resume.version, "reviewer_score": resume.reviewer_score,
             "markdown": resume.markdown, "cover_letter": resume.cover_letter,
             "reviewer_notes": resume.reviewer_notes, "auto_approved": auto_approved,
@@ -96,7 +110,7 @@ def task_dict(task: TailorTask) -> dict[str, Any]:
 # ───────────── per-user operations (the session belongs to the signed-in user) ─────────────
 
 def enqueue(db: Session, ids: list[int], mode: str = "tailor", regenerate: bool = False,
-            pages: int | None = None) -> dict[str, Any]:
+            pages: int | None = None, options: dict[str, Any] | None = None, commit: bool = True) -> dict[str, Any]:
     """Queue tailoring for jobs in the Tailor queue. Jobs already queued or running, or with a packet
     (unless `regenerate`), are skipped with a reason. `pages` is their page target (None = the default in Settings,
     read when the task runs)."""
@@ -122,8 +136,9 @@ def enqueue(db: Session, ids: list[int], mode: str = "tailor", regenerate: bool 
         if reason:
             skipped.append({"id": job_id, "reason": reason})
             continue
+        extra = {**({"pages": pages} if pages and mode == "tailor" else {}), **(options or {})}
         task = TailorTask(job_id=job.id, mode=mode, regenerate=regenerate, status="queued", stage="queued", attempts=0,
-                          options={"pages": pages} if pages and mode == "tailor" else None)
+                          options=extra or None)
         try:
             # uq_tailor_tasks_active_job: another request may have queued this job since the check above.
             with db.begin_nested():
@@ -133,12 +148,25 @@ def enqueue(db: Session, ids: list[int], mode: str = "tailor", regenerate: bool 
             skipped.append({"id": job_id, "reason": "already queued"})
             continue
         tasks.append(task)
+    if not commit:  # the caller commits it with its own write (the preparation graph's effect record)
+        if tasks:
+            _nudge_after_commit(db)
+        return {"queued": [task_dict(t) for t in tasks], "skipped": skipped}
     db.commit()
     if tasks:
         from app import scheduler_hooks
 
         scheduler_hooks.nudge("tailor")  # start now instead of at the next poll; the task table is the queue
     return {"queued": [task_dict(t) for t in tasks], "skipped": skipped}
+
+
+def _nudge_after_commit(db: Session) -> None:
+    def wake(_session: Session) -> None:
+        from app import scheduler_hooks
+
+        scheduler_hooks.nudge("tailor")
+
+    event.listen(db, "after_commit", wake, once=True)
 
 
 def list_tasks(db: Session, now: datetime | None = None) -> list[dict[str, Any]]:
@@ -263,6 +291,8 @@ def run_task(sessions: SessionFactory, task_id: int, worker_id: str, lease_secon
             return "missing"
         user_id, job_id, mode = task.user_id, task.job_id, task.mode
         pages = (task.options or {}).get("pages")
+        revise_from = (task.options or {}).get("revise_from")  # a revision pass: the version whose review to fix
+        conducted = bool((task.options or {}).get("conducted"))  # queued by the preparation graph
         holder, run_now = task.locked_by, task.run_now_at is not None
     worker_id = holder  # every write below is guarded by this claim's own name
     if run_now and not _write(sessions, task_id, worker_id, run_now_at=None):  # used once, by this run only
@@ -307,9 +337,12 @@ def run_task(sessions: SessionFactory, task_id: int, worker_id: str, lease_secon
             if job.status not in SKIP_TAILORING_STATUSES:
                 raise ValueError(f"This job is {job.status.replace('_', ' ')} and can no longer be tailored")
             with backoff.bypass(run_now):
+                feedback = _revision_feedback(db, job, revise_from) if mode == "tailor" else None
                 made = skip_tailoring(db, job, progress=progress) if mode == "skip" \
-                    else tailor_job(db, job, progress=progress, pages=pages)
-                out = packet_outcome(db, job, made)
+                    else tailor_job(db, job, progress=progress, pages=pages, **({"feedback": feedback} if feedback else {}))
+                # The preparation graph decides on a conducted run (review decision, then approval); it is never
+                # approved here.
+                out = packet_outcome(db, job, made, auto_approve=not conducted)
             result = {key: out[key] for key in ("resume_id", "version", "reviewer_score", "auto_approved", "untailored")}
             status, error = "succeeded", None
         except TaskAbandoned:
@@ -324,6 +357,10 @@ def run_task(sessions: SessionFactory, task_id: int, worker_id: str, lease_secon
     # that reached review). task_dict shows every finished task as "done".
     _write(sessions, task_id, worker_id, status=status, error=error, result=result,
            locked_by=None, lock_expires_at=None, finished_at=utcnow())
+    if conducted:  # the preparation graph run waiting for this pass may go on (a hint only)
+        from app import scheduler_hooks
+
+        scheduler_hooks.nudge("preparation")
     return status
 
 

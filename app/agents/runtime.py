@@ -62,7 +62,7 @@ class GraphSpec:
 
 
 def _graphs() -> dict[str, GraphSpec]:
-    from app.agents import qualification
+    from app.agents import job_insights, preparation, qualification
 
     return {
         pilot.GRAPH: GraphSpec(pilot.GRAPH, pilot.GRAPH_VERSION, pilot.build, pilot.PilotInput, pilot.PilotDecision,
@@ -71,6 +71,14 @@ def _graphs() -> dict[str, GraphSpec]:
                                        qualification.QualificationInput, qualification.QualificationResume,
                                        qualification.summary, qualification.EXPORT_FIELDS,
                                        context=qualification.QualificationContext, api_resumable=False),
+        preparation.GRAPH: GraphSpec(preparation.GRAPH, preparation.GRAPH_VERSION, preparation.build,
+                                     preparation.PreparationInput, preparation.PreparationResume,
+                                     preparation.summary, preparation.EXPORT_FIELDS,
+                                     context=preparation.PreparationContext, api_resumable=False),
+        job_insights.GRAPH: GraphSpec(job_insights.GRAPH, job_insights.GRAPH_VERSION, job_insights.build,
+                                      job_insights.InsightsInput, job_insights.InsightsResume,
+                                      job_insights.summary, job_insights.EXPORT_FIELDS,
+                                      context=job_insights.InsightsContext, api_resumable=False),
     }
 
 

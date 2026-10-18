@@ -28,7 +28,7 @@ from app.models import (AgentEffect, AgentThread, EvidenceResumeLink, RagIndexEn
                         ApplicationEvent, ApplicationInboxDigest, CandidateProfile, GmailConnection, LiteLLMConnection,
                         ModelTier, WorkerModelConfig, ModelRouteState, FailoverEvent,
                         ConversationAction, Evidence, FollowUp, InsightObservation, Job, JobDescriptionFetchTask,
-                        JobDescriptionParseTask, JobFeedbackEvent, JobInsight, JobInsightTask, JobQualificationTask, JobRanking,
+                        JobDescriptionParseTask, JobFeedbackEvent, JobInsight, JobInsightTask, JobQualificationTask, JobPreparationTask, ApprovedPacket, JobRanking,
                         JobRankingTask, RemovedPosting,
                         JobRequirementEvidence, JobStructuredDataChange, KnowledgeAnswer, McpToken, Resume,
                         ProviderCooldown, ResumeDataChange, ResumeDocument, ResumeVariant, ResumeVersion, SavedSearch,
@@ -43,7 +43,8 @@ OWNED_MODELS = (CandidateProfile, AppSetting, ResumeDocument, KnowledgeAnswer, E
                 LiteLLMConnection, AIModel, ModelTier, WorkerModelConfig, AIRoutingConfig, AIConfigVersion,
                 AIConfigAuditEntry, GmailConnection, ApplicationEmailMessage, ApplicationCommunicationEvent,
                 ApplicationInboxDigest, JobInsightTask, JobInsight, InsightObservation, ModelRouteState, FailoverEvent,
-                AgentThread, AgentEffect, EvidenceResumeLink, RagIndexVersion, RagIndexEntry, JobQualificationTask)
+                AgentThread, AgentEffect, EvidenceResumeLink, RagIndexVersion, RagIndexEntry, JobQualificationTask,
+                JobPreparationTask, ApprovedPacket)
 # Rows that inherit their owner from a parent row: model -> (relationship, foreign key, parent model).
 INHERITED_OWNER = {
     Application: ("job", "job_id", Job),
@@ -57,6 +58,8 @@ INHERITED_OWNER = {
     JobDescriptionFetchTask: ("job", "job_id", Job),
     JobInsightTask: ("job", "job_id", Job),
     JobQualificationTask: ("job", "job_id", Job),
+    JobPreparationTask: ("job", "job_id", Job),
+    ApprovedPacket: ("job", "job_id", Job),
     JobInsight: ("job", "job_id", Job),
     InsightObservation: ("insight", "job_insight_id", JobInsight),
     WorkflowTransition: ("job", "job_id", Job),

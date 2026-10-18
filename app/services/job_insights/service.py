@@ -262,7 +262,7 @@ def collect(snapshot: Snapshot, reused: dict[str, list[ObservationIn]]) -> list[
 # ───────────── 3. observations ─────────────
 
 def store(sessions: Callable[[], Session], claim_: InsightClaim, results: list[SourceResult],
-          now: datetime) -> list[dict[str, Any]] | None:
+          now: datetime, *, within: Callable[[Session], None] | None = None) -> list[dict[str, Any]] | None:
     """Replace the observations of every source that answered; keep those of sources that did not. Lease-guarded.
 
     Replaced rows are marked superseded, not deleted: a section this run may keep from an earlier one (when its model
@@ -295,11 +295,18 @@ def store(sessions: Callable[[], Session], claim_: InsightClaim, results: list[S
                     cache_key=o.cache_key, data=o.data, created_at=now))
         labels = {s.name: s.label for s in SOURCES}
         task.source_status = {r.name: {**r.summary(now), "label": labels.get(r.name, r.name)} for r in results}
+        if within is not None:  # the graph records this step in the same transaction (app.agents.effects)
+            within(db)
         db.commit()
-        rows = db.scalars(select(InsightObservation).where(InsightObservation.job_insight_id == insight.id,
-                                                           InsightObservation.superseded_at.is_(None))
-                          .order_by(InsightObservation.id)).all()
-        return [observation_dict(r) for r in rows]
+        return observations_of(db, insight.id)
+
+
+def observations_of(db: Session, insight_id: int) -> list[dict[str, Any]]:
+    """The insight's current (not superseded) observations, as sections and the model read them."""
+    rows = db.scalars(select(InsightObservation).where(InsightObservation.job_insight_id == insight_id,
+                                                       InsightObservation.superseded_at.is_(None))
+                      .order_by(InsightObservation.id)).all()
+    return [observation_dict(r) for r in rows]
 
 
 def safe_url(url: str | None) -> str | None:
@@ -535,12 +542,38 @@ def run_status(results: list[SourceResult], result: synthesis.Synthesis) -> str:
     return COMPLETED
 
 
+def results_from_status(source_status: dict[str, Any] | None) -> list[SourceResult]:
+    """The run's source results as `settle` reads them (name, status, detail), rebuilt from the task's stored
+    `source_status`, in SOURCES order. The graph uses it so no source result is ever kept in a checkpoint."""
+    stored = source_status or {}
+    order = [s.name for s in SOURCES if s.name in stored] + [n for n in stored if n not in {s.name for s in SOURCES}]
+    return [SourceResult(name, str((stored[name] or {}).get("status") or FAILED),
+                         detail=(stored[name] or {}).get("detail"), cached=bool((stored[name] or {}).get("cached")))
+            for name in order]
+
+
 # ───────────── 5. settle ─────────────
 
-def settle(sessions: Callable[[], Session], claim_: InsightClaim, results: list[SourceResult],
-           result: synthesis.Synthesis, observations: list[dict[str, Any]], now: datetime) -> str:
+def sections_for(db: Session, job: Job, insight: JobInsight, observations: list[dict[str, Any]],
+                 result: synthesis.Synthesis, results: list[SourceResult]) -> dict[str, Any]:
+    """build_sections with the job's own inputs (what `settle` saves). Reads only."""
     from app.services.workflow import get_profile
 
+    profile = get_profile(db)
+    return build_sections(
+        observations, result, job={"title": job.title or "", "company": job.company or "",
+                                   "location": job.location or "", "normalized": insight.normalized_title},
+        statuses={r.name: r.status for r in results}, website=insight.company_website,
+        profile_target=getattr(profile, "compensation_notes", None))
+
+
+def settle(sessions: Callable[[], Session], claim_: InsightClaim, results: list[SourceResult],
+           result: synthesis.Synthesis, observations: list[dict[str, Any]], now: datetime, *,
+           sections_filter: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+           within: Callable[[Session], None] | None = None) -> str:
+    """Save the run: its sections (the last good synthesis kept when the model did not run), status and task.
+    `sections_filter` lets the graph drop items whose provenance it refused (job_insights.provenance.enforce);
+    `within` records the graph's step in the same transaction. Both unset, this is the current path exactly."""
     status = run_status(results, result)
     with sessions() as db:
         task = held(db, claim_)
@@ -556,12 +589,12 @@ def settle(sessions: Callable[[], Session], claim_: InsightClaim, results: list[
         failures = [f"{r.name}: {r.detail or r.status}" for r in results if r.status in (FAILED, BLOCKED)]
         error = "; ".join(failures + result.errors)[:2000] or None
         insight.last_attempt_at = now
-        profile = get_profile(db)
-        sections = build_sections(
-            observations, result, job={"title": job.title or "", "company": job.company or "",
-                                       "location": job.location or "", "normalized": insight.normalized_title},
-            statuses={r.name: r.status for r in results}, website=insight.company_website,
-            profile_target=getattr(profile, "compensation_notes", None))
+        sections = sections_for(db, job, insight, observations, result, results)
+        if sections_filter is not None:
+            sections = sections_filter(sections)
+        if within is not None:
+            within(db)
+            task.staged = None  # the graph's staged synthesis is used up with this write
         for name, value in sections.items():
             if result.company is None and name in SYNTHESIZED and getattr(insight, name) is not None:
                 continue  # the model did not run this time: what the last good run wrote stands

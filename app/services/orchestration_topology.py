@@ -197,6 +197,15 @@ NODES: tuple[Node, ...] = (
          "workers; a job outside your domain stops at admission with nothing spent. Off unless "
          "QUALIFICATION_GRAPH_MODE is on (or shadow, which only compares).", "support", (2, -1),
          workers_tab="qualification", screen="discovery"),
+    # The resume preparation graph (app.agents.preparation, PREPARATION_GRAPH_MODE): a conductor over tailoring and
+    # review. It hands each pass to the tailor worker and waits, checks the saved version in code, lets review_results
+    # decide, loops a bounded number of times and waits for your approval; it never calls a model, so it is not an AI
+    # node. A job it waits on is shown at the worker doing the step.
+    Node("preparation", "Preparation graph", (ASYNC, DET), "Takes each qualified job through resume selection, the "
+         "Ranker's analysis, evidence, tailoring, evidence checks and the review decision (LangGraph), with a bounded "
+         "revision loop, then waits for your approval. A packet with an unsupported claim never passes. Off unless "
+         "PREPARATION_GRAPH_MODE is on (or shadow, which only compares).", "support", (3, -1),
+         workers_tab="preparation", screen="tailor"),
     Node("interview_insights", "Interview preparation", (AI,), "Writes interview preparation from the posting, the "
          "fit analysis and verified evidence, always labelled as generated (never as questions the company asks).",
          "support", (4, 2), workers=("INTERVIEW_INSIGHTS",), llm_stages=("INTERVIEW_INSIGHTS",),
@@ -238,6 +247,9 @@ EDGES: tuple[Edge, ...] = (
     Edge("compensation", "discovery", "salary enrichment", kind="support"),
     Edge("qualification", "domain_filter", "admits first", kind="support"),
     Edge("qualification", "ranker", "hands to ranking", kind="support"),
+    Edge("preparation", "tailor", "hands to tailoring", kind="support"),
+    Edge("preparation", "reviewer", "decides the review", kind="support"),
+    Edge("preparation", "approval", "waits for you", kind="support"),
     Edge("approval", "company_insights", "research", kind="support", measure="insight tasks created "
          "(job_insight_tasks.created_at)", timed=True),
     Edge("company_insights", "interview_insights", "researched", kind="support", measure="research runs that saved "

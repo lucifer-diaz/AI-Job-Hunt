@@ -115,6 +115,29 @@ def ranked_before_tailoring(request, monkeypatch):
     monkeypatch.setattr(context_builder, "stored_fit_analysis", stored)
 
 
+@pytest.fixture(autouse=True)
+def qualified_before_approval(request, monkeypatch):
+    """Approval moves the job's workflow state to READY_TO_APPLY and refuses a job whose state cannot get there
+    (app.services.approval). Tests written before that rule approve jobs added by hand that the ranker never saw, as
+    if it had qualified them: a job still before ranking (DISCOVERED, NORMALIZED, FILTERED) reads as QUALIFIED when it
+    is approved. Tests marked `strict_approval` get the production rule."""
+    if request.node.get_closest_marker("strict_approval"):
+        return
+    from app.services import approval
+    from app.services.lifecycle import WorkflowState as S
+    from app.services.lifecycle import parse_state
+
+    original = approval.path_to_ready
+
+    def path(db, job, variant):
+        if parse_state(job.state) in (S.DISCOVERED, S.NORMALIZED, S.FILTERED):
+            from sqlalchemy.orm.attributes import set_committed_value
+
+            set_committed_value(job, "state", S.QUALIFIED)  # as if ranked (the lifecycle guard is for real moves)
+        return original(db, job, variant)
+    monkeypatch.setattr(approval, "path_to_ready", path)
+
+
 @pytest.fixture
 def anonymous(monkeypatch):
     """Turn off the test account: requests are signed in only by a real session cookie."""

@@ -96,6 +96,8 @@ from app.services import (
     tracing,
 )
 from app.services.ai_config import PROVIDERS as AI_PROVIDERS
+from app.services import approval as approval_service
+from app.services.approval import ApprovalRefused
 from app.services.ai_config import STAGES as AI_STAGES
 from app.services.ai_config import env_defaults as ai_env_defaults
 from app.services.ai_config import resolve as resolve_ai_config
@@ -763,9 +765,18 @@ def resume_pdf(job_id: int, db: Session = Depends(get_user_db)):
     resume = db.scalar(select(ResumeVariant).where(ResumeVariant.job_id == job_id).order_by(desc(ResumeVariant.version)).limit(1))
     if not resume:
         raise HTTPException(404, "No tailored resume for this job")
+    _check_export(db, job_id)
     data = markdown_to_simple_pdf(resume.markdown)
     return Response(data, media_type="application/pdf",
                     headers=download_headers(packet_download_name(db, job_id, "pdf")))
+
+
+def _check_export(db: Session, job_id: int) -> None:
+    """An approved packet downloads only as it was approved (app.services.approval)."""
+    try:
+        approval_service.check_export(db, job_id)
+    except approval_service.PacketChanged as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @app.post("/api/jobs/{job_id}/approve")
@@ -793,6 +804,8 @@ def approve(job_id: int, payload: ApproveIn | None = None, db: Session = Depends
                                   "can_override": True})
     try:
         app_obj = approve_job(db, job, override=below, note=payload.note)
+    except ApprovalRefused as exc:
+        raise HTTPException(409, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     feedback_learning.record(db, job, "APPROVED")  # teaches the domain filter what a good job looks like

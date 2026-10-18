@@ -1,0 +1,1194 @@
+{
+ "description": "Phase 4 evaluation cases (LangSmith Example shape). Ground truth written by hand; mock providers only.",
+ "examples": [
+  {
+   "key": "grounded-bullets",
+   "inputs": {
+    "bullets": [
+     {
+      "role_index": null,
+      "text": "Led a team of eight engineers building Python and FastAPI platforms",
+      "evidence": "lead"
+     }
+    ]
+   },
+   "outputs": {
+    "grounding_codes": [
+     "UNKNOWN_EVIDENCE",
+     "UNCITED_CLAIM",
+     "INVENTED_METRIC",
+     "INVENTED_SKILL",
+     "UNSUPPORTED_TERM"
+    ]
+   },
+   "metadata": {
+    "evaluator": "evidence_grounding",
+    "note": "A bullet that restates its own verified fact passes every grounding check."
+   }
+  },
+  {
+   "key": "unknown-evidence-id",
+   "inputs": {
+    "bullets": [
+     {
+      "role_index": null,
+      "text": "Led a team of eight engineers building Python and FastAPI platforms",
+      "evidence": "missing"
+     }
+    ]
+   },
+   "outputs": {
+    "expected_codes": [
+     "UNKNOWN_EVIDENCE"
+    ]
+   },
+   "metadata": {
+    "evaluator": "unsupported_claims",
+    "note": "A bullet citing a fact that does not exist is caught."
+   }
+  },
+  {
+   "key": "invented-metric",
+   "inputs": {
+    "bullets": [
+     {
+      "role_index": null,
+      "text": "Led a team of eight engineers and cut cloud costs by 73%",
+      "evidence": "lead"
+     }
+    ]
+   },
+   "outputs": {
+    "expected_codes": [
+     "INVENTED_METRIC"
+    ]
+   },
+   "metadata": {
+    "evaluator": "unsupported_claims",
+    "note": "A number no cited fact states is caught."
+   }
+  },
+  {
+   "key": "invented-skill",
+   "inputs": {
+    "bullets": [],
+    "skills": [
+     "Python",
+     "Rust"
+    ]
+   },
+   "outputs": {
+    "expected_codes": [
+     "INVENTED_SKILL"
+    ]
+   },
+   "metadata": {
+    "evaluator": "unsupported_claims",
+    "note": "A skill the source resume and evidence never mention is caught."
+   }
+  },
+  {
+   "key": "uncited-claim",
+   "inputs": {
+    "bullets": [
+     {
+      "role_index": null,
+      "text": "Architected a global payments network for forty million users",
+      "evidence": null
+     }
+    ]
+   },
+   "outputs": {
+    "expected_codes": [
+     "UNCITED_CLAIM"
+    ]
+   },
+   "metadata": {
+    "evaluator": "unsupported_claims",
+    "note": "A new claim with no evidence id is caught."
+   }
+  },
+  {
+   "key": "lineage-matches",
+   "inputs": {
+    "content": {
+     "context": {
+      "id": 11,
+      "fit_analysis": {
+       "ranking_id": 7
+      }
+     }
+    },
+    "resume_id": 11,
+    "ranking_id": 7
+   },
+   "outputs": {
+    "lineage_ok": true
+   },
+   "metadata": {
+    "evaluator": "resume_version",
+    "note": "A version tailored from the selected resume and the loaded ranking."
+   }
+  },
+  {
+   "key": "lineage-other-resume",
+   "inputs": {
+    "content": {
+     "context": {
+      "id": 12,
+      "fit_analysis": {
+       "ranking_id": 7
+      }
+     }
+    },
+    "resume_id": 11,
+    "ranking_id": 7
+   },
+   "outputs": {
+    "lineage_ok": false
+   },
+   "metadata": {
+    "evaluator": "resume_version",
+    "note": "A version tailored from another resume is not this job's packet."
+   }
+  },
+  {
+   "key": "lineage-stale-ranking",
+   "inputs": {
+    "content": {
+     "context": {
+      "id": 11,
+      "fit_analysis": {
+       "ranking_id": 6
+      }
+     }
+    },
+    "resume_id": 11,
+    "ranking_id": 7
+   },
+   "outputs": {
+    "lineage_ok": false
+   },
+   "metadata": {
+    "evaluator": "resume_version",
+    "note": "A version tailored from an older ranking."
+   }
+  },
+  {
+   "key": "lineage-untailored",
+   "inputs": {
+    "content": {
+     "untailored": true
+    },
+    "resume_id": 11,
+    "ranking_id": 7
+   },
+   "outputs": {
+    "lineage_ok": true
+   },
+   "metadata": {
+    "evaluator": "resume_version",
+    "note": "Skipped tailoring: the packet is the source resume itself."
+   }
+  },
+  {
+   "key": "keywords-all-used",
+   "inputs": {
+    "targets": {
+     "use": [
+      {
+       "keyword": "Python"
+      },
+      {
+       "keyword": "Kubernetes"
+      }
+     ]
+    },
+    "markdown": "# A\n- Built Python services on Kubernetes"
+   },
+   "outputs": {
+    "missing_supported": [],
+    "score": 100
+   },
+   "metadata": {
+    "evaluator": "keyword_relevance",
+    "note": "Every supported posting term appears."
+   }
+  },
+  {
+   "key": "keywords-one-missing",
+   "inputs": {
+    "targets": {
+     "use": [
+      {
+       "keyword": "Python"
+      },
+      {
+       "keyword": "Kubernetes"
+      }
+     ]
+    },
+    "markdown": "# A\n- Built Python services"
+   },
+   "outputs": {
+    "missing_supported": [
+     "Kubernetes"
+    ],
+    "score": 50
+   },
+   "metadata": {
+    "evaluator": "keyword_relevance",
+    "note": "A supported term left out is named; nothing unsupported is suggested."
+   }
+  },
+  {
+   "key": "keywords-source-resume-ignored",
+   "inputs": {
+    "targets": {
+     "use": [
+      {
+       "keyword": "Kubernetes"
+      }
+     ]
+    },
+    "markdown": "# A\n- Built Python services\n## Source Resume\nKubernetes"
+   },
+   "outputs": {
+    "missing_supported": [
+     "Kubernetes"
+    ],
+    "score": 0
+   },
+   "metadata": {
+    "evaluator": "keyword_relevance",
+    "note": "The appended source resume does not count as coverage."
+   }
+  },
+  {
+   "key": "reviewer-pass-facts-fail",
+   "inputs": {
+    "review_decision": "PASS",
+    "recommendation": "PASS",
+    "fact_issues": 2,
+    "lineage_ok": true
+   },
+   "outputs": {
+    "decision": "RETAILOR",
+    "disagreement": true
+   },
+   "metadata": {
+    "evaluator": "reviewer_disagreement",
+    "note": "The evidence checks overrule a reviewer's PASS."
+   }
+  },
+  {
+   "key": "reviewer-pass-lineage-fail",
+   "inputs": {
+    "review_decision": "PASS",
+    "recommendation": "PASS",
+    "fact_issues": 0,
+    "lineage_ok": false
+   },
+   "outputs": {
+    "decision": "RETAILOR",
+    "disagreement": true
+   },
+   "metadata": {
+    "evaluator": "reviewer_disagreement",
+    "note": "A version of the wrong resume never passes."
+   }
+  },
+  {
+   "key": "reviewer-retailor-agrees",
+   "inputs": {
+    "review_decision": "RETAILOR",
+    "recommendation": "RETAILOR",
+    "fact_issues": 1,
+    "lineage_ok": true
+   },
+   "outputs": {
+    "decision": "RETAILOR",
+    "disagreement": false
+   },
+   "metadata": {
+    "evaluator": "reviewer_disagreement",
+    "note": "Both say revise: no disagreement."
+   }
+  },
+  {
+   "key": "reviewer-pass-clean",
+   "inputs": {
+    "review_decision": "PASS",
+    "recommendation": "PASS",
+    "fact_issues": 0,
+    "lineage_ok": true
+   },
+   "outputs": {
+    "decision": "PASS",
+    "disagreement": false
+   },
+   "metadata": {
+    "evaluator": "reviewer_disagreement",
+    "note": "A clean pass stays a pass."
+   }
+  },
+  {
+   "key": "reviewer-skip-human",
+   "inputs": {
+    "review_decision": "NEEDS_HUMAN",
+    "recommendation": "SKIP",
+    "fact_issues": 0,
+    "lineage_ok": true
+   },
+   "outputs": {
+    "decision": "NEEDS_HUMAN",
+    "disagreement": false
+   },
+   "metadata": {
+    "evaluator": "reviewer_disagreement",
+    "note": "A reviewer's SKIP goes to a person."
+   }
+  },
+  {
+   "key": "loop-pass-first",
+   "inputs": {
+    "decisions": [
+     "PASS"
+    ],
+    "max_revisions": 2
+   },
+   "outputs": {
+    "passes": 1,
+    "final": "PASS",
+    "max_revisions": 2
+   },
+   "metadata": {
+    "evaluator": "revision_termination",
+    "note": "No revision needed."
+   }
+  },
+  {
+   "key": "loop-pass-second",
+   "inputs": {
+    "decisions": [
+     "RETAILOR",
+     "PASS"
+    ],
+    "max_revisions": 2
+   },
+   "outputs": {
+    "passes": 2,
+    "final": "PASS",
+    "max_revisions": 2
+   },
+   "metadata": {
+    "evaluator": "revision_termination",
+    "note": "One revision fixes it."
+   }
+  },
+  {
+   "key": "loop-never-passes",
+   "inputs": {
+    "decisions": [
+     "RETAILOR"
+    ],
+    "max_revisions": 2
+   },
+   "outputs": {
+    "passes": 3,
+    "final": "NEEDS_HUMAN",
+    "max_revisions": 2
+   },
+   "metadata": {
+    "evaluator": "revision_termination",
+    "note": "Always sent back: three passes, then a person; never PASS."
+   }
+  },
+  {
+   "key": "loop-no-revisions",
+   "inputs": {
+    "decisions": [
+     "RETAILOR"
+    ],
+    "max_revisions": 0
+   },
+   "outputs": {
+    "passes": 1,
+    "final": "NEEDS_HUMAN",
+    "max_revisions": 0
+   },
+   "metadata": {
+    "evaluator": "revision_termination",
+    "note": "Revisions off: the first RETAILOR waits for a person."
+   }
+  },
+  {
+   "key": "loop-human-decides",
+   "inputs": {
+    "decisions": [
+     "NEEDS_HUMAN"
+    ],
+    "max_revisions": 2
+   },
+   "outputs": {
+    "passes": 1,
+    "final": "NEEDS_HUMAN",
+    "max_revisions": 2
+   },
+   "metadata": {
+    "evaluator": "revision_termination",
+    "note": "A low score goes to a person at once, without spending revisions."
+   }
+  },
+  {
+   "key": "provenance-clean",
+   "inputs": {
+    "sections": {
+     "company": {
+      "official_values": [
+       {
+        "value": "Ownership",
+        "kind": "FACT",
+        "source_ids": [
+         1
+        ]
+       }
+      ],
+      "culture_themes": [
+       {
+        "theme": "Fast paced",
+        "kind": "DERIVED",
+        "source_ids": [
+         2
+        ]
+       }
+      ],
+      "profile_facts": [
+       {
+        "field": "size",
+        "value": "200",
+        "kind": "FACT",
+        "source_ids": [
+         4
+        ]
+       }
+      ],
+      "mission": [],
+      "summary": null
+     }
+    },
+    "observations": [
+     {
+      "id": 1,
+      "category": "VALUES",
+      "source_type": "OFFICIAL_COMPANY",
+      "match_status": "ACCEPTED"
+     },
+     {
+      "id": 2,
+      "category": "CULTURE",
+      "source_type": "GLASSDOOR",
+      "match_status": "ACCEPTED"
+     },
+     {
+      "id": 3,
+      "category": "INTERVIEW_QUESTION",
+      "source_type": "GLASSDOOR",
+      "match_status": "ACCEPTED"
+     },
+     {
+      "id": 4,
+      "category": "COMPANY",
+      "source_type": "OFFICIAL_COMPANY",
+      "match_status": "ACCEPTED"
+     }
+    ]
+   },
+   "outputs": {
+    "rules": []
+   },
+   "metadata": {
+    "evaluator": "company_provenance",
+    "note": "Values from the company, culture from employees."
+   }
+  },
+  {
+   "key": "provenance-review-as-value",
+   "inputs": {
+    "sections": {
+     "company": {
+      "official_values": [
+       {
+        "value": "Ownership",
+        "kind": "FACT",
+        "source_ids": [
+         2
+        ]
+       }
+      ],
+      "culture_themes": [
+       {
+        "theme": "Fast paced",
+        "kind": "DERIVED",
+        "source_ids": [
+         2
+        ]
+       }
+      ],
+      "profile_facts": [
+       {
+        "field": "size",
+        "value": "200",
+        "kind": "FACT",
+        "source_ids": [
+         4
+        ]
+       }
+      ],
+      "mission": [],
+      "summary": null
+     }
+    },
+    "observations": [
+     {
+      "id": 1,
+      "category": "VALUES",
+      "source_type": "OFFICIAL_COMPANY",
+      "match_status": "ACCEPTED"
+     },
+     {
+      "id": 2,
+      "category": "CULTURE",
+      "source_type": "GLASSDOOR",
+      "match_status": "ACCEPTED"
+     },
+     {
+      "id": 3,
+      "category": "INTERVIEW_QUESTION",
+      "source_type": "GLASSDOOR",
+      "match_status": "ACCEPTED"
+     },
+     {
+      "id": 4,
+      "category": "COMPANY",
+      "source_type": "OFFICIAL_COMPANY",
+      "match_status": "ACCEPTED"
+     }
+    ]
+   },
+   "outputs": {
+    "rules": [
+     "WRONG_CATEGORY"
+    ]
+   },
+   "metadata": {
+    "evaluator": "company_provenance",
+    "note": "An employee review cited as an official value is refused."
+   }
+  },
+  {
+   "key": "provenance-company-page-as-culture",
+   "inputs": {
+    "sections": {
+     "company": {
+      "official_values": [
+       {
+        "value": "Ownership",
+        "kind": "FACT",
+        "source_ids": [
+         1
+        ]
+       }
+      ],
+      "culture_themes": [
+       {
+        "theme": "Fast paced",
+        "kind": "DERIVED",
+        "source_ids": [
+         4
+        ]
+       }
+      ],
+      "profile_facts": [
+       {
+        "field": "size",
+        "value": "200",
+        "kind": "FACT",
+        "source_ids": [
+         4
+        ]
+       }
+      ],
+      "mission": [],
+      "summary": null
+     }
+    },
+    "observations": [
+     {
+      "id": 1,
+      "category": "VALUES",
+      "source_type": "OFFICIAL_COMPANY",
+      "match_status": "ACCEPTED"
+     },
+     {
+      "id": 2,
+      "category": "CULTURE",
+      "source_type": "GLASSDOOR",
+      "match_status": "ACCEPTED"
+     },
+     {
+      "id": 3,
+      "category": "INTERVIEW_QUESTION",
+      "source_type": "GLASSDOOR",
+      "match_status": "ACCEPTED"
+     },
+     {
+      "id": 4,
+      "category": "COMPANY",
+      "source_type": "OFFICIAL_COMPANY",
+      "match_status": "ACCEPTED"
+     }
+    ]
+   },
+   "outputs": {
+    "rules": [
+     "WRONG_CATEGORY"
+    ]
+   },
+   "metadata": {
+    "evaluator": "company_provenance",
+    "note": "The company's own page is not employee-reported culture."
+   }
+  },
+  {
+   "key": "provenance-uncited-fact",
+   "inputs": {
+    "sections": {
+     "company": {
+      "official_values": [
+       {
+        "value": "Ownership",
+        "kind": "FACT",
+        "source_ids": [
+         1
+        ]
+       }
+      ],
+      "culture_themes": [
+       {
+        "theme": "Fast paced",
+        "kind": "DERIVED",
+        "source_ids": [
+         2
+        ]
+       }
+      ],
+      "profile_facts": [
+       {
+        "field": "size",
+        "value": "200",
+        "kind": "FACT",
+        "source_ids": []
+       }
+      ],
+      "mission": [],
+      "summary": null
+     }
+    },
+    "observations": [
+     {
+      "id": 1,
+      "category": "VALUES",
+      "source_type": "OFFICIAL_COMPANY",
+      "match_status": "ACCEPTED"
+     },
+     {
+      "id": 2,
+      "category": "CULTURE",
+      "source_type": "GLASSDOOR",
+      "match_status": "ACCEPTED"
+     },
+     {
+      "id": 3,
+      "category": "INTERVIEW_QUESTION",
+      "source_type": "GLASSDOOR",
+      "match_status": "ACCEPTED"
+     },
+     {
+      "id": 4,
+      "category": "COMPANY",
+      "source_type": "OFFICIAL_COMPANY",
+      "match_status": "ACCEPTED"
+     }
+    ]
+   },
+   "outputs": {
+    "rules": [
+     "MISSING_SOURCE"
+    ]
+   },
+   "metadata": {
+    "evaluator": "company_provenance",
+    "note": "A FACT without a source."
+   }
+  },
+  {
+   "key": "provenance-unknown-id",
+   "inputs": {
+    "sections": {
+     "company": {
+      "official_values": [
+       {
+        "value": "Ownership",
+        "kind": "FACT",
+        "source_ids": [
+         1
+        ]
+       }
+      ],
+      "culture_themes": [
+       {
+        "theme": "Fast paced",
+        "kind": "DERIVED",
+        "source_ids": [
+         2
+        ]
+       }
+      ],
+      "profile_facts": [
+       {
+        "field": "size",
+        "value": "200",
+        "kind": "FACT",
+        "source_ids": [
+         999
+        ]
+       }
+      ],
+      "mission": [],
+      "summary": null
+     }
+    },
+    "observations": [
+     {
+      "id": 1,
+      "category": "VALUES",
+      "source_type": "OFFICIAL_COMPANY",
+      "match_status": "ACCEPTED"
+     },
+     {
+      "id": 2,
+      "category": "CULTURE",
+      "source_type": "GLASSDOOR",
+      "match_status": "ACCEPTED"
+     },
+     {
+      "id": 3,
+      "category": "INTERVIEW_QUESTION",
+      "source_type": "GLASSDOOR",
+      "match_status": "ACCEPTED"
+     },
+     {
+      "id": 4,
+      "category": "COMPANY",
+      "source_type": "OFFICIAL_COMPANY",
+      "match_status": "ACCEPTED"
+     }
+    ]
+   },
+   "outputs": {
+    "rules": [
+     "UNKNOWN_SOURCE"
+    ]
+   },
+   "metadata": {
+    "evaluator": "company_provenance",
+    "note": "A cited id the run never stored."
+   }
+  },
+  {
+   "key": "salary-conflict-listed",
+   "inputs": {
+    "observations": [
+     {
+      "id": 1,
+      "category": "COMPENSATION",
+      "source_type": "EMPLOYER",
+      "source_name": "employer",
+      "match_scope": "POSTING",
+      "match_status": "ACCEPTED",
+      "recency": "HIGH",
+      "confidence": 0.98,
+      "observed_at": "2026-09-01",
+      "data": {
+       "low": 160000,
+       "high": 200000,
+       "currency": "SGD",
+       "period": "year",
+       "basis": "BASE",
+       "sample_size": null
+      }
+     },
+     {
+      "id": 2,
+      "category": "COMPENSATION",
+      "source_type": "GLASSDOOR",
+      "source_name": "glassdoor_compensation",
+      "match_scope": "COMPANY_ROLE_CITY",
+      "match_status": "ACCEPTED",
+      "recency": "HIGH",
+      "confidence": 0.8,
+      "observed_at": "2026-09-01",
+      "data": {
+       "low": 150000,
+       "high": 190000,
+       "currency": "SGD",
+       "period": "year",
+       "basis": "BASE",
+       "sample_size": 12
+      }
+     },
+     {
+      "id": 3,
+      "category": "COMPENSATION",
+      "source_type": "PAYSCALE",
+      "source_name": "payscale",
+      "match_scope": "COMPANY_ROLE_CITY",
+      "match_status": "ACCEPTED",
+      "recency": "HIGH",
+      "confidence": 0.8,
+      "observed_at": "2026-09-01",
+      "data": {
+       "low": 90000,
+       "high": 110000,
+       "currency": "SGD",
+       "period": "year",
+       "basis": "BASE",
+       "sample_size": 40
+      }
+     }
+    ],
+    "role": "Backend Engineer",
+    "company": "Northwind",
+    "location": "Singapore"
+   },
+   "outputs": {
+    "status": "CONFLICTING_ESTIMATES",
+    "employer_low": 160000,
+    "min_alternatives": 2
+   },
+   "metadata": {
+    "evaluator": "conflicting_salary",
+    "note": "Estimates that disagree with the posting are listed beside it; the employer's own range is kept, never replaced or averaged."
+   }
+  },
+  {
+   "key": "salary-estimates-disagree",
+   "inputs": {
+    "observations": [
+     {
+      "id": 2,
+      "category": "COMPENSATION",
+      "source_type": "GLASSDOOR",
+      "source_name": "glassdoor_compensation",
+      "match_scope": "COMPANY_ROLE_CITY",
+      "match_status": "ACCEPTED",
+      "recency": "HIGH",
+      "confidence": 0.8,
+      "observed_at": "2026-09-01",
+      "data": {
+       "low": 150000,
+       "high": 190000,
+       "currency": "SGD",
+       "period": "year",
+       "basis": "BASE",
+       "sample_size": 12
+      }
+     },
+     {
+      "id": 3,
+      "category": "COMPENSATION",
+      "source_type": "PAYSCALE",
+      "source_name": "payscale",
+      "match_scope": "COMPANY_ROLE_CITY",
+      "match_status": "ACCEPTED",
+      "recency": "HIGH",
+      "confidence": 0.8,
+      "observed_at": "2026-09-01",
+      "data": {
+       "low": 90000,
+       "high": 110000,
+       "currency": "SGD",
+       "period": "year",
+       "basis": "BASE",
+       "sample_size": 40
+      }
+     }
+    ],
+    "role": "Backend Engineer",
+    "company": "Northwind",
+    "location": "Singapore"
+   },
+   "outputs": {
+    "status": "CONFLICTING_ESTIMATES",
+    "employer_low": null,
+    "min_alternatives": 2
+   },
+   "metadata": {
+    "evaluator": "conflicting_salary",
+    "note": "Two estimates far apart: listed side by side, no midpoint made up."
+   }
+  },
+  {
+   "key": "questions-clean",
+   "inputs": {
+    "sections": {
+     "reported_questions": [
+      {
+       "question": "Design a rate limiter",
+       "origin": "REPORTED",
+       "kind": "FACT",
+       "source_ids": [
+        3
+       ]
+      }
+     ],
+     "generated_questions": [
+      {
+       "question": "How would you scale the ingestion service?",
+       "origin": "ROLE_DERIVED",
+       "kind": "GENERATED"
+      }
+     ]
+    },
+    "observations": [
+     {
+      "id": 1,
+      "category": "VALUES",
+      "source_type": "OFFICIAL_COMPANY",
+      "match_status": "ACCEPTED"
+     },
+     {
+      "id": 2,
+      "category": "CULTURE",
+      "source_type": "GLASSDOOR",
+      "match_status": "ACCEPTED"
+     },
+     {
+      "id": 3,
+      "category": "INTERVIEW_QUESTION",
+      "source_type": "GLASSDOOR",
+      "match_status": "ACCEPTED"
+     },
+     {
+      "id": 4,
+      "category": "COMPANY",
+      "source_type": "OFFICIAL_COMPANY",
+      "match_status": "ACCEPTED"
+     }
+    ]
+   },
+   "outputs": {
+    "rules": [],
+    "kept_reported": 1,
+    "kept_generated": 1
+   },
+   "metadata": {
+    "evaluator": "reported_vs_generated",
+    "note": "A reported question cites a report; a generated one carries no source."
+   }
+  },
+  {
+   "key": "questions-generated-attributed",
+   "inputs": {
+    "sections": {
+     "reported_questions": [
+      {
+       "question": "Design a rate limiter",
+       "origin": "REPORTED",
+       "kind": "FACT",
+       "source_ids": [
+        3
+       ]
+      }
+     ],
+     "generated_questions": [
+      {
+       "question": "How would you scale the ingestion service?",
+       "origin": "ROLE_DERIVED",
+       "kind": "GENERATED",
+       "source_ids": [
+        3
+       ]
+      }
+     ]
+    },
+    "observations": [
+     {
+      "id": 1,
+      "category": "VALUES",
+      "source_type": "OFFICIAL_COMPANY",
+      "match_status": "ACCEPTED"
+     },
+     {
+      "id": 2,
+      "category": "CULTURE",
+      "source_type": "GLASSDOOR",
+      "match_status": "ACCEPTED"
+     },
+     {
+      "id": 3,
+      "category": "INTERVIEW_QUESTION",
+      "source_type": "GLASSDOOR",
+      "match_status": "ACCEPTED"
+     },
+     {
+      "id": 4,
+      "category": "COMPANY",
+      "source_type": "OFFICIAL_COMPANY",
+      "match_status": "ACCEPTED"
+     }
+    ]
+   },
+   "outputs": {
+    "rules": [
+     "GENERATED_WITH_SOURCE"
+    ],
+    "kept_reported": 1,
+    "kept_generated": 0
+   },
+   "metadata": {
+    "evaluator": "reported_vs_generated",
+    "note": "A generated question presented with a source is dropped."
+   }
+  },
+  {
+   "key": "questions-reported-without-report",
+   "inputs": {
+    "sections": {
+     "reported_questions": [
+      {
+       "question": "Design a rate limiter",
+       "origin": "REPORTED",
+       "kind": "FACT",
+       "source_ids": [
+        3
+       ]
+      },
+      {
+       "question": "Invented",
+       "origin": "REPORTED",
+       "kind": "FACT",
+       "source_ids": []
+      }
+     ],
+     "generated_questions": [
+      {
+       "question": "How would you scale the ingestion service?",
+       "origin": "ROLE_DERIVED",
+       "kind": "GENERATED"
+      }
+     ]
+    },
+    "observations": [
+     {
+      "id": 1,
+      "category": "VALUES",
+      "source_type": "OFFICIAL_COMPANY",
+      "match_status": "ACCEPTED"
+     },
+     {
+      "id": 2,
+      "category": "CULTURE",
+      "source_type": "GLASSDOOR",
+      "match_status": "ACCEPTED"
+     },
+     {
+      "id": 3,
+      "category": "INTERVIEW_QUESTION",
+      "source_type": "GLASSDOOR",
+      "match_status": "ACCEPTED"
+     },
+     {
+      "id": 4,
+      "category": "COMPANY",
+      "source_type": "OFFICIAL_COMPANY",
+      "match_status": "ACCEPTED"
+     }
+    ]
+   },
+   "outputs": {
+    "rules": [
+     "MISSING_SOURCE"
+    ],
+    "kept_reported": 1,
+    "kept_generated": 1
+   },
+   "metadata": {
+    "evaluator": "reported_vs_generated",
+    "note": "A 'reported' question nobody reported is dropped."
+   }
+  },
+  {
+   "key": "questions-review-as-question",
+   "inputs": {
+    "sections": {
+     "reported_questions": [
+      {
+       "question": "Design a rate limiter",
+       "origin": "REPORTED",
+       "kind": "FACT",
+       "source_ids": [
+        2
+       ]
+      }
+     ],
+     "generated_questions": [
+      {
+       "question": "How would you scale the ingestion service?",
+       "origin": "ROLE_DERIVED",
+       "kind": "GENERATED"
+      }
+     ]
+    },
+    "observations": [
+     {
+      "id": 1,
+      "category": "VALUES",
+      "source_type": "OFFICIAL_COMPANY",
+      "match_status": "ACCEPTED"
+     },
+     {
+      "id": 2,
+      "category": "CULTURE",
+      "source_type": "GLASSDOOR",
+      "match_status": "ACCEPTED"
+     },
+     {
+      "id": 3,
+      "category": "INTERVIEW_QUESTION",
+      "source_type": "GLASSDOOR",
+      "match_status": "ACCEPTED"
+     },
+     {
+      "id": 4,
+      "category": "COMPANY",
+      "source_type": "OFFICIAL_COMPANY",
+      "match_status": "ACCEPTED"
+     }
+    ]
+   },
+   "outputs": {
+    "rules": [
+     "WRONG_CATEGORY"
+    ],
+    "kept_reported": 0,
+    "kept_generated": 1
+   },
+   "metadata": {
+    "evaluator": "reported_vs_generated",
+    "note": "A culture review is not an interview report."
+   }
+  }
+ ]
+}

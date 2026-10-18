@@ -59,7 +59,8 @@ def test_app_scheduler_has_every_job_configured_from_settings():
     assert list(scheduler.specs) == ["hunter", "apify_sync", "ranking", "jd_parsing", "jd_recovery", "listing_check",
                                      "compensation", "job_insights", "auto_tailor",
                                      "applications", "followups", "inbox", "analytics", "ai_optimization",
-                                     "litellm_telemetry", "model_health", "agent_graphs", "qualification", "rag_index",
+                                     "litellm_telemetry", "model_health", "agent_graphs", "qualification", "preparation",
+                                     "rag_index",
                                      "cleanup"]
     assert scheduler.interval("agent_graphs") == 0  # off unless AGENT_GRAPHS_ENABLED
     assert scheduler.interval("rag_index") == 0  # off unless RAG_VECTOR_ENABLED
