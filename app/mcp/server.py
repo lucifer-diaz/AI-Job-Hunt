@@ -5,7 +5,7 @@ import logging
 from collections.abc import Callable
 from typing import Annotated, Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from pydantic import Field
 from sqlalchemy.orm import Session
 
@@ -67,12 +67,12 @@ def run_tool(sessions: SessionFactory, user_id: int, name: str, handler: Callabl
     return result
 
 
-def build_server(user_id: int, sessions: SessionFactory | None = None) -> FastMCP:
+def build_server(user_id: int, sessions: SessionFactory | None = None) -> MCPServer:
     if sessions is None:
         from app.db import SessionLocal
 
         sessions = SessionLocal
-    server = FastMCP("job-hunt-os", instructions=MCP_SERVER_INSTRUCTIONS)
+    server = MCPServer("job-hunt-os", instructions=MCP_SERVER_INSTRUCTIONS)
 
     def call(name: str, **arguments: Any) -> dict[str, Any]:
         return run_tool(sessions, user_id, name, getattr(tools, name), arguments)
