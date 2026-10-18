@@ -144,7 +144,9 @@ def live(db: Session, application: Application | None) -> ApprovedPacket | None:
     """The application's current approval snapshot (newest, not revoked)."""
     if application is None or application.id is None:
         return None
+    # The job too: on SQLite a deleted application's id can come back, and its rows must never match.
     return db.scalar(select(ApprovedPacket).where(ApprovedPacket.application_id == application.id,
+                                                  ApprovedPacket.job_id == application.job_id,
                                                   ApprovedPacket.revoked_at.is_(None))
                      .order_by(desc(ApprovedPacket.id)).limit(1))
 

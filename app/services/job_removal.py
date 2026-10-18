@@ -96,7 +96,9 @@ def delete_job(db: Session, job: Job) -> None:
 
     qualification.on_job_deleted(db, job.id)  # its graph runs stop and lose their lease
     preparation.on_job_deleted(db, job.id)
-    for model in (JobDescriptionFetchTask, JobDescriptionParseTask, JobRankingTask, JobInsightTask):
+    from app.models import ApprovedPacket
+
+    for model in (JobDescriptionFetchTask, JobDescriptionParseTask, JobRankingTask, JobInsightTask, ApprovedPacket):
         for row in db.scalars(select(model).where(model.job_id == job.id)).all():
             db.delete(row)
     for insight in db.scalars(select(JobInsight).where(JobInsight.job_id == job.id)).all():
