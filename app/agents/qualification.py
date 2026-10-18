@@ -220,7 +220,6 @@ def validate_job(state: QualificationState, runtime: Runtime[QualificationContex
     ctx = _context(runtime)
     from app.services import ranker
     from app.services.lifecycle import WorkflowState as S
-    from app.services.work_queue import transition
 
     with _session(ctx, _shadow(state)) as db:
         job = _job(db, state)
@@ -235,9 +234,10 @@ def validate_job(state: QualificationState, runtime: Runtime[QualificationContex
         if job.state in (S.QUALIFIED, S.ARCHIVED, S.RANKED, S.TAILORING, S.TAILORED):
             return _end(VALIDATE_JOB, ALREADY_DECIDED, _state_name(job), decision=_state_name(job))
         if job.state is S.SKIPPED and state.get("reason") == "user_request" and ranker.removed_by_user(db, job):
-            # Taken out of the queue earlier and asked for again (Retry): it goes through the graph like a new job.
+            # Taken out of the queue earlier and asked for again (Retry): the ranker puts it back like a new job.
+            # Replay-safe: once it is NORMALIZED this branch no longer matches.
             effects.held(db, ctx.run)
-            transition(db, job, S.NORMALIZED, actor=ACTOR, reason="Qualification asked for again")
+            ranker.restore_removed(db, job, actor=ACTOR, reason="Qualification asked for again")
             db.commit()
         elif job.state is S.SKIPPED or job.state is S.FAILED or job.state not in (
                 *ranker.PRE_RANK_STATES, S.RANK_PENDING, S.RANKING):

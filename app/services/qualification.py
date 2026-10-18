@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import and_, exists, func, or_, select, text, update
+from sqlalchemy import and_, event, exists, func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased
 
@@ -146,14 +146,24 @@ def dispatch(db: Session, job: Job, *, reason: str = "new", force: bool = False,
             db.flush()
     except IntegrityError:  # another writer queued it at the same moment: one task
         return active_task(db, job.id)
-    _nudge()
+    _nudge_after_commit(db)
     return task
 
 
-def _nudge() -> None:
-    from app import scheduler_hooks
+def _nudge_after_commit(db: Session) -> None:
+    """Wake the qualification job once the task it should claim is committed (a nudge before then could find nothing
+    and use up the wake). Only a hint: a rolled-back transaction leaves at most one spare nudge on the next commit."""
+    if db.info.get("qualification_nudge"):
+        return
+    db.info["qualification_nudge"] = True
 
-    scheduler_hooks.nudge(KIND)
+    def wake(session: Session) -> None:
+        session.info.pop("qualification_nudge", None)
+        from app import scheduler_hooks
+
+        scheduler_hooks.nudge(KIND)
+
+    event.listen(db, "after_commit", wake, once=True)
 
 
 # ───────────── claiming ─────────────
@@ -448,10 +458,24 @@ def stop_threads(db: Session, thread_ids: list[int], now: datetime | None = None
 
 
 def on_stopped(db: Session, task: JobQualificationTask, now: datetime) -> None:
-    """Kill from Running workers: the task is already SKIPPED with STOPPED_BY_USER; stop its thread too."""
+    """Kill from Running workers: the task is already SKIPPED with STOPPED_BY_USER; stop its thread too, and the
+    ranking it handed the job to, so no model is asked and nothing decides the job after the person stopped it.
+
+    The ranking is stopped exactly as Kill on Ranking stops it (the job goes SKIPPED with STOPPED_BY_USER until a
+    person asks again; Retry here puts it back). Recovery and parsing tasks are left to finish: they only read the
+    posting and never move the job."""
+    from app.services import workers
+
     task.outcome, task.waiting_for = "STOPPED", None
     if task.agent_thread_id:
         stop_threads(db, [task.agent_thread_id], now)
+    r = JobRankingTask
+    query = select(r).where(r.job_id == task.job_id, r.user_id == task.user_id,
+                            r.status.in_(ACTIVE_RANKING_TASK_STATUSES))
+    if _postgres(db):
+        query = query.with_for_update()
+    for row in db.scalars(query).all():
+        workers._stop(db, workers.KINDS["ranking"], row, task.user_id, now)
 
 
 def on_job_deleted(db: Session, job_id: int) -> None:

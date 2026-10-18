@@ -401,6 +401,60 @@ def test_a_run_that_fails_its_attempts_is_not_started_again_until_retried(sessio
     assert qs.facts(sessions, job_id)["state"] == "QUALIFIED"
 
 
+def _waiting_for_ranking(sessions, job_id):
+    """Advance the run (no ranking pass) until it waits for the ranking it queued."""
+    for _ in range(6):
+        qs.drive(sessions, passes=("qualification", "jd_parsing"), rounds=1, settle=False)
+        task = qs.qualification_tasks(sessions, job_id)[-1]
+        if task.waiting_for == "RANKING":
+            return task
+    raise AssertionError("the run never waited for its ranking")
+
+
+def test_kill_while_waiting_for_ranking_stops_that_ranking_too(sessions, model, parses):
+    user_id = add_owner(sessions)
+    job_id = qs.new_job(sessions, user_id)
+    task = _waiting_for_ranking(sessions, job_id)
+    with sessions() as db:
+        db.info["user_id"] = user_id
+        workers.kill(db, user_id, "qualification", [task.id])
+    assert [status for status, _ in qs.facts(sessions, job_id)["tasks"]["ranking"]] == ["SKIPPED"]
+    qs.drive(sessions)  # the ranking pass finds nothing to run: no model is asked, nothing decides the job
+    assert model.calls == [] and qs.facts(sessions, job_id)["state"] == "SKIPPED"
+    with sessions() as db:
+        db.info["user_id"] = user_id
+        assert workers.retry(db, user_id, "qualification", [task.id])["retried"]
+    qs.drive(sessions)
+    assert qs.facts(sessions, job_id)["state"] == "QUALIFIED" and model.calls.count(job_id) == 1
+
+
+def test_retention_never_expires_a_run_waiting_for_work(sessions, model, parses):
+    from datetime import timedelta
+
+    user_id = add_owner(sessions)
+    job_id = qs.new_job(sessions, user_id)
+    task = _waiting_for_ranking(sessions, job_id)
+    later = qs.utcnow() + timedelta(days=400)  # long past AGENT_INTERRUPT_EXPIRY_DAYS
+    assert runtime.prune(sessions, later)["expired"] == 0
+    assert qs.thread_of(sessions, task).status == "INTERRUPTED"
+    qs.drive(sessions)
+    assert qs.facts(sessions, job_id)["state"] == "QUALIFIED"
+
+
+def test_dispatch_wakes_the_worker_only_once_its_task_is_committed(sessions, monkeypatch):
+    from app import scheduler_hooks
+
+    user_id, woken = add_owner(sessions), []
+    monkeypatch.setattr(scheduler_hooks, "nudge", lambda name: woken.append(name))
+    job_id = qs.old_job(sessions, user_id)
+    with sessions() as db:
+        db.info["user_id"] = user_id
+        assert qualification.dispatch(db, db.get(Job, job_id)) is not None
+        assert woken == []  # not visible to the scheduler yet
+        db.commit()
+    assert woken == ["qualification"]
+
+
 # ───────────── duplicates: delivery, dispatch, replay ─────────────
 
 def test_a_duplicate_delivery_and_a_repeated_dispatch_make_one_run_and_one_call(sessions, model, parses):

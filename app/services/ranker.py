@@ -294,6 +294,15 @@ def removed_by_user(db: Session, job: Job) -> bool:
     return reason in (REMOVED_BY_USER, STOPPED_BY_USER)
 
 
+def restore_removed(db: Session, job: Job, *, actor: str, reason: str, now: datetime | None = None) -> bool:
+    """A job the person took out of ranking (or whose ranking they stopped) and now asks for again goes back through
+    the filters like a new job. True when it was put back; False (nothing written) for any other job."""
+    if not removed_by_user(db, job):
+        return False
+    transition(db, job, S.NORMALIZED, actor=actor, reason=reason, now=now)
+    return True
+
+
 def remove_from_ranking(db: Session, job_ids: Iterable[int], *, actor: str,
                         now: datetime | None = None) -> dict[str, Any]:
     """Take jobs out of the ranking queue: their waiting task is cancelled and the job is SKIPPED, so no sweep
@@ -381,9 +390,7 @@ def queue_job(db: Session, job: Job, *, policy: RankingPolicy, actor: str, reaso
         job.attempt_count, job.retryable, job.next_attempt_at = 0, None, None
     elif state is S.RANKING:
         return "This job is being ranked right now"
-    elif state is S.SKIPPED and removed_by_user(db, job):
-        # Taken out of the queue earlier and asked for again: it goes back through the filters like a new job.
-        transition(db, job, S.NORMALIZED, actor=actor, reason="Ranking asked for again", now=now)
+    elif restore_removed(db, job, actor=actor, reason="Ranking asked for again", now=now):
         skipped = prepare(db, job, policy, actor=actor, now=now)
         if skipped:
             return skipped

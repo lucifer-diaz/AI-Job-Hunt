@@ -447,12 +447,14 @@ hand-back) qualify a job when `QUALIFICATION_GRAPH_MODE=on` (README §9c). The r
   the effect key and makes the business write in one transaction (`recovery.enqueue:<job>`, `parse.enqueue:<job>:<hash>`,
   `rank.enqueue:<job>`). The task is settled under its own lock token. A stopped or taken-over run writes nothing.
 * **Worker-owned threads.** The qualification graph is `api_resumable=False`. `/api/agents/runs/{id}/resume` refuses
-  it, and `runtime.claim_stale` never continues it: only its task's worker does (`runtime.WORKER_OWNED`). A thread key
+  it, `runtime.claim_stale` never continues it and `runtime.prune` never expires it while it waits for work: only its
+  task's worker does (`runtime.WORKER_OWNED`). A thread key
   carries the task's id, creation time and attempt.
 * **Shadow never writes and never pays by default.** A shadow session refuses to commit and is rolled back.
   Predictions use the deterministic functions and the latest stored ranking. A paid re-ranking needs
   `qualification_shadow_paid_daily_limit > 0`, reserved per account under a transaction lock.
-* **Kill stops; nothing revives it.** Kill ends the task with `STOPPED_BY_USER` and stops its thread. `dispatch`
+* **Kill stops; nothing revives it.** Kill ends the task with `STOPPED_BY_USER` and stops its thread and the job's
+  active ranking (as Kill on Ranking would), so no model decides a job a person stopped. `dispatch`
   never creates a new run for a job whose latest run a person stopped, or that failed its attempts, unless they ask
   (Retry and Run now create a new task); otherwise every `ranker.sweep` would start another run and the attempt limit
   would bound nothing.

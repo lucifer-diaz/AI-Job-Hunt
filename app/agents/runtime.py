@@ -345,7 +345,8 @@ def claim_stale(sessions: Callable[[], Session], worker: str, limit: int, now: d
 
 
 def prune(sessions: Callable[[], Session], now: datetime | None = None, limit: int = 200) -> dict[str, Any]:
-    """Checkpoint retention: expire threads left waiting, delete checkpoints of finished and orphaned threads.
+    """Checkpoint retention: expire threads left waiting for a person, delete checkpoints of finished and orphaned
+    threads. A worker-owned thread waits for work, not a person, so it never expires here (its task owns it).
 
     Reads and writes of agent_threads are committed before the checkpointer is opened: LangGraph's setup must never
     wait on a transaction of ours."""
@@ -359,7 +360,7 @@ def prune(sessions: Callable[[], Session], now: datetime | None = None, limit: i
             return {"skipped": "Agent graphs need PostgreSQL"}
         expired = db.execute(
             update(AgentThread)
-            .where(AgentThread.status == "INTERRUPTED",
+            .where(AgentThread.status == "INTERRUPTED", AgentThread.graph.not_in(WORKER_OWNED),
                    AgentThread.updated_at < now - timedelta(days=max(1, settings.agent_interrupt_expiry_days)))
             .values(status="STOPPED", last_error=EXPIRED_NOTE, interrupt=None, completed_at=now, updated_at=now)
             .execution_options(synchronize_session=False)).rowcount
