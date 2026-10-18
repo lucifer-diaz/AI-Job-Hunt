@@ -76,7 +76,8 @@ def test_approval_moves_a_qualified_job_through_its_real_stages():
     assert _history(job_id) == [("QUALIFIED", "TAILORING", "reconcile"), ("TAILORING", "TAILORED", "reconcile"),
                                 ("TAILORED", "REVIEWED", "reconcile"), ("REVIEWED", "READY_TO_APPLY", "approval")]
     with SessionLocal() as db:
-        packet = db.scalar(select(ApprovedPacket).where(ApprovedPacket.variant_id == variant_id, ApprovedPacket.job_id == job_id))
+        packet = db.scalar(select(ApprovedPacket).where(ApprovedPacket.variant_id == variant_id, ApprovedPacket.job_id == job_id)
+                           .order_by(ApprovedPacket.id.desc()).limit(1))
         assert packet.job_id == job_id and packet.revoked_at is None
         assert packet.content["resume_markdown"] == "# Asha Rao\n- Led eight engineers"  # newlines normalised
         assert packet.digest == approval.digest_of(packet.content)
@@ -102,7 +103,8 @@ def test_an_edit_after_approval_revokes_it_in_the_same_transaction():
     assert client.put(f"/api/resumes/{variant_id}/cover-letter", json={"text": "A new letter"}).status_code == 200
     with SessionLocal() as db:
         job = db.get(Job, job_id)
-        packet = db.scalar(select(ApprovedPacket).where(ApprovedPacket.variant_id == variant_id, ApprovedPacket.job_id == job_id))
+        packet = db.scalar(select(ApprovedPacket).where(ApprovedPacket.variant_id == variant_id, ApprovedPacket.job_id == job_id)
+                           .order_by(ApprovedPacket.id.desc()).limit(1))
         assert job.status == "pending_approval" and job.application.status == "pending_approval"
         assert job.state is S.REVIEWED
         assert packet.revoked_at is not None and "edited after approval" in packet.revoked_reason
@@ -111,7 +113,7 @@ def test_an_edit_after_approval_revokes_it_in_the_same_transaction():
     assert client.post(f"/api/jobs/{job_id}/approve").status_code == 200  # approve the edited packet again
     with SessionLocal() as db:
         rows = db.scalars(select(ApprovedPacket).where(ApprovedPacket.variant_id == variant_id, ApprovedPacket.job_id == job_id)
-                          .order_by(ApprovedPacket.id)).all()
+                          .order_by(ApprovedPacket.id)).all()[-2:]  # SQLite may keep a deleted job's rows (ids reused)
         assert [r.revoked_at is None for r in rows] == [False, True]
         assert rows[-1].content["cover_letter"] == "A new letter"
         assert db.get(Job, job_id).state is S.READY_TO_APPLY
