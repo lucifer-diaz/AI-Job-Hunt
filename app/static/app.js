@@ -36,7 +36,7 @@ const S = {
   kitJob: null, tailorJob: null, tailorTab: 'diff', editing: null,
   tailorMode: 'single', tailorChecked: new Set(), tailorRegenerate: false, tailorPages: '',  // '' = the default length in Settings
   pf: { tailor: pfDefaults('tailor'), approvals: pfDefaults('approvals') },
-  approvalJob: null, rejecting: null, overriding: null, selApp: null, trackerView: 'board', tf: { q: '', location: 'all', min_fit: 0 }, rf: { q: '', location: 'all' }, runSel: null, setupSel: null,
+  approvalJob: null, approvalPicked: new Set(), bulkRejecting: false, rejecting: null, overriding: null, selApp: null, trackerView: 'board', tf: { q: '', location: 'all', min_fit: 0 }, rf: { q: '', location: 'all' }, runSel: null, setupSel: null,
   scheduling: false, editingRecruiter: false, recruiterDraft: [], ivDraft: null, manualMissing: null,
   polling: null, busy: {}, forms: {}, apifyImport: false, importPick: new Set(), autoRefreshed: false,
 };
@@ -1289,8 +1289,10 @@ function renderApprovalsBody(list) {
   if (!list.length) return `<section class="card">${empty('The queue is clear', 'Tailored packets land here for your sign-off.', btn('Go to Tailor', 'go', { screen: 'tailor' }, 'primary'))}</section>`;
   const a = D.approval;
   const waiting = list.filter(x => x.waiting).length;
-  const queue = `<section class="card flush c-narrow"><div class="card-head card-title sm">Queue · ${waiting} waiting</div>
-    ${list.map(q => `<div class="lrow click ${q.id === S.approvalJob ? 'sel' : ''}" data-act="select-approval" data-id="${q.id}"><div class="grow"><div class="base b ellipsis">${esc(q.title)}</div><div class="xs muted">${esc(q.company)} · ${esc(q.age)}</div></div>${q.easy_apply ? pill('Easy Apply', 'brand') : ''}${q.approval_override ? pill('waived', 'warn') : ''}<span class="mono bb base" style="color:${q.status === 'approved' ? 'var(--faint)' : (q.reviewer_score || 0) >= 75 ? 'var(--good)' : (q.reviewer_score || 0) >= 65 ? 'var(--warn)' : 'var(--bad)'}">${fitTxt(q.reviewer_score)}</span></div>`).join('')}</section>`;
+  const allOn = list.every(q => S.approvalPicked.has(q.id));
+  const queue = `<section class="card flush c-narrow"><div class="card-head row gap10"><input type="checkbox" data-act="approval-check-all" ${allOn ? 'checked' : ''} aria-label="Select every job in the queue"><span class="card-title sm grow">Queue · ${waiting} waiting</span></div>
+    ${renderApprovalBulkBar(list)}
+    ${list.map(q => `<div class="lrow click ${q.id === S.approvalJob ? 'sel' : ''}" data-act="select-approval" data-id="${q.id}"><input type="checkbox" data-act="approval-check" data-id="${q.id}" ${S.approvalPicked.has(q.id) ? 'checked' : ''} aria-label="Select ${attr(q.title)}"><div class="grow"><div class="base b ellipsis">${esc(q.title)}</div><div class="xs muted">${esc(q.company)} · ${esc(q.age)}</div></div>${q.easy_apply ? pill('Easy Apply', 'brand') : ''}${q.approval_override ? pill('waived', 'warn') : ''}<span class="mono bb base" style="color:${q.status === 'approved' ? 'var(--faint)' : (q.reviewer_score || 0) >= 75 ? 'var(--good)' : (q.reviewer_score || 0) >= 65 ? 'var(--warn)' : 'var(--bad)'}">${fitTxt(q.reviewer_score)}</span></div>`).join('')}</section>`;
   if (!a) return `<div class="split">${queue}<section class="card c-main">${loading()}</section></div>`;
   const r = a.resume, job = a.job;
   const approved = job.status === 'approved';
@@ -1313,6 +1315,42 @@ function renderApprovalsBody(list) {
         <div class="col gap9">${a.answers.length ? a.answers.map(x => `<div class="box"><div class="small muted">${esc(x.question)}</div><div class="row gap8 mt4"><span class="small b grow">${esc(x.answer || 'Awaiting answer')}</span>${pill(x.sensitive ? 'confirm' : x.verified ? 'verified' : 'unverified', x.sensitive || !x.verified ? 'warn' : 'good')}</div></div>`).join('') : '<div class="small muted">No saved answers. Add them in the Knowledge bank.</div>'}</div>
         <textarea class="textarea mt12" id="approval-notes" data-act-blur="save-notes" data-id="${job.id}" placeholder="Notes for yourself — saved when you click away">${esc(fv('approvalNotes', job.id, a.notes))}</textarea></div></div>` : empty('No packet', 'This job has no tailored resume.')}
   </section></div>`;
+}
+// Acting on several queued jobs at once. Each button counts only the picked jobs it applies to; the server
+// decides each job on its own and reports the ones it skipped. Bulk approval never waives the reviewer minimum.
+function approvalBulkCounts(picked) {
+  const min = D.approval?.min_review_score;
+  return {
+    reject: picked.length,
+    revise: picked.filter(q => q.status !== 'pending_approval').length,
+    approve: picked.filter(q => q.status !== 'approved' && q.reviewer_score != null && (min == null || q.reviewer_score >= min)).length,
+  };
+}
+const BULK_APPROVAL_DONE = { reject: 'Rejected', revise: 'Sent back for revision', approve: 'Approved' };
+function bulkApprovalMsg(out) {
+  const n = out.done.length, skipped = out.skipped.length;
+  const first = skipped ? ` · ${skipped} skipped (${out.skipped[0].title ? `${out.skipped[0].title}: ` : ''}${out.skipped[0].reason}${skipped > 1 ? ', …' : ''})` : '';
+  return `${BULK_APPROVAL_DONE[out.action]} ${n} job${n === 1 ? '' : 's'}${first}`;
+}
+function renderApprovalBulkBar(list) {
+  const picked = list.filter(q => S.approvalPicked.has(q.id));
+  if (!picked.length) return '';
+  const n = approvalBulkCounts(picked), working = isBusy('bulkApproval');
+  const head = `<div class="row wrap gap8" style="padding:10px 18px;border-bottom:1px solid var(--line2);background:var(--brand-softer)">
+    <span class="small b grow">${picked.length} selected</span>
+    ${btn('Reject…', 'bulk-reject-open', {}, 'sm ghost danger', working || S.bulkRejecting)}
+    ${btn(label('bulkApproval', `Needs revision${n.revise ? ` ${n.revise}` : ''}`, 'Working…'), 'bulk-approval', { action: 'revise' }, 'sm', working || !n.revise)}
+    <span title="Approves packets that cleared your reviewer minimum. To waive the minimum, approve that packet on its own.">${btn(label('bulkApproval', `Approve${n.approve ? ` ${n.approve}` : ''}`, 'Working…'), 'bulk-approval', { action: 'approve' }, 'sm good', working || !n.approve)}</span>
+    <a href="#" class="small" data-act="approval-check-none">Clear</a></div>`;
+  if (!S.bulkRejecting) return head;
+  const reasons = D.approval?.rejection_reasons || [];
+  const chosen = fv('bulkReject', 'reason', '');
+  return head + `<div style="padding:12px 18px;border-bottom:1px solid var(--line2);background:var(--warn-soft)">
+    <div class="row between gap10 mb8"><div class="small b">Reject ${picked.length} job${picked.length === 1 ? '' : 's'}?</div><a href="#" class="small" data-act="bulk-reject-close">Cancel</a></div>
+    <div class="xs muted mb8">They leave the approval queue and your pipeline. Tailored resumes are kept, and nothing is sent to anyone.</div>
+    <div class="row gap6 wrap mb8">${reasons.map(x => `<button type="button" class="btn sm ${chosen === x.id ? 'soft' : ''}" data-act="bulk-reject-reason" data-id="${attr(x.id)}">${chosen === x.id ? '✓ ' : ''}${esc(x.label)}</button>`).join('')}</div>
+    ${inputF('bulkReject', 'notes', '', 'placeholder="Anything worth remembering (optional)" maxlength="2000"')}
+    <div class="row gap8 wrap mt10">${btn(label('bulkApproval', `Reject ${picked.length}${chosen ? ' with this reason' : ''}`, 'Rejecting…'), 'bulk-approval', { action: 'reject' }, 'danger-solid sm', working)}</div></div>`;
 }
 // Approving a packet the reviewer scored below your minimum. The minimum can be waived for one packet; the
 // review itself cannot be skipped, so a packet nobody scored is not offered this.
@@ -2533,6 +2571,36 @@ const A = {
     S.overriding = null; delete S.forms.override;
     await load(); openKit(el.dataset.id); return out;
   }, out => out.approval_override ? 'Approved below your minimum — here is your apply kit' : 'Approved — here is your apply kit'),
+  'approval-check': (el, e) => {
+    e.stopPropagation();
+    const id = Number(el.dataset.id);
+    S.approvalPicked.has(id) ? S.approvalPicked.delete(id) : S.approvalPicked.add(id);
+    if (!S.approvalPicked.size) S.bulkRejecting = false;
+    render();
+  },
+  'approval-check-all': () => {
+    const list = D.approvals || [];
+    S.approvalPicked = list.every(q => S.approvalPicked.has(q.id)) ? new Set() : new Set(list.map(q => q.id));
+    if (!S.approvalPicked.size) S.bulkRejecting = false;
+    render();
+  },
+  'approval-check-none': (el, e) => { e?.preventDefault?.(); S.approvalPicked = new Set(); S.bulkRejecting = false; render(); },
+  'bulk-reject-open': () => { S.bulkRejecting = true; delete S.forms.bulkReject; render(); },
+  'bulk-reject-close': (el, e) => { e?.preventDefault?.(); S.bulkRejecting = false; delete S.forms.bulkReject; render(); },
+  'bulk-reject-reason': el => { setF('bulkReject', 'reason', fv('bulkReject', 'reason', '') === el.dataset.id ? '' : el.dataset.id); render(); },
+  'bulk-approval': el => busy('bulkApproval', async () => {
+    const action = el.dataset.action;
+    const ids = (D.approvals || []).filter(q => S.approvalPicked.has(q.id)).map(q => q.id);
+    if (!ids.length) return null;
+    const body = { action, job_ids: ids, ...(action === 'reject' ? { reason: fv('bulkReject', 'reason', ''), notes: fv('bulkReject', 'notes', '') } : {}) };
+    const out = await api('/api/approvals/bulk', { method: 'POST', body });
+    // Skipped jobs stay selected, so it is clear which ones still need a decision.
+    S.approvalPicked = new Set(out.skipped.map(x => x.id));
+    S.bulkRejecting = false; delete S.forms.bulkReject;
+    if (action === 'reject' && out.done.includes(S.approvalJob)) { S.approvalJob = null; D.approval = null; }
+    await load();
+    return out;
+  }, out => out && bulkApprovalMsg(out)),
   'reject-open': el => { S.rejecting = Number(el.dataset.id); delete S.forms.reject; render(); },
   'reject-close': (el, e) => { e?.preventDefault?.(); S.rejecting = null; delete S.forms.reject; render(); },
   'reject-reason': el => { setF('reject', 'reason', el.dataset.id); render(); },
