@@ -1806,9 +1806,9 @@ nudged at once when it is free. Every control acts on your own tasks only.
 ## 9c. Agent graphs (experimental, off by default)
 
 `app/agents/` is the LangGraph foundation from the [agentic roadmap](docs/architecture/agentic-roadmap.md) (Phase 1).
-Today it runs one **pilot graph** with no production side effect. The pilot branches (auto or review), pauses for a
-person's decision, and continues after a worker crash from its last PostgreSQL checkpoint. Discovery, ranking,
-tailoring and applications do not use it.
+It runs a **pilot graph** with no production side effect. The pilot branches (auto or review), pauses for a person's
+decision, and continues after a worker crash from its last PostgreSQL checkpoint. Since Phase 3 it also runs the
+optional **qualification graph** (below, off by default). Tailoring and applications do not use graphs.
 
 | Setting | Default | What it does |
 | --- | --- | --- |
@@ -1852,6 +1852,44 @@ External APIs (provider `LANGSMITH`) and changes nothing else. These are our own
 **Rollback.** Set `AGENT_GRAPHS_ENABLED=false` (and `AGENT_LANGSMITH_EXPORT_ENABLED=false`). Migration 0044 is
 additive and can be downgraded. LangGraph's checkpoint tables can be dropped by hand: `checkpoints`,
 `checkpoint_blobs`, `checkpoint_writes` and `checkpoint_migrations`.
+
+### The qualification graph (Phase 3, off by default)
+
+`app/agents/qualification.py` takes a job from discovery to a decision in a fixed order:
+
+```text
+VALIDATE_JOB → DOMAIN_AND_SEARCH_SCOPE_ADMISSION → CHECK_JD → RECOVER_JD_IF_NEEDED → PARSE_JD
+  → QUALIFICATION_HARD_FILTER → RETRIEVE_VERIFIED_JOB_RESUME_EVIDENCE → RANK → VALIDATE → QUALIFY / ARCHIVE
+```
+
+The graph is a conductor. Each step calls the service that already owns it: `domain_match` / `search_scope`,
+`jd_recovery.enqueue`, `job_description.queue_parse`, `ranker.prepare`, `rag_retrieval.scope` and
+`ranker.queue_job`. The existing workers still do the HTTP, browser and model work, under their own task rows and
+leases, and the ranker still decides QUALIFIED or ARCHIVED (`ranker.qualify`). While a step's task runs, the graph
+waits: its run is interrupted and resumed when the task ends. The graph never calls a model itself.
+
+Admission runs first, for old jobs too. A job outside the account's domain or its search's scope stops there: no
+recovery, parse, browser or model call is ever made for it.
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `QUALIFICATION_GRAPH_MODE` | `off` | `off`: nothing changes. `shadow`: the current path still decides; each day a bounded number of its decided jobs per account are re-run through the graph read-only and compared (Monitoring → Logs on a difference). `on`: new and waiting jobs are qualified by the graph. Needs `AGENT_GRAPHS_ENABLED` and PostgreSQL. |
+| `QUALIFICATION_MINUTES` | `1` | How often the `qualification` scheduler job advances runs (nudged when recovery, a parse or a ranking ends). |
+| `QUALIFICATION_SHADOW_DAILY_LIMIT` | `50` | Shadow runs per account per day. |
+| `QUALIFICATION_SHADOW_PAID_DAILY_LIMIT` | `0` | Shadow re-rankings (model calls) per account per day for a job the current path never ranked. 0 never spends a call on shadow runs. |
+
+Runs are `job_qualification_tasks` rows (migration 0047), shown in Running workers → Qualification, with Kill, Retry
+and Run now. Kill stops the run and its thread, and no sweep picks the job up again until someone retries it. The
+AI Orchestration node `qualification` counts them. A job waiting on a step is shown at the worker doing it.
+
+`python scripts/qualification_parity.py --database-url <disposable PostgreSQL>` prints the old-vs-new table: the
+representative cases through both paths, their states, histories and paid calls.
+
+**Rollback.** Set `QUALIFICATION_GRAPH_MODE=off`. The next `qualification` pass hands waiting runs back to the
+current path (`ROUTED_TO_LEGACY`). The recovery, parse and ranking tasks the graph queued are ordinary tasks, and
+their workers finish them. Keep `AGENT_GRAPHS_ENABLED` on until that pass has run: with it off the pass does not run,
+and leftover runs stay listed as queued (inert: the current path still takes their jobs). Migration 0047 is additive
+and can be downgraded.
 
 ## 9d. Candidate knowledge retrieval (RAG, off by default)
 

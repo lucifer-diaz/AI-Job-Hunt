@@ -345,6 +345,21 @@ class Settings(BaseSettings):
     agent_langsmith_endpoint: str = "https://api.smith.langchain.com"
     agent_langsmith_project: str = "job-hunt-os"
     agent_langsmith_timeout_ms: int = 3000
+    # The qualification graph (app.agents.qualification, Phase 3). QUALIFICATION_GRAPH_MODE: off (default; jobs are
+    # qualified by the services exactly as before), shadow (they still are, and a bounded number of decided jobs per
+    # account a day are re-run through the graph read-only and compared — no paid call unless the paid budget below
+    # allows one), on (new and waiting jobs are qualified by the graph, which drives the same recovery, parse and
+    # ranking tasks). Needs AGENT_GRAPHS_ENABLED and PostgreSQL; otherwise it acts as off.
+    qualification_graph_mode: str = "off"
+    qualification_minutes: int = 1
+    qualification_batch_size: int = 50
+    qualification_concurrency: int = 4
+    qualification_max_attempts: int = 3
+    qualification_retry_seconds: int = 60
+    qualification_lease_seconds: int = 300
+    qualification_shadow_daily_limit: int = 50  # shadow runs per account per day
+    qualification_shadow_paid_daily_limit: int = 0  # shadow re-rankings (model calls) per account per day: none
+    qualification_shadow_lookback_hours: int = 48
     # Candidate knowledge retrieval (RAG, app.services.rag_retrieval). RAG_RETRIEVAL_MODE: off (default; the context
     # builders select evidence exactly as before), shadow (they still do, and the retrieval result is computed beside
     # it and compared in Monitoring → Logs, ids only), on (job contexts take their evidence from retrieval, scoped to
@@ -378,6 +393,18 @@ class Settings(BaseSettings):
     def agent_recovery_interval_minutes(self) -> int:
         """The scheduler interval of the agent graph recovery pass: 0 (off) unless AGENT_GRAPHS_ENABLED."""
         return max(0, self.agent_recovery_minutes) if self.agent_graphs_enabled else 0
+
+    @property
+    def qualification_mode(self) -> str:
+        """off, shadow or on; anything else, or agent graphs being off, is off."""
+        mode = (self.qualification_graph_mode or "off").strip().lower()
+        return mode if self.agent_graphs_enabled and mode in ("shadow", "on") else "off"
+
+    @property
+    def qualification_interval_minutes(self) -> int:
+        """The scheduler interval of the qualification graph job: 0 (off) unless the graph's mode is shadow or on.
+        In off mode with tasks left over from on, the job still runs to hand them back (qualification.release)."""
+        return max(0, self.qualification_minutes) if self.agent_graphs_enabled else 0
 
     @property
     def rag_index_interval_minutes(self) -> int:

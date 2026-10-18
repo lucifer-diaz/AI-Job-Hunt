@@ -6,6 +6,7 @@
       → resume: the saved search's pinned resume, else the best-tagged resume (app.services.resume_matching), else
         none (the account's active resume, at use time)
       → description usable? parse it : recover it first (app.services.jd_recovery)
+      (with QUALIFICATION_GRAPH_MODE=on the last step is the qualification graph's: app.services.qualification)
 
 A job the person adds themselves (source "manual") is always kept: adding it is the decision. Postings deleted
 earlier because they no longer existed are not imported again (app.services.job_removal.is_removed); the import
@@ -64,6 +65,13 @@ def admit(db: Session, job: Job, *, search_run_id: int | None = None,
     elif not search_scope.screen(db, job, search_run_id, actor="discovery"):
         return "not_matching"  # a role, skill or place its own search did not ask for
     choose_resume(db, job, search_run_id)
+    from app.services import qualification
+
+    if qualification.routes(db):
+        # The qualification graph takes it from here (QUALIFICATION_GRAPH_MODE=on): it recovers, parses and ranks the
+        # job through the same services, in order, after admitting it again (idempotent) as its first step.
+        qualification.dispatch(db, job, reason="new")
+        return "created"
     if not jd_recovery.on_new_job(db, job):
         job_description.queue_parse(db, job)
     return "created"

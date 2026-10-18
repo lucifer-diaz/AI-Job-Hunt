@@ -297,10 +297,14 @@ async def ranking(ctx: JobContext) -> dict[str, Any]:
     details = await threads.run_io(_prepare_ranking, ctx)
     if isinstance(details, str):
         return skipped(details)
+    async def rank(c: ranker.TaskClaim) -> str:
+        outcome = await threads.run_work(ranker.process, ctx.sessions, c)
+        scheduler_hooks.nudge("qualification")  # a graph run waiting for this ranking may go on (a hint only)
+        return outcome
+
     claimed, outcomes = await run_live(
         concurrency="ranking_concurrency", batch="ranking_batch_size",
-        claim=lambda n: _claim_ranking(ctx, n),
-        process=lambda c: threads.run_work(ranker.process, ctx.sessions, c),
+        claim=lambda n: _claim_ranking(ctx, n), process=rank,
         heartbeat=renew(ctx.sessions, JobRankingTask, get_settings().ranking_lease_seconds, token="token"))
     summary = {"claimed": claimed, **{name: outcomes.get(name, 0) for name in ranker.OUTCOMES}, **details}
     if not claimed and not any(details["queue"].values()):
@@ -379,6 +383,7 @@ async def jd_recovery_job(ctx: JobContext) -> dict[str, Any]:
             if outcome == "recovered":
                 scheduler_hooks.nudge("jd_parsing")
             scheduler_hooks.nudge("ranking")
+            scheduler_hooks.nudge("qualification")
         return outcome
 
     try:
@@ -639,6 +644,57 @@ async def agent_graphs(ctx: JobContext) -> dict[str, Any]:
     return {"recovered": len(runs), **outcomes}
 
 
+def _prepare_qualification(ctx: JobContext, mode: str) -> dict[str, Any]:
+    """Take back leases of crashed runs, then: off or shadow → hand ON tasks back to the current path; shadow → queue
+    the day's shadow runs. Never calls a model."""
+    from app.services import qualification
+
+    with ctx.sessions() as db:
+        details: dict[str, Any] = {"mode": mode, "expired_leases": qualification.recover_expired(db, ctx.now)}
+        if mode != "on":  # the current path qualifies again: runs left from mode on go back to it
+            details["released"] = qualification.release(db, ctx.now)
+        if mode == "shadow":
+            details["shadow"] = qualification.shadow_sweep(db, ctx.now)
+    return details
+
+
+def _claim_qualification(ctx: JobContext, limit: int, task_mode: str) -> list[Any]:
+    from app.services import qualification
+
+    with ctx.sessions() as db:
+        return qualification.claim(db, worker_id=ctx.worker_id, limit=limit, task_mode=task_mode)
+
+
+async def qualification_job(ctx: JobContext) -> dict[str, Any]:
+    """Advance qualification graph runs (app.agents.qualification): each claimed task's thread runs until its job is
+    decided or it waits for recovery, parsing or ranking, which the existing workers do. Shadow runs only read.
+
+    Off unless AGENT_GRAPHS_ENABLED; in mode off it only hands tasks left from mode on back to the current path."""
+    if not get_settings().agent_graphs_enabled:
+        return skipped("Agent graphs are off (AGENT_GRAPHS_ENABLED)")
+    with ctx.sessions() as db:
+        if not _is_postgres(db):
+            return skipped("The qualification graph needs PostgreSQL")
+    from app.services import qualification
+
+    mode = qualification.mode()
+    details = await threads.run_io(_prepare_qualification, ctx, mode)
+    if mode == "off":
+        if not details.get("released") and not details.get("expired_leases"):
+            return skipped("The qualification graph is off (QUALIFICATION_GRAPH_MODE)", **details)
+        return details
+    task_mode = qualification.ON if mode == "on" else qualification.SHADOW
+    claimed, outcomes = await run_live(
+        concurrency="qualification_concurrency", batch="qualification_batch_size",
+        claim=lambda n: _claim_qualification(ctx, n, task_mode),
+        process=lambda c: threads.run_work(qualification.process, ctx.sessions, c),
+        heartbeat=qualification.renew(ctx.sessions))
+    summary = {"claimed": claimed, **{name: outcomes.get(name, 0) for name in qualification.OUTCOMES}, **details}
+    if not claimed and not (details.get("shadow") or {}).get("queued"):
+        return skipped("No qualification runs waiting", **summary)
+    return summary
+
+
 async def rag_index_job(ctx: JobContext) -> dict[str, Any]:
     """Embed each account's verified evidence and saved answers into its retrieval index (app.services.rag_index).
 
@@ -802,6 +858,10 @@ JOBS: list[JobSpec] = [
     JobSpec("agent_graphs", "Agent graph recovery", "agent_recovery_interval_minutes", agent_graphs,
             "Continues agent graph runs (LangGraph pilot) left by a crashed worker from their last checkpoint; "
             "off unless AGENT_GRAPHS_ENABLED."),
+    JobSpec("qualification", "Qualification graph", "qualification_interval_minutes", qualification_job,
+            "Runs the LangGraph qualification graph (admission, description, parse, hard filters, evidence, ranking) "
+            "over the existing workers, or compares it read-only with the current path in shadow mode; off unless "
+            "AGENT_GRAPHS_ENABLED and QUALIFICATION_GRAPH_MODE."),
     JobSpec("rag_index", "Retrieval index", "rag_index_interval_minutes", rag_index_job,
             "Embeds verified evidence and saved answers for retrieval, builds a new index beside the old one when the "
             "embedding model changes, and retires the old one once it is complete; off unless RAG_VECTOR_ENABLED."),

@@ -69,6 +69,8 @@ class User(Base):
     failover_events: Mapped[list[FailoverEvent]] = relationship(back_populates="user", passive_deletes=True)
     agent_threads: Mapped[list[AgentThread]] = relationship(back_populates="user", passive_deletes=True)
     agent_effects: Mapped[list[AgentEffect]] = relationship(back_populates="user", passive_deletes=True)
+    qualification_tasks: Mapped[list[JobQualificationTask]] = relationship(back_populates="user",
+                                                                           passive_deletes=True)
     evidence_resume_links: Mapped[list[EvidenceResumeLink]] = relationship(back_populates="user",
                                                                            passive_deletes=True)
     rag_index_versions: Mapped[list[RagIndexVersion]] = relationship(back_populates="user", passive_deletes=True)
@@ -553,6 +555,8 @@ class Job(Base):
                                                                       passive_deletes=True)
     fetch_tasks: Mapped[list[JobDescriptionFetchTask]] = relationship(back_populates="job", cascade="all, delete-orphan",
                                                                       passive_deletes=True)
+    qualification_tasks: Mapped[list[JobQualificationTask]] = relationship(
+        back_populates="job", cascade="all, delete-orphan", passive_deletes=True)
     insight_tasks: Mapped[list[JobInsightTask]] = relationship(back_populates="job", cascade="all, delete-orphan",
                                                                passive_deletes=True)
     insight: Mapped[JobInsight | None] = relationship(back_populates="job", uselist=False, cascade="all, delete-orphan",
@@ -2368,6 +2372,67 @@ class AgentEffect(Base):
     effect_key: Mapped[str] = mapped_column(String(120))
     summary: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+
+QUALIFICATION_TASK_STATUSES = ("PENDING", "PROCESSING", "COMPLETED", "FAILED", "SKIPPED")
+ACTIVE_QUALIFICATION_TASK_STATUSES = ("PENDING", "PROCESSING")
+QUALIFICATION_MODES = ("ON", "SHADOW")
+
+
+class JobQualificationTask(Base):
+    """One run of the qualification graph (app.agents.qualification) for one job, claimed like every queued worker.
+
+    The graph conducts the existing workers (JD recovery, parsing, ranking) through their own task rows; this row is
+    its place in Running workers: its lease, attempts, the step it waits at and how it ended. ON runs drive the job;
+    SHADOW runs only predict what the graph would decide and compare it with what the current path did (`parity`,
+    ids and enums only). A job has at most one active task per mode (uq_job_qualification_tasks_active_job).
+    """
+
+    __tablename__ = "job_qualification_tasks"
+    __table_args__ = (
+        CheckConstraint(f"status IN ({_values(QUALIFICATION_TASK_STATUSES)})",
+                        name="ck_job_qualification_tasks_status"),
+        CheckConstraint(f"mode IN ({_values(QUALIFICATION_MODES)})", name="ck_job_qualification_tasks_mode"),
+        CheckConstraint("attempt_count >= 0", name="ck_job_qualification_tasks_attempt_count"),
+        Index("uq_job_qualification_tasks_active_job", "job_id", "mode", unique=True,
+              postgresql_where=text(f"status IN ({_values(ACTIVE_QUALIFICATION_TASK_STATUSES)})"),
+              sqlite_where=text(f"status IN ({_values(ACTIVE_QUALIFICATION_TASK_STATUSES)})")),
+        Index("ix_job_qualification_tasks_claim", "status", "next_attempt_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("job_qualification_tasks")
+    user: Mapped[User] = relationship(back_populates="qualification_tasks")
+    job_id: Mapped[int] = mapped_column(
+        ForeignKey("jobs.id", ondelete="CASCADE", name="fk_job_qualification_tasks_job_id"), index=True)
+    job: Mapped[Job] = relationship(back_populates="qualification_tasks")
+    agent_thread_id: Mapped[int | None] = mapped_column(
+        ForeignKey("agent_threads.id", ondelete="SET NULL", name="fk_job_qualification_tasks_agent_thread_id"),
+        nullable=True, index=True)
+    mode: Mapped[str] = mapped_column(String(10), default="ON")
+    status: Mapped[str] = mapped_column(String(20), default="PENDING")
+    reason: Mapped[str] = mapped_column(String(40), default="new")
+    # The graph node the run is at (or ended in), and what it waits for while PENDING between steps.
+    step: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    waiting_for: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    # QUALIFIED, ARCHIVED, HIDDEN, SKIPPED, BLOCKED, REMOVED, TRIAGED, STOPPED, FAILED, ALREADY_DECIDED
+    outcome: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    result_code: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    parity: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    paid_calls: Mapped[int] = mapped_column(Integer, default=0)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_category: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    locked_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    lock_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lock_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    run_now_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 # ───────────── Candidate knowledge retrieval (RAG, app.services.rag_*) ─────────────

@@ -135,6 +135,15 @@ describe('Running workers', () => {
     expect(view().textContent).toContain('JD recovery');
   });
 
+  it('shows the qualification graph only once it is scheduled or has work', async () => {
+    const extra = { kind: 'qualification', label: 'Qualification', description: 'LangGraph qualification',
+      counts: { running: 0, queued: 2, retrying: 0, active: 2 }, scheduler: { enabled: true, interval_minutes: 1 } };
+    routes.summary.workers.push(extra);
+    await open();
+    const tabs = [...view().querySelectorAll('[data-act="wk-tab"]')].map(b => b.textContent.trim());
+    expect(tabs).toContain('Qualification 2');
+  });
+
   it('shows the tailoring tasks at the review step on a Reviewing tab, with their scores', async () => {
     const v = await open('reviewing');
     expect(v.textContent).toContain('Median reviewer score');

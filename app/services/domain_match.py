@@ -252,6 +252,11 @@ def keep(db: Session, job: Job, *, actor: str, now: datetime | None = None) -> s
     from app.services import discovery
 
     discovery.choose_resume(db, job)  # hidden jobs were never matched to a resume
+    from app.services import qualification
+
+    if qualification.routes(db) and job.state in ranker.PRE_RANK_STATES:
+        qualification.dispatch(db, job, reason="user_request", now=now)
+        return None
     if not jd_recovery.on_new_job(db, job):
         job_description.queue_parse(db, job, reason="user_request", now=now)
     if job.state in ranker.PRE_RANK_STATES:

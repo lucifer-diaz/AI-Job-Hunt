@@ -64,6 +64,13 @@ FIELDS: dict[str, tuple[Field, ...]] = {
                       "ranking_retry_base_seconds", 10, 86400),
                 Field("retry_max_seconds", "Longest retry wait (seconds)", "The doubling stops here.", "int",
                       "ranking_retry_max_seconds", 10, 86400)),
+    "qualification": (AUTO,
+                      Field("max_attempts", "Attempts per run",
+                            "How often a graph run that failed is tried again before it is marked failed. Waiting for "
+                            "recovery, parsing or ranking never uses an attempt.", "int",
+                            "qualification_max_attempts", 1, 10),
+                      Field("retry_seconds", "Wait before a retry (seconds)",
+                            "Multiplied by the attempt number.", "int", "qualification_retry_seconds", 10, 86400)),
     "insights": (AUTO,
                  Field("max_attempts", "Attempts per job", "How often research is tried when every source fails.",
                        "int", "job_insights_max_attempts", 1, 10),

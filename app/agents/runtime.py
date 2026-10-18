@@ -55,12 +55,29 @@ class GraphSpec:
     decision_model: type[BaseModel]
     summary: Callable[[dict[str, Any]], dict[str, Any]]
     export_fields: tuple[str, ...]
+    # The per-run context its nodes receive: context(run, sessions, hold, **extra). Never checkpointed.
+    context: Callable[..., Any] = pilot.AgentContext
+    # False: only its worker resumes it (it waits for work, not for a person); /api/agents/runs/{id}/resume refuses it.
+    api_resumable: bool = True
 
 
-GRAPHS: dict[str, GraphSpec] = {
-    pilot.GRAPH: GraphSpec(pilot.GRAPH, pilot.GRAPH_VERSION, pilot.build, pilot.PilotInput, pilot.PilotDecision,
-                           pilot.summary, pilot.EXPORT_FIELDS),
-}
+def _graphs() -> dict[str, GraphSpec]:
+    from app.agents import qualification
+
+    return {
+        pilot.GRAPH: GraphSpec(pilot.GRAPH, pilot.GRAPH_VERSION, pilot.build, pilot.PilotInput, pilot.PilotDecision,
+                               pilot.summary, pilot.EXPORT_FIELDS),
+        qualification.GRAPH: GraphSpec(qualification.GRAPH, qualification.GRAPH_VERSION, qualification.build,
+                                       qualification.QualificationInput, qualification.QualificationResume,
+                                       qualification.summary, qualification.EXPORT_FIELDS,
+                                       context=qualification.QualificationContext, api_resumable=False),
+    }
+
+
+GRAPHS: dict[str, GraphSpec] = _graphs()
+# Graphs whose own worker claims, continues and settles their threads (with their task row); the generic recovery
+# pass (claim_stale) leaves them alone, so a run is never continued without the task that owns it.
+WORKER_OWNED = tuple(name for name, spec in GRAPHS.items() if not spec.api_resumable)
 
 
 class AgentsDisabled(RuntimeError):
@@ -175,11 +192,12 @@ def _saver_for(sessions: Callable[[], Session], saver: Any | None) -> Iterator[A
 
 
 def execute(sessions: Callable[[], Session], run: RunHandle, command: Any = None, *, saver: Any | None = None,
-            hold: Callable[[str], None] | None = None) -> str:
+            hold: Callable[[str], None] | None = None, extra: dict[str, Any] | None = None) -> str:
     """Run (or continue) a claimed thread until it ends or waits for a person. Returns the outcome; never raises.
 
     `command` is a LangGraph Command(resume=...) for a person's decision, or None to start or continue from the last
-    checkpoint. `saver` is for tests (an in-memory saver); production opens the PostgreSQL checkpointer.
+    checkpoint. `saver` is for tests (an in-memory saver); production opens the PostgreSQL checkpointer. `extra` adds
+    graph-specific fields to the run's context (the qualification graph's task id).
     """
     try:
         with sessions() as db:
@@ -206,7 +224,7 @@ def execute(sessions: Callable[[], Session], run: RunHandle, command: Any = None
                     argument: Any = dict(initial or {})  # first run: the stored input
                 else:
                     argument = command  # resume a decision, or None: continue from the last checkpoint
-                context = pilot.AgentContext(run=run, sessions=sessions, hold=hold)
+                context = spec.context(run=run, sessions=sessions, hold=hold, **(extra or {}))
                 app.invoke(argument, config=config, context=context, durability="sync")
                 state = app.get_state(config)
             return _settle(sessions, run, spec, state)
@@ -236,12 +254,17 @@ def _settle(sessions: Callable[[], Session], run: RunHandle, spec: GraphSpec, st
 
 # ───────────── a person's actions ─────────────
 
-def resume(db: Session, thread_pk: int, decision: dict[str, Any], worker: str) -> tuple[RunHandle, Any]:
-    """Validate a decision for one of the account's waiting threads and take its lease. Returns (run, Command)."""
+def resume(db: Session, thread_pk: int, decision: dict[str, Any], worker: str, *,
+           by_worker: bool = False) -> tuple[RunHandle, Any]:
+    """Validate a decision for one of the account's waiting threads and take its lease. Returns (run, Command).
+
+    A graph that waits for work rather than a person (`api_resumable` False) is resumed only by its worker."""
     from langgraph.types import Command
 
     user_id = require_user_id(db)
     thread = threads.owned(db, thread_pk)
+    if not by_worker and not spec_for(thread.graph).api_resumable:
+        raise ThreadBusy("this run is resumed by its worker, not by a person")
     if thread.status != "INTERRUPTED":
         raise ThreadBusy(f"this run is {thread.status.lower()}, not waiting for a decision")
     clean = spec_for(thread.graph).decision_model.model_validate(decision).model_dump()
@@ -293,14 +316,16 @@ def public(thread: AgentThread) -> dict[str, Any]:
 
 def claim_stale(sessions: Callable[[], Session], worker: str, limit: int, now: datetime | None = None
                 ) -> list[RunHandle]:
-    """Threads left QUEUED, or RUNNING with an expired lease (their worker died), up to `limit`. PostgreSQL."""
+    """Threads left QUEUED, or RUNNING with an expired lease (their worker died), up to `limit`. PostgreSQL.
+
+    Worker-owned graphs (WORKER_OWNED) are continued by their own worker, never here."""
     now = now or utcnow()
     max_attempts = max(1, get_settings().agent_max_attempts)
     runs: list[RunHandle] = []
     with sessions() as db:
         rows = db.execute(
             select(AgentThread.id, AgentThread.user_id, AgentThread.attempt_count)
-            .where(AgentThread.status.in_(("QUEUED", "RUNNING")),
+            .where(AgentThread.status.in_(("QUEUED", "RUNNING")), AgentThread.graph.not_in(WORKER_OWNED),
                    or_(AgentThread.lock_expires_at.is_(None), AgentThread.lock_expires_at < now))
             .order_by(AgentThread.id).limit(max(1, limit)).with_for_update(skip_locked=True)).all()
         exhausted = [r.id for r in rows if r.attempt_count >= max_attempts]
@@ -320,7 +345,8 @@ def claim_stale(sessions: Callable[[], Session], worker: str, limit: int, now: d
 
 
 def prune(sessions: Callable[[], Session], now: datetime | None = None, limit: int = 200) -> dict[str, Any]:
-    """Checkpoint retention: expire threads left waiting, delete checkpoints of finished and orphaned threads.
+    """Checkpoint retention: expire threads left waiting for a person, delete checkpoints of finished and orphaned
+    threads. A worker-owned thread waits for work, not a person, so it never expires here (its task owns it).
 
     Reads and writes of agent_threads are committed before the checkpointer is opened: LangGraph's setup must never
     wait on a transaction of ours."""
@@ -334,7 +360,7 @@ def prune(sessions: Callable[[], Session], now: datetime | None = None, limit: i
             return {"skipped": "Agent graphs need PostgreSQL"}
         expired = db.execute(
             update(AgentThread)
-            .where(AgentThread.status == "INTERRUPTED",
+            .where(AgentThread.status == "INTERRUPTED", AgentThread.graph.not_in(WORKER_OWNED),
                    AgentThread.updated_at < now - timedelta(days=max(1, settings.agent_interrupt_expiry_days)))
             .values(status="STOPPED", last_error=EXPIRED_NOTE, interrupt=None, completed_at=now, updated_at=now)
             .execution_options(synchronize_session=False)).rowcount

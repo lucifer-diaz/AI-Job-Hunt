@@ -9,6 +9,11 @@ check that this run still holds the thread's lease:
 
 A replay finds the first record and returns it; a run that lost its lease (stopped, or taken over after its lease
 expired) raises LeaseLost and writes nothing.
+
+`within` is the same record made inside the caller's transaction, for an effect that *is* a business write (a node
+queueing a recovery or ranking task through its service): the lease check (a row lock on PostgreSQL, held until the
+caller commits), the record and the write commit together or not at all, so a stopped run can never queue work and a
+replayed node finds the record and does not queue it twice.
 """
 from __future__ import annotations
 
@@ -48,12 +53,36 @@ def _locked(db: Session, run: RunHandle) -> AgentThread:
     return thread
 
 
-def once(db: Session, run: RunHandle, key: str, summary: dict[str, Any] | None = None) -> tuple[AgentEffect, bool]:
-    """Record the effect `key` for this thread once. Returns (record, created). Commits."""
+def _check(key: str, summary: dict[str, Any] | None) -> None:
     if not key or len(key) > KEY_LIMIT:
         raise ValueError(f"an effect key is 1 to {KEY_LIMIT} characters")  # never truncated: two keys must not merge
     if safety.problem(summary):
         raise ValueError("an effect summary must not carry credentials")
+
+
+def within(db: Session, run: RunHandle, key: str, summary: dict[str, Any] | None = None) -> tuple[AgentEffect, bool]:
+    """Check the lease and record `key` in the caller's transaction. Returns (record, created). Does not commit: the
+    caller commits it together with the write it stands for (a concurrent duplicate fails that commit)."""
+    _check(key, summary)
+    _locked(db, run)
+    existing = db.scalar(select(AgentEffect).where(AgentEffect.agent_thread_id == run.thread_pk,
+                                                   AgentEffect.effect_key == key))
+    if existing is not None:
+        return existing, False
+    record = AgentEffect(user_id=run.user_id, agent_thread_id=run.thread_pk, effect_key=key, summary=summary)
+    db.add(record)
+    db.flush()
+    return record, True
+
+
+def held(db: Session, run: RunHandle) -> None:
+    """Raise LeaseLost unless this run still holds its thread (a row lock on PostgreSQL until the caller commits)."""
+    _locked(db, run)
+
+
+def once(db: Session, run: RunHandle, key: str, summary: dict[str, Any] | None = None) -> tuple[AgentEffect, bool]:
+    """Record the effect `key` for this thread once. Returns (record, created). Commits."""
+    _check(key, summary)
     _locked(db, run)
     existing = db.scalar(select(AgentEffect).where(AgentEffect.agent_thread_id == run.thread_pk,
                                                    AgentEffect.effect_key == key))
