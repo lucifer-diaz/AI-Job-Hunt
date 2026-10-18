@@ -93,4 +93,29 @@ describe('acting on several approvals at once', () => {
     expect(JSON.parse(options.body)).toEqual({ action: 'revise', job_ids: [1] });
     expect(ui.S.approvalPicked.size).toBe(0);
   });
+
+  it('opens each picked posting in its own tab, skipping jobs without a web link', () => {
+    ui.D.approvals = [row(1, { url: 'https://jobs.example.test/1' }), row(2, { url: '' }),
+      row(3, { url: 'javascript:alert(1)' }), row(4, { url: 'http://jobs.example.test/4' })];
+    ui.render();
+    expect(button('bulk-open-postings')).toHaveLength(0);
+    ui.A['approval-check-all']();
+    const [open] = button('bulk-open-postings');
+    expect(open.textContent).toBe('Open postings 2 ↗');
+    const tabs = [];
+    vi.stubGlobal('open', vi.fn(url => { const tab = { url, opener: window }; tabs.push(tab); return tab; }));
+    ui.A['bulk-open-postings']();
+    expect(tabs.map(t => t.url)).toEqual(['https://jobs.example.test/1', 'http://jobs.example.test/4']);
+    expect(tabs.every(t => t.opener === null)).toBe(true);
+    expect(document.getElementById('toast').textContent).toContain('Opened 2 postings');
+  });
+
+  it('says so when the browser blocks the extra tabs', () => {
+    ui.D.approvals = [row(1, { url: 'https://a.example.test' }), row(2, { url: 'https://b.example.test' })];
+    ui.A['approval-check-all']();
+    vi.stubGlobal('open', vi.fn().mockReturnValueOnce({}).mockReturnValue(null));
+    ui.A['bulk-open-postings']();
+    expect(window.open).toHaveBeenCalledTimes(2);
+    expect(document.getElementById('toast').textContent).toContain('Opened 1 of 2 postings');
+  });
 });

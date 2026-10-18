@@ -1326,6 +1326,19 @@ function approvalBulkCounts(picked) {
     approve: picked.filter(q => q.status !== 'approved' && q.reviewer_score != null && (min == null || q.reviewer_score >= min)).length,
   };
 }
+// Only web links are opened in a new tab; a posting URL comes from a job board and is not trusted.
+function postingUrl(url) { return /^https?:\/\//i.test(url || '') ? url : ''; }
+// One tab per picked posting. window.open runs inside the click itself, before any await, or the browser
+// treats every tab after the first as an unrequested pop-up.
+function openPostings(urls) {
+  let opened = 0;
+  for (const url of urls) {
+    const tab = window.open(url, '_blank');
+    if (!tab) break;
+    tab.opener = null; opened += 1;
+  }
+  return opened;
+}
 const BULK_APPROVAL_DONE = { reject: 'Rejected', revise: 'Sent back for revision', approve: 'Approved' };
 function bulkApprovalMsg(out) {
   const n = out.done.length, skipped = out.skipped.length;
@@ -1336,8 +1349,10 @@ function renderApprovalBulkBar(list) {
   const picked = list.filter(q => S.approvalPicked.has(q.id));
   if (!picked.length) return '';
   const n = approvalBulkCounts(picked), working = isBusy('bulkApproval');
+  const links = picked.filter(q => postingUrl(q.url)).length;
   const head = `<div class="row wrap gap8" style="padding:10px 18px;border-bottom:1px solid var(--line2);background:var(--brand-softer)">
     <span class="small b grow">${picked.length} selected</span>
+    <span title="${attr(links < picked.length ? `${picked.length - links} selected job${picked.length - links === 1 ? ' has' : 's have'} no posting link` : 'Open each selected posting in a new tab')}">${btn(`Open postings${links ? ` ${links}` : ''} ↗`, 'bulk-open-postings', {}, 'sm', !links)}</span>
     ${btn('Reject…', 'bulk-reject-open', {}, 'sm ghost danger', working || S.bulkRejecting)}
     ${btn(label('bulkApproval', `Needs revision${n.revise ? ` ${n.revise}` : ''}`, 'Working…'), 'bulk-approval', { action: 'revise' }, 'sm', working || !n.revise)}
     <span title="Approves packets that cleared your reviewer minimum. To waive the minimum, approve that packet on its own.">${btn(label('bulkApproval', `Approve${n.approve ? ` ${n.approve}` : ''}`, 'Working…'), 'bulk-approval', { action: 'approve' }, 'sm good', working || !n.approve)}</span>
@@ -2585,6 +2600,13 @@ const A = {
     render();
   },
   'approval-check-none': (el, e) => { e?.preventDefault?.(); S.approvalPicked = new Set(); S.bulkRejecting = false; render(); },
+  'bulk-open-postings': () => {
+    const urls = (D.approvals || []).filter(q => S.approvalPicked.has(q.id)).map(q => postingUrl(q.url)).filter(Boolean);
+    if (!urls.length) return;
+    const opened = openPostings(urls);
+    if (opened < urls.length) toast(`Opened ${opened} of ${urls.length} postings — your browser blocked the rest. Allow pop-ups for this site and try again.`, true);
+    else toast(`Opened ${opened} posting${opened === 1 ? '' : 's'} in new tabs`);
+  },
   'bulk-reject-open': () => { S.bulkRejecting = true; delete S.forms.bulkReject; render(); },
   'bulk-reject-close': (el, e) => { e?.preventDefault?.(); S.bulkRejecting = false; delete S.forms.bulkReject; render(); },
   'bulk-reject-reason': el => { setF('bulkReject', 'reason', fv('bulkReject', 'reason', '') === el.dataset.id ? '' : el.dataset.id); render(); },
