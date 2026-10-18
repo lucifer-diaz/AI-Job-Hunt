@@ -201,6 +201,9 @@ input[type=range]{width:100%;accent-color:var(--brand)}
 .lrow.click{cursor:pointer}
 .lrow.click:hover{background:#fcfcff}
 .lrow.sel{background:var(--brand-softer);border-left-color:var(--brand)}
+.star-btn{flex:none;border:0;background:none;padding:0 2px;font-size:18px;line-height:1;cursor:pointer;color:var(--faint)}
+.star-btn:hover{color:var(--warn)}
+.star-btn.on{color:#e0a136}
 .avatar{width:42px;height:42px;flex:none;border-radius:11px;background:var(--brand-soft);color:var(--brand-ink);display:grid;place-items:center;font-weight:700;font-size:14px}
 .avatar.lg{width:52px;height:52px;border-radius:13px;font-size:17px}
 .avatar.good{background:var(--good-soft);color:var(--good)}

@@ -256,7 +256,7 @@ def job_card(job: Job) -> dict:
         "resume_choice_id": job.resume_id, "resume_choice": job.resume_choice,
         "search_run_id": job.search_run_id, "application_id": app.id if app else None,
         "application_status": app.status if app else None, "stage": app.stage if app else None,
-        "rejection": rejection_card(job),
+        "rejection": rejection_card(job), "starred": bool(job.starred),
     }
 
 
@@ -1812,6 +1812,7 @@ APPROVAL_STATUS_FILTERS = {
     "waiting": lambda r: r["status"] == "tailored",
     "sent_back": lambda r: r["status"] in ("pending_approval", "rejected"),
     "approved": lambda r: r["status"] == "approved",
+    "starred": lambda r: r["starred"],
 }
 PACKET_SORTS = {
     "fit": lambda r: (r["fit"] is None, -(r["fit"] or 0), -r["id"]),
@@ -1968,7 +1969,8 @@ def approvals(q: str = "", min_fit: int = 0, min_review: int = 0, board: str = "
                      "waiting": job.status == "tailored",
                      "easy_apply": easy_apply(job, inputs.get(job.search_run_id)),
                      "approval_override": bool(app.approval_override) if app else False})
-    rows.sort(key=lambda r: (not r["waiting"], r["status"] == "approved"))
+    # Starred jobs lead the queue, then the ones waiting for a decision.
+    rows.sort(key=lambda r: (not r["starred"], not r["waiting"], r["status"] == "approved"))
     return filter_packet_rows(rows, q=q, min_fit=min_fit, min_review=min_review, board=board, status=status, sort=sort,
                               status_filters=APPROVAL_STATUS_FILTERS, with_facets=with_facets,
                               location=location, easy_apply_only=easy_apply_filter == "only")
@@ -2008,6 +2010,10 @@ def approval_detail(job_id: int, db: Session = Depends(get_user_db)):
 
 class NotesIn(BaseModel):
     notes: str = ""
+
+
+class StarIn(BaseModel):
+    starred: bool
 
 
 # Why a candidate turns a job down. The reason is optional: rejecting with none is one click, and the label is
@@ -2173,6 +2179,15 @@ def save_notes(job_id: int, payload: NotesIn, db: Session = Depends(get_user_db)
     app.notes = payload.notes
     db.commit()
     return {"ok": True}
+
+
+@router.put("/api/jobs/{job_id}/star")
+def star_job(job_id: int, payload: StarIn, db: Session = Depends(get_user_db)):
+    """Star or unstar a job. A bookmark for the person: no workflow state, ranking or task changes."""
+    job = get_job(db, job_id)
+    job.starred = payload.starred
+    db.commit()
+    return {"ok": True, "starred": job.starred}
 
 
 def packet_names(db: Session, job: Job, resume: ResumeVariant | None) -> dict[str, str]:

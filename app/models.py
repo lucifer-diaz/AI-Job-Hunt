@@ -504,6 +504,8 @@ class Job(Base):
     # QUEUED (it queued the job once) or DECLINED (the person cancelled a tailoring task for it). NULL = undecided;
     # only an undecided job is ever queued automatically.
     auto_tailor_status: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    # The person starred this job to come back to it (Approvals). A bookmark only: it changes no workflow state.
+    starred: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
 
     # Salary enrichment (app.services.compensation): posting salary plus the status of other sources.
     compensation: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)

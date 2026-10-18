@@ -118,4 +118,19 @@ describe('acting on several approvals at once', () => {
     expect(window.open).toHaveBeenCalledTimes(2);
     expect(document.getElementById('toast').textContent).toContain('Opened 1 of 2 postings');
   });
+
+  it('stars a job from the queue without selecting it, and puts the star back if saving fails', async () => {
+    const [star] = button('approval-star');
+    expect(star.textContent).toBe('☆');
+    await ui.A['approval-star']({ dataset: { id: '2' } }, { stopPropagation() {} });
+    const [, options] = fetchMock.mock.calls.find(([u]) => u.endsWith('/api/jobs/2/star'));
+    expect(JSON.parse(options.body)).toEqual({ starred: true });
+    expect(ui.D.approvals.find(q => q.id === 2).starred).toBe(true);
+    expect(ui.S.approvalJob).toBe(1);
+
+    fetchMock.mockImplementationOnce(async () => ({ ok: false, status: 500, text: async () => JSON.stringify({ detail: 'down' }) }));
+    await ui.A['approval-star']({ dataset: { id: '1' } }, { stopPropagation() {} });
+    expect(ui.D.approvals.find(q => q.id === 1).starred).toBeFalsy();
+    expect(ui.D.approval.job.starred).toBeFalsy();
+  });
 });
