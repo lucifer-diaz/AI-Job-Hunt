@@ -21,6 +21,9 @@ from app.services.lifecycle import WorkflowState as S
 from app.services.workflow import approve_job
 
 pytestmark = pytest.mark.strict_approval
+POSTING = ("Lead Python platform teams building services on Kubernetes and AWS. You will own the roadmap for our data "
+           "platform, mentor five engineers, and work with product to ship reliably. We look for experience with "
+           "FastAPI, distributed systems and a track record of leading delivery.")
 client = TestClient(app)
 
 
@@ -169,3 +172,76 @@ def test_a_new_tailoring_pass_after_a_revoked_approval_is_recorded_before_approv
     tail = _history(job_id)[-4:]
     assert tail == [("REVIEWED", "TAILORING", "reconcile"), ("TAILORING", "TAILORED", "reconcile"),
                     ("TAILORED", "REVIEWED", "reconcile"), ("REVIEWED", "READY_TO_APPLY", "approval")]
+
+
+# ───────────── a job held by a failed ranking: the way back (ranker.pipeline_status, POST /api/jobs/{id}/rank) ─────────────
+
+def failed_ranking_job() -> tuple[int, int]:
+    """A packet tailored and reviewed, whose later re-ranking (a profile change) failed its attempts."""
+    job_id, variant_id = job_with_packet(S.FAILED, status="pending_approval")
+    with SessionLocal() as db:
+        from sqlalchemy.orm.attributes import set_committed_value
+
+        job = db.get(Job, job_id)
+        set_committed_value(job, "previous_state", S.RANK_PENDING)
+        db.query(Job).filter(Job.id == job_id).update({"previous_state": S.RANK_PENDING, "fit_score": 84,
+                                                       "description": POSTING})
+        db.add(WorkflowTransition(job_id=job_id, user_id=job.user_id, from_state=S.RANK_PENDING, to_state=S.FAILED,
+                                  actor="ranker", reason="Ranking gave up after 3 attempt(s): EXTERNAL_SERVICE"))
+        db.commit()
+    return job_id, variant_id
+
+
+def test_a_failed_ranking_is_explained_on_the_job_with_the_way_back():
+    job_id, _ = failed_ranking_job()
+    pipeline = client.get(f"/api/jobs/{job_id}").json()["pipeline"]
+    assert pipeline["state"] == "FAILED" and pipeline["stage"] == "ranking" and pipeline["action"] == "rank"
+    assert pipeline["action_label"] == "Put back in ranking" and pipeline["approval_blocked"] is True
+    assert "gave up after 3 attempt" in pipeline["reason"]
+    assert client.get(f"/api/approvals/{job_id}").json()["pipeline"]["action"] == "rank"
+    refused = client.post(f"/api/jobs/{job_id}/approve")
+    assert refused.status_code == 409 and "Put back in ranking" in refused.json()["detail"]
+
+
+def test_putting_it_back_requeues_the_ranking_and_approval_opens_once_it_qualifies():
+    from app.models import JobRankingTask
+    from app.services.work_queue import transition
+
+    job_id, _ = failed_ranking_job()
+    out = client.post(f"/api/jobs/{job_id}/rank")
+    assert out.status_code == 202 and out.json()["queued"] == [job_id]
+    with SessionLocal() as db:
+        job = db.get(Job, job_id)
+        assert job.state is S.RANK_PENDING and job.attempt_count == 0 and job.status == "pending_approval"
+        assert db.scalar(select(func.count()).select_from(JobRankingTask)
+                         .where(JobRankingTask.job_id == job_id, JobRankingTask.status == "PENDING")) == 1
+    pipeline = client.get(f"/api/jobs/{job_id}").json()["pipeline"]
+    assert pipeline["title"] == "Being ranked" and pipeline["action"] is None
+    with SessionLocal() as db:  # the ranker's own moves when the new ranking qualifies it
+        job = db.get(Job, job_id)
+        for target in (S.RANKING, S.RANKED, S.QUALIFIED):
+            transition(db, job, target, actor="ranker", reason="test")
+        db.commit()
+    assert client.get(f"/api/jobs/{job_id}").json()["pipeline"] is None
+    assert client.post(f"/api/jobs/{job_id}/approve").status_code == 200
+    with SessionLocal() as db:
+        assert db.get(Job, job_id).state is S.READY_TO_APPLY
+
+
+def test_a_job_archived_by_ranking_offers_rank_again():
+    job_id, _ = job_with_packet(S.ARCHIVED, status="pending_approval")
+    with SessionLocal() as db:
+        db.query(Job).filter(Job.id == job_id).update({"previous_state": S.RANKED, "description": POSTING})
+        db.commit()
+    pipeline = client.get(f"/api/jobs/{job_id}").json()["pipeline"]
+    assert pipeline["action"] == "rank" and pipeline["action_label"] == "Rank again"
+    assert "Rank again" in client.post(f"/api/jobs/{job_id}/approve").json()["detail"]
+
+
+def test_a_held_job_without_a_description_is_sent_to_add_one():
+    job_id, _ = job_with_packet(S.FAILED, status="pending_approval")
+    with SessionLocal() as db:
+        db.query(Job).filter(Job.id == job_id).update({"previous_state": S.RANK_PENDING, "description": ""})
+        db.commit()
+    pipeline = client.get(f"/api/jobs/{job_id}").json()["pipeline"]
+    assert pipeline["action"] == "description" and pipeline["action_label"] == "Add description"

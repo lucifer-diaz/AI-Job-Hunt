@@ -1004,7 +1004,7 @@ def job_detail(job_id: int, db: Session = Depends(get_user_db)):
             "description_recovery": jd_recovery.status_of(db, job),
             "rank_pct": rank, "wizard": [{"label": l, "done": d, "meta": m} for l, d, m in steps],
             "gap_notes": gap_notes, "notes": app.notes if app else "",
-            "resume_id": resume.id if resume else None}
+            "resume_id": resume.id if resume else None, "pipeline": ranker.pipeline_status(db, job)}
 
 
 class JobUrlIn(BaseModel):
@@ -2014,7 +2014,8 @@ def approval_detail(job_id: int, db: Session = Depends(get_user_db)):
             {"label": "Reviewer threshold", "detail": f"{score:.0f} vs minimum {data['min_review_score']}", "state": "ok" if score >= data["min_review_score"] else "warn"},
         ]
     app = job.application
-    return {**data, "checklist": checklist, "notes": app.notes if app else "", "application_id": app.id if app else None,
+    return {**data, "checklist": checklist, "pipeline": ranker.pipeline_status(db, job),
+            "notes": app.notes if app else "", "application_id": app.id if app else None,
             "approval": {"override": bool(app.approval_override), "note": app.approval_note or ""} if app else None,
             "rejection_reasons": [{"id": key, "label": label} for key, label in REJECTION_REASONS.items()],
             "profile": {"name": profile.name, "headline": profile.headline, "location": profile.location},

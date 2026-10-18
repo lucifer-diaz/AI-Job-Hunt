@@ -1303,6 +1303,7 @@ function renderApprovalsBody(list) {
   <section class="card flush c-main">
     <div class="row between wrap gap12" style="padding:18px 22px;border-bottom:1px solid var(--line2)"><div><div style="font-size:17px;font-weight:600">${esc(job.title)} · ${esc(job.company)}</div><div class="small muted mt4">Fit ${fitTxt(job.fit)} · reviewer ${fitTxt(r?.reviewer_score)} · tailored ${esc(r?.generated || '')} · ${statusPill(job.status)}${list.find(x => x.id === job.id)?.easy_apply ? ` ${pill('Easy Apply', 'brand')}` : ''}</div></div>
       <div class="row gap8 wrap">${btn('Job details', 'open-job', { id: job.id })}${job.url ? `<a class="btn" href="${attr(job.url)}" target="_blank" rel="noopener">Open posting ↗</a>` : ''}${btn(label('reject', 'Reject', 'Rejecting…'), 'reject-open', { id: job.id }, 'ghost danger', isBusy('reject'))}${approved ? btn('Open apply kit', 'open-kit', { id: job.id }, 'good') : `${btn(label('revise', 'Needs revision', 'Sending back…'), 'revise', { id: job.id }, '', isBusy('revise'))}${btn(label('approve', below ? 'Approve anyway…' : 'Approve → apply kit', 'Approving…'), approveAct, { id: job.id }, 'good', isBusy('approve') || !r)}`}</div></div>
+    ${pipelineBanner({ ...job, pipeline: a.pipeline }, '12px 22px 0')}
     ${a.approval?.override ? `<div class="banner warn" style="margin:0 22px;display:block"><b>Approved below your reviewer minimum.</b>${a.approval.note ? ` ${esc(a.approval.note)}` : ''}</div>` : ''}
     ${S.rejecting === job.id ? renderRejectPicker(job, a) : ''}
     ${S.overriding === job.id ? renderApprovalOverride(job, a, r) : ''}
@@ -1567,6 +1568,20 @@ const KIND_DOT = { applied: '#5b4ae8', stage: '#0f9c86', note: '#c6cad8', call: 
 const rejectionBanner = j => !j.rejection ? ''
   : `<div class="banner warn" style="margin:0 24px;display:block"><b>Rejected ${esc(j.rejection.on)}</b> · ${esc(j.rejection.label)}${j.rejection.note ? ` — ${esc(j.rejection.note)}` : ''}</div>`;
 
+// Where a job is held in the workflow (ranker.pipeline_status) and the one action that puts it back. Approval is
+// refused while `approval_blocked`, so the banner says so where the person would try to approve.
+const pipelineBanner = (j, margin = '0 24px') => {
+  const p = j?.pipeline;
+  if (!p) return '';
+  const when = p.since ? ` · ${esc(fmtDay(p.since))}` : '';
+  const action = p.action === 'rank'
+    ? btn(label('pipeline' + j.id, p.action_label, 'Queueing…'), 'pipeline-rank', { id: j.id }, 'sm primary', isBusy('pipeline' + j.id))
+    : p.action === 'description' ? btn(p.action_label, 'open-job', { id: j.id }, 'sm primary') : '';
+  return `<div class="banner warn" data-pipeline="${attr(p.state)}" style="margin:${margin};display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap">
+    <div class="grow" style="min-width:220px"><b>${esc(p.title)}</b>${when}${p.approval_blocked ? ' · <span class="b">approval is on hold</span>' : ''}
+      <div class="small mt4">${esc(p.message)}</div>${p.reason ? `<div class="xs muted mt4" title="${attr(p.reason)}">Last step: ${esc(p.reason.length > 160 ? p.reason.slice(0, 160) + '…' : p.reason)}</div>` : ''}</div>${action}</div>`;
+};
+
 // The resume a job is ranked and tailored with (Job.resume_id / resume_choice): auto = the best-tagged resume
 // (app.services.resume_matching), active = always the active resume, or one specific version.
 const resumeLabel = r => `${r.name}${r.roles?.length ? ` — ${r.roles.slice(0, 2).join(', ')}${r.roles.length > 2 ? '…' : ''}` : ''}${r.is_active ? ' (active)' : ''}`;
@@ -1695,6 +1710,7 @@ function renderJobModal() {
           : btn('Tailor resume', 'modal-tailor', { id: j.id }, 'primary')}${btn('Close', 'close-job')}</div></div>
       <div class="wizard">${j.wizard.map((w, i) => `<div class="${w.done ? 'done' : i === hereIdx ? 'here' : ''}"><div class="row gap6"><span class="m">${w.done ? '✓' : i + 1}</span><span class="small b" style="color:${w.done ? 'var(--ink)' : i === hereIdx ? 'var(--brand-ink)' : 'var(--faint)'}">${w.label}</span></div><div class="xs muted mt4">${esc(i === hereIdx && !w.done ? 'next step' : w.meta)}</div></div>`).join('')}</div></div>
     ${rejectionBanner(j)}
+    ${pipelineBanner(j)}
     ${j.domain_match === 'NOT_MATCHING' ? `<div class="banner warn" style="margin:0 24px;display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span class="grow"><b>Hidden: not matching.</b> ${esc(j.domain_reason || 'Outside your domain')} — not ranked, no model used.</span>${btn(label('keep' + j.id, 'Keep this job', 'Keeping…'), 'domain-keep', { id: j.id }, 'sm soft', isBusy('keep' + j.id))}</div>` : ''}
     <div class="split gap16" style="padding:18px 24px 24px">
       <section class="card flush" style="flex:1 1 420px;min-width:0"><div class="tabs under">${[['description', 'Description'], ['structured', 'Structured JD'], ['requirements', 'Requirements map'], ['insights', 'Insights'], ['notes', 'Notes']].map(([id, t]) => `<button class="${S.jobTab === id ? 'on' : ''}" data-act="job-tab" data-id="${id}">${t}</button>`).join('')}</div>${tab}</section>
@@ -2176,6 +2192,20 @@ const A = {
     if (recoveryActive(out)) watchRecovery(id);
     return out;
   }, out => out.queued ? 'Recovering the description from the posting…' : out.message),
+  // Put a held job back where it stopped (ranker.pipeline_status → POST /api/jobs/{id}/rank), then refresh what is on
+  // screen once the new ranking is in.
+  'pipeline-rank': el => busy('pipeline' + el.dataset.id, async () => {
+    const id = Number(el.dataset.id);
+    const out = await api(`/api/jobs/${id}/rank`, { method: 'POST' });
+    const refresh = async () => {
+      if (S.jobOpen === id) D.jobModal = await api(`/api/jobs/${id}`).catch(() => D.jobModal);
+      if (S.approvalJob === id) D.approval = await api(`/api/approvals/${id}`).catch(() => D.approval);
+      render();
+    };
+    await refresh();
+    watchRanking(out.queued).then(refresh);
+    return out;
+  }, out => out.queued.length ? 'Back in the ranking queue — approval opens once it qualifies again' : (out.skipped[0]?.reason || 'Nothing to queue')),
   'rank-job': el => busy('rank' + el.dataset.id, async () => {
     const out = await api(`/api/jobs/${el.dataset.id}/rank`, { method: 'POST' });
     watchRanking(out.queued);

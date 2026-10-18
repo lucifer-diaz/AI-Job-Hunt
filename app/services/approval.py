@@ -111,9 +111,19 @@ def path_to_ready(db: Session, job: Job, variant: ResumeVariant) -> list[tuple[S
 
 
 def refusal_reason(job: Job) -> str:
+    """Why approval is refused, and what puts the job back (the action ranker.pipeline_status offers on its screens)."""
+    from app.services.lifecycle import REOPENABLE_ARCHIVE_SOURCES
+
     state = parse_state(job.state)
+    previous = parse_state(job.previous_state) if job.previous_state else None
     if state in (S.RANK_PENDING, S.RANKING, S.RANKED):
         return "This job is being ranked again; approve it once the new ranking is in"
+    if state is S.FAILED and previous in (S.RANK_PENDING, S.RANKING):
+        return ("This job's last ranking failed, so it cannot be approved yet. Use \"Put back in ranking\" on the "
+                "job and approve it once it qualifies again")
+    if state is S.ARCHIVED and previous in REOPENABLE_ARCHIVE_SOURCES:
+        return ("The ranking policy archived this job, so it cannot be approved. Use \"Rank again\" on the job "
+                "first")
     return (f"This job's workflow state is {state.value}, which cannot move to ready-to-apply. "
             "Re-rank or restore the job first")
 
