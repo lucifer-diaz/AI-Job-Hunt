@@ -157,3 +157,71 @@ def test_one_account_cannot_reject_anothers_job(owner):
     assert reject(job_id, reason="company").status_code == 404
     with SessionLocal() as db:
         assert db.get(Job, job_id).rejected_at is None
+
+
+# ───────────── several at once ─────────────
+
+def bulk(action, ids, **body):
+    return client.post("/api/approvals/bulk", json={"action": action, "job_ids": ids, **body})
+
+
+def test_several_jobs_can_be_rejected_at_once(owner):
+    first, second = make_job(owner), make_job(owner, status="approved")
+    out = bulk("reject", [first, second], reason="location", notes="Onsite only").json()
+    assert out["done"] == [first, second] and out["skipped"] == []
+    with SessionLocal() as db:
+        for job_id in (first, second):
+            job = db.get(Job, job_id)
+            assert job.status == "dismissed" and job.rejection_reason == "location"
+            assert job.rejection_note == "Onsite only" and job.state is S.SKIPPED
+    assert not {first, second} & {row["id"] for row in client.get("/api/approvals").json()}
+
+
+def test_one_job_that_cannot_be_rejected_never_blocks_the_rest(owner):
+    """A submitted application, another account's job or a missing one is skipped with the reason."""
+    theirs = make_job(make_user(SessionLocal, email=f"other-{uuid.uuid4().hex[:8]}@example.com"))
+    sent = make_job(owner, status="applied", state=S.APPLIED, applied=True)
+    fine = make_job(owner)
+    out = bulk("reject", [sent, theirs, fine, 0]).json()
+    assert out["done"] == [fine]
+    skipped = {row["id"]: row["reason"] for row in out["skipped"]}
+    assert set(skipped) == {sent, theirs, 0}
+    assert skipped[theirs] == "Job not found"
+    with SessionLocal() as db:
+        assert db.get(Job, sent).status == "applied" and db.get(Job, theirs).rejected_at is None
+
+
+def test_a_bulk_reject_checks_its_reason_before_touching_anything(owner):
+    job_id = make_job(owner)
+    assert bulk("reject", [job_id], reason="nope").status_code == 422
+    assert bulk("reject", []).status_code == 422
+    assert bulk("archive", [job_id]).status_code == 422
+    with SessionLocal() as db:
+        assert db.get(Job, job_id).rejected_at is None
+
+
+def test_several_packets_can_be_sent_back_for_revision(owner):
+    first, second = make_job(owner), make_job(owner, status="approved")
+    already = make_job(owner, status="pending_approval")
+    out = bulk("revise", [first, second, already]).json()
+    assert out["done"] == [first, second]
+    assert out["skipped"] == [{"id": already, "title": "Lead Software Engineer", "reason": "Already sent back for revision"}]
+    with SessionLocal() as db:
+        for job_id in (first, second):
+            assert db.get(Job, job_id).status == "pending_approval"
+            assert db.scalar(select(Application).where(Application.job_id == job_id)).status == "pending_approval"
+
+
+def test_bulk_approval_never_waives_the_reviewer_minimum(owner):
+    cleared = make_job(owner)  # reviewer 80
+    low = make_job(owner)
+    with SessionLocal() as db:
+        db.scalar(select(ResumeVariant).where(ResumeVariant.job_id == low)).reviewer_score = 1
+        db.commit()
+    out = bulk("approve", [cleared, low]).json()
+    assert out["done"] == [cleared]
+    assert len(out["skipped"]) == 1 and "below your minimum" in out["skipped"][0]["reason"]
+    with SessionLocal() as db:
+        assert db.get(Job, cleared).status == "approved" and db.get(Job, low).status == "tailored"
+        approved = db.scalar(select(Application).where(Application.job_id == cleared))
+        assert approved.status == "approved" and not approved.approval_override

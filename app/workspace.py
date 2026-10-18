@@ -110,6 +110,7 @@ from app.services.work_queue import transition
 from app.services.workflow import (
     AWAITING_TAILORING_STATUSES,
     NEEDS_RETAILOR,
+    approve_job,
     draft_followup,
     followup_days,
     get_profile,
@@ -1945,13 +1946,16 @@ def answers_for(db: Session) -> list[KnowledgeAnswer]:
     return db.scalars(select(KnowledgeAnswer).order_by(desc(KnowledgeAnswer.verified), desc(KnowledgeAnswer.use_count))).all()
 
 
+APPROVAL_QUEUE_STATUSES = ("tailored", "pending_approval", "approved", "rejected")
+
+
 @router.get("/api/approvals")
 def approvals(q: str = "", min_fit: int = 0, min_review: int = 0, board: str = "all", location: str = "all",
               status: str = "all", sort: str = "default", easy_apply_filter: str = Query("all", alias="easy_apply"),
               with_facets: bool = False, db: Session = Depends(get_user_db)):
     if easy_apply_filter not in ("all", "", "only"):
         raise HTTPException(422, f"Unknown easy_apply filter: {easy_apply_filter}")
-    jobs = db.scalars(select(Job).where(Job.status.in_(("tailored", "pending_approval", "approved", "rejected")))
+    jobs = db.scalars(select(Job).where(Job.status.in_(APPROVAL_QUEUE_STATUSES))
                       .order_by(desc(Job.id))).all()
     inputs = run_inputs(db, jobs)
     rows = []
@@ -2039,24 +2043,21 @@ def rejection_card(job: Job) -> dict | None:
             "on": day_label(job.rejected_at)}
 
 
-@router.post("/api/jobs/{job_id}/reject")
-def reject_job(job_id: int, payload: RejectionIn, db: Session = Depends(get_user_db)):
-    """Turn a job down from the approval queue: it leaves the queue and the pipeline, with an optional reason.
-
-    This rejects the job, not the packet — use /revision to send a packet back for another tailoring pass. The
-    tailored resume is kept, so a restored job still has its work.
-    """
-    job = get_job(db, job_id)
-    reason = payload.reason.strip().lower()
+def check_rejection_reason(reason: str) -> str:
+    reason = reason.strip().lower()
     if reason and reason not in REJECTION_REASONS:
-        raise HTTPException(422, f"Unknown rejection reason '{payload.reason}'")
+        raise HTTPException(422, f"Unknown rejection reason '{reason}'")
+    return reason
+
+
+def reject_one(db: Session, job: Job, reason: str, notes: str) -> None:
+    """Reject one job without committing. `reason` is already checked; learning runs once, in the caller."""
     if job.status in SUBMITTED_STATUSES:
         raise HTTPException(409, "This application has already been submitted; record the outcome in the tracker")
-    job.rejection_reason, job.rejection_note = reason or None, payload.notes.strip() or None
+    job.rejection_reason, job.rejection_note = reason or None, notes.strip() or None
     job.rejected_at = job.triaged_at = utcnow()
     job.status = "dismissed"
     feedback_learning.record(db, job, "REJECTED")
-    feedback_learning.after_feedback(db, job.user_id)
     # The workflow state follows where the lifecycle allows it (app.services.lifecycle). A job whose state has
     # not caught up with the legacy status is still rejected — the queue is what the user acted on.
     if can_transition(job.state, S.SKIPPED, previous_state=job.previous_state):
@@ -2065,6 +2066,18 @@ def reject_job(job_id: int, payload: RejectionIn, db: Session = Depends(get_user
     application = job.application
     if application is not None and application.applied_at is None:
         application.status = "rejected"
+
+
+@router.post("/api/jobs/{job_id}/reject")
+def reject_job(job_id: int, payload: RejectionIn, db: Session = Depends(get_user_db)):
+    """Turn a job down from the approval queue: it leaves the queue and the pipeline, with an optional reason.
+
+    This rejects the job, not the packet — use /revision to send a packet back for another tailoring pass. The
+    tailored resume is kept, so a restored job still has its work.
+    """
+    job = get_job(db, job_id)
+    reject_one(db, job, check_rejection_reason(payload.reason), payload.notes)
+    feedback_learning.after_feedback(db, job.user_id)
     db.commit()
     db.refresh(job)
     return {"ok": True, "job": job_card(job), "rejection": rejection_card(job)}
@@ -2076,18 +2089,78 @@ def rejection_reasons():
     return {"reasons": [{"id": key, "label": label} for key, label in REJECTION_REASONS.items()]}
 
 
-@router.post("/api/jobs/{job_id}/revision")
-def send_back(job_id: int, payload: NotesIn, db: Session = Depends(get_user_db)):
-    job = get_job(db, job_id)
+def send_back_one(db: Session, job: Job, notes: str | None) -> None:
+    """Send one packet back for revision without committing. `notes=None` keeps the notes already on file."""
     if not job.resumes:
         raise HTTPException(400, "There is no tailored packet to send back")
     app = job.application or Application(job_id=job.id)
     db.add(app)
     app.status = "pending_approval"
-    app.notes = payload.notes
+    if notes is not None:
+        app.notes = notes
     job.status = "pending_approval"
+
+
+@router.post("/api/jobs/{job_id}/revision")
+def send_back(job_id: int, payload: NotesIn, db: Session = Depends(get_user_db)):
+    job = get_job(db, job_id)
+    send_back_one(db, job, payload.notes)
     db.commit()
     return {"ok": True, "status": job.status}
+
+
+# What the approval queue can do to several jobs at once. Approving in bulk only approves packets that cleared
+# your reviewer minimum: waiving it stays a deliberate, one-packet decision (POST /api/jobs/{id}/approve).
+BULK_APPROVAL_LIMIT = 200
+
+
+class BulkApprovalIn(BaseModel):
+    action: Literal["reject", "revise", "approve"]
+    job_ids: list[int] = Field(min_length=1, max_length=BULK_APPROVAL_LIMIT)
+    reason: str = ""  # reject only: one of REJECTION_REASONS, or empty
+    notes: str = Field(default="", max_length=2000)  # reject only
+
+
+@router.post("/api/approvals/bulk")
+def bulk_approval(payload: BulkApprovalIn, db: Session = Depends(get_user_db)):
+    """Reject, send back or approve several queued jobs. Each job is decided on its own: one that cannot take the
+    action is skipped with the reason, and never fails the rest."""
+    reason = check_rejection_reason(payload.reason) if payload.action == "reject" else ""
+    min_score = settings_for(db).min_review_score
+    done, skipped = [], []
+    for job_id in dict.fromkeys(payload.job_ids):
+        job = db.get(Job, job_id)  # the session is the account's: another account's job is simply not found
+        try:
+            if job is None:
+                raise HTTPException(404, "Job not found")
+            if job.status not in APPROVAL_QUEUE_STATUSES:
+                raise HTTPException(409, "Not in the approval queue")
+            if payload.action == "reject":
+                reject_one(db, job, reason, payload.notes)
+            elif payload.action == "revise":
+                if job.status == "pending_approval":
+                    raise HTTPException(409, "Already sent back for revision")
+                send_back_one(db, job, None)
+            else:
+                if job.status == "approved":
+                    raise HTTPException(409, "Already approved")
+                latest = max(job.resumes, key=lambda item: item.version) if job.resumes else None
+                if latest is None or latest.reviewer_score is None:
+                    raise HTTPException(400, "Not reviewed yet")
+                if latest.reviewer_score < min_score:
+                    raise HTTPException(400, f"Reviewer scored {latest.reviewer_score:.0f}, below your minimum of "
+                                             f"{min_score}; approve it on its own to waive the minimum")
+                approve_job(db, job)
+                feedback_learning.record(db, job, "APPROVED")
+            db.commit()
+            done.append(job_id)
+        except HTTPException as exc:
+            db.rollback()
+            skipped.append({"id": job_id, "title": job.title if job else "", "reason": str(exc.detail)})
+    if done and payload.action in ("reject", "approve"):
+        feedback_learning.after_feedback(db, db.info["user_id"])
+        db.commit()
+    return {"ok": True, "action": payload.action, "done": done, "skipped": skipped}
 
 
 @router.put("/api/jobs/{job_id}/notes")
