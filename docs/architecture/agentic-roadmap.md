@@ -818,7 +818,10 @@ Allowed status: NOT_STARTED, PLANNING, IN_PROGRESS, IN_REVIEW, MERGED, BLOCKED, 
     job as QUALIFIED at approval, like `ranked_before_tailoring`.
   - Full runs, each in a clean checkout (no local `.env`) next to `main` @ `fbb3fd7`:
     - PostgreSQL: 2299 passed, 7 failed. The same 7 fail on `main`.
-    - SQLite: see the PR.
+    - SQLite: 2150 passed, 0 failed (`main`: 2091 passed).
+    - One intermittent PostgreSQL failure:
+      `test_agents_postgres::test_the_api_runs_interrupts_and_resumes_the_pilot_for_its_owner_only` failed in 1 of 3
+      full runs, the one run alongside the SQLite suite. It passed 3 of 3 times with the new graph suites, and alone.
     - vitest: 330 passed, 2 failed (`overview_outcomes`, as on `main`).
     - Migrations: `test_migrations.py` upgrade, downgrade and empty diff pass.
     - Lint: ruff level with `main`.
