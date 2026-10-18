@@ -68,6 +68,9 @@ EDITABLE: dict[str, Editable] = {e.name: e for e in (
     Editable("qualification_shadow_paid_daily_limit", "qualification", "Shadow model calls per account per day",
              "In shadow mode: how many jobs without a ranking may be ranked again by the model, only to compare. "
              "0 (the default) never spends a model call on shadow runs.", 0, 500),
+    Editable("tailor_concurrency", "tailoring", "Side by side",
+             "How many packets are tailored at once across every account, and the most one account may ask for "
+             "(each account picks up to this).", 1, 16),
     Editable("rag_index_interval_minutes", "indexing", "Run every (minutes)",
              "How often the retrieval indexer looks for work. 0 turns it off for every account; it never runs while "
              "RAG_VECTOR_ENABLED is off.", 0, 1440, "rag_index"),

@@ -226,6 +226,17 @@ def test_the_account_ceiling_follows_the_servers_override(user_id, signed_in):
     assert user_settings.processing_maximums()["ranking_concurrency"] == 2
 
 
+def test_an_admin_can_raise_the_tailoring_ceiling(user_id, signed_in):
+    from app.services import user_settings, workers
+
+    signed_in(user_id, admin=True).put("/api/workers/server-settings",
+                                       json={"values": {"tailor_concurrency": 4}}).raise_for_status()
+    assert user_settings.processing_maximums()["tailoring_concurrency"] == 4
+    assert workers.scheduler_facts(None, None)["concurrency"] == 4
+    assert tailor_tasks.build_worker(SessionLocal).concurrency == 4
+    assert tailor_tasks.TailorWorker(SessionLocal, concurrency=1).concurrency == 1  # a fixed limit stays fixed
+
+
 def test_a_running_pass_follows_changed_limits_without_a_restart(monkeypatch):
     import asyncio
 

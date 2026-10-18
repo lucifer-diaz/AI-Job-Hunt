@@ -47,7 +47,7 @@ from app.models import (
     RagIndexVersion,
     TailorTask,
 )
-from app.services import backoff, redaction, worker_settings
+from app.services import backoff, redaction, server_settings, worker_settings
 from app.services.lifecycle import STOPPED_BY_USER, WorkflowState
 from app.settings import get_settings
 
@@ -1022,7 +1022,8 @@ def scheduler_facts(scheduler: Any, job: str | None) -> dict[str, Any] | None:
     if job is None:
         settings = get_settings()
         return {"name": "tailor_worker", "enabled": bool(settings.tailor_worker_enabled), "interval_minutes": None,
-                "poll_seconds": 2, "concurrency": settings.tailor_concurrency, "running": None, "next_run_at": None,
+                "poll_seconds": 2, "concurrency": server_settings.value("tailor_concurrency"), "running": None,
+                "next_run_at": None,
                 "last_finished_at": None, "last_status": None}
     if scheduler is None:
         return None

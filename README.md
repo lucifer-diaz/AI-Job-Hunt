@@ -1130,7 +1130,9 @@ scheduled before the cooldown ends.
 `RANKING_CONCURRENCY` (5) and `TAILOR_CONCURRENCY` (2) are the server's ceilings. Each account also chooses its
 own limits in **Running workers → Settings → Processing limits**: how many of its jobs may be ranked at once,
 and how many packets may be tailored at once. An account can only set a limit at or below the server ceiling, so
-one account with hundreds of queued jobs cannot take the whole machine.
+one account with hundreds of queued jobs cannot take the whole machine. An admin can change both ceilings without a restart in
+**Running workers → Settings** (Ranking: *Most per account*; Tailoring: *Side by side*, which is also how many packets
+the tailoring worker runs at once across every account).
 
 The same group sets **how often** ranking runs for an account: 0 (the default) means every time the server
 looks, which is `RANKING_INTERVAL_MINUTES`; a larger number spreads the same queue over a longer stretch —
