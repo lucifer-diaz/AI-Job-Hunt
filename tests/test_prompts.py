@@ -512,3 +512,36 @@ def test_tailoring_accepts_null_for_highlights_and_role_updates_but_not_an_empty
     with pytest.raises(ValidationError):
         TailoringResult.model_validate({"summary": None, "skills_order": [], "role_updates": None,
                                         "highlights": None, "selected_evidence_ids": []})
+
+
+def _role(index: int, ids: list[int]) -> dict:
+    return {"role_index": index, "bullets": [{"text": f"Delivered outcome {i}.", "evidence_ids": [i]} for i in ids]}
+
+
+def test_a_long_tailored_resume_is_not_rejected_for_citing_many_facts():
+    """Regression: seven roles of bullets cite more than 20 facts, and selected_evidence_ids used to be capped at 20,
+    which failed most Tailor answers whole. The list is now derived from the cited units."""
+    ids = list(range(1, 31))
+    result = TailoringResult.model_validate({
+        "summary": {"text": "x" * 1000, "evidence_ids": ids[:25]}, "skills_order": ["Python"],
+        "role_updates": [_role(r, ids[r * 5:(r + 1) * 5]) for r in range(6)], "highlights": [],
+        "selected_evidence_ids": ids})
+    assert result.selected_evidence_ids == ids
+    omitted = TailoringResult.model_validate({"skills_order": [], "role_updates": [_role(0, [4, 2]), _role(1, [9])]})
+    assert omitted.selected_evidence_ids == [2, 4, 9], "derived from the units when the model leaves it out"
+    with pytest.raises(ValidationError):  # bullets keep their own length limit
+        TailoringResult.model_validate({"role_updates": [{"role_index": 0, "bullets": [
+            {"text": "x" * 700, "evidence_ids": [1]}]}]})
+    with pytest.raises(ValidationError):  # a summary still has a bound
+        TailoringResult.model_validate({"summary": {"text": "x" * 1600, "evidence_ids": [1]}})
+    with pytest.raises(ValidationError):  # other workers keep their cap
+        RankingResult.model_validate({"relevant_evidence_ids": ids})
+
+
+def test_a_role_with_no_bullets_is_no_update_not_an_error():
+    """The prompt says a role with max_bullets 0 gets no bullets; models send it as an empty list."""
+    result = TailoringResult.model_validate({"skills_order": ["Python"], "role_updates": [
+        _role(0, [1]), {"role_index": 1, "bullets": []}, {"role_index": 2, "bullets": None}]})
+    assert [u.role_index for u in result.role_updates] == [0]
+    with pytest.raises(ValidationError):  # empty role updates alone still change nothing
+        TailoringResult.model_validate({"skills_order": [], "role_updates": [{"role_index": 1, "bullets": []}]})
