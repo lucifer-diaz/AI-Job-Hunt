@@ -31,8 +31,14 @@ def main() -> int:
     parser.add_argument("--database-url", required=True, help="a disposable PostgreSQL database (name contains 'test')")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
-    if "test" not in args.database_url.rsplit("/", 1)[-1]:
-        parser.error("use a disposable database whose name contains 'test'")
+    from sqlalchemy.engine import make_url
+
+    try:  # the database name, also for a socket URL (…/name?host=/tmp), whose last "/" is in the query
+        url = make_url(args.database_url)
+    except Exception:  # noqa: BLE001
+        parser.error("--database-url is not a database URL")
+    if url.get_backend_name() != "postgresql" or "test" not in (url.database or ""):
+        parser.error("use a disposable PostgreSQL database whose name contains 'test'")
     os.environ.update({"DATABASE_URL": args.database_url, "LLM_PROVIDER": "mock", "AGENT_GRAPHS_ENABLED": "true",
                        "RAG_RETRIEVAL_MODE": "off", "RAG_VECTOR_ENABLED": "false", "AGENT_LANGSMITH_EXPORT_ENABLED":
                        "false", "SCHEDULER_ENABLED": "false"})
