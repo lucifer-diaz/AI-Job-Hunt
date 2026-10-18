@@ -116,9 +116,8 @@ def processing_maximums() -> dict[str, int]:
     """The server's ceilings — the most an account is allowed to ask for."""
     from app.services import server_settings
 
-    settings = get_settings()
     return {"ranking_concurrency": max(1, server_settings.value("ranking_concurrency")),
-            "tailoring_concurrency": max(1, settings.tailor_concurrency)}
+            "tailoring_concurrency": max(1, server_settings.value("tailor_concurrency"))}
 
 
 def _bounded(value: Any, ceiling: int) -> int:
