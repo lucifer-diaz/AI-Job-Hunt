@@ -25,7 +25,14 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import Job, ResumeVariant, TailorTask
-from app.services import backoff, context_builder, threads, user_settings, worker_settings
+from app.services import (
+    backoff,
+    context_builder,
+    server_settings,
+    threads,
+    user_settings,
+    worker_settings,
+)
 from app.services.user_settings import execution_mode_for, settings_for
 from app.services.workflow import (
     NEEDS_RETAILOR,
@@ -330,13 +337,18 @@ def run_pending(sessions: SessionFactory, worker_id: str = "inline", lease_secon
 
 
 class TailorWorker:
-    """Polls for queued tailoring tasks and runs up to `concurrency` of them at once, each in a thread."""
+    """Polls for queued tailoring tasks and runs up to `concurrency` of them at once, each in a thread.
 
-    def __init__(self, sessions: SessionFactory, *, enabled: bool = True, concurrency: int = 2,
+    Without a fixed `concurrency` the limit is the server setting (TAILOR_CONCURRENCY, or an admin's override in
+    Running workers → Settings), re-read on every poll, so a change applies without a restart. Lowering it never stops
+    a running task: the worker just claims no more until enough have finished.
+    """
+
+    def __init__(self, sessions: SessionFactory, *, enabled: bool = True, concurrency: int | None = None,
                  poll_seconds: float = 2.0, lease_seconds: int = 900):
         self.sessions = sessions
         self.enabled = enabled
-        self.concurrency = max(1, concurrency)
+        self._concurrency = None if concurrency is None else max(1, concurrency)
         self.poll_seconds = poll_seconds
         self.lease_seconds = lease_seconds
         self.worker_id = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:6]}"
@@ -344,6 +356,12 @@ class TailorWorker:
         self._inflight: set[asyncio.Task] = set()
         self._wake: asyncio.Event | None = None
         self._event_loop: asyncio.AbstractEventLoop | None = None
+
+    @property
+    def concurrency(self) -> int:
+        if self._concurrency is not None:
+            return self._concurrency
+        return max(1, server_settings.value("tailor_concurrency"))  # cached briefly, never raises
 
     async def start(self) -> None:
         if self._loop_task is None:
@@ -376,7 +394,9 @@ class TailorWorker:
     async def _loop(self) -> None:
         while True:
             try:
-                while len(self._inflight) < self.concurrency:
+                # Read off the event loop: a cache miss reads the server_settings table.
+                limit = await threads.run_io(lambda: self.concurrency)
+                while len(self._inflight) < limit:
                     task_id = await threads.run_io(claim_next, self.sessions, self.worker_id, self.lease_seconds)
                     if task_id is None:
                         break
@@ -400,4 +420,4 @@ def build_worker(sessions: SessionFactory | None = None) -> TailorWorker:
 
     settings = get_settings()
     return TailorWorker(sessions or SessionLocal, enabled=settings.tailor_worker_enabled,
-                        concurrency=settings.tailor_concurrency, lease_seconds=settings.tailor_lease_seconds)
+                        lease_seconds=settings.tailor_lease_seconds)
