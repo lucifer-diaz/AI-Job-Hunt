@@ -133,4 +133,12 @@ describe('acting on several approvals at once', () => {
     expect(ui.D.approvals.find(q => q.id === 1).starred).toBeFalsy();
     expect(ui.D.approval.job.starred).toBeFalsy();
   });
+
+  it('labels an approved job whose posting closed', () => {
+    ui.D.approvals = [row(1, { status: 'approved', posting_closed: { at: '2026-10-18T09:00:00', ago: '1d ago', reason: 'JOB_CLOSED' } }), row(2)];
+    ui.render();
+    const rows = [...view().querySelectorAll('[data-act="select-approval"]')];
+    expect(rows[0].textContent).toContain('posting closed');
+    expect(rows[1].textContent).not.toContain('posting closed');
+  });
 });

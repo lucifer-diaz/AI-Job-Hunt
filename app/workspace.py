@@ -257,6 +257,9 @@ def job_card(job: Job) -> dict:
         "search_run_id": job.search_run_id, "application_id": app.id if app else None,
         "application_status": app.status if app else None, "stage": app.stage if app else None,
         "rejection": rejection_card(job), "starred": bool(job.starred),
+        # The listing check found the posting closed but kept the job (approved): app.services.job_removal.
+        "posting_closed": ({"at": job.posting_closed_at.isoformat(), "ago": ago(job.posting_closed_at),
+                            "reason": job.posting_closed_reason} if job.posting_closed_at else None),
     }
 
 

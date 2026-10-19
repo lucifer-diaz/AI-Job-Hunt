@@ -400,15 +400,22 @@ async def jd_recovery_job(ctx: JobContext) -> dict[str, Any]:
 
 
 async def listing_check(ctx: JobContext) -> dict[str, Any]:
-    """Re-read a bounded batch of postings over plain HTTP and delete the ones that no longer exist.
+    """Re-read a bounded batch of postings (every job up to approval, about once a day) and delete the ones that no
+    longer exist or no longer take applications; approved jobs are labelled instead.
 
-    Never the browser or a model, and only a removed or closed page deletes: blocked pages, timeouts and server
-    errors change nothing (app.services.job_removal)."""
+    HTTP first, the shared browser only when HTTP found nothing readable — never after a login wall, a challenge or
+    a 429 — and never a model. Only a removed or closed page deletes: blocked pages, timeouts and server errors change
+    nothing (app.services.job_removal)."""
+    from app.infrastructure.browser import get_browser_service
     from app.services import job_removal
 
     if not get_settings().auto_delete_removed_jobs:
         return skipped("Removed postings are kept (AUTO_DELETE_REMOVED_JOBS=false)")
-    summary = await job_removal.check_listings(ctx.sessions, ctx.now)
+    browser = get_browser_service()
+    try:
+        summary = await job_removal.check_listings(ctx.sessions, ctx.now, browser=browser)
+    finally:
+        await browser.release_idle()
     if not summary["checked"]:
         return skipped("No postings due for a check", **summary)
     return summary
@@ -833,7 +840,7 @@ JOBS: list[JobSpec] = [
     JobSpec("jd_recovery", "Job description recovery", "jd_recovery_interval_minutes", jd_recovery_job,
             "Reads missing job descriptions from their posting URLs: HTTP first, the browser only when needed."),
     JobSpec("listing_check", "Removed posting check", "listing_check_interval_minutes", listing_check,
-            "Re-reads postings over HTTP and deletes the ones that no longer exist (applied jobs are kept)."),
+            "Re-reads postings daily (HTTP, then the browser when needed) and deletes closed ones (approved jobs are kept)."),
     JobSpec("compensation", "Salary enrichment", "compensation_interval_minutes", compensation,
             "Records the salary stated in each posting."),
     JobSpec("job_insights", "Job insights", "job_insights_interval_minutes", job_insights,

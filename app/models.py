@@ -493,6 +493,10 @@ class Job(Base):
     domain_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     # When the posting URL was last confirmed to still exist (app.services.job_removal.listing_check).
     listing_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # The listing check found the posting closed but kept the job because the person approved or applied to it.
+    # Cleared when a later check finds it open again.
+    posting_closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    posting_closed_reason: Mapped[str | None] = mapped_column(String(40), nullable=True)
     # The resume ranking, tailoring and review use for this job. NULL = the account's active resume.
     resume_id: Mapped[int | None] = mapped_column(
         ForeignKey("resumes.id", ondelete="SET NULL", name="fk_jobs_resume_id"), nullable=True, index=True)

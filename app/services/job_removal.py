@@ -4,9 +4,14 @@
       → remove_posting(): tombstone (removed_postings) + a Monitoring → Logs line + delete the job
       → the next search that returns the same posting skips it (is_removed)
 
-Jobs the person approved or applied to are never deleted: the log says the posting closed and the job stays. Only a
-page that says the posting is gone counts — a login wall, a challenge, a timeout or a server error never deletes
-anything. With AUTO_DELETE_REMOVED_JOBS=false removed postings are only marked (the recovery task says so).
+The listing check re-reads every job up to approval about once a day: HTTP first, then one ordinary rendering in the
+shared browser when HTTP found nothing readable (never after a login wall, a challenge or a 429). A page that still
+shows the posting but says it no longer takes applications counts as closed.
+
+Jobs the person approved or applied to are never deleted: the log says the posting closed, the job stays and is
+labelled (posting_closed_at). Only a page that says the posting is gone counts — a login wall, a challenge, a timeout
+or a server error never deletes anything. With AUTO_DELETE_REMOVED_JOBS=false removed postings are only marked (the
+recovery task says so).
 """
 from __future__ import annotations
 
@@ -28,8 +33,9 @@ from app.models import (
     JobInsightTask,
     JobRankingTask,
     RemovedPosting,
+    TailorTask,
 )
-from app.services import system_log
+from app.services import jd_quality, system_log, threads
 from app.settings import get_settings
 
 # Jobs the person has committed to: never deleted automatically.
@@ -73,6 +79,8 @@ def remove_posting(db: Session, job: Job, reason: str, *, actor: str, now: datet
     if not get_settings().auto_delete_removed_jobs:
         return "disabled"
     if protected(db, job):
+        if job.posting_closed_at is None:
+            job.posting_closed_at, job.posting_closed_reason = now, reason[:40]
         system_log.log_event(category="WORKFLOW", level="WARNING", operation="posting_removed", workflow="DISCOVERY",
                              user_id=job.user_id, entity_type="job", entity_id=job.id, status="kept",
                              message=f"Posting for {job.title} at {job.company} is gone; kept because you approved "
@@ -107,61 +115,113 @@ def delete_job(db: Session, job: Job) -> None:
 
 # ───────────── the listing check ─────────────
 
-def due_jobs(db: Session, now: datetime, limit: int) -> list[tuple[int, int]]:
-    """(job id, owner) of postings worth re-checking: a URL, not applied or approved, not checked recently."""
-    from app.services.lifecycle import WorkflowState as S
+# Every state up to approval. In-flight states (RANKING, TAILORING, APPLYING) are left to their worker, and states
+# after applying are not checked: a posting closing once you applied is expected and changes nothing.
+CHECKED_STATES = ("DISCOVERED", "NORMALIZED", "FILTERED", "RANK_PENDING", "RANKED", "QUALIFIED", "TAILORED",
+                  "REVIEWED", "READY_TO_APPLY", "SKIPPED", "ARCHIVED")
 
+
+def due_jobs(db: Session, now: datetime, limit: int) -> list[tuple[int, int]]:
+    """(job id, owner) of postings worth re-checking: a URL, up to approval (approved ones only get labelled), not
+    held by a worker, not checked recently."""
     cutoff = now - timedelta(days=max(0, get_settings().listing_check_max_age_days))
-    live = (S.DISCOVERED, S.NORMALIZED, S.FILTERED, S.RANK_PENDING, S.RANKED, S.QUALIFIED, S.SKIPPED, S.ARCHIVED)
+    tailoring = select(TailorTask.id).where(TailorTask.job_id == Job.id, TailorTask.status.in_(("queued", "running")))
     return list(db.execute(
-        select(Job.id, Job.user_id).where(Job.user_id.is_not(None), Job.url != "", Job.state.in_(live),
-                                          Job.status.not_in(PROTECTED_STATUSES),
+        select(Job.id, Job.user_id).where(Job.user_id.is_not(None), Job.url != "", Job.state.in_(CHECKED_STATES),
+                                          Job.status != "applied", Job.lock_token.is_(None), ~tailoring.exists(),
                                           or_(Job.listing_checked_at.is_(None), Job.listing_checked_at < cutoff))
         .order_by(Job.listing_checked_at.asc().nulls_first(), Job.id).limit(max(1, limit))).all())
 
 
-def check_one(sessions: Callable[[], Session], job_id: int, owner: int, now: datetime) -> str:
-    """Read one posting over plain HTTP. Only a removed or closed page deletes; anything else just records the
-    check. Never the browser, never a model."""
+def closed_banner(result: Any) -> bool:
+    """A page that still shows the posting but says it no longer takes applications (LinkedIn, some ATSs)."""
+    extraction = getattr(result, "extraction", None)
+    text = jd_quality.lower_text(getattr(extraction, "page_text", None))[:40000]
+    return any(marker in text for marker in jd_quality.CLOSED_BANNER_MARKERS)
+
+
+async def read_posting(snapshot: Any, browser: Any = None) -> tuple[Any, bool]:
+    """HTTP, then one ordinary browser rendering when HTTP found nothing readable and the account allows it.
+    Returns (result, whether the browser was used). Never a model; never raises."""
     from app.services import jd_recovery
+
+    try:
+        result = await threads.run_work(jd_recovery._http_stage, snapshot)
+    except Exception:  # noqa: BLE001  one posting failing never stops the check
+        return None, False
+    if (browser is None or not snapshot.use_browser or not jd_recovery.should_try_browser_after_http(result)
+            or result.code == "RATE_LIMITED"):
+        return result, False
+    try:
+        if not browser.is_available():
+            return result, False
+        rendered = await jd_recovery._browser_stage(snapshot, browser, result.final_url or snapshot.url)
+    except Exception:  # noqa: BLE001
+        return result, True
+    return (result if rendered.kind == "unavailable" else rendered), True
+
+
+def verdict(result: Any) -> tuple[str, str | None]:
+    """("removed", reason), ("live", None) or ("unknown", None). Only a page that says so is removed."""
+    if result is None:
+        return "unknown", None
+    if result.kind == "removed":
+        return "removed", result.code or "JOB_REMOVED"
+    if result.kind in ("found", "ambiguous", "empty") and closed_banner(result):
+        return "removed", jd_quality.JOB_CLOSED
+    if result.kind in ("found", "ambiguous"):
+        return "live", None
+    return "unknown", None  # blocked, transient, permanent, not_html, empty: never deleted on a guess
+
+
+async def check_one(sessions: Callable[[], Session], job_id: int, owner: int, now: datetime, *,
+                    browser: Any = None) -> str:
+    """Read one posting and act on what it says: deleted, kept (approved: labelled instead), live, unknown or
+    missing. Never a model, and never a deletion on a guess."""
+    from app.services import jd_recovery, worker_settings
 
     with sessions() as db:
         db.info["user_id"] = owner
         job = db.get(Job, job_id)
         if job is None:
             return "missing"
-        snapshot = jd_recovery.Snapshot(job.id, owner, job.url, job.title or "", job.company or "", 1)
-    try:
-        result = jd_recovery._http_stage(snapshot)
-    except Exception:  # noqa: BLE001  one posting failing never stops the check
-        result = None
+        use_browser = bool(worker_settings.for_user(db, owner, "recovery").get("use_browser", True))
+        snapshot = jd_recovery.Snapshot(job.id, owner, job.url, job.title or "", job.company or "", 1,
+                                        use_browser=use_browser, use_model=False)
+    result, used_browser = await read_posting(snapshot, browser)
+    kind, reason = verdict(result)
     with sessions() as db:
         db.info["user_id"] = owner
         job = db.get(Job, job_id)
         if job is None:
             return "missing"
         job.listing_checked_at = now
-        outcome = "live"
-        if result is not None and result.kind == "removed":
-            outcome = remove_posting(db, job, result.code or "JOB_REMOVED", actor="listing_check", now=now)
-        elif result is None or result.kind in ("blocked", "transient", "permanent", "not_html"):
-            outcome = "unknown"  # never deleted on a guess
+        outcome = kind
+        if kind == "removed":
+            outcome = remove_posting(db, job, reason or "JOB_REMOVED", actor="listing_check", now=now)
+        elif kind == "live":
+            job.posting_closed_at = job.posting_closed_reason = None  # a posting that reopened
         db.commit()
-        return outcome
+    return f"{outcome}+browser" if used_browser else outcome
 
 
 async def check_listings(sessions: Callable[[], Session], now: datetime, *, limit: int | None = None,
-                         concurrency: int | None = None) -> dict[str, Any]:
+                         concurrency: int | None = None, browser: Any = None) -> dict[str, Any]:
     with sessions() as db:
         due = due_jobs(db, now, limit or get_settings().listing_check_batch_size)
     semaphore = asyncio.Semaphore(max(1, concurrency or get_settings().jd_fetch_max_concurrency))
 
     async def run(job_id: int, owner: int) -> str:
         async with semaphore:
-            return await asyncio.to_thread(check_one, sessions, job_id, owner, now)
+            try:
+                return await check_one(sessions, job_id, owner, now, browser=browser)
+            except Exception:  # noqa: BLE001  one posting failing never stops the check
+                return "unknown"
 
     outcomes = await asyncio.gather(*(run(job_id, owner) for job_id, owner in due))
-    summary = {"checked": len(due)}
+    summary: dict[str, Any] = {"checked": len(due), "browser_used": 0}
     for outcome in outcomes:
+        outcome, _, used = outcome.partition("+")
+        summary["browser_used"] += bool(used)
         summary[outcome] = summary.get(outcome, 0) + 1
     return summary
