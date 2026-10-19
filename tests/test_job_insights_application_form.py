@@ -182,7 +182,7 @@ def test_predicted_questions_follow_the_rules_whatever_the_model_says(owner, mon
         assert "Tell us about your Kafka work." not in got, "an item citing an unknown id is dropped alone"
         uncited = got["What is your greatest strength?"]
         assert uncited["status"] == "NEEDS_INPUT", "a factual draft needs evidence"
-        assert insight_of(job_id).prompt_versions["application_form"] == "v1"
+        assert insight_of(job_id).prompt_versions["application_form"] == "v2"
     finally:
         _unseed()
 
@@ -200,6 +200,112 @@ def test_a_run_without_the_model_keeps_the_last_drafts(owner, monkeypatch):
         assert insight_of(job_id).application_questions == before
     finally:
         _unseed()
+
+
+# ───────────── the candidate's resume, profile and per-question retrieval ─────────────
+
+LEADERSHIP = "Tell us about a time you led a team of engineers."
+RESUMES = __import__("tests.rag_support", fromlist=["DATASET"]).DATASET["resumes"]
+
+
+def _candidate(user_id: int) -> dict[str, int]:
+    """A fresh account with the backend resume (active, experience verified), the data resume, a headline and a
+    work authorization a draft must never see."""
+    from app.services import resume_verification
+    from app.services.user_settings import profile_for
+
+    with SessionLocal() as db:
+        db.info["user_id"] = user_id
+        profile = profile_for(db)
+        profile.headline, profile.work_authorization = "Backend engineer", "Needs sponsorship (secret-ish)"
+        ids = {}
+        for key in ("backend", "data"):
+            resume = resume_verification.record_version(db, profile, RESUMES[key]["text"], name=key,
+                                                        activate=key == "backend")
+            resume_verification.verify_section(db, resume, "experience")
+            ids[key] = resume.id
+        db.commit()
+        return ids
+
+
+def _evidence_id(user_id: int, claim_start: str) -> int:
+    with SessionLocal() as db:
+        return db.scalar(select(Evidence.id).where(Evidence.user_id == user_id, Evidence.claim.like(f"{claim_start}%")))
+
+
+def test_the_form_context_carries_the_jobs_resume_and_retrieves_for_each_question():
+    from app.models import Job
+    from app.services.context_builder import build_application_form_context
+    from app.services.user_settings import profile_for
+
+    user = make_user(SessionLocal)
+    _candidate(user)
+    job_id = new_job(user, approve=False)
+    led = _evidence_id(user, "Led an on-call rotation")
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        form = build_application_form_context(db, profile_for(db), db.get(Job, job_id),
+                                              [{"ref": "F1", "question": LEADERSHIP}])
+    ctx = form.context
+    assert ctx.candidate.get("headline") == "Backend engineer"
+    assert "work_authorization" not in ctx.candidate, "only the person answers work authorization"
+    assert {r["company"] for r in ctx.relevant_experience} == {"Acme", "Globex"}, "the job's (active) resume"
+    assert led in form.questions["F1"]["evidence_ids"], "the question finds its own evidence"
+    assert led in ctx.evidence_ids and form.evidence_labels[led].startswith("Led an on-call")
+    assert ctx.stats.selected_context_tokens > 0
+
+
+def test_a_pasted_question_is_drafted_from_the_resume_and_its_own_retrieval(monkeypatch):
+    user = make_user(SessionLocal)
+    _candidate(user)
+    job_id = new_job(user)
+    run_insights()
+    led = _evidence_id(user, "Led an on-call rotation")
+    seen = {}
+
+    def items(user_text):
+        seen["prompt"] = user_text
+        return [{"form_ref": "F1", "form_question": LEADERSHIP, "form_category": "BEHAVIORAL",
+                 "form_decision": "DRAFT", "evidence_ids": [led],
+                 "form_answer": "At Globex I led an on-call rotation of 6 engineers and wrote the incident runbooks."}]
+    _crafted(monkeypatch, items)
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        insight = db.scalar(select(JobInsight).where(JobInsight.job_id == job_id))
+        application_form.add_questions(insight, [LEADERSHIP], insight.updated_at or insight.created_at)
+        from app.services.job_insights import tasks as insight_tasks
+        insight_tasks.enqueue(db, insight.job, reason=insight_tasks.USER_REQUEST, force=True,
+                              scope=insight_tasks.APPLICATION_FORM)
+        db.commit()
+    run_insights()
+    prompt = seen["prompt"]
+    assert "CANDIDATE:" in prompt and "RESUME:" in prompt and "Globex" in prompt
+    assert "RETRIEVED FOR EACH QUESTION:" in prompt and str(led) in prompt
+    assert "Needs sponsorship" not in prompt, "work authorization never reaches the model"
+    got = by_question(job_id)[LEADERSHIP]
+    assert got["status"] == "DRAFTED" and got["evidence_ids"] == [led]
+    assert got["evidence"] == ["Led an on-call rotation of 6 engineers and wrote the incident runbooks"]
+
+
+def test_with_retrieval_on_another_resumes_facts_are_never_retrieved(monkeypatch):
+    from app.models import Job
+    from app.services.context_builder import build_application_form_context
+    from app.services.user_settings import profile_for
+    from app.settings import get_settings
+
+    monkeypatch.setattr(get_settings(), "rag_retrieval_mode", "on")
+    monkeypatch.setattr(get_settings(), "rag_vector_enabled", False)
+    user = make_user(SessionLocal)
+    _candidate(user)
+    job_id = new_job(user, approve=False)
+    churn = _evidence_id(user, "Trained churn prediction")  # the data resume's fact
+    assert churn, "the data resume has its own verified evidence"
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        form = build_application_form_context(db, profile_for(db), db.get(Job, job_id), [
+            {"ref": "F1", "question": "Describe a machine learning model you trained, such as churn prediction."}])
+    assert churn not in form.context.evidence_ids
+    assert churn not in form.questions["F1"]["evidence_ids"]
 
 
 # ───────────── units ─────────────

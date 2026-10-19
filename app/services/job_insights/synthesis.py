@@ -338,6 +338,8 @@ class _NoModel:
     """Stands in for the gateway when no model is configured: every call fails as an LLMError, so the drafting pass
     settles what it can without one and records why."""
 
+    offline = True
+
     def __init__(self, why: str) -> None:
         self.why = why
 

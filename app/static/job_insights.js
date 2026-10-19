@@ -239,7 +239,7 @@ function insForm(x, jobId) {
   const form = 'insform' + jobId;
   const full = (f.from_form || []).length >= (f.max_questions || 20);
   return `<div class="col gap16">
-    <div class="box"><div class="base b mb4">Questions on the form</div><div class="xs muted mb8">Paste the questions the application asks, one per line. Each is answered from your saved answers and verified evidence in the background; questions only you can answer (work authorization, pay, notice period, personal details) are never drafted.</div>
+    <div class="box"><div class="base b mb4">Questions on the form</div><div class="xs muted mb8">Paste the questions the application asks, one per line. Each is drafted in the background from your resume for this job, your profile, your saved answers and the verified evidence retrieved for that question; questions only you can answer (work authorization, pay, notice period, personal details) are never drafted.</div>
       ${textareaF(form, 'questions', '', `placeholder="Why do you want to join this company?&#10;Describe a project where you led a team." style="min-height:80px" aria-label="Questions from the application form"${full ? ' disabled' : ''}`)}
       <div class="row gap8 mt8">${btn(label('insformadd' + jobId, 'Add and draft', 'Adding…'), 'ins-form-add', { id: jobId }, 'primary sm', isBusy('insformadd' + jobId) || full)}${full ? '<span class="xs muted">Remove a question to add another.</span>' : ''}</div></div>
     <div><div class="row gap8 mb8"><span class="caps">FROM THE FORM</span><span class="xs faint">questions you pasted</span></div>

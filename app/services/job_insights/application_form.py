@@ -3,8 +3,12 @@
     pasted questions (application_form_input) ─┐
                                                ├→ before the model: the person's verified library answer wins,
     a full research run predicts more ─────────┘   a personal question (visa, salary, notice, …) needs the person
-          → one APPLICATION_ANSWER call (prompt `application_form`) with the structured JD, the fit analysis, verified
-            evidence scoped to the job's resume, verified non-sensitive saved answers and a company summary
+          → the candidate's context (context_builder.build_application_form_context): the job's own resume (verified
+            roles, bullets with their evidence ids, projects, skills, education), the profile's headline and verified
+            summary, and for each pasted question its own retrieval — verified evidence (RAG when it is on) and
+            similar verified saved answers — inside the job's resume scope
+          → one APPLICATION_ANSWER call (prompt `application_form`, through the LLM gateway) with the structured JD, the
+            fit analysis, that context, verified non-sensitive saved answers and a company summary
           → after the model, item by item: ids it was not shown drop that item; a personal question loses its draft;
             a draft must pass the screening-answer grounding checks (tailoring_results.check_prose) or needs input
           → job_insights.application_questions (merged with the last good drafts)
@@ -220,6 +224,63 @@ def after_model(db: Session, job: Job, profile: Any, item: Any, *, qid: str, que
                  evidence=[evidence_labels.get(e, "") for e in item.evidence_ids], knowledge_ids=item.knowledge_ids)
 
 
+# ───────────── the candidate's context ─────────────
+
+MAX_EVIDENCE = 36
+MAX_KNOWLEDGE = 20
+
+
+def candidate_context(db: Session, client: Any, profile: Any, job: Job, questions: list[dict[str, str]]) -> Any:
+    """context_builder.build_application_form_context for this pass: the job's resume and profile, and per-question
+    retrieval. None without a profile, without a model (nothing would read it) or when it cannot be built: the
+    posting-level evidence of the research context still stands."""
+    import logging
+
+    from app.services.context_builder import build_application_form_context
+
+    if profile is None or getattr(client, "offline", False):
+        return None
+    try:
+        with db.begin_nested():
+            return build_application_form_context(db, profile, job, questions)
+    except Exception:  # noqa: BLE001  drafting goes on with the research context
+        logging.getLogger("jobhunt.job_insights").warning("application form context for job %s failed", job.id,
+                                                          exc_info=True)
+        return None
+
+
+def resume_view(context: Any) -> dict[str, Any]:
+    """The resume as the prompt reads it: verified roles with their bullets and evidence ids, projects, skills,
+    education and certifications (relevance scores and status flags left out)."""
+    roles = [{"job_title": r.get("job_title"), "company": r.get("company"), "location": r.get("location"),
+              "dates": r.get("dates"), "technologies": r.get("technologies") or [],
+              "bullets": [{"text": b["text"], "evidence_ids": b.get("evidence_ids") or []} for b in r.get("bullets") or []]}
+             for r in context.relevant_experience]
+    projects = [{"name": p.get("name"), "technologies": p.get("technologies") or [],
+                 "bullets": [{"text": b["text"], "evidence_ids": b.get("evidence_ids") or []} for b in p.get("bullets") or []]}
+                for p in context.relevant_projects]
+    return {"experience": roles, "projects": projects, "skills": context.relevant_skills,
+            "education": context.education, "certifications": context.certifications}
+
+
+def _question_first(form: Any) -> list[dict[str, Any]]:
+    """The context's evidence, what was retrieved for a pasted question first: the cap never drops it."""
+    if form is None:
+        return []
+    wanted = {i for hits in form.questions.values() for i in hits["evidence_ids"]}
+    return sorted(form.evidence, key=lambda e: (e["id"] not in wanted, e["id"]))
+
+
+def _merged(first: list[dict[str, Any]], second: list[dict[str, Any]], cap: int) -> list[dict[str, Any]]:
+    """Both lists, one copy of each id, the first list's items first."""
+    seen, out = set(), []
+    for item in [*first, *second]:
+        if item["id"] not in seen:
+            seen.add(item["id"])
+            out.append(item)
+    return out[:cap]
+
+
 # ───────────── one drafting pass ─────────────
 
 def draft(db: Session, client: Any, job: Job, *, attempt: int, ctx: dict[str, Any], company: dict[str, Any],
@@ -246,18 +307,27 @@ def draft(db: Session, client: Any, job: Job, *, attempt: int, ctx: dict[str, An
             ask.append({"ref": f"F{n}", "id": q["id"], "question": q["question"]})
 
     model_ran, predicted_items = False, None
+    profile = get_profile(db)
+    evidence_labels = {e["id"]: (e.get("claim") or "")[:160] for e in ctx["evidence"]}
     if ask or predict:
-        knowledge = known_answers(db, job.user_id)
+        form = candidate_context(db, client, profile, job, [{"ref": a["ref"], "question": a["question"]} for a in ask])
+        evidence = _merged(_question_first(form), ctx["evidence"], MAX_EVIDENCE)
+        knowledge = _merged(form.knowledge if form else [], known_answers(db, job.user_id), MAX_KNOWLEDGE)
+        if form is not None:
+            evidence_labels = {**form.evidence_labels, **evidence_labels}
         prompt = build_application_form_prompt(
             job={"title": job.title, "company": job.company, "location": job.location}, context=ctx["context"],
-            fit_analysis=ctx["fit"], evidence=ctx["evidence"], knowledge=knowledge, company=company,
+            fit_analysis=ctx["fit"], evidence=evidence, knowledge=knowledge, company=company,
             form_questions=[{"ref": a["ref"], "question": a["question"]} for a in ask],
-            predict=MAX_PREDICTED if predict else 0)
+            predict=MAX_PREDICTED if predict else 0,
+            candidate=form.context.candidate if form else None, resume=resume_view(form.context) if form else None,
+            retrieved={ref: hits for ref, hits in form.questions.items() if any(hits.values())} if form else None)
         refs = {a["ref"]: a for a in ask}
-        shown_evidence = {e["id"] for e in ctx["evidence"]}
+        shown_evidence = {e["id"] for e in evidence} | (form.context.evidence_ids if form else set())
         try:
             result = client.generate_prompt(prompt, LLMCall(
                 workflow_type="job", entity_id=job.id, attempt=attempt,
+                context_stats=form.context.call_stats() if form else None,
                 validate=lambda data: screen(ApplicationFormPrepResult.model_validate(data), form_refs=set(refs),
                                              requirement_ids=set(ctx["requirements"]), evidence_ids=shown_evidence,
                                              knowledge_ids={k["id"] for k in knowledge}, dropped=dropped)))
@@ -266,8 +336,6 @@ def draft(db: Session, client: Any, job: Job, *, attempt: int, ctx: dict[str, An
             errors.append(f"Application form drafts failed: {type(exc).__name__}: {exc}"[:300])
             result = None
         if result is not None:
-            profile = get_profile(db)
-            evidence_labels = {e["id"]: (e.get("claim") or "")[:160] for e in ctx["evidence"]}
             predicted_items = []
             seen = {q["id"] for q in pasted}  # a prediction that repeats a pasted question is not shown twice
             for item in result.validated.form_questions:
