@@ -1740,6 +1740,8 @@ const RENDER = { overview: renderOverview, today: renderToday, discovery: render
 // what renders before it comes and goes. A box located only through a render root is restored only while the
 // screen (the hash) is the same, so a new screen never inherits another one's scroll.
 const RENDER_ROOTS = ['nav', 'side-foot', 'top', 'view', 'overlays'];
+// A field whose text an action has taken (Enter on data-enter) is submitted, not being typed: never put it back.
+const consumedFields = new WeakSet();
 function domPath(el) {
   const steps = [];
   for (let n = el; n && n !== document.body; n = n.parentElement) {
@@ -1771,7 +1773,7 @@ function keptView() {
   const active = document.activeElement, field = {};
   if (active && active !== document.body && RENDER_ROOTS.some(id => document.getElementById(id)?.contains(active))) {
     field.path = domPath(active);
-    if ('defaultValue' in active && active.value !== active.defaultValue && active.type !== 'file') field.value = [active.defaultValue, active.value];
+    if ('defaultValue' in active && active.value !== active.defaultValue && active.type !== 'file' && !consumedFields.has(active)) field.value = [active.defaultValue, active.value];
     try { if (typeof active.selectionStart === 'number') field.range = [active.selectionStart, active.selectionEnd, active.selectionDirection]; } catch { /* not a text field */ }
   }
   return { scrolled, field, hash: location.hash, page: [window.scrollX, window.scrollY] };
@@ -2843,7 +2845,7 @@ document.addEventListener('keydown', e => {
       const list = [...(fv(form, tag, tagFallback(form, tag)) || [])]; list.pop(); setF(form, tag, list); render(); return;
     }
   }
-  if (el.dataset && el.dataset.enter && e.key === 'Enter') { e.preventDefault(); A[el.dataset.enter](el, e); return; }
+  if (el.dataset && el.dataset.enter && e.key === 'Enter') { e.preventDefault(); consumedFields.add(el); A[el.dataset.enter](el, e); return; }
   if (el.dataset && el.dataset.palette && e.key === 'Enter') { const first = S.paletteJobs[0]; if (first) { S.paletteOpen = false; openJob(first.id); } return; }
   const typing = ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName);
   if (typing || e.metaKey || e.ctrlKey || e.altKey || S.jobOpen || S.kitJob || S.paletteOpen) return;
