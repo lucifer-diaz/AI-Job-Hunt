@@ -20,7 +20,14 @@ from app.db import SessionLocal
 from app.main import app
 from app.mcp import tools
 from app.mcp.server import run_tool
-from app.models import Application, ApplicationClaim, ApplicationClaimKey, ApplicationEvent, Job, ResumeVariant
+from app.models import (
+    Application,
+    ApplicationClaim,
+    ApplicationClaimKey,
+    ApplicationEvent,
+    Job,
+    ResumeVariant,
+)
 from app.services import apply_queue, approval
 from app.settings import get_settings
 from tests.conftest import make_user

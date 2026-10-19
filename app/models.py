@@ -73,6 +73,10 @@ class User(Base):
                                                                            passive_deletes=True)
     preparation_tasks: Mapped[list[JobPreparationTask]] = relationship(back_populates="user", passive_deletes=True)
     approved_packets: Mapped[list[ApprovedPacket]] = relationship(back_populates="user", passive_deletes=True)
+    application_claims: Mapped[list[ApplicationClaim]] = relationship(back_populates="user", passive_deletes=True)
+    application_claim_keys: Mapped[list[ApplicationClaimKey]] = relationship(back_populates="user", passive_deletes=True)
+    application_execution_tasks: Mapped[list[ApplicationExecutionTask]] = relationship(back_populates="user", passive_deletes=True)
+    application_execution_attempts: Mapped[list[ApplicationExecutionAttempt]] = relationship(back_populates="user", passive_deletes=True)
     evidence_resume_links: Mapped[list[EvidenceResumeLink]] = relationship(back_populates="user",
                                                                            passive_deletes=True)
     rag_index_versions: Mapped[list[RagIndexVersion]] = relationship(back_populates="user", passive_deletes=True)
@@ -2591,6 +2595,7 @@ class ApplicationClaim(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = _owner("application_claims")
+    user: Mapped[User] = relationship(back_populates="application_claims")
     job_id: Mapped[int] = mapped_column(
         ForeignKey("jobs.id", ondelete="CASCADE", name="fk_application_claims_job_id"), index=True)
     job: Mapped[Job] = relationship()
@@ -2626,6 +2631,7 @@ class ApplicationClaimKey(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = _owner("application_claim_keys")
+    user: Mapped[User] = relationship(back_populates="application_claim_keys")
     claim_id: Mapped[int] = mapped_column(
         ForeignKey("application_claims.id", ondelete="CASCADE", name="fk_application_claim_keys_claim_id"), index=True)
     claim: Mapped[ApplicationClaim] = relationship(back_populates="keys")
@@ -2659,6 +2665,7 @@ class ApplicationExecutionTask(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = _owner("application_execution_tasks")
+    user: Mapped[User] = relationship(back_populates="application_execution_tasks")
     job_id: Mapped[int] = mapped_column(
         ForeignKey("jobs.id", ondelete="CASCADE", name="fk_application_execution_tasks_job_id"), index=True)
     job: Mapped[Job] = relationship()
@@ -2708,6 +2715,7 @@ class ApplicationExecutionAttempt(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = _owner("application_execution_attempts")
+    user: Mapped[User] = relationship(back_populates="application_execution_attempts")
     task_id: Mapped[int] = mapped_column(
         ForeignKey("application_execution_tasks.id", ondelete="CASCADE",
                    name="fk_application_execution_attempts_task_id"), index=True)

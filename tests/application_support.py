@@ -18,8 +18,18 @@ from typing import Any, Self
 from bs4 import BeautifulSoup
 from sqlalchemy import select
 
-from app.infrastructure.application_browser.service import ApplicationPage, ApplicationSessionManager, PageLoad
-from app.models import ApplicationExecutionTask, CandidateProfile, Job, KnowledgeAnswer, ResumeVariant
+from app.infrastructure.application_browser.service import (
+    ApplicationPage,
+    ApplicationSessionManager,
+    PageLoad,
+)
+from app.models import (
+    ApplicationExecutionTask,
+    CandidateProfile,
+    Job,
+    KnowledgeAnswer,
+    ResumeVariant,
+)
 from app.services import scheduled_jobs as sj
 from app.services import workflow
 from app.services.knowledge import question_key
@@ -98,7 +108,7 @@ class FormServer:
         self.thread.start()
         return self
 
-    def __exit__(self, *exc: Any) -> None:
+    def __exit__(self, *exc: object) -> None:
         self.httpd.shutdown()
         self.httpd.server_close()
 
@@ -202,11 +212,13 @@ def owner(sessions) -> int:
 
 def approved_job(sessions, user_id: int, url: str, **fields: Any) -> int:
     """A job whose packet was approved through workflow.approve_job (so it has an approval snapshot and digest)."""
+    from app.services.lifecycle import WorkflowState as S
+
     with sessions() as db:
         db.info["user_id"] = user_id
         job = Job(user_id=user_id, source="test", source_ref=uuid.uuid4().hex, title="Senior Backend Engineer",
                   company="Examplecorp", location="Singapore", url=url, description="Python", fit_score=80,
-                  status="tailored", **fields)
+                  status="tailored", state=S.QUALIFIED, **fields)
         db.add(job)
         db.flush()
         db.add(ResumeVariant(user_id=user_id, job_id=job.id, version=1, markdown=RESUME,
