@@ -167,3 +167,42 @@ def test_the_screen_is_told_what_was_waived(owner):
     assert packet["min_review_score"] == MINIMUM
     row = next(r for r in client.get("/api/approvals").json() if r["id"] == job_id)
     assert row["approval_override"] is True
+
+
+# ───────────── the queue waits for the review ─────────────
+
+def listed(job_id):
+    return any(r["id"] == job_id for r in client.get("/api/approvals").json())
+
+
+def approvals_badge():
+    return client.get("/api/workspace/summary").json()["counts"]["approvals"]
+
+
+def test_a_packet_reaches_approvals_only_once_it_is_reviewed(owner):
+    before = approvals_badge()
+    job_id = make_packet(owner, None)  # tailoring saved it; the Reviewer has not stored a score yet
+    assert not listed(job_id), "still being reviewed: it stays on Tailor"
+    assert approvals_badge() == before
+    assert any(r["id"] == job_id for r in client.get("/api/tailor/queue").json()), "Tailor still shows it"
+
+    with SessionLocal() as db:
+        resume = db.scalar(select(ResumeVariant).where(ResumeVariant.job_id == job_id))
+        resume.reviewer_score = 80
+        db.commit()
+    assert listed(job_id) and approvals_badge() == before + 1
+
+
+def test_a_new_version_under_review_leaves_the_queue_until_it_is_reviewed(owner):
+    job_id = make_packet(owner, 80)
+    assert listed(job_id)
+    with SessionLocal() as db:
+        db.add(ResumeVariant(job_id=job_id, user_id=owner, version=2, markdown="# Rohan v2", reviewer_score=None))
+        db.commit()
+    assert not listed(job_id), "the latest version decides, not an older reviewed one"
+
+
+def test_an_approved_job_stays_listed(owner):
+    job_id = make_packet(owner, 80)
+    approve(job_id)
+    assert listed(job_id)

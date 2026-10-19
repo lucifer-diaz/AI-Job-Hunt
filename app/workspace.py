@@ -19,7 +19,7 @@ from bs4 import BeautifulSoup
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, field_validator, model_validator
-from sqlalchemy import and_, desc, func, or_, select, update
+from sqlalchemy import and_, desc, exists, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.auth import get_user_db
@@ -281,8 +281,19 @@ def triage_query(db: Session):
     return query
 
 
+def reviewed_or_approved():
+    """A packet belongs in Approvals once its latest version has been reviewed. Tailoring saves the packet (status
+    "tailored") before the Reviewer runs; until the review is stored, or when it failed, the job stays on Tailor.
+    Approved jobs always qualify: approval needed a reviewed packet, and the packet is locked after it."""
+    latest = select(func.max(ResumeVariant.version)).where(ResumeVariant.job_id == Job.id) \
+        .correlate(Job).scalar_subquery()
+    reviewed = exists().where(ResumeVariant.job_id == Job.id, ResumeVariant.version == latest,
+                              ResumeVariant.reviewer_score.is_not(None))
+    return or_(Job.status == "approved", reviewed)
+
+
 def approval_jobs(db: Session) -> list[Job]:
-    return db.scalars(select(Job).where(Job.status.in_(("tailored", "pending_approval")))
+    return db.scalars(select(Job).where(Job.status.in_(("tailored", "pending_approval")), reviewed_or_approved())
                       .order_by(desc(Job.fit_score))).all()
 
 
@@ -1959,7 +1970,7 @@ def approvals(q: str = "", min_fit: int = 0, min_review: int = 0, board: str = "
               with_facets: bool = False, db: Session = Depends(get_user_db)):
     if easy_apply_filter not in ("all", "", "only"):
         raise HTTPException(422, f"Unknown easy_apply filter: {easy_apply_filter}")
-    jobs = db.scalars(select(Job).where(Job.status.in_(APPROVAL_QUEUE_STATUSES))
+    jobs = db.scalars(select(Job).where(Job.status.in_(APPROVAL_QUEUE_STATUSES), reviewed_or_approved())
                       .order_by(desc(Job.id))).all()
     inputs = run_inputs(db, jobs)
     rows = []

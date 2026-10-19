@@ -1594,6 +1594,10 @@ it is still refused until it has been reviewed.
 
 ### Rejecting a job
 
+A packet reaches **Approvals** only once its latest version has been reviewed (`workspace.reviewed_or_approved`).
+Tailoring saves the packet before the Reviewer runs; while the review runs, or after it fails, the job stays on Tailor
+(the task shows *Reviewing…*, or *failed* with Retry), and the sidebar badge does not count it.
+
 Three decisions are open on every packet in **Approvals**:
 
 | Decision | What happens |
