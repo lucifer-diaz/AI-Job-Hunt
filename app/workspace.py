@@ -2282,8 +2282,17 @@ def apply_kit(job_id: int, db: Session = Depends(get_user_db)):
             {"kind": "TXT", "name": names["cover_letter"], "meta": f"{len(resume.cover_letter.split())} words · paste-ready", "href": f"/api/jobs/{job.id}/cover-letter.txt"},
         ] if resume else [],
         "answers": [{"id": a.id, "question": a.question, "answer": a.answer, "sensitive": a.sensitive} for a in answers],
-        "claim": _open_claim_view(db, job),
+        "claim": _open_claim_view(db, job), **_execution_view(db, job),
     }
+
+
+def _execution_view(db: Session, job: Job) -> dict:
+    """The job's latest application worker run (Phase 5) and whether the worker is on, for the Apply kit."""
+    from app.services import application_execution
+
+    task = application_execution.latest(db, job.id)
+    return {"execution": application_execution.view(task) if task is not None else None,
+            "execution_mode": application_execution.mode()}
 
 
 def _open_claim_view(db: Session, job: Job) -> dict | None:

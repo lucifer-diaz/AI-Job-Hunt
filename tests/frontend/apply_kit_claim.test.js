@@ -1,0 +1,85 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { createContext, runInContext } from 'node:vm';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+// The Apply kit's pre-submit claim (Phase 5): start the submission before submitting on the employer's site, report
+// with the claim's token, release it when nothing was sent, and say what happened when its outcome is unknown.
+const appSource = readFileSync('app/static/app.js', 'utf8').split('/* ───────────── boot ───────────── */')[0];
+const names = ['S', 'D', 'A', 'renderKit'];
+let ui, context, fetchMock, calls;
+
+const kit = (over = {}) => ({
+  job: { id: 11, title: 'Senior Backend Engineer', company: 'Examplecorp', fit: 80, url: 'https://boards.greenhouse.io/x/jobs/1' },
+  status: 'approved', reviewer_score: 90, followup_date: '2026-10-26T00:00:00', files: [], answers: [],
+  claim: null, execution: null, execution_mode: 'off', ...over });
+
+beforeEach(() => {
+  document.body.innerHTML = '<script id="boot" type="application/json">{"user":{"email":"a@b.c"}}</script><div id="nav"></div><div id="side-foot"></div><div id="side-meta"></div><div id="brand-sub"></div><div id="top"></div><div id="view"></div><div id="overlays"></div><div id="toast"></div>';
+  vi.stubGlobal('scrollTo', vi.fn());
+  calls = [];
+  fetchMock = vi.fn(async (url, options = {}) => {
+    calls.push([options.method || 'GET', url, options.body ? JSON.parse(options.body) : null]);
+    const body = url.includes('/apply-kit') ? ui.D.kit : url.includes('/api/tracker') ? { applications: [] } : {};
+    return { ok: true, status: 200, text: async () => JSON.stringify(body) };
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  if (!ui) {
+    context = createContext({ document, window, location, history, navigator, URLSearchParams, FormData, File, Intl, setTimeout, clearTimeout, setInterval, clearInterval, console });
+    for (const file of ['monitoring.js', 'orchestration.js', 'workers.js', 'settings.js', 'resume_data.js', 'job_data.js', 'knowledge.js', 'inbox.js', 'guide.js', 'job_insights.js']) {
+      runInContext(readFileSync(`app/static/${file}`, 'utf8'), context, { filename: resolve(`app/static/${file}`) });
+    }
+    runInContext(appSource, context, { filename: resolve('app/static/app.js') });
+    ui = runInContext(`({${names.join(',')}})`, context);
+  }
+  context.fetch = fetchMock;
+  context.render = () => {};  // the actions re-render; the markup is checked through renderKit itself
+  ui.S.forms = {}; ui.S.busy = {}; ui.S.kitJob = 11;
+});
+
+const html = k => { ui.D.kit = k; const el = document.createElement('div'); el.innerHTML = ui.renderKit(); return el; };
+const acts = el => [...el.querySelectorAll('[data-act]')].map(b => b.dataset.act);
+
+describe('the Apply kit claim', () => {
+  it('asks to start the submission and warns that outside submissions cannot be locked', () => {
+    const el = html(kit());
+    expect(acts(el)).toContain('kit-start');
+    expect(el.textContent).toContain('cannot be locked here');
+  });
+
+  it('starts the submission and reports with the claim token', async () => {
+    ui.D.kit = kit();
+    await ui.A['kit-start']({ dataset: { id: '11' } });
+    expect(calls.some(([m, u]) => m === 'POST' && u.endsWith('/api/jobs/11/submission/start'))).toBe(true);
+    ui.D.kit = kit({ claim: { id: 4, job_id: 11, status: 'CLAIMED', client: 'apply_kit', claim_token: 'tok-123',
+      claimed_at: '2026-10-19T10:00:00', lease_expires_at: '2026-10-19T11:00:00', started_by: 'you' } });
+    expect(acts(html(ui.D.kit))).toContain('kit-release');
+    await ui.A['mark-applied']({ dataset: { id: '11' } });
+    const applied = calls.find(([m, u]) => m === 'POST' && u.endsWith('/api/jobs/11/applied'));
+    expect(applied[2].claim_token).toBe('tok-123');
+  });
+
+  it('shows another client is submitting, without a way to submit over it', () => {
+    const el = html(kit({ claim: { id: 5, job_id: 12, status: 'CLAIMED', client: 'mcp', started_by: 'Claude Desktop',
+      claimed_at: '2026-10-19T10:00:00' } }));
+    expect(el.textContent).toContain('Claude Desktop is submitting this posting (job #12)');
+    expect(acts(el)).not.toContain('kit-start');
+  });
+
+  it('asks the person to resolve an uncertain submission', async () => {
+    const el = html(kit({ claim: { id: 6, job_id: 11, status: 'UNCERTAIN', client: 'apply_kit', claimed_at: '2026-10-19T10:00:00' } }));
+    expect(acts(el).filter(a => a === 'kit-resolve')).toHaveLength(2);
+    await ui.A['kit-resolve']({ dataset: { id: '11', claim: '6', submitted: '' } });
+    const resolved = calls.find(([m, u]) => m === 'POST' && u.endsWith('/submission/resolve'));
+    expect(resolved[2]).toEqual({ claim_id: 6, submitted: false });
+  });
+
+  it('shows the application worker only when it is on, and never offers to submit', () => {
+    expect(acts(html(kit()))).not.toContain('kit-prepare');
+    const el = html(kit({ execution_mode: 'assist', execution: { id: 9, status: 'COMPLETED', stage: 'READY_TO_SUBMIT', interrupt: null, result_code: 'READY_TO_SUBMIT' } }));
+    expect(el.textContent).toContain('It never submits');
+    expect(el.textContent).toContain('Submit it yourself');
+    const waiting = html(kit({ execution_mode: 'assist', execution: { id: 9, status: 'PENDING', stage: 'NEEDS_INPUT', interrupt: { question_ids: [], confirm_question_ids: [3] } } }));
+    expect(acts(waiting)).toContain('kit-confirm');
+  });
+});

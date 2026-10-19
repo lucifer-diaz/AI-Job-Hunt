@@ -437,11 +437,11 @@ def _settle(sessions: SessionFactory, c: ExecutionClaim, thread_pk: int) -> str:
         status = thread.status if thread is not None else "STOPPED"
         _clear_lease(task)
         if status == "INTERRUPTED":
-            task.status, task.attempt_count = PENDING, max(0, task.attempt_count - 1)  # waiting uses no attempt
-            task.next_attempt_at, task.last_error = None, None
             if task.stage != WAITING:
                 set_stage(task, WAITING)
             attempt_note(db, task, stage_reached=task.stage, outcome="WAITING", ended_at=now)
+            task.status, task.attempt_count = PENDING, max(0, task.attempt_count - 1)  # waiting uses no attempt
+            task.next_attempt_at, task.last_error = None, None
             wake(db, task)  # everything it needs may already have been answered meanwhile
             db.commit()
             return "waiting"

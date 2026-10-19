@@ -1432,6 +1432,7 @@ function renderKit() {
       </div>
       <div style="padding:20px 24px;background:#fbfbfe">
         <div class="caps mb10">3 · SUBMIT ON THEIR SITE</div>
+        ${k.status === 'applied' ? '' : renderKitClaim(k)}
         ${job.url ? `<a class="btn primary block lg" style="border-radius:11px;padding:14px" href="${attr(job.url)}" target="_blank" rel="noopener">Open ${esc(job.company)} application ↗</a>` : `<div class="banner warn">No posting URL was captured for this job.</div>`}
         <div class="small muted mt10 pretty" style="line-height:1.55">Opens in a new tab. Job Hunt OS does not bypass logins or CAPTCHAs — the submit click stays yours.</div>
         <div class="hr"></div>
@@ -1443,6 +1444,43 @@ function renderKit() {
           ${btn(label('applied', 'Yes — mark applied', 'Saving…'), 'mark-applied', { id: job.id }, 'good block lg mt12', isBusy('applied'))}
           ${btn('Not yet — keep it in approvals', 'close-kit', {}, 'block mt8')}</div>`}
       </div></div></div></div>`;
+}
+
+// The pre-submit claim (Phase 5): start the submission here so Claude Desktop (or another tab) cannot submit the
+// same posting at the same time; a claim whose outcome is unknown waits for you to say what happened.
+function renderKitClaim(k) {
+  const c = k.claim, job = k.job;
+  const execution = renderKitExecution(k);
+  if (!c) {
+    return `<div class="box mb12" style="padding:13px;border-radius:12px"><div class="small ink2 pretty" style="line-height:1.55">Start the submission first: it reserves this posting (and any other saved copy of it) so nothing else submits it twice.</div>
+      ${btn(label('kit-start', 'Start submission', 'Starting…'), 'kit-start', { id: job.id }, 'block mt10', isBusy('kit-start'))}
+      <div class="xs muted mt8 pretty">Applications you send entirely outside Job Hunt OS cannot be locked here.</div></div>${execution}`;
+  }
+  if (c.status === 'UNCERTAIN') {
+    return `<div class="banner warn mb12"><div class="b">A submission was started ${fmtDateTime(c.claimed_at)} and never reported</div>
+      <div class="small mt4">Did it go through? This posting stays reserved until you say.</div>
+      <div class="row gap8 mt10">${btn('It was submitted', 'kit-resolve', { id: job.id, claim: c.id, submitted: '1' }, 'good sm')}${btn('It was not submitted', 'kit-resolve', { id: job.id, claim: c.id, submitted: '' }, 'sm')}</div></div>`;
+  }
+  if (!c.claim_token) {
+    return `<div class="banner warn mb12"><div class="b">${esc(c.started_by)} is submitting this posting${c.job_id !== job.id ? ` (job #${c.job_id})` : ''}</div><div class="small mt4">Wait for it to report before you submit here.</div></div>`;
+  }
+  return `<div class="box mb12" style="padding:13px;border-radius:12px"><div class="small b">Submission started ${fmtDateTime(c.claimed_at)}</div>
+    <div class="xs muted mt4">Reserved for you until ${fmtDateTime(c.lease_expires_at)}; then it waits for you to say what happened.</div>
+    ${btn("I didn't submit — release it", 'kit-release', { id: job.id, token: c.claim_token }, 'ghost sm mt8')}</div>${execution}`;
+}
+// The application worker (APPLICATION_EXECUTION_MODE): reads and, in assist mode, fills the form; never submits.
+function renderKitExecution(k) {
+  const x = k.execution, mode = k.execution_mode;
+  if (!mode || mode === 'off') return '';
+  const waiting = x && x.stage === 'NEEDS_INPUT', confirm = (x?.interrupt?.confirm_question_ids) || [];
+  const state = !x ? '' : `<div class="row gap8 mt8">${pill(x.stage.replaceAll('_', ' '), x.stage === 'READY_TO_SUBMIT' ? 'good' : ['BLOCKED', 'NEEDS_HUMAN', 'FAILED'].includes(x.stage) ? 'warn' : 'muted')}${x.result_code ? `<span class="xs muted">${esc(x.result_code)}</span>` : ''}</div>
+    ${waiting && (x.interrupt.question_ids || []).length ? `<div class="xs muted mt6">Answer ${x.interrupt.question_ids.length} question(s) in the Knowledge bank; it continues by itself.</div>` : ''}
+    ${waiting && confirm.length ? btn(`Confirm ${confirm.length} sensitive answer(s) for this application`, 'kit-confirm', { exec: x.id, ids: confirm.join(',') }, 'sm mt8') : ''}
+    ${x.stage === 'READY_TO_SUBMIT' ? '<div class="xs muted mt6 pretty">The form was filled and checked in a private browser page. Submit it yourself on their site.</div>' : ''}`;
+  const active = x && ['PENDING', 'PROCESSING'].includes(x.status);
+  return `<div class="box mb12" style="padding:13px;border-radius:12px"><div class="small b">Application worker · ${esc(mode)}</div>
+    <div class="xs muted mt4 pretty">Reads the form and finds a verified source for every answer${mode === 'assist' ? ', then fills it in a private page' : ''}. It never submits.</div>
+    ${state}${active ? '' : btn(label('kit-prepare', x ? 'Prepare again' : 'Prepare the form', 'Queueing…'), 'kit-prepare', { id: k.job.id }, 'sm mt8', isBusy('kit-prepare'))}</div>`;
 }
 
 /* ───────────── tracker ───────────── */
@@ -2733,9 +2771,30 @@ const A = {
   'open-kit': el => openKit(el.dataset.id),
   'close-kit': () => { S.kitJob = null; render(); },
   'copy-answer': el => { copyText(el.dataset.text); api(`/api/knowledge/${el.dataset.id}/used`, { method: 'POST' }).catch(() => {}); },
+  'kit-start': el => busy('kit-start', async () => {
+    await api(`/api/jobs/${el.dataset.id}/submission/start`, { method: 'POST' });
+    D.kit = await api(`/api/jobs/${el.dataset.id}/apply-kit`);
+  }, 'Submission started · this posting is reserved for you'),
+  'kit-release': el => busy('kit-release', async () => {
+    await api(`/api/jobs/${el.dataset.id}/submission/release`, { method: 'POST', body: { claim_token: el.dataset.token, reason: 'Not submitted (Apply kit)' } });
+    D.kit = await api(`/api/jobs/${el.dataset.id}/apply-kit`);
+  }, 'Released'),
+  'kit-resolve': el => busy('kit-resolve', async () => {
+    await api(`/api/jobs/${el.dataset.id}/submission/resolve`, { method: 'POST', body: { claim_id: Number(el.dataset.claim), submitted: !!el.dataset.submitted } });
+    D.kit = await api(`/api/jobs/${el.dataset.id}/apply-kit`);
+  }, 'Saved'),
+  'kit-prepare': el => busy('kit-prepare', async () => {
+    await api(`/api/jobs/${el.dataset.id}/application-execution`, { method: 'POST', body: {} });
+    D.kit = await api(`/api/jobs/${el.dataset.id}/apply-kit`);
+  }, 'Queued for the application worker'),
+  'kit-confirm': el => busy('kit-confirm', async () => {
+    await api(`/api/application-executions/${el.dataset.exec}/confirm`, { method: 'POST', body: { question_ids: el.dataset.ids.split(',').map(Number) } });
+    D.kit = await api(`/api/jobs/${S.kitJob}/apply-kit`);
+  }, 'Confirmed for this application'),
   'mark-applied': el => busy('applied', async () => {
     const k = S.forms.kit || {};
-    await api(`/api/jobs/${el.dataset.id}/applied`, { method: 'POST', body: { recruiter_name: k.recruiter_name || '', recruiter_email: k.recruiter_email || '', notes: '' } });
+    const token = D.kit?.claim?.claim_token;
+    await api(`/api/jobs/${el.dataset.id}/applied`, { method: 'POST', body: { recruiter_name: k.recruiter_name || '', recruiter_email: k.recruiter_email || '', notes: '', ...(token ? { claim_token: token } : {}) } });
     delete S.forms.kit; S.kitJob = null;
     const tracker = await api('/api/tracker');
     const app = tracker.applications.find(a => a.job_id === Number(el.dataset.id));
