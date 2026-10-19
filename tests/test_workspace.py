@@ -684,7 +684,11 @@ def test_approvals_filter_to_easy_apply_jobs():
         db.add(run)
         db.flush()
         for job_id in (plain["id"], easy["id"]):
-            db.get(Job, job_id).status = "tailored"
+            tailored = db.get(Job, job_id)
+            tailored.status = "tailored"
+            # Approvals lists a packet once its latest version is reviewed.
+            db.add(ResumeVariant(job_id=job_id, user_id=tailored.user_id, version=1, markdown="# Packet",
+                                 reviewer_score=80))
         job = db.get(Job, easy["id"])
         job.source, job.search_run_id = "apify:linkedin", run.id
         db.commit()

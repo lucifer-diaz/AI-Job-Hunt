@@ -1062,7 +1062,7 @@ FastAPI starts → scheduler loop (every SCHEDULER_TICK_SECONDS)
 | `apify_sync` | `APIFY_SYNC_INTERVAL_MINUTES=5` | Imports datasets of Apify runs that finished; each run is imported once |
 | `ranking` | `RANKING_INTERVAL_MINUTES=2` | The Job Ranker (section 8). A deterministic sweep hard-filters and queues new jobs, recovers crashed tasks and queues re-ranks; then it claims up to `RANKING_BATCH_SIZE` ranking tasks and runs at most `RANKING_CONCURRENCY` model calls at a time — and no more than each account's own limit (see "Processing limits"). Jobs move RANK_PENDING → RANKING → RANKED → QUALIFIED / ARCHIVED |
 | `auto_tailor` | `AUTO_TAILOR_INTERVAL_MINUTES=5` | Automatic tailoring's safety net (see "Automatic tailoring"): queues qualified jobs ranked since an account turned it on that have no tailoring task yet. The tailor worker runs them within the account's tailoring limit |
-| `listing_check` | `LISTING_CHECK_INTERVAL_MINUTES=720` | Re-reads a bounded batch of postings over plain HTTP and deletes the ones that no longer exist (section 14). Approved and applied jobs are kept |
+| `listing_check` | `LISTING_CHECK_INTERVAL_MINUTES=240` | Re-reads every job up to approval about once a day (HTTP, then the shared browser when needed) and deletes postings that are gone or no longer take applications (section 14). Approved and applied jobs are kept; approved ones are labelled *posting closed* |
 | `jd_recovery` | `JD_RECOVERY_INTERVAL_MINUTES=2` | Job description recovery (section 13): assesses descriptions never assessed, claims up to `JD_FETCH_BATCH_SIZE` recovery tasks and reads at most `JD_FETCH_MAX_CONCURRENCY` postings at a time — HTTP first, the shared headless browser only when HTTP finds nothing. Runs on SQLite too (claims are guarded UPDATEs) |
 | `compensation` | `COMPENSATION_INTERVAL_MINUTES=5` | Records the salary stated in the original posting (structured actor fields or explicit salary text) in `jobs.compensation`. Glassdoor and PayScale are recorded as `not_configured` until those actors are integrated |
 | `applications` | `APPLICATION_INTERVAL_MINUTES=5` | Reports READY_TO_APPLY / APPLYING counts. Automatic submission is not enabled, so it always reports `skipped` |
@@ -1593,6 +1593,10 @@ setting alone), and **it cannot skip review** — a packet the reviewer never sc
 it is still refused until it has been reviewed.
 
 ### Rejecting a job
+
+A packet reaches **Approvals** only once its latest version has been reviewed (`workspace.reviewed_or_approved`).
+Tailoring saves the packet before the Reviewer runs; while the review runs, or after it fails, the job stays on Tailor
+(the task shows *Reviewing…*, or *failed* with Retry), and the sidebar badge does not count it.
 
 Three decisions are open on every packet in **Approvals**:
 
@@ -3072,15 +3076,23 @@ Deleting jobs the filter had already hidden, and dead postings deleted automatic
 
 When JD recovery or the `listing_check` job finds a posting gone (404/410, or "no longer accepting applications"), the
 job is **deleted** with its tasks and a tombstone is kept, so the next search does not import it again. Approved and
-applied jobs are never deleted (the log says the posting closed). A login wall, a challenge, a timeout or a server
-error never deletes anything. `listing_check` re-reads postings over plain HTTP in bounded batches — never the browser
-or a model. Each deletion is a Monitoring → Logs line (`posting_removed`) with the title, company and URL.
+applied jobs are never deleted: the log says the posting closed, and an approved job is labelled *posting closed* on
+Approvals (`posting_closed_at`, cleared if a later check finds it open). A login wall, a challenge, a timeout or a
+server error never deletes anything.
+
+`listing_check` re-reads every job up to approval (discovered, ranked, tailored, waiting for approval, approved; not
+jobs a worker holds or a tailoring task is working on) about once a day, in bounded batches. HTTP comes first; when
+HTTP found nothing readable, the page gets one ordinary rendering in the shared browser (`BrowserService`, and only if
+the account's *Use the browser* recovery switch is on) — never after a login wall, a challenge or a 429, and never a
+model. A page that still shows the description but carries a closed banner ("No longer accepting applications") counts
+as closed. Each deletion is a Monitoring → Logs line (`posting_removed`) with the title, company and URL; each run's
+counts (deleted, kept, live, unknown, browser_used) are in Monitoring → Scheduler.
 
 ```env
 AUTO_DELETE_REMOVED_JOBS=true
-LISTING_CHECK_INTERVAL_MINUTES=720     # 0 disables the job
-LISTING_CHECK_BATCH_SIZE=25
-LISTING_CHECK_MAX_AGE_DAYS=3           # a posting is re-checked at most this often
+LISTING_CHECK_INTERVAL_MINUTES=240     # 0 disables the job
+LISTING_CHECK_BATCH_SIZE=60
+LISTING_CHECK_MAX_AGE_DAYS=1           # a posting is re-checked at most this often
 DOMAIN_FILTER_ENABLED=true             # server switch; each account has its own lists and switch
 LEARN_MIN_DISMISSALS=3
 ```

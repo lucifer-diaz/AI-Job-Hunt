@@ -201,7 +201,10 @@ The rules a change has to keep:
   `feedback_learning.record(db, job, action)` *before* deleting a job, then `after_feedback`, which learns inside a
   savepoint so a failure never undoes the person's action. Automatic deletions (dead postings) are never feedback.
 * **Dead postings go through `job_removal.remove_posting`**: tombstone, log line, `delete_job` (which also removes task
-  rows, for SQLite). Approved or applied jobs are never deleted, and only a page that says the posting is gone counts.
+  rows, for SQLite). Approved or applied jobs are never deleted (an approved one gets `posting_closed_at` instead), and
+  only a page that says the posting is gone counts. The daily listing check (`job_removal.check_listings`) covers jobs
+  up to approval, skips jobs a worker or tailoring task holds, and may render a page once in the shared browser after
+  HTTP — never after a login wall, a challenge or a 429, and never a model.
   Import paths check `job_removal.is_removed` before creating a job.
 * **One resume selection: the active version (`Resume.is_active`).** Only `resume_verification.set_active` changes it,
   and only because the person asked (Make active). Uploads, saved resume text, structured edits, file deletes and

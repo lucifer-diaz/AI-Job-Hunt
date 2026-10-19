@@ -19,7 +19,7 @@ from bs4 import BeautifulSoup
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, field_validator, model_validator
-from sqlalchemy import and_, desc, func, or_, select, update
+from sqlalchemy import and_, desc, exists, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.auth import get_user_db
@@ -265,7 +265,10 @@ def job_card(job: Job) -> dict:
         "resume_choice_id": job.resume_id, "resume_choice": job.resume_choice,
         "search_run_id": job.search_run_id, "application_id": app.id if app else None,
         "application_status": app.status if app else None, "stage": app.stage if app else None,
-        "rejection": rejection_card(job),
+        "rejection": rejection_card(job), "starred": bool(job.starred),
+        # The listing check found the posting closed but kept the job (approved): app.services.job_removal.
+        "posting_closed": ({"at": job.posting_closed_at.isoformat(), "ago": ago(job.posting_closed_at),
+                            "reason": job.posting_closed_reason} if job.posting_closed_at else None),
     }
 
 
@@ -287,8 +290,19 @@ def triage_query(db: Session):
     return query
 
 
+def reviewed_or_approved():
+    """A packet belongs in Approvals once its latest version has been reviewed. Tailoring saves the packet (status
+    "tailored") before the Reviewer runs; until the review is stored, or when it failed, the job stays on Tailor.
+    Approved jobs always qualify: approval needed a reviewed packet, and the packet is locked after it."""
+    latest = select(func.max(ResumeVariant.version)).where(ResumeVariant.job_id == Job.id) \
+        .correlate(Job).scalar_subquery()
+    reviewed = exists().where(ResumeVariant.job_id == Job.id, ResumeVariant.version == latest,
+                              ResumeVariant.reviewer_score.is_not(None))
+    return or_(Job.status == "approved", reviewed)
+
+
 def approval_jobs(db: Session) -> list[Job]:
-    return db.scalars(select(Job).where(Job.status.in_(("tailored", "pending_approval")))
+    return db.scalars(select(Job).where(Job.status.in_(("tailored", "pending_approval")), reviewed_or_approved())
                       .order_by(desc(Job.fit_score))).all()
 
 
@@ -1821,6 +1835,7 @@ APPROVAL_STATUS_FILTERS = {
     "waiting": lambda r: r["status"] == "tailored",
     "sent_back": lambda r: r["status"] in ("pending_approval", "rejected"),
     "approved": lambda r: r["status"] == "approved",
+    "starred": lambda r: r["starred"],
 }
 PACKET_SORTS = {
     "fit": lambda r: (r["fit"] is None, -(r["fit"] or 0), -r["id"]),
@@ -1971,7 +1986,7 @@ def approvals(q: str = "", min_fit: int = 0, min_review: int = 0, board: str = "
               with_facets: bool = False, db: Session = Depends(get_user_db)):
     if easy_apply_filter not in ("all", "", "only"):
         raise HTTPException(422, f"Unknown easy_apply filter: {easy_apply_filter}")
-    jobs = db.scalars(select(Job).where(Job.status.in_(APPROVAL_QUEUE_STATUSES))
+    jobs = db.scalars(select(Job).where(Job.status.in_(APPROVAL_QUEUE_STATUSES), reviewed_or_approved())
                       .order_by(desc(Job.id))).all()
     inputs = run_inputs(db, jobs)
     rows = []
@@ -1984,7 +1999,8 @@ def approvals(q: str = "", min_fit: int = 0, min_review: int = 0, board: str = "
                      "waiting": job.status == "tailored",
                      "easy_apply": easy_apply(job, inputs.get(job.search_run_id)),
                      "approval_override": bool(app.approval_override) if app else False})
-    rows.sort(key=lambda r: (not r["waiting"], r["status"] == "approved"))
+    # Starred jobs lead the queue, then the ones waiting for a decision.
+    rows.sort(key=lambda r: (not r["starred"], not r["waiting"], r["status"] == "approved"))
     return filter_packet_rows(rows, q=q, min_fit=min_fit, min_review=min_review, board=board, status=status, sort=sort,
                               status_filters=APPROVAL_STATUS_FILTERS, with_facets=with_facets,
                               location=location, easy_apply_only=easy_apply_filter == "only")
@@ -2025,6 +2041,10 @@ def approval_detail(job_id: int, db: Session = Depends(get_user_db)):
 
 class NotesIn(BaseModel):
     notes: str = ""
+
+
+class StarIn(BaseModel):
+    starred: bool
 
 
 # Why a candidate turns a job down. The reason is optional: rejecting with none is one click, and the label is
@@ -2205,6 +2225,15 @@ def save_notes(job_id: int, payload: NotesIn, db: Session = Depends(get_user_db)
     app.notes = payload.notes
     db.commit()
     return {"ok": True}
+
+
+@router.put("/api/jobs/{job_id}/star")
+def star_job(job_id: int, payload: StarIn, db: Session = Depends(get_user_db)):
+    """Star or unstar a job. A bookmark for the person: no workflow state, ranking or task changes."""
+    job = get_job(db, job_id)
+    job.starred = payload.starred
+    db.commit()
+    return {"ok": True, "starred": job.starred}
 
 
 def packet_names(db: Session, job: Job, resume: ResumeVariant | None) -> dict[str, str]:

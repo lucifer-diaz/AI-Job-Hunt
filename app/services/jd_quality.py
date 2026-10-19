@@ -78,6 +78,11 @@ CLOSED_MARKERS = ("no longer accepting applications", "this job is no longer ava
                   "this job is closed", "no longer open", "the job you are looking for is no longer",
                   "this job has been closed", "this role has been filled", "job not found", "posting not found",
                   "position is no longer available", "vacancy has been closed", "this requisition is closed")
+# Phrases that close a posting even on a page that still shows its description (the listing check only): a banner
+# the board puts on the posting itself, never a phrase a description would use.
+CLOSED_BANNER_MARKERS = ("no longer accepting applications", "this job is no longer available",
+                         "this job has expired", "this posting is closed", "this job is closed",
+                         "this position has been filled", "this job posting has been removed")
 ERROR_MARKERS = ("page not found", "404 not found", "error 404", "something went wrong", "an error occurred",
                  "internal server error", "service unavailable", "bad gateway", "please enable javascript",
                  "you need to enable javascript", "this site requires javascript", "we can't find that page",
@@ -86,6 +91,9 @@ ERROR_MARKERS = ("page not found", "404 not found", "error 404", "something went
 
 def _lower(text: str | None) -> str:
     return re.sub(r"\s+", " ", (text or "")).strip().lower()
+
+
+lower_text = _lower
 
 
 def content_hash(text: str | None) -> str | None:

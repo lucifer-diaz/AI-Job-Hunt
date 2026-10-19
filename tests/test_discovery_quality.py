@@ -8,7 +8,7 @@ import uuid
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 
 import app.main  # noqa: F401  migrates the test database, as every API test does
 from app import auth
@@ -34,7 +34,8 @@ from app.services.domain_match import DEFAULT_DOMAIN_EXCLUDES, DEFAULT_SKILL_EXC
 from app.services.lifecycle import WorkflowState as S
 from app.settings import get_settings
 from tests.conftest import make_user
-from tests.jd_support import PostingServer
+from tests.jd_support import PAGES as PAGES_DIR
+from tests.jd_support import FakeBrowser, PostingServer
 
 SOURCE = "test:discovery-quality"
 POSTING = ("About the role\nWe are looking for a backend engineer to build Python services.\nResponsibilities\n"
@@ -316,10 +317,10 @@ def server(monkeypatch):
         yield posting_server
 
 
-def check(owner: int, job_id: int) -> str:
+def check(owner: int, job_id: int, browser=None) -> str:
     from app.services.jd_recovery import utcnow
 
-    return job_removal.check_one(SessionLocal, job_id, owner, utcnow())
+    return asyncio.run(job_removal.check_one(SessionLocal, job_id, owner, utcnow(), browser=browser))
 
 
 def test_the_listing_check_deletes_only_postings_that_are_gone(user, server):
@@ -344,6 +345,80 @@ def test_approved_or_applied_jobs_are_never_deleted(user, server):
         db.get(Job, job_id).status = "applied"
         db.commit()
     assert check(user, job_id) == "kept" and job_of(job_id) is not None
+
+
+def move(job_id: int, **fields) -> None:
+    """Put a job where a test needs it, past the lifecycle's transition guard."""
+    with SessionLocal() as db:
+        db.execute(update(Job).where(Job.id == job_id).values(**fields))
+        db.commit()
+
+
+BANNER_PAGE = f"<html><head><title>Backend Engineer</title></head><body><main><h1>Backend Engineer</h1>" \
+              f"<div class='notice'>No longer accepting applications</div><p>{POSTING}</p></main></body></html>"
+SCRIPT_SHELL = "<html><head><title>Careers</title></head><body><div id='root'>Please enable JavaScript</div></body></html>"
+
+
+def test_tailored_jobs_waiting_for_approval_are_checked_and_deleted(user, server):
+    job_id = add(user, "Backend Engineer", url=server.url("gone"))
+    move(job_id, state=S.READY_TO_APPLY, status="tailored")
+    with SessionLocal() as db:
+        assert job_id in {j for j, _ in job_removal.due_jobs(db, job_removal.utcnow(), 500)}
+    assert check(user, job_id) == "deleted" and job_of(job_id) is None
+
+
+def test_an_approved_job_whose_posting_closed_is_kept_and_labelled_until_it_reopens(user, server):
+    server.routes["approved"] = (404, "<h1>Not found</h1>", {})
+    job_id = add(user, "Backend Engineer", url=server.url("custom/approved"))
+    move(job_id, state=S.READY_TO_APPLY, status="approved")
+    assert check(user, job_id) == "kept"
+    job = job_of(job_id)
+    assert job is not None and job.posting_closed_at is not None and job.posting_closed_reason == "JOB_REMOVED"
+    server.routes["approved"] = (200, (PAGES_DIR / "posting.html").read_text(), {})
+    assert check(user, job_id) == "live" and job_of(job_id).posting_closed_at is None
+
+
+def test_a_posting_that_still_shows_its_description_but_takes_no_applications_is_deleted(user, server):
+    server.routes["banner"] = (200, BANNER_PAGE, {})
+    job_id = add(user, "Backend Engineer", url=server.url("custom/banner"))
+    assert check(user, job_id) == "deleted" and job_of(job_id) is None
+
+
+def test_the_browser_reads_a_page_http_could_not(user, server):
+    server.routes["shell"] = (200, SCRIPT_SHELL, {})
+    closed, live = (add(user, "Backend Engineer", url=server.url(f"custom/shell?{n}")) for n in ("a", "b"))
+    browser = FakeBrowser({"shell?a": (200, BANNER_PAGE)})
+    assert check(user, closed, browser) == "deleted+browser" and job_of(closed) is None
+    assert browser.calls, "the page was rendered"
+    live_browser = FakeBrowser({"shell?b": (200, (PAGES_DIR / "posting.html").read_text())})
+    assert check(user, live, live_browser) == "live+browser" and job_of(live) is not None
+
+
+def test_a_login_wall_never_reaches_the_browser(user, server):
+    job_id = add(user, "Backend Engineer", url=server.url("login.html"))
+    browser = FakeBrowser({"login.html": (200, BANNER_PAGE)})
+    assert check(user, job_id, browser) == "unknown" and browser.calls == []
+    assert job_of(job_id) is not None
+
+
+def test_jobs_a_worker_holds_or_that_were_applied_to_are_not_checked(user, server):
+    from datetime import timedelta
+
+    from app.models import TailorTask
+
+    held, tailoring, applied, free = (add(user, "Backend Engineer", url=server.url("gone")) for _ in range(4))
+    now = job_removal.utcnow()
+    move(held, lock_token="t", locked_by="w", locked_at=now, lock_expires_at=now + timedelta(minutes=5))
+    move(applied, state=S.APPLIED, status="applied")
+    with SessionLocal() as db:
+        db.add(TailorTask(job_id=tailoring, user_id=user, status="running"))
+        db.commit()
+    with SessionLocal() as db:
+        due = {j for j, _ in job_removal.due_jobs(db, now, 500)}
+    assert free in due and not due & {held, tailoring, applied}
+    with SessionLocal() as db:
+        db.execute(delete(TailorTask).where(TailorTask.job_id == tailoring))
+        db.commit()
 
 
 def test_a_deleted_posting_is_not_imported_again(user, server):

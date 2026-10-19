@@ -495,6 +495,10 @@ class Job(Base):
     domain_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     # When the posting URL was last confirmed to still exist (app.services.job_removal.listing_check).
     listing_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # The listing check found the posting closed but kept the job because the person approved or applied to it.
+    # Cleared when a later check finds it open again.
+    posting_closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    posting_closed_reason: Mapped[str | None] = mapped_column(String(40), nullable=True)
     # The resume ranking, tailoring and review use for this job. NULL = the account's active resume.
     resume_id: Mapped[int | None] = mapped_column(
         ForeignKey("resumes.id", ondelete="SET NULL", name="fk_jobs_resume_id"), nullable=True, index=True)
@@ -506,6 +510,8 @@ class Job(Base):
     # QUEUED (it queued the job once) or DECLINED (the person cancelled a tailoring task for it). NULL = undecided;
     # only an undecided job is ever queued automatically.
     auto_tailor_status: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    # The person starred this job to come back to it (Approvals). A bookmark only: it changes no workflow state.
+    starred: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
 
     # Salary enrichment (app.services.compensation): posting salary plus the status of other sources.
     compensation: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)

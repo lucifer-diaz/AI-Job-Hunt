@@ -264,10 +264,11 @@ class Settings(BaseSettings):
     # A posting that no longer exists (404/410, "no longer accepting applications") is deleted, and a tombstone stops
     # it being imported again (app.services.job_removal). Approved and applied jobs are never deleted.
     auto_delete_removed_jobs: bool = True
-    # Re-check that postings with a usable description still exist: plain HTTP, bounded, never the browser or a model.
-    listing_check_interval_minutes: int = 720
-    listing_check_batch_size: int = 25
-    listing_check_max_age_days: int = 3
+    # Re-check, about daily, that postings up to approval still exist: HTTP first, the shared browser only when HTTP
+    # read nothing (never after a login wall, a challenge or a 429), bounded, never a model.
+    listing_check_interval_minutes: int = 240
+    listing_check_batch_size: int = 60
+    listing_check_max_age_days: int = 1
     # Domain filter (app.services.domain_match): jobs outside the candidate's domain are hidden at discovery and never
     # recovered, parsed or ranked. Each account edits its own lists; this switches the feature for the server.
     domain_filter_enabled: bool = True

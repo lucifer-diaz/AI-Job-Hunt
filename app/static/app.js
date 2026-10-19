@@ -1067,7 +1067,7 @@ function renderManualAdd() {
 /* ───────────── packet filters (Tailor, Approvals) ───────────── */
 const PF_STATUS = {
   tailor: [['all', 'All packets'], ['not_tailored', 'Not tailored'], ['has_packet', 'Has packet'], ['needs_retailor', 'Needs re-tailoring'], ['sent_back', 'Sent back'], ['untailored', 'Master resume only']],
-  approvals: [['all', 'All statuses'], ['waiting', 'Waiting'], ['sent_back', 'Sent back'], ['approved', 'Approved']],
+  approvals: [['all', 'All statuses'], ['starred', 'Starred'], ['waiting', 'Waiting'], ['sent_back', 'Sent back'], ['approved', 'Approved']],
 };
 const PF_SORT = {
   tailor: [['fit', 'Sort: best fit'], ['reviewer', 'Sort: reviewer score'], ['new', 'Sort: newest'], ['company', 'Sort: company']],
@@ -1292,7 +1292,7 @@ function renderApprovalsBody(list) {
   const allOn = list.every(q => S.approvalPicked.has(q.id));
   const queue = `<section class="card flush c-narrow"><div class="card-head row gap10"><input type="checkbox" data-act="approval-check-all" ${allOn ? 'checked' : ''} aria-label="Select every job in the queue"><span class="card-title sm grow">Queue · ${waiting} waiting</span></div>
     ${renderApprovalBulkBar(list)}
-    ${list.map(q => `<div class="lrow click ${q.id === S.approvalJob ? 'sel' : ''}" data-act="select-approval" data-id="${q.id}"><input type="checkbox" data-act="approval-check" data-id="${q.id}" ${S.approvalPicked.has(q.id) ? 'checked' : ''} aria-label="Select ${attr(q.title)}"><div class="grow"><div class="base b ellipsis">${esc(q.title)}</div><div class="xs muted">${esc(q.company)} · ${esc(q.age)}</div></div>${q.easy_apply ? pill('Easy Apply', 'brand') : ''}${q.approval_override ? pill('waived', 'warn') : ''}<span class="mono bb base" style="color:${q.status === 'approved' ? 'var(--faint)' : (q.reviewer_score || 0) >= 75 ? 'var(--good)' : (q.reviewer_score || 0) >= 65 ? 'var(--warn)' : 'var(--bad)'}">${fitTxt(q.reviewer_score)}</span></div>`).join('')}</section>`;
+    ${list.map(q => `<div class="lrow click ${q.id === S.approvalJob ? 'sel' : ''}" data-act="select-approval" data-id="${q.id}"><input type="checkbox" data-act="approval-check" data-id="${q.id}" ${S.approvalPicked.has(q.id) ? 'checked' : ''} aria-label="Select ${attr(q.title)}">${starButton(q)}<div class="grow"><div class="base b ellipsis">${esc(q.title)}</div><div class="xs muted">${esc(q.company)} · ${esc(q.age)}</div></div>${q.easy_apply ? pill('Easy Apply', 'brand') : ''}${q.approval_override ? pill('waived', 'warn') : ''}${postingClosedPill(q)}<span class="mono bb base" style="color:${q.status === 'approved' ? 'var(--faint)' : (q.reviewer_score || 0) >= 75 ? 'var(--good)' : (q.reviewer_score || 0) >= 65 ? 'var(--warn)' : 'var(--bad)'}">${fitTxt(q.reviewer_score)}</span></div>`).join('')}</section>`;
   if (!a) return `<div class="split">${queue}<section class="card c-main">${loading()}</section></div>`;
   const r = a.resume, job = a.job;
   const approved = job.status === 'approved';
@@ -1301,7 +1301,7 @@ function renderApprovalsBody(list) {
   const approveAct = below ? 'approve-override-open' : 'approve';
   return `<div class="split">${queue}
   <section class="card flush c-main">
-    <div class="row between wrap gap12" style="padding:18px 22px;border-bottom:1px solid var(--line2)"><div><div style="font-size:17px;font-weight:600">${esc(job.title)} · ${esc(job.company)}</div><div class="small muted mt4">Fit ${fitTxt(job.fit)} · reviewer ${fitTxt(r?.reviewer_score)} · tailored ${esc(r?.generated || '')} · ${statusPill(job.status)}${list.find(x => x.id === job.id)?.easy_apply ? ` ${pill('Easy Apply', 'brand')}` : ''}</div></div>
+    <div class="row between wrap gap12" style="padding:18px 22px;border-bottom:1px solid var(--line2)"><div><div class="row gap8" style="font-size:17px;font-weight:600">${starButton(job)}<span>${esc(job.title)} · ${esc(job.company)}</span></div><div class="small muted mt4">Fit ${fitTxt(job.fit)} · reviewer ${fitTxt(r?.reviewer_score)} · tailored ${esc(r?.generated || '')} · ${statusPill(job.status)} ${postingClosedPill(job)}${list.find(x => x.id === job.id)?.easy_apply ? ` ${pill('Easy Apply', 'brand')}` : ''}</div></div>
       <div class="row gap8 wrap">${btn('Job details', 'open-job', { id: job.id })}${job.url ? `<a class="btn" href="${attr(job.url)}" target="_blank" rel="noopener">Open posting ↗</a>` : ''}${btn(label('reject', 'Reject', 'Rejecting…'), 'reject-open', { id: job.id }, 'ghost danger', isBusy('reject'))}${approved ? btn('Open apply kit', 'open-kit', { id: job.id }, 'good') : `${btn(label('revise', 'Needs revision', 'Sending back…'), 'revise', { id: job.id }, '', isBusy('revise'))}${btn(label('approve', below ? 'Approve anyway…' : 'Approve → apply kit', 'Approving…'), approveAct, { id: job.id }, 'good', isBusy('approve') || !r)}`}</div></div>
     ${pipelineBanner({ ...job, pipeline: a.pipeline }, '12px 22px 0')}
     ${a.approval?.override ? `<div class="banner warn" style="margin:0 22px;display:block"><b>Approved below your reviewer minimum.</b>${a.approval.note ? ` ${esc(a.approval.note)}` : ''}</div>` : ''}
@@ -1327,6 +1327,23 @@ function approvalBulkCounts(picked) {
     approve: picked.filter(q => q.status !== 'approved' && q.reviewer_score != null && (min == null || q.reviewer_score >= min)).length,
   };
 }
+// The daily posting check found this posting closed; the job stays because you approved it.
+const postingClosedPill = job => job.posting_closed ? `<span title="${attr(`The posting was found closed ${job.posting_closed.ago || ''}. Kept because you approved it.`)}">${pill('posting closed', 'bad')}</span>` : '';
+// A star marks a job to come back to. It is a bookmark only: it changes no workflow state.
+const starButton = job => `<button type="button" class="star-btn ${job.starred ? 'on' : ''}" data-act="approval-star" data-id="${job.id}" aria-pressed="${job.starred ? 'true' : 'false'}" aria-label="${job.starred ? 'Unstar' : 'Star'} ${attr(job.title)}" title="${job.starred ? 'Starred — click to unstar' : 'Star this job'}">${job.starred ? '★' : '☆'}</button>`;
+// Only web links are opened in a new tab; a posting URL comes from a job board and is not trusted.
+function postingUrl(url) { return /^https?:\/\//i.test(url || '') ? url : ''; }
+// One tab per picked posting. window.open runs inside the click itself, before any await, or the browser
+// treats every tab after the first as an unrequested pop-up.
+function openPostings(urls) {
+  let opened = 0;
+  for (const url of urls) {
+    const tab = window.open(url, '_blank');
+    if (!tab) break;
+    tab.opener = null; opened += 1;
+  }
+  return opened;
+}
 const BULK_APPROVAL_DONE = { reject: 'Rejected', revise: 'Sent back for revision', approve: 'Approved' };
 function bulkApprovalMsg(out) {
   const n = out.done.length, skipped = out.skipped.length;
@@ -1337,8 +1354,10 @@ function renderApprovalBulkBar(list) {
   const picked = list.filter(q => S.approvalPicked.has(q.id));
   if (!picked.length) return '';
   const n = approvalBulkCounts(picked), working = isBusy('bulkApproval');
+  const links = picked.filter(q => postingUrl(q.url)).length;
   const head = `<div class="row wrap gap8" style="padding:10px 18px;border-bottom:1px solid var(--line2);background:var(--brand-softer)">
     <span class="small b grow">${picked.length} selected</span>
+    <span title="${attr(links < picked.length ? `${picked.length - links} selected job${picked.length - links === 1 ? ' has' : 's have'} no posting link` : 'Open each selected posting in a new tab')}">${btn(`Open postings${links ? ` ${links}` : ''} ↗`, 'bulk-open-postings', {}, 'sm', !links)}</span>
     ${btn('Reject…', 'bulk-reject-open', {}, 'sm ghost danger', working || S.bulkRejecting)}
     ${btn(label('bulkApproval', `Needs revision${n.revise ? ` ${n.revise}` : ''}`, 'Working…'), 'bulk-approval', { action: 'revise' }, 'sm', working || !n.revise)}
     <span title="Approves packets that cleared your reviewer minimum. To waive the minimum, approve that packet on its own.">${btn(label('bulkApproval', `Approve${n.approve ? ` ${n.approve}` : ''}`, 'Working…'), 'bulk-approval', { action: 'approve' }, 'sm good', working || !n.approve)}</span>
@@ -2660,6 +2679,26 @@ const A = {
     render();
   },
   'approval-check-none': (el, e) => { e?.preventDefault?.(); S.approvalPicked = new Set(); S.bulkRejecting = false; render(); },
+  'approval-star': async (el, e) => {
+    e?.stopPropagation?.();
+    const id = Number(el.dataset.id);
+    const row = (D.approvals || []).find(q => q.id === id), detail = D.approval?.job?.id === id ? D.approval.job : null;
+    const starred = !(row || detail)?.starred;
+    const set = v => { if (row) row.starred = v; if (detail) detail.starred = v; };
+    set(starred); render();
+    try {
+      await api(`/api/jobs/${id}/star`, { method: 'PUT', body: { starred } });
+      // The queue puts starred jobs first, and the Starred filter drops an unstarred one.
+      await load();
+    } catch (err) { set(!starred); render(); toast(err.message, true); }
+  },
+  'bulk-open-postings': () => {
+    const urls = (D.approvals || []).filter(q => S.approvalPicked.has(q.id)).map(q => postingUrl(q.url)).filter(Boolean);
+    if (!urls.length) return;
+    const opened = openPostings(urls);
+    if (opened < urls.length) toast(`Opened ${opened} of ${urls.length} postings — your browser blocked the rest. Allow pop-ups for this site and try again.`, true);
+    else toast(`Opened ${opened} posting${opened === 1 ? '' : 's'} in new tabs`);
+  },
   'bulk-reject-open': () => { S.bulkRejecting = true; delete S.forms.bulkReject; render(); },
   'bulk-reject-close': (el, e) => { e?.preventDefault?.(); S.bulkRejecting = false; delete S.forms.bulkReject; render(); },
   'bulk-reject-reason': el => { setF('bulkReject', 'reason', fv('bulkReject', 'reason', '') === el.dataset.id ? '' : el.dataset.id); render(); },

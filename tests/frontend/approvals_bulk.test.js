@@ -93,4 +93,52 @@ describe('acting on several approvals at once', () => {
     expect(JSON.parse(options.body)).toEqual({ action: 'revise', job_ids: [1] });
     expect(ui.S.approvalPicked.size).toBe(0);
   });
+
+  it('opens each picked posting in its own tab, skipping jobs without a web link', () => {
+    ui.D.approvals = [row(1, { url: 'https://jobs.example.test/1' }), row(2, { url: '' }),
+      row(3, { url: 'javascript:alert(1)' }), row(4, { url: 'http://jobs.example.test/4' })];
+    ui.render();
+    expect(button('bulk-open-postings')).toHaveLength(0);
+    ui.A['approval-check-all']();
+    const [open] = button('bulk-open-postings');
+    expect(open.textContent).toBe('Open postings 2 ↗');
+    const tabs = [];
+    vi.stubGlobal('open', vi.fn(url => { const tab = { url, opener: window }; tabs.push(tab); return tab; }));
+    ui.A['bulk-open-postings']();
+    expect(tabs.map(t => t.url)).toEqual(['https://jobs.example.test/1', 'http://jobs.example.test/4']);
+    expect(tabs.every(t => t.opener === null)).toBe(true);
+    expect(document.getElementById('toast').textContent).toContain('Opened 2 postings');
+  });
+
+  it('says so when the browser blocks the extra tabs', () => {
+    ui.D.approvals = [row(1, { url: 'https://a.example.test' }), row(2, { url: 'https://b.example.test' })];
+    ui.A['approval-check-all']();
+    vi.stubGlobal('open', vi.fn().mockReturnValueOnce({}).mockReturnValue(null));
+    ui.A['bulk-open-postings']();
+    expect(window.open).toHaveBeenCalledTimes(2);
+    expect(document.getElementById('toast').textContent).toContain('Opened 1 of 2 postings');
+  });
+
+  it('stars a job from the queue without selecting it, and puts the star back if saving fails', async () => {
+    const [star] = button('approval-star');
+    expect(star.textContent).toBe('☆');
+    await ui.A['approval-star']({ dataset: { id: '2' } }, { stopPropagation() {} });
+    const [, options] = fetchMock.mock.calls.find(([u]) => u.endsWith('/api/jobs/2/star'));
+    expect(JSON.parse(options.body)).toEqual({ starred: true });
+    expect(ui.D.approvals.find(q => q.id === 2).starred).toBe(true);
+    expect(ui.S.approvalJob).toBe(1);
+
+    fetchMock.mockImplementationOnce(async () => ({ ok: false, status: 500, text: async () => JSON.stringify({ detail: 'down' }) }));
+    await ui.A['approval-star']({ dataset: { id: '1' } }, { stopPropagation() {} });
+    expect(ui.D.approvals.find(q => q.id === 1).starred).toBeFalsy();
+    expect(ui.D.approval.job.starred).toBeFalsy();
+  });
+
+  it('labels an approved job whose posting closed', () => {
+    ui.D.approvals = [row(1, { status: 'approved', posting_closed: { at: '2026-10-18T09:00:00', ago: '1d ago', reason: 'JOB_CLOSED' } }), row(2)];
+    ui.render();
+    const rows = [...view().querySelectorAll('[data-act="select-approval"]')];
+    expect(rows[0].textContent).toContain('posting closed');
+    expect(rows[1].textContent).not.toContain('posting closed');
+  });
 });
