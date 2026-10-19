@@ -2082,6 +2082,8 @@ def reject_one(db: Session, job: Job, reason: str, notes: str) -> None:
                    reason=f"Rejected: {REJECTION_REASONS.get(reason, 'no reason given')}")
     application = job.application
     if application is not None and application.applied_at is None:
+        if application.status == "approved":  # the approval no longer stands: its snapshot is withdrawn, not kept live
+            approval.withdraw(db, application, "Rejected after approval")
         application.status = "rejected"
     from app.services import preparation
 
@@ -2113,6 +2115,10 @@ def send_back_one(db: Session, job: Job, notes: str | None) -> None:
     """Send one packet back for revision without committing. `notes=None` keeps the notes already on file."""
     if not job.resumes:
         raise HTTPException(400, "There is no tailored packet to send back")
+    if job.application is not None and job.application.status == "approved":
+        # Sending back an approved packet withdraws the approval, as an edit does: snapshot revoked and the canonical
+        # state back to REVIEWED, so the next version is recorded through its real stages before it is approved again.
+        approval.revoke(db, job, "Sent back for revision")
     app = job.application or Application(job_id=job.id)
     db.add(app)
     app.status = "pending_approval"

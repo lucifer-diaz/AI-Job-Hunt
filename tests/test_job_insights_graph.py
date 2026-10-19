@@ -196,10 +196,25 @@ def test_shadow_rechecks_a_finished_run_without_writing(sessions, monkeypatch):
         assert db.scalar(select(func.count()).select_from(AgentThread)) == 0  # in memory: nothing stored
         task = db.scalar(select(JobInsightTask).where(JobInsightTask.job_id == job_id))
         assert task.status == "COMPLETED" and task.agent_thread_id is None
+    from contextlib import contextmanager
+
+    from app.agents import job_insights as graph
+    from app.agents import tracing_boundary
     from app.services.job_insights import graph as runner
 
+    exported = []
+    real_export = tracing_boundary.export
+
+    @contextmanager
+    def export(fields):
+        exported.append(fields)
+        with real_export(fields) as callbacks:
+            yield callbacks
+    monkeypatch.setattr(tracing_boundary, "export", export)
     result = runner.shadow(sessions, user, job_id, task.id)
     assert result["code"] == "PARITY" and result["provenance_violations"] == 0
+    # Inside the export boundary like every graph run: an environment tracer can never see it unpoliced.
+    assert exported == [graph.EXPORT_FIELDS]
 
 
 # ───────────── the provenance check (no database) ─────────────

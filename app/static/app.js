@@ -1220,7 +1220,7 @@ function renderTailorSingle(queue) {
   const stack = renderTaskLink() + renderPacketFilters('tailor', D.tailorFacets) + (locked ? `<section class="banner ${job.status === 'applied' ? '' : 'warn'} row wrap gap10" style="margin:0">
       <span class="grow" style="min-width:220px">${job.status === 'applied'
         ? '<b>Already applied.</b> Edits here no longer change what you submitted.'
-        : '<b>This packet is approved.</b> Edits below change the approved resume and cover letter directly. To regenerate it or skip tailoring, send it back for revision first.'}</span>
+        : '<b>This packet is approved.</b> Editing the resume or cover letter below withdraws the approval; approve it again afterwards. To regenerate it or skip tailoring, send it back for revision first.'}</span>
       ${job.status === 'approved' ? btn(label('revise', 'Send back for revision', 'Sending back…'), 'revise', { id: job.id }, 'sm', isBusy('revise')) + btn('Open apply kit', 'open-kit', { id: job.id }, 'sm good') : ''}</section>` : '');
   if (!r) {
     return `<div class="stack">${stack}<section class="card row gap16 wrap" id="tailor-packet"><div class="grow" style="min-width:220px"><div class="card-title" style="font-size:16px">Tailoring for ${esc(job.title)} · ${esc(job.company)}</div><div class="card-sub">Fit ${fitTxt(job.fit)} · no packet generated yet</div></div>${picker}</section>

@@ -213,14 +213,22 @@ def revoke(db: Session, job: Job, reason: str, *, now: datetime | None = None) -
     if application is None or application.status != "approved":
         return False
     now = now or utcnow()
-    packet = live(db, application)
-    if packet is not None:
-        packet.revoked_at, packet.revoked_reason = now, reason[:200]
+    withdraw(db, application, reason, now=now)
     application.status = "pending_approval"
     application.approved_at = None
     job.status = "pending_approval"
     if parse_state(job.state) is S.READY_TO_APPLY:
         transition(db, job, S.REVIEWED, actor=ACTOR, reason=f"Approval revoked: {reason}"[:500], now=now)
+    return True
+
+
+def withdraw(db: Session, application: Application | None, reason: str, *, now: datetime | None = None) -> bool:
+    """Mark the application's live approval snapshot revoked (the row stays as history). Does not commit. True when
+    there was one. The caller moves the application and the job (revoke, or a rejection)."""
+    packet = live(db, application)
+    if packet is None:
+        return False
+    packet.revoked_at, packet.revoked_reason = now or utcnow(), reason[:200]
     return True
 
 

@@ -118,15 +118,20 @@ def shadow(sessions: SessionFactory, user_id: int, job_id: int, task_id: int) ->
     Logs a difference; never writes to the research tables and never calls a source or a model."""
     from langgraph.checkpoint.memory import InMemorySaver
 
-    from app.agents import effects
+    from app.agents import effects, tracing_boundary
     from app.agents import job_insights as graph
 
     try:
         app = graph.build(InMemorySaver())
         context = graph.InsightsContext(run=effects.RunHandle(0, user_id, "shadow"), sessions=sessions,
                                         task_id=task_id)
-        state = app.invoke({"job_id": job_id, "task_id": task_id, "mode": "SHADOW"},
-                           config={"configurable": {"thread_id": f"shadow:{user_id}:{task_id}"}}, context=context)
+        # Like every graph run (runtime.execute): inside the export boundary, so LANGSMITH_TRACING in the environment
+        # can never add an unpoliced tracer to this one.
+        with tracing_boundary.export(graph.EXPORT_FIELDS) as callbacks:
+            state = app.invoke({"job_id": job_id, "task_id": task_id, "mode": "SHADOW"},
+                               config={"configurable": {"thread_id": f"shadow:{user_id}:{task_id}"},
+                                       "callbacks": callbacks, "run_name": "agent:job_insights:shadow"},
+                               context=context)
     except Exception:
         log.warning("job insights shadow check for task %s failed", task_id, exc_info=True)
         return None

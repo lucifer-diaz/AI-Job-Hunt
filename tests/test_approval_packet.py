@@ -122,6 +122,33 @@ def test_an_edit_after_approval_revokes_it_in_the_same_transaction():
         assert db.get(Job, job_id).state is S.READY_TO_APPLY
 
 
+def test_sending_an_approved_packet_back_withdraws_the_approval():
+    job_id, _ = job_with_packet(S.QUALIFIED)
+    assert client.post(f"/api/jobs/{job_id}/approve").status_code == 200
+    assert client.post(f"/api/jobs/{job_id}/revision", json={"notes": "Shorter summary"}).status_code == 200
+    with SessionLocal() as db:
+        job = db.get(Job, job_id)
+        packet = db.scalar(select(ApprovedPacket).where(ApprovedPacket.job_id == job_id)
+                           .order_by(ApprovedPacket.id.desc()).limit(1))
+        assert job.status == "pending_approval" and job.application.status == "pending_approval"
+        assert job.state is S.REVIEWED, "the canonical state leaves READY_TO_APPLY with the approval"
+        assert packet.revoked_at is not None and packet.revoked_reason == "Sent back for revision"
+        assert approval.live(db, job.application) is None
+    assert _history(job_id)[-1] == ("READY_TO_APPLY", "REVIEWED", approval.ACTOR)
+
+
+def test_rejecting_an_approved_job_withdraws_its_snapshot():
+    job_id, _ = job_with_packet(S.QUALIFIED)
+    assert client.post(f"/api/jobs/{job_id}/approve").status_code == 200
+    assert client.post(f"/api/jobs/{job_id}/reject", json={"reason": "", "notes": ""}).status_code == 200
+    with SessionLocal() as db:
+        job = db.get(Job, job_id)
+        packet = db.scalar(select(ApprovedPacket).where(ApprovedPacket.job_id == job_id)
+                           .order_by(ApprovedPacket.id.desc()).limit(1))
+        assert job.status == "dismissed" and job.state is S.SKIPPED
+        assert packet.revoked_at is not None and approval.live(db, job.application) is None
+
+
 def test_a_packet_changed_behind_the_approval_is_refused_for_export_and_application():
     job_id, variant_id = job_with_packet(S.QUALIFIED)
     client.post(f"/api/jobs/{job_id}/approve")

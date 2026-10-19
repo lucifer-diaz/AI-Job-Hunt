@@ -392,14 +392,15 @@ def test_existing_jobs_are_picked_up_in_batches(user):
     ids = [add_job(user) for _ in range(3)]
     with SessionLocal() as db:
         first = jd.sweep(db, limit=2)["queued"]
-        second = jd.sweep(db, limit=len(ids) + 20)["queued"]
+        # The sweep reads every account's backlog (an unscoped session), so earlier tests' jobs share it: sweep it all.
+        second = jd.sweep(db, limit=10_000)["queued"]
         assert first == 2 and second >= 1
         counts = {job_id: db.scalar(select(JobDescriptionParseTask.id).where(
             JobDescriptionParseTask.job_id == job_id)) for job_id in ids}
         assert all(task is not None for task in counts.values()), "every backlog job is queued"
         tasks = db.scalars(select(JobDescriptionParseTask).where(JobDescriptionParseTask.job_id.in_(ids))).all()
         assert len(tasks) == len(ids), "and only once each"
-        assert jd.sweep(db, limit=len(ids) + 20)["queued"] == 0
+        assert jd.sweep(db, limit=10_000)["queued"] == 0
 
 
 # ───────────── manual correction, re-parse and history ─────────────
