@@ -490,7 +490,9 @@ def approve_job(db: Session, job: Job, *, override: bool = False, note: str = ""
 
 
 def mark_applied(db: Session, job: Job, *, submitted_by: str = "you", submitted_via: str | None = None,
-                 confirmation_id: str | None = None) -> Application:
+                 confirmation_id: str | None = None, claim: dict | None = None) -> Application:
+    """Record the submission on the application and the job. Callers go through apply_queue.record_submission, which
+    takes the account lock and checks the packet, duplicates and claims first; `claim` is its provenance."""
     application = job.application or approve_job(db, job)
     if application.status != "approved":
         raise ValueError("Application must be approved before marking applied")
@@ -507,7 +509,8 @@ def mark_applied(db: Session, job: Job, *, submitted_by: str = "you", submitted_
     db.add(ApplicationEvent(application=application, kind="applied", title="Applied",
                             detail=detail + (f" · confirmation {confirmation_id}" if confirmation_id else ""),
                             occurred_at=applied_at,
-                            meta={"confirmation_id": confirmation_id} if confirmation_id else None))
+                            meta={**({"confirmation_id": confirmation_id} if confirmation_id else {}),
+                                  **(claim or {})} or None))
     db.commit()
     db.refresh(application)
     return application

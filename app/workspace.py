@@ -2282,7 +2282,17 @@ def apply_kit(job_id: int, db: Session = Depends(get_user_db)):
             {"kind": "TXT", "name": names["cover_letter"], "meta": f"{len(resume.cover_letter.split())} words · paste-ready", "href": f"/api/jobs/{job.id}/cover-letter.txt"},
         ] if resume else [],
         "answers": [{"id": a.id, "question": a.question, "answer": a.answer, "sensitive": a.sensitive} for a in answers],
+        "claim": _open_claim_view(db, job),
     }
+
+
+def _open_claim_view(db: Session, job: Job) -> dict | None:
+    """The posting's open pre-submit claim for the Apply kit (Phase 5): started where, by whom, and whether its
+    outcome is unknown."""
+    from app.application_api import claim_view
+    from app.services import apply_queue
+
+    return claim_view(apply_queue.open_claim(db, job), with_token=True)
 
 
 @router.post("/api/knowledge/{item_id}/used")
@@ -2711,6 +2721,10 @@ def knowledge_put(item_id: int, payload: KnowledgeUpdateIn, db: Session = Depend
     for field, value in payload.model_dump().items():
         setattr(item, field, value)
     item.question_key = key
+    if item.verified and (item.answer or "").strip():
+        from app.services import application_execution
+
+        application_execution.wake_waiting(db, item.user_id)  # an execution waiting for this answer can go on
     db.commit()
     return {"id": item.id, "verified": item.verified}
 

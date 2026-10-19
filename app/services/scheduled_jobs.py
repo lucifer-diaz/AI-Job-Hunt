@@ -486,12 +486,17 @@ def compensation(ctx: JobContext) -> dict[str, Any]:
 
 
 def applications(ctx: JobContext) -> dict[str, Any]:
-    """Report the application queue. Submission stays a human action, so nothing is submitted here."""
+    """Report the application queue, and mark pre-submit claims whose lease ran out as UNCERTAIN (a person says what
+    happened). Submission stays a human action, so nothing is submitted here."""
+    from app.services import apply_queue
+
     with ctx.sessions() as db:
+        uncertain = apply_queue.expire_claims(db, now=ctx.now)
         counts = dict(db.execute(select(Job.state, func.count()).where(Job.state.in_((S.READY_TO_APPLY, S.APPLYING)))
                                  .group_by(Job.state)).all())
     return skipped("Automatic application submission is not enabled; approved packets stay in the apply kit",
-                   ready_to_apply=counts.get(S.READY_TO_APPLY, 0), applying=counts.get(S.APPLYING, 0))
+                   ready_to_apply=counts.get(S.READY_TO_APPLY, 0), applying=counts.get(S.APPLYING, 0),
+                   claims_now_uncertain=uncertain)
 
 
 def followups(ctx: JobContext) -> dict[str, Any]:
@@ -755,6 +760,66 @@ async def preparation_job(ctx: JobContext) -> dict[str, Any]:
     return summary
 
 
+def _prepare_application_execution(ctx: JobContext, mode: str) -> dict[str, Any]:
+    """Take back leases of crashed runs (RETRYING, never towards a submit) and mark expired pre-submit claims
+    UNCERTAIN; mode off → end the tasks left over."""
+    from app.services import application_execution, apply_queue
+
+    with ctx.sessions() as db:
+        details: dict[str, Any] = {"mode": mode,
+                                   "expired_leases": application_execution.recover_expired(db, ctx.now),
+                                   "claims_now_uncertain": apply_queue.expire_claims(db, now=ctx.now)}
+        if mode == "off":
+            details["released"] = application_execution.release(db, ctx.now)
+    return details
+
+
+def _claim_application_execution(ctx: JobContext, limit: int) -> list[Any]:
+    from app.services import application_execution
+
+    with ctx.sessions() as db:
+        return application_execution.claim(db, worker_id=ctx.worker_id, limit=limit)
+
+
+async def application_execution_job(ctx: JobContext) -> dict[str, Any]:
+    """Advance application execution runs (app.agents.application): read an approved job's form, resolve where each
+    answer comes from, and in assist mode fill it in an ephemeral browser page and validate it — ending at
+    READY_TO_SUBMIT. Nothing here submits an application.
+
+    Off unless AGENT_GRAPHS_ENABLED and APPLICATION_EXECUTION_MODE; in mode off it only ends tasks left over."""
+    if not get_settings().agent_graphs_enabled:
+        return skipped("Agent graphs are off (AGENT_GRAPHS_ENABLED)")
+    with ctx.sessions() as db:
+        if not _is_postgres(db):
+            return skipped("The application worker needs PostgreSQL")
+    from app.infrastructure.application_browser import get_application_sessions
+    from app.infrastructure.browser import get_browser_service
+    from app.services import application_execution
+
+    mode = application_execution.mode()
+    details = await threads.run_io(_prepare_application_execution, ctx, mode)
+    if mode == "off":
+        if not details.get("released") and not details.get("expired_leases"):
+            return skipped("The application worker is off (APPLICATION_EXECUTION_MODE)", **details)
+        return details
+    browser = get_application_sessions()
+    run_async = application_execution.loop_runner(asyncio.get_running_loop())
+    try:
+        claimed, outcomes = await run_live(
+            concurrency="application_execution_concurrency", batch="application_execution_batch_size",
+            claim=lambda n: _claim_application_execution(ctx, n),
+            process=lambda c: threads.run_work(application_execution.process, ctx.sessions, c, browser=browser,
+                                               run_async=run_async),
+            heartbeat=application_execution.renew(ctx.sessions))
+    finally:
+        await get_browser_service().release_idle()
+    summary = {"claimed": claimed, **{name: outcomes.get(name, 0) for name in application_execution.OUTCOMES},
+               **details}
+    if not claimed:
+        return skipped("No application runs waiting", **summary)
+    return summary
+
+
 async def rag_index_job(ctx: JobContext) -> dict[str, Any]:
     """Embed each account's verified evidence and saved answers into its retrieval index (app.services.rag_index).
 
@@ -927,6 +992,11 @@ JOBS: list[JobSpec] = [
             "review decision, bounded revisions, your approval) over the existing tailor worker, or compares it "
             "read-only with the current path in shadow mode; off unless AGENT_GRAPHS_ENABLED and "
             "PREPARATION_GRAPH_MODE."),
+    JobSpec("application_execution", "Application worker", "application_execution_interval_minutes",
+            application_execution_job,
+            "Runs the LangGraph application worker: reads approved jobs' application forms, finds a verified source "
+            "for each answer and, in assist mode, fills the form in a private browser page and validates it, stopping "
+            "at ready to submit. Never submits; off unless AGENT_GRAPHS_ENABLED and APPLICATION_EXECUTION_MODE."),
     JobSpec("rag_index", "Retrieval index", "rag_index_interval_minutes", rag_index_job,
             "Embeds verified evidence and saved answers for retrieval, builds a new index beside the old one when the "
             "embedding model changes, and retires the old one once it is complete; off unless RAG_VECTOR_ENABLED."),

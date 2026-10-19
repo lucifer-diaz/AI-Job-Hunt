@@ -207,6 +207,15 @@ NODES: tuple[Node, ...] = (
          "revision loop, then waits for your approval. A packet with an unsupported claim never passes. Off unless "
          "PREPARATION_GRAPH_MODE is on (or shadow, which only compares).", "support", (3, -1),
          workers_tab="preparation", screen="tailor"),
+    # The application worker (app.agents.application, APPLICATION_EXECUTION_MODE): reads an approved job's form,
+    # resolves each answer's source in code and, in assist mode, fills it in an ephemeral browser page. It never
+    # submits and never calls a model, so it is not an AI node; it hands a filled, validated form to you.
+    Node("application_execution", "Application worker", (ASYNC, BROWSER, EXT, DET), "Reads an approved job's "
+         "application form, finds a verified source for every answer (unknown required answers wait for you) and, "
+         "in assist mode, fills it in a private browser page that cannot submit, ending at ready to submit. You "
+         "submit from the Apply kit. Off unless APPLICATION_EXECUTION_MODE is observe or assist.", "support", (1, -1),
+         external=(ExternalMatch("WEB", "application_browser"),), monitoring_tab="external",
+         workers_tab="application", screen="approvals"),
     Node("interview_insights", "Interview preparation", (AI,), "Writes interview preparation from the posting, the "
          "fit analysis and verified evidence, always labelled as generated (never as questions the company asks).",
          "support", (4, 2), workers=("INTERVIEW_INSIGHTS",), llm_stages=("INTERVIEW_INSIGHTS",),
@@ -253,6 +262,10 @@ EDGES: tuple[Edge, ...] = (
     Edge("preparation", "approval", "waits for you", kind="support"),
     Edge("approval", "company_insights", "research", kind="support", measure="insight tasks created "
          "(job_insight_tasks.created_at)", timed=True),
+    Edge("approval", "application_execution", "form prepared", kind="support", measure="application runs queued "
+         "(application_execution_tasks.created_at)", timed=True),
+    Edge("application_execution", "application", "ready to submit", kind="support", measure="application runs that "
+         "ended READY_TO_SUBMIT (application_execution_tasks.completed_at)"),
     Edge("company_insights", "interview_insights", "researched", kind="support", measure="research runs that saved "
          "insights (job_insight_tasks COMPLETED or PARTIAL)"),
 )

@@ -79,6 +79,14 @@ EDITABLE: dict[str, Editable] = {e.name: e for e in (
     Editable("preparation_shadow_daily_limit", "preparation", "Shadow runs per account per day",
              "In shadow mode: how many reviewed packets per account a day are re-checked by the graph (read-only, "
              "never a model call).", 0, 5000),
+    Editable("application_execution_interval_minutes", "application", "Run every (minutes)",
+             "How often the application worker looks for work. 0 turns it off for every account; it never runs while "
+             "AGENT_GRAPHS_ENABLED is off or APPLICATION_EXECUTION_MODE is off.", 0, 1440, "application_execution"),
+    Editable("application_execution_batch_size", "application", "Tasks per run",
+             "How many application runs one pass claims.", 1, 100),
+    Editable("application_execution_concurrency", "application", "Side by side",
+             "How many application runs advance at once. Each holds a browser page while it reads or fills a form.",
+             1, 8),
     Editable("tailor_concurrency", "tailoring", "Side by side",
              "How many packets are tailored at once across every account, and the most one account may ask for "
              "(each account picks up to this).", 1, 16),

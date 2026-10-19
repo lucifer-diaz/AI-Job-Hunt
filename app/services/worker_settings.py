@@ -82,6 +82,14 @@ FIELDS: dict[str, tuple[Field, ...]] = {
                           "How many more tailoring passes a packet the review or the evidence checks send back may "
                           "get before it waits for you. A packet never passes by running out of revisions.", "int",
                           "preparation_max_revisions", 0, 3)),
+    "application": (AUTO,
+                    Field("max_attempts", "Attempts per run",
+                          "How often a run that failed (the page did not load, the browser broke) is tried again "
+                          "before it is marked failed. Waiting for your answers never uses an attempt.", "int",
+                          "application_execution_max_attempts", 1, 10),
+                    Field("retry_seconds", "Wait before a retry (seconds)",
+                          "Multiplied by the attempt number.", "int", "application_execution_retry_seconds", 10,
+                          86400)),
     "insights": (AUTO,
                  Field("max_attempts", "Attempts per job", "How often research is tried when every source fails.",
                        "int", "job_insights_max_attempts", 1, 10),

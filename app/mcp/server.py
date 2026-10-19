@@ -23,7 +23,8 @@ SessionFactory = Callable[[], Session]
 TOOL_NAMES = ("list_jobs_for_tailoring", "get_tailoring_context", "save_tailored_resume", "save_bulk_tailored_resumes",
               "list_jobs_for_review", "get_review_context", "save_review", "save_bulk_reviews",
               "get_bulk_operation_status", "list_jobs_for_application", "get_job_packet",
-              "search_application_knowledge", "request_human_answer", "record_application_result")
+              "search_application_knowledge", "request_human_answer", "begin_application_submission",
+              "release_application_claim", "record_application_result")
 
 JobIds = Annotated[list[int], Field(description="Job IDs from list_jobs_for_tailoring or list_jobs_for_review")]
 
@@ -205,6 +206,25 @@ def build_server(user_id: int, sessions: SessionFactory | None = None) -> MCPSer
                     field_label=field_label, note=note)
 
     @server.tool()
+    def begin_application_submission(
+            job_id: Annotated[int, Field(description="The job you are about to submit")],
+    ) -> dict[str, Any]:
+        """Call immediately before pressing the form's final submit button. Reserves the posting (and every other
+        saved posting of the same job) for this one submission and returns a claim_token; press submit only when
+        status is CLAIMED. Any other status (CLAIM_CONFLICT, UNCERTAIN, DUPLICATE, NOT_READY) means do not submit."""
+        return call("begin_application_submission", job_id=job_id)
+
+    @server.tool()
+    def release_application_claim(
+            job_id: Annotated[int, Field(description="The job you claimed")],
+            claim_token: Annotated[str, Field(description="The claim_token begin_application_submission returned")],
+            reason: Annotated[str, Field(description="Why nothing was submitted, in a sentence")],
+    ) -> dict[str, Any]:
+        """Free a claimed job when nothing was submitted. Never call it when the submission may have gone through:
+        leave that for the candidate to resolve."""
+        return call("release_application_claim", job_id=job_id, claim_token=claim_token, reason=reason)
+
+    @server.tool()
     def record_application_result(
             job_id: Annotated[int, Field(description="The job applied to")],
             outcome: Annotated[str, Field(description="submitted (the portal confirmed it) or blocked")],
@@ -215,11 +235,14 @@ def build_server(user_id: int, sessions: SessionFactory | None = None) -> MCPSer
             detail: Annotated[str | None, Field(description="What happened, in a sentence")] = None,
             question_ids: Annotated[list[int] | None, Field(description=(
                 "For needs_human_answer: the question_ids from request_human_answer"))] = None,
+            claim_token: Annotated[str | None, Field(description=(
+                "The claim_token begin_application_submission returned for this job"))] = None,
     ) -> dict[str, Any]:
         """Record a confirmed submission (once: a job already applied to is never recorded again) or the blocker
-        that stopped it."""
+        that stopped it. Pass the claim_token from begin_application_submission."""
         return call("record_application_result", job_id=job_id, outcome=outcome, confirmation_id=confirmation_id,
-                    blocker_reason=blocker_reason, detail=detail, question_ids=question_ids)
+                    blocker_reason=blocker_reason, detail=detail, question_ids=question_ids,
+                    claim_token=claim_token)
 
     @server.prompt()
     def tailor_jobs(minimum_fit_score: float | None = None, limit: int = 5) -> str:
