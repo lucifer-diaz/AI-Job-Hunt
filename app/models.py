@@ -2557,6 +2557,172 @@ class ApprovedPacket(Base):
     revoked_reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
 
 
+# ───────────── Application execution (Phase 5, app.services.apply_queue / application_execution) ─────────────
+# A claim reserves one posting for one submission before anything external starts (apply_queue.begin_submission).
+# Its alias keys (`application_claim_keys`) are unique per account while the claim is held, so a duplicate job row or
+# another URL of the same posting cannot be claimed a second time. Executions fill forms; they never submit (Phase 5).
+
+APPLICATION_CLAIM_STATUSES = ("CLAIMED", "UNCERTAIN", "RECORDED", "RELEASED")
+HELD_APPLICATION_CLAIM_STATUSES = ("CLAIMED", "UNCERTAIN", "RECORDED")
+APPLICATION_CLAIM_CLIENTS = ("mcp", "apply_kit", "worker")
+APPLICATION_EXECUTION_TASK_STATUSES = ("PENDING", "PROCESSING", "COMPLETED", "FAILED", "SKIPPED")
+ACTIVE_APPLICATION_EXECUTION_TASK_STATUSES = ("PENDING", "PROCESSING")
+APPLICATION_EXECUTION_MODES = ("OBSERVE", "ASSIST")
+# The roadmap's execution states (docs/architecture/agentic-roadmap.md §5). SUBMITTING, CONFIRMING and CONFIRMED are
+# part of the vocabulary and refused in Phase 5 (application_execution.set_stage).
+APPLICATION_EXECUTION_STAGES = ("QUEUED", "DISCOVERING", "ROUTED", "FORM_ANALYZING", "ANSWERING", "FILLING",
+                                "PRE_SUBMIT_VALIDATION", "READY_TO_SUBMIT", "SUBMITTING", "CONFIRMING", "CONFIRMED",
+                                "NEEDS_INPUT", "NEEDS_HUMAN", "RETRYING", "BLOCKED", "SUBMISSION_UNCERTAIN", "FAILED",
+                                "CANCELLED")
+
+
+class ApplicationClaim(Base):
+    """One reservation of a posting for one submission (apply_queue.begin_submission), bound to the job, its approval
+    snapshot and digest. CLAIMED until the client reports; past its lease it becomes UNCERTAIN (something may have
+    been submitted) and only a person resolves it. RECORDED and RELEASED are final; a RECORDED claim keeps its keys."""
+
+    __tablename__ = "application_claims"
+    __table_args__ = (
+        CheckConstraint(f"status IN ({_values(APPLICATION_CLAIM_STATUSES)})", name="ck_application_claims_status"),
+        CheckConstraint(f"client IN ({_values(APPLICATION_CLAIM_CLIENTS)})", name="ck_application_claims_client"),
+        UniqueConstraint("token", name="uq_application_claims_token"),
+        Index("ix_application_claims_lease", "status", "lease_expires_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("application_claims")
+    job_id: Mapped[int] = mapped_column(
+        ForeignKey("jobs.id", ondelete="CASCADE", name="fk_application_claims_job_id"), index=True)
+    job: Mapped[Job] = relationship()
+    application_id: Mapped[int | None] = mapped_column(
+        ForeignKey("applications.id", ondelete="SET NULL", name="fk_application_claims_application_id"),
+        nullable=True)
+    approved_packet_id: Mapped[int | None] = mapped_column(
+        ForeignKey("approved_packets.id", ondelete="SET NULL", name="fk_application_claims_approved_packet_id"),
+        nullable=True)
+    packet_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)  # None: a pre-Phase-4 (LEGACY) approval
+    identity: Mapped[str] = mapped_column(String(800))
+    token: Mapped[str] = mapped_column(String(64))
+    client: Mapped[str] = mapped_column(String(20))
+    status: Mapped[str] = mapped_column(String(20), default="CLAIMED")
+    claimed_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    lease_expires_at: Mapped[datetime] = mapped_column(DateTime)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    resolution: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    execution_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    keys: Mapped[list[ApplicationClaimKey]] = relationship(back_populates="claim", cascade="all, delete-orphan",
+                                                           passive_deletes=True)
+
+
+class ApplicationClaimKey(Base):
+    """One alias of a claimed posting (`apply:`, `url:`, `board:`, `dedupe:` …). `held` mirrors the claim's status;
+    while it is true the key is unique within the account (uq_application_claim_keys_held)."""
+
+    __tablename__ = "application_claim_keys"
+    __table_args__ = (
+        Index("uq_application_claim_keys_held", "user_id", "key", unique=True,
+              postgresql_where=text("held"), sqlite_where=text("held")),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("application_claim_keys")
+    claim_id: Mapped[int] = mapped_column(
+        ForeignKey("application_claims.id", ondelete="CASCADE", name="fk_application_claim_keys_claim_id"), index=True)
+    claim: Mapped[ApplicationClaim] = relationship(back_populates="keys")
+    key: Mapped[str] = mapped_column(String(800))
+    held: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
+
+
+class ApplicationExecutionTask(Base):
+    """One run of the application execution worker (app.agents.application) for one approved job: inspect the form
+    (OBSERVE) or fill it in an ephemeral browser (ASSIST), up to READY_TO_SUBMIT. Never submits.
+
+    `stage` is the execution state (APPLICATION_EXECUTION_STAGES); `status` is the queue status every worker shares.
+    `form` is the analysed form's structure and `plan` each field's answer source and status — never a value.
+    A job has at most one active task (uq_application_execution_tasks_active_job).
+    """
+
+    __tablename__ = "application_execution_tasks"
+    __table_args__ = (
+        CheckConstraint(f"status IN ({_values(APPLICATION_EXECUTION_TASK_STATUSES)})",
+                        name="ck_application_execution_tasks_status"),
+        CheckConstraint(f"mode IN ({_values(APPLICATION_EXECUTION_MODES)})",
+                        name="ck_application_execution_tasks_mode"),
+        CheckConstraint(f"stage IN ({_values(APPLICATION_EXECUTION_STAGES)})",
+                        name="ck_application_execution_tasks_stage"),
+        CheckConstraint("attempt_count >= 0", name="ck_application_execution_tasks_attempt_count"),
+        Index("uq_application_execution_tasks_active_job", "job_id", unique=True,
+              postgresql_where=text(f"status IN ({_values(ACTIVE_APPLICATION_EXECUTION_TASK_STATUSES)})"),
+              sqlite_where=text(f"status IN ({_values(ACTIVE_APPLICATION_EXECUTION_TASK_STATUSES)})")),
+        Index("ix_application_execution_tasks_claim", "status", "next_attempt_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("application_execution_tasks")
+    job_id: Mapped[int] = mapped_column(
+        ForeignKey("jobs.id", ondelete="CASCADE", name="fk_application_execution_tasks_job_id"), index=True)
+    job: Mapped[Job] = relationship()
+    application_id: Mapped[int | None] = mapped_column(
+        ForeignKey("applications.id", ondelete="SET NULL", name="fk_application_execution_tasks_application_id"),
+        nullable=True)
+    approved_packet_id: Mapped[int | None] = mapped_column(
+        ForeignKey("approved_packets.id", ondelete="SET NULL",
+                   name="fk_application_execution_tasks_approved_packet_id"), nullable=True)
+    packet_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    agent_thread_id: Mapped[int | None] = mapped_column(
+        ForeignKey("agent_threads.id", ondelete="SET NULL", name="fk_application_execution_tasks_agent_thread_id"),
+        nullable=True, index=True)
+    mode: Mapped[str] = mapped_column(String(10), default="OBSERVE")
+    status: Mapped[str] = mapped_column(String(20), default="PENDING")
+    stage: Mapped[str] = mapped_column(String(30), default="QUEUED")
+    reason: Mapped[str] = mapped_column(String(40), default="user_request")
+    route: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    form_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    form: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    plan: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # {kind: NEEDS_INPUT|NEEDS_HUMAN, reason, question_ids, field_ids}
+    interrupt: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    confirmed_question_ids: Mapped[list[int] | None] = mapped_column(JSON, nullable=True)
+    outcome: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    result_code: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    error_category: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    locked_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    lock_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lock_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    run_now_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class ApplicationExecutionAttempt(Base):
+    """One attempt of an execution task: how far it got and how it ended. Metadata only."""
+
+    __tablename__ = "application_execution_attempts"
+    __table_args__ = (UniqueConstraint("task_id", "attempt", name="uq_application_execution_attempts_task_attempt"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("application_execution_attempts")
+    task_id: Mapped[int] = mapped_column(
+        ForeignKey("application_execution_tasks.id", ondelete="CASCADE",
+                   name="fk_application_execution_attempts_task_id"), index=True)
+    task: Mapped[ApplicationExecutionTask] = relationship()
+    attempt: Mapped[int] = mapped_column(Integer)
+    stage_reached: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    outcome: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    error_category: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    form_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # {format: sha256} of the packet files uploaded in this attempt (ASSIST)
+    file_digests: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 # ───────────── Candidate knowledge retrieval (RAG, app.services.rag_*) ─────────────
 # Evidence ↔ resume tags are a person's (and the verifier's) statement of which resume a fact belongs to; retrieval
 # for a job only ever considers the evidence of the job's own resume. The index tables are *derived*: they never

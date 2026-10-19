@@ -513,6 +513,54 @@ hand-back) qualify a job when `QUALIFICATION_GRAPH_MODE=on` (README §9c). The r
   `tests/fixtures/preparation_eval/dataset.json`). Targets call the graphs' own pure rules and the real checks, never a
   stand-in. Nothing uploads to LangSmith; `--jsonl` is for a manual import.
 
+## Application execution and pre-submit claims (Phase 5)
+
+`app/services/apply_queue.py` (readiness, posting identity, claims, the one result recorder),
+`app/services/application_execution.py` / `app/agents/application.py` (the execution worker and its graph),
+`app/services/answer_resolver.py`, `app/services/ats_forms/` and `app/infrastructure/application_browser/` (README
+§10a). The rules a change has to keep:
+
+* **Nothing in Job Hunt OS clicks a final Submit.** Phase 5 fills a form at most (ASSIST) and ends at
+  READY_TO_SUBMIT; a person submits. The execution stages SUBMITTING, CONFIRMING and CONFIRMED exist in the vocabulary
+  and are refused by `application_execution.set_stage`. `ApplicationPage` has no click, press, submit, tap or evaluate,
+  and the application browser aborts every non-GET request. `tests/test_no_automated_submit.py` fails the build on a
+  submit-capable call under the application modules. Do not add one before the Phase 6 SubmissionIntent, pre-submit
+  validator and confirmation verifier exist and are reviewed.
+* **`apply_queue` stays the one domain boundary.** Readiness (`not_ready_reason`), duplicates (`applied_duplicate`,
+  over `posting_identity`), blockers and recording (`record_submission`, `record_blocker`) are shared by MCP, the Apply
+  kit, `POST /api/jobs/{id}/applied` and the execution worker. Never add a second readiness, duplicate or result path.
+* **A claim before any external submit.** `apply_queue.begin_submission` takes the account lock, re-checks readiness
+  (including the approved packet's digest) and reserves every alias key of the posting (`application_claim_keys`,
+  unique per account while held), returning a token bound to the job and the approved digest. `lock_application`
+  serialises *recording*; it is not a pre-submit reservation. Never hold a transaction across a browser.
+* **An expired claim is UNCERTAIN, never free.** `expire_claims` moves a CLAIMED claim past its lease to UNCERTAIN; only
+  a person resolves it (`resolve_uncertain`: submitted → recorded through `record_submission`, not submitted →
+  released). A release is only ever a client saying nothing was submitted. A RECORDED claim keeps its keys forever.
+* **Tokenless reports are checked, not trusted.** A result reported without a claim token (older MCP clients, the in-app
+  "I applied") goes through the same lock, digest, duplicate and held-key checks, is refused while another claim holds
+  the posting, and is recorded with `claim: "unclaimed"`. Submissions made entirely outside Job Hunt OS cannot be
+  serialised; say so, and reconcile instead of promising exactly-once.
+* **The packet is verified at every use.** Enqueue captures the approved digest; FILL re-verifies it
+  (`approval.verify`, and the digest equal to the one captured) before touching a form; a mismatch is BLOCKED
+  `PACKET_CHANGED` and needs a new approval. Never re-hash a packet to make it current.
+* **Answers come from verified sources only** (`answer_resolver`): profile contact fields, the approved packet's files
+  and letter, a verified KnowledgeAnswer for the same question. A sensitive answer needs the person's confirmation for
+  this execution; anything else a *required* field needs is saved with `knowledge.request_answer` and the execution
+  waits (NEEDS_INPUT). Optional unknown fields stay empty. No model writes an answer in Phase 5. Answer values are
+  resolved at fill time and never stored on the execution: its `plan` holds sources and statuses only.
+* **The application browser is not the JD-recovery browser.** Application pages come only from
+  `app.infrastructure.application_browser` (`ApplicationSessionManager`). Its only implementation is ephemeral: a fresh
+  context per step, no storage state, cookies, credentials or profile, closed in `finally`. It never passes anything
+  to `BrowserService.fetch_rendered_page` or JD recovery, and JD recovery never receives an application context.
+  Persisting an authenticated session needs a reviewed `AuthenticatedApplicationBrowser` implementation, an ADR and an
+  update of this section first. A login wall, OTP or CAPTCHA pauses as NEEDS_HUMAN; it is never solved or retried.
+* **The execution worker is a normal queued worker.** `application_execution_tasks` (one active per job), WorkerKind
+  `application`, scheduler job `application_execution`, orchestration node `application_execution`, worker-owned graph
+  `application` (`api_resumable=False`; thread key `application:<job>:<task>:<created>:a<attempt>`). Kill stops the
+  task and its thread; Retry and Run now create a new task. Everything is off unless `APPLICATION_EXECUTION_MODE` is
+  `observe` or `assist`, `AGENT_GRAPHS_ENABLED` is on and the database is PostgreSQL. Graph state holds ids, enums and
+  counts only — never form values, page HTML or answers.
+
 ## Candidate knowledge retrieval (RAG)
 
 `app/services/embeddings.py`, `evidence_tags.py`, `rag_index.py`, `rag_retrieval.py`, `vector_store.py` and
