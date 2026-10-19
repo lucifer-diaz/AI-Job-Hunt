@@ -2268,7 +2268,7 @@ def knowledge_used(item_id: int, db: Session = Depends(get_user_db)):
 
 @router.get("/api/jobs/{job_id}/resume.docx")
 def resume_docx(job_id: int, db: Session = Depends(get_user_db)):
-    resume = latest_resume(db, job_id)
+    resume = approval.export_variant(db, job_id)  # the approved version once approved, never a newer one
     if not resume:
         raise HTTPException(404, "No tailored resume for this job")
     check_export(db, job_id)
@@ -2278,7 +2278,7 @@ def resume_docx(job_id: int, db: Session = Depends(get_user_db)):
 
 @router.get("/api/jobs/{job_id}/cover-letter.txt")
 def cover_letter_txt(job_id: int, db: Session = Depends(get_user_db)):
-    resume = latest_resume(db, job_id)
+    resume = approval.export_variant(db, job_id)  # the approved version once approved, never a newer one
     if not resume:
         raise HTTPException(404, "No tailored resume for this job")
     check_export(db, job_id)

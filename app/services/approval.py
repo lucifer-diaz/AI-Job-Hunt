@@ -245,6 +245,19 @@ def guard_edit(db: Session, variant: ResumeVariant, what: str) -> None:
         revoke(db, job, f"{what} edited after approval")
 
 
+def export_variant(db: Session, job_id: int) -> ResumeVariant | None:
+    """The version a download renders: the approved one while the job's application is approved or submitted (a
+    newer version saved later is not what was approved), else the newest."""
+    job = db.get(Job, job_id)
+    application = job.application if job is not None else None
+    if application is not None and application.status in ("approved", "applied") and application.approved_resume_id:
+        approved = db.get(ResumeVariant, application.approved_resume_id)
+        if approved is not None and approved.job_id == job_id:
+            return approved
+    return db.scalar(select(ResumeVariant).where(ResumeVariant.job_id == job_id)
+                     .order_by(desc(ResumeVariant.version)).limit(1))
+
+
 def check_export(db: Session, job_id: int) -> None:
     """Before a download of an approved (or submitted) packet: refuse (PacketChanged) when it no longer matches what
     was approved. Packets not approved yet download as they are."""

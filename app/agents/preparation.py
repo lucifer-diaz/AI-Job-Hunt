@@ -212,7 +212,7 @@ def _terminal(db: Session, job: Any, step: str) -> dict[str, Any] | None:
     if job.status == "approved":
         packet = approval.live(db, job.application)
         return _end(step, APPROVED, "APPROVED", approved_packet_id=packet.id if packet else None)
-    if job.status == "dismissed":
+    if job.status in ("dismissed", "rejected"):  # rejected from the queue, or the application set to rejected
         return _end(step, REJECTED, "REJECTED")
     if job.status == "applied":
         return _end(step, TRIAGED, "STATUS_APPLIED")
@@ -573,7 +573,7 @@ def decide(state: PreparationState, runtime: Runtime[PreparationContext]) -> dic
                 job.status = "pending_approval"  # a person decides; the packet never passes by running out of tries
             record.summary = {"decision": decision, "at_limit": at_limit}
         db.commit()
-        _maybe_auto_approve(db, job, variant, decision, created)
+        _maybe_auto_approve(db, ctx.run, job, variant, decision)
     if route == "tailor":
         return {"step": DECIDE, "decision": decision, "disagreement": disagreement, "revision": revision + 1,
                 "previous_variant_id": state.get("variant_id")}
@@ -590,20 +590,23 @@ def next_step(decision: str, revision: int, limit: int) -> tuple[str, bool]:
     return "await_approval", False
 
 
-def _maybe_auto_approve(db: Session, job: Any, variant: Any, decision: str, created: bool) -> None:
+def _maybe_auto_approve(db: Session, run: effects.RunHandle, job: Any, variant: Any, decision: str) -> None:
     """An account in automatic application mode approves a PASS at once, as the tailor worker did before the graph.
-    Only a PASS; a refused approval (approval.ApprovalRefused) leaves it to a person."""
+    Only a PASS, and only while the packet still waits as that PASS (status `tailored`, this version the newest):
+    a replay after a crash between the decision and the approval approves it then, and an approved, rejected or
+    sent-back packet is never approved here. A refused approval (approval.ApprovalRefused) leaves it to a person."""
     from app.services.approval import ApprovalRefused
     from app.services.user_settings import settings_for
     from app.services.workflow import approve_job
 
-    if not created or decision != PASS:
+    if decision != PASS or job.status != "tailored" or _latest_variant(db, job.id) is not variant:
         return
     setting = settings_for(db, job.user_id)
     if setting.application_mode != "automatic" or (variant.reviewer_score or 0) < setting.min_review_score:
         return
     try:
-        approve_job(db, job)
+        effects.held(db, run)  # only while this run holds its thread: a stopped run approves nothing
+        approve_job(db, job)  # commits with the lease row still locked
     except (ApprovalRefused, ValueError):
         db.rollback()
 

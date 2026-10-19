@@ -188,6 +188,12 @@ def write_cover_letter(db: Session, profile: CandidateProfile, job: Job, llm: LL
 def persist_tailored_resume(db: Session, job: Job, content: dict, *, markdown: str | None = None) -> ResumeVariant:
     """Store a new tailored version for a job. Every tailoring path (backend worker, Claude Desktop over MCP,
     the ADK agent) saves through here. The master resume is only read, never written."""
+    # A pass that was running when a person approved the packet must not save over that decision: the approved
+    # version stays the newest one and the job stays approved.
+    decided = db.scalar(select(Application.status).where(Application.job_id == job.id))
+    if decided in ("approved", "applied"):
+        raise ValueError(f"This job was {decided} while it was being tailored; send it back for revision to tailor "
+                         "it again")
     # Evidence ids are kept in the structured content; the letter itself is what a recruiter reads.
     content = {**content, "cover_letter": strip_citations(content.get("cover_letter", "") or "").strip()}
     version = (db.scalar(select(ResumeVariant.version).where(ResumeVariant.job_id == job.id)

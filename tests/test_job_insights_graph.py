@@ -270,3 +270,16 @@ def test_enforce_drops_a_bad_item_and_never_relabels_it():
     assert [q["question"] for q in kept["reported_questions"]] == ["Design a cache"]
     assert [q["question"] for q in kept["generated_questions"]] == ["Tell me about scale"]
     assert sections["reported_questions"][-1]["question"] == "Invented"  # the input is not changed
+
+
+def test_enforce_withholds_compensation_whose_figure_cites_the_wrong_source():
+    sections = copy.deepcopy(SECTIONS)
+    sections["compensation_prep"] = {"talking_points": ["Anchor on the employer's range"]}
+    sections["compensation"]["employer_posted_range"]["source_ids"] = [5]  # a market observation
+    kept, report = provenance.enforce(sections, OBS)
+    assert report.counts() == {"WRONG_SOURCE_TYPE": 1}
+    # Withheld whole, never edited: settle then keeps the last stored compensation.
+    assert "compensation" not in kept and "compensation_prep" not in kept
+    assert kept["reported_questions"] == sections["reported_questions"]
+    clean, _ = provenance.enforce(copy.deepcopy(SECTIONS), OBS)
+    assert clean["compensation"] == SECTIONS["compensation"]

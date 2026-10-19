@@ -307,3 +307,89 @@ def test_approval_records_the_real_stages_and_the_packet(sessions, monkeypatch):
     assert history == [("QUALIFIED", "TAILORING", "reconcile"), ("TAILORING", "TAILORED", "reconcile"),
                        ("TAILORED", "REVIEWED", "reconcile"), ("REVIEWED", "READY_TO_APPLY", "approval")]
     assert packet is not None and packet.revoked_at is None and len(packet.digest) == 64
+
+
+def test_mode_off_gives_an_unstarted_job_back_to_automatic_tailoring(sessions, monkeypatch):
+    from sqlalchemy import update
+
+    from app.services import tailor_tasks
+
+    user = ps.owner(sessions)
+    job_id = ps.qualified_job(sessions, user)
+    with sessions() as db:  # as auto_tailor.queue leaves it: the claim taken, the job handed to the graph
+        db.info["user_id"] = user
+        db.execute(update(Job).where(Job.id == job_id).values(auto_tailor_status=tailor_tasks.AUTO_QUEUED))
+        preparation.dispatch(db, db.get(Job, job_id), reason="auto")
+        db.commit()
+    ps.set_mode(monkeypatch, "off")  # before the graph queued any tailoring pass
+    ps.drive(sessions)
+    assert ps.task_of(sessions, job_id).result_code == preparation.ROUTED_TO_LEGACY
+    job = _job(sessions, job_id)
+    assert job.auto_tailor_status is None, "the claim is given back, so automatic tailoring can pick the job up"
+    with sessions() as db:
+        db.info["user_id"] = user
+        held = db.scalar(select(func.count()).select_from(Job).where(Job.id == job_id, preparation.untouched()))
+    assert held == 1, "a handed-back run no longer holds the job from automatic tailoring"
+    assert ps.counts(sessions, job_id)["tailor"] == 0
+
+
+def test_automatic_approval_of_a_pass_does_not_depend_on_a_fresh_decision(sessions, monkeypatch):
+    """A replayed DECIDE (its effect already recorded) still approves a PASS that is still waiting; a packet a person
+    already decided, or an older version, is never approved there."""
+    from app.agents import effects
+    from app.services.user_settings import settings_for
+
+    user = ps.owner(sessions)
+    job_id = ps.qualified_job(sessions, user)
+    ps.script_reviews(monkeypatch, ["PASS"])
+    ps.dispatch(sessions, user, job_id)
+    ps.drive(sessions)  # manual mode: the PASS waits for a person
+    assert _job(sessions, job_id).status == "tailored"
+    monkeypatch.setattr(effects, "held", lambda db, run: None)
+    with sessions() as db:
+        db.info["user_id"] = user
+        setting = settings_for(db, user)
+        setting.application_mode, setting.min_review_score = "automatic", 50
+        db.commit()
+        job = db.get(Job, job_id)
+        latest = graph._latest_variant(db, job_id)
+        graph._maybe_auto_approve(db, None, job, latest, graph.PASS)
+    assert _job(sessions, job_id).status == "approved"
+    with sessions() as db:  # again, as a second replay would: nothing more happens
+        db.info["user_id"] = user
+        job = db.get(Job, job_id)
+        graph._maybe_auto_approve(db, None, job, graph._latest_variant(db, job_id), graph.PASS)
+        packets = db.scalar(select(func.count()).select_from(ApprovedPacket).where(ApprovedPacket.job_id == job_id))
+    assert packets == 1
+
+
+def test_a_waiting_run_ends_when_the_application_is_set_to_rejected(sessions, monkeypatch):
+    from app.main import application_update
+    from app.models import Application
+    from app.schemas import ApplicationUpdateIn
+
+    user = ps.owner(sessions)
+    job_id = ps.qualified_job(sessions, user)
+    ps.script_reviews(monkeypatch, ["PASS"])
+    ps.dispatch(sessions, user, job_id)
+    ps.drive(sessions)
+    with sessions() as db:
+        db.info["user_id"] = user
+        job = db.get(Job, job_id)
+        if job.application is None:
+            db.add(Application(job_id=job_id, status="pending_approval"))
+            db.commit()
+        application_id = db.get(Job, job_id).application.id
+    with sessions() as db:  # PATCH /api/applications/{id}, with the account's session
+        db.info["user_id"] = user
+        application_update(application_id, ApplicationUpdateIn(status="rejected"), db)
+    ps.drive(sessions)
+    task = ps.task_of(sessions, job_id)
+    assert (task.status, task.outcome) == ("COMPLETED", graph.REJECTED)
+
+
+def test_a_shadow_run_with_nothing_to_compare_is_not_a_match():
+    assert preparation.parity({"predicted_decision": "PASS", "actual_decision": "UNKNOWN"})["match"] is None
+    assert preparation.parity({"predicted_decision": None, "actual_decision": "PASS"})["match"] is None
+    assert preparation.parity({"predicted_decision": "PASS", "actual_decision": "PASS"})["match"] is True
+    assert preparation.parity({"predicted_decision": "PASS", "actual_decision": "RETAILOR"})["match"] is False

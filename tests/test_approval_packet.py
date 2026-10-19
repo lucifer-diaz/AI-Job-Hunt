@@ -166,6 +166,51 @@ def test_a_packet_changed_behind_the_approval_is_refused_for_export_and_applicat
         assert approval.verify(db, job.application).ok is False
 
 
+def test_downloads_serve_the_approved_version_not_a_newer_one():
+    job_id, variant_id = job_with_packet(S.QUALIFIED)
+    assert client.post(f"/api/jobs/{job_id}/approve").status_code == 200
+    with SessionLocal() as db:  # a version saved after approval (written directly: the tailor path refuses now)
+        db.info["user_id"] = _user()
+        db.add(ResumeVariant(user_id=_user(), job_id=job_id, version=2, reviewer_score=90, markdown="# Not approved",
+                             cover_letter="Not approved either.", content={"summary": ""}))
+        db.commit()
+    letter = client.get(f"/api/jobs/{job_id}/cover-letter.txt")
+    assert letter.status_code == 200 and letter.text.strip() == "Dear team,\n\nHello."
+    for path in ("resume.pdf", "resume.docx"):
+        assert client.get(f"/api/jobs/{job_id}/{path}").status_code == 200
+    with SessionLocal() as db:
+        db.info["user_id"] = _user()
+        assert approval.export_variant(db, job_id).id == variant_id
+
+
+def test_a_tailoring_pass_that_ends_after_approval_saves_nothing():
+    from app.services.workflow import persist_tailored_resume
+
+    job_id, variant_id = job_with_packet(S.QUALIFIED)
+    assert client.post(f"/api/jobs/{job_id}/approve").status_code == 200
+    with SessionLocal() as db:
+        db.info["user_id"] = _user()
+        with pytest.raises(ValueError, match="approved while it was being tailored"):
+            persist_tailored_resume(db, db.get(Job, job_id), {"summary": "late"}, markdown="# Late")
+        db.rollback()
+        job = db.get(Job, job_id)
+        assert job.status == "approved" and [v.id for v in job.resumes] == [variant_id]
+
+
+@pytest.mark.parametrize("status", ["pending_approval", "rejected"])
+def test_changing_an_approved_application_withdraws_the_approval(status):
+    job_id, _ = job_with_packet(S.QUALIFIED)
+    assert client.post(f"/api/jobs/{job_id}/approve").status_code == 200
+    with SessionLocal() as db:
+        application_id = db.scalar(select(Application.id).where(Application.job_id == job_id))
+    assert client.patch(f"/api/applications/{application_id}", json={"status": status}).status_code == 200
+    with SessionLocal() as db:
+        job = db.get(Job, job_id)
+        assert job.status == status and approval.live(db, job.application) is None
+        if status == "pending_approval":
+            assert job.state is S.REVIEWED
+
+
 def test_a_submitted_packet_cannot_be_edited():
     job_id, variant_id = job_with_packet(S.QUALIFIED)
     client.post(f"/api/jobs/{job_id}/approve")

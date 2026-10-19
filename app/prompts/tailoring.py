@@ -160,7 +160,8 @@ def build_tailoring_prompt(candidate_profile: Any, job: Any, context: Any) -> Pr
                 to_json(keywords)) if (keywords := context_value(context, "keyword_targets")) else "",
         section("LENGTH PLAN", to_json(length_plan_input(context_value(context, "length_plan")))),
         section("FIT ANALYSIS (completed by the Ranker; read-only)", to_json(fit_analysis_input(analysis))),
-        section(REVISION_SECTION, to_json(feedback, limit=8000))
+        # The previous Reviewer's output: model-written, and it quotes the posting, so it is data, never instructions.
+        untrusted(REVISION_SECTION, "untrusted_previous_review", to_json(feedback, limit=8000))
         if (feedback := context_value(context, "revision_feedback")) else "",
     )
     return Prompt("tailoring", TAILOR_PROMPT_VERSION, TAILOR_MARKER, TAILOR_SYSTEM, user, TailoringResult)

@@ -15,7 +15,8 @@ Rules (each item is kept apart by kind, never re-labelled):
   * generated questions, questions to ask and value preparation are GENERATED and carry no source attribution;
   * compensation: the employer range comes only from EMPLOYER / JOB_DESCRIPTION observations, the recruiter budget
     only from RECRUITER, the market range only from market sources. Compensation is computed in code, so a breach
-    there is reported (and fails the run's validation) but never "fixed" by editing a figure.
+    there is never "fixed" by editing a figure: `enforce` withholds the run's compensation and its preparation whole,
+    and the last stored version stands.
 """
 from __future__ import annotations
 
@@ -140,7 +141,9 @@ def _walk(sections: dict[str, Any], by_id: dict[int, dict[str, Any]], report: Re
     return bad
 
 
-def _compensation(sections: dict[str, Any], by_id: dict[int, dict[str, Any]], report: Report) -> None:
+def _compensation(sections: dict[str, Any], by_id: dict[int, dict[str, Any]], report: Report) -> bool:
+    """Report each compensation figure that cites the wrong kind of source. True when there was one."""
+    breached = False
     comp = sections.get("compensation") or {}
     checks = (("employer_posted_range", EMPLOYER_PAY), ("recruiter_budget", ("RECRUITER",)),
               ("market_range", MARKET_SOURCES))
@@ -150,6 +153,8 @@ def _compensation(sections: dict[str, Any], by_id: dict[int, dict[str, Any]], re
             rule = _cites(value, by_id, source_types=allowed, categories=("COMPENSATION",))
             if rule:
                 report.add(f"compensation.{name}", None, rule)
+                breached = True
+    return breached
 
 
 def check(sections: dict[str, Any], observations: list[dict[str, Any]]) -> Report:
@@ -166,10 +171,15 @@ def enforce(sections: dict[str, Any], observations: list[dict[str, Any]]) -> tup
     by_id = {o["id"]: o for o in observations}
     report = Report()
     bad = _walk(sections, by_id, report)
-    _compensation(sections, by_id, report)
-    if not bad:
+    comp_breached = _compensation(sections, by_id, report)
+    if not bad and not comp_breached:
         return sections, report
     out = dict(sections)
+    if comp_breached:
+        # Compensation is computed in code as one picture (status, ranges, discussion range, preparation), so a figure
+        # is never cut out of it or edited: the run's compensation is withheld whole, and the last stored one stands.
+        out.pop("compensation", None)
+        out.pop("compensation_prep", None)
 
     def keep(path: str, items: list[Any]) -> list[Any]:
         return [item for i, item in enumerate(items) if (path, i) not in bad]

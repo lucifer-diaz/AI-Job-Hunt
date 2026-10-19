@@ -48,6 +48,8 @@ OUTCOMES = ("completed", "waiting", "retrying", "failed", "stopped", "busy", "lo
 ROUTED_TO_LEGACY = "ROUTED_TO_LEGACY"
 KIND = "preparation"
 APPROVAL = "APPROVAL"
+# Job statuses where a person has decided the packet: a run waiting for approval ends at them (agents.preparation).
+DECIDED_STATUSES = ("approved", "dismissed", "rejected", "applied", "archived")
 ACTIVE_TAILOR = ("queued", "running")
 ERROR_LIMIT = 300
 
@@ -79,9 +81,10 @@ def _held_until_asked() -> Any:
 
 
 def untouched(job_id: Any = Job.id) -> Any:
-    """SQL: the graph never ran this job (automatic tailoring leaves a job it ran to it)."""
+    """SQL: the graph never ran this job, or handed it back (automatic tailoring leaves a job the graph holds to it)."""
     q = JobPreparationTask
-    return ~exists().where(q.job_id == job_id, q.mode == ON)
+    return ~exists().where(q.job_id == job_id, q.mode == ON,
+                           or_(q.result_code.is_(None), q.result_code != ROUTED_TO_LEGACY))
 
 
 def active_task(db: Session, job_id: int, task_mode: str = ON) -> JobPreparationTask | None:
@@ -172,7 +175,7 @@ def _busy() -> Any:
 def _waiting_for_person() -> Any:
     """Waiting at AWAIT_APPROVAL with nothing decided: not claimable (a person's action, or Run now, wakes it)."""
     q = JobPreparationTask
-    decided = exists().where(Job.id == q.job_id, Job.status.in_(("approved", "dismissed", "applied", "archived")))
+    decided = exists().where(Job.id == q.job_id, Job.status.in_(DECIDED_STATUSES))
     # coalesce: a NULL column must make this false, not NULL (NOT NULL would hide every task from the claim)
     return and_(func.coalesce(q.waiting_for, "") == APPROVAL, q.person_decision.is_(None), q.run_now_at.is_(None),
                 ~decided)
@@ -349,7 +352,7 @@ def _settle(sessions: SessionFactory, c: PreparationClaim, thread_pk: int) -> st
             if task.mode == SHADOW:
                 task.parity = parity(result)
             db.commit()
-            if task.mode == SHADOW and task.parity and not task.parity.get("match"):
+            if task.mode == SHADOW and task.parity and task.parity.get("match") is False:
                 _log_mismatch(task)
             return "completed"
         if status == "STOPPED":
@@ -460,8 +463,9 @@ def requeue(db: Session, task: JobPreparationTask, user_id: int) -> JobPreparati
 def release(db: Session, now: datetime | None = None, limit: int = 200) -> int:
     """Mode off with ON tasks left: end them (ROUTED_TO_LEGACY) and stop their threads. Their jobs carry on through
     the current path: a tailoring pass the graph queued is an ordinary task the tailor worker finishes, and the Tailor
-    and Approve screens act on the job as they always did. Commits."""
-    from app.services import qualification
+    and Approve screens act on the job as they always did. A job the graph held before it queued any tailoring pass
+    gets its automatic-tailoring claim back, so automatic tailoring picks it up again. Commits."""
+    from app.services import qualification, tailor_tasks
 
     now = now or utcnow()
     q = JobPreparationTask
@@ -470,6 +474,12 @@ def release(db: Session, now: datetime | None = None, limit: int = 200) -> int:
     for task in rows:
         task.status, task.completed_at, task.result_code = SKIPPED, now, ROUTED_TO_LEGACY
         task.waiting_for = None
+    unstarted = [r.job_id for r in rows if r.reason == "auto"]
+    if unstarted:
+        # The claim auto_tailor.queue took for the graph; never a job with a tailoring pass or a person's decision.
+        db.execute(update(Job).where(Job.id.in_(unstarted), Job.auto_tailor_status == tailor_tasks.AUTO_QUEUED,
+                                     ~exists().where(TailorTask.job_id == Job.id))
+                   .values(auto_tailor_status=None).execution_options(synchronize_session=False))
     db.commit()
     return len(rows)
 
@@ -514,12 +524,13 @@ def shadow_sweep(db: Session, now: datetime | None = None) -> dict[str, int]:
 
 def parity(result: dict[str, Any]) -> dict[str, Any]:
     """Old vs new for one job, from the shadow run's result: the review decision the graph predicts against the one
-    the current path's packet carries. UNKNOWN on either side is left out."""
+    the current path's packet carries. UNKNOWN on either side is left out, and a run with nothing to compare is
+    neither a match nor a mismatch (`match` None)."""
     predicted, actual = result.get("predicted_decision"), result.get("actual_decision")
     fields: dict[str, Any] = {}
     if predicted not in (None, "UNKNOWN") and actual not in (None, "UNKNOWN"):
         fields["decision"] = {"predicted": predicted, "actual": actual, "match": predicted == actual}
-    return {"match": all(f["match"] for f in fields.values()), "fields": fields,
+    return {"match": all(f["match"] for f in fields.values()) if fields else None, "fields": fields,
             "disagreement": bool(result.get("disagreement")), "outcome": result.get("outcome")}
 
 
@@ -541,5 +552,7 @@ def summary(db: Session, user_id: int | None = None) -> dict[str, Any]:
     shadow = db.scalars(select(q.parity).where(q.mode == SHADOW, q.status == COMPLETED, q.parity.is_not(None),
                                                *([q.user_id == user_id] if user_id is not None else []))
                         .limit(5000)).all()
-    matched = sum(1 for p in shadow if (p or {}).get("match"))
-    return {"outcomes": by_outcome, "shadow_runs": len(shadow), "shadow_matched": matched}
+    compared = [p for p in shadow if (p or {}).get("match") is not None]
+    matched = sum(1 for p in compared if p["match"] is True)
+    return {"outcomes": by_outcome, "shadow_runs": len(shadow), "shadow_compared": len(compared),
+            "shadow_matched": matched}

@@ -89,6 +89,7 @@ from app.services import (
     evidence_tags,
     feedback_learning,
     mcp_tokens,
+    preparation,
     ranker,
     resume_verification,
     server_settings,
@@ -762,7 +763,7 @@ def clear_tailor_tasks(db: Session = Depends(get_user_db)):
 
 @app.get("/api/jobs/{job_id}/resume.pdf")
 def resume_pdf(job_id: int, db: Session = Depends(get_user_db)):
-    resume = db.scalar(select(ResumeVariant).where(ResumeVariant.job_id == job_id).order_by(desc(ResumeVariant.version)).limit(1))
+    resume = approval_service.export_variant(db, job_id)  # the approved version once approved, never a newer one
     if not resume:
         raise HTTPException(404, "No tailored resume for this job")
     _check_export(db, job_id)
@@ -874,8 +875,17 @@ def application_update(application_id: int, payload: ApplicationUpdateIn, db: Se
     if payload.status:
         if payload.status not in {"pending_approval", "rejected"}:
             raise HTTPException(422, "Only pending approval or rejected may be set here")
+        if item.status == "approved":
+            # The approval no longer stands: withdraw it as send-back and reject do (snapshot revoked; back to
+            # pending approval also takes the canonical state READY_TO_APPLY -> REVIEWED).
+            if payload.status == "pending_approval":
+                approval_service.revoke(db, item.job, "Moved back to pending approval")
+            else:
+                approval_service.withdraw(db, item, "Rejected after approval")
         item.status = payload.status
         item.job.status = payload.status
+        # A preparation graph run waiting for this packet's decision records it (never blocks, never raises).
+        preparation.on_decision(db, item.job, "rejected" if payload.status == "rejected" else "revise")
     db.commit()
     return {"ok": True, "status": item.status}
 
