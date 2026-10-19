@@ -59,8 +59,10 @@ WORKERS: dict[str, Worker] = {w.worker_type: w for w in (
            description="Presents verified experience for a job (a patch of the resume) and writes the cover letter"),
     Worker("REVIEWER", "Reviewer", ("review",), True, 16384, "TIER", DEEP_REVIEW, "review",
            description="Independently reviews a tailored resume"),
-    Worker("APPLICATION_ANSWER", "Application Answer", ("application_question",), True, 4096, "TIER",
-           PRIMARY_REASONING, description="Drafts answers to application form questions"),
+    # Also drafts a job's application form on Job Insights (app.services.job_insights.application_form): the
+    # questions the person pasted and the ones a form for the role is likely to ask. Personal ones are never drafted.
+    Worker("APPLICATION_ANSWER", "Application Answer", ("application_question", "application_form"), True, 8192,
+           "TIER", PRIMARY_REASONING, description="Drafts answers to application form questions"),
     # The Application Inbox (app.services.application_inbox): extracts what a matched recruiting email says, and
     # helps decide which application an email belongs to when deterministic matching is unsure. Never moves a job.
     Worker("INBOX_CLASSIFIER", "Inbox Classifier", ("inbox", "application_inbox", "application_email_match"), True,

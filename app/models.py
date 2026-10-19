@@ -811,6 +811,9 @@ class JobInsightTask(Base):
         ForeignKey("agent_threads.id", ondelete="SET NULL", name="fk_job_insight_tasks_agent_thread_id"),
         nullable=True, index=True)
     staged: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # FULL (research, then every model section) or APPLICATION_FORM (only the application-form drafts: no source is
+    # called and no other section is written). NULL on rows from before the column means FULL.
+    scope: Mapped[str | None] = mapped_column(String(20), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -866,6 +869,11 @@ class JobInsight(Base):
     compensation_prep: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     risks: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
     unknowns: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    # Application-form questions with what to answer (app.services.job_insights.application_form): the person's
+    # verified library answer, a draft grounded in verified evidence, or NEEDS_INPUT. Never saved as an answer.
+    application_questions: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    # The questions the person pasted from the real form: [{id, question, added_at}]. Research reads it, never writes it.
+    application_form_input: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
     # The person's own notes from the recruiter: {recruiter_name, budget_low, budget_high, currency, period, basis,
     # interview_process, recruiter_questions, comments}. Research reads it and never writes it.
     recruiter_input: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)

@@ -37,7 +37,7 @@ log = logging.getLogger("jobhunt.llm_telemetry")
 # Prompt name (app.prompts Prompt.name) → workflow stage shown on the Monitoring tab.
 STAGE_BY_PROMPT = {
     "ranking": "RANKER", "tailoring": "TAILOR", "cover_letter": "TAILOR", "review": "REVIEWER", "resume_parser": "RESUME_PARSER",
-    "evidence_extraction": "RESUME_PARSER", "application_question": "APPLICATION", "followup": "FOLLOW_UP",
+    "evidence_extraction": "RESUME_PARSER", "application_question": "APPLICATION", "application_form": "APPLICATION", "followup": "FOLLOW_UP",
     "inbox": "INBOX", "company_insights": "COMPANY_INSIGHTS", "interview_insights": "INTERVIEW_INSIGHTS", "job_description_parser": "JD_PARSER", "job_description_recovery": "JD_RECOVERY", "ai_optimization": "ADVISOR",
     "application_inbox": "INBOX", "application_email_match": "INBOX",
 }

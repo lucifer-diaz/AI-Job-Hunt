@@ -43,6 +43,8 @@ def run(sessions: SessionFactory, claim_: InsightClaim, *, saver: Any | None = N
         hold: Callable[[str], None] | None = None) -> str:
     """Research one claimed task by the configured path. Returns an outcome (service.OUTCOMES); never raises."""
     current = mode()
+    if service.scope_of(sessions, claim_) == service.application_form.FORM_ONLY:
+        return service.process(sessions, claim_)  # form drafts only: no research for the graph to conduct
     if current == "on" and _usable(sessions):
         return process(sessions, claim_, saver=saver, hold=hold)
     label = service.process(sessions, claim_)

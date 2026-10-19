@@ -1,0 +1,303 @@
+"""Application-form preparation on Job Insights: what to write for the questions an ATS form asks.
+
+    pasted questions (application_form_input) ─┐
+                                               ├→ before the model: the person's verified library answer wins,
+    a full research run predicts more ─────────┘   a personal question (visa, salary, notice, …) needs the person
+          → one APPLICATION_ANSWER call (prompt `application_form`) with the structured JD, the fit analysis, verified
+            evidence scoped to the job's resume, verified non-sensitive saved answers and a company summary
+          → after the model, item by item: ids it was not shown drop that item; a personal question loses its draft;
+            a draft must pass the screening-answer grounding checks (tailoring_results.check_prose) or needs input
+          → job_insights.application_questions (merged with the last good drafts)
+
+A draft is a suggestion. Nothing here writes a KnowledgeAnswer: the person saves an answer in the Answer library, and
+marks it verified there. Runs inside a claimed research task (a full run, or an APPLICATION_FORM task queued when the
+person pastes questions), never in a request.
+"""
+from __future__ import annotations
+
+import hashlib
+import re
+from datetime import datetime
+from typing import Any
+
+from sqlalchemy import desc, select
+from sqlalchemy.orm import Session
+
+from app.models import Job, JobInsight, KnowledgeAnswer
+
+FULL, FORM_ONLY = "FULL", "APPLICATION_FORM"
+FORM, PREDICTED = "FORM", "PREDICTED"
+LIBRARY, DRAFTED, NEEDS_INPUT = "LIBRARY", "DRAFTED", "NEEDS_INPUT"
+MAX_FORM_QUESTIONS = 20
+MAX_QUESTION_CHARS = 400
+MAX_KNOWN_ANSWERS = 12
+# Saved-answer categories only the person may answer (app/static/knowledge.js KNOWLEDGE_CATEGORIES): never shown to
+# the model, even verified.
+PERSONAL_KNOWLEDGE = ("work_authorization", "compensation", "notice_period", "relocation", "demographic")
+# Questions only the person may answer, whatever the model says: work authorization, pay, availability, relocation,
+# demographic, legal and contact details. Read on the question text, before and after the model.
+PERSONAL_RE = re.compile(
+    r"\b(visas?|sponsor\w*|work authori[sz]\w*|authori[sz]ed to work|legally (?:able|eligible|permitted)|"
+    r"right to work|work permits?|employment pass|citizen\w*|permanent resident\w*|green card|h-?1b|"
+    r"salary|salaries|compensation|pay (?:range|expectations?)|expected pay|remuneration|ctc|hourly rate|"
+    r"notice period|start date|earliest start|when can you start|available to start|your availability|"
+    r"relocat\w*|commute|willing to travel|"
+    r"gender|pronouns?|sexual orientation|race|racial|ethnic\w*|disabilit\w*|veteran|date of birth|your age|"
+    r"criminal|convict\w*|background check|"
+    r"phone number|mobile number|e-?mail address|home address|mailing address|linkedin|github|portfolio)\b",
+    re.IGNORECASE)
+PERSONAL_CATEGORIES = ("WORK_AUTHORIZATION", "COMPENSATION", "AVAILABILITY", "RELOCATION", "DEMOGRAPHIC", "PERSONAL")
+
+
+def question_id(origin: str, question: str) -> str:
+    """Stable across runs: the same question keeps its id, so its draft never moves to another question."""
+    digest = hashlib.sha1(f"{origin}|{' '.join(question.lower().split())}".encode()).hexdigest()[:12]
+    return f"f{digest}"
+
+
+def clean_questions(lines: list[str]) -> list[str]:
+    """Pasted questions as the person meant them: trimmed, list markers removed, short fragments dropped."""
+    out = []
+    for line in lines:
+        text = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line or "").strip()
+        if len(text) >= 8:
+            out.append(" ".join(text.split())[:MAX_QUESTION_CHARS])
+    return out
+
+
+def add_questions(insight: JobInsight, questions: list[str], now: datetime) -> list[dict[str, Any]]:
+    """Add pasted questions to the person's own list (deduplicated, bounded). Returns the ones that were new."""
+    current = list(insight.application_form_input or [])
+    known = {q["id"] for q in current}
+    added = []
+    for text in clean_questions(questions):
+        qid = question_id(FORM, text)
+        if qid in known:
+            continue
+        if len(current) >= MAX_FORM_QUESTIONS:
+            raise ValueError(f"A job keeps at most {MAX_FORM_QUESTIONS} form questions; remove one first")
+        item = {"id": qid, "question": text, "added_at": now.isoformat()}
+        current.append(item)
+        added.append(item)
+        known.add(qid)
+    insight.application_form_input = current
+    return added
+
+
+def remove_question(insight: JobInsight, qid: str) -> bool:
+    current = list(insight.application_form_input or [])
+    kept = [q for q in current if q.get("id") != qid]
+    if len(kept) == len(current):
+        return False
+    insight.application_form_input = kept
+    insight.application_questions = [q for q in insight.application_questions or [] if q.get("id") != qid]
+    return True
+
+
+def personal(question: str, category: str | None = None) -> bool:
+    return bool(PERSONAL_RE.search(question or "")) or (category or "") in PERSONAL_CATEGORIES
+
+
+def undrafted(insight: JobInsight | None) -> list[str]:
+    """Pasted questions no run has handled yet: their ids."""
+    if insight is None:
+        return []
+    handled = {q.get("id") for q in insight.application_questions or []}
+    return [q["id"] for q in insight.application_form_input or [] if q.get("id") not in handled]
+
+
+def current(items: list[dict[str, Any]], form_input: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """The section as it is saved: pasted questions the person removed meanwhile are left out."""
+    pasted = {q.get("id") for q in form_input or []}
+    return [i for i in items if i.get("origin") != FORM or i.get("id") in pasted]
+
+
+# ───────────── items ─────────────
+
+def _item(qid: str, question: str, origin: str, status: str, **values: Any) -> dict[str, Any]:
+    kind = {LIBRARY: "FACT", DRAFTED: "GENERATED"}.get(status, "UNKNOWN")
+    label = {LIBRARY: "Your saved answer", DRAFTED: "Draft — check and edit before you submit"}.get(
+        status, "Needs your answer")
+    return {"id": qid, "question": question, "origin": origin, "status": status, "category": values.get("category"),
+            "answer": values.get("answer"), "answer_source": values.get("answer_source"),
+            "knowledge_answer_id": values.get("knowledge_answer_id"),
+            "evidence_ids": values.get("evidence_ids") or [], "evidence": values.get("evidence") or [],
+            "requirement_ids": values.get("requirement_ids") or [], "requirements": values.get("requirements") or [],
+            "knowledge_ids": values.get("knowledge_ids") or [], "rationale": values.get("rationale") or None,
+            "reason": values.get("reason") or None, "kind": kind, "label": label}
+
+
+def before_model(db: Session, qid: str, question: str, origin: str) -> dict[str, Any] | None:
+    """What the person's own data settles without a model: a verified saved answer (or a contact detail from the
+    profile), a sensitive saved answer, a question waiting in the Answer library, or a personal question."""
+    from app.services import knowledge
+
+    found = knowledge.search(db, question, limit=3)
+    status = found["status"]
+    if status == "ANSWERED":
+        source = found.get("answer_source") or ""
+        knowledge_id = int(source.split(":", 1)[1]) if source.startswith("knowledge_answer:") else None
+        return _item(qid, question, origin, LIBRARY, answer=found["answer"], answer_source=source,
+                     knowledge_answer_id=knowledge_id,
+                     reason=None if knowledge_id else "From your profile")
+    if status == "NEEDS_CONFIRMATION":
+        return _item(qid, question, origin, NEEDS_INPUT, category="PERSONAL",
+                     reason="You saved a sensitive answer to this; confirm it on the form each time")
+    if status == "PENDING_HUMAN":
+        return _item(qid, question, origin, NEEDS_INPUT,
+                     reason="Already waiting for your answer in the Answer library")
+    if personal(question):
+        return _item(qid, question, origin, NEEDS_INPUT, category="PERSONAL",
+                     reason="Only you can answer this (work authorization, pay, availability, relocation or "
+                            "personal details). Save your answer in the Answer library to reuse it.")
+    return None
+
+
+def known_answers(db: Session, user_id: int) -> list[dict[str, Any]]:
+    """Verified, non-sensitive saved answers outside the personal categories, most used first, with their ids."""
+    rows = db.scalars(select(KnowledgeAnswer).where(
+        KnowledgeAnswer.user_id == user_id, KnowledgeAnswer.verified.is_(True), KnowledgeAnswer.sensitive.is_(False),
+        KnowledgeAnswer.category.not_in(PERSONAL_KNOWLEDGE))
+        .order_by(desc(KnowledgeAnswer.use_count), KnowledgeAnswer.id).limit(MAX_KNOWN_ANSWERS * 3)).all()
+    out = [{"id": r.id, "question": r.question[:300], "answer": r.answer[:800]} for r in rows
+           if (r.answer or "").strip() and not personal(r.question)]
+    return out[:MAX_KNOWN_ANSWERS]
+
+
+def company_summary(insight: JobInsight | None, synthesized: Any = None) -> dict[str, Any]:
+    """A few lines about the company for motivation answers: this run's summary, else the stored one."""
+    stored = (insight.company if insight is not None else None) or {}
+    summary = getattr(synthesized, "company_summary", None) or (stored.get("summary") or {}).get("text")
+    values = ([v.value for v in synthesized.official_values] if synthesized is not None else
+              [v.get("value") for v in stored.get("official_values") or []])
+    out = {"summary": summary, "official_values": [v for v in values if v][:8],
+           "mission": [m.get("text") for m in stored.get("mission") or [] if m.get("text")][:2]}
+    return {k: v for k, v in out.items() if v}
+
+
+def screen(answer: Any, *, form_refs: set[str], requirement_ids: set[str], evidence_ids: set[int],
+           knowledge_ids: set[int], dropped: list[str]) -> Any:
+    """Item by item: an item citing an id it was not shown is dropped (and noted), never the whole answer."""
+    keep = []
+    for item in answer.form_questions:
+        unknown = ([r for r in item.requirement_ids if r not in requirement_ids]
+                   + [e for e in item.evidence_ids if e not in evidence_ids]
+                   + [k for k in item.knowledge_ids if k not in knowledge_ids])
+        if item.form_ref is not None and item.form_ref not in form_refs:
+            dropped.append(f"form answer for an unknown form question {item.form_ref!r}")
+        elif unknown:
+            dropped.append(f"form answer citing unknown ids {unknown[:5]}: '{item.form_question[:60]}'")
+        else:
+            keep.append(item)
+    answer.form_questions = keep
+    return answer
+
+
+def after_model(db: Session, job: Job, profile: Any, item: Any, *, qid: str, question: str, origin: str,
+                requirement_labels: dict[str, str], evidence_labels: dict[int, str]) -> dict[str, Any]:
+    """One model item as it is saved. A personal question never keeps a draft; a draft that states a number, a name
+    or a work authorization the person's data does not support needs the person instead."""
+    from app.services.tailoring_results import check_prose
+
+    common = {"category": item.form_category, "requirement_ids": item.requirement_ids,
+              "requirements": [requirement_labels.get(r, r) for r in item.requirement_ids],
+              "rationale": item.likely_because}
+    if personal(question, item.form_category):
+        return _item(qid, question, origin, NEEDS_INPUT, **{**common, "category": "PERSONAL"},
+                     reason="Only you can answer this (work authorization, pay, availability, relocation or personal "
+                            "details). Save your answer in the Answer library to reuse it.")
+    if item.form_decision != "DRAFT":
+        return _item(qid, question, origin, NEEDS_INPUT, **common,
+                     reason=item.form_note or "Your saved data does not answer this")
+    if not item.evidence_ids and not item.knowledge_ids and item.form_category != "MOTIVATION":
+        return _item(qid, question, origin, NEEDS_INPUT, **common,
+                     reason="No verified evidence supports a draft; add evidence or answer it yourself")
+    problems = check_prose(db, profile, job, {"draft": item.form_answer or ""}) if profile is not None else []
+    if problems:
+        return _item(qid, question, origin, NEEDS_INPUT, **common,
+                     reason="The draft was withheld: " + "; ".join(p["message"] for p in problems[:2]))
+    return _item(qid, question, origin, DRAFTED, **common, answer=item.form_answer, evidence_ids=item.evidence_ids,
+                 evidence=[evidence_labels.get(e, "") for e in item.evidence_ids], knowledge_ids=item.knowledge_ids)
+
+
+# ───────────── one drafting pass ─────────────
+
+def draft(db: Session, client: Any, job: Job, *, attempt: int, ctx: dict[str, Any], company: dict[str, Any],
+          predict: bool, dropped: list[str], errors: list[str]) -> dict[str, Any]:
+    """Draft the job's application form: every pasted question, and (in a full run) predicted ones. Never raises: a
+    model failure is recorded in `errors` and the previous drafts stand. Returns {items, model_ran, predicted}, the
+    section merged with the last good one."""
+    from app.prompts import build_application_form_prompt
+    from app.prompts.application_form import MAX_PREDICTED
+    from app.prompts.contracts import ApplicationFormPrepResult
+    from app.services.llm import LLMCall, LLMError
+    from app.services.workflow import get_profile
+
+    insight = db.scalar(select(JobInsight).where(JobInsight.job_id == job.id))
+    previous = {i.get("id"): i for i in (insight.application_questions if insight else None) or []}
+    pasted = list((insight.application_form_input if insight else None) or [])
+    settled: dict[str, dict[str, Any]] = {}
+    ask: list[dict[str, str]] = []
+    for n, q in enumerate(pasted, start=1):
+        early = before_model(db, q["id"], q["question"], FORM)
+        if early is not None:
+            settled[q["id"]] = early
+        else:
+            ask.append({"ref": f"F{n}", "id": q["id"], "question": q["question"]})
+
+    model_ran, predicted_items = False, None
+    if ask or predict:
+        knowledge = known_answers(db, job.user_id)
+        prompt = build_application_form_prompt(
+            job={"title": job.title, "company": job.company, "location": job.location}, context=ctx["context"],
+            fit_analysis=ctx["fit"], evidence=ctx["evidence"], knowledge=knowledge, company=company,
+            form_questions=[{"ref": a["ref"], "question": a["question"]} for a in ask],
+            predict=MAX_PREDICTED if predict else 0)
+        refs = {a["ref"]: a for a in ask}
+        shown_evidence = {e["id"] for e in ctx["evidence"]}
+        try:
+            result = client.generate_prompt(prompt, LLMCall(
+                workflow_type="job", entity_id=job.id, attempt=attempt,
+                validate=lambda data: screen(ApplicationFormPrepResult.model_validate(data), form_refs=set(refs),
+                                             requirement_ids=set(ctx["requirements"]), evidence_ids=shown_evidence,
+                                             knowledge_ids={k["id"] for k in knowledge}, dropped=dropped)))
+            model_ran = True
+        except (LLMError, ValueError) as exc:
+            errors.append(f"Application form drafts failed: {type(exc).__name__}: {exc}"[:300])
+            result = None
+        if result is not None:
+            profile = get_profile(db)
+            evidence_labels = {e["id"]: (e.get("claim") or "")[:160] for e in ctx["evidence"]}
+            predicted_items = []
+            seen = {q["id"] for q in pasted}  # a prediction that repeats a pasted question is not shown twice
+            for item in result.validated.form_questions:
+                if item.form_ref is not None:
+                    asked = refs[item.form_ref]
+                    if asked["id"] in settled:
+                        continue  # one answer per pasted question
+                    settled[asked["id"]] = after_model(
+                        db, job, profile, item, qid=asked["id"], question=asked["question"], origin=FORM,
+                        requirement_labels=ctx["requirements"], evidence_labels=evidence_labels)
+                elif predict and len(predicted_items) < MAX_PREDICTED:
+                    qid = question_id(PREDICTED, item.form_question)
+                    if question_id(FORM, item.form_question) in seen or qid in seen:
+                        continue
+                    seen.add(qid)
+                    predicted_items.append(before_model(db, qid, item.form_question, PREDICTED) or after_model(
+                        db, job, profile, item, qid=qid, question=item.form_question, origin=PREDICTED,
+                        requirement_labels=ctx["requirements"], evidence_labels=evidence_labels))
+
+    items = []
+    for q in pasted:
+        if q["id"] in settled:
+            items.append(settled[q["id"]])
+        elif q["id"] in previous and previous[q["id"]].get("status") != NEEDS_INPUT:
+            items.append(previous[q["id"]])  # the model did not answer this time: the last good draft stands
+        else:
+            items.append(_item(q["id"], q["question"], FORM, NEEDS_INPUT,
+                               reason="Not drafted: " + (errors[-1] if errors else "the model gave no answer")))
+    if predicted_items is not None:
+        items += predicted_items
+    else:
+        items += [i for i in previous.values() if i.get("origin") == PREDICTED]
+    return {"items": items, "model_ran": model_ran, "predicted": predicted_items is not None}

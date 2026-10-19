@@ -14,6 +14,7 @@ from typing import Any
 
 from app.prompts import (
     build_application_email_match_prompt,
+    build_application_form_prompt,
     build_application_inbox_prompt,
     build_application_question_prompt,
     build_company_insights_prompt,
@@ -85,6 +86,11 @@ def build(fixture: dict[str, Any]) -> Prompt:
         return build_interview_insights_prompt(job={"title": job.title, "company": job.company},
                                                context=given["context"], fit_analysis=given["fit_analysis"],
                                                evidence=evidence, research=given["research"], stage=given["stage"])
+    if name == "application_form":
+        return build_application_form_prompt(job={"title": job.title, "company": job.company},
+                                             context=given["context"], fit_analysis=given["fit_analysis"],
+                                             evidence=evidence, knowledge=given["knowledge"], company=given["company"],
+                                             form_questions=given["form_questions"])
     raise KeyError(f"no builder for golden prompt {name}")
 
 

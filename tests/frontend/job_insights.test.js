@@ -142,6 +142,42 @@ describe('job insights', () => {
     expect(ui.D.insights[7].researching).toBe(true);
   });
 
+  it('shows each form question as a library answer, a draft or a question only the person can answer', () => {
+    const form = { pending: false, max_questions: 20, note: 'Check and edit each one.', from_form: [
+      { id: 'f1', question: 'What is your notice period?', origin: 'FORM', status: 'LIBRARY', kind: 'FACT', answer: 'One month' },
+      { id: 'f2', question: 'Do you require visa sponsorship?', origin: 'FORM', status: 'NEEDS_INPUT', kind: 'UNKNOWN', answer: null, reason: 'Only you can answer this' },
+      { id: 'f3', question: 'Why Grab?', origin: 'FORM', status: 'PENDING' }],
+      likely: [{ id: 'f4', question: 'Describe a reliable system you built.', origin: 'PREDICTED', status: 'DRAFTED', kind: 'GENERATED',
+        answer: 'I built reliable payment services.', evidence: ['Built reliable payment services'], rationale: 'The JD centres on reliability.' }] };
+    const div = panel('form', insights({ application_form: form }));
+    const text = div.textContent;
+    expect(text).toContain('From your library');
+    expect(text).toContain('Needs your answer');
+    expect(text).toContain('Drafting…');
+    expect(text).toContain('Draft');
+    expect(text).toContain('Only you can answer this');
+    expect(text).toContain('From your evidence: Built reliable payment services');
+    // Only pasted questions can be removed; a library answer is not offered for saving again.
+    expect(div.querySelectorAll('[data-act="ins-form-remove"]').length).toBe(3);
+    expect([...div.querySelectorAll('[data-act="ins-form-save"]')].map(b => b.dataset.q)).toEqual(['f2', 'f4']);
+    expect(div.querySelector('[data-act="ins-form-save"][data-q="f4"]').textContent).toBe('Save to library');
+  });
+
+  it('posts pasted form questions and opens the library editor unverified', async () => {
+    fetchMock.mockImplementation(async url => response(url.includes('/insights/') ? { ...insights(), researching: true, application_form: { from_form: [], likely: [], pending: true } } : []));
+    ui.D.insights = { 7: insights() };
+    ui.S.forms.insform7 = { questions: 'Why do you want to join Grab?\nok\nDescribe a team you led.' };
+    await ui.A['ins-form-add']({ dataset: { id: '7' } });
+    const [, opt] = fetchMock.mock.calls.find(([url]) => url === '/api/jobs/7/insights/application-questions');
+    expect(JSON.parse(opt.body)).toEqual({ questions: ['Why do you want to join Grab?', 'Describe a team you led.'] });
+    expect(ui.S.forms.insform7).toBeUndefined();
+
+    ui.D.insights = { 7: insights({ application_form: { from_form: [], likely: [{ id: 'f4', question: 'Why Grab?', origin: 'PREDICTED', status: 'DRAFTED', answer: 'Draft text' }] } }) };
+    await ui.A['ins-form-save']({ dataset: { id: '7', q: 'f4' } });
+    expect(ui.S.forms.knnew).toEqual({ question: 'Why Grab?', answer: 'Draft text', verified: false });
+    expect(ui.S.screen).toBe('knowledge');
+  });
+
   it('formats ranges in their own currency and period', () => {
     expect(ui.insRange({ low: 90, high: 110, currency: 'SGD', period: 'hour' })).toBe('SGD 90–110 / hour');
     expect(ui.insRange(null)).toBe('Not listed');

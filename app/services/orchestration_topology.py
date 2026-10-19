@@ -145,7 +145,8 @@ NODES: tuple[Node, ...] = (
          "policy you can override with a reason.", "pipeline", (3, 1), states=("READY_TO_APPLY",),
          screen="approvals"),
     Node("application", "Application", (HUMAN, AI), "Submission: you (or Claude Desktop over MCP) fill the form; the "
-         "Application Answer worker drafts answers to form questions.", "pipeline", (2, 1),
+         "Application Answer worker drafts answers to form questions (on Job Insights, from verified evidence; personal "
+         "questions are never drafted).", "pipeline", (2, 1),
          workers=("APPLICATION_ANSWER",), llm_stages=("APPLICATION",), states=("APPLYING", "APPLIED"),
          optional_ai=True, screen="approvals"),
     Node("application_inbox", "Application inbox", (ASYNC, EXT, AI), "Reads Gmail (read-only) for replies to "

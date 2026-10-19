@@ -727,6 +727,57 @@ class InterviewPrepResult(Contract):
     compensation_questions: Phrases = Field(description="questions to ask the recruiter about pay; never figures")
 
 
+# ───────────── Application form preparation (Job Insights) ─────────────
+# Categories whose answer only the candidate may give: never drafted, whatever the model says
+# (app.services.job_insights.application_form enforces it in code as well).
+PERSONAL_FORM_CATEGORIES = ("WORK_AUTHORIZATION", "COMPENSATION", "AVAILABILITY", "RELOCATION", "DEMOGRAPHIC",
+                            "PERSONAL")
+FORM_CATEGORIES = ("MOTIVATION", "EXPERIENCE", "TECHNICAL", "LEADERSHIP", "BEHAVIORAL", *PERSONAL_FORM_CATEGORIES,
+                   "OTHER")
+FORM_DECISIONS = ("DRAFT", "NEEDS_INPUT")
+
+
+class FormQuestionDraft(Contract):
+    form_ref: Annotated[str | None, BeforeValidator(_text_id)] = Field(
+        default=None, max_length=12, description="the id of the FORM QUESTIONS item this answers (e.g. F2); null for "
+                                                 "a question you predict")
+    form_question: str = Field(min_length=8, max_length=400,
+                               description="the question; for a FORM QUESTIONS item, its text as given")
+    form_category: Annotated[str, _choice(FORM_CATEGORIES, "OTHER")] = Field(
+        default="OTHER", description=f"one of {', '.join(FORM_CATEGORIES)}")
+    form_decision: Annotated[Literal["DRAFT", "NEEDS_INPUT"], _choice(FORM_DECISIONS, "NEEDS_INPUT")] = Field(
+        default="NEEDS_INPUT", description="DRAFT: the supplied facts answer it; NEEDS_INPUT: only the candidate can "
+                                           "(a personal, legal or preference answer, or a fact you were not given)")
+    form_answer: Annotated[str | None, BeforeValidator(lambda v: _phrase(v) or None)] = Field(
+        default=None, max_length=2500, description="the draft answer in the candidate's voice; null unless DRAFT")
+    likely_because: Annotated[str, BeforeValidator(_phrase)] = Field(
+        default="", max_length=300, description="for a predicted question: what in the posting makes a form likely "
+                                                "to ask it")
+    requirement_ids: RequirementIds = Field(description="JOB REQUIREMENTS ids the question or answer relates to")
+    evidence_ids: EvidenceIds = Field(description="VERIFIED EVIDENCE ids the draft rests on")
+    knowledge_ids: SourceIds = Field(description="KNOWN ANSWERS ids the draft reuses")
+    form_note: Annotated[str, BeforeValidator(_phrase)] = Field(
+        default="", max_length=300, description="for NEEDS_INPUT: what the candidate has to decide or supply")
+
+    @model_validator(mode="after")
+    def _draft_needs_an_answer(self) -> FormQuestionDraft:
+        """Read leniently: a DRAFT without text needs input, and a NEEDS_INPUT answer is never kept."""
+        if self.form_decision == "DRAFT" and not (self.form_answer or "").strip():
+            self.form_decision = "NEEDS_INPUT"
+        if self.form_decision != "DRAFT":
+            self.form_answer = None
+        return self
+
+
+class ApplicationFormPrepResult(Contract):
+    """Draft answers for one job's application form: the questions the candidate pasted and the ones a form for this
+    role is likely to ask. A draft is a suggestion the candidate edits, never a saved answer."""
+
+    worker: ClassVar[str] = "APPLICATION_ANSWER"
+
+    form_questions: list[FormQuestionDraft] = Field(default_factory=list, max_length=30)
+
+
 # ───────────── AI Optimization Advisor ─────────────
 
 class Recommendation(BaseModel):
@@ -777,7 +828,7 @@ CONTRACTS: tuple[type[Contract], ...] = (
     RankingResult, TailoringResult, ReviewResult, CoverLetterResult, FollowUpResult, ApplicationAnswerResult,
     InboxClassificationResult, ApplicationEmailAnalysis, ApplicationEmailMatchResult, ResumeParserOutput,
     EvidenceExtractionResult, JobDescriptionParserOutput, JobDescriptionRecoveryResult, OptimizationReport,
-    CompanyInsightSynthesis, InterviewPrepResult)
+    CompanyInsightSynthesis, InterviewPrepResult, ApplicationFormPrepResult)
 # Field names older prompts (or a confused model) use for another worker's output, beyond the contracts' own fields.
 LEGACY_FIELDS = {
     "RANKER": {"score", "fit_score", "gaps", "must_have_missing", "keywords", "application_strategy", "matches"},

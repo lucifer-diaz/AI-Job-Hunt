@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.models import Application, InsightObservation, Job, JobInsight, JobInsightTask
 from app.services import redaction
-from app.services.job_insights import service
+from app.services.job_insights import application_form, service
 from app.services.job_insights.base import (
     BLOCKED,
     FAILED,
@@ -76,7 +76,8 @@ def _redact(text: str | None) -> str | None:
 def task_view(task: JobInsightTask | None) -> dict[str, Any] | None:
     if task is None:
         return None
-    return {"id": task.id, "status": task.status, "reason": task.reason, "attempts": task.attempt_count,
+    return {"id": task.id, "status": task.status, "reason": task.reason, "scope": task.scope or "FULL",
+            "attempts": task.attempt_count,
             "force_refresh": task.force_refresh, "created_at": _iso(task.created_at),
             "started_at": _iso(task.started_at), "completed_at": _iso(task.completed_at),
             "next_attempt_at": _iso(task.next_attempt_at), "last_error": _redact(task.last_error),
@@ -125,7 +126,27 @@ def overview(insight: JobInsight | None) -> dict[str, Any]:
                           "focus_areas": [f.get("area") for f in insight.focus_areas or []][:8]},
             "company": {"summary": (company.get("summary") or {}).get("text"),
                         "official_values": len(company.get("official_values") or []),
-                        "culture_themes": len(company.get("culture_themes") or [])}}
+                        "culture_themes": len(company.get("culture_themes") or [])},
+            "application_form": {status.lower(): sum(1 for q in insight.application_questions or []
+                                                     if q.get("status") == status)
+                                 for status in (application_form.LIBRARY, application_form.DRAFTED,
+                                                application_form.NEEDS_INPUT)}}
+
+
+def form_view(insight: JobInsight | None, active: JobInsightTask | None) -> dict[str, Any]:
+    """The application-form section: each question with its library answer, draft or what the person must decide,
+    the questions the person pasted, and which of those are still being drafted."""
+    items = (insight.application_questions if insight else None) or []
+    waiting = application_form.undrafted(insight)
+    by_id = {q["id"]: q for q in (insight.application_form_input if insight else None) or []}
+    drafting = [{"id": qid, "question": by_id[qid]["question"], "origin": application_form.FORM,
+                 "status": "PENDING"} for qid in waiting]
+    return {"from_form": [q for q in items if q.get("origin") == application_form.FORM] + drafting,
+            "likely": [q for q in items if q.get("origin") == application_form.PREDICTED],
+            "pending": bool(waiting), "drafting": active is not None and bool(waiting),
+            "max_questions": application_form.MAX_FORM_QUESTIONS,
+            "note": "Drafts are written from your verified evidence and saved answers. Check and edit each one; "
+                    "nothing is saved to your Answer library until you save it there."}
 
 
 def insight_view(db: Session, job: Job) -> dict[str, Any]:
@@ -151,7 +172,7 @@ def insight_view(db: Session, job: Job) -> dict[str, Any]:
     if insight is None:
         return {**base, "identity": None, "overview": {}, "compensation": None, "compensation_prep": None,
                 "company": None, "interview": None, "questions_to_ask": [], "risks": [], "unknowns": [],
-                "recruiter_input": None}
+                "recruiter_input": None, "application_form": form_view(None, active)}
     generated = insight.generated_questions or []
     return {**base,
             "generated_at": _iso(insight.generated_at), "refreshed_at": _iso(insight.refreshed_at),
@@ -171,7 +192,8 @@ def insight_view(db: Session, job: Job) -> dict[str, Any]:
                                                            if q.get("origin") == "CANDIDATE_SPECIFIC"],
                           "focus_areas": insight.focus_areas or [], "value_prep": insight.value_prep or []},
             "questions_to_ask": insight.questions_to_ask or [], "risks": insight.risks or [],
-            "unknowns": insight.unknowns or [], "recruiter_input": insight.recruiter_input}
+            "unknowns": insight.unknowns or [], "recruiter_input": insight.recruiter_input,
+            "application_form": form_view(insight, active)}
 
 
 def public_data(row: InsightObservation) -> dict[str, Any]:

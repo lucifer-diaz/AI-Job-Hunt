@@ -36,6 +36,7 @@ log = logging.getLogger("jobhunt.job_insights")
 PENDING, PROCESSING, COMPLETED, PARTIAL, FAILED, SKIPPED = (
     "PENDING", "PROCESSING", "COMPLETED", "PARTIAL", "FAILED", "SKIPPED")
 AUTO_APPROVED, USER_REQUEST, REFRESH, BACKLOG = "AUTO_APPROVED", "USER_REQUEST", "REFRESH", "BACKLOG"
+FULL, APPLICATION_FORM = "FULL", "APPLICATION_FORM"  # JobInsightTask.scope
 KIND = "insights"  # the Running workers kind (app.services.workers, app.services.worker_settings)
 WORKER = "JOB_INSIGHTS"
 MAX_ERROR_LENGTH = 2000
@@ -64,25 +65,27 @@ def latest_task(db: Session, job_id: int) -> JobInsightTask | None:
 
 
 def enqueue(db: Session, job: Job, *, reason: str = AUTO_APPROVED, force: bool = False,
-            now: datetime | None = None) -> JobInsightTask | None:
+            now: datetime | None = None, scope: str = FULL) -> JobInsightTask | None:
     """Queue research for this job. Flushes, does not commit.
 
     Returns the job's active task when there is one: a second request (two Refresh clicks, approval racing a
     sweep) never creates a second task; a person's Refresh on a queued automatic task marks it to bypass the cache.
-    Without `force`, a job that already has research is left alone."""
+    Without `force`, a job that already has research is left alone. `scope` APPLICATION_FORM queues only the drafts
+    for pasted form questions; a queued full run covers them, and a full request widens a queued form-only task."""
     now = now or utcnow()
     existing = _pending_in_session(db, job.id) or active_task(db, job.id)
     if existing is not None:
-        if force and existing.status == PENDING:
-            existing.force_refresh, existing.reason = True, reason
+        if force and existing.status == PENDING and scope == FULL:
+            existing.force_refresh, existing.reason, existing.scope = True, reason, FULL
         return existing
-    if not force:
+    if not force and scope == FULL:
         insight = db.scalar(select(JobInsight).where(JobInsight.job_id == job.id))
         if insight is not None and insight.refreshed_at is not None:
             return None
     application_id = db.scalar(select(Application.id).where(Application.job_id == job.id))
     task = JobInsightTask(user_id=job.user_id, job_id=job.id, application_id=application_id, status=PENDING,
-                          reason=reason, force_refresh=force, attempt_count=0, created_at=now, updated_at=now)
+                          reason=reason, force_refresh=force and scope == FULL, scope=scope, attempt_count=0,
+                          created_at=now, updated_at=now)
     db.add(task)
     db.flush()
     return task

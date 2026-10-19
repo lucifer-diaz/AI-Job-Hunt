@@ -126,6 +126,17 @@ def _walk(sections: dict[str, Any], by_id: dict[int, dict[str, Any]], report: Re
 
     for i, item in enumerate(sections.get("risks") or []):
         flag("risks", i, _cites(item, by_id, required=False))
+    # Application-form drafts: a draft is GENERATED and never cites research; a library answer is the person's own.
+    for i, item in enumerate(sections.get("application_questions") or []):
+        status, kind = item.get("status"), item.get("kind")
+        rule = None
+        if status == "DRAFTED" and (kind != "GENERATED" or any(item.get(k) for k in ATTRIBUTION_KEYS)):
+            rule = "GENERATED_MISLABELLED" if kind != "GENERATED" else "GENERATED_WITH_SOURCE"
+        elif status == "LIBRARY" and not item.get("answer_source"):
+            rule = "MISSING_SOURCE"
+        elif status not in ("DRAFTED", "LIBRARY") and item.get("answer"):
+            rule = "GENERATED_MISLABELLED"
+        flag("application_questions", i, rule)
     return bad
 
 
@@ -174,7 +185,8 @@ def enforce(sections: dict[str, Any], observations: list[dict[str, Any]]) -> tup
         process = dict(out["interview_process"])
         process["stages"] = keep("interview_process.stages", process.get("stages") or [])
         out["interview_process"] = process
-    for name in ("reported_questions", "generated_questions", "questions_to_ask", "value_prep", "risks"):
+    for name in ("reported_questions", "generated_questions", "questions_to_ask", "value_prep", "risks",
+                 "application_questions"):
         if isinstance(out.get(name), list):
             out[name] = keep(name, out[name])
     return out, report

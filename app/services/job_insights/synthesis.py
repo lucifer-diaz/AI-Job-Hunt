@@ -4,6 +4,8 @@
       → COMPANY_INSIGHTS (app.prompts.company_insights) → validated against the ids it was shown
       → INTERVIEW_INSIGHTS (app.prompts.interview_insights) with the structured JD, the fit analysis and verified
         evidence → validated against those requirement and evidence ids
+      → APPLICATION_ANSWER (app.prompts.application_form): drafts for the application form, the pasted questions and
+        predicted ones (app.services.job_insights.application_form), item by item
 
 Both calls go through the centralized LLM gateway (LLMClient.generate_prompt), so the worker's model comes from its
 configuration and every request is in Monitoring with its worker, prompt version, tokens and trace. A model never sees
@@ -36,6 +38,7 @@ class SynthesisRejected(ValueError):
 class Synthesis:
     company: Any = None  # CompanyInsightSynthesis
     interview: Any = None  # InterviewPrepResult
+    application_form: dict[str, Any] | None = None  # application_form.draft(): {items, model_ran, predicted}
     model: str | None = None
     prompt_versions: dict[str, str] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
@@ -48,6 +51,7 @@ def to_stage(result: Synthesis) -> dict[str, Any]:
     """A validated synthesis as JSON, to keep on the task row between two graph steps (never in a checkpoint)."""
     return {"company": result.company.model_dump(mode="json") if result.company is not None else None,
             "interview": result.interview.model_dump(mode="json") if result.interview is not None else None,
+            "application_form": result.application_form,
             "model": result.model, "prompt_versions": dict(result.prompt_versions), "errors": list(result.errors),
             "dropped": list(result.dropped), "requirement_labels": dict(result.requirement_labels),
             "evidence_labels": {str(k): v for k, v in result.evidence_labels.items()}}
@@ -61,6 +65,7 @@ def from_stage(data: dict[str, Any] | None) -> Synthesis:
     return Synthesis(
         company=CompanyInsightSynthesis.model_validate(data["company"]) if data.get("company") else None,
         interview=InterviewPrepResult.model_validate(data["interview"]) if data.get("interview") else None,
+        application_form=data.get("application_form"),
         model=data.get("model"), prompt_versions=dict(data.get("prompt_versions") or {}),
         errors=list(data.get("errors") or []), dropped=list(data.get("dropped") or []),
         requirement_labels=dict(data.get("requirement_labels") or {}),
@@ -214,10 +219,13 @@ def interview_context(db: Session, job: Job) -> dict[str, Any]:
 
 def run(sessions: Callable[[], Session], *, user_id: int, job_id: int, attempt: int,
         observations: list[dict[str, Any]]) -> Synthesis:
-    """Both model calls. Never raises: a failure is recorded in `errors` and that part stays None."""
+    """Every model call. Never raises: a failure is recorded in `errors` and that part stays None."""
+    from app.models import JobInsight
     from app.prompts import build_company_insights_prompt, build_interview_insights_prompt
+    from app.services.job_insights import application_form
     from app.prompts.company_insights import COMPANY_INSIGHTS_PROMPT_VERSION, shown_observations
     from app.prompts.contracts import CompanyInsightSynthesis, InterviewPrepResult
+    from app.prompts.application_form import APPLICATION_FORM_PROMPT_VERSION
     from app.prompts.interview_insights import INTERVIEW_INSIGHTS_PROMPT_VERSION
     from app.services.llm import LLMCall, LLMClient, LLMError
     from app.services.user_settings import ai_ready
@@ -283,4 +291,57 @@ def run(sessions: Callable[[], Session], *, user_id: int, job_id: int, attempt: 
                 out.prompt_versions["interview_insights"] = INTERVIEW_INSIGHTS_PROMPT_VERSION
             except (LLMError, SynthesisRejected, ValueError) as exc:
                 out.errors.append(f"Interview preparation failed: {type(exc).__name__}: {exc}"[:300])
+            insight = db.scalar(select(JobInsight).where(JobInsight.job_id == job_id))
+            out.application_form = application_form.draft(
+                db, client, job, attempt=attempt, ctx=ctx, company=application_form.company_summary(insight, out.company),
+                predict=True, dropped=out.dropped, errors=out.errors)
+            if out.application_form["model_ran"]:
+                out.prompt_versions["application_form"] = APPLICATION_FORM_PROMPT_VERSION
     return out
+
+
+def run_form(sessions: Callable[[], Session], *, user_id: int, job_id: int, attempt: int) -> Synthesis:
+    """An APPLICATION_FORM task: drafts for newly pasted questions only (no research, no other section, nothing
+    predicted). Never raises. Without a model the person's library answers and personal questions are still settled."""
+    from app.models import JobInsight
+    from app.services.job_insights import application_form
+    from app.prompts.application_form import APPLICATION_FORM_PROMPT_VERSION
+    from app.services.llm import LLMClient
+    from app.services.user_settings import ai_ready
+
+    out = Synthesis()
+    with sessions() as db:
+        db.info["user_id"] = user_id
+        job = db.get(Job, job_id)
+        if job is None:
+            out.errors.append("The job was deleted")
+            return out
+        ready, why = ai_ready(db, user_id)
+        with tracing.trace("job_insights", job_id=job_id, user_id=user_id):
+            ctx = {"context": {}, "fit": {}, "evidence": [], "requirements": {}}
+            if ready:
+                try:
+                    ctx = interview_context(db, job)
+                except Exception as exc:  # noqa: BLE001  the person's own answers are still settled without it
+                    ready, why = False, f"context unavailable ({type(exc).__name__})"
+            client = LLMClient.for_user(db, user_id) if ready else _NoModel(f"No model call: {why}")
+            insight = db.scalar(select(JobInsight).where(JobInsight.job_id == job_id))
+            out.application_form = application_form.draft(
+                db, client, job, attempt=attempt, ctx=ctx, company=application_form.company_summary(insight),
+                predict=False, dropped=out.dropped, errors=out.errors)
+            if out.application_form["model_ran"]:
+                out.prompt_versions["application_form"] = APPLICATION_FORM_PROMPT_VERSION
+    return out
+
+
+class _NoModel:
+    """Stands in for the gateway when no model is configured: every call fails as an LLMError, so the drafting pass
+    settles what it can without one and records why."""
+
+    def __init__(self, why: str) -> None:
+        self.why = why
+
+    def generate_prompt(self, *_args: Any, **_kwargs: Any) -> Any:
+        from app.services.llm import LLMError
+
+        raise LLMError(self.why or "No model configured")
