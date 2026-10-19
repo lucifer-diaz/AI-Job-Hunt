@@ -41,6 +41,7 @@ from app.models import (
     JobDescriptionFetchTask,
     JobDescriptionParseTask,
     JobInsightTask,
+    JobPreparationTask,
     JobQualificationTask,
     JobRankingTask,
     RagIndexEntry,
@@ -203,6 +204,12 @@ KINDS: dict[str, WorkerKind] = {k.kind: k for k in (
                "it hands each step to its worker and waits.", JobQualificationTask, "qualification", "PENDING",
                "PROCESSING", ("COMPLETED", "FAILED", "SKIPPED"), lambda: get_settings().qualification_max_attempts,
                "qualification", scope=_qualification_scope),
+    WorkerKind("preparation", "Preparation", "Takes each qualified job through resume selection, the Ranker's "
+               "analysis, evidence, tailoring, the evidence checks, the review decision and a bounded revision loop, "
+               "then waits for your approval (LangGraph). It never calls a model itself: tailoring and review run in "
+               "the Tailoring worker.", JobPreparationTask, "preparation", "PENDING", "PROCESSING",
+               ("COMPLETED", "FAILED", "SKIPPED"), lambda: get_settings().preparation_max_attempts, "preparation",
+               scope=_qualification_scope),
     WorkerKind("insights", "Job insights", "Researches approved jobs (posting, company site, Glassdoor and PayScale "
                "when configured), then a model organises what was found.", JobInsightTask, "job_insights", "PENDING",
                "PROCESSING", ("COMPLETED", "PARTIAL", "FAILED", "SKIPPED"),
@@ -251,7 +258,7 @@ def _display_status(spec: WorkerKind, task: Any, now: datetime) -> str:
 
 
 def _started_graph_run(spec: WorkerKind, task: Any) -> bool:
-    return spec.kind == "qualification" and getattr(task, "agent_thread_id", None) is not None
+    return spec.kind in ("qualification", "preparation") and getattr(task, "agent_thread_id", None) is not None
 
 
 def _attempts(spec: WorkerKind, task: Any) -> int:
@@ -828,6 +835,14 @@ def _stop(db: Session, spec: WorkerKind, task: Any, user_id: int, now: datetime)
         from app.services import qualification
 
         qualification.on_stopped(db, task, now)  # its graph thread stops too, so no node writes again
+    if spec.kind == "preparation":
+        from app.services import preparation
+
+        preparation.on_stopped(db, task, now)  # its thread and the tailoring pass it queued stop too
+    if spec.kind == "insights" and getattr(task, "agent_thread_id", None):
+        from app.services import qualification
+
+        qualification.stop_threads(db, [task.agent_thread_id], now)  # a graph run (JOB_INSIGHTS_GRAPH_MODE=on)
     if spec.kind == "ranking":
         from app.services.work_queue import transition
 
@@ -907,6 +922,10 @@ def _requeue_finished(db: Session, spec: WorkerKind, task: Any, user_id: int) ->
         from app.services import qualification
 
         return qualification.requeue(db, task, user_id)
+    elif spec.kind == "preparation":
+        from app.services import preparation
+
+        return preparation.requeue(db, task, user_id)
     elif spec.kind == "insights":
         from app.services.job_insights import tasks as insight_tasks
 

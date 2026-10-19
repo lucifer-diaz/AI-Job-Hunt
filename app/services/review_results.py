@@ -128,13 +128,50 @@ def decide_review(db: Session, job: Job, variant: ResumeVariant, review: ReviewI
 DECISION_STATUS = {"PASS": "tailored", "RETAILOR": NEEDS_RETAILOR, "NEEDS_HUMAN": "pending_approval"}
 
 
-def apply_review(db: Session, job: Job, variant: ResumeVariant, review: ReviewIn, *, source: str) -> ReviewDecision:
-    """Decide, store the review on the version and move the job. Returns the decision."""
+def apply_review(db: Session, job: Job, variant: ResumeVariant, review: ReviewIn, *, source: str,
+                 commit: bool = True) -> ReviewDecision:
+    """Decide, store the review on the version and move the job. Returns the decision. `commit=False` leaves the
+    commit to the caller (the preparation graph commits it with its effect record)."""
     decision = decide_review(db, job, variant, review)
     notes = {**review.model_dump(), "score": review.review_score, "decision": decision.decision,
              "decision_reasons": decision.reasons, "deterministic_issues": decision.deterministic_issues,
              "reject_reasons": decision.reasons if decision.decision != "PASS" else [],
              "improvements": review.missing_requirements, "source": source}
     job.status = DECISION_STATUS[decision.decision]
-    store_review(db, variant, notes)
+    store_review(db, variant, notes, commit=commit)
     return decision
+
+
+def retailor_feedback(variant: ResumeVariant | None) -> dict[str, Any]:
+    """What the next tailoring pass must fix, from a version's stored review. Empty without a reviewed version.
+
+    Used by Claude Desktop (MCP) and by the resume preparation graph's revision pass alike: the reasons the review and
+    the deterministic checks gave, never new facts."""
+    if variant is None:
+        return {}
+    notes = variant.reviewer_notes or {}
+    return {"previous_review": {
+        "version": variant.version, "review_score": variant.reviewer_score,
+        "decision_reasons": notes.get("decision_reasons") or [],
+        "unsupported_claims": notes.get("unsupported_claims") or [],
+        "overstated_claims": notes.get("overstated_claims") or [],
+        "missing_requirements": notes.get("missing_requirements") or [],
+        "failed_checks": [i.get("code") for i in notes.get("deterministic_issues") or []],
+    }}
+
+
+def review_of(job_id: int, variant: ResumeVariant) -> ReviewIn | None:
+    """A stored review (backend or Claude Desktop) in the shared schema, or None when the version has none."""
+    notes = variant.reviewer_notes or {}
+    if variant.reviewer_score is None or not notes:
+        return None
+    clip = lambda key: [str(v) for v in notes.get(key) or [] if str(v).strip()][:30]
+    try:
+        return ReviewIn(job_id=job_id, review_score=max(0.0, min(100.0, float(variant.reviewer_score))),
+                        confidence=max(0.0, min(1.0, float(notes.get("confidence") or 0))),
+                        unsupported_claims=clip("unsupported_claims"), overstated_claims=clip("overstated_claims"),
+                        missing_requirements=clip("missing_requirements"), risks=clip("risks"),
+                        recommendation=str(notes.get("recommendation") or "SKIP"),
+                        tailored_resume_version=variant.version, summary=str(notes.get("summary") or "")[:2000])
+    except ValueError:
+        return None

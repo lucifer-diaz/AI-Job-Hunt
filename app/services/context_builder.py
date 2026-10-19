@@ -170,6 +170,8 @@ class TaskContext:
     keyword_targets: dict[str, Any] = field(default_factory=dict)
     # Cover letters only: the validated tailored resume the letter accompanies (summary, top bullets).
     tailored: dict[str, Any] = field(default_factory=dict)
+    # Tailoring revision passes only: the previous version's review (review_results.retailor_feedback).
+    revision_feedback: dict[str, Any] = field(default_factory=dict)
     # Evidence held back from generation because its provenance disagrees with its source ({id, code}).
     excluded_evidence: list[dict[str, Any]] = field(default_factory=list)
     resume_text: str = ""  # a readable rendering of the selected facts (or the raw text when nothing is structured)

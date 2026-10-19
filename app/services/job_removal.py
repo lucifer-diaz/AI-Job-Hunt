@@ -92,10 +92,13 @@ def remove_posting(db: Session, job: Job, reason: str, *, actor: str, now: datet
 def delete_job(db: Session, job: Job) -> None:
     """Delete a job and its task rows. PostgreSQL cascades these; deleting them here too keeps SQLite installs free of
     orphans (a reused job id would otherwise inherit another job's tasks). Does not commit."""
-    from app.services import qualification
+    from app.services import preparation, qualification
 
     qualification.on_job_deleted(db, job.id)  # its graph runs stop and lose their lease
-    for model in (JobDescriptionFetchTask, JobDescriptionParseTask, JobRankingTask, JobInsightTask):
+    preparation.on_job_deleted(db, job.id)
+    from app.models import ApprovedPacket
+
+    for model in (JobDescriptionFetchTask, JobDescriptionParseTask, JobRankingTask, JobInsightTask, ApprovedPacket):
         for row in db.scalars(select(model).where(model.job_id == job.id)).all():
             db.delete(row)
     for insight in db.scalars(select(JobInsight).where(JobInsight.job_id == job.id)).all():

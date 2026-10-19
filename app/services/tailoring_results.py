@@ -277,11 +277,23 @@ def validate_tailored_resume(db: Session, profile: CandidateProfile, job: Job, d
 
     # The summary, cover letter and screening answers are read as fact too, so their numbers and the names
     # they drop must come from the same places a bullet's do. Naming this job and yourself is always fine.
-    allowed = supported | _words(f"{job.company} {job.title} {profile.name}")
-    supported_numbers = _numbers(master_text + " " + evidence_text)
     prose = {"summary": data.summary, "cover_letter": data.cover_letter,
              **{f"screening_answer_drafts.{key}": value for key, value in data.screening_answer_drafts.items()}}
-    for location, text in ({} if legacy else prose).items():
+    texts = {**prose, **{f"experience_sections.{i}": " ".join(b.text for b in s.bullets)
+                         for i, s in enumerate(data.experience_sections)},
+             "resume_bullets": " ".join(b.text for b in data.resume_bullets)}
+    issues += _prose_issues({} if legacy else prose, texts, supported=supported, job=job, profile=profile,
+                            supported_numbers=_numbers(master_text + " " + evidence_text))
+    return issues
+
+
+def _prose_issues(prose: dict[str, str], authorization_texts: dict[str, str], *, supported: set[str], job: Job,
+                  profile: CandidateProfile, supported_numbers: set[str]) -> list[dict[str, str]]:
+    """Numbers and named terms in prose must come from the resume, the profile or verified evidence; a work
+    authorization claim anywhere must match the profile's own."""
+    issues: list[dict[str, str]] = []
+    allowed = supported | _words(f"{job.company} {job.title} {profile.name}")
+    for location, text in prose.items():
         invented = sorted(_numbers(text) - supported_numbers)
         if invented:
             issues.append(_issue("INVENTED_METRIC", location,
@@ -291,20 +303,28 @@ def validate_tailored_resume(db: Session, profile: CandidateProfile, job: Job, d
             issues.append(_issue("UNSUPPORTED_TERM", location,
                                  f"{unsupported} appear nowhere in the master resume, your profile or verified "
                                  "evidence; cite them there first or leave them out"))
-
     authorization = (profile.work_authorization or "").lower()
-    texts = {"summary": data.summary, "cover_letter": data.cover_letter,
-             **{f"screening_answer_drafts.{k}": v for k, v in data.screening_answer_drafts.items()},
-             **{f"experience_sections.{i}": " ".join(b.text for b in s.bullets)
-                for i, s in enumerate(data.experience_sections)},
-             "resume_bullets": " ".join(b.text for b in data.resume_bullets)}
-    for location, text in texts.items():
+    for location, text in authorization_texts.items():
         for match in {m.group(0).lower() for m in WORK_AUTH_RE.finditer(text or "")}:
             stem = match[:5]
             if not authorization or stem not in authorization:
                 issues.append(_issue("WORK_AUTHORIZATION", location,
                                      f"'{match}' is not supported by the work authorization in your profile"))
     return issues
+
+
+def check_prose(db: Session, profile: CandidateProfile, job: Job, texts: dict[str, str]) -> list[dict[str, str]]:
+    """The checks a tailored resume's screening answers get, for drafts written elsewhere (application-form drafts on
+    Job Insights): numbers and named terms from the job's resume, the profile or verified evidence only, and no work
+    authorization claim the profile does not make."""
+    from app.services import resume_verification as rv
+
+    profile = rv.for_job(db, profile, job)
+    master_text = to_plain(profile.master_resume or "")
+    evidence_text = _evidence_text(verified_evidence(db, job))
+    supported = _vocabulary(master_text, evidence_text, profile)
+    return _prose_issues(texts, texts, supported=supported, job=job, profile=profile,
+                         supported_numbers=_numbers(master_text + " " + evidence_text))
 
 
 def to_variant_content(data: TailoredResumeIn, *, source: str) -> dict[str, Any]:

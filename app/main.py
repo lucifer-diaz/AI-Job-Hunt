@@ -89,6 +89,7 @@ from app.services import (
     evidence_tags,
     feedback_learning,
     mcp_tokens,
+    preparation,
     ranker,
     resume_verification,
     server_settings,
@@ -96,6 +97,8 @@ from app.services import (
     tracing,
 )
 from app.services.ai_config import PROVIDERS as AI_PROVIDERS
+from app.services import approval as approval_service
+from app.services.approval import ApprovalRefused
 from app.services.ai_config import STAGES as AI_STAGES
 from app.services.ai_config import env_defaults as ai_env_defaults
 from app.services.ai_config import resolve as resolve_ai_config
@@ -760,12 +763,21 @@ def clear_tailor_tasks(db: Session = Depends(get_user_db)):
 
 @app.get("/api/jobs/{job_id}/resume.pdf")
 def resume_pdf(job_id: int, db: Session = Depends(get_user_db)):
-    resume = db.scalar(select(ResumeVariant).where(ResumeVariant.job_id == job_id).order_by(desc(ResumeVariant.version)).limit(1))
+    resume = approval_service.export_variant(db, job_id)  # the approved version once approved, never a newer one
     if not resume:
         raise HTTPException(404, "No tailored resume for this job")
+    _check_export(db, job_id)
     data = markdown_to_simple_pdf(resume.markdown)
     return Response(data, media_type="application/pdf",
                     headers=download_headers(packet_download_name(db, job_id, "pdf")))
+
+
+def _check_export(db: Session, job_id: int) -> None:
+    """An approved packet downloads only as it was approved (app.services.approval)."""
+    try:
+        approval_service.check_export(db, job_id)
+    except approval_service.PacketChanged as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @app.post("/api/jobs/{job_id}/approve")
@@ -793,6 +805,8 @@ def approve(job_id: int, payload: ApproveIn | None = None, db: Session = Depends
                                   "can_override": True})
     try:
         app_obj = approve_job(db, job, override=below, note=payload.note)
+    except ApprovalRefused as exc:
+        raise HTTPException(409, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     feedback_learning.record(db, job, "APPROVED")  # teaches the domain filter what a good job looks like
@@ -861,8 +875,17 @@ def application_update(application_id: int, payload: ApplicationUpdateIn, db: Se
     if payload.status:
         if payload.status not in {"pending_approval", "rejected"}:
             raise HTTPException(422, "Only pending approval or rejected may be set here")
+        if item.status == "approved":
+            # The approval no longer stands: withdraw it as send-back and reject do (snapshot revoked; back to
+            # pending approval also takes the canonical state READY_TO_APPLY -> REVIEWED).
+            if payload.status == "pending_approval":
+                approval_service.revoke(db, item.job, "Moved back to pending approval")
+            else:
+                approval_service.withdraw(db, item, "Rejected after approval")
         item.status = payload.status
         item.job.status = payload.status
+        # A preparation graph run waiting for this packet's decision records it (never blocks, never raises).
+        preparation.on_decision(db, item.job, "rejected" if payload.status == "rejected" else "revise")
     db.commit()
     return {"ok": True, "status": item.status}
 

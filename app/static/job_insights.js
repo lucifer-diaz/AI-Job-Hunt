@@ -5,7 +5,10 @@
 'use strict';
 
 const INS_SECTIONS = [['overview', 'Overview'], ['compensation', 'Compensation'], ['company', 'Company'],
-  ['interview', 'Interview'], ['ask', 'Questions to ask'], ['sources', 'Sources']];
+  ['interview', 'Interview'], ['form', 'Application form'], ['ask', 'Questions to ask'], ['sources', 'Sources']];
+// Application-form question status → [label, tone]. A draft is never shown as the person's own answer.
+const INS_FORM_STATUS = { LIBRARY: ['From your library', 'good'], DRAFTED: ['Draft', 'warn'], NEEDS_INPUT: ['Needs your answer', 'muted'],
+  PENDING: ['Drafting…', 'brand'] };
 // [label, tone]: what kind of statement an item is. Colour is never the only signal: the word is always shown.
 const INS_KIND = { FACT: ['Source fact', 'good'], DERIVED: ['Interpretation', 'brand'], GENERATED: ['Generated prep', 'warn'],
   UNKNOWN: ['Unknown', 'muted'] };
@@ -89,7 +92,8 @@ function insHeader(x, jobId) {
   const researching = x.researching;
   const never = x.status === 'NONE' && !researching;
   const action = btn(label('insrefresh' + jobId, never ? 'Find insights' : 'Refresh', 'Queueing…'), 'ins-refresh', { id: jobId }, never ? 'primary sm' : 'sm', isBusy('insrefresh' + jobId) || researching);
-  const state = researching ? `${pill(x.task?.status === 'PROCESSING' ? 'Researching…' : 'Queued', 'brand')} <span class="xs muted">Research runs in the background; this updates on its own.</span>`
+  const formOnly = x.task?.scope === 'APPLICATION_FORM';
+  const state = researching ? `${pill(formOnly ? 'Drafting answers…' : x.task?.status === 'PROCESSING' ? 'Researching…' : 'Queued', 'brand')} <span class="xs muted">${formOnly ? 'Drafting your form answers' : 'Research runs'} in the background; this updates on its own.</span>`
     : x.last_successful_at ? `<span class="xs muted">Last refreshed ${esc(insAgo(x.last_successful_at))}</span>${x.status === 'PARTIAL' ? ` ${pill('Partial', 'warn')}` : ''}`
     : never ? `<span class="xs muted">${x.eligible ? 'Not researched yet.' : 'Research starts automatically when the job is approved; you can start it now.'}</span>` : '';
   const failed = x.refresh_failed ? `<div class="banner warn mt8" style="display:block"><b>Refresh failed.</b> ${x.last_successful_at ? `Last successful data: ${esc(fmtDateTime(x.last_successful_at))}.` : 'No research has succeeded yet.'}${x.last_error ? ` <span class="xs">${esc(x.last_error)}</span>` : ''}</div>` : '';
@@ -212,6 +216,40 @@ function insInterview(x, jobId) {
   </div>`;
 }
 
+function insFormQuestion(q, jobId) {
+  const [word, tone] = INS_FORM_STATUS[q.status] || INS_FORM_STATUS.NEEDS_INPUT;
+  const key = `${jobId}:${q.id}`;
+  const actions = [
+    q.answer ? btn('Copy', 'ins-form-copy', { id: jobId, q: q.id }, 'sm ghost') : '',
+    q.status !== 'LIBRARY' && q.status !== 'PENDING' ? btn(q.status === 'DRAFTED' ? 'Save to library' : 'Answer in library', 'ins-form-save', { id: jobId, q: q.id }, 'sm ghost') : '',
+    q.origin === 'FORM' ? btn(label('insformrm' + key, 'Remove', 'Removing…'), 'ins-form-remove', { id: jobId, q: q.id }, 'sm ghost danger', isBusy('insformrm' + key)) : '',
+  ].filter(Boolean).join('');
+  return `<div class="ins-q"><div class="row top-align gap8"><div class="grow"><div class="small b pretty">${esc(q.question)}</div>
+      ${q.rationale ? `<div class="xs mt4"><span class="faint">Why likely:</span> ${esc(q.rationale)}</div>` : ''}
+      ${q.answer ? `<div class="box soft mt8 small pretty" style="white-space:pre-wrap">${esc(q.answer)}</div>` : ''}
+      ${q.evidence?.filter(Boolean).length ? `<div class="xs muted mt6">From your evidence: ${q.evidence.filter(Boolean).map(esc).join(' · ')}</div>` : ''}
+      ${q.requirements?.length ? `<div class="xs muted mt4">Relates to: ${esc(q.requirements.join(', '))}</div>` : ''}
+      ${q.reason ? `<div class="xs mt6" style="color:var(--warn-deep)">${esc(q.reason)}</div>` : ''}</div>
+      <div class="col gap6 none">${pill(word, tone)}${q.kind ? insKind(q.kind) : ''}</div></div>
+    ${actions ? `<div class="row wrap gap6 mt8">${actions}</div>` : ''}</div>`;
+}
+
+function insForm(x, jobId) {
+  const f = x.application_form || { from_form: [], likely: [] };
+  const form = 'insform' + jobId;
+  const full = (f.from_form || []).length >= (f.max_questions || 20);
+  return `<div class="col gap16">
+    <div class="box"><div class="base b mb4">Questions on the form</div><div class="xs muted mb8">Paste the questions the application asks, one per line. Each is answered from your saved answers and verified evidence in the background; questions only you can answer (work authorization, pay, notice period, personal details) are never drafted.</div>
+      ${textareaF(form, 'questions', '', `placeholder="Why do you want to join this company?&#10;Describe a project where you led a team." style="min-height:80px" aria-label="Questions from the application form"${full ? ' disabled' : ''}`)}
+      <div class="row gap8 mt8">${btn(label('insformadd' + jobId, 'Add and draft', 'Adding…'), 'ins-form-add', { id: jobId }, 'primary sm', isBusy('insformadd' + jobId) || full)}${full ? '<span class="xs muted">Remove a question to add another.</span>' : ''}</div></div>
+    <div><div class="row gap8 mb8"><span class="caps">FROM THE FORM</span><span class="xs faint">questions you pasted</span></div>
+      ${(f.from_form || []).map(q => insFormQuestion(q, jobId)).join('') || '<div class="small muted">None yet. Paste the questions your application form asks above.</div>'}</div>
+    <div><div class="row gap8 mb8"><span class="caps">LIKELY ON THE FORM</span><span class="xs faint">predicted from the posting, drafted from your data</span></div>
+      ${(f.likely || []).map(q => insFormQuestion(q, jobId)).join('') || `<div class="small muted">${x.status === 'NONE' ? 'Written when the job is researched.' : 'None yet: refresh to predict them.'}</div>`}</div>
+    <div class="xs faint">${esc(f.note || '')}</div>
+  </div>`;
+}
+
 function insAsk(x) {
   const qs = x.questions_to_ask || [];
   if (!qs.length) return '<div class="small muted">No questions yet: they are written after research.</div>';
@@ -255,7 +293,7 @@ function renderJobInsights(jobId) {
   const x = D.insights?.[jobId];
   if (!x) return `<div style="padding:20px 22px">${loading()}</div>`;
   const tab = insState().tab;
-  const body = { overview: insOverview, compensation: insCompensation, company: insCompany, interview: insInterview, ask: insAsk, sources: insSources }[tab] || insOverview;
+  const body = { overview: insOverview, compensation: insCompensation, company: insCompany, interview: insInterview, form: insForm, ask: insAsk, sources: insSources }[tab] || insOverview;
   return `<div class="ins" style="padding:16px 22px 22px">${insHeader(x, jobId)}${insTabs(tab)}<div class="mt14">${body(x, jobId)}</div></div>`;
 }
 // The Approvals card: the overview, and a way into the full package.
@@ -330,6 +368,44 @@ const INSIGHTS_ACTIONS = {
       D.insPrep = { ...(D.insPrep || {}), [`${id}:${q}`]: out };
       return out;
     });
+  },
+  'ins-form-add': el => {
+    const id = Number(el.dataset.id), form = 'insform' + id;
+    const questions = String(fv(form, 'questions', '') || '').split('\n').map(s => s.trim()).filter(s => s.length >= 8);
+    if (!questions.length) { toast('Paste at least one question (8 characters or more).', true); return; }
+    return busy('insformadd' + id, async () => {
+      const out = await api(`/api/jobs/${id}/insights/application-questions`, { method: 'POST', body: { questions } });
+      D.insights = { ...(D.insights || {}), [id]: out };
+      delete S.forms[form];
+      scheduleInsPoll(id);
+      return out;
+    }, 'Added — drafting in the background');
+  },
+  'ins-form-remove': el => {
+    const id = Number(el.dataset.id), q = el.dataset.q;
+    return busy(`insformrm${id}:${q}`, async () => {
+      D.insights = { ...(D.insights || {}), [id]: await api(`/api/jobs/${id}/insights/application-questions/${encodeURIComponent(q)}`, { method: 'DELETE' }) };
+    });
+  },
+  'ins-form-copy': el => {
+    const f = D.insights?.[Number(el.dataset.id)]?.application_form || {};
+    const q = [...(f.from_form || []), ...(f.likely || [])].find(item => item.id === el.dataset.q);
+    if (q?.answer) copyText(q.answer);
+  },
+  // Opens the Answer library editor with the question (and the draft) filled in. "Human verified" starts unticked:
+  // the person reads the draft and confirms it there; nothing is saved from here.
+  'ins-form-save': el => {
+    const f = D.insights?.[Number(el.dataset.id)]?.application_form || {};
+    const q = [...(f.from_form || []), ...(f.likely || [])].find(item => item.id === el.dataset.q);
+    if (!q) return;
+    S.jobOpen = null;
+    delete S.forms.knnew;
+    setF('knnew', 'question', q.question);
+    setF('knnew', 'answer', q.answer || '');
+    setF('knnew', 'verified', false);
+    knowledgeState().editors.answers = { id: null, form: 'knnew' };
+    go('knowledge', { knowledgeSection: 'answers' });
+    document.getElementById('knnew-answer')?.focus();
   },
   'ins-provenance': el => {
     const id = Number(el.dataset.id), prev = el.dataset.more ? D.insProv?.[id] : null;

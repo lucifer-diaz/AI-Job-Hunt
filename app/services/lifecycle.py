@@ -85,7 +85,8 @@ TRANSITIONS: dict[WorkflowState, frozenset[WorkflowState]] = {
     S.TAILORED: frozenset({S.REVIEWED, S.SKIPPED, S.FAILED}),
     # A review may send the packet back for another tailoring pass.
     S.REVIEWED: frozenset({S.READY_TO_APPLY, S.TAILORING, S.SKIPPED, S.FAILED}),
-    S.READY_TO_APPLY: frozenset({S.APPLYING, S.ARCHIVED, S.SKIPPED}),
+    # An approval is revoked when its packet is edited (app.services.approval): back to the reviewed packet.
+    S.READY_TO_APPLY: frozenset({S.APPLYING, S.REVIEWED, S.ARCHIVED, S.SKIPPED}),
     S.APPLYING: frozenset({S.APPLIED, S.SKIPPED, S.FAILED}),
     # After submission the job never becomes FAILED: a failed follow-up must not erase that we applied.
     S.APPLIED: frozenset({S.FOLLOWUP_DUE, S.INTERVIEW, S.REJECTED, S.OFFER, S.ARCHIVED}),

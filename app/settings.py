@@ -360,6 +360,25 @@ class Settings(BaseSettings):
     qualification_shadow_daily_limit: int = 50  # shadow runs per account per day
     qualification_shadow_paid_daily_limit: int = 0  # shadow re-rankings (model calls) per account per day: none
     qualification_shadow_lookback_hours: int = 48
+    # The resume preparation graph (app.agents.preparation, Phase 4). PREPARATION_GRAPH_MODE: off (default; automatic
+    # tailoring queues the tailor worker exactly as before), shadow (it still does, and a bounded number of reviewed
+    # packets per account a day are re-checked by the graph read-only: never a model call), on (qualified jobs are
+    # prepared by the graph: tailor, evidence checks, review decision, a bounded revision loop, a person's approval).
+    # Needs AGENT_GRAPHS_ENABLED and PostgreSQL; otherwise it acts as off.
+    preparation_graph_mode: str = "off"
+    preparation_minutes: int = 1
+    preparation_batch_size: int = 50
+    preparation_concurrency: int = 4
+    preparation_max_attempts: int = 3
+    preparation_retry_seconds: int = 60
+    preparation_max_revisions: int = 2  # tailoring passes after the first, per run, before a person decides
+    preparation_lease_seconds: int = 300
+    preparation_shadow_daily_limit: int = 50
+    preparation_shadow_lookback_hours: int = 48
+    # The Job Insights graph (app.agents.job_insights, Phase 4). JOB_INSIGHTS_GRAPH_MODE: off (default; research runs
+    # as before), shadow (it does, and the graph's deterministic steps re-check each finished run read-only), on (each
+    # research task runs as a graph thread on the same task row). Needs AGENT_GRAPHS_ENABLED and PostgreSQL.
+    job_insights_graph_mode: str = "off"
     # Candidate knowledge retrieval (RAG, app.services.rag_retrieval). RAG_RETRIEVAL_MODE: off (default; the context
     # builders select evidence exactly as before), shadow (they still do, and the retrieval result is computed beside
     # it and compared in Monitoring → Logs, ids only), on (job contexts take their evidence from retrieval, scoped to
@@ -405,6 +424,24 @@ class Settings(BaseSettings):
         """The scheduler interval of the qualification graph job: 0 (off) unless the graph's mode is shadow or on.
         In off mode with tasks left over from on, the job still runs to hand them back (qualification.release)."""
         return max(0, self.qualification_minutes) if self.agent_graphs_enabled else 0
+
+    @property
+    def preparation_mode(self) -> str:
+        """off, shadow or on; anything else, or agent graphs being off, is off."""
+        mode = (self.preparation_graph_mode or "off").strip().lower()
+        return mode if self.agent_graphs_enabled and mode in ("shadow", "on") else "off"
+
+    @property
+    def preparation_interval_minutes(self) -> int:
+        """The scheduler interval of the preparation graph job: 0 (off) unless agent graphs are on. In off mode with
+        tasks left over from on, the job still runs to hand them back (preparation.release)."""
+        return max(0, self.preparation_minutes) if self.agent_graphs_enabled else 0
+
+    @property
+    def job_insights_graph_mode_value(self) -> str:
+        """off, shadow or on for research runs; anything else, or agent graphs being off, is off."""
+        mode = (self.job_insights_graph_mode or "off").strip().lower()
+        return mode if self.agent_graphs_enabled and mode in ("shadow", "on") else "off"
 
     @property
     def rag_index_interval_minutes(self) -> int:

@@ -862,7 +862,32 @@ class LLMClient:
             return self._mock_company_insights(user)
         if "PREPARE_INTERVIEW_INSIGHTS" in user.split("\n", 1)[0]:
             return self._mock_interview_insights(user)
+        if "PREPARE_APPLICATION_FORM" in user.split("\n", 1)[0]:
+            return self._mock_application_form(user)
         return {"summary": "Mock answer."}
+
+    @staticmethod
+    def _mock_application_form(user: str) -> dict[str, Any]:
+        """Drafts made of the evidence it was given, word for word; every pasted question answered or handed back."""
+        evidence = re.search(r"^VERIFIED EVIDENCE:\n(.*)$", user, re.MULTILINE)
+        items = json.loads(evidence.group(1))[:2] if evidence else []
+        raw = user.split("<untrusted_form_questions>", 1)[-1].rsplit("</untrusted_form_questions>", 1)[0].strip()
+        pasted = json.loads(raw) if raw.startswith("[") else []
+        task = re.search(r"^TASK:\n(.*)$", user, re.MULTILINE)
+        predict = int(json.loads(task.group(1)).get("predict_up_to") or 0) if task else 0
+        answer = " ".join(e.get("claim") or "" for e in items).strip()
+
+        def draft(question: str, ref: str | None, category: str, why: str = "") -> dict[str, Any]:
+            return {"form_ref": ref, "form_question": question, "form_category": category,
+                    "form_decision": "DRAFT" if answer else "NEEDS_INPUT", "form_answer": answer or None,
+                    "likely_because": why, "requirement_ids": [], "evidence_ids": [e["id"] for e in items],
+                    "knowledge_ids": [], "form_note": "" if answer else "No verified evidence to draft from."}
+
+        out = [draft(q["question"], q["ref"], "EXPERIENCE") for q in pasted if len(q.get("question") or "") >= 8]
+        if predict:
+            out.append(draft("Describe the experience that best prepares you for this role.", None, "EXPERIENCE",
+                             "Forms for this kind of role usually ask for relevant experience."))
+        return {"form_questions": out}
 
     @staticmethod
     def _mock_company_insights(user: str) -> dict[str, Any]:

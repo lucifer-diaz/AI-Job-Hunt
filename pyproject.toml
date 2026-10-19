@@ -43,6 +43,7 @@ testpaths = ["tests"]
 markers = [
     "strict_resume_policy: run with the production CandidatePolicy (verified resume facts only)",
     "strict_ranking: tailoring requires a real completed FitAnalysis (no test stand-in)",
+    "strict_approval: approval requires a job whose workflow state can reach READY_TO_APPLY (no test stand-in)",
 ]
 
 [tool.ruff]

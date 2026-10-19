@@ -630,7 +630,7 @@ def test_graph_state_exported_is_ids_enums_and_counts_only():
                                        for f in graph.EXPORT_FIELDS)
     assert graph.summary({"job_id": 1, "outcome": "QUALIFIED", "description": "x" * 50}) == {"job_id": 1,
                                                                                             "outcome": "QUALIFIED"}
-    assert runtime.WORKER_OWNED == (graph.GRAPH,)
+    assert graph.GRAPH in runtime.WORKER_OWNED and "pilot" not in runtime.WORKER_OWNED
 
 
 # ───────────── the old-vs-new report (scripts/qualification_parity.py) ─────────────

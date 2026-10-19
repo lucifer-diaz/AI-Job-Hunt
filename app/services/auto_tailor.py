@@ -30,7 +30,7 @@ from sqlalchemy import exists, func, select, update
 from sqlalchemy.orm import Session
 
 from app.models import Job, JobRanking, TailorTask
-from app.services import system_log, tailor_tasks
+from app.services import preparation, system_log, tailor_tasks
 from app.services.lifecycle import WorkflowState as S
 from app.services.user_settings import auto_tailor_for, execution_mode_for
 
@@ -59,7 +59,8 @@ def _candidates(db: Session, config: dict[str, Any], *, manual: bool = False):
         return None
     query = select(Job).where(Job.state == S.QUALIFIED, Job.status == TAILOR_QUEUE_STATUS,
                               Job.fit_score.is_not(None),
-                              Job.auto_tailor_status.is_(None), ~exists().where(TailorTask.job_id == Job.id))
+                              Job.auto_tailor_status.is_(None), ~exists().where(TailorTask.job_id == Job.id),
+                              preparation.untouched())
     if not manual:
         ranked_at = (select(func.max(JobRanking.created_at)).where(JobRanking.job_id == Job.id)
                      .correlate(Job).scalar_subquery())
@@ -86,12 +87,26 @@ def queue(db: Session, job_ids: list[int] | None = None, *, manual: bool = False
     if not claimed:
         db.rollback()
         return {"queued": [], "skipped": []}
-    result = tailor_tasks.enqueue(db, claimed)
+    result = _hand_to_graph(db, claimed) if preparation.routes(db) else tailor_tasks.enqueue(db, claimed)
     for task in result["queued"]:
         system_log.log_event(message=f"Automatic tailoring queued job {task['job_id']} after ranking",
                              category="WORKFLOW", workflow="auto_tailor", user_id=db.info.get("user_id"),
                              entity_type="job", entity_id=task["job_id"], status="QUEUED")
     return result
+
+
+def _hand_to_graph(db: Session, job_ids: list[int]) -> dict[str, Any]:
+    """PREPARATION_GRAPH_MODE=on: each claimed job gets a preparation graph run, which queues its tailoring pass
+    itself. Commits (with the claim, as enqueue does)."""
+    queued, skipped = [], []
+    for job in db.scalars(select(Job).where(Job.id.in_(job_ids))).all():
+        task = preparation.dispatch(db, job, reason="auto")
+        if task is None:
+            skipped.append({"id": job.id, "reason": "held until you ask again"})
+        else:
+            queued.append({"job_id": job.id, "preparation_task_id": task.id})
+    db.commit()
+    return {"queued": queued, "skipped": skipped}
 
 
 def after_qualified(sessions: SessionFactory, user_id: int, job_id: int) -> bool:

@@ -68,6 +68,17 @@ EDITABLE: dict[str, Editable] = {e.name: e for e in (
     Editable("qualification_shadow_paid_daily_limit", "qualification", "Shadow model calls per account per day",
              "In shadow mode: how many jobs without a ranking may be ranked again by the model, only to compare. "
              "0 (the default) never spends a model call on shadow runs.", 0, 500),
+    Editable("preparation_interval_minutes", "preparation", "Run every (minutes)",
+             "How often the resume preparation graph looks for work. 0 turns it off for every account; it never runs "
+             "while AGENT_GRAPHS_ENABLED is off.", 0, 1440, "preparation"),
+    Editable("preparation_batch_size", "preparation", "Tasks per run", "How many graph runs one pass claims.",
+             1, 500),
+    Editable("preparation_concurrency", "preparation", "Side by side",
+             "How many graph runs advance at once. A run hands tailoring to the tailor worker, so this is cheap.",
+             1, 32),
+    Editable("preparation_shadow_daily_limit", "preparation", "Shadow runs per account per day",
+             "In shadow mode: how many reviewed packets per account a day are re-checked by the graph (read-only, "
+             "never a model call).", 0, 5000),
     Editable("tailor_concurrency", "tailoring", "Side by side",
              "How many packets are tailored at once across every account, and the most one account may ask for "
              "(each account picks up to this).", 1, 16),

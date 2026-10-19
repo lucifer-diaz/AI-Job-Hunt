@@ -257,18 +257,9 @@ def _job_resume(db: Session, profile: Any, job: Job) -> dict[str, Any]:
 
 def _retailor_feedback(db: Session, job: Job) -> dict[str, Any]:
     """For a packet review sent back: what to fix this time. Empty for a job that has never been tailored."""
-    variant = latest_variant(db, job.id) if job.status == NEEDS_RETAILOR else None
-    if variant is None:
-        return {}
-    notes = variant.reviewer_notes or {}
-    return {"previous_review": {
-        "version": variant.version, "review_score": variant.reviewer_score,
-        "decision_reasons": notes.get("decision_reasons") or [],
-        "unsupported_claims": notes.get("unsupported_claims") or [],
-        "overstated_claims": notes.get("overstated_claims") or [],
-        "missing_requirements": notes.get("missing_requirements") or [],
-        "failed_checks": [i.get("code") for i in notes.get("deterministic_issues") or []],
-    }}
+    from app.services.review_results import retailor_feedback
+
+    return retailor_feedback(latest_variant(db, job.id) if job.status == NEEDS_RETAILOR else None)
 
 
 def _save_one_tailored(db: Session, profile: Any, item: Any, seen: set[int]) -> dict[str, Any]:

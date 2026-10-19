@@ -11,6 +11,7 @@ from app.prompts.application import (
                                        APPLICATION_QUESTION_PROMPT_VERSION,
                                        build_application_question_prompt,
 )
+from app.prompts.application_form import APPLICATION_FORM_PROMPT_VERSION, build_application_form_prompt
 from app.prompts.application_inbox import (
                                        APPLICATION_INBOX_PROMPT_VERSION,
                                        build_application_email_match_prompt,
@@ -24,6 +25,7 @@ from app.prompts.company_insights import (
 from app.prompts.contracts import (
                                        ApplicationAnswerResult,
                                        ApplicationEmailAnalysis,
+                                       ApplicationFormPrepResult,
                                        ApplicationEmailMatchResult,
                                        CompanyInsightSynthesis,
                                        CoverLetterResult,
@@ -87,6 +89,7 @@ PROMPT_VERSIONS = {
     "job_description_recovery": JOB_DESCRIPTION_RECOVERY_PROMPT_VERSION,
     "evidence_extraction": EVIDENCE_EXTRACTION_PROMPT_VERSION,
     "application_question": APPLICATION_QUESTION_PROMPT_VERSION,
+    "application_form": APPLICATION_FORM_PROMPT_VERSION,
     "inbox": INBOX_PROMPT_VERSION,
     "application_inbox": APPLICATION_INBOX_PROMPT_VERSION,
     "application_email_match": APPLICATION_INBOX_PROMPT_VERSION,
@@ -113,6 +116,7 @@ OUTPUT_CONTRACTS = {
     "job_description_recovery": JobDescriptionRecoveryResult,
     "evidence_extraction": EvidenceExtractionResult,
     "application_question": ApplicationAnswerResult,
+    "application_form": ApplicationFormPrepResult,
     "inbox": InboxClassificationResult,
     "application_inbox": ApplicationEmailAnalysis,
     "application_email_match": ApplicationEmailMatchResult,
@@ -135,6 +139,7 @@ __all__ = [
                                        "Prompt",
                                        "build_ai_optimization_prompt",
                                        "build_application_email_match_prompt",
+                                       "build_application_form_prompt",
                                        "build_application_inbox_prompt",
                                        "build_application_question_prompt",
                                        "build_company_insights_prompt",

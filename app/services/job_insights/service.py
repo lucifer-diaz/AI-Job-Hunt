@@ -29,7 +29,7 @@ from sqlalchemy.orm import Session
 
 from app.models import Application, InsightObservation, Job, JobInsight
 from app.services import backoff, compensation, redaction, system_log, tracing, worker_settings
-from app.services.job_insights import matching, synthesis
+from app.services.job_insights import application_form, matching, synthesis
 from app.services.job_insights.apify import (
     GlassdoorCompensationSource,
     GlassdoorInterviewSource,
@@ -58,6 +58,7 @@ from app.services.job_insights.tasks import (
     KIND,
     PARTIAL,
     SKIPPED,
+    USER_REQUEST,
     WORKER,
     InsightClaim,
     finish,
@@ -77,7 +78,8 @@ ANSWERED = (OK, NO_DATA, NEEDS_REVIEW)
 # Sections the company synthesis shapes: a run without it never replaces a previous run's version.
 SYNTHESIZED = ("company", "interview_process", "reported_questions", "risks", "unknowns")
 INSIGHT_SECTIONS = ("compensation", "compensation_prep", "company", "interview_process", "reported_questions",
-                    "generated_questions", "questions_to_ask", "focus_areas", "value_prep", "risks", "unknowns")
+                    "generated_questions", "questions_to_ask", "focus_areas", "value_prep", "risks", "unknowns",
+                    "application_questions")
 # A pay question a model wrote must not carry a figure: amounts come only from sources (app.services.compensation).
 MONEY = re.compile(r"(?:[$£€₹]|\b[A-Z]{3}\b)\s?\d|\d[\d,.]*\s?[kKmM]\b|\d{1,3}(?:,\d{3})+|\d{4,}|\blakhs?\b|\bLPA\b")
 WEBSITE_KEYS = ("company_website", "companyWebsite", "company_url", "companyUrl", "employer_website",
@@ -262,7 +264,7 @@ def collect(snapshot: Snapshot, reused: dict[str, list[ObservationIn]]) -> list[
 # ───────────── 3. observations ─────────────
 
 def store(sessions: Callable[[], Session], claim_: InsightClaim, results: list[SourceResult],
-          now: datetime) -> list[dict[str, Any]] | None:
+          now: datetime, *, within: Callable[[Session], None] | None = None) -> list[dict[str, Any]] | None:
     """Replace the observations of every source that answered; keep those of sources that did not. Lease-guarded.
 
     Replaced rows are marked superseded, not deleted: a section this run may keep from an earlier one (when its model
@@ -295,11 +297,18 @@ def store(sessions: Callable[[], Session], claim_: InsightClaim, results: list[S
                     cache_key=o.cache_key, data=o.data, created_at=now))
         labels = {s.name: s.label for s in SOURCES}
         task.source_status = {r.name: {**r.summary(now), "label": labels.get(r.name, r.name)} for r in results}
+        if within is not None:  # the graph records this step in the same transaction (app.agents.effects)
+            within(db)
         db.commit()
-        rows = db.scalars(select(InsightObservation).where(InsightObservation.job_insight_id == insight.id,
-                                                           InsightObservation.superseded_at.is_(None))
-                          .order_by(InsightObservation.id)).all()
-        return [observation_dict(r) for r in rows]
+        return observations_of(db, insight.id)
+
+
+def observations_of(db: Session, insight_id: int) -> list[dict[str, Any]]:
+    """The insight's current (not superseded) observations, as sections and the model read them."""
+    rows = db.scalars(select(InsightObservation).where(InsightObservation.job_insight_id == insight_id,
+                                                       InsightObservation.superseded_at.is_(None))
+                      .order_by(InsightObservation.id)).all()
+    return [observation_dict(r) for r in rows]
 
 
 def safe_url(url: str | None) -> str | None:
@@ -514,6 +523,8 @@ def build_sections(observations: list[dict[str, Any]], result: synthesis.Synthes
         unknowns.append({"text": f"Not researched (source not configured): {', '.join(not_configured)}.",
                          "kind": "UNKNOWN"})
     sections["risks"], sections["unknowns"] = risks, unknowns
+    if result.application_form is not None:
+        sections["application_questions"] = result.application_form["items"]
     return sections
 
 
@@ -535,12 +546,38 @@ def run_status(results: list[SourceResult], result: synthesis.Synthesis) -> str:
     return COMPLETED
 
 
+def results_from_status(source_status: dict[str, Any] | None) -> list[SourceResult]:
+    """The run's source results as `settle` reads them (name, status, detail), rebuilt from the task's stored
+    `source_status`, in SOURCES order. The graph uses it so no source result is ever kept in a checkpoint."""
+    stored = source_status or {}
+    order = [s.name for s in SOURCES if s.name in stored] + [n for n in stored if n not in {s.name for s in SOURCES}]
+    return [SourceResult(name, str((stored[name] or {}).get("status") or FAILED),
+                         detail=(stored[name] or {}).get("detail"), cached=bool((stored[name] or {}).get("cached")))
+            for name in order]
+
+
 # ───────────── 5. settle ─────────────
 
-def settle(sessions: Callable[[], Session], claim_: InsightClaim, results: list[SourceResult],
-           result: synthesis.Synthesis, observations: list[dict[str, Any]], now: datetime) -> str:
+def sections_for(db: Session, job: Job, insight: JobInsight, observations: list[dict[str, Any]],
+                 result: synthesis.Synthesis, results: list[SourceResult]) -> dict[str, Any]:
+    """build_sections with the job's own inputs (what `settle` saves). Reads only."""
     from app.services.workflow import get_profile
 
+    profile = get_profile(db)
+    return build_sections(
+        observations, result, job={"title": job.title or "", "company": job.company or "",
+                                   "location": job.location or "", "normalized": insight.normalized_title},
+        statuses={r.name: r.status for r in results}, website=insight.company_website,
+        profile_target=getattr(profile, "compensation_notes", None))
+
+
+def settle(sessions: Callable[[], Session], claim_: InsightClaim, results: list[SourceResult],
+           result: synthesis.Synthesis, observations: list[dict[str, Any]], now: datetime, *,
+           sections_filter: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+           within: Callable[[Session], None] | None = None) -> str:
+    """Save the run: its sections (the last good synthesis kept when the model did not run), status and task.
+    `sections_filter` lets the graph drop items whose provenance it refused (job_insights.provenance.enforce);
+    `within` records the graph's step in the same transaction. Both unset, this is the current path exactly."""
     status = run_status(results, result)
     with sessions() as db:
         task = held(db, claim_)
@@ -556,15 +593,17 @@ def settle(sessions: Callable[[], Session], claim_: InsightClaim, results: list[
         failures = [f"{r.name}: {r.detail or r.status}" for r in results if r.status in (FAILED, BLOCKED)]
         error = "; ".join(failures + result.errors)[:2000] or None
         insight.last_attempt_at = now
-        profile = get_profile(db)
-        sections = build_sections(
-            observations, result, job={"title": job.title or "", "company": job.company or "",
-                                       "location": job.location or "", "normalized": insight.normalized_title},
-            statuses={r.name: r.status for r in results}, website=insight.company_website,
-            profile_target=getattr(profile, "compensation_notes", None))
+        sections = sections_for(db, job, insight, observations, result, results)
+        if sections_filter is not None:
+            sections = sections_filter(sections)
+        if within is not None:
+            within(db)
+            task.staged = None  # the graph's staged synthesis is used up with this write
         for name, value in sections.items():
             if result.company is None and name in SYNTHESIZED and getattr(insight, name) is not None:
                 continue  # the model did not run this time: what the last good run wrote stands
+            if name == "application_questions":  # a question the person removed during the run stays removed
+                value = application_form.current(value, insight.application_form_input)
             setattr(insight, name, value)
         prune_superseded(db, insight)
         if status == "FAILED":
@@ -597,8 +636,100 @@ def settle(sessions: Callable[[], Session], claim_: InsightClaim, results: list[
     return status.lower()
 
 
+def scope_of(sessions: Callable[[], Session], claim_: InsightClaim) -> str:
+    """FULL, or APPLICATION_FORM for a task queued because the person pasted form questions."""
+    from app.models import JobInsightTask
+
+    with sessions() as db:
+        db.info["user_id"] = claim_.user_id
+        scope = db.scalar(select(JobInsightTask.scope).where(JobInsightTask.id == claim_.task_id))
+    return scope or application_form.FULL
+
+
+def follow_up(sessions: Callable[[], Session], user_id: int, job_id: int) -> None:
+    """Queue drafts for questions the person pasted while a run was already past reading them. Never raises."""
+    from app.services.job_insights.tasks import enqueue
+
+    try:
+        with sessions() as db:
+            db.info["user_id"] = user_id
+            insight = db.scalar(select(JobInsight).where(JobInsight.job_id == job_id))
+            job = db.get(Job, job_id)
+            if job is not None and application_form.undrafted(insight):
+                enqueue(db, job, reason=USER_REQUEST, force=True, scope=application_form.FORM_ONLY)
+                db.commit()
+    except Exception:  # noqa: BLE001  the pasted questions stay listed; the next run or Draft again picks them up
+        logging.getLogger("jobhunt.job_insights").warning("could not queue form drafts for job %s", job_id,
+                                                          exc_info=True)
+
+
+def process_form(sessions: Callable[[], Session], claim_: InsightClaim) -> str:
+    """An APPLICATION_FORM task: drafts for the pasted questions only. No source is called and no other section is
+    written; every write after the model call is lease-guarded like a research run's."""
+    started = time.monotonic()
+    try:
+        with sessions() as db:
+            task = held(db, claim_)
+            if task is None:
+                return "lost"
+            attempt = task.attempt_count
+        with backoff.bypass(claim_.run_now):
+            result = synthesis.run_form(sessions, user_id=claim_.user_id, job_id=claim_.job_id, attempt=attempt)
+        label = settle_form(sessions, claim_, result, utcnow())
+    except Exception as exc:  # noqa: BLE001  an unexpected failure is this task's problem, retried later
+        logging.getLogger("jobhunt.job_insights").exception("job insights form task %s crashed", claim_.task_id)
+        label = _crashed(sessions, claim_, type(exc).__name__)
+        result = synthesis.Synthesis(errors=[type(exc).__name__])
+    if label in ("completed", "partial"):
+        follow_up(sessions, claim_.user_id, claim_.job_id)
+    level = "INFO" if label in ("completed", "partial") else "WARNING" if label in ("retrying", "skipped") \
+        else "ERROR"
+    system_log.log_event(
+        category="WORKFLOW", level=level, operation="job_insights", workflow=WORKER, user_id=claim_.user_id,
+        entity_type="job", entity_id=claim_.job_id, status=label,
+        duration_ms=int((time.monotonic() - started) * 1000), message=f"Application form drafts {label}",
+        details={"worker": WORKER, "job_id": claim_.job_id, "task_id": claim_.task_id, "scope": "APPLICATION_FORM",
+                 "model_errors": len(result.errors), "dropped_items": len(result.dropped)})
+    return label
+
+
+def settle_form(sessions: Callable[[], Session], claim_: InsightClaim, result: synthesis.Synthesis,
+                now: datetime) -> str:
+    """Save the form drafts and finish the task. A model failure keeps the last good drafts and retries; the person's
+    own answers settled without the model are saved either way."""
+    with sessions() as db:
+        task = held(db, claim_)
+        if task is None:
+            return "lost"
+        db.info["user_id"] = task.user_id
+        insight = db.scalar(select(JobInsight).where(JobInsight.job_id == task.job_id))
+        if insight is None or db.get(Job, task.job_id) is None or result.application_form is None:
+            finish(task, SKIPPED, now, "; ".join(result.errors) or "The job was deleted", ErrorCategory.VALIDATION)
+            db.commit()
+            return "skipped"
+        insight.application_questions = application_form.current(result.application_form["items"],
+                                                                 insight.application_form_input)
+        if result.prompt_versions:
+            insight.prompt_versions = {**(insight.prompt_versions or {}), **result.prompt_versions}
+        error = "; ".join(result.errors)[:2000] or None
+        model_failed = bool(result.errors) and not result.application_form["model_ran"]
+        if model_failed and not any("No model call" in e for e in result.errors):  # no model: retrying won't help
+            own = worker_settings.for_user(db, task.user_id, KIND)
+            if task.attempt_count < own["max_attempts"]:
+                release(task, now, error or "The model call failed", retry_seconds=own["retry_seconds"],
+                        category=ErrorCategory.EXTERNAL_SERVICE)
+                db.commit()
+                return "retrying"
+        status = PARTIAL if error else COMPLETED
+        finish(task, status, now, error)
+        db.commit()
+    return status.lower()
+
+
 def process(sessions: Callable[[], Session], claim_: InsightClaim) -> str:
     """Research one claimed task. Returns an outcome (OUTCOMES); one task's failure never reaches the caller."""
+    if scope_of(sessions, claim_) == application_form.FORM_ONLY:
+        return process_form(sessions, claim_)
     started = time.monotonic()
     loaded = load(sessions, claim_)
     if isinstance(loaded, str):
@@ -614,6 +745,8 @@ def process(sessions: Callable[[], Session], claim_: InsightClaim) -> str:
             result = synthesis.run(sessions, user_id=snapshot.user_id, job_id=snapshot.job_id,
                                    attempt=snapshot.attempt, observations=observations)
             label = settle(sessions, claim_, results, result, observations, utcnow())
+        if label in ("completed", "partial"):
+            follow_up(sessions, snapshot.user_id, snapshot.job_id)
     except Exception as exc:  # noqa: BLE001  an unexpected failure is this task's problem, retried later
         # The class name alone ("ProgrammingError") hides the cause; keep its first line, redacted, and the traceback
         # in the server log.

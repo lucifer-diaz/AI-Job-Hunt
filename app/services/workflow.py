@@ -84,12 +84,14 @@ def generation_provenance(prompt_version: str, result: LLMResult) -> dict:
             "config_version": routing.get("config_version"), "escalated": bool(routing.get("escalated"))}
 
 
-def tailor_job(db: Session, job: Job, progress: Progress = _no_progress, pages: int | None = None) -> ResumeVariant:
+def tailor_job(db: Session, job: Job, progress: Progress = _no_progress, pages: int | None = None,
+               feedback: dict | None = None) -> ResumeVariant:
     """Tailor from verified facts and the Ranker's completed fit analysis. Ranking never runs here: it is the
     asynchronous ranker's job (app.services.ranker). Without a completed analysis the context builder raises
     ContextError(RANKING_REQUIRED) and no model is called.
 
-    `pages` (1, 2 or 3) is this job's page target; omitted, the account's default (app.services.resume_length)."""
+    `pages` (1, 2 or 3) is this job's page target; omitted, the account's default (app.services.resume_length).
+    `feedback` is a revision pass's previous review (review_results.retailor_feedback): what to fix, never new facts."""
     from app.services import resume_length
     from app.services.tailoring_results import apply_tailoring_patch
 
@@ -97,6 +99,8 @@ def tailor_job(db: Session, job: Job, progress: Progress = _no_progress, pages: 
     plan = resume_length.plan_for(db, job.user_id, pages)
     # Verified facts relevant to this job only; raises UnverifiedResumeError / ContextError before any model call.
     context = build_tailoring_context(db, profile, job, plan)
+    if feedback:
+        context.revision_feedback = feedback
     progress("tailoring")
     llm = LLMClient.for_user(db)
     prompt = build_tailoring_prompt(candidate_profile=profile, job=job, context=context)
@@ -184,6 +188,12 @@ def write_cover_letter(db: Session, profile: CandidateProfile, job: Job, llm: LL
 def persist_tailored_resume(db: Session, job: Job, content: dict, *, markdown: str | None = None) -> ResumeVariant:
     """Store a new tailored version for a job. Every tailoring path (backend worker, Claude Desktop over MCP,
     the ADK agent) saves through here. The master resume is only read, never written."""
+    # A pass that was running when a person approved the packet must not save over that decision: the approved
+    # version stays the newest one and the job stays approved.
+    decided = db.scalar(select(Application.status).where(Application.job_id == job.id))
+    if decided in ("approved", "applied"):
+        raise ValueError(f"This job was {decided} while it was being tailored; send it back for revision to tailor "
+                         "it again")
     # Evidence ids are kept in the structured content; the letter itself is what a recruiter reads.
     content = {**content, "cover_letter": strip_citations(content.get("cover_letter", "") or "").strip()}
     version = (db.scalar(select(ResumeVariant.version).where(ResumeVariant.job_id == job.id)
@@ -384,6 +394,9 @@ def length_caps(content: dict) -> tuple[dict[int, int] | None, dict[int, list[st
 
 
 def update_resume_edit(db: Session, resume: ResumeVariant, index: int, status: str | None, text: str | None) -> None:
+    from app.services import approval
+
+    approval.guard_edit(db, resume, "The resume")  # an approved packet loses its approval with this edit
     content = dict(resume.content or {})
     state = dict(content.get("edit_state") or {})
     entry = dict(state.get(str(index)) or {})
@@ -427,19 +440,25 @@ def review_resume(db: Session, resume: ResumeVariant) -> dict:
     return notes
 
 
-def store_review(db: Session, resume: ResumeVariant, notes: dict) -> None:
+def store_review(db: Session, resume: ResumeVariant, notes: dict, *, commit: bool = True) -> None:
     """Persist a review on a tailored version. Backend and Claude Desktop reviews are stored the same way."""
     resume.reviewer_score = float(notes.get("review_score", notes.get("score", 0)) or 0)
     resume.reviewer_notes = notes
-    db.commit()
+    if commit:
+        db.commit()
 
 
 def approve_job(db: Session, job: Job, *, override: bool = False, note: str = "") -> Application:
     """Approve the latest reviewed packet. `override` records that the reviewer minimum was waived for it."""
+    from app.services import approval
+
     latest = db.scalar(select(ResumeVariant).where(ResumeVariant.job_id == job.id)
                        .order_by(desc(ResumeVariant.version)).limit(1))
     if not latest or latest.reviewer_score is None:
         raise ValueError("The latest resume must be reviewed before approval")
+    # The canonical state goes to READY_TO_APPLY through validated transitions, or the approval is refused before
+    # anything is written (approval.ApprovalRefused).
+    approval.reconcile_to_ready(db, job, latest)
     application = job.application
     if not application:
         application = Application(job_id=job.id)
@@ -450,6 +469,9 @@ def approve_job(db: Session, job: Job, *, override: bool = False, note: str = ""
     application.approval_override = bool(override)
     application.approval_note = (note or "").strip()[:2000] or None
     job.status = "approved"
+    application.job = job
+    # Exactly what was approved, and its digest: export, packet issuance and application check against it.
+    approval.snapshot(db, application, latest, override=override)
     if override:
         # The tracker timeline should say the minimum was waived, and why, long after the decision.
         db.add(ApplicationEvent(application=application, kind="approval", title="Approved below the reviewer minimum",
@@ -459,6 +481,9 @@ def approve_job(db: Session, job: Job, *, override: bool = False, note: str = ""
     from app.services.job_insights import tasks as job_insights
 
     job_insights.on_approved(db, job)
+    from app.services import preparation
+
+    preparation.on_decision(db, job, "approved")  # a preparation graph run waiting for this ends (never blocks)
     db.commit()
     db.refresh(application)
     return application

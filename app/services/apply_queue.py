@@ -17,7 +17,7 @@ from sqlalchemy import desc, nulls_last, or_, select
 from sqlalchemy.orm import Session
 
 from app.models import Application, ApplicationEvent, Job, ResumeVariant, User
-from app.services import knowledge
+from app.services import approval, knowledge
 from app.services.exports import DOCX_MEDIA_TYPE, markdown_to_docx, markdown_to_simple_pdf, packet_filename, packet_slug
 from app.services.workflow import get_profile, mark_applied
 from app.settings import get_settings
@@ -91,6 +91,8 @@ def ready_to_apply(db: Session, *, reviewer_score_above: float | None = None, in
     for job, application, resume in db.execute(query).all():
         if not apply_url(job) or applied_duplicate(db, job) is not None:
             continue
+        if not approval.verify(db, application).ok:
+            continue  # changed after approval: it needs a new approval before anyone applies with it
         blocker = open_blocker(db, application)
         if blocker and not include_blocked:
             continue
@@ -108,6 +110,9 @@ def not_ready_reason(db: Session, job: Job, *, reviewer_score_above: float | Non
     resume = approved_resume(db, application)
     if resume is None or resume.reviewer_score is None:
         return "The approved packet has no reviewed resume"
+    checked = approval.verify(db, application)
+    if not checked.ok:
+        return checked.reason
     threshold = check_threshold(reviewer_score_above)
     if resume.reviewer_score <= threshold:
         return f"Reviewer score {resume.reviewer_score:g} is not above {threshold:g}"

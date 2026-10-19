@@ -18,7 +18,7 @@ from app.auth import get_user_db
 from app.models import Application, Evidence, Job, JobInsight
 from app.scheduler_hooks import run_soon
 from app.services import knowledge
-from app.services.job_insights import matching, service, views
+from app.services.job_insights import application_form, matching, service, views
 from app.services.job_insights import tasks as insight_tasks
 from app.services.url_safety import UnsafeURL, check_public_url
 
@@ -46,6 +46,10 @@ class RecruiterIn(BaseModel):
         if value and (len(value) != 3 or not value.isalpha()):
             raise ValueError("Use a three-letter currency code, e.g. SGD")
         return value or None
+
+
+class FormQuestionsIn(BaseModel):
+    questions: list[str] = Field(min_length=1, max_length=application_form.MAX_FORM_QUESTIONS)
 
 
 class InputsIn(BaseModel):
@@ -141,6 +145,44 @@ def save_inputs(job_id: int, payload: InputsIn, db: Session = Depends(get_user_d
         if recruiter["budget_low"] and recruiter["budget_high"] and recruiter["budget_low"] > recruiter["budget_high"]:
             raise HTTPException(422, "The budget's low end is above its high end")
         insight.recruiter_input = {k: v for k, v in recruiter.items() if v not in (None, "", [])}
+    db.commit()
+    return views.insight_view(db, job)
+
+
+@router.post("/api/jobs/{job_id}/insights/application-questions")
+def add_form_questions(job_id: int, payload: FormQuestionsIn, request: Request, background: BackgroundTasks,
+                       db: Session = Depends(get_user_db)) -> dict[str, Any]:
+    """Questions pasted from the job's real application form. Saved as the person's own list and drafted in the
+    background (an APPLICATION_FORM task: no research, no other section); nothing is answered in this request."""
+    job = _job(db, job_id)
+    insight = service.ensure_insight(db, job)
+    try:
+        added = application_form.add_questions(insight, payload.questions, insight_tasks.utcnow())
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if not added and not application_form.undrafted(insight):
+        db.commit()
+        return {"added": 0, **views.insight_view(db, job)}
+    try:
+        insight_tasks.enqueue(db, job, reason=insight_tasks.USER_REQUEST, force=True,
+                              scope=insight_tasks.APPLICATION_FORM)
+        db.commit()
+    except IntegrityError:  # another request queued a task at the same moment; it will see these questions
+        db.rollback()
+        insight = service.ensure_insight(db, job)
+        application_form.add_questions(insight, payload.questions, insight_tasks.utcnow())
+        db.commit()
+    run_soon(background, request.app, "job_insights")
+    return {"added": len(added), **views.insight_view(db, job)}
+
+
+@router.delete("/api/jobs/{job_id}/insights/application-questions/{question_id}")
+def remove_form_question(job_id: int, question_id: str, db: Session = Depends(get_user_db)) -> dict[str, Any]:
+    """Remove a pasted question and its draft. Predicted questions are not removable: they are rewritten each run."""
+    job = _job(db, job_id)
+    insight = db.scalar(select(JobInsight).where(JobInsight.job_id == job.id))
+    if insight is None or not application_form.remove_question(insight, question_id):
+        raise HTTPException(404, "Question not found")
     db.commit()
     return views.insight_view(db, job)
 

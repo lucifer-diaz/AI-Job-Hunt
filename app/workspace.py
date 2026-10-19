@@ -41,7 +41,16 @@ from app.models import (
 )
 from app.prompts import build_evidence_extraction_prompt
 from app.scheduler_hooks import run_soon
-from app.services import ats_keywords, evidence_tags, feedback_learning, ranker, resume_length, resume_verification
+from app.services import (
+    approval,
+    ats_keywords,
+    evidence_tags,
+    feedback_learning,
+    ranker,
+    resume_length,
+    resume_verification,
+)
+from app.services.approval import ApprovalRefused
 from app.services.actors import (
     ACTOR_GROUPS,
     BUILTIN,
@@ -995,7 +1004,7 @@ def job_detail(job_id: int, db: Session = Depends(get_user_db)):
             "description_recovery": jd_recovery.status_of(db, job),
             "rank_pct": rank, "wizard": [{"label": l, "done": d, "meta": m} for l, d, m in steps],
             "gap_notes": gap_notes, "notes": app.notes if app else "",
-            "resume_id": resume.id if resume else None}
+            "resume_id": resume.id if resume else None, "pipeline": ranker.pipeline_status(db, job)}
 
 
 class JobUrlIn(BaseModel):
@@ -1928,7 +1937,10 @@ def edit_resume(resume_id: int, index: int, payload: EditIn, db: Session = Depen
         raise HTTPException(422, "Status must be accepted, review or reverted")
     if index < 0 or index >= len(resume_edits(db, resume)):
         raise HTTPException(404, "Edit not found")
-    update_resume_edit(db, resume, index, payload.status, payload.text)
+    try:
+        update_resume_edit(db, resume, index, payload.status, payload.text)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
     return packet(db, resume.job)
 
 
@@ -1937,6 +1949,10 @@ def edit_cover_letter(resume_id: int, payload: EditIn, db: Session = Depends(get
     resume = db.get(ResumeVariant, resume_id)
     if not resume:
         raise HTTPException(404, "Resume not found")
+    try:
+        approval.guard_edit(db, resume, "The cover letter")  # an approved packet loses its approval with this edit
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
     resume.cover_letter = (payload.text or "").strip()
     db.commit()
     return {"ok": True}
@@ -1998,7 +2014,8 @@ def approval_detail(job_id: int, db: Session = Depends(get_user_db)):
             {"label": "Reviewer threshold", "detail": f"{score:.0f} vs minimum {data['min_review_score']}", "state": "ok" if score >= data["min_review_score"] else "warn"},
         ]
     app = job.application
-    return {**data, "checklist": checklist, "notes": app.notes if app else "", "application_id": app.id if app else None,
+    return {**data, "checklist": checklist, "pipeline": ranker.pipeline_status(db, job),
+            "notes": app.notes if app else "", "application_id": app.id if app else None,
             "approval": {"override": bool(app.approval_override), "note": app.approval_note or ""} if app else None,
             "rejection_reasons": [{"id": key, "label": label} for key, label in REJECTION_REASONS.items()],
             "profile": {"name": profile.name, "headline": profile.headline, "location": profile.location},
@@ -2065,7 +2082,12 @@ def reject_one(db: Session, job: Job, reason: str, notes: str) -> None:
                    reason=f"Rejected: {REJECTION_REASONS.get(reason, 'no reason given')}")
     application = job.application
     if application is not None and application.applied_at is None:
+        if application.status == "approved":  # the approval no longer stands: its snapshot is withdrawn, not kept live
+            approval.withdraw(db, application, "Rejected after approval")
         application.status = "rejected"
+    from app.services import preparation
+
+    preparation.on_decision(db, job, "rejected")
 
 
 @router.post("/api/jobs/{job_id}/reject")
@@ -2093,12 +2115,19 @@ def send_back_one(db: Session, job: Job, notes: str | None) -> None:
     """Send one packet back for revision without committing. `notes=None` keeps the notes already on file."""
     if not job.resumes:
         raise HTTPException(400, "There is no tailored packet to send back")
+    if job.application is not None and job.application.status == "approved":
+        # Sending back an approved packet withdraws the approval, as an edit does: snapshot revoked and the canonical
+        # state back to REVIEWED, so the next version is recorded through its real stages before it is approved again.
+        approval.revoke(db, job, "Sent back for revision")
     app = job.application or Application(job_id=job.id)
     db.add(app)
     app.status = "pending_approval"
     if notes is not None:
         app.notes = notes
     job.status = "pending_approval"
+    from app.services import preparation
+
+    preparation.on_decision(db, job, "revise")  # a waiting preparation graph run tailors again (bounded)
 
 
 @router.post("/api/jobs/{job_id}/revision")
@@ -2150,7 +2179,10 @@ def bulk_approval(payload: BulkApprovalIn, db: Session = Depends(get_user_db)):
                 if latest.reviewer_score < min_score:
                     raise HTTPException(400, f"Reviewer scored {latest.reviewer_score:.0f}, below your minimum of "
                                              f"{min_score}; approve it on its own to waive the minimum")
-                approve_job(db, job)
+                try:
+                    approve_job(db, job)
+                except ApprovalRefused as exc:
+                    raise HTTPException(409, str(exc)) from exc
                 feedback_learning.record(db, job, "APPROVED")
             db.commit()
             done.append(job_id)
@@ -2180,6 +2212,14 @@ def packet_names(db: Session, job: Job, resume: ResumeVariant | None) -> dict[st
     slug = packet_slug(get_profile(db).name, job.company)
     version = resume.version if resume else 1
     return {kind: packet_filename(slug, kind, version) for kind in ("pdf", "docx", "cover_letter")}
+
+
+def check_export(db: Session, job_id: int) -> None:
+    """An approved packet downloads only as it was approved (app.services.approval)."""
+    try:
+        approval.check_export(db, job_id)
+    except approval.PacketChanged as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 def download_headers(filename: str) -> dict[str, str]:
@@ -2228,18 +2268,20 @@ def knowledge_used(item_id: int, db: Session = Depends(get_user_db)):
 
 @router.get("/api/jobs/{job_id}/resume.docx")
 def resume_docx(job_id: int, db: Session = Depends(get_user_db)):
-    resume = latest_resume(db, job_id)
+    resume = approval.export_variant(db, job_id)  # the approved version once approved, never a newer one
     if not resume:
         raise HTTPException(404, "No tailored resume for this job")
+    check_export(db, job_id)
     return Response(markdown_to_docx(resume.markdown), media_type=DOCX_MEDIA_TYPE,
                     headers=download_headers(packet_download_name(db, job_id, "docx")))
 
 
 @router.get("/api/jobs/{job_id}/cover-letter.txt")
 def cover_letter_txt(job_id: int, db: Session = Depends(get_user_db)):
-    resume = latest_resume(db, job_id)
+    resume = approval.export_variant(db, job_id)  # the approved version once approved, never a newer one
     if not resume:
         raise HTTPException(404, "No tailored resume for this job")
+    check_export(db, job_id)
     # Letters saved before citations were stripped on write still download clean.
     return Response(strip_citations(resume.cover_letter), media_type="text/plain; charset=utf-8",
                     headers=download_headers(packet_download_name(db, job_id, "cover_letter")))

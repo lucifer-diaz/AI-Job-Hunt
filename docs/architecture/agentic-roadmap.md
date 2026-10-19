@@ -159,6 +159,14 @@ Record accepted changes to these decisions with an appended rationale, date, PR,
 | ADR-020 (amended 2026-10-17) | The first production graph is registered like every queued worker: `WorkerKind` `qualification` (Kill also stops the thread; Retry and Run now create a new task and thread) and orchestration node `qualification` (ASYNC_WORKER + DETERMINISTIC, not AI). Its threads are worker-owned (`GraphSpec.api_resumable=False`): the agents API cannot resume them and `runtime.claim_stale` never continues them. `GraphSpec.context` replaces the pilot's hard-coded run context. | ADR-020's revisit trigger fired ("a graph does production work"). A worker-owned thread continued without its task row would run without the task's lease and mode. | A graph needs a person to resume it mid-run |
 | ADR-017 (clarified 2026-10-17) | In mode `on`, the backlog sweeps (`ranker.sweep`, `jd_recovery.sweep`, `job_description.sweep`) leave pre-rank jobs to the graph, whose first node is admission. The current path's parse backlog parses a never-admitted old job before `ranker.sweep` screens it, and a stub whose recovery failed; the graph does neither. | Admission before any paid work, for old jobs too. | — |
 
+**Proposed in Phase 4 (2026-10-19, branch `feat/langgraph-preparation`; accepted only when the Phase 4 PR is approved)**
+
+| ID | Decision | Reason / consequences | Revisit if |
+| --- | --- | --- | --- |
+| ADR-025 | The resume preparation graph is a **conductor** over the tailor worker: TAILOR queues `tailor_tasks.enqueue` (conducted) and waits; VALIDATE_FACTS re-runs the deterministic evidence checks and lineage; `review_results` decides; a pure rule (`next_step`) bounds the revision loop; AWAIT_APPROVAL waits for the person's action in the existing screens (`preparation.on_decision`). The Job Insights graph runs the research service's own steps on the same task row and claim, adding once-per-attempt step records and a code-only provenance check (`job_insights.provenance`). Modes `PREPARATION_GRAPH_MODE` / `JOB_INSIGHTS_GRAPH_MODE`: off (default) / shadow / on. | Same reasons as ADR-024: one implementation of tailoring, review and research, and the same task rows, telemetry and Running workers controls. The backend reviewer's decision (previously only on the MCP path) now runs in the graph. Consequence: the backend path with the graph off is unchanged (it still stores the review without deciding). | The tailor worker's single task (tailor + review) needs splitting, or a step needs a decision `review_results` cannot express |
+| ADR-026 | `workflow.approve_job` moves `Job.state` to READY_TO_APPLY through transitions backed by stored facts (`approval.reconcile_to_ready`; recorded as `reconcile` with the version), and **refuses** (409, nothing written) a job with no such path. Tailoring and review themselves still do not move `Job.state`. | The roadmap requires canonical approval without forged stages. Moving state during tailoring would stop `ranker._queue_stale` and `discovery.repoint_jobs` re-ranking tailored-but-unapproved jobs (both select QUALIFIED), a behaviour change beyond this phase; reconciling at approval, from the facts, leaves them as they are. Consequence (chosen by the owner): legacy jobs in FAILED, ARCHIVED or SKIPPED states cannot be approved until re-ranked or restored; `scripts/reconcile_approved_state.py` reports approvals made before this change. | Running workers or the tracker need TAILORING/TAILORED live, or the refusals block real use |
+| ADR-027 | The approved packet is an immutable `approved_packets` snapshot plus a SHA-256 digest of a documented canonical JSON (serializer v1: rendered resume, letter, attachment identity), written inside `approve_job`. An in-place edit of an approved packet revokes the approval in the same transaction (READY_TO_APPLY → REVIEWED, a new lifecycle edge); a submitted packet cannot be edited. Export, the apply queue and MCP packet issuance verify the digest; a mismatch needs a new approval. Pre-Phase-4 approvals have no snapshot and are reported LEGACY. | Phase 5's pre-submit claim needs an approval-time digest to compare against; revoking (rather than copy-on-write versions) keeps "the latest version is the one approved" true for every existing reader. | Phase 5 needs per-file (PDF/DOCX bytes) digests, or attachments beyond the resume |
+
 ## 5. Core data and durability contracts
 
 ### Authority boundaries
@@ -513,8 +521,8 @@ This section is intended to change after *each approved phase merge*. Initial en
 | --- | --- | --- | --- | --- | --- |
 | 1. LangGraph foundation | MERGED | [#72](https://github.com/triump0870/AI-Job-Hunt/pull/72) | `74930e5` | 2026-10-13 note below | OFF (`AGENT_GRAPHS_ENABLED=false`) |
 | 2. RAG knowledge layer | MERGED | [#74](https://github.com/triump0870/AI-Job-Hunt/pull/74) | `a2f0b30` | 2026-10-15 note below | OFF (`RAG_RETRIEVAL_MODE=off`, `RAG_VECTOR_ENABLED=false`) |
-| 3. Qualification graphs | IN_REVIEW | [#78](https://github.com/triump0870/AI-Job-Hunt/pull/78) | — | 2026-10-17 note below | OFF (`QUALIFICATION_GRAPH_MODE=off`) |
-| 4. Preparation / insights graphs | NOT_STARTED | — | — | — | OFF |
+| 3. Qualification graphs | MERGED | [#78](https://github.com/triump0870/AI-Job-Hunt/pull/78) | `4cf1e66` | 2026-10-17 note below | OFF (`QUALIFICATION_GRAPH_MODE=off`) |
+| 4. Preparation / insights graphs | IN_REVIEW | (this branch) | — | 2026-10-19 note below | OFF (`PREPARATION_GRAPH_MODE=off`, `JOB_INSIGHTS_GRAPH_MODE=off`); approval digest and state sync always on |
 | 5. Application execution | NOT_STARTED | — | — | — | OBSERVE only (planned) |
 | 6. Guarded agentic submission | NOT_STARTED | — | — | — | OFF |
 | 7. Evaluation and feedback | NOT_STARTED | — | — | — | OFF |
@@ -752,6 +760,84 @@ Allowed status: NOT_STARTED, PLANNING, IN_PROGRESS, IN_REVIEW, MERGED, BLOCKED, 
 - **Rollback:** `QUALIFICATION_GRAPH_MODE=off`. The next pass ends waiting ON runs `ROUTED_TO_LEGACY`, and the current
   path takes their jobs on. Optionally, downgrade 0047.
 - **Next dependency:** Phase 4 needs this PR reviewed and merged. Stop here.
+
+### 2026-10-19 — Phase 4: Preparation and insights graphs
+- **Branch / PR:** `feat/langgraph-preparation` → `main`, not merged.
+- **Base:** `main` @ `fbb3fd7` (merged in; the tailoring prompt is v10 because `main`'s #83 took v9).
+- **What shipped:**
+  - **ResumePreparationGraph** (`app/agents/preparation.py`, queue `app/services/preparation.py`, ADR-025):
+    - SELECT_RESUME → LOAD_FIT_ANALYSIS → RETRIEVE_VERIFIED_EVIDENCE → BUILD_TAILOR_CONTEXT → TAILOR →
+      VALIDATE_FACTS → REVIEW → DECIDE_PASS_OR_REVISION → AWAIT_APPROVAL.
+    - A conductor over the tailor worker. It never ranks: no analysis, or one made from another resume, ends the run.
+    - A deterministic evidence or lineage problem overrules a reviewer PASS.
+    - The revision loop is bounded (`max_revisions`, per account, default 2). Past it the packet waits for a person
+      as NEEDS_HUMAN; it never passes by exhaustion.
+    - Revision passes get the previous review (tailoring prompt v10, `PREVIOUS REVIEW`).
+    - A person decides in the existing screens.
+    - Registered as `WorkerKind` / node `preparation`, scheduler job `preparation`, migration 0049.
+  - **JobInsightsGraph** (`app/agents/job_insights.py`, `app/services/job_insights/graph.py`):
+    - LOAD_JOB_CONTEXT → … → PERSIST_INSIGHTS, over the research service's own steps on the same task row and claim.
+    - Step records are written once per attempt. The synthesis is staged on the task row, never checkpointed.
+    - The code-only provenance check (`job_insights/provenance.py`) drops, never relabels.
+  - **Approved packet** (`app/services/approval.py`, ADR-026, ADR-027; always on):
+    - Approval moves `Job.state` to READY_TO_APPLY through fact-backed, reconciled transitions, or is refused (409).
+    - An immutable snapshot and digest are kept; an edit after approval revokes it (new edge READY_TO_APPLY →
+      REVIEWED).
+    - Export, the apply queue and MCP packet issuance verify the digest.
+  - **Evaluations** (`app/services/preparation_eval.py`, 33 hand-labelled cases in LangSmith Example shape, mock
+    providers): evidence grounding, unsupported skills and metrics, resume version, keyword relevance, reviewer
+    disagreement, loop termination, company provenance, conflicting salary, reported vs generated questions.
+    33/33 score 1.0.
+- **Old vs new** (`scripts/preparation_parity.py`, PostgreSQL 16, mock Tailor, scripted Reviewer; the current path is
+  the tailor worker plus the `review_results` decision Claude Desktop makes):
+
+  | Case | Same first version | Same first decision | Current path | Graph | Versions current/graph |
+  | --- | --- | --- | --- | --- | --- |
+  | pass | yes | yes | PASS → tailored | PASS → tailored | 1/1 |
+  | reviewer sends back, then passes | yes | yes | RETAILOR → needs_retailor | RETAILOR → tailored | 1/2 |
+  | reviewer always sends back | yes | yes | RETAILOR → needs_retailor | RETAILOR → pending_approval | 1/3 |
+  | score below the minimum | yes | yes | NEEDS_HUMAN → pending_approval | NEEDS_HUMAN → pending_approval | 1/1 |
+  | reviewer says skip | yes | yes | NEEDS_HUMAN → pending_approval | NEEDS_HUMAN → pending_approval | 1/1 |
+  | invented claim, reviewer passes it | yes | yes | RETAILOR → needs_retailor | RETAILOR → pending_approval | 1/3 |
+  | letter with an invented number | yes | yes | RETAILOR → needs_retailor | RETAILOR → pending_approval | 1/3 |
+
+  - In 7 of 7 cases, both paths saved the same first version and made the same first decision.
+  - In every case the source resume rows were unchanged and no ranking was made.
+  - No version with an unsupported claim was passed.
+  - Where the current path stops (needs_retailor), the graph continues its bounded loop.
+  - Job Insights: the graph and `service.process` give the same API view on the same fake sources and mock model
+    (ids and timestamps aside), with the same source and model calls.
+- **Tests:**
+  - New suites:
+    - `test_preparation_graph.py` (13, PostgreSQL)
+    - `test_preparation_parity.py` (7, PostgreSQL)
+    - `test_job_insights_graph.py` (16)
+    - `test_approval_packet.py` (11, `strict_approval`)
+    - `test_preparation_eval.py` (35)
+  - Older tests approve jobs the ranker never saw. The new autouse `qualified_before_approval` stand-in treats such a
+    job as QUALIFIED at approval, like `ranked_before_tailoring`.
+  - Full runs, each in a clean checkout (no local `.env`) next to `main` @ `fbb3fd7`:
+    - PostgreSQL: 2299 passed, 7 failed. The same 7 fail on `main`.
+    - SQLite: 2150 passed, 0 failed (`main`: 2091 passed).
+    - One intermittent PostgreSQL failure:
+      `test_agents_postgres::test_the_api_runs_interrupts_and_resumes_the_pilot_for_its_owner_only` failed in 1 of 3
+      full runs, the one run alongside the SQLite suite. It passed 3 of 3 times with the new graph suites, and alone.
+    - vitest: 330 passed, 2 failed (`overview_outcomes`, as on `main`).
+    - Migrations: `test_migrations.py` upgrade, downgrade and empty diff pass.
+    - Lint: ruff level with `main`.
+- **Known gaps:**
+  - Tailoring and review still do not move `Job.state` themselves. It is reconciled at approval (ADR-026). Legacy
+    FAILED / ARCHIVED / SKIPPED jobs cannot be approved until re-ranked or restored.
+  - The backend path with the graph off still stores reviews without deciding (unchanged).
+  - The digest covers the rendered markdown and letter, not the exported PDF/DOCX bytes (ADR-027 revisit).
+  - Insights shadow results go to Monitoring → Logs only; there is no parity column.
+  - No dataset upload to LangSmith: export stays traces-only.
+- **Rollback:**
+  - `PREPARATION_GRAPH_MODE=off` and `JOB_INSIGHTS_GRAPH_MODE=off`. Waiting runs are handed back
+    (`ROUTED_TO_LEGACY`).
+  - The approval rules need a code revert.
+  - Migration 0049 is additive and can be downgraded.
+- **Next dependency:** Phase 5 needs this PR reviewed and merged. Stop here.
 
 ### Phase update template
 

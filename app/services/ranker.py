@@ -303,6 +303,67 @@ def restore_removed(db: Session, job: Job, *, actor: str, reason: str, now: date
     return True
 
 
+def _held(db: Session, job: Job) -> dict[str, Any] | None:
+    """Where the job is held in the workflow, why, and the one action that puts it back, for the job's own screens.
+    None for a job that is moving normally.
+
+    `action` is "rank" only where `queue_job` takes the job back (POST /api/jobs/{id}/rank): a ranking that failed its
+    attempts goes back to RANK_PENDING, a job ranking archived is ranked again, one the person took out of ranking
+    goes back through the filters. `approval_blocked` says approval would be refused (app.services.approval) until
+    the job is back in the qualified stages. Reads only."""
+    from app.services import approval
+    from app.services.lifecycle import REOPENABLE_ARCHIVE_SOURCES
+    from app.services.redaction import redact_text
+
+    state, previous = job.state, job.previous_state
+    last = db.scalar(select(WorkflowTransition).where(WorkflowTransition.job_id == job.id)
+                     .order_by(desc(WorkflowTransition.id)).limit(1))
+    since = last.created_at.isoformat() if last is not None and last.created_at else None
+    why = redact_text(last.reason, 300) if last is not None and last.reason else None
+    blocked = state not in approval.PREPARATION_STATES
+    base = {"state": state.value, "previous_state": previous.value if previous else None, "since": since,
+            "reason": why, "approval_blocked": blocked}
+    if state is S.FAILED and previous in (S.RANK_PENDING, S.RANKING):
+        return {**base, "stage": "ranking", "title": "Ranking failed", "action": "rank",
+                "action_label": "Put back in ranking",
+                "message": "Its last ranking gave up after its attempts. Put it back in the ranking queue: it is "
+                           "ranked again from the start and, if it still qualifies, can be approved."}
+    if state is S.FAILED:
+        return {**base, "stage": (previous.value.lower() if previous else "unknown"), "title": "Failed",
+                "action": None, "action_label": None,
+                "message": "This job failed at a step that cannot be restarted from here."}
+    if state in (S.RANK_PENDING, S.RANKING):
+        return {**base, "stage": "ranking", "title": "Being ranked", "action": None, "action_label": None,
+                "message": "It is waiting for (or in) a new ranking. It can be approved once the ranking is in."}
+    if state is S.ARCHIVED and previous in REOPENABLE_ARCHIVE_SOURCES:
+        return {**base, "stage": "ranking", "title": "Archived by ranking", "action": "rank",
+                "action_label": "Rank again",
+                "message": "The ranking policy archived it. Ranking it again uses your current profile and policy."}
+    if state is S.ARCHIVED:
+        return {**base, "stage": "archived", "title": "Archived", "action": None, "action_label": None,
+                "message": "It was archived outside ranking. Restore it from Discovery to bring it back."}
+    if state is S.SKIPPED and removed_by_user(db, job):
+        return {**base, "stage": "ranking", "title": "Taken out of ranking", "action": "rank",
+                "action_label": "Put back in ranking",
+                "message": "You (or Kill in Running workers) took it out of ranking. Putting it back runs it through "
+                           "the filters and the ranker like a new job."}
+    if state is S.SKIPPED:
+        return {**base, "stage": "skipped", "title": "Skipped", "action": None, "action_label": None,
+                "message": "It was skipped and cannot be put back from here."}
+    return None
+
+
+def pipeline_status(db: Session, job: Job) -> dict[str, Any] | None:
+    """`_held` with the action checked against what the ranker needs: a job without a description cannot be ranked,
+    so its way back is adding one (the ranker refuses a ranking from a title alone)."""
+    held = _held(db, job)
+    if held and held["action"] == "rank" and missing_description(job):
+        return {**held, "action": "description", "action_label": "Add description",
+                "message": held["message"] + " It needs its job description first: a ranking from a title alone "
+                                             "would mean nothing."}
+    return held
+
+
 def remove_from_ranking(db: Session, job_ids: Iterable[int], *, actor: str,
                         now: datetime | None = None) -> dict[str, Any]:
     """Take jobs out of the ranking queue: their waiting task is cancelled and the job is SKIPPED, so no sweep
