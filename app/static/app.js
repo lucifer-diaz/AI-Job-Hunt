@@ -1749,23 +1749,72 @@ function renderPalette() {
 
 /* ───────────── render ───────────── */
 const RENDER = { overview: renderOverview, today: renderToday, discovery: renderDiscovery, tailor: renderTailor, approvals: renderApprovals, tracker: renderTracker, orchestration: renderOrchestration, workers: renderWorkers, monitoring: renderMonitoring, knowledge: renderKnowledge, settings: renderSettings };
-// Re-rendering replaces the markup, so a scrolled box would snap back to the top on every refresh (the ranking
-// tracker polls every few seconds). A box with data-scroll-key keeps its position across renders.
-function keptScroll() {
-  return new Map([...document.querySelectorAll('[data-scroll-key]')].map(el => [el.dataset.scrollKey, [el.scrollTop, el.scrollLeft]]));
-}
-function restoreScroll(kept) {
-  for (const el of document.querySelectorAll('[data-scroll-key]')) {
-    const at = kept.get(el.dataset.scrollKey);
-    if (at) [el.scrollTop, el.scrollLeft] = at;
+// Re-rendering replaces the markup, so every scrolled box (a modal, a list, a textarea) would snap back to the top
+// on each refresh, and the field being typed in would lose its focus and caret; polls re-render every few seconds.
+// render() keeps them: each scrolled element, and the focused one, is found again by where it sits under its nearest
+// data-scroll-key or id (else under the render root), counting same-tag siblings. Give a box a data-scroll-key when
+// what renders before it comes and goes. A box located only through a render root is restored only while the
+// screen (the hash) is the same, so a new screen never inherits another one's scroll.
+const RENDER_ROOTS = ['nav', 'side-foot', 'top', 'view', 'overlays'];
+// A field whose text an action has taken (Enter on data-enter) is submitted, not being typed: never put it back.
+const consumedFields = new WeakSet();
+function domPath(el) {
+  const steps = [];
+  for (let n = el; n && n !== document.body; n = n.parentElement) {
+    if (n.dataset?.scrollKey) return { anchor: { key: n.dataset.scrollKey }, steps: steps.reverse() };
+    if (n.id) return { anchor: { id: n.id }, steps: steps.reverse(), loose: RENDER_ROOTS.includes(n.id) };
+    let i = 0;
+    for (let s = n.previousElementSibling; s; s = s.previousElementSibling) if (s.tagName === n.tagName) i++;
+    steps.push([n.tagName, i]);
   }
+  return null;
+}
+function findPath(path, keyed) {
+  let n = path.anchor.key != null ? keyed.get(path.anchor.key) : document.getElementById(path.anchor.id);
+  for (const [tag, i] of path.steps) {
+    if (!n) return null;
+    n = [...n.children].filter(c => c.tagName === tag)[i];
+  }
+  return n || null;
+}
+function keptView() {
+  const scrolled = [];
+  for (const id of RENDER_ROOTS) {
+    for (const el of document.getElementById(id)?.querySelectorAll('*') || []) {
+      if (!el.scrollTop && !el.scrollLeft) continue;
+      const path = domPath(el);
+      if (path) scrolled.push([path, el.scrollTop, el.scrollLeft]);
+    }
+  }
+  const active = document.activeElement, field = {};
+  if (active && active !== document.body && RENDER_ROOTS.some(id => document.getElementById(id)?.contains(active))) {
+    field.path = domPath(active);
+    if ('defaultValue' in active && active.value !== active.defaultValue && active.type !== 'file' && !consumedFields.has(active)) field.value = [active.defaultValue, active.value];
+    try { if (typeof active.selectionStart === 'number') field.range = [active.selectionStart, active.selectionEnd, active.selectionDirection]; } catch { /* not a text field */ }
+  }
+  return { scrolled, field, hash: location.hash, page: [window.scrollX, window.scrollY] };
+}
+function restoreView(kept) {
+  const keyed = new Map([...document.querySelectorAll('[data-scroll-key]')].map(el => [el.dataset.scrollKey, el]));
+  const sameScreen = kept.hash === location.hash;
+  const find = path => (path && (sameScreen || !path.loose) ? findPath(path, keyed) : null);
+  const el = find(kept.field.path);
+  // A button found by position may now be another job's: only an element with its own id, or a field, gets focus back.
+  if (el && (!kept.field.path.steps.length || ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName))) {
+    // Typing the poll has not seen yet stays, unless the render brought a different value for this field.
+    const [was, typed] = kept.field.value || [];
+    if (kept.field.value && el.defaultValue === was && el.value === el.defaultValue) el.value = typed;
+    el.focus({ preventScroll: true });
+    if (kept.field.range) { try { el.setSelectionRange(...kept.field.range); } catch { /* ignore */ } }
+  }
+  for (const [path, top, left] of kept.scrolled) {
+    const box = find(path);
+    if (box) { box.scrollTop = top; box.scrollLeft = left; }
+  }
+  if (sameScreen && (window.scrollX !== kept.page[0] || window.scrollY !== kept.page[1])) window.scrollTo?.(...kept.page);
 }
 function render() {
-  const kept = keptScroll();
-  const active = document.activeElement;
-  const fid = active && active.id;
-  let selRange = null;
-  try { if (fid && typeof active.selectionStart === 'number') selRange = [active.selectionStart, active.selectionEnd]; } catch { /* not a text field */ }
+  const kept = keptView();
   $('#nav').innerHTML = renderNav();
   $('#side-foot').innerHTML = renderSideFoot();
   if (D.summary) $('#side-meta').textContent = `${D.summary.model || D.summary.llm_provider || ''} · ${(D.summary.application_mode || '').replace('_', ' ')}`;
@@ -1775,11 +1824,7 @@ function render() {
   $('#overlays').innerHTML = (S.jobOpen ? renderJobModal() : '') + (S.kitJob ? renderKit() : '') + (S.paletteOpen ? renderPalette() : '') + (S.mon?.request ? renderMonRequestModal() : '')
     + (S.boardReview ? renderBoardReview() : '') + (S.mon?.ext?.request ? renderMonExtRequestModal() : '') + (S.mon?.logs?.entry ? renderMonLogModal() : '');
   document.body.style.overflow = (S.jobOpen || S.kitJob || S.paletteOpen || S.mon?.request || S.boardReview) ? 'hidden' : '';
-  restoreScroll(kept);
-  if (fid) {
-    const el = document.getElementById(fid);
-    if (el) { el.focus({ preventScroll: true }); if (selRange) { try { el.setSelectionRange(...selRange); } catch { /* ignore */ } } }
-  }
+  restoreView(kept);
 }
 
 /* ───────────── background tailoring ───────────── */
@@ -2830,7 +2875,7 @@ document.addEventListener('keydown', e => {
       const list = [...(fv(form, tag, tagFallback(form, tag)) || [])]; list.pop(); setF(form, tag, list); render(); return;
     }
   }
-  if (el.dataset && el.dataset.enter && e.key === 'Enter') { e.preventDefault(); A[el.dataset.enter](el, e); return; }
+  if (el.dataset && el.dataset.enter && e.key === 'Enter') { e.preventDefault(); consumedFields.add(el); A[el.dataset.enter](el, e); return; }
   if (el.dataset && el.dataset.palette && e.key === 'Enter') { const first = S.paletteJobs[0]; if (first) { S.paletteOpen = false; openJob(first.id); } return; }
   const typing = ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName);
   if (typing || e.metaKey || e.ctrlKey || e.altKey || S.jobOpen || S.kitJob || S.paletteOpen) return;

@@ -3,8 +3,8 @@ import { resolve } from 'node:path';
 import { createContext, runInContext } from 'node:vm';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-// The ranking tracker polls every few seconds and re-renders. Its lists scroll on their own, and used to jump back
-// to the top on each refresh; a box with data-scroll-key keeps its position.
+// Polls re-render every few seconds (ranking tracker, JD recovery, workers). Every scrolled box, and the field being
+// typed in, used to jump back to the top and lose its caret on each refresh; render() now keeps them.
 const appSource = readFileSync('app/static/app.js', 'utf8').split('/* ───────────── boot ───────────── */')[0];
 let ui;
 
@@ -30,6 +30,7 @@ beforeEach(() => {
     }
     runInContext(appSource, context, { filename: resolve('app/static/app.js') });
     ui = runInContext('({ S, D, render, renderTaskStack })', context);
+    context.scrollTo = () => {};
   }
   ui.S.screen = 'workers'; ui.S.wk = { tab: 'ranking', range: '7d' }; ui.D.wk = { workers: [{ kind: 'parsing', label: 'JD parsing', counts: { running: 0, queued: 0, retrying: 0, active: 0 } }, { kind: 'recovery', label: 'JD recovery', counts: { running: 0, queued: 0, retrying: 0, active: 0 } }, { kind: 'ranking', label: 'Ranking', description: 'Scores each job', counts: { running: 1, queued: 2, retrying: 0, active: 3 }, scheduler: { enabled: true, interval_minutes: 2 } }, { kind: 'tailoring', label: 'Tailoring', counts: { running: 0, queued: 0, retrying: 0, active: 0 } }], cooldowns: [], active: 3, running: 1 }; ui.S.jobOpen = null; ui.S.busy = {};
   ui.D.ranking = ranking();
@@ -97,5 +98,61 @@ describe('Ranking tracker · clearing the finished list', () => {
     expect(root.querySelector('[data-act="wk-unclear"]')).not.toBeNull();
     expect(root.querySelector('[data-act="wk-clear"]')).toBeNull();  // nothing finished left to clear
     expect(root.textContent).not.toContain('No ranking activity in the last day');
+  });
+});
+
+describe('Job detail · scrolling while a poll re-renders', () => {
+  const job = { id: 1, title: 'AI Implementation Engineer', company: 'Example Corp', location: 'Mumbai', url: '', source: 'manual',
+    board: 'Manual', fit: 42, status: 'archived', discovered_at: '2026-10-18T10:00:00', posted: '1d ago', matches: ['Python'],
+    gaps: ['Java'], missing: [], keywords: [], summary: 'Strong match on core AI implementation.', strategy: '', snippet: '',
+    needs_description: false, domain_match: 'KEPT', description: Array.from({ length: 120 }, (_, i) => `Line ${i + 1}`).join('\n'),
+    fit_analysis: { confidence: 0.7 }, description_state: 'PARSED', description_recovery: { state: 'NOT_NEEDED', usable: true },
+    rank_pct: null, wizard: [{ label: 'Discovered', done: true, meta: '1d ago' }, { label: 'Ranked', done: true, meta: 'fit 42' }],
+    gap_notes: [{ gap: 'Java' }, { gap: 'Kubernetes' }], notes: '', resume_id: null, rejection: null };
+  const modal = () => document.querySelector('.modal');
+  const textarea = () => document.getElementById('jobdesc-1');
+  const gaps = () => [...document.querySelectorAll('.modal section.card')].find(s => s.textContent.includes('Close the gaps'));
+
+  beforeEach(() => {
+    ui.S.screen = 'overview'; ui.D.overview = undefined;
+    ui.S.jobOpen = 1; ui.S.jobTab = 'description'; ui.S.descEdit = 1; ui.S.forms = {};
+    ui.D.jobModal = { ...job };
+  });
+
+  it('keeps the description editor, the modal and the side cards where you scrolled them', () => {
+    ui.render();
+    textarea().scrollTop = 500; modal().scrollTop = 120; gaps().scrollTop = 40;
+    ui.D.jobModal = { ...job, description_recovery: { state: 'NOT_NEEDED', usable: true } };  // what watchRecovery brings back
+    ui.render();
+    expect(textarea().scrollTop).toBe(500);
+    expect(modal().scrollTop).toBe(120);
+    expect(gaps().scrollTop).toBe(40);
+  });
+
+  it('keeps focus, caret and unsaved typing in the field being edited', () => {
+    ui.render();
+    const field = textarea();
+    field.focus(); field.value = 'Pasted text the input handler has not seen yet'; field.setSelectionRange(6, 10);
+    ui.render();
+    expect(textarea()).not.toBe(field);  // the markup really was replaced
+    expect(document.activeElement).toBe(textarea());
+    expect(textarea().value).toBe('Pasted text the input handler has not seen yet');
+    expect([textarea().selectionStart, textarea().selectionEnd]).toEqual([6, 10]);
+  });
+
+  it('takes a value the render brings over what was typed before it', () => {
+    ui.render();
+    textarea().focus(); textarea().value = 'typed';
+    ui.S.forms = { jobdesc: { 1: 'Saved elsewhere' } };
+    ui.render();
+    expect(textarea().value).toBe('Saved elsewhere');
+  });
+
+  it('never moves focus to whatever button now sits where the clicked one was', () => {
+    ui.render();
+    const button = document.querySelector('.modal [data-act="modal-triage"]');
+    button.focus();
+    ui.render();
+    expect(document.activeElement).toBe(document.body);
   });
 });

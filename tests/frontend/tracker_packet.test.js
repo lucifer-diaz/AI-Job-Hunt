@@ -117,3 +117,14 @@ describe('landing on the packet', () => {
     expect(scrolled).toEqual(['tailor-packet']);
   });
 });
+
+describe('logging activity from the tracker', () => {
+  it('clears the activity text once Enter has logged it', async () => {
+    const field = document.getElementById('log-text');
+    field.focus(); field.value = 'Called the recruiter';
+    field.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    await vi.waitFor(() => expect(fetchMock.mock.calls.some(([url]) => url.includes('/api/applications/3/events'))).toBe(true));
+    await vi.waitFor(() => expect(ui.S.busy.log).toBeUndefined());
+    expect(document.getElementById('log-text').value).toBe('');
+  });
+});
