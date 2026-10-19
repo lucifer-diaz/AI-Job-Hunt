@@ -291,3 +291,43 @@ def test_0039_repairs_what_the_renumbering_let_an_install_skip(tmp_path):
         command.downgrade(alembic_config(connection), "0038")
         command.upgrade(alembic_config(connection), "0039")
     engine.dispose()
+
+
+def _schema(engine) -> set[str]:
+    import sqlalchemy as sa
+
+    inspector = sa.inspect(engine)
+    found = {table for table in ("job_preparation_tasks", "approved_packets") if inspector.has_table(table)}
+    for table, names in (("jobs", ("starred", "posting_closed_at", "posting_closed_reason")),
+                         ("job_insight_tasks", ("agent_thread_id", "staged", "scope")),
+                         ("job_insights", ("application_questions", "application_form_input"))):
+        columns = {c["name"] for c in inspector.get_columns(table)}
+        found |= {f"{table}.{name}" for name in names if name in columns}
+    return found
+
+
+@pytest.mark.parametrize("old_pair", [("0051_job_starred", "0052_job_posting_closed"),
+                                      ("0049_preparation_and_approval", "0050_application_form_questions")])
+def test_0053_repairs_either_side_of_the_duplicate_0049_0050(tmp_path, old_pair):
+    """Two pairs of migrations were both numbered 0049 / 0050, so an install standing at '0050' ran one pair or the other.
+    Whichever it ran, upgrading to head gives the full schema, and running the repair again changes nothing."""
+    from alembic.operations import Operations
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'duplicate.db'}")
+    with engine.begin() as connection:
+        command.upgrade(alembic_config(connection), "0048")
+        with Operations.context(MigrationContext.configure(connection)):
+            for name in old_pair:
+                _migration_module(name).upgrade()
+        connection.execute(text("UPDATE alembic_version SET version_num = '0050'"))
+    with engine.begin() as connection:
+        command.upgrade(alembic_config(connection), "head")
+    expected = {"job_preparation_tasks", "approved_packets", "jobs.starred", "jobs.posting_closed_at",
+                "jobs.posting_closed_reason", "job_insight_tasks.agent_thread_id", "job_insight_tasks.staged",
+                "job_insight_tasks.scope", "job_insights.application_questions", "job_insights.application_form_input"}
+    assert _schema(engine) == expected
+    with engine.begin() as connection:  # already repaired: running it again changes nothing
+        command.downgrade(alembic_config(connection), "0052")
+        command.upgrade(alembic_config(connection), "head")
+    assert _schema(engine) == expected
+    engine.dispose()
