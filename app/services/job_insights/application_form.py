@@ -127,7 +127,8 @@ def _item(qid: str, question: str, origin: str, status: str, **values: Any) -> d
             "knowledge_answer_id": values.get("knowledge_answer_id"),
             "evidence_ids": values.get("evidence_ids") or [], "evidence": values.get("evidence") or [],
             "requirement_ids": values.get("requirement_ids") or [], "requirements": values.get("requirements") or [],
-            "knowledge_ids": values.get("knowledge_ids") or [], "rationale": values.get("rationale") or None,
+            "knowledge_ids": values.get("knowledge_ids") or [], "resume_refs": values.get("resume_refs") or [],
+            "resume_facts": values.get("resume_facts") or [], "rationale": values.get("rationale") or None,
             "reason": values.get("reason") or None, "kind": kind, "label": label}
 
 
@@ -180,13 +181,14 @@ def company_summary(insight: JobInsight | None, synthesized: Any = None) -> dict
 
 
 def screen(answer: Any, *, form_refs: set[str], requirement_ids: set[str], evidence_ids: set[int],
-           knowledge_ids: set[int], dropped: list[str]) -> Any:
+           knowledge_ids: set[int], dropped: list[str], resume_refs: set[str] | frozenset[str] = frozenset()) -> Any:
     """Item by item: an item citing an id it was not shown is dropped (and noted), never the whole answer."""
     keep = []
     for item in answer.form_questions:
         unknown = ([r for r in item.requirement_ids if r not in requirement_ids]
                    + [e for e in item.evidence_ids if e not in evidence_ids]
-                   + [k for k in item.knowledge_ids if k not in knowledge_ids])
+                   + [k for k in item.knowledge_ids if k not in knowledge_ids]
+                   + [r for r in item.form_resume_refs if r not in resume_refs])
         if item.form_ref is not None and item.form_ref not in form_refs:
             dropped.append(f"form answer for an unknown form question {item.form_ref!r}")
         elif unknown:
@@ -198,9 +200,11 @@ def screen(answer: Any, *, form_refs: set[str], requirement_ids: set[str], evide
 
 
 def after_model(db: Session, job: Job, profile: Any, item: Any, *, qid: str, question: str, origin: str,
-                requirement_labels: dict[str, str], evidence_labels: dict[int, str]) -> dict[str, Any]:
+                requirement_labels: dict[str, str], evidence_labels: dict[int, str],
+                resume_facts: dict[str, str] | None = None) -> dict[str, Any]:
     """One model item as it is saved. A personal question never keeps a draft; a draft that states a number, a name
-    or a work authorization the person's data does not support needs the person instead."""
+    or a work authorization the person's data does not support needs the person instead. A verified resume fact that
+    is not a bullet (a role, a degree, the skills ... cited by its RESUME ref) supports a draft like evidence does."""
     from app.services.tailoring_results import check_prose
 
     common = {"category": item.form_category, "requirement_ids": item.requirement_ids,
@@ -213,7 +217,8 @@ def after_model(db: Session, job: Job, profile: Any, item: Any, *, qid: str, que
     if item.form_decision != "DRAFT":
         return _item(qid, question, origin, NEEDS_INPUT, **common,
                      reason=item.form_note or "Your saved data does not answer this")
-    if not item.evidence_ids and not item.knowledge_ids and item.form_category != "MOTIVATION":
+    if (not item.evidence_ids and not item.knowledge_ids and not item.form_resume_refs
+            and item.form_category != "MOTIVATION"):
         return _item(qid, question, origin, NEEDS_INPUT, **common,
                      reason="No verified evidence supports a draft; add evidence or answer it yourself")
     problems = check_prose(db, profile, job, {"draft": item.form_answer or ""}) if profile is not None else []
@@ -221,7 +226,9 @@ def after_model(db: Session, job: Job, profile: Any, item: Any, *, qid: str, que
         return _item(qid, question, origin, NEEDS_INPUT, **common,
                      reason="The draft was withheld: " + "; ".join(p["message"] for p in problems[:2]))
     return _item(qid, question, origin, DRAFTED, **common, answer=item.form_answer, evidence_ids=item.evidence_ids,
-                 evidence=[evidence_labels.get(e, "") for e in item.evidence_ids], knowledge_ids=item.knowledge_ids)
+                 evidence=[evidence_labels.get(e, "") for e in item.evidence_ids], knowledge_ids=item.knowledge_ids,
+                 resume_refs=item.form_resume_refs,
+                 resume_facts=[(resume_facts or {}).get(r, r) for r in item.form_resume_refs])
 
 
 # ───────────── the candidate's context ─────────────
@@ -249,26 +256,41 @@ def candidate_context(db: Session, client: Any, profile: Any, job: Job, question
         return None
 
 
-def resume_view(context: Any) -> dict[str, Any]:
-    """The resume as the prompt reads it: verified roles with their bullets and evidence ids, projects, skills,
-    education and certifications (relevance scores and status flags left out)."""
-    roles = [{"job_title": r.get("job_title"), "company": r.get("company"), "location": r.get("location"),
-              "dates": r.get("dates"), "technologies": r.get("technologies") or [],
-              "bullets": [{"text": b["text"], "evidence_ids": b.get("evidence_ids") or []} for b in r.get("bullets") or []]}
-             for r in context.relevant_experience]
-    projects = [{"name": p.get("name"), "technologies": p.get("technologies") or [],
-                 "bullets": [{"text": b["text"], "evidence_ids": b.get("evidence_ids") or []} for b in p.get("bullets") or []]}
-                for p in context.relevant_projects]
-    return {"experience": roles, "projects": projects, "skills": context.relevant_skills,
-            "education": context.education, "certifications": context.certifications}
+def _round_robin(lists: list[list[int]]) -> list[int]:
+    """Each question's best hit, then each one's second, ...: a cap shared by many questions keeps every question's
+    best hits rather than the first questions' whole lists."""
+    out, seen = [], set()
+    for rank in range(max((len(ids) for ids in lists), default=0)):
+        for ids in lists:
+            if rank < len(ids) and ids[rank] not in seen:
+                seen.add(ids[rank])
+                out.append(ids[rank])
+    return out
 
 
-def _question_first(form: Any) -> list[dict[str, Any]]:
-    """The context's evidence, what was retrieved for a pasted question first: the cap never drops it."""
-    if form is None:
-        return []
-    wanted = {i for hits in form.questions.values() for i in hits["evidence_ids"]}
-    return sorted(form.evidence, key=lambda e: (e["id"] not in wanted, e["id"]))
+def _question_first(items: list[dict[str, Any]], ranked: list[int]) -> list[dict[str, Any]]:
+    """`items` with the ids of `ranked` first, in that order."""
+    order = {i: n for n, i in enumerate(ranked)}
+    return sorted(items, key=lambda e: (order.get(e["id"], len(order)), e["id"]))
+
+
+def bullet_evidence(resume: dict[str, Any]) -> set[int]:
+    """Evidence ids the RESUME section carries on its bullets."""
+    return {i for part in ("experience", "projects") for unit in resume.get(part) or []
+            for b in unit.get("bullets") or [] for i in b.get("evidence_ids") or []}
+
+
+def call_stats(form: Any, prompt: Any) -> dict[str, Any]:
+    """Context size for the LLM request row, measured on the prompt actually sent (capped evidence and answers,
+    resume, fit, company, form questions) against everything the candidate context could have carried. Posting-side
+    figures are not measured here and stay unknown."""
+    from app.services.context_builder import CONTEXT_BUILDER_VERSION, ContextStats
+    from app.services.llm_telemetry import estimate_tokens
+
+    selected = estimate_tokens(prompt.user)
+    full = form.context.stats.full_available_context_tokens if form is not None else 0
+    return {**ContextStats.measure(max(full, selected), selected).as_dict(),
+            "context_builder_version": CONTEXT_BUILDER_VERSION}
 
 
 def _merged(first: list[dict[str, Any]], second: list[dict[str, Any]], cap: int) -> list[dict[str, Any]]:
@@ -311,8 +333,22 @@ def draft(db: Session, client: Any, job: Job, *, attempt: int, ctx: dict[str, An
     evidence_labels = {e["id"]: (e.get("claim") or "")[:160] for e in ctx["evidence"]}
     if ask or predict:
         form = candidate_context(db, client, profile, job, [{"ref": a["ref"], "question": a["question"]} for a in ask])
-        evidence = _merged(_question_first(form), ctx["evidence"], MAX_EVIDENCE)
-        knowledge = _merged(form.knowledge if form else [], known_answers(db, job.user_id), MAX_KNOWLEDGE)
+        hits = form.questions if form else {}
+        research = ctx["evidence"] if form is None or form.scope is None else \
+            [e for e in ctx["evidence"] if e["id"] in form.scope]  # the research context is account-wide when off
+        evidence = _merged(_question_first(form.evidence, _round_robin([h["evidence_ids"] for h in hits.values()]))
+                           if form else [], research, MAX_EVIDENCE)
+        knowledge = _merged(_question_first(form.knowledge, _round_robin([h["knowledge_ids"] for h in hits.values()]))
+                            if form else [], known_answers(db, job.user_id), MAX_KNOWLEDGE)
+        resume = form.resume if form else {}
+        # Only what the capped prompt carries may be cited or pointed at.
+        shown_evidence = {e["id"] for e in evidence} | bullet_evidence(resume)
+        shown_knowledge = {k["id"] for k in knowledge}
+        retrieved = {ref: {"evidence_ids": [i for i in h["evidence_ids"] if i in shown_evidence],
+                           "knowledge_ids": [i for i in h["knowledge_ids"] if i in shown_knowledge]}
+                     for ref, h in hits.items()}
+        retrieved = {ref: h for ref, h in retrieved.items() if any(h.values())}
+        resume_facts = form.resume_facts if form else {}
         if form is not None:
             evidence_labels = {**form.evidence_labels, **evidence_labels}
         prompt = build_application_form_prompt(
@@ -320,17 +356,16 @@ def draft(db: Session, client: Any, job: Job, *, attempt: int, ctx: dict[str, An
             fit_analysis=ctx["fit"], evidence=evidence, knowledge=knowledge, company=company,
             form_questions=[{"ref": a["ref"], "question": a["question"]} for a in ask],
             predict=MAX_PREDICTED if predict else 0,
-            candidate=form.context.candidate if form else None, resume=resume_view(form.context) if form else None,
-            retrieved={ref: hits for ref, hits in form.questions.items() if any(hits.values())} if form else None)
+            candidate=form.context.candidate if form else None, resume=resume or None, retrieved=retrieved or None)
         refs = {a["ref"]: a for a in ask}
-        shown_evidence = {e["id"] for e in evidence} | (form.context.evidence_ids if form else set())
         try:
             result = client.generate_prompt(prompt, LLMCall(
                 workflow_type="job", entity_id=job.id, attempt=attempt,
-                context_stats=form.context.call_stats() if form else None,
+                context_stats=call_stats(form, prompt) if form else None,
                 validate=lambda data: screen(ApplicationFormPrepResult.model_validate(data), form_refs=set(refs),
                                              requirement_ids=set(ctx["requirements"]), evidence_ids=shown_evidence,
-                                             knowledge_ids={k["id"] for k in knowledge}, dropped=dropped)))
+                                             knowledge_ids=shown_knowledge, resume_refs=set(resume_facts),
+                                             dropped=dropped)))
             model_ran = True
         except (LLMError, ValueError) as exc:
             errors.append(f"Application form drafts failed: {type(exc).__name__}: {exc}"[:300])
@@ -345,7 +380,8 @@ def draft(db: Session, client: Any, job: Job, *, attempt: int, ctx: dict[str, An
                         continue  # one answer per pasted question
                     settled[asked["id"]] = after_model(
                         db, job, profile, item, qid=asked["id"], question=asked["question"], origin=FORM,
-                        requirement_labels=ctx["requirements"], evidence_labels=evidence_labels)
+                        requirement_labels=ctx["requirements"], evidence_labels=evidence_labels,
+                        resume_facts=resume_facts)
                 elif predict and len(predicted_items) < MAX_PREDICTED:
                     qid = question_id(PREDICTED, item.form_question)
                     if question_id(FORM, item.form_question) in seen or qid in seen:
@@ -353,7 +389,8 @@ def draft(db: Session, client: Any, job: Job, *, attempt: int, ctx: dict[str, An
                     seen.add(qid)
                     predicted_items.append(before_model(db, qid, item.form_question, PREDICTED) or after_model(
                         db, job, profile, item, qid=qid, question=item.form_question, origin=PREDICTED,
-                        requirement_labels=ctx["requirements"], evidence_labels=evidence_labels))
+                        requirement_labels=ctx["requirements"], evidence_labels=evidence_labels,
+                        resume_facts=resume_facts))
 
     items = []
     for q in pasted:

@@ -52,8 +52,9 @@ APPLICATION_FORM_SYSTEM = instructions(
 - RETRIEVED FOR EACH QUESTION lists, per FORM QUESTIONS ref, the evidence ids and KNOWN ANSWERS ids most relevant to
   that question. Start from them; use any other supplied fact that answers the question better.
 - Write in the first person, as the candidate, about what RESUME and VERIFIED EVIDENCE show. When you draw on a
-  resume bullet, cite its evidence_ids; a bullet without evidence_ids may give context (where, when) but is not by
-  itself support for a claim.""",
+  resume bullet, cite its evidence_ids. When you draw on a role, project, degree, certification, the skills or the
+  verified summary, cite its ref in form_resume_refs (SUMMARY for CANDIDATE's summary). Cite only what the draft
+  actually rests on.""",
     f"""WHAT YOU WRITE
 - One item for every FORM QUESTIONS entry, with its id in form_ref and its text in form_question.
 - Up to {MAX_PREDICTED} more items (form_ref null) for questions an application form for this role is likely to ask:
@@ -61,8 +62,8 @@ APPLICATION_FORM_SYSTEM = instructions(
   with ..."), a leadership or behavioral prompt the role suggests. Say in likely_because what in the posting makes it
   likely. Do not repeat a FORM QUESTIONS entry, and do not predict the standard personal questions.
 - form_decision DRAFT with form_answer when the supplied facts answer it: two to five sentences for an open question,
-  a short phrase for a factual one. Cite the VERIFIED EVIDENCE ids it rests on in evidence_ids and the KNOWN ANSWERS
-  ids it reuses in knowledge_ids. A motivation answer may draw on COMPANY and the posting, and must still describe
+  a short phrase for a factual one. Cite the VERIFIED EVIDENCE ids it rests on in evidence_ids, the KNOWN ANSWERS
+  ids it reuses in knowledge_ids and the RESUME refs in form_resume_refs. A motivation answer may draw on COMPANY and the posting, and must still describe
   only experience the evidence shows.
 - form_decision NEEDS_INPUT (form_answer null, what to decide in form_note) for every question in these categories:
   {", ".join(PERSONAL_FORM_CATEGORIES)} — work authorization, visa or sponsorship, salary or expected pay, notice

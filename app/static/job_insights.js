@@ -228,6 +228,7 @@ function insFormQuestion(q, jobId) {
       ${q.rationale ? `<div class="xs mt4"><span class="faint">Why likely:</span> ${esc(q.rationale)}</div>` : ''}
       ${q.answer ? `<div class="box soft mt8 small pretty" style="white-space:pre-wrap">${esc(q.answer)}</div>` : ''}
       ${q.evidence?.filter(Boolean).length ? `<div class="xs muted mt6">From your evidence: ${q.evidence.filter(Boolean).map(esc).join(' · ')}</div>` : ''}
+      ${q.resume_facts?.filter(Boolean).length ? `<div class="xs muted mt4">From your resume: ${q.resume_facts.filter(Boolean).map(esc).join(' · ')}</div>` : ''}
       ${q.requirements?.length ? `<div class="xs muted mt4">Relates to: ${esc(q.requirements.join(', '))}</div>` : ''}
       ${q.reason ? `<div class="xs mt6" style="color:var(--warn-deep)">${esc(q.reason)}</div>` : ''}</div>
       <div class="col gap6 none">${pill(word, tone)}${q.kind ? insKind(q.kind) : ''}</div></div>
