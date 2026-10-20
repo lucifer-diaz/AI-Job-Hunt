@@ -66,6 +66,69 @@ def test_application_sessions_share_nothing_with_jd_recovery_and_post_nothing():
     assert "/apply/submit" not in all_posts and "Senior Backend Engineer" in rendered.html
 
 
+SW_PAGE = b"""<html><body><script>
+navigator.serviceWorker.register('/sw.js').then(() => navigator.serviceWorker.ready).then(() =>
+  setTimeout(() => fetch('/apply/via-worker', {method: 'POST', body: 'x'}).catch(() => {}), 300));
+</script></body></html>"""
+SW_SCRIPT = b"""self.addEventListener('install', e => self.skipWaiting());
+self.addEventListener('activate', e => e.waitUntil(self.clients.claim().then(() =>
+  fetch('/apply/from-worker', {method: 'POST', body: 'x'}).catch(() => {}))));
+self.addEventListener('fetch', e => e.respondWith(fetch(e.request)));"""
+
+
+@needs_chromium
+def test_a_service_worker_cannot_post_from_an_application_page():
+    """The shared context allows service workers (JD recovery needs them), and `page.route` never sees what a worker
+    sends or answers. The application browser aborts non-GET requests at the context too, so neither the worker's own
+    POST nor a page POST the worker answers reaches the server."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    seen: list[tuple[str, str]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def _answer(self, method):
+            seen.append((method, self.path))
+            body, kind = (SW_SCRIPT, "application/javascript") if self.path == "/sw.js" else (SW_PAGE, "text/html")
+            self.send_response(200)
+            self.send_header("Content-Type", kind)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            self._answer("GET")
+
+        def do_POST(self):
+            self._answer("POST")
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    browser = _browser()
+    sessions = EphemeralApplicationSessions(browser, record_telemetry=False)
+
+    async def go():
+        try:
+            async with sessions.session(user_id=1, ats="greenhouse") as page:
+                await page.goto(f"http://127.0.0.1:{httpd.server_address[1]}/page.html")
+                await asyncio.sleep(2)
+                return page.blocked_requests
+        finally:
+            await browser.stop()
+
+    try:
+        blocked = asyncio.run(go())
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+    assert ("GET", "/sw.js") in seen  # the worker was installed
+    assert [path for method, path in seen if method != "GET"] == []
+    assert blocked >= 2
+
+
 @needs_chromium
 def test_a_full_assist_run_in_chromium_ends_ready_to_submit_with_zero_posts(pg_sessions, pg_engine, monkeypatch,
                                                                            tmp_path):

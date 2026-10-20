@@ -449,6 +449,10 @@ def resolve_uncertain(db: Session, job: Job, claim_id: int, *, submitted: bool,
                                  confirmation_id=confirmation_id, resolving=True)
     lock_application(db, job)
     claim = db.get(ApplicationClaim, claim_id, populate_existing=True)
+    if claim is None or claim.status not in (CLAIMED, UNCERTAIN):
+        # Recorded (or released) by its client since it was read: a RECORDED claim keeps its keys for good.
+        db.rollback()
+        raise ValueError("There is no open submission to resolve for this job")
     _finish(claim, RELEASED, "a person said it was not submitted")
     db.commit()
     return claim

@@ -185,6 +185,28 @@ def test_resolving_an_uncertain_claim_as_submitted_records_it(user):
         assert result.status == "SUBMITTED" and result.application.confirmation_id == "GH-1"
 
 
+def test_a_person_saying_not_submitted_never_releases_a_claim_its_client_just_recorded(user, monkeypatch):
+    """The person read an open claim; before their "not submitted" took the lock, Claude Desktop recorded the
+    submission. The recorded claim keeps its keys; the person is told there is nothing open to resolve."""
+    job_id = approved_job(user)
+    _, token, _ = begin(user, job_id)
+    with session(user) as db:
+        claim_id = db.scalar(select(ApplicationClaim.id).where(ApplicationClaim.token == token))
+    original = apply_queue.lock_application
+
+    def recorded_meanwhile(db, job):
+        monkeypatch.setattr(apply_queue, "lock_application", original)
+        assert record(user, job_id, token) == "SUBMITTED"  # the client's report wins the race
+        return original(db, job)
+
+    monkeypatch.setattr(apply_queue, "lock_application", recorded_meanwhile)
+    with session(user) as db, pytest.raises(ValueError):
+        apply_queue.resolve_uncertain(db, db.get(Job, job_id), claim_id, submitted=False)
+    with session(user) as db:
+        claim = db.get(ApplicationClaim, claim_id)
+        assert claim.status == "RECORDED" and all(k.held for k in claim.keys)
+
+
 def test_a_blocker_with_the_token_releases_the_claim(user):
     job_id = approved_job(user)
     _, token, _ = begin(user, job_id)

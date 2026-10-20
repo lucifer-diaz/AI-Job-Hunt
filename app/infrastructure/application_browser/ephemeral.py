@@ -2,8 +2,10 @@
 
 The context comes from `BrowserService.new_context()` exactly as JD recovery's do (no cookies, storage, credentials,
 downloads; the same SSRF routing), and it is never handed to JD recovery or reused: it is closed when the step ends.
-On top, every request that is not a GET is aborted at the page, so nothing a page does — a script, a stray Enter, a
-form — can post an application. Page loads are recorded in Monitoring → External APIs (provider WEB, service
+On top, every request that is not a GET is aborted, at the page and at its context, so nothing a page does — a script,
+a stray Enter, a form, a service worker it registers — can post an application. (`page.route` alone does not see
+requests a service worker makes or answers; the shared context allows service workers for JD recovery, and in
+Chromium `context.route` sees them.) Page loads are recorded in Monitoring → External APIs (provider WEB, service
 application_browser) like every other third-party call.
 """
 from __future__ import annotations
@@ -34,8 +36,9 @@ def _utcnow() -> datetime:
 
 class _Page(ApplicationPage):
     def __init__(self, page: Any, *, allow_private: bool, user_id: int, job_id: int | None, ats: str,
-                 record_telemetry: bool):
+                 record_telemetry: bool, context: Any = None):
         self._page = page
+        self._context = context
         self._allow_private = allow_private
         self._user_id, self._job_id, self._ats = user_id, job_id, ats
         self._record_telemetry = record_telemetry
@@ -43,7 +46,8 @@ class _Page(ApplicationPage):
 
     async def _guard(self, route: Any) -> None:
         """Abort anything that is not a GET (a form post, an XHR submit, a beacon); let the rest through to the
-        context's own routing (the SSRF checks every browser page gets)."""
+        context's own routing (the SSRF checks every browser page gets). Installed on the context too, before the
+        page loads, so a service worker's requests (its own, or a page's it answers) are aborted the same way."""
         try:
             if route.request.method.upper() != "GET":
                 self._blocked += 1
@@ -54,6 +58,8 @@ class _Page(ApplicationPage):
             log.debug("application page routing ended early")
 
     async def install(self) -> None:
+        if self._context is not None:
+            await self._context.route("**/*", self._guard)  # last registered runs first: before the SSRF route
         await self._page.route("**/*", self._guard)
 
     @property
@@ -140,7 +146,8 @@ class EphemeralApplicationSessions(ApplicationSessionManager):
         try:
             page = await self._browser.new_page(context)
             wrapped = _Page(page, allow_private=bool(getattr(self._browser, "allow_private_hosts", False)),
-                            user_id=user_id, job_id=job_id, ats=ats, record_telemetry=self._record_telemetry)
+                            user_id=user_id, job_id=job_id, ats=ats, record_telemetry=self._record_telemetry,
+                            context=context)
             await wrapped.install()
             yield wrapped
         finally:
