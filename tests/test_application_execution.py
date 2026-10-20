@@ -356,3 +356,91 @@ def test_mode_off_ends_the_tasks_left_over(sessions, browser, monkeypatch):
     task = aps.task_of(sessions, job_id)
     assert (task.status, task.stage, task.result_code) == ("SKIPPED", "CANCELLED", application_execution.MODE_OFF)
 
+
+
+# ───────────── review fixes (Codex review of PR #88) ─────────────
+
+def test_a_sensitive_answer_to_a_merely_similar_question_is_never_filled(sessions, browser):
+    """"…authorized to work in Singapore without sponsorship?" is similar enough to the form's "…authorized to work in
+    Singapore?" for knowledge.search to withhold it as NEEDS_CONFIRMATION, but its "No" means something else here.
+    The worker asks the form's own question instead of offering the similar one for confirmation."""
+    user = aps.owner(sessions)
+    aps.answer(sessions, user, aps.PYTHON_QUESTION, "8")
+    similar = aps.answer(sessions, user, "Are you legally authorized to work in Singapore without sponsorship?", "No",
+                         sensitive=True)
+    job_id = aps.approved_job(sessions, user, FORM)
+    aps.enqueue(sessions, user, job_id)
+    aps.drive(sessions)
+    task = aps.task_of(sessions, job_id)
+    assert (task.status, task.stage) == ("PENDING", "NEEDS_INPUT")
+    assert task.interrupt["confirm_question_ids"] == []  # nothing similar is offered for confirmation
+    (asked,) = task.interrupt["question_ids"]
+    assert asked != similar
+    with sessions() as db:
+        assert db.get(KnowledgeAnswer, asked).question == aps.AUTH_QUESTION
+        assert f"knowledge_answer:{similar}" not in str(db.get(ApplicationExecutionTask, task.id).plan)
+    assert browser.filled == []
+
+
+def test_the_apply_kit_sees_each_sensitive_answer_it_is_asked_to_confirm(sessions, browser):
+    user = aps.owner(sessions)
+    ids = aps.standard_answers(sessions, user)
+    job_id = aps.approved_job(sessions, user, FORM)
+    aps.enqueue(sessions, user, job_id)
+    aps.drive(sessions)
+    with sessions() as db:
+        db.info["user_id"] = user
+        task = db.get(ApplicationExecutionTask, aps.task_of(sessions, job_id).id)
+        assert application_execution.confirmations(db, task) == [
+            {"id": ids["auth"], "question": aps.AUTH_QUESTION, "answer": "Yes"}]
+
+
+def test_a_deployment_that_cannot_run_the_worker_shows_it_as_off(sessions, monkeypatch):
+    with sessions() as db:
+        assert application_execution.available_mode(db) == "assist"
+        monkeypatch.setattr(application_execution, "_postgres", lambda _db: False)  # SQLite
+        assert application_execution.available_mode(db) == "off"
+
+
+def test_turning_agent_graphs_off_still_ends_the_runs_left_over(sessions, browser, monkeypatch):
+    """AGENT_GRAPHS_ENABLED off unschedules the worker's own job; the always-on applications pass settles its tasks."""
+    from app.services import scheduled_jobs as sj
+
+    user = aps.owner(sessions)
+    job_id = aps.approved_job(sessions, user, FORM)
+    aps.enqueue(sessions, user, job_id)
+    monkeypatch.setattr(aps.get_settings(), "agent_graphs_enabled", False)
+    assert aps.get_settings().application_execution_interval_minutes == 0
+    result = sj.applications(aps.ctx(sessions))
+    assert result["executions_ended"] == 1
+    task = aps.task_of(sessions, job_id)
+    assert (task.status, task.result_code) == ("SKIPPED", application_execution.MODE_OFF)
+
+
+def test_a_run_stopped_while_saving_questions_saves_no_more(sessions, browser, monkeypatch):
+    """Each saved question commits and ends the thread lock. A Kill landing between two of them stops the run at the
+    next one: the stopped run leaves no further questions behind."""
+    from app.services import knowledge, qualification
+
+    user = aps.owner(sessions)  # no saved answers: two required questions to ask
+    job_id = aps.approved_job(sessions, user, FORM)
+    aps.enqueue(sessions, user, job_id)
+    original, saved = knowledge.request_answer, []
+
+    def save_then_kill(db, job, question, **kwargs):
+        out = original(db, job, question, **kwargs)
+        saved.append(question)
+        with sessions() as other:
+            other.info["user_id"] = user
+            task = other.scalar(select(ApplicationExecutionTask).where(ApplicationExecutionTask.job_id == job_id))
+            qualification.stop_threads(other, [task.agent_thread_id])
+            other.commit()
+        return out
+
+    monkeypatch.setattr(knowledge, "request_answer", save_then_kill)
+    aps.drive(sessions)
+    assert len(saved) == 1
+    with sessions() as db:
+        db.info["user_id"] = user
+        asked = db.scalars(select(KnowledgeAnswer).where(KnowledgeAnswer.answer == "")).all()
+        assert [q.question for q in asked] == saved

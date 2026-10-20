@@ -76,10 +76,23 @@ describe('the Apply kit claim', () => {
 
   it('shows the application worker only when it is on, and never offers to submit', () => {
     expect(acts(html(kit()))).not.toContain('kit-prepare');
-    const el = html(kit({ execution_mode: 'assist', execution: { id: 9, status: 'COMPLETED', stage: 'READY_TO_SUBMIT', interrupt: null, result_code: 'READY_TO_SUBMIT' } }));
+    const el = html(kit({ execution_mode: 'assist', execution: { id: 9, mode: 'ASSIST', status: 'COMPLETED', stage: 'READY_TO_SUBMIT', interrupt: null, result_code: 'READY_TO_SUBMIT' } }));
     expect(el.textContent).toContain('It never submits');
-    expect(el.textContent).toContain('Submit it yourself');
-    const waiting = html(kit({ execution_mode: 'assist', execution: { id: 9, status: 'PENDING', stage: 'NEEDS_INPUT', interrupt: { question_ids: [], confirm_question_ids: [3] } } }));
-    expect(acts(waiting)).toContain('kit-confirm');
+    // The filled page is gone: the kit says so instead of implying a filled form is waiting somewhere.
+    expect(el.textContent).toContain('which was then closed');
+    expect(el.textContent).toContain('fill it in yourself');
+  });
+
+  it('shows each sensitive question and its saved answer before they are confirmed, and sends only those', async () => {
+    const execution = { id: 9, status: 'PENDING', stage: 'NEEDS_INPUT', interrupt: { question_ids: [], confirm_question_ids: [3] } };
+    // Nothing to show (no confirmations sent): nothing to confirm blindly.
+    expect(acts(html(kit({ execution_mode: 'assist', execution })))).not.toContain('kit-confirm');
+    const el = html(kit({ execution_mode: 'assist', execution, execution_confirmations: [
+      { id: 3, question: 'Are you authorized to work in the United States?', answer: 'Yes' }] }));
+    expect(el.textContent).toContain('Are you authorized to work in the United States?');
+    expect(el.textContent).toContain('Yes');
+    expect(acts(el)).toContain('kit-confirm');
+    const button = [...el.querySelectorAll('[data-act="kit-confirm"]')][0];
+    expect(button.dataset.ids).toBe('3');
   });
 });

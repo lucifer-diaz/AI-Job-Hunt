@@ -86,6 +86,12 @@ def routes(db: Session) -> bool:
     return mode() != "off" and get_settings().agent_graphs_enabled and _postgres(db)
 
 
+def available_mode(db: Session) -> str:
+    """The mode screens show: the server's mode only where a run can actually be queued (`routes`), else off, so a
+    deployment that cannot run the worker (SQLite) never offers an action that is always refused."""
+    return mode() if routes(db) else "off"
+
+
 def set_stage(task: ApplicationExecutionTask, stage: str) -> None:
     """The only way an execution's stage changes. Refuses the submit stages (SubmitForbidden) and unknown names."""
     if stage in SUBMIT_STAGES:
@@ -211,6 +217,17 @@ def wake_waiting(db: Session, user_id: int) -> int:
     except Exception:
         log.warning("could not wake waiting application executions", exc_info=True)
     return woken
+
+
+def confirmations(db: Session, task: ApplicationExecutionTask) -> list[dict[str, Any]]:
+    """The saved sensitive answers this execution waits for the person to confirm: each question and the answer that
+    would be filled, so a person sees exactly what they authorize. For the account's own Apply kit only (it shows
+    saved answers already); never stored on the task, the graph or a log."""
+    ids = list((task.interrupt or {}).get("confirm_question_ids") or []) if task.stage == WAITING else []
+    if not ids:
+        return []
+    rows = {r.id: r for r in db.scalars(select(KnowledgeAnswer).where(KnowledgeAnswer.id.in_(ids))).all()}
+    return [{"id": i, "question": rows[i].question, "answer": rows[i].answer} for i in ids if i in rows]
 
 
 def confirm_answers(db: Session, task_id: int, question_ids: list[int]) -> ApplicationExecutionTask:

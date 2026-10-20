@@ -207,6 +207,55 @@ def test_a_person_saying_not_submitted_never_releases_a_claim_its_client_just_re
         assert claim.status == "RECORDED" and all(k.held for k in claim.keys)
 
 
+def test_a_claim_past_its_lease_is_never_released_by_its_client_even_before_the_sweep(user):
+    """No sweep has run, so the row still says CLAIMED, but the lease ran out: whether it was submitted is unknown.
+    The client can neither release it nor free it with a blocker; the next start finds it UNCERTAIN."""
+    job_id = approved_job(user)
+    _, token, _ = begin(user, job_id)
+    with session(user) as db:
+        claim = db.scalar(select(ApplicationClaim).where(ApplicationClaim.token == token))
+        claim.lease_expires_at = now() - timedelta(minutes=1)
+        db.commit()
+    with session(user) as db, pytest.raises(ValueError, match="ran out"):
+        apply_queue.release_claim(db, db.get(Job, job_id), token, "nothing sent")
+    with session(user) as db:
+        apply_queue.lock_application(db, db.get(Job, job_id))
+        with pytest.raises(ValueError, match="ran out"):
+            apply_queue.record_blocker(db, db.get(Job, job_id), "captcha", claim_token=token)
+    with session(user) as db:
+        claim = db.scalar(select(ApplicationClaim).where(ApplicationClaim.token == token))
+        assert claim.status == "CLAIMED" and all(k.held for k in claim.keys)  # still held
+    assert begin(user, job_id, "apply_kit")[0] == "UNCERTAIN"
+
+
+def test_the_expiry_sweep_never_overwrites_a_claim_finished_meanwhile(user, monkeypatch):
+    """The sweep selected a CLAIMED row; before its update, the client released it. The release stands: the sweep
+    never turns a finished claim (whose keys are already free) into an unresolved one."""
+    job_id = approved_job(user)
+    _, token, _ = begin(user, job_id)
+    with session(user) as db:
+        claim = db.scalar(select(ApplicationClaim).where(ApplicationClaim.token == token))
+        claim.lease_expires_at = now() + timedelta(seconds=2)
+        db.commit()
+    original = apply_queue.update
+
+    def released_meanwhile(*args, **kwargs):
+        monkeypatch.setattr(apply_queue, "update", original)
+        with session(user) as other:
+            apply_queue.release_claim(other, other.get(Job, job_id), token, "nothing sent")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(apply_queue, "update", released_meanwhile)
+    with session(user) as db:
+        # the lease has not run out for release_claim (now), but has for the sweep (an hour later)
+        assert apply_queue.expire_claims(db, now=now() + timedelta(hours=1), user_id=user) == 0
+    with session(user) as db:
+        claim = db.scalar(select(ApplicationClaim).where(ApplicationClaim.token == token))
+        assert claim.status == "RELEASED" and not any(k.held for k in claim.keys)
+        assert not db.scalars(select(ApplicationEvent).where(ApplicationEvent.title == "Submission outcome unknown")
+                              ).all()
+
+
 def test_a_blocker_with_the_token_releases_the_claim(user):
     job_id = approved_job(user)
     _, token, _ = begin(user, job_id)
@@ -286,6 +335,20 @@ def test_mcp_listing_leaves_out_a_posting_someone_is_submitting(user):
 def client_for(monkeypatch, user_id):
     monkeypatch.setattr(auth, "authenticate", lambda request: CurrentUser(user_id, f"{user_id}@jobhunt.test", False))
     return TestClient(app)
+
+
+def test_another_saved_posting_shows_the_claim_without_its_token(user, monkeypatch):
+    """Job B is a duplicate row of job A's posting. A's Apply kit claim shows on B as a submission in progress
+    elsewhere, never with A's token (which B's record and release would only refuse)."""
+    client = client_for(monkeypatch, user)
+    first = approved_job(user)
+    duplicate = approved_job(user, url=URL + "/?utm_source=linkedin")
+    started = client.post(f"/api/jobs/{first}/submission/start").json()["claim"]
+    assert started["claim_token"]
+    for path in (f"/api/jobs/{duplicate}/apply-kit", f"/api/jobs/{duplicate}/submission"):
+        claim = client.get(path).json()["claim"]
+        assert claim["job_id"] == first and claim["status"] == "CLAIMED" and "claim_token" not in claim
+    assert client.get(f"/api/jobs/{first}/submission").json()["claim"]["claim_token"] == started["claim_token"]
 
 
 def test_the_apply_kit_starts_reports_and_releases_through_the_claim(user, monkeypatch):

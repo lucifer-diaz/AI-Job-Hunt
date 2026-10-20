@@ -535,7 +535,9 @@ hand-back) qualify a job when `QUALIFICATION_GRAPH_MODE=on` (README §9c). The r
   serialises *recording*; it is not a pre-submit reservation. Never hold a transaction across a browser.
 * **An expired claim is UNCERTAIN, never free.** `expire_claims` moves a CLAIMED claim past its lease to UNCERTAIN; only
   a person resolves it (`resolve_uncertain`: submitted → recorded through `record_submission`, not submitted →
-  released). A release is only ever a client saying nothing was submitted. A RECORDED claim keeps its keys forever.
+  released). A release is only ever a client saying nothing was submitted, and only before its lease runs out (whether
+  or not the sweep has run). A RECORDED claim keeps its keys forever. Every claim transition re-checks the status it
+  starts from under the lock (expiry is a conditional UPDATE), so a later writer never undoes a finished claim.
 * **Tokenless reports are checked, not trusted.** A result reported without a claim token (older MCP clients, the in-app
   "I applied") goes through the same lock, digest, duplicate and held-key checks, is refused while another claim holds
   the posting, and is recorded with `claim: "unclaimed"`. Submissions made entirely outside Job Hunt OS cannot be
@@ -544,8 +546,9 @@ hand-back) qualify a job when `QUALIFICATION_GRAPH_MODE=on` (README §9c). The r
   (`approval.verify`, and the digest equal to the one captured) before touching a form; a mismatch is BLOCKED
   `PACKET_CHANGED` and needs a new approval. Never re-hash a packet to make it current.
 * **Answers come from verified sources only** (`answer_resolver`): profile contact fields, the approved packet's files
-  and letter, a verified KnowledgeAnswer for the same question. A sensitive answer needs the person's confirmation for
-  this execution; anything else a *required* field needs is saved with `knowledge.request_answer` and the execution
+  and letter, a verified KnowledgeAnswer for the same question (`knowledge.same_question`, never a similar one, for
+  sensitive answers too). A sensitive answer needs the person's confirmation for this execution, given after the Apply
+  kit showed the question and the saved value; anything else a *required* field needs is saved with `knowledge.request_answer` and the execution
   waits (NEEDS_INPUT). Optional unknown fields stay empty. No model writes an answer in Phase 5. Answer values are
   resolved at fill time and never stored on the execution: its `plan` holds sources and statuses only.
 * **The application browser is not the JD-recovery browser.** Application pages come only from
@@ -558,8 +561,11 @@ hand-back) qualify a job when `QUALIFICATION_GRAPH_MODE=on` (README §9c). The r
   `application`, scheduler job `application_execution`, orchestration node `application_execution`, worker-owned graph
   `application` (`api_resumable=False`; thread key `application:<job>:<task>:<created>:a<attempt>`). Kill stops the
   task and its thread; Retry and Run now create a new task. Everything is off unless `APPLICATION_EXECUTION_MODE` is
-  `observe` or `assist`, `AGENT_GRAPHS_ENABLED` is on and the database is PostgreSQL. Graph state holds ids, enums and
-  counts only — never form values, page HTML or answers.
+  `observe` or `assist`, `AGENT_GRAPHS_ENABLED` is on and the database is PostgreSQL (screens show the mode only where
+  it can run: `available_mode`); while it is off, the always-on `applications` pass ends the runs left over. Graph state
+  holds ids, enums and counts only — never form values, page HTML or answers. ASSIST fills a page that is closed when
+  the step ends: READY_TO_SUBMIT means every required field could be filled from verified sources, not that a filled
+  form is waiting anywhere. Never present it as one; a person fills and submits on the site.
 
 ## Candidate knowledge retrieval (RAG)
 

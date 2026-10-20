@@ -244,7 +244,9 @@ def resolve_answers(state: ApplicationState, runtime: Runtime[ApplicationContext
         task, job = _load(db, state)
         effects.held(db, ctx.run)
         form = ats_forms.ApplicationForm.model_validate(task.form)
-        plan = answer_resolver.plan(db, job, form, confirmed=list(task.confirmed_question_ids or []))
+        # Each saved question commits, which ends the thread lock taken above: check the lease again before each.
+        plan = answer_resolver.plan(db, job, form, confirmed=list(task.confirmed_question_ids or []),
+                                    before_write=lambda: effects.held(db, ctx.run))
         task, job = _load(db, state)
         fields = plan["fields"]
         counts = {"resolved_count": sum(1 for f in fields.values() if f["status"] == answer_resolver.RESOLVED),

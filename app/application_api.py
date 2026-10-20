@@ -52,15 +52,18 @@ def _job(db: Session, job_id: int) -> Job:
     return job
 
 
-def claim_view(claim: ApplicationClaim | None, *, with_token: bool = False) -> dict[str, Any] | None:
-    """A claim for the screens. The token only for the Apply kit's own open claim (it reports with it)."""
+def claim_view(claim: ApplicationClaim | None, *, with_token: bool = False,
+               job_id: int | None = None) -> dict[str, Any] | None:
+    """A claim for the screens. The token only for the Apply kit's own open claim on the job being viewed (it reports
+    with it): another saved posting of the same job shows the claim as someone else's submission in progress, since
+    its token is bound to that other job and would only be refused here."""
     if claim is None:
         return None
     out = {"id": claim.id, "job_id": claim.job_id, "status": claim.status, "client": claim.client,
            "claimed_at": claim.claimed_at.isoformat() if claim.claimed_at else None,
            "lease_expires_at": claim.lease_expires_at.isoformat() if claim.lease_expires_at else None,
            "started_by": apply_queue.SUBMITTED_BY.get(claim.client, claim.client)}
-    if with_token and claim.client == "apply_kit" and claim.status == apply_queue.CLAIMED:
+    if with_token and claim.client == "apply_kit" and claim.status == apply_queue.CLAIMED and claim.job_id == job_id:
         out["claim_token"] = claim.token
     return out
 
@@ -72,10 +75,11 @@ def submission(job_id: int, db: Session = Depends(get_user_db)) -> dict[str, Any
     job = _job(db, job_id)
     apply_queue.expire_claims(db, user_id=job.user_id)
     task = application_execution.latest(db, job.id)
-    return {"job_id": job.id, "claim": claim_view(apply_queue.open_claim(db, job), with_token=True),
+    return {"job_id": job.id, "claim": claim_view(apply_queue.open_claim(db, job), with_token=True, job_id=job.id),
             "not_ready_reason": apply_queue.not_ready_reason(db, job),
             "execution": application_execution.view(task) if task is not None else None,
-            "execution_mode": application_execution.mode(),
+            "execution_confirmations": application_execution.confirmations(db, task) if task is not None else [],
+            "execution_mode": application_execution.available_mode(db),
             "warning": "Applications you submit entirely outside Job Hunt OS cannot be locked here: start the "
                        "submission from the Apply kit (or Claude Desktop) so no one else submits it at the same time."}
 
@@ -88,7 +92,7 @@ def start_submission(job_id: int, db: Session = Depends(get_user_db)) -> dict[st
         raise HTTPException(409, {"message": result.reason, "status": result.status,
                                   "conflict_job_id": result.conflict_job_id,
                                   "claim": claim_view(result.claim)})
-    return {"status": "CLAIMED", "claim": claim_view(result.claim, with_token=True)}
+    return {"status": "CLAIMED", "claim": claim_view(result.claim, with_token=True, job_id=job.id)}
 
 
 @router.post("/api/jobs/{job_id}/submission/release")

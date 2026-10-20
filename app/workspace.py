@@ -2292,7 +2292,8 @@ def _execution_view(db: Session, job: Job) -> dict:
 
     task = application_execution.latest(db, job.id)
     return {"execution": application_execution.view(task) if task is not None else None,
-            "execution_mode": application_execution.mode()}
+            "execution_confirmations": application_execution.confirmations(db, task) if task is not None else [],
+            "execution_mode": application_execution.available_mode(db)}
 
 
 def _open_claim_view(db: Session, job: Job) -> dict | None:
@@ -2301,7 +2302,7 @@ def _open_claim_view(db: Session, job: Job) -> dict | None:
     from app.application_api import claim_view
     from app.services import apply_queue
 
-    return claim_view(apply_queue.open_claim(db, job), with_token=True)
+    return claim_view(apply_queue.open_claim(db, job), with_token=True, job_id=job.id)
 
 
 @router.post("/api/knowledge/{item_id}/used")

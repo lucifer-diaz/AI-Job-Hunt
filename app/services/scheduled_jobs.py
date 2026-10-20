@@ -487,16 +487,24 @@ def compensation(ctx: JobContext) -> dict[str, Any]:
 
 def applications(ctx: JobContext) -> dict[str, Any]:
     """Report the application queue, and mark pre-submit claims whose lease ran out as UNCERTAIN (a person says what
-    happened). Submission stays a human action, so nothing is submitted here."""
-    from app.services import apply_queue
+    happened). Submission stays a human action, so nothing is submitted here.
 
+    While the application worker is off — its mode, or AGENT_GRAPHS_ENABLED, which also unschedules its own job —
+    this always-on pass settles the runs it left: expired leases are taken back and pending runs end MODE_OFF, so no
+    row stays active in Running workers or blocks a later run of the same job."""
+    from app.services import application_execution, apply_queue
+
+    worker_off: dict[str, Any] = {}
     with ctx.sessions() as db:
         uncertain = apply_queue.expire_claims(db, now=ctx.now)
+        if application_execution.mode() == "off":
+            worker_off = {"execution_leases_taken_back": application_execution.recover_expired(db, ctx.now),
+                          "executions_ended": application_execution.release(db, ctx.now)}
         counts = dict(db.execute(select(Job.state, func.count()).where(Job.state.in_((S.READY_TO_APPLY, S.APPLYING)))
                                  .group_by(Job.state)).all())
     return skipped("Automatic application submission is not enabled; approved packets stay in the apply kit",
                    ready_to_apply=counts.get(S.READY_TO_APPLY, 0), applying=counts.get(S.APPLYING, 0),
-                   claims_now_uncertain=uncertain)
+                   claims_now_uncertain=uncertain, **worker_off)
 
 
 def followups(ctx: JobContext) -> dict[str, Any]:

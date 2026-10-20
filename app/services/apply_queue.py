@@ -30,9 +30,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from sqlalchemy import desc, nulls_last, or_, select
+from sqlalchemy import desc, nulls_last, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import set_committed_value
 
 from app.models import (
     HELD_APPLICATION_CLAIM_STATUSES,
@@ -108,9 +109,6 @@ def posting_identity(job: Job) -> list[str]:
     return list(dict.fromkeys(keys))
 
 
-APPLIED_SCAN_LIMIT = 5000
-
-
 def applied_duplicate(db: Session, job: Job) -> Job | None:
     """Another saved posting of the same job already applied to: the same stored apply URL, posting URL or
     company/title/city key (as before), or any alias key `posting_identity` derives (another URL of the same posting,
@@ -127,7 +125,7 @@ def applied_duplicate(db: Session, job: Job) -> Job | None:
     keys = set(posting_identity(job))
     applied = db.scalars(select(Job).join(Application, Application.job_id == Job.id)
                          .where(Job.id != job.id, Job.user_id == job.user_id, Application.status == "applied")
-                         .order_by(Job.id).limit(APPLIED_SCAN_LIMIT)).all()
+                         .order_by(Job.id)).all()  # every one: a truncated scan would miss a duplicate
     return next((other for other in applied if keys & set(posting_identity(other))), None)
 
 
@@ -240,6 +238,8 @@ def record_blocker(db: Session, job: Job, reason: str, *, detail: str = "", ques
         claim = _claim_by_token(db, job, claim_token)
         if claim is None or claim.status != CLAIMED:
             raise ValueError("claim_token is not an open claim on this job")
+        if _lease_ran_out(claim):
+            raise ValueError(LEASE_RAN_OUT)
     blocker = {"reason": reason, "detail": (detail or "").strip()[:2000] or None, "question_ids": question_ids,
                "recorded_by": recorded_by, "recorded_at": _now().isoformat()}
     application = job.application
@@ -292,6 +292,14 @@ class RecordResult:
         return self.status in ("SUBMITTED", "ALREADY_APPLIED")
 
 
+LEASE_RAN_OUT = ("This submission's reservation ran out, so whether it was submitted is unknown; the candidate says "
+                 "what happened (Apply kit)")
+
+
+def _lease_ran_out(claim: ApplicationClaim, now: datetime | None = None) -> bool:
+    return claim.lease_expires_at is not None and claim.lease_expires_at < (now or _now())
+
+
 def claim_lease() -> timedelta:
     return timedelta(minutes=max(1, get_settings().application_claim_lease_minutes))
 
@@ -336,8 +344,19 @@ def expire_claims(db: Session, *, now: datetime | None = None, user_id: int | No
     if user_id is not None:
         query = query.where(ApplicationClaim.user_id == user_id)
     rows = db.scalars(query.order_by(ApplicationClaim.id).limit(limit)).all()
+    expired = 0
     for claim in rows:
-        claim.status = UNCERTAIN
+        # Only while it is still CLAIMED: a release or a record committed since the select wins (its keys are
+        # already settled), and this sweep never turns a finished claim back into an unknown one.
+        moved = db.execute(update(ApplicationClaim)
+                           .where(ApplicationClaim.id == claim.id, ApplicationClaim.status == CLAIMED,
+                                  ApplicationClaim.lease_expires_at < now)
+                           .values(status=UNCERTAIN)
+                           .execution_options(synchronize_session=False)).rowcount
+        if not moved:
+            continue
+        expired += 1
+        set_committed_value(claim, "status", UNCERTAIN)  # what the row now holds; no second UPDATE
         application = db.get(Application, claim.application_id) if claim.application_id else None
         if application is not None:
             db.add(ApplicationEvent(application=application, kind="note", title="Submission outcome unknown",
@@ -346,7 +365,7 @@ def expire_claims(db: Session, *, now: datetime | None = None, user_id: int | No
                                     meta={"claim_id": claim.id, "client": claim.client}))
     if rows:
         db.commit()
-    return len(rows)
+    return expired
 
 
 def _conflict(job: Job, claims: list[ApplicationClaim], *, token: str | None = None) -> ClaimResult | None:
@@ -430,6 +449,10 @@ def release_claim(db: Session, job: Job, token: str, reason: str) -> Application
     if claim is None or claim.status != CLAIMED:
         db.rollback()
         raise ValueError("claim_token is not an open claim on this job")
+    if _lease_ran_out(claim):
+        # The sweep may not have run yet: past its lease the outcome is unknown whatever the status column says.
+        db.rollback()
+        raise ValueError(LEASE_RAN_OUT)
     _finish(claim, RELEASED, f"not submitted: {(reason or 'no reason given').strip()}")
     db.commit()
     return claim

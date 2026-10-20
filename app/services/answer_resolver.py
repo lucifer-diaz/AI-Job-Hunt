@@ -18,6 +18,7 @@ existing `knowledge.search` rule): only the person's own verified saved answer, 
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -62,8 +63,10 @@ def _sensitive_question(label: str) -> bool:
 
 
 def plan(db: Session, job: Job, form: ApplicationForm, *, confirmed: list[int] | None = None,
-         requested_by: str = "application_worker") -> dict[str, Any]:
+         requested_by: str = "application_worker", before_write: Callable[[], None] | None = None) -> dict[str, Any]:
     """Each field's source and status. Saves the questions a person must answer (request_answer commits).
+    `before_write` runs before each of those saves (the graph passes its lease check, so a run that was stopped
+    meanwhile raises there and leaves no further questions behind).
     Returns {"fields": {...}, "needs_input": [question ids], "needs_confirmation": [question ids]}."""
     confirmed_ids = set(confirmed or [])
     profile = _profile(db)
@@ -73,6 +76,8 @@ def plan(db: Session, job: Job, form: ApplicationForm, *, confirmed: list[int] |
     for field in form.fields:
         entry = _resolve(db, job, profile, field, confirmed_ids)
         if entry["status"] == NEEDS_INPUT and field.required:
+            if before_write is not None:
+                before_write()
             saved = knowledge.request_answer(
                 db, job, field.label, answer_options=[o.label for o in field.options] or None,
                 answer_type=("choice" if field.options else "boolean" if field.kind == "checkbox" else "text"),
@@ -118,7 +123,7 @@ def _resolve(db: Session, job: Job, profile: Any, field: FormField, confirmed: s
         if not letter:
             return _entry(field, NEEDS_INPUT)
         return _entry(field, RESOLVED, "packet.cover_letter_file" if field.kind == "file" else "packet.cover_letter")
-    found = knowledge.search(db, field.label, 5)
+    found = knowledge.search(db, field.label, 50)  # enough sensitive rows to find the same question among similar ones
     status = found["status"]
     if status == "ANSWERED" and (found.get("answer_source") or "").startswith("knowledge_answer:"):
         answer = found["answer"]
@@ -129,11 +134,18 @@ def _resolve(db: Session, job: Job, profile: Any, field: FormField, confirmed: s
         return _entry(field, RESOLVED, found["answer_source"]) if field.kind not in ("select", "radio") \
             else _entry(field, NEEDS_INPUT)
     if status == "NEEDS_CONFIRMATION":
-        question_id = int(found["answer_source"].split(":")[1])
+        # knowledge.search withholds sensitive answers to *similar* questions too (for a person reading them). A form
+        # value may only come from the same question: "Are you authorized to work in the US?" and "Will you require
+        # sponsorship to work in the US?" are similar, and the same saved "Yes" means the opposite in each.
+        same = next((s for s in found.get("sensitive_answers") or []
+                     if knowledge.same_question(field.label, s["question"])), None)
+        if same is None:
+            return _entry(field, NEEDS_INPUT, why="only a similar question has a saved sensitive answer")
+        question_id = same["id"]
         if question_id in confirmed:
-            return _entry(field, RESOLVED, found["answer_source"], sensitive=True, question_id=question_id,
+            return _entry(field, RESOLVED, same["source"], sensitive=True, question_id=question_id,
                           confirmed=True)
-        return _entry(field, CONFIRM, found["answer_source"], sensitive=True, question_id=question_id)
+        return _entry(field, CONFIRM, same["source"], sensitive=True, question_id=question_id)
     return _entry(field, NEEDS_INPUT, why=status)
 
 

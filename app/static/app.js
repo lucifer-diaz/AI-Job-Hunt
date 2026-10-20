@@ -1472,11 +1472,15 @@ function renderKitClaim(k) {
 function renderKitExecution(k) {
   const x = k.execution, mode = k.execution_mode;
   if (!mode || mode === 'off') return '';
-  const waiting = x && x.stage === 'NEEDS_INPUT', confirm = (x?.interrupt?.confirm_question_ids) || [];
+  const waiting = x && x.stage === 'NEEDS_INPUT';
+  // Each sensitive answer is shown with the question it answers before it is confirmed: a person authorizes the
+  // values they can see, never a count. Only the ones shown are sent.
+  const confirm = waiting ? (k.execution_confirmations || []) : [];
+  const confirmList = confirm.length ? `<div class="mt8">${confirm.map(c => `<div class="small mt6"><div class="ink2 pretty">${esc(c.question)}</div><div class="b pretty">${esc(c.answer || '(no saved answer)')}</div></div>`).join('')}</div>` : '';
   const state = !x ? '' : `<div class="row gap8 mt8">${pill(x.stage.replaceAll('_', ' '), x.stage === 'READY_TO_SUBMIT' ? 'good' : ['BLOCKED', 'NEEDS_HUMAN', 'FAILED'].includes(x.stage) ? 'warn' : 'muted')}${x.result_code ? `<span class="xs muted">${esc(x.result_code)}</span>` : ''}</div>
     ${waiting && (x.interrupt.question_ids || []).length ? `<div class="xs muted mt6">Answer ${x.interrupt.question_ids.length} question(s) in the Knowledge bank; it continues by itself.</div>` : ''}
-    ${waiting && confirm.length ? btn(`Confirm ${confirm.length} sensitive answer(s) for this application`, 'kit-confirm', { exec: x.id, ids: confirm.join(',') }, 'sm mt8') : ''}
-    ${x.stage === 'READY_TO_SUBMIT' ? '<div class="xs muted mt6 pretty">The form was filled and checked in a private browser page. Submit it yourself on their site.</div>' : ''}`;
+    ${waiting && confirm.length ? `${confirmList}${btn(confirm.length === 1 ? 'Use this answer for this application' : `Use these ${confirm.length} answers for this application`, 'kit-confirm', { exec: x.id, ids: confirm.map(c => c.id).join(',') }, 'sm mt8')}` : ''}
+    ${x.stage === 'READY_TO_SUBMIT' ? `<div class="xs muted mt6 pretty">${x.mode === 'ASSIST' ? 'Every required field was filled from a verified source in a private browser page, which was then closed: nothing was kept there or sent.' : 'Every required field has a verified source.'} Open the posting and fill it in yourself with the answers in this kit, then submit it there.</div>` : ''}`;
   const active = x && ['PENDING', 'PROCESSING'].includes(x.status);
   return `<div class="box mb12" style="padding:13px;border-radius:12px"><div class="small b">Application worker · ${esc(mode)}</div>
     <div class="xs muted mt4 pretty">Reads the form and finds a verified source for every answer${mode === 'assist' ? ', then fills it in a private page' : ''}. It never submits.</div>
