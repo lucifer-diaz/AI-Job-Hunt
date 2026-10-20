@@ -20,7 +20,7 @@ from app.prompts.mcp_application import APPLICATION_RULES, MCP_APPLICATION_PROMP
 from app.prompts.mcp_review import MCP_REVIEW_PROMPT_VERSION, REVIEW_RULES
 from app.prompts.mcp_tailoring import MCP_TAILORING_PROMPT_VERSION, TAILORING_RULES
 from app.prompts.tailoring import JOB_FIELDS, fit_analysis_input
-from app.services import apply_queue, conversation_actions, knowledge
+from app.services import apply_queue, approval, conversation_actions, knowledge
 from app.services import resume_verification as rv
 from app.services.context_builder import ContextError
 from app.services.ranker import policy_for, relevant_evidence
@@ -476,7 +476,7 @@ def list_jobs_for_application(db: Session, reviewer_score_above: float | None = 
              "posting_url": r["job"].url or r["job"].source_url or None,
              "reviewer_score": r["resume"].reviewer_score, "fit_score": r["job"].fit_score,
              "resume_version": r["resume"].version, "approved_at": _iso(r["application"].approved_at),
-             "blocker": _blocker_out(r["blocker"])} for r in page]
+             "blocker": _blocker_out(r["blocker"]), "claim": _claim_out(r.get("claim"))} for r in page]
     next_offset = offset + len(page) if offset + len(page) < len(ready) else None
     return {"ok": True, "reviewer_score_above": threshold, "total": len(ready), "offset": offset,
             "count": len(jobs), "next_offset": next_offset, "jobs": jobs}
@@ -501,7 +501,7 @@ def get_job_packet(db: Session, job_id: int, formats: list[str] | None = None,
             "resume": {"resume_id": resume.id, "version": resume.version, "reviewer_score": resume.reviewer_score,
                        "approved_at": _iso(application.approved_at), "markdown": resume.markdown,
                        "summary": content.get("summary", "")},
-            "cover_letter": resume.cover_letter or "",
+            "cover_letter": approval.packet_content(resume)["cover_letter"],
             "screening_answer_drafts": content.get("screening_answer_drafts") or {},
             "files": apply_queue.packet_files(db, job, resume, formats, include_content=bool(include_content)),
             "blocker": _blocker_out(apply_queue.open_blocker(db, application))}
@@ -528,38 +528,76 @@ def request_human_answer(db: Session, job_id: int, question: str, answer_options
     return {"ok": True, "job_id": job.id, **saved}
 
 
+def _claim_out(claim: Any) -> dict[str, Any] | None:
+    if claim is None:
+        return None
+    return {"claim_id": claim.id, "status": claim.status, "client": claim.client, "job_id": claim.job_id,
+            "claimed_at": _iso(claim.claimed_at), "lease_expires_at": _iso(claim.lease_expires_at)}
+
+
+def begin_application_submission(db: Session, job_id: int) -> dict[str, Any]:
+    job = _job(db, job_id)
+    result = apply_queue.begin_submission(db, job, client="mcp")
+    if not result.ok:
+        return {"ok": False, "status": result.status, "job_id": job.id, "error": result.reason,
+                "conflict_job_id": result.conflict_job_id}
+    claim = result.claim
+    return {"ok": True, "status": "CLAIMED", "job_id": job.id, "claim_token": claim.token,
+            "identity": claim.identity, "lease_expires_at": _iso(claim.lease_expires_at)}
+
+
+def release_application_claim(db: Session, job_id: int, claim_token: str, reason: str) -> dict[str, Any]:
+    job = _job(db, job_id)
+    if not isinstance(claim_token, str) or not claim_token.strip():
+        raise ToolError("claim_token is required")
+    try:
+        claim = apply_queue.release_claim(db, job, claim_token, reason or "")
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+    return {"ok": True, "status": "RELEASED", "job_id": job.id, "claim": _claim_out(claim)}
+
+
 def record_application_result(db: Session, job_id: int, outcome: str, confirmation_id: str | None = None,
                               blocker_reason: str | None = None, detail: str | None = None,
-                              question_ids: list[int] | None = None) -> dict[str, Any]:
+                              question_ids: list[int] | None = None, claim_token: str | None = None) -> dict[str, Any]:
     job = _job(db, job_id)
     if outcome not in ("submitted", "blocked"):
         raise ToolError("outcome must be submitted or blocked")
     if question_ids is not None and not (isinstance(question_ids, list)
                                          and all(isinstance(i, int) and not isinstance(i, bool) for i in question_ids)):
         raise ToolError("question_ids must be a list of integers")
-    application = apply_queue.lock_application(db, job)
-    if application is not None and application.status == "applied":
-        # Idempotent: a second report of the same submission changes nothing.
-        return {"ok": True, "status": "ALREADY_APPLIED", "job_id": job.id, "job_status": job.status,
-                "applied_at": _iso(application.applied_at), "confirmation_id": application.confirmation_id,
-                "submitted_via": application.submitted_via}
-    if application is None or application.status != "approved" or job.status != "approved":
-        raise ToolError(f"Job {job.id} is {job.status}, not approved for application")
+    if claim_token is not None and not isinstance(claim_token, str):
+        raise ToolError("claim_token must be a string")
     if outcome == "blocked":
+        application = apply_queue.lock_application(db, job)
+        if application is not None and application.status == "applied":
+            return {"ok": True, "status": "ALREADY_APPLIED", "job_id": job.id, "job_status": job.status,
+                    "applied_at": _iso(application.applied_at), "confirmation_id": application.confirmation_id,
+                    "submitted_via": application.submitted_via}
+        if application is None or application.status != "approved" or job.status != "approved":
+            raise ToolError(f"Job {job.id} is {job.status}, not approved for application")
         try:
             blocker = apply_queue.record_blocker(db, job, blocker_reason or "", detail=detail or "",
-                                                 question_ids=question_ids)
+                                                 question_ids=question_ids, claim_token=claim_token)
         except ValueError as exc:
             raise ToolError(str(exc)) from exc
         return {"ok": True, "status": "BLOCKED", "job_id": job.id, "job_status": job.status,
                 "blocker": _blocker_out(blocker)}
-    duplicate = apply_queue.applied_duplicate(db, job)
-    if duplicate is not None:
-        db.rollback()
-        return {"ok": False, "status": "DUPLICATE_APPLICATION", "job_id": job.id, "duplicate_of_job_id": duplicate.id,
-                "error": f"Already applied to the same posting as job {duplicate.id} ({duplicate.company}); "
-                         "not recorded"}
-    application = apply_queue.record_submission(db, job, confirmation_id=confirmation_id)
+    result = apply_queue.record_submission(db, job, claim_token=claim_token, client="mcp",
+                                           confirmation_id=confirmation_id)
+    application = result.application
+    if result.status == "ALREADY_APPLIED":
+        # Idempotent: a second report of the same submission changes nothing.
+        return {"ok": True, "status": "ALREADY_APPLIED", "job_id": job.id, "job_status": job.status,
+                "applied_at": _iso(application.applied_at), "confirmation_id": application.confirmation_id,
+                "submitted_via": application.submitted_via}
+    if result.status == "NOT_APPROVED":
+        raise ToolError(result.reason or f"Job {job.id} is not approved for application")
+    if result.status == "DUPLICATE_APPLICATION":
+        return {"ok": False, "status": "DUPLICATE_APPLICATION", "job_id": job.id,
+                "duplicate_of_job_id": result.duplicate_job_id, "error": f"{result.reason}; not recorded"}
+    if not result.ok:
+        return {"ok": False, "status": result.status, "job_id": job.id, "error": f"{result.reason}; not recorded"}
     return {"ok": True, "status": "SUBMITTED", "job_id": job.id, "job_status": job.status,
             "applied_at": _iso(application.applied_at), "confirmation_id": application.confirmation_id,
-            "followup_due_at": _iso(application.followup_due_at)}
+            "followup_due_at": _iso(application.followup_due_at), "claimed": result.claimed}

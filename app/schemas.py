@@ -91,6 +91,10 @@ class RecruiterIn(BaseModel):
     recruiter_name: str = ""
     recruiter_email: str = ""
     notes: str = ""
+    # The token "Start submission" (POST /api/jobs/{id}/submission/start) returned; omitted when a person reports an
+    # application they made without starting it here.
+    claim_token: str | None = None
+    confirmation_id: str | None = None
 
 
 class TailoringLengthIn(BaseModel):

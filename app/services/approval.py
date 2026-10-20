@@ -241,8 +241,20 @@ def guard_edit(db: Session, variant: ResumeVariant, what: str) -> None:
         return
     if application.status in SUBMITTED_STATUSES or application.applied_at is not None:
         raise ValueError("This application has been submitted; its packet can no longer be edited")
+    if application.status == "approved" and application.approved_resume_id == variant.id and _submission_open(db, job):
+        raise ValueError("A submission of this packet has started; say whether it was submitted (Apply kit) before "
+                         "editing it")
     if application.status == "approved" and application.approved_resume_id == variant.id:
         revoke(db, job, f"{what} edited after approval")
+
+
+def _submission_open(db: Session, job: Job) -> bool:
+    """A pre-submit claim on this job is open or its outcome unknown (apply_queue): the packet may be at the employer."""
+    from app.models import ApplicationClaim
+
+    return db.scalar(select(ApplicationClaim.id).where(ApplicationClaim.job_id == job.id,
+                                                       ApplicationClaim.status.in_(("CLAIMED", "UNCERTAIN")))
+                     .limit(1)) is not None
 
 
 def export_variant(db: Session, job_id: int) -> ResumeVariant | None:

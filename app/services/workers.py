@@ -36,6 +36,7 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.models import (
+    ApplicationExecutionTask,
     AppSetting,
     Job,
     JobDescriptionFetchTask,
@@ -210,6 +211,12 @@ KINDS: dict[str, WorkerKind] = {k.kind: k for k in (
                "the Tailoring worker.", JobPreparationTask, "preparation", "PENDING", "PROCESSING",
                ("COMPLETED", "FAILED", "SKIPPED"), lambda: get_settings().preparation_max_attempts, "preparation",
                scope=_qualification_scope),
+    WorkerKind("application", "Application", "Reads an approved job's application form, finds a verified source for "
+               "every answer and (in assist mode) fills it in a private browser page, then stops at ready to submit "
+               "for you (LangGraph). It never submits: you do, from the Apply kit. A login, code or CAPTCHA waits for "
+               "you.", ApplicationExecutionTask, "application_execution", "PENDING", "PROCESSING",
+               ("COMPLETED", "FAILED", "SKIPPED"), lambda: get_settings().application_execution_max_attempts,
+               "application_execution"),
     WorkerKind("insights", "Job insights", "Researches approved jobs (posting, company site, Glassdoor and PayScale "
                "when configured), then a model organises what was found.", JobInsightTask, "job_insights", "PENDING",
                "PROCESSING", ("COMPLETED", "PARTIAL", "FAILED", "SKIPPED"),
@@ -258,7 +265,8 @@ def _display_status(spec: WorkerKind, task: Any, now: datetime) -> str:
 
 
 def _started_graph_run(spec: WorkerKind, task: Any) -> bool:
-    return spec.kind in ("qualification", "preparation") and getattr(task, "agent_thread_id", None) is not None
+    return spec.kind in ("qualification", "preparation", "application") \
+        and getattr(task, "agent_thread_id", None) is not None
 
 
 def _attempts(spec: WorkerKind, task: Any) -> int:
@@ -839,6 +847,10 @@ def _stop(db: Session, spec: WorkerKind, task: Any, user_id: int, now: datetime)
         from app.services import preparation
 
         preparation.on_stopped(db, task, now)  # its thread and the tailoring pass it queued stop too
+    if spec.kind == "application":
+        from app.services import application_execution
+
+        application_execution.on_stopped(db, task, now)  # its graph thread stops too, and its stage is CANCELLED
     if spec.kind == "insights" and getattr(task, "agent_thread_id", None):
         from app.services import qualification
 
@@ -926,6 +938,10 @@ def _requeue_finished(db: Session, spec: WorkerKind, task: Any, user_id: int) ->
         from app.services import preparation
 
         return preparation.requeue(db, task, user_id)
+    elif spec.kind == "application":
+        from app.services import application_execution
+
+        return application_execution.requeue(db, task, user_id)
     elif spec.kind == "insights":
         from app.services.job_insights import tasks as insight_tasks
 

@@ -299,7 +299,9 @@ def test_a_submission_is_recorded_once(account):
         assert application.status == "applied" and application.submitted_via == "claude_desktop"
         events = db.scalars(select(ApplicationEvent).where(ApplicationEvent.application_id == application.id)).all()
         assert [e.kind for e in events] == ["applied"]
-        assert "Claude Desktop" in events[0].detail and events[0].meta == {"confirmation_id": "GRAB-12345"}
+        assert "Claude Desktop" in events[0].detail
+        assert events[0].meta["confirmation_id"] == "GRAB-12345"
+        assert events[0].meta["claim"] == "unclaimed" and events[0].meta["client"] == "mcp"
     assert [j["company"] for j in call(uid, "list_jobs_for_application")["jobs"]] == ["Stripe"]
     assert call(uid, "get_job_packet", job_id=grab)["ok"] is False
 

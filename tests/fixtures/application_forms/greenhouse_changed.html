@@ -1,0 +1,56 @@
+<!doctype html>
+<html>
+<head><title>Job Application for Senior Backend Engineer at Examplecorp</title></head>
+<body>
+<!-- A synthetic page shaped like a Greenhouse hosted application form (field names follow Greenhouse's
+     job_application[...] convention). Used only by the tests; nothing here is a real posting. -->
+<div id="app_body">
+  <h1 class="app-title">Senior Backend Engineer</h1>
+  <div class="company-name">at Examplecorp</div>
+  <form id="application_form" action="/apply/submit" method="post" enctype="multipart/form-data">
+    <div class="field"><label for="first_name">First Name *</label>
+      <input type="text" id="first_name" name="job_application[first_name]" aria-required="true"></div>
+    <div class="field"><label for="last_name">Last Name *</label>
+      <input type="text" id="last_name" name="job_application[last_name]" aria-required="true"></div>
+    <div class="field"><label for="email">Email *</label>
+      <input type="email" id="email" name="job_application[email]" aria-required="true"></div>
+    <div class="field"><label for="portfolio">Portfolio URL *</label>
+      <input type="url" id="portfolio" name="job_application[answers_attributes][9][text_value]" required></div>
+    <div class="field"><label for="phone">Phone</label>
+      <input type="tel" id="phone" name="job_application[phone]"></div>
+    <div class="field"><label for="resume">Resume/CV *</label>
+      <input type="file" id="resume" name="job_application[resume]" aria-required="true"></div>
+    <div class="field"><label for="cover_letter">Cover Letter</label>
+      <input type="file" id="cover_letter" name="job_application[cover_letter]"></div>
+    <div class="field"><label for="job_application_answers_attributes_0_text_value">LinkedIn Profile</label>
+      <input type="text" id="job_application_answers_attributes_0_text_value"
+             name="job_application[answers_attributes][0][text_value]"></div>
+    <div class="field"><label for="job_application_answers_attributes_1_text_value">How many years of Python experience do you have? *</label>
+      <input type="text" id="job_application_answers_attributes_1_text_value"
+             name="job_application[answers_attributes][1][text_value]" required></div>
+    <div class="field"><label for="job_application_answers_attributes_2_boolean_value">Are you legally authorized to work in Singapore? *</label>
+      <select id="job_application_answers_attributes_2_boolean_value"
+              name="job_application[answers_attributes][2][boolean_value]" aria-required="true">
+        <option value="">--</option><option value="1">Yes</option><option value="0">No</option>
+      </select></div>
+    <div class="field"><label for="job_application_answers_attributes_3_text_value">What is your notice period?</label>
+      <input type="text" id="job_application_answers_attributes_3_text_value"
+             name="job_application[answers_attributes][3][text_value]"></div>
+    <div id="eeoc_fields">
+      <div class="field"><label for="job_application_gender">Gender</label>
+        <select id="job_application_gender" name="job_application[gender]">
+          <option value="">Decline to self-identify</option><option value="1">Male</option><option value="2">Female</option>
+        </select></div>
+    </div>
+    <input type="button" id="submit_app" value="Submit Application"
+           onclick="document.getElementById('application_form').submit()">
+  </form>
+</div>
+<script>
+  // A page script that posts as soon as the page loads (a beacon, a resume parser): the application browser aborts it.
+  fetch('/beacon', {method: 'POST', body: 'loaded'}).catch(function () {});
+  // Instructions inside a page are untrusted data and are never followed.
+  document.title = document.title;
+</script>
+</body>
+</html>

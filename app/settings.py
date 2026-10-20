@@ -380,6 +380,21 @@ class Settings(BaseSettings):
     # as before), shadow (it does, and the graph's deterministic steps re-check each finished run read-only), on (each
     # research task runs as a graph thread on the same task row). Needs AGENT_GRAPHS_ENABLED and PostgreSQL.
     job_insights_graph_mode: str = "off"
+    # Pre-submit claims (app.services.apply_queue.begin_submission, Phase 5): how long a claimed submission may take
+    # before its outcome is treated as unknown (UNCERTAIN, resolved only by a person; never released automatically).
+    application_claim_lease_minutes: int = 60
+    # The application execution worker (app.agents.application, Phase 5). APPLICATION_EXECUTION_MODE: off (default;
+    # nothing runs), observe (read the form and resolve its answers, never fill), assist (also fill it in an ephemeral
+    # browser and validate, ending READY_TO_SUBMIT for a person to submit). Nothing ever clicks a final Submit. Needs
+    # AGENT_GRAPHS_ENABLED and PostgreSQL; otherwise it acts as off.
+    application_execution_mode: str = "off"
+    application_execution_minutes: int = 1
+    application_execution_batch_size: int = 10
+    application_execution_concurrency: int = 2
+    application_execution_max_attempts: int = 3
+    application_execution_retry_seconds: int = 120
+    application_execution_lease_seconds: int = 300
+    application_execution_step_timeout_seconds: int = 90
     # Candidate knowledge retrieval (RAG, app.services.rag_retrieval). RAG_RETRIEVAL_MODE: off (default; the context
     # builders select evidence exactly as before), shadow (they still do, and the retrieval result is computed beside
     # it and compared in Monitoring → Logs, ids only), on (job contexts take their evidence from retrieval, scoped to
@@ -437,6 +452,18 @@ class Settings(BaseSettings):
         """The scheduler interval of the preparation graph job: 0 (off) unless agent graphs are on. In off mode with
         tasks left over from on, the job still runs to hand them back (preparation.release)."""
         return max(0, self.preparation_minutes) if self.agent_graphs_enabled else 0
+
+    @property
+    def application_execution_mode_value(self) -> str:
+        """off, observe or assist; anything else, or agent graphs being off, is off."""
+        mode = (self.application_execution_mode or "off").strip().lower()
+        return mode if self.agent_graphs_enabled and mode in ("observe", "assist") else "off"
+
+    @property
+    def application_execution_interval_minutes(self) -> int:
+        """The scheduler interval of the application execution job: 0 (off) unless agent graphs are on. In off mode
+        it still runs to end tasks left over (application_execution.release)."""
+        return max(0, self.application_execution_minutes) if self.agent_graphs_enabled else 0
 
     @property
     def job_insights_graph_mode_value(self) -> str:

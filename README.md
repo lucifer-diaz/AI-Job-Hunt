@@ -2401,7 +2401,9 @@ Claude
   search_application_knowledge      saved answers, verified evidence and profile facts, each with its source
   request_human_answer              when nothing answers it: saved to the Knowledge bank with the job and the
                                     form's options, for you to answer
-→ record_application_result         submitted (with the portal's confirmation ID) or blocked (with the reason)
+→ begin_application_submission      right before the final click: reserves the posting (and any other saved copy
+                                    of it) for this one submission and returns a claim_token; submit only on CLAIMED
+→ record_application_result         submitted (with the portal's confirmation ID and the claim_token) or blocked
 ```
 
 | Tool | Returns / does |
@@ -2410,9 +2412,51 @@ Claude
 | `get_job_packet` | The approved resume, cover letter and screening drafts, plus `files`: `pdf` and `docx` with `path`, `filename`, `size_bytes` and `sha256` (`include_content=true` also returns them base64-encoded). Refused for a job that is not approved, is already applied to, or is at or below the reviewer floor. |
 | `search_application_knowledge` | A `status` and the sources behind it. `ANSWERED`: a verified saved answer to the same question (only filler words may differ), or a contact detail from your profile. Answers to merely similar questions ("years of Python" vs "years of Java") are listed in `similar_questions` and never used. `SUPPORTED`: only facts (verified evidence, work authorization) to compose an answer from. `NEEDS_CONFIRMATION`: a saved answer marked sensitive, which you confirm for each application, so its text is not returned and Claude asks you in the conversation. `PENDING_HUMAN`: already waiting for you. `UNKNOWN`: nothing supports an answer. Unverified evidence and unverified answers are never used. |
 | `request_human_answer` | Saves the question (once per distinct question) as an unanswered, unverified Knowledge bank entry with the form's options and the job that asked. The Knowledge bank shows *Asked by Company · Title — Options: …*. A question that already has a verified answer is not reopened. |
-| `record_application_result` | `submitted` marks the job applied (the same path as the Apply screen: follow-up date, tracker event, confirmation ID). A job already applied to is never recorded again: a repeat returns `ALREADY_APPLIED` and changes nothing, and a duplicate posting of a job already applied to is refused. `blocked` records `captcha`, `login_required`, `account_required`, `needs_human_answer`, `missing_document`, `posting_closed`, `form_error` or `other`; a `needs_human_answer` blocker clears itself once you have answered and verified its questions, except sensitive ones, which stay open until the application is submitted. Submissions for one account are recorded one at a time, so two sessions cannot both submit duplicate postings. |
+| `begin_application_submission` | The pre-submit claim (§10a): `CLAIMED` with a `claim_token`, or why not to submit — `CLAIM_CONFLICT` (someone else is submitting this posting or another saved copy of it), `UNCERTAIN` (an earlier submission was never reported; you say what happened in the Apply kit), `DUPLICATE` or `NOT_READY`. |
+| `release_application_claim` | Frees a claim when nothing was submitted. A claim whose outcome is unknown is never released by a client. |
+| `record_application_result` | `submitted` marks the job applied (the same path as the Apply screen: follow-up date, tracker event, confirmation ID). A job already applied to is never recorded again: a repeat returns `ALREADY_APPLIED` and changes nothing, and a duplicate posting of a job already applied to is refused. `blocked` records `captcha`, `login_required`, `account_required`, `needs_human_answer`, `missing_document`, `posting_closed`, `form_error` or `other`; a `needs_human_answer` blocker clears itself once you have answered and verified its questions, except sensitive ones, which stay open until the application is submitted. Submissions for one account are recorded one at a time, so two sessions cannot both submit duplicate postings. Pass the `claim_token`; a report without one (older clients) is still recorded, as unclaimed, unless another client holds the posting. |
 
 Job Hunt OS never submits anything itself, and these tools never create accounts, accept terms or change the approval. The `apply_to_jobs` prompt starts the workflow with the rules included.
+
+### 10a. Pre-submit claims and the application worker (Phase 5)
+
+**One submission per posting.** Before anything is submitted — by Claude Desktop, by you from the Apply kit, or (from
+Phase 6) by a worker — Job Hunt OS reserves the posting (`apply_queue.begin_submission`). The reservation covers every
+saved copy of the same posting: another URL of it (with or without `www`, tracking parameters or a trailing slash),
+the board's own job id, and the stored company/title/city key. A second client gets `CLAIM_CONFLICT`, never a second
+go. When a claimed submission is never reported, it becomes **uncertain** after `APPLICATION_CLAIM_LEASE_MINUTES`
+(60): the posting stays reserved and the Apply kit asks you whether it went through. It is never freed automatically.
+An approved packet cannot be edited while its submission is open.
+
+In the Apply kit: **Start submission** before you submit on the employer's site, then **Yes — mark applied** (or
+**I didn't submit — release it**). Marking a job applied without starting is still possible, and is checked the same
+way (approved packet unchanged, no duplicate, nobody else submitting). Applications you send entirely outside Job Hunt
+OS cannot be locked; they are reconciled when you report them.
+
+**The application worker** (`APPLICATION_EXECUTION_MODE`, off by default; needs `AGENT_GRAPHS_ENABLED` and
+PostgreSQL) prepares an approved job's form. It never submits.
+
+| Mode | What it does |
+| --- | --- |
+| `off` | Nothing runs (tasks left over are ended). |
+| `observe` | Opens the form in a private browser page, reads it, and finds a verified source for every answer. |
+| `assist` | Also fills the form in that private page and checks every required field, ending **Ready to submit**. You then submit on the employer's site. |
+
+Answers come only from your profile's contact fields, the approved packet (resume file, cover letter) and verified
+Knowledge bank answers to the same question. A sensitive answer (work authorization, demographics…) is used only once
+you confirm it for that application (Apply kit → Confirm). A required question nothing answers is saved to the
+Knowledge bank and the run waits until you answer it; optional ones and voluntary self-identification stay empty.
+A login page, a verification code or a CAPTCHA stops the run for you (recorded as the application's blocker); it is
+never worked around. The packet's approval digest is checked when the run is queued and again right before the form
+is filled. The worker's private page shares nothing with JD recovery, keeps nothing after each step, and aborts every
+request that is not a GET, so nothing can be posted from it. Today it reads Greenhouse forms (hosted and embedded).
+
+It appears in **Running workers → Application** (Kill, Retry, Run now, settings) and in AI Orchestration as
+*Application worker*. Try it end to end, locally, with real Chromium:
+
+```bash
+python scripts/application_dry_run.py postgresql+psycopg://localhost/jobhunt_test
+```
 
 ### Recommended batch sizes
 
@@ -2478,7 +2522,7 @@ JOBHUNT_MCP_TOKEN=jhos_mcp_... PYTHONPATH=$PWD .venv/bin/python -m app.mcp
 
 ### Safety and data rules
 
-- Claude can't access arbitrary database records. The server exposes only the nine tools above, and every query is limited to the token's account.
+- Claude can't access arbitrary database records. The server exposes only the tools listed above, and every query is limited to the token's account.
 - No tool accepts SQL, file paths, shell commands or settings, and no tool returns API keys or environment variables.
 - Resume facts must come from your CandidateProfile, master resume and verified evidence. The backend enforces this before saving.
 - Claude can't bypass your candidate policy or control workflow state. Python code decides both.

@@ -22,7 +22,8 @@ from typing import Any
 from sqlalchemy import event
 from sqlalchemy.orm import Session, with_loader_criteria
 
-from app.models import (AgentEffect, AgentThread, EvidenceResumeLink, RagIndexEntry, RagIndexVersion,
+from app.models import (AgentEffect, ApplicationClaim, ApplicationClaimKey, ApplicationExecutionAttempt,
+                        ApplicationExecutionTask, AgentThread, EvidenceResumeLink, RagIndexEntry, RagIndexVersion,
                         AIConfigAuditEntry, AIConfigVersion, AIModel, AIOptimizationReport, AIOptimizationTask,
                         AIRoutingConfig, AppSetting, Application, ApplicationCommunicationEvent, ApplicationEmailMessage,
                         ApplicationEvent, ApplicationInboxDigest, CandidateProfile, GmailConnection, LiteLLMConnection,
@@ -44,7 +45,8 @@ OWNED_MODELS = (CandidateProfile, AppSetting, ResumeDocument, KnowledgeAnswer, E
                 AIConfigAuditEntry, GmailConnection, ApplicationEmailMessage, ApplicationCommunicationEvent,
                 ApplicationInboxDigest, JobInsightTask, JobInsight, InsightObservation, ModelRouteState, FailoverEvent,
                 AgentThread, AgentEffect, EvidenceResumeLink, RagIndexVersion, RagIndexEntry, JobQualificationTask,
-                JobPreparationTask, ApprovedPacket)
+                JobPreparationTask, ApprovedPacket, ApplicationClaim, ApplicationClaimKey, ApplicationExecutionTask,
+                ApplicationExecutionAttempt)
 # Rows that inherit their owner from a parent row: model -> (relationship, foreign key, parent model).
 INHERITED_OWNER = {
     Application: ("job", "job_id", Job),
@@ -60,6 +62,10 @@ INHERITED_OWNER = {
     JobQualificationTask: ("job", "job_id", Job),
     JobPreparationTask: ("job", "job_id", Job),
     ApprovedPacket: ("job", "job_id", Job),
+    ApplicationClaim: ("job", "job_id", Job),
+    ApplicationClaimKey: ("claim", "claim_id", ApplicationClaim),
+    ApplicationExecutionTask: ("job", "job_id", Job),
+    ApplicationExecutionAttempt: ("task", "task_id", ApplicationExecutionTask),
     JobInsight: ("job", "job_id", Job),
     InsightObservation: ("insight", "job_insight_id", JobInsight),
     WorkflowTransition: ("job", "job_id", Job),

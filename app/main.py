@@ -33,6 +33,7 @@ from sqlalchemy.orm import Session
 
 from app import auth
 from app.agents_api import router as agents_router
+from app.application_api import router as application_router
 from app.rag_api import router as rag_router
 from app.ai_models_api import router as ai_models_router
 from app.failover_api import router as failover_router
@@ -133,7 +134,6 @@ from app.services.workflow import (
     SKIP_TAILORING_STATUSES,
     approve_job,
     get_profile,
-    mark_applied,
     skip_tailoring,
     tailor_job,
 )
@@ -191,6 +191,7 @@ app.include_router(discovery_router)
 app.include_router(ai_models_router)
 app.include_router(failover_router)
 app.include_router(application_inbox_router)
+app.include_router(application_router)
 app.include_router(setup_guide_router)
 app.include_router(agents_router)
 app.include_router(rag_router)
@@ -819,13 +820,31 @@ def approve(job_id: int, payload: ApproveIn | None = None, db: Session = Depends
 
 @app.post("/api/jobs/{job_id}/applied")
 def applied(job_id: int, payload: RecruiterIn, db: Session = Depends(get_user_db)):
+    from app.services import apply_queue
+
     job = db.get(Job, job_id)
     if not job:
         raise HTTPException(404, "Job not found")
-    try:
-        app_obj = mark_applied(db, job)
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
+    if job.application is None:
+        # A person reporting an application made before approving it here: approve the packet first (as before).
+        try:
+            approve_job(db, job)
+        except ApprovalRefused as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    # The one recorder MCP uses too: account lock, approved digest, duplicates and other clients' claims.
+    result = apply_queue.record_submission(
+        db, job, claim_token=payload.claim_token, client="apply_kit", confirmation_id=payload.confirmation_id,
+        submitted_by="you", submitted_via="apply_kit" if payload.claim_token else "manual")
+    if result.status == "NOT_APPROVED":
+        raise HTTPException(400, "Application must be approved before marking applied")
+    if not result.ok:
+        raise HTTPException(409, {"message": result.reason or "Not recorded", "status": result.status,
+                                  "duplicate_of_job_id": result.duplicate_job_id})
+    app_obj = result.application
+    if result.status == "ALREADY_APPLIED":
+        return {"status": app_obj.status, "followup_due_at": app_obj.followup_due_at, "already_applied": True}
     feedback_learning.record(db, job, "APPLIED")
     # Only overwrite what the confirmation step actually supplied.
     if payload.recruiter_name or payload.recruiter_email:
