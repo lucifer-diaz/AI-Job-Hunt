@@ -60,6 +60,9 @@ from app.services.user_settings import candidate_policy
 
 log = logging.getLogger("jobhunt.context_builder")
 
+# v5: the verified background (leadership, AI, cloud, data flags) is derived from verified units only, the summary
+# included: an unverified or edited summary no longer sets a flag. Only that block changes; the ranking identity
+# (latest_ranking_context_hash) does not cover it, so no job is re-ranked because of it.
 # v4: generation tasks (tailoring, cover letters) pick bullets and evidence by the parsed posting's skills,
 # responsibilities and keywords as well as its words; tailoring and letters also carry a requirement map (the Ranker's
 # matched requirements with the ids that prove them) and keyword targets (app.services.ats_keywords.targets).
@@ -69,7 +72,7 @@ log = logging.getLogger("jobhunt.context_builder")
 # near-identical items collapse to one. Evidence is sent as {id, company, role, claim}.
 # v2: task-specific projections (no search configuration), the Tailor's canonical source resume with evidence ids per
 # bullet, the completed-FitAnalysis gate, provenance exclusion and pre-prompt consistency checks.
-CONTEXT_BUILDER_VERSION = "v4"
+CONTEXT_BUILDER_VERSION = "v5"
 # Two texts state the same fact when this share of their distinctive words overlaps (Jaccard).
 SAME_CLAIM = 0.6
 BULLET_KINDS = {"achievements": "achievement", "responsibilities": "responsibility"}
@@ -474,8 +477,12 @@ def _reviewed_list(data: dict[str, Any], section: str, allowed: tuple[str, ...],
 
 
 def _filtered(data: dict[str, Any], allowed: tuple[str, ...]) -> dict[str, Any]:
-    """A copy holding only units with an allowed status, for derived facts that must not use other data."""
+    """A copy holding only units with an allowed status, for derived facts that must not use other data. The summary
+    is a unit too: structured_resume.derive reads its text, so an unverified one must not reach it."""
     out = {k: v for k, v in data.items() if k not in sr.LIST_SECTIONS}
+    summary = out.get("summary")
+    if summary and (not isinstance(summary, dict) or _status(summary) not in allowed):
+        out.pop("summary")
     for section in sr.LIST_SECTIONS:
         items = []
         for item in data.get(section) or []:
