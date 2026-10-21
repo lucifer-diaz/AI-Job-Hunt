@@ -3422,3 +3422,15 @@ Relevant API regressions: `python -m pytest tests/test_workspace.py tests/test_a
 tests/test_dashboard_features.py -q`. No API or database migration is required.
 Rollback by reverting the Knowledge bank module, its dashboard script inclusion,
 and the associated routing and styles together.
+
+## License and commercial use
+
+**Job Hunt OS is source-available, not OSI-defined open-source software.**
+
+The project's original code is available under the [PolyForm Noncommercial License 1.0.0](LICENSE). You may use, study, modify and share it for purposes permitted by that license, including personal noncommercial self-hosting. **Commercial use (including paid hosted/SaaS offerings) requires a separate written license** from Rohan Roy.
+
+We welcome community contributions. Please read [CONTRIBUTING.md](CONTRIBUTING.md) and sign the [Contributor License Agreement](CLA.md) before any substantive contribution is merged. Contributors retain copyright to their own original work while granting Rohan Roy personally the right to operate paid hosted and other commercially licensed versions without royalties.
+
+For business licensing, see [COMMERCIAL-LICENSING.md](COMMERCIAL-LICENSING.md). For branding, see [TRADEMARKS.md](TRADEMARKS.md). Third-party dependencies retain their own licenses.
+
+The license applies to the portions of Job Hunt OS for which Rohan Roy or contributing licensors have the appropriate rights. Third-party dependencies, third-party materials, and prior contributor work remain subject to their applicable terms.
