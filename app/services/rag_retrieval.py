@@ -263,8 +263,11 @@ def scope(db: Session, profile: Any, job: Job | None) -> tuple[Any, set[int]]:
 
 def retrieve_evidence(db: Session, profile: Any, job: Job, *, terms: Any = None,
                       exclude: set[int] | frozenset[int] = frozenset(), budget_tokens: int | None = None,
-                      limit: int | None = None, allow_model_call: bool = True) -> ContextPack:
-    """The evidence a job's prompt should carry: in scope, relevant, cited by its real id, within a token budget."""
+                      limit: int | None = None, allow_model_call: bool = True, query: str | None = None) -> ContextPack:
+    """The evidence a job's prompt should carry: in scope, relevant, cited by its real id, within a token budget.
+
+    `query` searches for something narrower than the posting (one application-form question) inside the same job's
+    scope; the posting's required skills still count as canonical matches."""
     from app.services.context_builder import job_terms
 
     started = time.monotonic()
@@ -285,7 +288,8 @@ def retrieve_evidence(db: Session, profile: Any, job: Job, *, terms: Any = None,
     rows = {e.id: e for e in db.scalars(select(Evidence).where(
         Evidence.user_id == user_id, Evidence.verified.is_(True), Evidence.id.in_(sorted(allowed)))).all()} \
         if allowed else {}
-    query, required = job_query(job)
+    posting, required = job_query(job)
+    query = (query or "").strip()[:4000] or posting
     terms = terms or job_terms(job)
 
     keyword = bm25(query_terms(terms, query), {eid: evidence_terms(e) for eid, e in rows.items()})[:cap]
