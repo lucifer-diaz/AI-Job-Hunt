@@ -364,6 +364,23 @@ describe('focused settings UI', () => {
     expect(ui.S.forms.resumes.master_resume).toBe('Draft');
     expect(ui.D.resumeData.versions.map(v => v.id)).toEqual([1]);
   });
+  it('renames a resume in place without touching anything else', async () => {
+    resumesLoaded([resumeCard(), resumeCard({ id: 2, name: 'older.pdf', version: 2, is_active: false, roles: ['Lead'] })]); section('resumes');
+    ui.A['rd-rename']({ dataset: { id: '2', name: 'older.pdf' } });
+    expect(document.getElementById('rdname-name').value).toBe('older.pdf');
+    ui.setF('rdname', 'name', '   ');
+    await ui.A['rd-rename-save']({ dataset: { id: '2' } }); expect(fetchMock).not.toHaveBeenCalled();
+    ui.setF('rdname', 'name', ' Leadership CV ');
+    fetchMock.mockResolvedValueOnce(response({ id: 2, name: 'Leadership CV' }));
+    await ui.A['rd-rename-save']({ dataset: { id: '2' } });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/resumes/2');
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ name: 'Leadership CV' });
+    const renamed = ui.D.resumeData.versions.find(v => v.id === 2);
+    expect(renamed).toMatchObject({ name: 'Leadership CV', is_active: false, roles: ['Lead'], version: 2 });
+    expect(ui.RD.renaming).toBeNull();
+    expect(document.querySelector('[data-rd-resume="2"] strong').textContent).toBe('Leadership CV · v2');
+  });
   it('requires saved text for evidence extraction', async () => {
     resumesLoaded(); section('resumes'); ui.setF('resumes', 'master_resume', 'Draft');
     await ui.A['parse-evidence'](); expect(fetchMock).not.toHaveBeenCalled();

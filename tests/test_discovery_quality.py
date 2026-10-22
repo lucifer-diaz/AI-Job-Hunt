@@ -532,8 +532,18 @@ def test_choosing_a_resume_for_old_jobs_ranks_them_again(user, resumes, client):
 
 
 def test_a_resume_can_be_renamed_for_the_pickers(user, resumes, client):
-    active, _ = resumes
+    active, ml = resumes
+    client.put(f"/api/resumes/{ml}/tags", json={"domain": "ML", "roles": ["ML Engineer"]})
     assert client.put(f"/api/resumes/{active}", json={"name": "Platform resume"}).json()["name"] == "Platform resume"
+    out = client.put(f"/api/resumes/{ml}", json={"name": "  Applied ML  "}).json()
+    assert out == {"id": ml, "name": "Applied ML"}
+    with SessionLocal() as db:
+        renamed = db.get(Resume, ml)
+        # Only the label changed: tags, text and which resume is active stay as they were.
+        assert (renamed.domain, renamed.roles, renamed.is_active) == ("ML", ["ML Engineer"], False)
+        assert renamed.raw_text == RESUME_B and db.get(Resume, active).is_active
+    assert client.put(f"/api/resumes/{ml}", json={"name": "   "}).status_code == 422
+    assert client.put(f"/api/resumes/{ml}", json={"name": ""}).status_code == 422
 
 
 def test_the_mcp_context_carries_the_jobs_own_resume(user, resumes):
