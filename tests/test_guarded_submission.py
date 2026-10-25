@@ -279,6 +279,61 @@ def test_a_packet_changed_after_the_claim_means_no_click(sessions, monkeypatch):
     assert f["intents"] == ["ABORTED"] and f["task"][1] == "BLOCKED"
 
 
+
+def test_an_intent_aborted_by_someone_else_is_never_turned_into_a_click(sessions, monkeypatch):
+    """A Kill or the lease sweep aborts the ARMED intent while the worker is between its checks and the CLICKING
+    commit: the commit is a compare-and-set from ARMED, so the worker refuses instead of overwriting ABORTED."""
+    from app.agents import application as graph
+
+    original = graph._hold
+
+    def hold(ctx, at):
+        if at == "armed":
+            with sessions() as db:  # the claim is not released yet: only the intent's own status stops the click
+                intent = db.scalar(select(SubmissionIntent))
+                assert submission.move(db, intent.id, submission.ABORTED, only_from=(submission.ARMED,))
+                db.commit()
+        return original(ctx, at)
+    monkeypatch.setattr(graph, "_hold", hold)
+    with gs.FakeATS("confirm") as ats:
+        _user, job_id = guarded_job(sessions, ats)
+        run(sessions)
+        submits = list(ats.submits)
+    f = facts(sessions, job_id)
+    assert submits == []
+    assert f["intents"] == ["ABORTED"] and f["state"] == "READY_TO_APPLY" and f["job_status"] == "approved"
+
+
+def test_an_abort_or_release_arriving_after_clicking_changes_nothing(sessions, monkeypatch):
+    """The reverse race: CLICKING is committed, then a late abort (a Kill or sweep that read ARMED earlier) or a
+    release arrives. Neither may free the claim of a click that may happen: the submission is recorded once."""
+    from app.agents import application as graph
+
+    original, seen = graph._hold, {}
+
+    def hold(ctx, at):
+        if at == "before_click":
+            with sessions() as db:
+                intent = db.scalar(select(SubmissionIntent))
+                job = db.get(Job, intent.job_id)
+                claim = db.get(ApplicationClaim, intent.claim_id)
+                seen["aborted"] = submission.abort(db, intent, job, "late abort")
+                with pytest.raises(ValueError):
+                    apply_queue.release_claim(db, job, claim.token, "late release")
+            with sessions() as db:
+                seen["after"] = (db.scalar(select(SubmissionIntent)).status, db.scalar(select(ApplicationClaim)).status)
+        return original(ctx, at)
+    monkeypatch.setattr(graph, "_hold", hold)
+    with gs.FakeATS("confirm") as ats:
+        _user, job_id = guarded_job(sessions, ats)
+        run(sessions)
+        submits = list(ats.submits)
+    f = facts(sessions, job_id)
+    assert seen["aborted"] is False and seen["after"] == ("CLICKING", "CLAIMED")
+    assert submits == ["/apply/submit"]
+    assert f["intents"] == ["CONFIRMED"] and f["state"] == "APPLIED"
+
+
 LEGAL_FORM = (aps.FORMS / "greenhouse_form.html").read_text().replace(
     '<input type="button" id="submit_app"',
     '<div class="field"><label for="certify">I certify that the information I have provided is true and complete *'

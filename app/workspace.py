@@ -2288,10 +2288,8 @@ def apply_kit(job_id: int, db: Session = Depends(get_user_db)):
 
 def _execution_view(db: Session, job: Job) -> dict:
     """The job's latest application worker run (Phase 5) and whether the worker is on, for the Apply kit."""
-    from app.services import application_execution
-
     from app.application_api import _takeover_view
-    from app.services import submission
+    from app.services import application_execution, submission
 
     task = application_execution.latest(db, job.id)
     intents = submission.intents(db, task.id) if task is not None else []

@@ -243,7 +243,6 @@ def save_login(task_id: int, payload: SaveLoginIn, db: Session = Depends(get_use
     signup) in the vault, and the window's session for that domain only."""
     from app.infrastructure.application_browser.browser_use_sidecar import get_sidecars
     from app.services import ats_auth
-
     from app.services.workflow import get_profile
 
     task = _task(db, task_id)

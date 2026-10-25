@@ -499,7 +499,8 @@ def advance_to_applied(db: Session, job: Job, *, actor: str, reason: str) -> str
     Never forges a step: when no backed path exists the state stays where it is and the reason is returned for the
     audit trail. Does not commit."""
     from app.services import approval
-    from app.services.lifecycle import InvalidTransition, WorkflowState as S, parse_state
+    from app.services.lifecycle import InvalidTransition, parse_state
+    from app.services.lifecycle import WorkflowState as S
     from app.services.work_queue import transition
 
     state = parse_state(job.state) if job.state else None

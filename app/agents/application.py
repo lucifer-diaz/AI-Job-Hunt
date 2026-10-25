@@ -311,7 +311,10 @@ def _park_or_close(ctx: ApplicationContext, session: Any, problem: str | None) -
 
 
 def _analyze_browser_use(ctx: ApplicationContext, task_id: int, job: Any, url: str, attempt: int) -> dict[str, Any]:
-    from app.infrastructure.application_browser.browser_use_sidecar import SidecarRefused, SidecarUnavailable
+    from app.infrastructure.application_browser.browser_use_sidecar import (
+        SidecarRefused,
+        SidecarUnavailable,
+    )
     from app.services import application_backends, ats_forms, ats_map, browser_actions
     from app.services.ats_forms import generic
 
@@ -810,7 +813,7 @@ def submit(state: ApplicationState, runtime: Runtime[ApplicationContext]) -> dic
                 task, job = _load(db, state)
                 effects.held(db, ctx.run)  # a stopped run writes nothing (Kill already settled its intent)
                 submission.abort(db, db.get(submission.SubmissionIntent, intent_id), job,
-                                 f"Refused before the click: {exc.code}")
+                                 f"Refused before the click: {exc.code}", refused_at_click=True)
                 task, _ = _load(db, state)
                 service.set_stage(task, "BLOCKED")
                 task.result_code = exc.code

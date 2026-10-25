@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import hmac
 import json
@@ -130,18 +131,14 @@ class SidecarSession:
 
     async def kill(self) -> None:
         if self.alive:
-            try:
+            with contextlib.suppress(Exception):
                 self.process.kill()
                 await asyncio.wait_for(self.process.wait(), timeout=5)
-            except Exception:  # noqa: BLE001
-                pass
 
     async def close(self) -> None:
         if self.alive:
-            try:
+            with contextlib.suppress(Exception):
                 await self.call("close", timeout=15, record=False)
-            except Exception:  # noqa: BLE001
-                pass
             await self.kill()
 
 
@@ -170,10 +167,8 @@ async def _record(session: SidecarSession, cmd: str, started: datetime, clock: f
         kwargs["error"] = error
         if isinstance(error, SidecarRefused):
             call.note(refusal=error.code)
-    try:
+    with contextlib.suppress(Exception):  # telemetry never changes an outcome
         await asyncio.to_thread(external_api.record, call, **kwargs)
-    except Exception:  # noqa: BLE001  telemetry never changes an outcome
-        pass
 
 
 class SidecarManager:
