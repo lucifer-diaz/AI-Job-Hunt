@@ -261,6 +261,16 @@ describe('Running workers', () => {
     expect(view().querySelector('.wk-row').textContent).toContain('First in line');
   });
 
+  it('shows an application run waiting for the person as such, never as first in line, and with no model', async () => {
+    routes.parsing = { ...parsing(), rows: [row({ kind: 'application', status: 'QUEUED', run_now: true, can_run_now: false, waiting_for: 'YOU', backend: 'playwright', waiting_detail: { kind: 'NEEDS_INPUT', questions: 11, confirmations: 0 }, model: { model: null, source: 'none' }, model_change: null })] };
+    const text = (await open()).querySelector('.wk-row').textContent;
+    expect(text).toContain('Waiting for you');
+    expect(text).toContain('answer 11 questions in the Knowledge bank');
+    expect(text).not.toContain('First in line');
+    expect(text).toContain('No model call');
+    expect(view().querySelector('.wk-row [data-act="wk-run-now"]')).toBeNull();
+  });
+
   it('nudges finished jobs on to the next stage, and only offers it when some are waiting', async () => {
     routes.summary.workers.find(w => w.kind === 'parsing').next_stage = { to: 'Ranking', waiting: 2 };
     routes.summary.workers.find(w => w.kind === 'recovery').next_stage = { to: 'Parsing', waiting: 0 };

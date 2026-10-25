@@ -134,7 +134,15 @@ function wkCooldowns(list) {
   return `<div class="banner warn" role="status"><span class="grow">Rate-limited: ${list.map(c => `<b>${esc(c.provider.toLowerCase())}</b> ${c.seconds_left}s left${c.calls_skipped ? ` (${c.calls_skipped} calls held back)` : ''}`).join(' · ')}. Waiting tasks resume when it ends.</span>
     ${btn(label('wkCooldown', 'Reset backoff', 'Resetting…'), 'wk-reset-cooldowns', {}, 'sm', isBusy('wkCooldown'))}</div>`;
 }
+// An application run waiting for the person (it is not claimable, so it is not "waiting its turn").
+function wkWaitingText(r) {
+  const w = r.waiting_detail || {};
+  if (w.kind === 'NEEDS_HUMAN') return `Waiting for you to finish in the browser window${w.reason ? ` (${wkHumanize(w.reason).toLowerCase()})` : ''}, then Continue in the Apply kit${w.expires_at ? ` · until ${fmtDateTime(w.expires_at)}` : ''}`;
+  const parts = [w.questions ? `answer ${w.questions} question${w.questions === 1 ? '' : 's'} in the Knowledge bank (and verify them)` : '', w.confirmations ? `confirm ${w.confirmations} saved answer${w.confirmations === 1 ? '' : 's'} in the Apply kit` : ''].filter(Boolean);
+  return `Waiting for you: ${parts.join(', then ') || 'see the Apply kit'}. It continues by itself`;
+}
 function wkDetail(r) {
+  if (r.waiting_for === 'YOU') return wkWaitingText(r);
   const of = r.max_attempts ? ` of ${r.max_attempts}` : '';
   const error = r.last_error ? ` · ${r.last_error}` : '';
   if (r.run_now && ['QUEUED', 'RETRYING'].includes(r.status)) return `First in line: runs on the next pass, without waiting${r.attempt ? ` · attempt ${r.attempt}${of} so far${error}` : ''}`;
@@ -240,7 +248,7 @@ function wkTable(kind, data) {
   return `<section class="card flush"><div class="row between wrap gap10" style="padding:14px 18px;border-bottom:1px solid var(--line2)">
       <div><div class="card-title" style="font-size:16px">Tasks${filtered ? ' matching your filters' : ''}</div><div class="card-sub">${active} waiting, running or retrying · ${rows.length - active} finished in the last day${shown}</div></div>${wkShownNudge(kind, rows)}</div>
     <div style="max-height:560px;overflow:auto" data-scroll-key="wk-${kind}"><div class="wk-head" aria-hidden="true"><div></div><div>Status</div><div>Task</div><div>Last run</div><div>Model &amp; route</div><div>Change</div><div></div></div>${rows.map(r => `<div class="wk-row ${r.status === 'RUNNING' ? 'running' : ''} ${wkSel(kind).has(r.task_id) ? 'picked' : ''}">
-      <div>${['FAILED', 'BLOCKED', 'STOPPED'].includes(r.status) && !r.retried_by ? wkSelectBox(kind, r.task_id, r.title) : ''}</div><div>${wkChip(r.status)}</div>
+      <div>${['FAILED', 'BLOCKED', 'STOPPED'].includes(r.status) && !r.retried_by ? wkSelectBox(kind, r.task_id, r.title) : ''}</div><div>${r.waiting_for === 'YOU' ? wkPill('Waiting for you', 'warn', '◷') : wkChip(r.status)}</div>
       <div style="min-width:0"><div class="small b ellipsis">${wkTaskName(r)}</div>
         <div class="wk-detail xs ${['FAILED', 'BLOCKED'].includes(r.status) ? 'orch-bad' : 'muted'}"><span class="ellipsis" title="${attr(wkDetail(r))}">${wkTries(r)}${esc(wkDetail(r))}</span>${wkRowWhy(r)}</div></div>
       ${wkLastRun(r)}${wkModel(r)}${wkModelChange(r)}

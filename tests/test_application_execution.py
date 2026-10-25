@@ -292,6 +292,22 @@ def test_an_expired_lease_retries_and_never_moves_towards_a_submit(sessions, bro
     assert (task.status, task.stage) == ("PENDING", "RETRYING") and claim.task_id == task_id
 
 
+def test_a_run_waiting_for_answers_says_so_and_shows_no_model_in_running_workers(sessions, browser):
+    """A run paused for the person is not "waiting its turn": it says what it needs, cannot be Run now, and a
+    Greenhouse (form adapter) run never shows a model it does not call."""
+    user = aps.owner(sessions)
+    job_id = aps.approved_job(sessions, user, FORM)
+    aps.enqueue(sessions, user, job_id)
+    aps.drive(sessions)  # the Python question has no verified answer and the sensitive one needs confirming
+    with sessions() as db:
+        db.info["user_id"] = user
+        (row,) = workers.rows(db, user, "application")["rows"]
+    assert row["status"] == "QUEUED" and row["waiting_for"] == "YOU" and row["can_run_now"] is False
+    assert row["waiting_detail"]["kind"] == "NEEDS_INPUT" and row["waiting_detail"]["questions"] >= 1
+    assert row["backend"] == "playwright" and row["model"] == {"model": None, "source": "none"}
+    assert row["model_change"] is None
+
+
 def test_the_application_worker_is_visible_in_running_workers_for_its_owner_only(sessions, browser):
     user, other = aps.owner(sessions), aps.owner(sessions)
     job_id = aps.approved_job(sessions, user, FORM)

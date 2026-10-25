@@ -303,7 +303,24 @@ def row(spec: WorkerKind, task: Any, label: dict[str, Any] | None, now: datetime
             "retried_by": None,  # set by rows() when a newer task of the same job exists
             "can_remove": active and status != "RUNNING" and spec.kind in ("ranking", "tailoring"),
             **({"reviewer_score": (task.result or {}).get("reviewer_score")} if spec.kind == "reviewing" else {}),
+            **(_application_facts(task, status) if spec.kind == "application" else {}),
             **{k: v for k, v in label.items() if k not in ("title", "company")}}
+
+
+def _application_facts(task: Any, status: str) -> dict[str, Any]:
+    """An application run's backend, and what it waits for when it waits for the person: answers to save in the
+    Knowledge bank, answers to confirm in the Apply kit, or something to finish in its browser window. Such a run is
+    not claimable until then (application_execution.WAITING_STAGES), so it is not "waiting its turn"."""
+    out: dict[str, Any] = {"backend": task.backend}
+    if status == "QUEUED" and task.stage in ("NEEDS_INPUT", "NEEDS_HUMAN"):
+        waiting = task.interrupt or {}
+        out["waiting_for"] = "YOU"
+        out["waiting_detail"] = {"kind": waiting.get("kind") or task.stage, "reason": waiting.get("reason"),
+                                 "questions": len(waiting.get("question_ids") or []),
+                                 "confirmations": len(waiting.get("confirm_question_ids") or []),
+                                 "expires_at": waiting.get("expires_at")}
+        out["can_run_now"] = False  # it resumes by itself once the person has done what it needs
+    return out
 
 
 # Status filters, the same for every worker: what a task is doing, in the words the screen uses.
@@ -694,6 +711,10 @@ def attach_models(db: Session, user_id: int, spec: WorkerKind | str, rows_: list
         for log in logs:  # newest first
             by_job.setdefault(log.workflow_entity_id, []).append(log)
         for r in rows_:
+            if spec.kind == "application" and r.get("backend") != "browser_use_webui":
+                # Only the browser-use backend asks a model anything (the Browser Navigator); a form adapter never does.
+                r["model"], r["model_change"] = {"model": None, "source": "none"}, None
+                continue
             active = status_of(r) in STATUS_FILTERS["active"]
             start = datetime.fromisoformat(r["created_at"]) if r.get("created_at") else None
             finished = r.get("finished_at") or r.get("completed_at")

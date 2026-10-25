@@ -189,6 +189,7 @@ def test_a_dead_runner_is_unavailable_and_a_new_session_starts(runner, tmp_path)
 def test_a_dynamic_form_is_revealed_and_filled_through_the_scheduler_with_zero_posts(runner, pg_sessions, pg_engine,
                                                                                     monkeypatch, tmp_path):
     aps.configure(monkeypatch, "assist")
+    monkeypatch.setattr(aps.get_settings(), "browser_use_webui_enabled", True)  # configure() turns it off
     monkeypatch.setattr(aps.get_settings(), "mcp_packet_dir", str(tmp_path / "packets"))
     checkpoint.forget_setup()
     qs.clear_checkpoints(pg_engine)
