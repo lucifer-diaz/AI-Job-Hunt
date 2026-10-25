@@ -108,6 +108,8 @@ async function aimApplyNow() {
   }
 }
 const aimSaved = (ok, out) => out?.status === 'PENDING' ? `${ok} · v${out.version} — restart LiteLLM to load it` : out?.status === 'UNCHANGED' ? `${ok} · nothing changed` : `${ok} · v${out?.version}`;
+// What disabling or deleting a model took it out of ("Ranker (backup 1)" → "Ranker"), for the toast.
+const aimDropped = dropped => dropped?.length ? ` · no longer a backup for ${[...new Set(dropped.map(d => d.replace(/ \(backup \d+\)$/, '')))].join(', ')}` : '';
 // A change to the configuration: write it, then apply it at once.
 async function aimSave(key, write, ok = 'Saved') {
   return busy(key, async () => {
@@ -419,7 +421,10 @@ const AI_MODELS_ACTIONS = {
   },
   'aim-worker-test': el => { const w = el.dataset.worker; return busy(`aim-wtest-${w}`, async () => { AIM.tests[`worker:${w}`] = await api(`/api/settings/ai/workers/${encodeURIComponent(w)}/test`, { method: 'POST', body: { configuration: 'draft' } }); }); },
   'aim-model-test': el => { const n = el.dataset.name; return busy(`aim-mtest-${n}`, async () => { AIM.tests[`model:${n}`] = await api(`/api/settings/ai/models/${encodeURIComponent(n)}/test`, { method: 'POST' }); await aimLoad(); }); },
-  'aim-model-toggle': el => aimSave('aim-model', () => api(`/api/settings/ai/models/${encodeURIComponent(el.dataset.name)}`, { method: 'PUT', body: { revision: aimRev(), enabled: !!el.dataset.on } }), `${el.dataset.name} ${el.dataset.on ? 'enabled' : 'disabled'}`),
+  'aim-model-toggle': el => {
+    let dropped = [];
+    return aimSave('aim-model', async () => { dropped = (await api(`/api/settings/ai/models/${encodeURIComponent(el.dataset.name)}`, { method: 'PUT', body: { revision: aimRev(), enabled: !!el.dataset.on } }))?.dropped || []; }, () => `${el.dataset.name} ${el.dataset.on ? 'enabled' : 'disabled'}${aimDropped(dropped)}`);
+  },
   'aim-model-dims': el => {
     const m = aimModel(el.dataset.name) || {}, size = el.value === '' ? null : Number(el.value);
     return aimSave('aim-model', () => api(`/api/settings/ai/models/${encodeURIComponent(el.dataset.name)}`, { method: 'PUT', body: { revision: aimRev(), overrides: { ...(m.overrides || {}), embedding_dimensions: size } } }), 'Vector size saved');
@@ -441,11 +446,12 @@ const AI_MODELS_ACTIONS = {
     const what = el.dataset.managed ? `Its deployment is also removed from LiteLLM.` : `It stays in LiteLLM; Job Hunt OS stops using it.`;
     if (!confirm(`Delete ${n} from Job Hunt OS? ${what} A sync won't bring it back; you can restore it from Removed models.`)) return;
     AIM.refs = { ...(AIM.refs || {}) }; delete AIM.refs[n];
+    let dropped = [];
     return aimSave('aim-model-remove', async () => {
-      try { await api(`/api/settings/ai/models/${encodeURIComponent(n)}/remove`, { method: 'POST', body: { revision: aimRev() } }); }
+      try { dropped = (await api(`/api/settings/ai/models/${encodeURIComponent(n)}/remove`, { method: 'POST', body: { revision: aimRev() } }))?.dropped || []; }
       catch (err) { if (err.status === 409 && err.detail?.references) { AIM.refs[n] = err.detail.references; render(); } throw err; }
       AIM.more = { ...(AIM.more || {}), [n]: false };
-    }, `${n} deleted`);
+    }, () => `${n} deleted${aimDropped(dropped)}`);
   },
   'aim-model-restore': el => aimSave('aim-model-restore', () => api(`/api/settings/ai/models/${encodeURIComponent(el.dataset.name)}/restore`, { method: 'POST', body: { revision: aimRev() } }), `${el.dataset.name} restored`),
   'aim-model-more': el => { AIM.more = { ...(AIM.more || {}), [el.dataset.name]: !AIM.more?.[el.dataset.name] }; render(); },

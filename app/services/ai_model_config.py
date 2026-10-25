@@ -1111,10 +1111,15 @@ def update_model(db: Session, user_id: int, name: str, changes: dict[str, Any],
     if row is None:
         raise NotFound(f"Model {name} is not in the registry")
     conn = _bump(db, user_id, expected_revision)
+    dropped: list[str] = []
     for key, value in changes.items():
         if key == "display_name":
             row.display_name = str(value or name)[:200]
         elif key == "enabled":
+            if row.enabled and not value:
+                dropped = drop_backup_uses(db, user_id, name)
+                audit(db, user_id, "DISABLE", actor=_actor(db, user_id),
+                      changes=[{"model": name, "dropped_from": dropped}])
             row.enabled = bool(value)
         elif key == "model_type":
             if value not in AI_MODEL_TYPES:
@@ -1164,7 +1169,32 @@ def update_model(db: Session, user_id: int, name: str, changes: dict[str, Any],
             row.context_window = params["num_ctx"]
     row.updated_at = utcnow()
     db.commit()
-    return {"model": model_snapshot(row), "draft_revision": conn.draft_revision}
+    return {"model": model_snapshot(row), "draft_revision": conn.draft_revision, "dropped": dropped}
+
+
+def drop_backup_uses(db: Session, user_id: int, name: str) -> list[str]:
+    """Stop using a model as a backup: it leaves every worker's backups (the next one moving up, order kept) and
+    every other model's own fallbacks. Edits the draft only (the caller commits; the apply versions it). A main
+    model, a tier, the auto router and escalation are left alone. Returns what changed, worded like
+    `model_references`."""
+    out: list[str] = []
+    workers = db.scalars(select(WorkerModelConfig).where(WorkerModelConfig.user_id == user_id)).all()
+    for row in sorted(workers, key=lambda w: w.worker_type):
+        backups = [b for b in (row.fallback_model, *(row.secondary_models or [])) if b]
+        if name not in backups:
+            continue
+        out += [f"{label(row.worker_type)} (backup {i})" for i, b in enumerate(backups, 1) if b == name]
+        rest = [b for b in backups if b != name]
+        row.fallback_model = rest[0] if rest else None
+        row.secondary_models = rest[1:] or None
+        row.updated_at = utcnow()
+    models = db.scalars(select(AIModel).where(AIModel.user_id == user_id, AIModel.litellm_model_name != name)).all()
+    for row in sorted(models, key=lambda m: m.litellm_model_name):
+        if name in (row.fallback_models or []):
+            row.fallback_models = [m for m in row.fallback_models if m != name] or None
+            row.updated_at = utcnow()
+            out.append(f"{row.litellm_model_name}'s fallbacks")
+    return out
 
 
 def model_references(snapshot: dict[str, Any], name: str) -> list[str]:
@@ -1203,18 +1233,21 @@ def remove_model(db: Session, user_id: int, name: str, expected_revision: int | 
                                           AIModel.removed_at.is_(None)))
     if row is None:
         raise NotFound(f"{name} is not in the model registry")
+    conn = _bump(db, user_id, expected_revision)
+    dropped = drop_backup_uses(db, user_id, name)
+    db.flush()
     references = model_references(draft_snapshot(db, user_id), name)
     if references:
+        db.rollback()  # a refused removal keeps its backups too
         raise ConfigConflict(f"{name} is still used by: {', '.join(references)}. Change those first.",
                              references=references)
-    conn = _bump(db, user_id, expected_revision)
     # `managed` is kept: the snapshot leaves the model out, so the apply deletes an owned deployment anyway, and a
     # Restore redeploys it
     row.removed_at, row.enabled, row.updated_at = utcnow(), False, utcnow()
     db.execute(delete(ModelRouteState).where(ModelRouteState.user_id == user_id, ModelRouteState.model == name))
-    audit(db, user_id, "REMOVE", actor=_actor(db, user_id), changes=[{"model": name}])
+    audit(db, user_id, "REMOVE", actor=_actor(db, user_id), changes=[{"model": name, "dropped_from": dropped}])
     db.commit()
-    return {"removed": name, "draft_revision": conn.draft_revision}
+    return {"removed": name, "draft_revision": conn.draft_revision, "dropped": dropped}
 
 
 def restore_model(db: Session, user_id: int, name: str, expected_revision: int | None = None) -> dict[str, Any]:

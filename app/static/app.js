@@ -1804,7 +1804,8 @@ function renderJobModal() {
       <div style="flex:1 1 240px;min-width:0"><div style="font-size:21px;font-weight:600;letter-spacing:-.02em">${esc(j.title)}</div><div class="muted mt4" style="font-size:13.5px">${esc(j.company)}${j.location ? ' · ' + esc(j.location) : ''} · ${esc(j.board)} · ${postedTxt(j) ? `<span class="ink2">${esc(postedTxt(j))}</span>` : '<span class="faint" title="The job board did not give a posting date">posting date not listed</span>'} · found ${esc(j.posted)}</div></div>
       <div class="row gap8 wrap"><div class="scorebox sm"><div class="n">${fitTxt(j.fit)}</div><div class="l">FIT</div></div>
         ${j.url ? `<a class="btn" href="${attr(j.url)}" target="_blank" rel="noopener">Open posting ↗</a>` : ''}
-        ${j.resume_id ? btn('Open packet', 'modal-tailor', { id: j.id }, 'primary')
+        ${['approved', 'applied'].includes(j.status) ? btn('Open apply kit', 'modal-kit', { id: j.id }, 'primary')
+          : j.resume_id ? btn('Open packet', 'modal-tailor', { id: j.id }, 'primary')
           : j.needs_description ? `<span title="Ranking and tailoring need the job description">${btn('Add description', 'edit-job-description', { id: j.id }, 'primary')}</span>`
           : j.fit == null ? `<span title="Tailoring works from the ranking: rank this job first">${btn(label('rank' + j.id, 'Rank first', 'Queueing…'), 'rank-job', { id: j.id }, 'primary', isBusy('rank' + j.id))}</span>`
           : btn('Tailor resume', 'modal-tailor', { id: j.id }, 'primary')}${btn('Close', 'close-job')}</div></div>
@@ -2246,6 +2247,8 @@ const A = {
     else if (j.status === 'applied') go('tracker', { selApp: j.application_id });
     else go('tailor', { tailorJob: id });
   },
+  // An approved or applied job's next step is its Apply kit: open it in place of the job, not over it.
+  'modal-kit': el => { S.jobOpen = null; openKit(el.dataset.id); },
   'modal-triage': async el => { await triageJob(el.dataset.id, el.dataset.action); if (S.jobOpen) openJob(S.jobOpen); },
   'save-job-notes': el => busy('jobnotes', () => api(`/api/jobs/${el.dataset.id}/notes`, { method: 'PUT', body: { notes: fv('jobnotes', el.dataset.id, D.jobModal.notes) } }), 'Notes saved'),
   'add-evidence-for': el => {
