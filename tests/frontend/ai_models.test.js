@@ -192,6 +192,17 @@ describe('AI Orchestration → Models & routing', () => {
     expect(body('PUT', '/api/settings/ai/workers/INBOX_CLASSIFIER')).toMatchObject({ model_mode: 'AUTO_ROUTER', tier_name: 'FAST' });
   });
 
+  it('sets a model for a worker added after the account was configured (no config row yet)', async () => {
+    routes['GET /api/settings/ai'] = () => ({ ...overview(), workers: [...overview().workers, { worker_type: 'BROWSER_NAVIGATOR', label: 'Browser Navigator', description: 'Next step', structured_output_required: true, min_context_tokens: 16384, has_prompt: true, config: null, resolved: { model: null, assignment: null, note: 'nothing assigned' } }] });
+    routes['PUT /api/settings/ai/workers/BROWSER_NAVIGATOR'] = () => ({});
+    routes['POST /api/settings/ai/apply'] = () => ({ status: 'PENDING', version: 5 });
+    await open('workers');
+    expect(text()).toContain('Browser Navigator');
+    await ui.A['aim-worker-target']({ dataset: { worker: 'BROWSER_NAVIGATOR' }, value: 'model:local-reasoning' });
+    expect(body('PUT', '/api/settings/ai/workers/BROWSER_NAVIGATOR')).toEqual({ revision: 7, model_mode: 'FIXED', primary_model: 'local-reasoning', tier_name: null });
+    expect(document.getElementById('toast').textContent).not.toContain('Cannot read properties');
+  });
+
   it('shows a refused save with its reasons, keeps the drawer, and undoes it on request', async () => {
     routes['PUT /api/settings/ai/workers/RANKER'] = () => ({});
     routes['POST /api/settings/ai/apply'] = () => [{ detail: { message: 'invalid', validation: { errors: [{ message: 'A model can appear only once' }], warnings: [{ message: 'unknown JSON support' }] } } }, 422];
