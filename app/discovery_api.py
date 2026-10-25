@@ -273,8 +273,13 @@ def resume_choices(db: Session = Depends(get_user_db)):
 
 @router.put("/api/resumes/{resume_id}")
 def rename_resume(resume_id: int, payload: RenameIn, db: Session = Depends(get_user_db)):
+    """Rename a resume version. Only its label changes: its file, data, tags, verification and which resume is
+    active stay as they are, and no job is re-matched or re-ranked."""
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(422, "A resume needs a name")
     resume = _resume(db, resume_id)
-    resume.name = payload.name.strip()
+    resume.name = name
     db.commit()
     return {"id": resume.id, "name": resume.name}
 
