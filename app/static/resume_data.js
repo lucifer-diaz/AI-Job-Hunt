@@ -25,7 +25,7 @@ const RD_BULLETS = { experience: [['achievements', 'Achievements'], ['responsibi
 const RD_STATUS = { VERIFIED: ['✓', 'Verified', 'good'], REJECTED: ['✕', 'Rejected', 'bad'], EDITED: ['!', 'Edited · needs review', 'warn'], UNVERIFIED: ['?', 'Unverified', 'muted'] };
 const RD_STATE = { VERIFIED: ['✓', 'good'], NEEDS_REVIEW: ['!', 'warn'], PARTIAL: ['…', 'brand'], UNVERIFIED: ['?', 'muted'], EMPTY: ['–', 'muted'] };
 const RD_RESUME = { VERIFIED: ['Resume verified', 'good'], NEEDS_REVIEW: ['Needs review', 'warn'], PARTIALLY_VERIFIED: ['Partially verified', 'brand'], UNVERIFIED: ['Unverified', 'muted'] };
-const RD = { tab: 'structured', editing: null, draft: null, decisions: {}, blocking: null, changes: null, raw: null, loading: false, viewId: null };
+const RD = { tab: 'structured', renaming: null, editing: null, draft: null, decisions: {}, blocking: null, changes: null, raw: null, loading: false, viewId: null };
 
 // The version shown and edited here. Viewing or editing a version never makes it active: only "Make active" does.
 const rdActive = () => D.resumeData?.current || D.resumeData?.active || null;
@@ -183,12 +183,16 @@ function rdResumeCard(v, current) {
   const status = (RD_RESUME[v.verification_status] || RD_RESUME.UNVERIFIED)[0];
   return `<article class="settings-resume rd-resume${viewing ? ' is-viewing' : ''}" data-rd-resume="${v.id}"${viewing ? ' aria-current="true"' : ''}>
     <div class="settings-file-icon" aria-hidden="true">${kind}</div>
-    <div class="grow"><div class="row gap8 wrap" style="align-items:center"><strong>${esc(v.name || 'Resume')} · v${v.version}</strong>${v.is_active ? pill('Active', 'good') : ''}${viewing ? pill('Reviewing below', 'brand') : ''}</div>
+    <div class="grow">${RD.renaming === v.id ? rdRenameEditor(v) : `<div class="row gap8 wrap" style="align-items:center"><strong>${esc(v.name || 'Resume')} · v${v.version}</strong>${v.is_active ? pill('Active', 'good') : ''}${viewing ? pill('Reviewing below', 'brand') : ''}${btn('Rename', 'rd-rename', { id: v.id, name: v.name || '' }, 'sm ghost', locked)}</div>`}
       <p>${source} · ${esc(status)} · ${v.reviewed_percent ?? 0}% reviewed${v.setups?.length ? ` · Used by ${esc(v.setups.map(x => x.name).join(', '))}` : ''}</p>
       <div class="rd-roles"><span class="xs muted">Target roles</span> <span class="xs faint">· jobs whose title names one are ranked and tailored with this resume</span>${resumeTags('version', v.id, v.domain, v.roles || [])}</div>
       <div class="row gap8 wrap mt10">${viewing ? '' : btn('Review data', 'rd-view', { id: v.id }, 'sm', locked)}${v.is_active ? '' : btn('Make active', 'rd-activate', { id: v.id }, 'sm', locked)}${v.has_original ? `<a class="btn sm" href="/api/resumes/${v.id}/original">Download</a>` : ''}${v.is_active ? '' : btn('Delete', 'rd-delete-version', { id: v.id, name: `${v.name || 'Resume'} · v${v.version}` }, 'sm danger', locked)}</div>
     </div>
   </article>`;
+}
+// Renaming changes only the label: the file, data, tags, verification and the active resume stay as they are.
+function rdRenameEditor(v) {
+  return `<div class="row gap8 wrap" style="align-items:center" data-rd-rename="${v.id}">${inputF('rdname', 'name', v.name || '', `maxlength="300" aria-label="Resume name" style="margin:0;flex:0 1 320px;min-width:0" data-enter="rd-rename-save" data-id="${v.id}"`)}<span class="small muted">· v${v.version}</span>${btn(label('rdRename', 'Save name', 'Saving…'), 'rd-rename-save', { id: v.id }, 'sm primary', isBusy('rdRename'))}${btn('Cancel', 'rd-rename-cancel', {}, 'sm')}</div>`;
 }
 function rdResumeList(current) {
   const versions = D.resumeData.versions || [];
@@ -296,6 +300,19 @@ const RESUME_DATA_ACTIONS = {
     return rdPost('reparse/resolve', { decisions }, 'Re-parse choices applied');
   },
   'rd-activate': el => settingsResumeGuard() && rdLeaveDraft() && rdRun(async () => { await api(`/api/resumes/${el.dataset.id}/activate`, { method: 'POST' }); RD.viewId = null; D.resumeData = await api(rdResumeUrl()); D.profile = await api('/api/profile'); delete S.forms.resumes; D.resumeChoices = null; RD.changes = null; RD.raw = null; }, 'Active resume changed: ranking, tailoring and review now use it'),
+  'rd-rename': el => { RD.renaming = Number(el.dataset.id); S.forms.rdname = { name: el.dataset.name || '' }; render(); document.getElementById('rdname-name')?.focus(); },
+  'rd-rename-cancel': () => { RD.renaming = null; delete S.forms.rdname; render(); },
+  'rd-rename-save': el => {
+    const name = String(fv('rdname', 'name', '') || '').trim();
+    if (!name) return toast('A resume needs a name', true);
+    return busy('rdRename', async () => {
+      const out = await api(`/api/resumes/${el.dataset.id}`, { method: 'PUT', body: { name } });
+      const rename = r => r && r.id === out.id ? { ...r, name: out.name } : r;
+      D.resumeData = { ...D.resumeData, versions: (D.resumeData.versions || []).map(rename), active: rename(D.resumeData.active), current: rename(D.resumeData.current) };
+      RD.renaming = null; delete S.forms.rdname; D.resumeChoices = null;
+      return out;
+    }, 'Resume renamed');
+  },
   'rd-view': el => {
     if (!rdLeaveDraft()) return;
     RD.viewId = Number(el.dataset.id); RD.tab = 'structured';

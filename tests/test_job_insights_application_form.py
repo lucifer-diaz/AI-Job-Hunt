@@ -3,6 +3,7 @@ research run, the person's library answers winning, personal questions never dra
 drafts kept, tenancy and the API. The model is the no-cost mock provider or a stub returning a crafted answer."""
 from __future__ import annotations
 
+import pytest
 from sqlalchemy import delete, select
 
 from app.db import SessionLocal
@@ -182,7 +183,7 @@ def test_predicted_questions_follow_the_rules_whatever_the_model_says(owner, mon
         assert "Tell us about your Kafka work." not in got, "an item citing an unknown id is dropped alone"
         uncited = got["What is your greatest strength?"]
         assert uncited["status"] == "NEEDS_INPUT", "a factual draft needs evidence"
-        assert insight_of(job_id).prompt_versions["application_form"] == "v1"
+        assert insight_of(job_id).prompt_versions["application_form"] == "v2"
     finally:
         _unseed()
 
@@ -200,6 +201,236 @@ def test_a_run_without_the_model_keeps_the_last_drafts(owner, monkeypatch):
         assert insight_of(job_id).application_questions == before
     finally:
         _unseed()
+
+
+# ───────────── the candidate's resume, profile and per-question retrieval ─────────────
+
+LEADERSHIP = "Tell us about a time you led a team of engineers."
+RESUMES = __import__("tests.rag_support", fromlist=["DATASET"]).DATASET["resumes"]
+
+
+def _candidate(user_id: int) -> dict[str, int]:
+    """A fresh account with the backend resume (active, experience verified), the data resume, a headline and a
+    work authorization a draft must never see."""
+    from app.services import resume_verification
+    from app.services.user_settings import profile_for
+
+    with SessionLocal() as db:
+        db.info["user_id"] = user_id
+        profile = profile_for(db)
+        profile.headline, profile.work_authorization = "Backend engineer", "Needs sponsorship (secret-ish)"
+        ids = {}
+        for key in ("backend", "data"):
+            resume = resume_verification.record_version(db, profile, RESUMES[key]["text"], name=key,
+                                                        activate=key == "backend")
+            resume_verification.verify_section(db, resume, "experience")
+            resume_verification.verify_section(db, resume, "education")
+            ids[key] = resume.id
+        db.commit()
+        return ids
+
+
+def _evidence_id(user_id: int, claim_start: str) -> int:
+    with SessionLocal() as db:
+        return db.scalar(select(Evidence.id).where(Evidence.user_id == user_id, Evidence.claim.like(f"{claim_start}%")))
+
+
+def test_the_form_context_carries_the_jobs_resume_and_retrieves_for_each_question():
+    from app.models import Job
+    from app.services.context_builder import build_application_form_context
+    from app.services.user_settings import profile_for
+
+    user = make_user(SessionLocal)
+    _candidate(user)
+    job_id = new_job(user, approve=False)
+    led = _evidence_id(user, "Led an on-call rotation")
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        form = build_application_form_context(db, profile_for(db), db.get(Job, job_id),
+                                              [{"ref": "F1", "question": LEADERSHIP}])
+    ctx = form.context
+    assert ctx.candidate.get("headline") == "Backend engineer"
+    assert "work_authorization" not in ctx.candidate, "only the person answers work authorization"
+    assert {r["company"] for r in ctx.relevant_experience} == {"Acme", "Globex"}, "the job's (active) resume"
+    assert led in form.questions["F1"]["evidence_ids"], "the question finds its own evidence"
+    assert led in ctx.evidence_ids and form.evidence_labels[led].startswith("Led an on-call")
+    assert ctx.stats.selected_context_tokens > 0
+
+
+def test_a_pasted_question_is_drafted_from_the_resume_and_its_own_retrieval(monkeypatch):
+    user = make_user(SessionLocal)
+    _candidate(user)
+    job_id = new_job(user)
+    run_insights()
+    led = _evidence_id(user, "Led an on-call rotation")
+    seen = {}
+
+    def items(user_text):
+        seen["prompt"] = user_text
+        return [{"form_ref": "F1", "form_question": LEADERSHIP, "form_category": "BEHAVIORAL",
+                 "form_decision": "DRAFT", "evidence_ids": [led],
+                 "form_answer": "At Globex I led an on-call rotation of 6 engineers and wrote the incident runbooks."}]
+    _crafted(monkeypatch, items)
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        insight = db.scalar(select(JobInsight).where(JobInsight.job_id == job_id))
+        application_form.add_questions(insight, [LEADERSHIP], insight.updated_at or insight.created_at)
+        from app.services.job_insights import tasks as insight_tasks
+        insight_tasks.enqueue(db, insight.job, reason=insight_tasks.USER_REQUEST, force=True,
+                              scope=insight_tasks.APPLICATION_FORM)
+        db.commit()
+    run_insights()
+    prompt = seen["prompt"]
+    assert "CANDIDATE:" in prompt and "RESUME:" in prompt and "Globex" in prompt
+    assert "RETRIEVED FOR EACH QUESTION:" in prompt and str(led) in prompt
+    assert "Needs sponsorship" not in prompt, "work authorization never reaches the model"
+    got = by_question(job_id)[LEADERSHIP]
+    assert got["status"] == "DRAFTED" and got["evidence_ids"] == [led]
+    assert got["evidence"] == ["Led an on-call rotation of 6 engineers and wrote the incident runbooks"]
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "on"])
+def test_another_resumes_facts_are_never_retrieved_in_any_mode(monkeypatch, mode):
+    """Scope before scoring for this new path in every mode, not only with retrieval on (Codex review, PR #89)."""
+    from app.models import Job
+    from app.services.context_builder import build_application_form_context
+    from app.services.user_settings import profile_for
+    from app.settings import get_settings
+
+    monkeypatch.setattr(get_settings(), "rag_retrieval_mode", mode)
+    monkeypatch.setattr(get_settings(), "rag_vector_enabled", False)
+    user = make_user(SessionLocal)
+    _candidate(user)
+    job_id = new_job(user, approve=False)
+    churn = _evidence_id(user, "Trained churn prediction")  # the data resume's fact
+    assert churn, "the data resume has its own verified evidence"
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        form = build_application_form_context(db, profile_for(db), db.get(Job, job_id), [
+            {"ref": "F1", "question": "Describe a machine learning model you trained, such as churn prediction."}])
+    assert churn not in form.context.evidence_ids
+    assert churn not in form.questions["F1"]["evidence_ids"]
+
+
+def _paste_and_run(user, job_id, questions, items, monkeypatch):
+    """Paste `questions`, answer the form prompt with `items(prompt_user)`, run the task. Returns what the model was
+    sent: {"prompt": user text, "stats": the call's context_stats}."""
+    from app.services.job_insights import tasks as insight_tasks
+
+    seen = {}
+    real = LLMClient.generate_prompt
+
+    def generate(self, prompt, call=None):
+        if prompt.name != "application_form":
+            return real(self, prompt, call)
+        seen.update(prompt=prompt.user, stats=call.context_stats)
+        data = {"form_questions": items(prompt.user)}
+        return LLMResult(data, "mock", "mock", validated=call.validate(data))
+    monkeypatch.setattr(LLMClient, "generate_prompt", generate)
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        insight = db.scalar(select(JobInsight).where(JobInsight.job_id == job_id))
+        application_form.add_questions(insight, questions, insight.updated_at or insight.created_at)
+        insight_tasks.enqueue(db, insight.job, reason=insight_tasks.USER_REQUEST, force=True,
+                              scope=insight_tasks.APPLICATION_FORM)
+        db.commit()
+    run_insights()
+    return seen
+
+
+def test_a_degree_or_skills_question_can_rest_on_a_cited_resume_fact(monkeypatch):
+    """Verified resume facts that are not bullets carry a RESUME ref a draft may cite; an unknown ref drops the item."""
+    user = make_user(SessionLocal)
+    _candidate(user)
+    job_id = new_job(user)
+    run_insights()
+    study, made_up = "What did you study at university?", "Which certifications do you hold today?"
+    seen = _paste_and_run(user, job_id, [study, made_up], lambda _u: [
+        {"form_ref": "F1", "form_question": study, "form_category": "EXPERIENCE", "form_decision": "DRAFT",
+         "form_answer": "I studied Computer Science at IIT Delhi.", "form_resume_refs": ["EDU1"]},
+        {"form_ref": "F2", "form_question": made_up, "form_category": "EXPERIENCE", "form_decision": "DRAFT",
+         "form_answer": "I hold an AWS certification.", "form_resume_refs": ["CERT9"]}], monkeypatch)
+    assert '"ref": "EDU1"' in seen["prompt"] and '"ref": "ROLE1"' in seen["prompt"]
+    got = by_question(job_id)
+    assert got[study]["status"] == "DRAFTED" and got[study]["resume_refs"] == ["EDU1"]
+    assert "IIT Delhi" in got[study]["resume_facts"][0]
+    assert got[made_up]["status"] == "NEEDS_INPUT", "a ref the prompt never showed is not support"
+
+
+def test_per_question_hits_stay_inside_the_capped_prompt(monkeypatch):
+    """With more hits than the cap, every question keeps its best hit, the per-question map only points at evidence
+    the prompt carries, and citing evidence the cap left out is refused."""
+    from app.services.context_builder import FormContext, TaskContext
+
+    user = make_user(SessionLocal)
+    job_id = new_job(user)
+    run_insights()
+    with SessionLocal() as db:
+        rows = [Evidence(user_id=user, company="Northwind Labs", role="Engineer", context=MARK, verified=True,
+                         claim=f"Verified fact number {n} about payments") for n in range(6)]
+        db.add_all(rows)
+        db.commit()
+        ids = [r.id for r in rows]
+    q1, q2 = "Describe your payments experience in detail.", "Describe your reliability experience please."
+    fake = FormContext(TaskContext(task="application_form", candidate={}, resume={},
+                                   relevant_evidence=[{"id": i, "claim": f"fact {i}"} for i in ids]),
+                       {"F1": {"evidence_ids": ids[:3], "knowledge_ids": []},
+                        "F2": {"evidence_ids": ids[3:], "knowledge_ids": []}},
+                       {i: f"fact {i}" for i in ids}, scope=set(ids))
+    monkeypatch.setattr(application_form, "candidate_context", lambda *a, **k: fake)
+    monkeypatch.setattr(application_form, "MAX_EVIDENCE", 2)
+    try:
+        seen = _paste_and_run(user, job_id, [q1, q2], lambda _u: [
+            {"form_ref": "F1", "form_question": q1, "form_category": "EXPERIENCE", "form_decision": "DRAFT",
+             "form_answer": "Verified fact number 0 about payments.", "evidence_ids": [ids[0]]},
+            {"form_ref": "F2", "form_question": q2, "form_category": "EXPERIENCE", "form_decision": "DRAFT",
+             "form_answer": "Verified fact number 4 about payments.", "evidence_ids": [ids[4]]}], monkeypatch)
+        retrieved = __import__("json").loads(
+            seen["prompt"].split("RETRIEVED FOR EACH QUESTION:\n", 1)[1].split("\n", 1)[0])
+        assert retrieved == {"F1": {"evidence_ids": [ids[0]], "knowledge_ids": []},
+                             "F2": {"evidence_ids": [ids[3]], "knowledge_ids": []}}, "each question's best hit"
+        got = by_question(job_id)
+        assert got[q1]["status"] == "DRAFTED"
+        assert got[q2]["status"] == "NEEDS_INPUT", "evidence the cap left out cannot be cited"
+    finally:
+        _unseed()
+
+
+def test_an_unverified_summary_never_becomes_a_verified_background_flag():
+    from app.models import Job
+    from app.services import resume_verification
+    from app.services.context_builder import build_application_form_context
+    from app.services.user_settings import profile_for
+
+    user = make_user(SessionLocal)
+    text = ("# Sam Doe\n\n## Summary\nMachine learning leader who managed teams.\n\n## Experience\n"
+            "### Engineer | Acme | Pune | Jan 2020 - Dec 2022\n- Designed PostgreSQL schemas for the billing ledger\n")
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        resume = resume_verification.record_version(db, profile_for(db), text, name="r", activate=True)
+        resume_verification.verify_section(db, resume, "experience")  # the summary stays unverified
+        db.commit()
+    job_id = new_job(user, approve=False)
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        form = build_application_form_context(db, profile_for(db), db.get(Job, job_id), [])
+    background = form.context.candidate.get("verified_background") or {}
+    assert not background.get("leadership_experience") and not background.get("ai_experience")
+    assert "summary" not in form.context.candidate and "SUMMARY" not in form.resume_facts
+
+
+def test_the_request_row_measures_the_prompt_actually_sent(monkeypatch):
+    from app.services.llm_telemetry import estimate_tokens
+
+    user = make_user(SessionLocal)
+    _candidate(user)
+    job_id = new_job(user)
+    run_insights()
+    seen = _paste_and_run(user, job_id, [LEADERSHIP], lambda _u: [], monkeypatch)
+    stats = seen["stats"]
+    assert stats["selected_context_tokens"] == estimate_tokens(seen["prompt"])
+    assert stats["full_available_context_tokens"] >= stats["selected_context_tokens"]
+    assert stats["context_builder_version"]
 
 
 # ───────────── units ─────────────

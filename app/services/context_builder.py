@@ -60,6 +60,9 @@ from app.services.user_settings import candidate_policy
 
 log = logging.getLogger("jobhunt.context_builder")
 
+# v5: the verified background (leadership, AI, cloud, data flags) is derived from verified units only, the summary
+# included: an unverified or edited summary no longer sets a flag. Only that block changes; the ranking identity
+# (latest_ranking_context_hash) does not cover it, so no job is re-ranked because of it.
 # v4: generation tasks (tailoring, cover letters) pick bullets and evidence by the parsed posting's skills,
 # responsibilities and keywords as well as its words; tailoring and letters also carry a requirement map (the Ranker's
 # matched requirements with the ids that prove them) and keyword targets (app.services.ats_keywords.targets).
@@ -69,7 +72,7 @@ log = logging.getLogger("jobhunt.context_builder")
 # near-identical items collapse to one. Evidence is sent as {id, company, role, claim}.
 # v2: task-specific projections (no search configuration), the Tailor's canonical source resume with evidence ids per
 # bullet, the completed-FitAnalysis gate, provenance exclusion and pre-prompt consistency checks.
-CONTEXT_BUILDER_VERSION = "v4"
+CONTEXT_BUILDER_VERSION = "v5"
 # Two texts state the same fact when this share of their distinctive words overlaps (Jaccard).
 SAME_CLAIM = 0.6
 BULLET_KINDS = {"achievements": "achievement", "responsibilities": "responsibility"}
@@ -365,8 +368,8 @@ def select_evidence(db: Session, user_id: int, terms: JobTerms, limit: int,
 
 
 def retrieved_evidence(db: Session, profile: Any, job: Job, task: str, terms: JobTerms, limit: int,
-                       deterministic: list[dict[str, Any]], held_back: set[int], resume_items: set[str]
-                       ) -> list[dict[str, Any]]:
+                       deterministic: list[dict[str, Any]], held_back: set[int], resume_items: set[str],
+                       query: str | None = None) -> list[dict[str, Any]]:
     """The evidence a job context carries, by RAG_RETRIEVAL_MODE:
 
         off      `deterministic` (select_evidence), exactly as before — the default and the rollback
@@ -388,7 +391,7 @@ def retrieved_evidence(db: Session, profile: Any, job: Job, task: str, terms: Jo
         Evidence.structured_item_id.in_(sorted(resume_items)))).all()) if resume_items else set()
     try:
         pack = rag_retrieval.retrieve_evidence(db, profile, job, terms=terms, exclude=held_back | shown,
-                                               limit=limit)
+                                               limit=limit, query=query)
     except Exception as exc:  # noqa: BLE001  the deterministic builder is the fallback
         system_log.log_event(message=f"Retrieval failed for job {job.id}; the deterministic context was used",
                              category="WORKFLOW", level="WARNING", operation="rag_retrieval", user_id=profile.user_id,
@@ -474,8 +477,12 @@ def _reviewed_list(data: dict[str, Any], section: str, allowed: tuple[str, ...],
 
 
 def _filtered(data: dict[str, Any], allowed: tuple[str, ...]) -> dict[str, Any]:
-    """A copy holding only units with an allowed status, for derived facts that must not use other data."""
+    """A copy holding only units with an allowed status, for derived facts that must not use other data. The summary
+    is a unit too: structured_resume.derive reads its text, so an unverified one must not reach it."""
     out = {k: v for k, v in data.items() if k not in sr.LIST_SECTIONS}
+    summary = out.get("summary")
+    if summary and (not isinstance(summary, dict) or _status(summary) not in allowed):
+        out.pop("summary")
     for section in sr.LIST_SECTIONS:
         items = []
         for item in data.get(section) or []:
@@ -506,26 +513,27 @@ def _candidate(profile: CandidateProfile, data: dict[str, Any], allowed: tuple[s
     return facts, extra_unverified
 
 
-GENERATION_TASKS = ("tailoring", "cover_letter", "followup", "application_answer")
+GENERATION_TASKS = ("tailoring", "cover_letter", "followup", "application_answer", "application_form")
 
 
 def _base(db: Session, profile: CandidateProfile, job: Job, task: str, allowed: tuple[str, ...],
-          evidence_limit: int, caps: dict[str, int] | None = None
+          evidence_limit: int, caps: dict[str, int] | None = None, terms: JobTerms | None = None,
+          out_of_scope: set[int] | frozenset[int] = frozenset()
           ) -> tuple[TaskContext, dict[str, Any], list[dict[str, Any]], Resume | None]:
     from app.services.evidence_provenance import excluded_ids
 
     resume = rv.resume_for(db, profile)
     data = resume.structured_data if resume is not None else {}
-    terms = generation_terms(job) if task in ("tailoring", "cover_letter") else job_terms(job)
+    terms = terms or (generation_terms(job) if task in ("tailoring", "cover_letter") else job_terms(job))
     policy = candidate_policy(db, profile.user_id)
     experience, unverified = _select_experience(data or {}, terms, allowed, caps)
     candidate, unverified_summary = _candidate(profile, data or {}, allowed)
     held_back = excluded_ids(db, profile.user_id) if task in GENERATION_TASKS else {}
     resume_items = {unit.item_id for unit in sr.iter_units(data or {})}
-    relevant, every = select_evidence(db, profile.user_id, terms, evidence_limit, exclude=set(held_back),
-                                      resume_items=resume_items)
-    relevant = retrieved_evidence(db, profile, job, task, terms, evidence_limit, relevant, set(held_back),
-                                  resume_items)
+    relevant, every = select_evidence(db, profile.user_id, terms, evidence_limit,
+                                      exclude=set(held_back) | set(out_of_scope), resume_items=resume_items)
+    relevant = retrieved_evidence(db, profile, job, task, terms, evidence_limit, relevant,
+                                  set(held_back) | set(out_of_scope), resume_items)
     every = scoped_evidence(db, profile, job, every)
     projects = _select_projects(data or {}, terms, allowed)
     education_fields = ("degree", "field_of_study", "institution", "university", "grade", "end_date",
@@ -972,6 +980,155 @@ def build_application_answer_context(db: Session, profile: CandidateProfile, que
     context.resume_text = _render(context)
     _measure(context, rv.raw_text(profile), every, subject)
     return context
+
+
+FORM_EVIDENCE = 12
+FORM_QUESTION_EVIDENCE = 4
+FORM_QUESTION_ANSWERS = 3
+# Profile fields a form draft never sees: only the person answers work authorization, and search settings are not
+# facts about them.
+FORM_PRIVATE_FIELDS = ("work_authorization", "search_preferences", "preferred_locations", "target_roles")
+
+
+def _question_terms(text: str) -> JobTerms:
+    from types import SimpleNamespace
+
+    return job_terms(SimpleNamespace(title="", description=text or "", skills=[]))
+
+
+@dataclass
+class FormContext:
+    """build_application_form_context: the candidate context; what was retrieved for each pasted question
+    ({ref: {evidence_ids, knowledge_ids}}, best first); a short label for every evidence id the model may cite; the
+    resume as the prompt reads it, where each verified non-bullet fact (a role, a degree, a certification, a project,
+    the skills, the summary) carries a ref a draft may cite, with `resume_facts` labelling each ref; and the evidence
+    ids the job's resume may draw on (None only when that scope could not be read)."""
+
+    context: TaskContext
+    questions: dict[str, dict[str, list[int]]]
+    evidence_labels: dict[int, str]
+    resume: dict[str, Any] = field(default_factory=dict)
+    resume_facts: dict[str, str] = field(default_factory=dict)
+    scope: set[int] | None = None
+
+    @property
+    def evidence(self) -> list[dict[str, Any]]:
+        return self.context.relevant_evidence
+
+    @property
+    def knowledge(self) -> list[dict[str, Any]]:
+        return self.context.knowledge
+
+
+def _form_resume(context: TaskContext) -> tuple[dict[str, Any], dict[str, str]]:
+    """(the resume for the form prompt, {ref: label}). Bullets cite their evidence ids; every other verified fact gets
+    a ref (ROLE1, PROJ1, EDU1, CERT1, SKILLS, SUMMARY) so a draft resting on it can say so."""
+    facts: dict[str, str] = {}
+    roles = []
+    for n, r in enumerate(context.relevant_experience, start=1):
+        ref = f"ROLE{n}"
+        facts[ref] = ", ".join(filter(None, [r.get("job_title"), r.get("company"), r.get("dates")]))
+        roles.append({"ref": ref, "job_title": r.get("job_title"), "company": r.get("company"),
+                      "location": r.get("location"), "dates": r.get("dates"), "technologies": r.get("technologies") or [],
+                      "bullets": [{"text": b["text"], "evidence_ids": b.get("evidence_ids") or []}
+                                  for b in r.get("bullets") or []]})
+    projects = []
+    for n, p in enumerate(context.relevant_projects, start=1):
+        ref = f"PROJ{n}"
+        facts[ref] = f"Project: {p.get('name') or ''}".strip()
+        projects.append({"ref": ref, "name": p.get("name"), "technologies": p.get("technologies") or [],
+                         "bullets": [{"text": b["text"], "evidence_ids": b.get("evidence_ids") or []}
+                                     for b in p.get("bullets") or []]})
+    education = []
+    for n, e in enumerate(context.education, start=1):
+        facts[f"EDU{n}"] = ", ".join(str(v) for k, v in e.items() if k != "verified")
+        education.append({"ref": f"EDU{n}", **e})
+    certifications = []
+    for n, c in enumerate(context.certifications, start=1):
+        facts[f"CERT{n}"] = ", ".join(str(v) for k, v in c.items() if k != "verified")
+        certifications.append({"ref": f"CERT{n}", **c})
+    skills = {}
+    if context.relevant_skills:
+        facts["SKILLS"] = "Skills: " + ", ".join(context.relevant_skills[:12])
+        skills = {"ref": "SKILLS", "names": context.relevant_skills}
+    if context.candidate.get("summary"):
+        facts["SUMMARY"] = "Summary: " + context.candidate["summary"][:140]
+    return ({"experience": roles, "projects": projects, "skills": skills, "education": education,
+             "certifications": certifications}, {k: v[:160] for k, v in facts.items()})
+
+
+def build_application_form_context(db: Session, profile: CandidateProfile, job: Job,
+                                   questions: list[dict[str, str]]) -> FormContext:
+    """What drafting one job's application form needs, from the job's own resume (resume_verification.for_job):
+    the candidate's headline, verified summary and background, the resume's roles with their verified bullets (and
+    the evidence ids behind each), projects, skills, education, and verified evidence relevant to the posting.
+
+    Each pasted question (`questions`: [{ref, question}]) also gets its own retrieval: verified evidence for that
+    question (RAG_RETRIEVAL_MODE=on: hybrid retrieval with the question as the query; otherwise keyword scoring) and
+    verified, non-sensitive saved answers to similar questions. Verified facts only, whatever the candidate policy.
+
+    Scope comes before scoring in every mode: this is a new retrieval path, so evidence the job's resume may not use
+    (evidence_tags.allowed_evidence_ids) is never a candidate, even with retrieval off. The other builders keep their
+    old behaviour in mode off."""
+    from app.services import rag_retrieval
+    from app.services.evidence_provenance import excluded_ids
+    from app.services.job_insights.application_form import PERSONAL_KNOWLEDGE, personal
+
+    profile = rv.for_job(db, profile, job)
+    try:
+        in_scope: set[int] | None = pack_scope(db, profile, job)
+    except Exception:  # noqa: BLE001  without a scope nothing outside the resume's own bullets is offered
+        log.warning("resume scope for job %s could not be read", getattr(job, "id", None), exc_info=True)
+        in_scope = set()
+    verified = set(db.scalars(select(Evidence.id).where(Evidence.user_id == profile.user_id,
+                                                        Evidence.verified.is_(True))).all())
+    out_of_scope = verified - in_scope
+    asked = " ".join(q.get("question") or "" for q in questions)
+    terms = generation_terms(job)
+    if asked:
+        terms.focus |= tokens(asked) - jc.FILLER
+        terms.text = f"{terms.text} {asked}"
+    context, _data, every, _resume = _base(db, profile, job, "application_form", VERIFIED_ONLY, FORM_EVIDENCE,
+                                           terms=terms, out_of_scope=out_of_scope)
+    context.candidate = {k: v for k, v in context.candidate.items() if k not in FORM_PRIVATE_FIELDS and v}
+    context.unverified_facts = []
+    context.job = {}
+
+    held_back = set(excluded_ids(db, profile.user_id))
+    labels: dict[int, str] = {e["id"]: e.get("claim") or "" for e in context.relevant_evidence}
+    for unit in [*context.relevant_experience, *context.relevant_projects]:
+        for bullet in unit.get("bullets") or []:
+            for i in bullet.get("evidence_ids") or []:
+                labels.setdefault(i, bullet.get("text") or "")
+    per_question: dict[str, dict[str, list[int]]] = {}
+    answers: dict[int, dict[str, Any]] = {}
+    for q in questions:
+        text = q.get("question") or ""
+        q_terms = _question_terms(text)
+        deterministic, _ = select_evidence(db, profile.user_id, q_terms, FORM_QUESTION_EVIDENCE,
+                                           exclude=held_back | out_of_scope)
+        found = retrieved_evidence(db, profile, job, "application_form", q_terms, FORM_QUESTION_EVIDENCE,
+                                   deterministic, held_back | out_of_scope, set(), query=text)
+        found = [e for e in found if e["id"] in in_scope]  # a retrieval fallback never brings in another resume's
+        for e in found:
+            if e["id"] not in labels:
+                context.relevant_evidence.append(e)
+                labels[e["id"]] = e.get("claim") or ""
+        suggested = [a for a in rag_retrieval.suggest_answers(db, profile.user_id, text, limit=FORM_QUESTION_ANSWERS)
+                     if not a["sensitive"] and a.get("answer") and a.get("category") not in PERSONAL_KNOWLEDGE
+                     and not personal(a.get("question") or "")]
+        for a in suggested:
+            answers.setdefault(a["id"], {"id": a["id"], "question": (a["question"] or "")[:300],
+                                         "answer": a["answer"][:800]})
+        per_question[q["ref"]] = {"evidence_ids": list(dict.fromkeys(e["id"] for e in found)),
+                                  "knowledge_ids": [a["id"] for a in suggested]}
+    context.relevant_evidence.sort(key=lambda e: e["id"])
+    context.knowledge = list(answers.values())
+    context.resume_text = _render(context)
+    _measure(context, rv.raw_text(profile), every, job)
+    resume, resume_facts = _form_resume(context)
+    return FormContext(context, per_question, {i: text[:160] for i, text in labels.items()}, resume, resume_facts,
+                       in_scope)
 
 
 def build_inbox_context(db: Session, user_id: int, limit: int = 40) -> list[dict[str, Any]]:

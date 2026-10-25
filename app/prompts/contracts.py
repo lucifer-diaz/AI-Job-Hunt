@@ -756,6 +756,11 @@ class FormQuestionDraft(Contract):
     requirement_ids: RequirementIds = Field(description="JOB REQUIREMENTS ids the question or answer relates to")
     evidence_ids: EvidenceIds = Field(description="VERIFIED EVIDENCE ids the draft rests on")
     knowledge_ids: SourceIds = Field(description="KNOWN ANSWERS ids the draft reuses")
+    form_resume_refs: Annotated[list[str], BeforeValidator(lambda v: [_text_id(i) for i in v] if isinstance(v, list)
+                                                           else v)] = Field(
+        default_factory=list, max_length=12,
+        description="RESUME refs (ROLE1, PROJ1, EDU1, CERT1, SKILLS, SUMMARY) of the verified resume facts the draft "
+                    "rests on that are not bullets; a bullet is cited by its evidence_ids")
     form_note: Annotated[str, BeforeValidator(_phrase)] = Field(
         default="", max_length=300, description="for NEEDS_INPUT: what the candidate has to decide or supply")
 
