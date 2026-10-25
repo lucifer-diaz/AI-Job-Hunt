@@ -73,7 +73,29 @@ async function loadWorkers() {
   if (data) D.wkData = { ...(D.wkData || {}), [tab]: data };
   if (act) D.wkAct = { ...(D.wkAct || {}), [tab]: act };
   if (performance) D.wkPerf = { ...(D.wkPerf || {}), [tab]: performance };
+  const h = w.history;
+  if (h && h.kind === tab) D.wkHistory = await api(`/api/workers/${h.kind}/tasks/${h.id}/history`).catch(e => ({ error: e.message }));
   scheduleWkPoll();
+}
+/* ───────────── a task's history (click its name) ───────────── */
+const WK_SOURCE_ICON = { task: '◆', attempt: '↻', step: '▸', browser: '▣', model: '●', workflow: '→', application: '✎', intent: '⚑' };
+function wkHistoryPanel(tab) {
+  const h = wkState().history;
+  if (!h || h.kind !== tab) return '';
+  const d = D.wkHistory;
+  if (!d) return `<section class="card mb12">${loading()}</section>`;
+  if (d.error) return `<section class="card mb12"><div class="row between"><div class="small">${esc(d.error)}</div>${btn('Close', 'wk-history-close', {}, 'sm')}</div></section>`;
+  const r = d.task, tone = { good: 'var(--good)', warn: 'var(--warn)', bad: 'var(--bad)', brand: 'var(--brand)', muted: 'var(--line)' };
+  const actions = [wkButtons(tab, r.task_id, { kill: r.can_kill, runNow: r.can_run_now }),
+    tab === 'application' && r.job_id != null ? btn('Open Apply kit', 'open-kit', { id: r.job_id }, 'sm') : '',
+    tab === 'application' && r.job_id != null && d.browser_use_ready ? `<span title="${attr('Opens a browser window (browser-use) that fills the form from your verified answers, checked step by step. It never submits: you do.')}">${btn(label('kit-browser-use', 'Run with browser-use', 'Queueing…'), 'kit-browser-use', { id: r.job_id }, 'sm', isBusy('kit-browser-use'))}</span>` : ''].join('');
+  return `<section class="card mb12 wk-history" aria-label="Task history"><div class="row between wrap gap10" style="padding:14px 18px;border-bottom:1px solid var(--line2)">
+      <div><div class="card-title" style="font-size:16px">${wkTaskName(r)}</div><div class="card-sub">Task #${r.task_id} · ${esc(wkDetail(r))}</div></div>
+      <div class="row gap8 wrap">${actions}${btn('Close', 'wk-history-close', {}, 'sm')}</div></div>
+    <ol style="list-style:none;margin:0;padding:10px 18px;max-height:420px;overflow:auto">${(d.events || []).map(e => `<li class="row gap10" style="padding:6px 0;border-bottom:1px solid var(--line2);align-items:flex-start">
+      <span aria-hidden="true" style="color:${tone[e.tone] || tone.muted};width:16px;text-align:center">${WK_SOURCE_ICON[e.source] || '•'}</span>
+      <span class="xs muted mono" style="min-width:150px">${esc(fmtDateTime(e.at))}</span>
+      <span class="grow"><span class="small">${esc(e.title)}</span>${e.detail ? `<span class="xs muted"> · ${esc(e.detail)}</span>` : ''}</span></li>`).join('') || '<li class="small muted">Nothing recorded yet.</li>'}</ol></section>`;
 }
 // Every few seconds while anything runs, slowly when idle, never on another screen or in a hidden tab.
 function wkPollDelay() {
@@ -249,7 +271,7 @@ function wkTable(kind, data) {
       <div><div class="card-title" style="font-size:16px">Tasks${filtered ? ' matching your filters' : ''}</div><div class="card-sub">${active} waiting, running or retrying · ${rows.length - active} finished in the last day${shown}</div></div>${wkShownNudge(kind, rows)}</div>
     <div style="max-height:560px;overflow:auto" data-scroll-key="wk-${kind}"><div class="wk-head" aria-hidden="true"><div></div><div>Status</div><div>Task</div><div>Last run</div><div>Model &amp; route</div><div>Change</div><div></div></div>${rows.map(r => `<div class="wk-row ${r.status === 'RUNNING' ? 'running' : ''} ${wkSel(kind).has(r.task_id) ? 'picked' : ''}">
       <div>${['FAILED', 'BLOCKED', 'STOPPED'].includes(r.status) && !r.retried_by ? wkSelectBox(kind, r.task_id, r.title) : ''}</div><div>${r.waiting_for === 'YOU' ? wkPill('Waiting for you', 'warn', '◷') : wkChip(r.status)}</div>
-      <div style="min-width:0"><div class="small b ellipsis">${wkTaskName(r)}</div>
+      <div style="min-width:0"><div class="small b ellipsis"><button type="button" class="linklike" style="all:unset;cursor:pointer" data-act="wk-history" data-kind="${attr(kind)}" data-id="${r.task_id}" title="Show what happened to this task">${wkTaskName(r)}</button></div>
         <div class="wk-detail xs ${['FAILED', 'BLOCKED'].includes(r.status) ? 'orch-bad' : 'muted'}"><span class="ellipsis" title="${attr(wkDetail(r))}">${wkTries(r)}${esc(wkDetail(r))}</span>${wkRowWhy(r)}</div></div>
       ${wkLastRun(r)}${wkModel(r)}${wkModelChange(r)}
       <div class="wk-row-actions">${r.retried_by ? `<span class="orch-chip muted" title="${attr(`A newer task (#${r.retried_by.task_id}) is handling this job`)}">↻ Run again</span>` : ''}${wkButtons(kind, r.task_id, { kill: r.can_kill, runNow: r.can_run_now })}${wkRowNudge(kind, r.job_id, r.status)}${r.waiting_for === 'YOU' && r.job_id != null ? btn(r.waiting_detail?.kind === 'NEEDS_HUMAN' ? 'Open Apply kit' : 'Answer questions', 'open-kit', { id: r.job_id }, 'sm primary') : ''}${r.job_id != null ? btn('Job', 'open-job', { id: r.job_id }, 'sm') : ''}</div></div>`).join('')}</div></section>`;
@@ -716,7 +738,7 @@ function renderWorkers() {
     // The filters narrow the task list, not the metrics, so they sit right above the list.
     const insights = { parsing: wkParsingInsights, recovery: wkRecoveryInsights }[w.tab]
       || (WK_PERF.includes(w.tab) ? () => wkPerformanceInsights(w.tab, (D.wkPerf || {})[w.tab]) : null);
-    body = !data ? loading() : `${insights ? insights(data) : ''}${wkFilterBar(w.tab, filterCounts)}${wkBulkBar(w.tab)}${wkTable(w.tab, data)}`;
+    body = !data ? loading() : `${insights ? insights(data) : ''}${wkHistoryPanel(w.tab)}${wkFilterBar(w.tab, filterCounts)}${wkBulkBar(w.tab)}${wkTable(w.tab, data)}`;
   }
   return `<div class="stack">${top}${wkCooldowns(s.cooldowns)}${wkHero(w.tab, spec, act)}${wkActivity(act)}${body}</div>`;
 }
@@ -798,6 +820,13 @@ const WORKERS_ACTIONS = {
     await wkReload();
     return out;
   }, out => out.message || `Moved ${out.moved.length} job${out.moved.length === 1 ? '' : 's'} to ${out.to}${out.skipped.length ? ` · ${out.skipped.length} skipped: ${out.skipped[0].reason}` : ''}`),
+  'wk-history': async el => {
+    wkState().history = { kind: el.dataset.kind, id: Number(el.dataset.id) };
+    D.wkHistory = null; render();
+    D.wkHistory = await api(`/api/workers/${el.dataset.kind}/tasks/${el.dataset.id}/history`).catch(e => ({ error: e.message }));
+    render();
+  },
+  'wk-history-close': () => { wkState().history = null; D.wkHistory = null; render(); },
   'wk-run-now': el => busy(`wkRun${el.dataset.kind}${el.dataset.id}`, async () => {
     const out = await api(`/api/workers/${el.dataset.kind}/tasks/${el.dataset.id}/run-now`, { method: 'POST' });
     await wkReload();

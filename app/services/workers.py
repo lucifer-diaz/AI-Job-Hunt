@@ -1105,3 +1105,156 @@ def summary(db: Session, user_id: int, scheduler: Any = None, now: datetime | No
                         for s in KINDS.values()],
             "active": sum(per_kind[k]["active"] for k, s in KINDS.items() if s.view_of is None),
             "running": sum(per_kind[k]["running"] for k, s in KINDS.items() if s.view_of is None)}
+
+
+# ───────────── a task's history ─────────────
+# What happened to one task, in order, from facts that are already stored: its own row and attempts, the graph steps
+# it recorded (agent_effects), its job's workflow transitions and application events, its submission intent, and the
+# page loads, runner commands and model calls made for its job while it ran. Metadata only: never a form value, an
+# answer, page text or a prompt. Bounded: each source is read with a limit.
+
+HISTORY_LIMIT = 200
+STEP_LABELS = {
+    "verify_packet": "Checked the approved packet", "route": "Chose how to open the form",
+    "analyze_form": "Read the application form", "fill": "Filled the form",
+    "pre_submit_validation": "Checked every required field", "submit": "Guarded submission step",
+}
+
+
+def _step(key: str) -> tuple[str, str]:
+    """A recorded graph step (its effect key) in words, and its tone."""
+    parts = key.split(":")
+    name = parts[0]
+    if name == "resolve_answers" and len(parts) >= 5:
+        asked, confirm = int(parts[3] or 0), int(parts[4] or 0)
+        if asked or confirm:
+            return (f"Saved {asked} question{'s' if asked != 1 else ''} for you to answer"
+                    + (f" and {confirm} to confirm" if confirm else ""), "warn")
+        return "Found a verified source for every answer", "good"
+    if "takeover" in parts:
+        return f"Waited for you in the browser window ({(parts[-1] or '').replace('_', ' ').lower()})", "warn"
+    if name == "fill" and parts[-1] == "done":
+        return "Finished filling the form", "good"
+    if name == "fill":
+        return "Started filling the form", "muted"
+    if name == "submit":
+        return {"fill": "Filled the form for a guarded submission", "validated": "Passed the pre-submit checks",
+                "clicking": "Authorized the one final click", "clicked": "Clicked Submit"}.get(
+            parts[2] if len(parts) > 2 else "", f"Stopped the guarded submission ({parts[-1].lower()})"), "brand"
+    return STEP_LABELS.get(name, name.replace("_", " ").capitalize()), "muted"
+
+
+def history(db: Session, user_id: int, kind: str, task_id: int, now: datetime | None = None) -> dict[str, Any]:
+    """The task's timeline for Running workers, newest first. 404 for another account's task."""
+    import re
+
+    from app.models import (
+        AgentEffect,
+        ApplicationEvent,
+        ApplicationExecutionAttempt,
+        ExternalAPIRequestLog,
+        LLMRequestLog,
+        SubmissionIntent,
+        WorkflowTransition,
+    )
+
+    spec, now = kind_of(kind), now or utcnow()
+    task = db.scalar(spec.where(select(spec.model).where(spec.model.id == task_id, spec.model.user_id == user_id)))
+    if task is None:  # read only: no row lock, unlike the actions
+        raise WorkerError("Task not found", 404)
+    labels = _labels_for(db, spec, user_id, [task])
+    view = row(spec, task, labels.get(task.id), now, worker_settings.get(db, user_id, spec.settings_kind,
+                                                                           "max_attempts"))
+    start = task.created_at
+    end = (task.finished_at if spec.tailor else getattr(task, "completed_at", None)) or now
+    job_id = getattr(task, "job_id", None)
+    events: list[dict[str, Any]] = []
+
+    def add(at: datetime | None, title: str, *, detail: str = "", tone: str = "muted", source: str) -> None:
+        if at is not None:
+            events.append({"at": at.isoformat(), "title": title, "detail": detail[:300], "tone": tone,
+                           "source": source})
+
+    add(start, "Queued", detail=f"because: {getattr(task, 'reason', '') or 'a person asked'}"
+        + (f" · backend {task.backend}" if getattr(task, "backend", None) else ""), source="task")
+    if task.started_at:
+        add(task.started_at, "Claimed by the worker (latest attempt)", source="task")
+    if spec.kind == "application":
+        for a in db.scalars(select(ApplicationExecutionAttempt).where(
+                ApplicationExecutionAttempt.task_id == task.id).order_by(ApplicationExecutionAttempt.attempt)
+                .limit(HISTORY_LIMIT)).all():
+            add(a.started_at, f"Attempt {a.attempt} started", source="attempt")
+            if a.ended_at:
+                outcome = (a.outcome or "ended").replace("_", " ").lower()
+                add(a.ended_at, f"Attempt {a.attempt} {outcome}",
+                    detail=" · ".join(filter(None, [f"reached {a.stage_reached.replace('_', ' ').lower()}"
+                                                    if a.stage_reached else "", a.error_category or ""])),
+                    tone="bad" if a.outcome == "FAILED" else "warn" if a.outcome in ("WAITING", "BLOCKED") else "good",
+                    source="attempt")
+        mine = re.compile(rf"^[a-z_]+:{task.id}(:|$)")
+        for effect in db.scalars(select(AgentEffect).where(AgentEffect.user_id == user_id,
+                                                           AgentEffect.created_at >= start,
+                                                           AgentEffect.effect_key.like(f"%:{task.id}%"))
+                                 .order_by(AgentEffect.id).limit(HISTORY_LIMIT)).all():
+            if mine.match(effect.effect_key):
+                title, tone = _step(effect.effect_key)
+                add(effect.created_at, title, tone=tone, source="step")
+        for intent in db.scalars(select(SubmissionIntent).where(SubmissionIntent.execution_task_id == task.id)
+                                 .limit(20)).all():
+            add(intent.created_at, "Reserved the posting for one submission (claim)", tone="brand", source="intent")
+            add(intent.clicking_at, "Final click authorized", tone="brand", source="intent")
+            add(intent.resolved_at, f"Submission {intent.status.replace('_', ' ').lower()}", detail=intent.reason or "",
+                tone="good" if intent.status in ("CONFIRMED", "RESOLVED_SUBMITTED") else "warn", source="intent")
+        if job_id is not None:
+            for log in db.scalars(select(ExternalAPIRequestLog).where(
+                    ExternalAPIRequestLog.user_id == user_id, ExternalAPIRequestLog.job_id == job_id,
+                    ExternalAPIRequestLog.created_at >= start, ExternalAPIRequestLog.created_at <= end,
+                    ExternalAPIRequestLog.provider.in_(("WEB", "BROWSER_USE")))
+                    .order_by(ExternalAPIRequestLog.id).limit(HISTORY_LIMIT)).all():
+                if log.provider == "WEB" and log.service != "application_browser":
+                    continue
+                what = f"Opened {log.endpoint_host or 'the page'}" if log.provider == "WEB" else \
+                    f"Browser-use: {log.operation.replace('_', ' ')}"
+                add(log.started_at, what, detail=" · ".join(filter(None, [
+                    f"HTTP {log.http_status_code}" if log.http_status_code else "",
+                    f"{log.latency_ms} ms" if log.latency_ms is not None else "",
+                    (log.error_type or "").lower()])), tone="bad" if log.status == "FAILED" else "muted",
+                    source="browser")
+            for call in db.scalars(select(LLMRequestLog).where(
+                    LLMRequestLog.user_id == user_id, LLMRequestLog.workflow_entity_id == job_id,
+                    LLMRequestLog.worker_type == "BROWSER_NAVIGATOR", LLMRequestLog.created_at >= start,
+                    LLMRequestLog.created_at <= end).order_by(LLMRequestLog.id).limit(HISTORY_LIMIT)).all():
+                add(call.created_at, "Browser Navigator proposed a step",
+                    detail=" · ".join(filter(None, [call.model or "", call.status.lower(),
+                                                    f"{call.latency_ms} ms" if call.latency_ms else ""])),
+                    source="model")
+    if job_id is not None:
+        for t in db.scalars(select(WorkflowTransition).where(WorkflowTransition.job_id == job_id,
+                                                             WorkflowTransition.created_at >= start,
+                                                             WorkflowTransition.created_at <= end)
+                            .order_by(WorkflowTransition.id).limit(HISTORY_LIMIT)).all():
+            add(t.created_at, f"Job moved {t.from_state or '—'} → {t.to_state}", detail=f"by {t.actor}",
+                tone="brand", source="workflow")
+        job = db.get(Job, job_id)
+        if job is not None and job.application is not None:
+            for e in db.scalars(select(ApplicationEvent).where(ApplicationEvent.application_id == job.application.id,
+                                                               ApplicationEvent.created_at >= start,
+                                                               ApplicationEvent.created_at <= end)
+                                .order_by(ApplicationEvent.id).limit(HISTORY_LIMIT)).all():
+                add(e.created_at, e.title or e.kind, detail=e.detail or "",
+                    tone="warn" if e.kind == "blocker" else "muted", source="application")
+    finished = end if end is not now else None
+    if finished is not None:
+        add(finished, f"Ended: {view['status'].lower()}", detail=" · ".join(filter(None, [
+            (getattr(task, "result_code", None) or "").replace("_", " ").lower(),
+            view.get("last_error") or ""])), tone="bad" if view["status"] in STATUS_FILTERS["failed"] else "good",
+            source="task")
+    events.sort(key=lambda e: e["at"], reverse=True)
+    out: dict[str, Any] = {"task": view, "events": events[:HISTORY_LIMIT]}
+    if spec.kind == "application":
+        from app.infrastructure.application_browser.browser_use_sidecar import configured
+        from app.services import application_execution
+
+        out["browser_use_ready"] = configured() and application_execution.available_mode(db) in ("observe", "assist",
+                                                                                                  "guarded_auto")
+    return out

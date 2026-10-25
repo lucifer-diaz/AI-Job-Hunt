@@ -139,8 +139,11 @@ def latest(db: Session, job_id: int) -> ApplicationExecutionTask | None:
     return db.scalar(select(q).where(q.job_id == job_id).order_by(q.id.desc()).limit(1))
 
 
+BROWSER_USE = "browser_use_webui"
+
+
 def enqueue(db: Session, job: Job, *, execution_mode: str | None = None, reason: str = "user_request",
-            now: datetime | None = None) -> ApplicationExecutionTask:
+            now: datetime | None = None, backend: str | None = None) -> ApplicationExecutionTask:
     """Queue the execution worker for an approved job, or return its active task. Refused (ExecutionRefused) while
     the mode is off, when the packet may not be used (the shared apply_queue rules), or while a submission of the
     posting is in progress. Captures the approved digest. Flushes in a savepoint; the caller commits."""
@@ -153,8 +156,13 @@ def enqueue(db: Session, job: Job, *, execution_mode: str | None = None, reason:
                                "PostgreSQL are needed)", "OFF")
     if server not in SERVER_MODES.get(wanted, ()):
         raise ExecutionRefused(f"This server runs the application worker in {server} mode", "MODE")
+    if backend is not None:
+        backend_refusal(backend, wanted)
     existing = active_task(db, job.id)
     if existing is not None:
+        if backend is not None and existing.backend != backend:
+            raise ExecutionRefused("This job already has a run in progress; stop it in Running workers first",
+                                   "ACTIVE")
         return existing
     reason_not_ready = apply_queue.not_ready_reason(db, job)
     if reason_not_ready:
@@ -170,7 +178,7 @@ def enqueue(db: Session, job: Job, *, execution_mode: str | None = None, reason:
     task = q(user_id=job.user_id, job_id=job.id, application_id=job.application.id,
              approved_packet_id=packet.id if packet else None, packet_digest=packet.digest if packet else None,
              mode=wanted, status=PENDING, stage="QUEUED", reason=reason[:40], attempt_count=0, created_at=now,
-             updated_at=now)
+             updated_at=now, backend=backend)
     try:
         with db.begin_nested():
             db.add(task)
@@ -182,6 +190,20 @@ def enqueue(db: Session, job: Job, *, execution_mode: str | None = None, reason:
         return found
     _nudge_after_commit(db)
     return task
+
+
+def backend_refusal(backend: str, mode_: str) -> None:
+    """A person may send a run to the browser-use backend (a visible window when BROWSER_USE_HEADLESS is false) for
+    OBSERVE or ASSIST. Never for GUARDED_AUTO, which needs the route's own form adapter end to end."""
+    from app.infrastructure.application_browser.browser_use_sidecar import configured
+
+    if backend != BROWSER_USE:
+        raise ExecutionRefused("The only backend a run can be sent to is browser_use_webui", "BACKEND")
+    if mode_ == "GUARDED_AUTO":
+        raise ExecutionRefused("Guarded submission runs only on the route's own form adapter", "BACKEND")
+    if not configured():
+        raise ExecutionRefused("The browser-use backend is not set up on this server (BROWSER_USE_WEBUI_ENABLED, "
+                               "BROWSER_USE_PYTHON)", "BACKEND_UNAVAILABLE")
 
 
 def guarded_refusal(db: Session, job: Job) -> None:
@@ -674,7 +696,10 @@ def requeue(db: Session, task: ApplicationExecutionTask, user_id: int) -> Applic
     if job is None:
         raise WorkerError("The job no longer exists", 404)
     try:
-        fresh = enqueue(db, job, execution_mode=task.mode, reason="user_request")
+        # The same backend only when a person chose it; otherwise ROUTE decides again (the site may have changed).
+        chosen = task.backend if task.backend == BROWSER_USE and (task.reason or "").startswith("browser_use") else None
+        fresh = enqueue(db, job, execution_mode=task.mode, reason=task.reason if chosen else "user_request",
+                        backend=chosen)
     except ExecutionRefused as exc:
         raise WorkerError(str(exc)) from exc
     db.flush()

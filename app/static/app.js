@@ -1523,7 +1523,7 @@ function renderKitExecution(k) {
   const what = mode === 'observe' ? '' : guarded ? ', fills it and, on an allowlisted route, submits it once after every check — only the site’s confirmation marks it applied' : ', then fills it in a private page. It never submits';
   return `<div class="box mb12" style="padding:13px;border-radius:12px"><div class="small b">Application worker · ${esc(mode)}${x && x.backend ? ` · ${esc(x.backend.replaceAll('_', ' '))}` : ''}</div>
     <div class="xs muted mt4 pretty">Reads the form and finds a verified source for every answer${what}.</div>
-    ${state}${renderKitIntent(k)}${renderKitTakeover(k)}${active ? '' : `<div class="row gap8 wrap">${btn(label('kit-prepare', x ? 'Prepare again' : 'Prepare the form', 'Queueing…'), 'kit-prepare', { id: k.job.id }, 'sm mt8', isBusy('kit-prepare'))}${guarded ? btn(label('kit-guarded', 'Submit for me (guarded)', 'Queueing…'), 'kit-guarded', { id: k.job.id }, 'sm mt8 primary', isBusy('kit-guarded')) : ''}</div>`}</div>`;
+    ${state}${renderKitIntent(k)}${renderKitTakeover(k)}${active ? '' : `<div class="row gap8 wrap">${btn(label('kit-prepare', x ? 'Prepare again' : 'Prepare the form', 'Queueing…'), 'kit-prepare', { id: k.job.id }, 'sm mt8', isBusy('kit-prepare'))}${k.browser_use_ready && mode !== 'off' ? `<span title="${attr('Opens a browser window (browser-use) that fills the form from your verified answers, step by step, checked by Job Hunt OS. It never submits: you do.')}">${btn(label('kit-browser-use', 'Run with browser-use', 'Queueing…'), 'kit-browser-use', { id: k.job.id }, 'sm mt8', isBusy('kit-browser-use'))}</span>` : ''}${guarded ? btn(label('kit-guarded', 'Submit for me (guarded)', 'Queueing…'), 'kit-guarded', { id: k.job.id }, 'sm mt8 primary', isBusy('kit-guarded')) : ''}</div>`}</div>`;
 }
 
 /* ───────────── tracker ───────────── */
@@ -2851,6 +2851,11 @@ const A = {
     Object.assign(f, { q: '', status: 'all', category: 'all', sensitive: 'all', ids });
     go('knowledge');
   },
+  'kit-browser-use': el => busy('kit-browser-use', async () => {
+    await api(`/api/jobs/${el.dataset.id}/application-execution`, { method: 'POST', body: { backend: 'browser_use_webui' } });
+    if (S.kitJob) D.kit = await api(`/api/jobs/${el.dataset.id}/apply-kit`);
+    if (S.screen === 'workers' && typeof loadWorkers === 'function') await loadWorkers();
+  }, 'Queued on browser-use: a browser window opens on the next pass'),
   'kit-guarded': el => busy('kit-guarded', async () => {
     await api(`/api/jobs/${el.dataset.id}/application-execution`, { method: 'POST', body: { mode: 'GUARDED_AUTO' } });
     D.kit = await api(`/api/jobs/${el.dataset.id}/apply-kit`);

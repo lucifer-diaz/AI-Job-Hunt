@@ -2301,7 +2301,14 @@ def _execution_view(db: Session, job: Job) -> dict:
             "execution_mode": application_execution.available_mode(db),
             "execution_intent": submission.view(intents[-1]) if intents else None,
             "execution_takeover": _takeover_view(task),
-            "guarded_consent": submission.consent(db, job.user_id)["enabled"]}
+            "guarded_consent": submission.consent(db, job.user_id)["enabled"],
+            "browser_use_ready": _browser_use_ready()}
+
+
+def _browser_use_ready() -> bool:
+    from app.infrastructure.application_browser.browser_use_sidecar import configured
+
+    return configured()
 
 
 def _open_claim_view(db: Session, job: Job) -> dict | None:

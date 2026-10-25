@@ -83,6 +83,8 @@ def _compatible(field_: FormField, element: dict[str, Any]) -> bool:
         return False
     if field_.kind == "select":
         return tag == "select"
+    if field_.kind == "combobox":
+        return tag == "input" and element.get("role") == "combobox"
     if field_.kind in ("checkbox", "radio", "file"):
         return tag == "input" and kind == field_.kind
     return tag == "textarea" if field_.kind == "textarea" else tag == "input" and kind in TEXT_KINDS + ("search",)
@@ -99,6 +101,8 @@ def step_for(field_: FormField, element: dict[str, Any], value: Any) -> Step | R
         if str(value) not in [o.get("value") for o in element.get("options") or []]:
             return Refusal("NO_SUCH_OPTION", "The resolved answer is not one of this select's options")
         return Step("select", {"key": key, "value": str(value)}, field_.id)
+    if field_.kind == "combobox":
+        return Step("choose", {"key": key, "text": str(value)}, field_.id)
     if field_.kind == "checkbox":
         return Step("check", {"key": key}, field_.id) if value is True else None
     if field_.kind == "radio":
@@ -141,7 +145,7 @@ def check(proposal: BrowserActionProposal, observation: dict[str, Any], form: Ap
         return Refusal("WRONG_ELEMENT", "An answer goes only into the element it was resolved for")
     if not _compatible(field_, element):
         return Refusal("WRONG_KIND", "The element cannot hold this kind of answer")
-    expected = {"fill_field": TEXT_KINDS, "select_option": ("select",), "check_box": ("checkbox", "radio"),
+    expected = {"fill_field": TEXT_KINDS, "select_option": ("select", "combobox"), "check_box": ("checkbox", "radio"),
                 "upload_file": ("file",)}[proposal.action]
     if field_.kind not in expected:
         return Refusal("WRONG_ACTION", "This action does not fit the field")
@@ -279,4 +283,6 @@ def holds(field_: FormField, value: Any, read: dict[str, Any]) -> bool:
         return isinstance(value, dict) and Path(value.get("path", "")).name in (read.get("files") or [])
     if field_.kind == "checkbox":
         return bool(read.get("checked")) == (value is True)
+    if field_.kind == "combobox":
+        return " ".join(str(read.get("value") or "").split()).lower() == " ".join(str(value).split()).lower()
     return str(read.get("value") or "").strip() == str(value).strip()

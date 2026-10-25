@@ -638,6 +638,15 @@ ADR-035). The rules a change has to keep:
 
   The model's contract (`BrowserActionProposal`) has no field for a value and no submit action. Deterministic filling
   comes first; the navigator only reaches what it cannot.
+* **Dropdown widgets (`role=combobox`, the newer Greenhouse board) are set only by the runner's `choose`.** It opens
+  the widget, types the verified answer and clicks the option whose text matches it exactly; anything else is
+  refused (`NO_SUCH_OPTION`). The Playwright path never clicks, so a form with a required dropdown goes to browser-use
+  (OBSERVE/ASSIST only), or waits for the person (`DROPDOWN_FIELDS`). Guarded submission never takes such a form. A
+  widget's hidden helper inputs (`aria-hidden`, `tabindex=-1`, no id or name) are never fields. Each ephemeral-page
+  field action waits at most `FIELD_TIMEOUT_MS`.
+* **A person may send a run to browser-use** (`enqueue(backend="browser_use_webui")`, the Apply kit and the history
+  panel): OBSERVE/ASSIST only, refused while another run of the job is active or when the runner is not configured;
+  Retry and Run now keep that choice.
 * **The Web UI's own HTTP interface is not an automation API.** `browser_use_webui.probe` GETs its `/config` for
   health and compatibility, nothing else. Never drive its Gradio endpoints (positional, auto-named, unauthenticated,
   one global session, no pre-action veto).
