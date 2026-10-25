@@ -98,7 +98,9 @@ These rules keep the model a worker uses a matter of configuration, never of cod
   creates a version). Keep that pairing: a refused save must never leave edits silently waiting in the draft.
 * **Deleting a model is a soft removal** (`ai_model_config.remove_model`, `AIModel.removed_at`): it leaves the draft,
   every picker and the next version, and `ai_registry.discover` never brings it back; Restore (or a rollback to a version
-  that had it) does. It is refused while anything still uses it (`model_references`). Only a deployment Job Hunt OS owns
+  that had it) does. Disabling or removing a model first drops it from worker backups and model fallbacks
+  (`drop_backup_uses`), never from a main model, a tier or the router; it is refused while anything still uses it
+  (`model_references`). Only a deployment Job Hunt OS owns
   leaves LiteLLM (through the normal apply; `managed` is kept, so Restore redeploys it); a discovered model stays in
   LiteLLM. Undo (`discard_draft`) removes again a model restored since the active version.
 * **Prompts remain under `app/prompts/`.** Prompts say *what* a model is asked to do; worker configuration decides

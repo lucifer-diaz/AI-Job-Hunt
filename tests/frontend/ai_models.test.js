@@ -304,7 +304,7 @@ describe('AI Orchestration → Models & routing', () => {
     routes['GET /api/settings/ai'] = () => ({ ...overview(), models: [model('local-fast', { managed: true }), model('whisper')],
       removed_models: [{ name: 'old-model', removed_at: '2026-10-10T11:00:00' }] });
     routes['POST /api/settings/ai/models/local-fast/remove'] = () => [{ detail: { message: 'local-fast is still used by: tier FAST', references: ['tier FAST', 'Ranker (backup 1)'] } }, 409];
-    routes['POST /api/settings/ai/models/whisper/remove'] = () => ({ removed: 'whisper' });
+    routes['POST /api/settings/ai/models/whisper/remove'] = () => ({ removed: 'whisper', dropped: ['Tailor (backup 1)'] });
     routes['POST /api/settings/ai/models/old-model/restore'] = () => ({ restored: 'old-model' });
     routes['POST /api/settings/ai/apply'] = () => ({ status: 'SYNCED', version: 5 });
     await open('models');
@@ -319,7 +319,7 @@ describe('AI Orchestration → Models & routing', () => {
     await ui.A['aim-model-remove']({ dataset: { name: 'whisper', managed: '' } });
     expect(confirm.mock.calls.at(-1)[0]).toContain('It stays in LiteLLM');
     expect(body('POST', '/api/settings/ai/models/whisper/remove')).toEqual({ revision: 7 });
-    expect(document.getElementById('toast').textContent).toBe('whisper deleted · v5');
+    expect(document.getElementById('toast').textContent).toBe('whisper deleted · no longer a backup for Tailor · v5');
     confirm.mockReturnValueOnce(false);
     ui.A['aim-model-remove']({ dataset: { name: 'whisper', managed: '' } });
     expect(call('POST', '/api/settings/ai/models/whisper/remove')).toHaveLength(1);  // cancelled: not sent again
@@ -469,6 +469,10 @@ describe('Settings → AI Models actions', () => {
     await ui.A['aim-model-toggle']({ dataset: { name: 'local-fast', on: '' } });
     expect(body('PUT', '/api/settings/ai/models/local-fast')).toEqual({ revision: 7, enabled: false });
     expect(document.getElementById('toast').textContent).toBe('local-fast disabled · v5');
+    routes['PUT /api/settings/ai/models/local-fast'] = () => ({ dropped: ['Ranker (backup 1)', 'Reviewer (backup 2)', 'Ranker (backup 3)', "local-deep's fallbacks"] });
+    await ui.A['aim-model-toggle']({ dataset: { name: 'local-fast', on: '' } });
+    expect(document.getElementById('toast').textContent).toBe("local-fast disabled · no longer a backup for Ranker, Reviewer, local-deep's fallbacks · v5");
+    routes['PUT /api/settings/ai/models/local-fast'] = ok;
     await ui.A['aim-model-type']({ dataset: { name: 'local-fast' }, value: 'FAST' });
     expect(body('PUT', '/api/settings/ai/models/local-fast')).toEqual({ revision: 7, model_type: 'FAST' });
     await ui.A['aim-model-unmanage']({ dataset: { name: 'local-fast' } });
@@ -477,7 +481,7 @@ describe('Settings → AI Models actions', () => {
     ui.A['aim-model-unmanage']({ dataset: { name: 'local-fast' } });
     await ui.A['aim-sync']();
     expect(document.getElementById('toast').textContent).toBe('5 models discovered, 1 new · v5');
-    expect(call('POST', '/api/settings/ai/apply').length).toBe(4);
+    expect(call('POST', '/api/settings/ai/apply').length).toBe(5);
     routes['GET /api/settings/ai'] = () => ({ ...overview(), models: [] });
     await open('models');
     expect(text()).toContain('No models yet');
