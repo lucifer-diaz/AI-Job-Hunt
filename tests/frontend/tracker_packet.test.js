@@ -83,7 +83,7 @@ describe('opening the packet from the tracker', () => {
   });
 
   it('opens the packet from an applied job’s detail instead of bouncing back', async () => {
-    // The job modal's primary button says "Open packet" whenever a packet exists — including after applying.
+    // A link straight to the packet ("Open packet" elsewhere) still opens it after applying, read-only.
     ui.D.jobModal = { id: 11, status: 'applied', resume_id: 7, application_id: 3, title: 'Lead Software Engineer',
       company: 'Epsilon', wizard: [], matches: [], gaps: [], missing: [], keywords: [], fit_analysis: {},
       description: 'x', notes: '', rejection: null, board: 'Manual', fit: 85 };
@@ -99,6 +99,37 @@ describe('opening the packet from the tracker', () => {
     await ui.A['modal-tailor']({ dataset: { id: '11' } });
     expect(ui.S.screen).toBe('tracker');
     expect(ui.S.selApp).toBe(3);
+  });
+});
+
+const jobDetail = (over = {}) => ({ id: 11, status: 'approved', resume_id: 7, application_id: 3,
+  title: 'Forward Deployed Engineer', company: 'Anthropic', board: 'Manual', posted: '16d ago', fit: 82,
+  wizard: [], matches: [], gaps: [], missing: [], keywords: [], gap_notes: [], fit_analysis: {},
+  description: 'x', notes: '', rejection: null, ...over });
+const modalButtons = () => [...document.querySelectorAll('#overlays .modal-head [data-act]')].map(b => b.textContent.trim());
+
+describe('the job detail’s primary button', () => {
+  for (const status of ['approved', 'applied']) {
+    it(`opens the Apply kit for an ${status} job`, () => {
+      ui.D.jobModal = jobDetail({ status }); ui.S.jobOpen = 11; ui.render();
+      expect(modalButtons()).toContain('Open apply kit');
+      expect(modalButtons()).not.toContain('Open packet');
+    });
+  }
+
+  it('still opens the packet for a job that is only tailored', () => {
+    ui.D.jobModal = jobDetail({ status: 'tailored' }); ui.S.jobOpen = 11; ui.render();
+    expect(modalButtons()).toContain('Open packet');
+    expect(modalButtons()).not.toContain('Open apply kit');
+  });
+
+  it('replaces the job detail with the kit', async () => {
+    ui.D.jobModal = jobDetail(); ui.S.jobOpen = 11;
+    await ui.A['modal-kit']({ dataset: { id: '11' } });
+    expect(ui.S.jobOpen).toBeNull();
+    expect(ui.S.kitJob).toBe(11);
+    expect(fetchMock.mock.calls.some(([url]) => url.includes('/api/jobs/11/apply-kit'))).toBe(true);
+    ui.S.kitJob = null;
   });
 });
 
