@@ -372,8 +372,9 @@ class Runner:
 
     async def choose(self, args: dict[str, Any]) -> dict[str, Any]:
         """Set a dropdown widget (role=combobox) to the option whose text is exactly `text` (ignoring case and
-        surrounding spaces): open it, type the text to filter, click that option. Anything else (no option, several
-        partial matches) closes the list and refuses: a person's answer is never mapped to a nearby option."""
+        surrounding spaces): open it, type the text to filter, click that option. Anything else (no option, only
+        partial matches, several matches) closes the list and refuses: a person's answer is never mapped to a nearby
+        option."""
         element = self._element(args["key"])
         if element.get("role") != "combobox" or element.get("submit_like"):
             raise Refused("WRONG_KIND", "choose is for dropdown widgets (role=combobox)")
@@ -390,8 +391,9 @@ class Runner:
             pass
         texts = [" ".join(t.split()).lower() for t in await page.evaluate(OPTION_TEXTS_JS)]
         exact = [i for i, t in enumerate(texts) if t == wanted]
-        partial = [i for i, t in enumerate(texts) if wanted in t]
-        index = exact[0] if len(exact) == 1 else partial[0] if not exact and len(partial) == 1 else None
+        # Exactly one option with exactly this text, never the only option that merely contains it ("Yes" must not
+        # become "Yes, I will need sponsorship").
+        index = exact[0] if len(exact) == 1 else None
         if index is None:
             await page.keyboard.press("Escape")
             raise Refused("NO_SUCH_OPTION", f"{len(texts)} options, none exactly matching the answer")

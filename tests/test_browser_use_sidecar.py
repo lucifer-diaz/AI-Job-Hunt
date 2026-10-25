@@ -235,11 +235,12 @@ def test_choose_sets_a_dropdown_to_the_exact_option_only(runner, tmp_path):
             observation = run(session.call("observe", html=True))
             form = generic.analyze(observation["url"], observation["elements"])
             combo = next(e for e in observation["elements"] if e.get("role") == "combobox")
-            refused = None
-            try:
-                run(session.call("choose", key=combo["key"], text="Maybe"))
-            except bus.SidecarRefused as exc:
-                refused = exc.code
+            refused = []
+            for text in ("Maybe", "Ye"):  # no option, and an option that only contains the answer
+                try:
+                    run(session.call("choose", key=combo["key"], text=text))
+                except bus.SidecarRefused as exc:
+                    refused.append(exc.code)
             chosen = run(session.call("choose", key=combo["key"], text=" yes "))
             read = run(session.call("read", key=combo["key"]))
         finally:
@@ -248,7 +249,7 @@ def test_choose_sets_a_dropdown_to_the_exact_option_only(runner, tmp_path):
     kinds = {f.label: f.kind for f in form.fields}
     assert kinds["Are you open to relocation for this role?"] == "combobox"
     assert not any(f.label in ("", "field") or f.id.startswith("bu_") and not f.label for f in form.fields)
-    assert refused == "NO_SUCH_OPTION" and chosen["value"] == "Yes" and read["value"] == "Yes"
+    assert refused == ["NO_SUCH_OPTION", "NO_SUCH_OPTION"] and chosen["value"] == "Yes" and read["value"] == "Yes"
     assert posts == []
 
 
