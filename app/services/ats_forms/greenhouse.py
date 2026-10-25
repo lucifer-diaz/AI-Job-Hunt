@@ -18,12 +18,14 @@ from app.services.ats_forms import (
     FormField,
     FormOption,
     SubmitControl,
+    is_legal,
     with_fingerprint,
 )
 
 NAME = "greenhouse"
 HOSTS = ("greenhouse.io",)
-FORM_SELECTOR = "#application_form"
+# The classic hosted form (boards.greenhouse.io and embeds) and the newer job-boards.greenhouse.io one.
+FORM_SELECTOR = "#application_form, form#application-form, form.application--form"
 EEO_MARKERS = ("eeoc", "demographic", "gender", "race", "ethnicity", "veteran", "disability", "hispanic")
 ROLE_PATTERNS = (
     ("first_name", re.compile(r"(^|[\[_])first_name\]?$")),
@@ -44,7 +46,7 @@ def detect(url: str, html: str) -> bool:
     if any(host == h or host.endswith("." + h) for h in HOSTS):
         return True
     soup = BeautifulSoup(html or "", "html.parser")
-    form = soup.select_one(FORM_SELECTOR)
+    form = soup.select_one("#application_form")
     return form is not None and form.find(attrs={"name": re.compile(r"^job_application\[")}) is not None
 
 
@@ -116,7 +118,7 @@ def analyze(url: str, html: str) -> ApplicationForm | None:
         field_id = (element.get("id") or element.get("name") or f"field_{len(fields)}")[:200]
         fields.append(FormField(id=field_id, label=label or field_id, kind=kind, role=_role(element, label),
                                 required=bool(required), options=options, locator=_locator(element),
-                                eeo=_is_eeo(element, label)))
+                                eeo=_is_eeo(element, label), legal=kind == "checkbox" and is_legal(label)))
     for name, group in radios.items():
         first = group[0]
         legend = first.find_parent("fieldset")
@@ -129,6 +131,8 @@ def analyze(url: str, html: str) -> ApplicationForm | None:
                                 role="question", required=bool(required), options=options,
                                 locator=f'input[type="radio"][name="{safe}"]', eeo=_is_eeo(first, label)))
     submit = form.find(id="submit_app") or form.find(["button", "input"], attrs={"type": "submit"})
+    if submit is None:  # the newer board: a plain button labelled Submit inside the form
+        submit = next((b for b in form.find_all("button") if _text(b).lower().startswith("submit")), None)
     label = (submit.get("value") or _text(submit)) if submit is not None else ""
     host = (urlparse(url or "").hostname or "")[:200]
     return with_fingerprint(ApplicationForm(adapter=NAME, host=host, fields=fields,

@@ -174,6 +174,11 @@ Record accepted changes to these decisions with an appended rationale, date, PR,
 | ADR-028 | The pre-submit claim lives in `apply_queue` (no parallel service). `begin_submission` takes the account lock, re-runs `not_ready_reason` (approved digest included) and reserves **every alias key** of the posting (`posting_identity`: board id, each canonicalised URL except a site root, the stored company/title/city key) in `application_claim_keys`, unique per account while held. A claim is CLAIMED → RECORDED / RELEASED; past its lease it becomes UNCERTAIN and only a person resolves it. One recorder (`record_submission`) serves MCP, the Apply kit and `POST /api/jobs/{id}/applied`; a tokenless report is checked the same way, refused while another claim holds the posting, and recorded as `unclaimed`. An approved packet cannot be edited while its submission is open. | One unique index catches duplicate job rows and URL aliases even where the account lock is absent (SQLite) or bypassed; aliases cover jobs whose canonical columns were never filled (manual, Lever, Greenhouse). Consequence: a site's root URL is never an alias; the company/title/city key is used only when stored (Hunter), never computed, so two openings with the same title are not merged by accident. `Job.state` READY_TO_APPLY → APPLYING → APPLIED stays for Phase 6 (owner's choice). | Phase 6's atomic submit writer needs the claim to carry its SubmissionIntent |
 | ADR-029 | Application pages come only from `app/infrastructure/application_browser` (`ApplicationSessionManager`). Its only implementation is ephemeral: a fresh anonymous context per step from the shared Chromium process, every non-GET request aborted at the page, and `ApplicationPage` exposes no click, press, tap, submit or script evaluation. `AuthenticatedApplicationBrowser` (persistent per-account, per-ATS sessions) is a reviewed interface with no implementation; a login wall, OTP or challenge pauses as NEEDS_HUMAN and records the shared blocker. | ADR-012's separate boundary, without storing any session material yet. Consequence: a site that needs a login is not automated in Phase 5; the person applies through the Apply kit. A guard test fails the build on any click/press/dispatch in `app/`. | Phase 6 needs authenticated sessions: implement the interface after its own security review |
 | ADR-030 | The application execution worker is a queued worker with a worker-owned LangGraph conductor (`application`, `api_resumable=False`), WorkerKind `application`, scheduler job `application_execution` and orchestration node `application_execution` (ASYNC_WORKER + BROWSER + EXTERNAL + DETERMINISTIC). Graph nodes call the shared services and, unlike the Phase 3/4 conductors, do the browser steps themselves (read the form, fill it), through the application browser on the scheduler's event loop. Answers come from `answer_resolver` (deterministic; no model). The worker never takes a claim and never submits: the last reachable stage is READY_TO_SUBMIT; SUBMITTING, CONFIRMING and CONFIRMED are refused by `set_stage` and by the column itself. Modes `APPLICATION_EXECUTION_MODE` off (default) / observe / assist. | ADR-018: visible lease, retry, kill and tenant-scoped controls from first use. A browser step in an ephemeral page has no effect outside the process, so a replayed node is harmless. Consequence: no narrative answers are written in Phase 5 (a required question without a verified answer waits for the person). | Phase 6 adds SubmissionIntent, the pre-submit validator and confirmation |
+| ADR-031 | browser-use runs in a Job Hunt OS-owned sidecar (`sidecars/browser_use_runner`), one child process per execution, started with the browser-use Web UI checkout's own Python (`BROWSER_USE_PYTHON`, browser-use 0.1.48), speaking JSON lines over stdio. It reuses browser-use's DOM indexing and element actions only; Job Hunt OS decides every step (deterministic fill first, then the BROWSER_NAVIGATOR worker through the LLM gateway, every proposal checked by `browser_actions.check`). The running Web UI (`BROWSER_USE_WEBUI_URL`) is only health-checked (`browser_use_webui.probe`). | Inspected 2026-10-26: the Web UI's Gradio API (`/gradio_api/info`, 20 auto-named endpoints) takes 45 positional inputs ordered by a Python set (the order can change on restart), has no authentication (`auth_required` null), one global `WebuiManager` shared by every caller, Markdown chat results and no pre-action veto; its `ask_for_assistant` path is broken and `upload_file` has no `available_file_paths`. browser-use 0.1.48 needs langchain-core 0.3 (Job Hunt OS pins 1.6.5) and its Agent would call models outside the gateway. Its own launcher opens `--remote-debugging-port` and adds `--disable-blink-features=AutomationControlled`, so the runner launches plain Chromium itself. Consequence: no Gradio live view; the runner is pinned to the 0.1.x API. | browser-use upgraded past 0.1.x, or the Web UI gains authenticated, per-session, vetoable programmatic runs |
+| ADR-032 | Guarded submission: GUARDED_AUTO per consenting account and allowlisted, deterministic-adapter route; PreSubmitValidator twice; the shared claim (`begin_submission(client="worker")`, `claim.execution_id`); a SubmissionIntent per claim, ARMED then CLICKING committed immediately before the one click (`GuardedPage.submit` with a ticket that re-reads it); CONFIRMING with READY_TO_APPLY → APPLYING after the click; ConfirmationVerifier (non-GET 2xx/3xx from the domain + form gone + confirmation); `record_submission` with `evidence: verified_browser`, or UNCERTAIN. | ADR-007, ADR-013, ADR-028. CLICKING before the click means a crash after it is never mistaken for "not submitted"; APPLYING only after the click means a refusal before it needs no reverse transition. Consequence: a Kill in the instant between CLICKING and the click is reported uncertain (conservative). | A second guarded-capable adapter, or a site whose confirmation is not on the domain it posts to |
+| ADR-033 | Route exclusivity: while a GUARDED_AUTO task is active for a posting (any alias), `begin_submission` refuses every other client (`ROUTE_HELD`) and MCP `get_job_packet` refuses the packet; a tokenless report is already refused by the held claim. APPLYING → READY_TO_APPLY exists for a person only (`lifecycle.PERSON_ONLY`). | The roadmap's precondition (§5): guarded auto-submit must not run beside a client that can submit unclaimed. Claude Desktop clicks outside Job Hunt OS, so the posting is withheld from it. | MCP clients that can be required to claim |
+| ADR-034 | Takeover: a headful sidecar session is parked for `APPLICATION_TAKEOVER_TTL_MINUTES`; the task waits PENDING at NEEDS_HUMAN (not claimable) until the person continues; the run then re-observes from the apply URL and re-validates; it never replays. Headless or remote deployments end NEEDS_HUMAN as in Phase 5. | Keeps a person's login or code entry useful without storing anything until they ask. Consequence: takeover needs a local, headful install. | A remote takeover channel (VNC/CDP) with its own security review |
+| ADR-035 | Saved ATS logins: `ats_credentials` (encrypted password, write-only API, used only on a domain in `APPLICATION_LOGIN_DOMAINS`, once per run, inside `redaction.holding`) and `ats_sessions` (the person's window storage, scoped to its own domain, `APPLICATION_AUTH_SESSIONS_ENABLED`, `ATS_SESSION_MAX_DAYS`). Signup is always the person's; a generated password is shown once. Used only by the browser-use runner, never by the ephemeral or JD-recovery browsers. | The owner chose session reuse plus a vault (2026-10-26). Supersedes ADR-029's "no session material" for the runner only; `AuthenticatedApplicationBrowser` in-process stays unimplemented. | A credential leak path, or an ATS whose login needs a second factor every time |
 
 ## 5. Core data and durability contracts
 
@@ -861,6 +866,57 @@ Allowed status: NOT_STARTED, PLANNING, IN_PROGRESS, IN_REVIEW, MERGED, BLOCKED, 
 - Reviewer / approval: pending.
 - Production activation and rollback: everything new is off by default except claims, which are additive (a tokenless report still works). Rollback: `APPLICATION_EXECUTION_MODE=off` ends queued tasks (MODE_OFF); downgrade of `0054` drops the four tables; Apply kit and MCP keep working.
 - Next dependency: Phase 6 (SubmissionIntent, PreSubmitValidator, confirmation verifier, atomic READY_TO_APPLY → APPLYING → APPLIED) needs this PR reviewed and merged.
+
+### 2026-10-26 — Phase 6: guarded submission, the browser-use backend and ATS logins
+- Branch / PR: `feat/agentic-browser-apply` (PR linked in the ledger once opened).
+- Base / merge SHA: base `55e6622` (main with Phase 5 #88).
+- What shipped:
+  - **SubmissionIntent, PreSubmitValidator, ConfirmationVerifier and reconciliation** (`app/services/submission.py`)
+    and the one clicking page (`guarded_submit.py`), wired into the `application` graph v2 (ROUTE, SUBMIT).
+  - **The shared claim before the click**, route exclusivity against MCP and the Apply kit, and canonical READY_TO_APPLY
+    → APPLYING → APPLIED for every recorded submission, with `verified_browser` / `reported` provenance.
+  - **The browser-use sidecar runner and adapter**, the BROWSER_NAVIGATOR worker (prompt `browser_navigation`, contract
+    `BrowserActionProposal`, LLM stage BROWSER_NAVIGATION), the deterministic action validator, takeover with continue,
+    and the ATS map (`ats_routes`).
+  - **Encrypted ATS logins and sessions**, plus signup with a generated password.
+- New migrations, flags, APIs:
+  - **Migration:** `0055` (`submission_intents`, `ats_routes`, `ats_credentials`, `ats_sessions`;
+    `application_execution_tasks.backend`; mode GUARDED_AUTO; LLM stage BROWSER_NAVIGATION).
+  - **Flags:** `APPLICATION_EXECUTION_MODE=guarded_auto` (autonomous refused), `APPLICATION_GUARDED_ROUTES`,
+    `APPLICATION_MAX_ACTIONS`, `APPLICATION_TAKEOVER_TTL_MINUTES`, `APPLICATION_AUTH_SESSIONS_ENABLED`,
+    `APPLICATION_LOGIN_DOMAINS`, `ATS_SESSION_MAX_DAYS`, `BROWSER_USE_WEBUI_ENABLED`, `BROWSER_USE_WEBUI_URL`,
+    `BROWSER_USE_WEBUI_PATH`, `BROWSER_USE_PYTHON`, `BROWSER_USE_TIMEOUT_SECONDS`,
+    `BROWSER_USE_COMMAND_TIMEOUT_SECONDS`, `BROWSER_USE_HEADLESS`.
+  - **APIs:** `/api/application-executions/{id}/continue|signup|save-login`,
+    `/api/settings/guarded-application`, `/api/settings/ats-credentials[/{domain}]`,
+    `/api/settings/ats-sessions/{domain}`, `/api/application-routes`, `/api/application-backends`.
+- Architectural decisions and deviations: ADR-031 – ADR-035.
+  - **Deviations:** the Web UI's HTTP interface is not used to run tasks (ADR-031). `ats_api` has no implementation,
+    because no ATS offers a candidate-side submission API. Ashby is unsupported: its form loads through POST, which the
+    application browsers never send.
+- Test/evaluation evidence: see the PR. The test files are:
+  - `tests/test_guarded_submission.py`: real Chromium, a local fake ATS, the full scheduler pass.
+  - `tests/test_browser_use_sidecar.py`: the real runner on browser-use 0.1.48.
+  - `tests/test_application_takeover.py`, `tests/test_phase6_units.py`, `tests/test_no_automated_submit.py` (Phase 6
+    guard).
+
+  `scripts/ats_live_check.py` ran read-only against live postings; its matrix is in docs/operations/browser-use.md.
+- Known gaps:
+  - Guarded submission is Greenhouse-only, and no real submission has been made with it yet.
+  - Lever, Workable and employer sites are ASSIST only.
+  - Ashby, LinkedIn and Indeed are unsupported.
+  - Takeover needs a local headful install.
+  - The Lever/Workday/iCIMS login flows are exercised only against the in-process fake.
+  - Narrative answers are still never written.
+- Reviewer / approval: pending.
+- Production activation and rollback:
+  - **Activation:** everything new is off by default. Activation steps are in docs/operations/browser-use.md
+    (rollout).
+  - **Rollback:** `APPLICATION_EXECUTION_MODE=assist` (or off) stops guarded runs at once, and uncertain claims stay
+    for a person. `BROWSER_USE_WEBUI_ENABLED=false` returns every form to the Phase 5 path. The downgrade of `0055` is
+    refused while GUARDED_AUTO rows exist.
+- Next dependency: the owner's explicit go-ahead for one real guarded submission on a chosen job before any allowlist
+  entry is used in production.
 
 ### Phase update template
 

@@ -1468,7 +1468,26 @@ function renderKitClaim(k) {
     <div class="xs muted mt4">Reserved for you until ${fmtDateTime(c.lease_expires_at)}; then it waits for you to say what happened.</div>
     ${btn("I didn't submit — release it", 'kit-release', { id: job.id, token: c.claim_token }, 'ghost sm mt8')}</div>${execution}`;
 }
-// The application worker (APPLICATION_EXECUTION_MODE): reads and, in assist mode, fills the form; never submits.
+// The application worker (APPLICATION_EXECUTION_MODE): reads and, in assist mode, fills the form. In guarded_auto
+// (Phase 6) a run of a consenting account on an allowlisted route may submit once, after the pre-submit checks and
+// the shared claim; an unknown outcome waits for you (the claim banner above).
+function renderKitTakeover(k) {
+  const t = k.execution_takeover, x = k.execution;
+  if (!t || !x) return '';
+  const why = { LOGIN_REQUIRED: 'The site wants you to sign in', LOGIN_FAILED: 'The saved login did not work', OTP_REQUIRED: 'The site sent a one-time code', ACCOUNT_REQUIRED: 'The site wants a new account', CAPTCHA_OR_ANTI_BOT: 'The site shows a CAPTCHA' }[t.reason] || 'The page needs you';
+  return `<div class="banner warn mt8"><div class="b">${esc(why)}</div>
+    <div class="small mt4 pretty">Finish it in the browser window Job Hunt OS opened (until ${fmtDateTime(t.expires_at)}), then continue. Nothing is submitted from that window unless you do it.</div>
+    <div class="row gap8 mt10 wrap">${btn(label('kit-continue', 'I’m done — continue', 'Continuing…'), 'kit-continue', { exec: x.id }, 'sm', isBusy('kit-continue'))}
+    ${t.reason === 'ACCOUNT_REQUIRED' ? btn('Sign up with a generated password', 'kit-signup', { exec: x.id }, 'sm') : ''}
+    ${btn('Save this login', 'kit-save-login', { exec: x.id }, 'sm ghost')}</div>
+    ${S.kitSignup && S.kitSignup.exec === x.id ? `<div class="box mt8" style="padding:10px"><div class="xs muted">Use exactly these on ${esc(S.kitSignup.domain)}; the password is not shown again.</div><div class="small mono mt4">${esc(S.kitSignup.username)}</div><div class="row gap8 mt4"><span class="small mono">${esc(S.kitSignup.password)}</span>${btn('Copy', 'kit-copy-password', {}, 'sm none')}</div></div>` : ''}</div>`;
+}
+function renderKitIntent(k) {
+  const i = k.execution_intent;
+  if (!i) return '';
+  const tone = i.status === 'CONFIRMED' ? 'good' : ['UNCERTAIN', 'CLICKING'].includes(i.status) ? 'warn' : 'muted';
+  return `<div class="row gap8 mt8">${pill(`Submit ${i.status.replaceAll('_', ' ').toLowerCase()}`, tone)}${i.reason ? `<span class="xs muted pretty">${esc(i.reason)}</span>` : ''}</div>`;
+}
 function renderKitExecution(k) {
   const x = k.execution, mode = k.execution_mode;
   if (!mode || mode === 'off') return '';
@@ -1482,9 +1501,11 @@ function renderKitExecution(k) {
     ${waiting && confirm.length ? `${confirmList}${btn(confirm.length === 1 ? 'Use this answer for this application' : `Use these ${confirm.length} answers for this application`, 'kit-confirm', { exec: x.id, ids: confirm.map(c => c.id).join(',') }, 'sm mt8')}` : ''}
     ${x.stage === 'READY_TO_SUBMIT' ? `<div class="xs muted mt6 pretty">${x.mode === 'ASSIST' ? 'Every required field was filled from a verified source in a private browser page, which was then closed: nothing was kept there or sent.' : 'Every required field has a verified source.'} Open the posting and fill it in yourself with the answers in this kit, then submit it there.</div>` : ''}`;
   const active = x && ['PENDING', 'PROCESSING'].includes(x.status);
-  return `<div class="box mb12" style="padding:13px;border-radius:12px"><div class="small b">Application worker · ${esc(mode)}</div>
-    <div class="xs muted mt4 pretty">Reads the form and finds a verified source for every answer${mode === 'assist' ? ', then fills it in a private page' : ''}. It never submits.</div>
-    ${state}${active ? '' : btn(label('kit-prepare', x ? 'Prepare again' : 'Prepare the form', 'Queueing…'), 'kit-prepare', { id: k.job.id }, 'sm mt8', isBusy('kit-prepare'))}</div>`;
+  const guarded = mode === 'guarded_auto' && k.guarded_consent;
+  const what = mode === 'observe' ? '' : guarded ? ', fills it and, on an allowlisted route, submits it once after every check — only the site’s confirmation marks it applied' : ', then fills it in a private page. It never submits';
+  return `<div class="box mb12" style="padding:13px;border-radius:12px"><div class="small b">Application worker · ${esc(mode)}${x && x.backend ? ` · ${esc(x.backend.replaceAll('_', ' '))}` : ''}</div>
+    <div class="xs muted mt4 pretty">Reads the form and finds a verified source for every answer${what}.</div>
+    ${state}${renderKitIntent(k)}${renderKitTakeover(k)}${active ? '' : `<div class="row gap8 wrap">${btn(label('kit-prepare', x ? 'Prepare again' : 'Prepare the form', 'Queueing…'), 'kit-prepare', { id: k.job.id }, 'sm mt8', isBusy('kit-prepare'))}${guarded ? btn(label('kit-guarded', 'Submit for me (guarded)', 'Queueing…'), 'kit-guarded', { id: k.job.id }, 'sm mt8 primary', isBusy('kit-guarded')) : ''}</div>`}</div>`;
 }
 
 /* ───────────── tracker ───────────── */
@@ -2791,6 +2812,26 @@ const A = {
     await api(`/api/jobs/${el.dataset.id}/application-execution`, { method: 'POST', body: {} });
     D.kit = await api(`/api/jobs/${el.dataset.id}/apply-kit`);
   }, 'Queued for the application worker'),
+  'kit-guarded': el => busy('kit-guarded', async () => {
+    await api(`/api/jobs/${el.dataset.id}/application-execution`, { method: 'POST', body: { mode: 'GUARDED_AUTO' } });
+    D.kit = await api(`/api/jobs/${el.dataset.id}/apply-kit`);
+  }, 'Queued: it submits only if every check passes'),
+  'kit-continue': el => busy('kit-continue', async () => {
+    await api(`/api/application-executions/${el.dataset.exec}/continue`, { method: 'POST' });
+    S.kitSignup = null;
+    D.kit = await api(`/api/jobs/${S.kitJob}/apply-kit`);
+  }, 'Continuing: it checks the page again first'),
+  'kit-signup': el => busy('kit-signup', async () => {
+    const out = await api(`/api/application-executions/${el.dataset.exec}/signup`, { method: 'POST' });
+    S.kitSignup = { exec: Number(el.dataset.exec), domain: out.domain, username: out.username, password: out.password };
+  }, 'Use these on the signup form, then Save this login'),
+  'kit-copy-password': () => { if (S.kitSignup) copyText(S.kitSignup.password); },
+  'kit-save-login': el => busy('kit-save-login', async () => {
+    const typed = S.kitSignup && S.kitSignup.exec === Number(el.dataset.exec) ? null : window.prompt('The password you used on the site (stored encrypted, never shown again). Leave empty to keep only the session.');
+    const out = await api(`/api/application-executions/${el.dataset.exec}/save-login`, { method: 'POST', body: typed ? { password: typed } : {} });
+    S.kitSignup = null;
+    toast(out.session_saved ? 'Login saved: the next application on this site starts signed in' : 'Login saved');
+  }, null),
   'kit-confirm': el => busy('kit-confirm', async () => {
     await api(`/api/application-executions/${el.dataset.exec}/confirm`, { method: 'POST', body: { question_ids: el.dataset.ids.split(',').map(Number) } });
     D.kit = await api(`/api/jobs/${S.kitJob}/apply-kit`);

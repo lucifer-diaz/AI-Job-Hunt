@@ -9,6 +9,8 @@ const SETTINGS_SECTIONS = [
   ['api-keys', 'API keys', 'Connect your own providers', '05'],
   ['domain', 'Domain filter', 'Which discovered jobs are kept, and what it learned from you', '06'],
   ['gmail', 'Gmail inbox', 'Read-only updates on the applications you submitted', '07'],
+  // Phase 6: whether the application worker may submit for you, what you approve it to attest, and saved logins.
+  ['applying', 'Guarded submission', 'Consent, attestations, saved ATS logins and routes', '08'],
 ];
 // AI models moved to AI Orchestration → Models (ai_models.js); its direct-provider form ('ai') is still saved here.
 const SETTINGS_FORMS = ['profile', 'preferences', 'resumes', 'resume-data', 'account', 'keys', 'domain'];
@@ -137,7 +139,7 @@ function profileCompleteness() {
   return Math.round(100 * values.filter(v => Array.isArray(v) ? v.length : v !== null && v !== undefined && String(v).trim() !== '').length / values.length);
 }
 function settingsClearSecrets() {
-  delete S.forms.keys; delete S.forms.account; editingKey = null;
+  delete S.forms.keys; delete S.forms.account; delete S.forms.applyingLogin; editingKey = null;
   delete SETTING_ERRORS.keys; delete SETTING_ERRORS.account;
 }
 // Settings forms that live on other screens: Running workers → Settings and AI Orchestration → Models & routing.
@@ -313,7 +315,32 @@ function renderDomainSettings() {
   ${settingsGroup('Existing jobs', 'After changing the lists, check the jobs that are not ranked yet again. Jobs you kept are never touched.', btn(label('domainReapply', 'Apply to existing jobs', 'Checking…'), 'domain-reapply', {}, 'soft', isBusy('domainReapply')))}
   ${settingsFooter('domain')}`;
 }
-const SETTINGS_RENDERERS = { profile: renderProfileSettings, preferences: renderPreferenceSettings, resumes: renderResumeSettings, 'resume-data': () => renderResumeDataSettings(), account: renderAccountSettings, 'api-keys': renderKeySettings, domain: renderDomainSettings, gmail: () => renderInboxSettings() };
+// Guarded submission (app.services.submission) and ATS logins (app.services.ats_auth). Passwords are write-only.
+function renderApplyingSettings() {
+  const a = D.applying;
+  if (a === undefined) {
+    Promise.all([api('/api/settings/guarded-application'), api('/api/settings/ats-credentials'), api('/api/application-routes')])
+      .then(([consent, logins, routes]) => { D.applying = { consent, logins, routes: routes.routes }; render(); })
+      .catch(err => { D.applying = { error: err.message }; render(); });
+    return loading();
+  }
+  if (a.error) return `<p class="settings-help">${esc(a.error)}</p>`;
+  const c = a.consent, on = c.server_mode === 'guarded_auto';
+  const consent = settingsGroup('Submit for me (guarded)', 'When this is on, and the server allows it, the application worker may press a form’s final Submit for you — only on an allowlisted route with a form adapter, only after every required answer comes from a verified source, the approved packet is unchanged and no other submission of the posting is open. It records Applied only when the site confirms; anything less waits for you.',
+    `<div class="row wrap gap10">${pill(c.enabled ? 'On for your account' : 'Off for your account', c.enabled ? 'good' : 'muted')}${pill(on ? 'Server: guarded_auto' : `Server: ${c.server_mode}`, on ? 'good' : 'muted')}<span class="xs muted">Allowlisted routes: ${c.allowlisted_routes.length ? esc(c.allowlisted_routes.join(', ')) : 'none'}</span></div>
+    <label class="field mt12" for="applying-attest">Attestations you approve, one per line (exact wording, as the form shows it)<textarea class="input" id="applying-attest" rows="4" data-applying="attestations">${esc((c.attestations || []).join('\n'))}</textarea></label>
+    <p class="settings-help">A form that asks you to certify, agree or consent to anything not listed here stops and waits for you.</p>
+    <div class="row gap8 mt8">${btn(c.enabled ? 'Turn off' : 'Turn on', 'applying-consent', { on: c.enabled ? '' : '1' }, c.enabled ? '' : 'primary', isBusy('applying'))}${btn('Save attestations', 'applying-consent', { on: c.enabled ? '1' : '' }, 'ghost', isBusy('applying'))}</div>`);
+  const logins = settingsGroup('Saved ATS logins', 'A login is used only on its own site, and only where the server allows logins to be filled. Job Hunt OS never shows a saved password again.',
+    `${(a.logins.credentials || []).map(l => `<div class="row gap8 mt6"><span class="small mono grow">${esc(l.domain)}</span><span class="small">${esc(l.username)}</span>${pill(l.status === 'ACTIVE' ? (l.login_allowed ? 'Used' : 'Saved (not allowed here)') : 'Pending signup', l.status === 'ACTIVE' && l.login_allowed ? 'good' : 'muted')}${btn('Remove', 'applying-remove-login', { domain: l.domain }, 'sm ghost')}</div>`).join('') || '<p class="settings-help">No saved logins.</p>'}
+    ${(a.logins.sessions || []).filter(x => x.active).map(x => `<div class="row gap8 mt6"><span class="xs muted grow">Signed-in session · ${esc(x.domain)} · until ${esc(fmtDay(x.expires_at))}</span>${btn('Sign out', 'applying-revoke-session', { domain: x.domain }, 'sm ghost')}</div>`).join('')}
+    <div class="grid-auto mt12" style="grid-template-columns:1fr 1fr 1fr;gap:8px">${inputF('applyingLogin', 'domain', '', 'placeholder="acme.wd5.myworkdayjobs.com"')}${inputF('applyingLogin', 'username', '', 'placeholder="Email or username" autocomplete="off"')}${inputF('applyingLogin', 'password', '', 'type="password" placeholder="Password" autocomplete="new-password"')}</div>
+    ${btn('Save login', 'applying-save-login', {}, 'sm mt8', isBusy('applying'))}`);
+  const routes = settingsGroup('Application routes', 'Where your approved applications go, read from each posting and each run. Guarded submission runs only where a route is capable and allowlisted on this server.',
+    `${(a.routes || []).map(r => `<div class="row gap8 mt6 wrap"><span class="small b">${esc(r.label)}</span><span class="small mono">${esc(r.route)}</span><span class="xs muted grow">${esc(r.company || '')}${r.source_board ? ` · via ${esc(r.source_board)}` : ''}</span>${r.auth_required !== 'none' ? pill(r.has_session ? 'signed in' : r.has_credential ? 'login saved' : `needs ${r.auth_required}`, r.has_session || r.has_credential ? 'good' : 'warn') : ''}${pill(r.guarded_allowed ? 'guarded allowed' : r.guarded_capable ? 'guarded capable' : 'assist only', r.guarded_allowed ? 'good' : 'muted')}${r.last_outcome ? `<span class="xs muted">${esc(r.last_outcome)}</span>` : ''}</div>`).join('') || '<p class="settings-help">No approved applications yet.</p>'}`);
+  return consent + logins + routes;
+}
+const SETTINGS_RENDERERS = { applying: renderApplyingSettings, profile: renderProfileSettings, preferences: renderPreferenceSettings, resumes: renderResumeSettings, 'resume-data': () => renderResumeDataSettings(), account: renderAccountSettings, 'api-keys': renderKeySettings, domain: renderDomainSettings, gmail: () => renderInboxSettings() };
 function renderSettings() {
   if (D.settingsLoadError) return `<div class="settings-content"><div class="settings-error" role="alert">Settings could not be loaded: ${esc(D.settingsLoadError)}</div>${btn('Try again', 'settings-retry', {}, 'mt16')}</div>`;
   if (!D.profile || !D.settings || !D.prefs) return loading();
@@ -411,6 +438,24 @@ async function settingsUploadResume(file) {
     : 'Resume uploaded. Review its data below, and make it active when you want it used');
 }
 const SETTINGS_ACTIONS = {
+  'applying-consent': el => busy('applying', async () => {
+    const text = document.getElementById('applying-attest')?.value || '';
+    const lines = text.split('\n').map(x => x.trim()).filter(Boolean);
+    D.applying.consent = { ...D.applying.consent, ...(await api('/api/settings/guarded-application', { method: 'PUT', body: { enabled: !!el.dataset.on, attestations: lines } })) };
+  }, 'Saved'),
+  'applying-save-login': () => busy('applying', async () => {
+    const f = S.forms.applyingLogin || {};
+    await api(`/api/settings/ats-credentials/${encodeURIComponent((f.domain || '').trim())}`, { method: 'PUT', body: { username: f.username || '', password: f.password || '' } });
+    delete S.forms.applyingLogin; D.applying.logins = await api('/api/settings/ats-credentials');
+  }, 'Login saved (encrypted)'),
+  'applying-remove-login': el => busy('applying', async () => {
+    await api(`/api/settings/ats-credentials/${encodeURIComponent(el.dataset.domain)}`, { method: 'DELETE' });
+    D.applying.logins = await api('/api/settings/ats-credentials');
+  }, 'Removed'),
+  'applying-revoke-session': el => busy('applying', async () => {
+    await api(`/api/settings/ats-sessions/${encodeURIComponent(el.dataset.domain)}`, { method: 'DELETE' });
+    D.applying.logins = await api('/api/settings/ats-credentials');
+  }, 'Signed out'),
   'tailor-budget-reset': el => { setF('workers', `tailor_budget_${el.dataset.pages}`, (D.settings.tailoring_length?.presets?.[el.dataset.pages] || []).join(', ')); render(); },
   'settings-retry': async () => { D.settingsLoadError = ''; render(); await load(); },
   'settings-section': el => settingsNavigate(el.value),

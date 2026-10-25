@@ -776,7 +776,8 @@ def _prepare_application_execution(ctx: JobContext, mode: str) -> dict[str, Any]
     with ctx.sessions() as db:
         details: dict[str, Any] = {"mode": mode,
                                    "expired_leases": application_execution.recover_expired(db, ctx.now),
-                                   "claims_now_uncertain": apply_queue.expire_claims(db, now=ctx.now)}
+                                   "claims_now_uncertain": apply_queue.expire_claims(db, now=ctx.now),
+                                   "takeovers_ended": application_execution.end_expired_takeovers(db, ctx.now)}
         if mode == "off":
             details["released"] = application_execution.release(db, ctx.now)
     return details
@@ -810,8 +811,11 @@ async def application_execution_job(ctx: JobContext) -> dict[str, Any]:
         if not details.get("released") and not details.get("expired_leases"):
             return skipped("The application worker is off (APPLICATION_EXECUTION_MODE)", **details)
         return details
+    from app.infrastructure.application_browser.browser_use_sidecar import get_sidecars
+
     browser = get_application_sessions()
     run_async = application_execution.loop_runner(asyncio.get_running_loop())
+    await get_sidecars().reap()  # takeover windows nobody came back to
     try:
         claimed, outcomes = await run_live(
             concurrency="application_execution_concurrency", batch="application_execution_batch_size",

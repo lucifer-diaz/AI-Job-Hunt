@@ -17,6 +17,7 @@ from app.prompts.application_inbox import (
                                        build_application_email_match_prompt,
                                        build_application_inbox_prompt,
 )
+from app.prompts.browser_navigation import BROWSER_NAVIGATION_PROMPT_VERSION, build_browser_navigation_prompt
 from app.prompts.common import Prompt
 from app.prompts.company_insights import (
                                        COMPANY_INSIGHTS_PROMPT_VERSION,
@@ -27,6 +28,7 @@ from app.prompts.contracts import (
                                        ApplicationEmailAnalysis,
                                        ApplicationFormPrepResult,
                                        ApplicationEmailMatchResult,
+                                       BrowserActionProposal,
                                        CompanyInsightSynthesis,
                                        CoverLetterResult,
                                        EvidenceExtractionResult,
@@ -97,6 +99,7 @@ PROMPT_VERSIONS = {
     "ai_optimization": AI_OPTIMIZATION_PROMPT_VERSION,
     "company_insights": COMPANY_INSIGHTS_PROMPT_VERSION,
     "interview_insights": INTERVIEW_INSIGHTS_PROMPT_VERSION,
+    "browser_navigation": BROWSER_NAVIGATION_PROMPT_VERSION,
     "mcp_tailoring": MCP_TAILORING_PROMPT_VERSION,
     "mcp_review": MCP_REVIEW_PROMPT_VERSION,
     "mcp_application": MCP_APPLICATION_PROMPT_VERSION,
@@ -123,6 +126,7 @@ OUTPUT_CONTRACTS = {
     "ai_optimization": OptimizationReport,
     "company_insights": CompanyInsightSynthesis,
     "interview_insights": InterviewPrepResult,
+    "browser_navigation": BrowserActionProposal,
 }
 # Worker prompt names reserved in app.services.ai_workers with no production prompt yet (nothing calls them).
 RESERVED_PROMPTS: tuple[str, ...] = ()
@@ -142,6 +146,7 @@ __all__ = [
                                        "build_application_form_prompt",
                                        "build_application_inbox_prompt",
                                        "build_application_question_prompt",
+                                       "build_browser_navigation_prompt",
                                        "build_company_insights_prompt",
                                        "build_cover_letter_prompt",
                                        "build_evidence_extraction_prompt",

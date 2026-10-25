@@ -2290,10 +2290,17 @@ def _execution_view(db: Session, job: Job) -> dict:
     """The job's latest application worker run (Phase 5) and whether the worker is on, for the Apply kit."""
     from app.services import application_execution
 
+    from app.application_api import _takeover_view
+    from app.services import submission
+
     task = application_execution.latest(db, job.id)
+    intents = submission.intents(db, task.id) if task is not None else []
     return {"execution": application_execution.view(task) if task is not None else None,
             "execution_confirmations": application_execution.confirmations(db, task) if task is not None else [],
-            "execution_mode": application_execution.available_mode(db)}
+            "execution_mode": application_execution.available_mode(db),
+            "execution_intent": submission.view(intents[-1]) if intents else None,
+            "execution_takeover": _takeover_view(task),
+            "guarded_consent": submission.consent(db, job.user_id)["enabled"]}
 
 
 def _open_claim_view(db: Session, job: Job) -> dict | None:

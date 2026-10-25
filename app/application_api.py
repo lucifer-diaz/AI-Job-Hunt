@@ -6,10 +6,20 @@
     POST /api/jobs/{id}/submission/resolve   → a person says what happened to a submission whose outcome is unknown
     GET  /api/jobs/{id}/submission           → the posting's open claim and the job's latest execution
 
-    POST /api/jobs/{id}/application-execution            → queue the execution worker (OBSERVE or ASSIST)
+    POST /api/jobs/{id}/application-execution            → queue the execution worker (OBSERVE, ASSIST, GUARDED_AUTO)
     POST /api/application-executions/{id}/confirm        → the person confirms sensitive answers for this execution
+    POST /api/application-executions/{id}/continue       → the person finished in the kept browser window (takeover)
+    POST /api/application-executions/{id}/signup         → a pending login with a generated password, shown once
+    POST /api/application-executions/{id}/save-login     → keep the window's login (session) and the password
 
-Every endpoint acts on the signed-in account only. Nothing here submits an application.
+    GET/PUT    /api/settings/guarded-application          → the account's guarded-submission consent and attestations
+    GET/PUT/DELETE /api/settings/ats-credentials[/{domain}] → saved ATS logins (the password is write-only)
+    GET/DELETE /api/settings/ats-sessions[/{domain}]       → saved ATS sessions
+    GET        /api/application-routes                     → the account's ATS map
+    GET        /api/application-backends                   → the backends and the browser-use Web UI's health
+
+Every endpoint acts on the signed-in account only. Nothing here submits an application: guarded submission happens
+only inside the execution worker (app.services.submission).
 """
 from __future__ import annotations
 
@@ -17,10 +27,11 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.auth import get_user_db
-from app.models import ApplicationClaim, Job
+from app.auth import CurrentUser, current_user, get_user_db
+from app.models import ApplicationClaim, AtsCredential, Job
 from app.services import apply_queue
 
 router = APIRouter()
@@ -38,7 +49,22 @@ class ResolveIn(BaseModel):
 
 
 class ExecutionIn(BaseModel):
-    mode: Literal["OBSERVE", "ASSIST"] | None = None
+    mode: Literal["OBSERVE", "ASSIST", "GUARDED_AUTO"] | None = None
+
+
+class ConsentIn(BaseModel):
+    enabled: bool
+    attestations: list[str] = Field(default_factory=list, max_length=50)
+
+
+class CredentialIn(BaseModel):
+    username: str = Field(min_length=1, max_length=320)
+    password: str = Field(min_length=1, max_length=500)
+
+
+class SaveLoginIn(BaseModel):
+    username: str | None = Field(default=None, max_length=320)
+    password: str | None = Field(default=None, max_length=500)
 
 
 class ConfirmIn(BaseModel):
@@ -75,13 +101,26 @@ def submission(job_id: int, db: Session = Depends(get_user_db)) -> dict[str, Any
     job = _job(db, job_id)
     apply_queue.expire_claims(db, user_id=job.user_id)
     task = application_execution.latest(db, job.id)
+    from app.services import submission
+
+    intent = submission.intents(db, task.id)[-1] if task is not None and submission.intents(db, task.id) else None
     return {"job_id": job.id, "claim": claim_view(apply_queue.open_claim(db, job), with_token=True, job_id=job.id),
             "not_ready_reason": apply_queue.not_ready_reason(db, job),
             "execution": application_execution.view(task) if task is not None else None,
+            "intent": submission.view(intent),
+            "takeover": _takeover_view(task),
             "execution_confirmations": application_execution.confirmations(db, task) if task is not None else [],
             "execution_mode": application_execution.available_mode(db),
             "warning": "Applications you submit entirely outside Job Hunt OS cannot be locked here: start the "
                        "submission from the Apply kit (or Claude Desktop) so no one else submits it at the same time."}
+
+
+def _takeover_view(task: Any) -> dict[str, Any] | None:
+    waiting = (task.interrupt or {}) if task is not None else {}
+    if task is None or task.status != "PENDING" or task.stage != "NEEDS_HUMAN" or not waiting.get("takeover"):
+        return None
+    return {"reason": waiting.get("reason"), "expires_at": waiting.get("expires_at"),
+            "login_domain": waiting.get("login_domain"), "continued": bool(waiting.get("continued"))}
 
 
 @router.post("/api/jobs/{job_id}/submission/start")
@@ -143,3 +182,176 @@ def confirm_answers(task_id: int, payload: ConfirmIn, db: Session = Depends(get_
     except application_execution.ExecutionRefused as exc:
         raise HTTPException(409, {"message": str(exc), "code": exc.code}) from exc
     return {"execution": application_execution.view(task)}
+
+
+# ───────────── takeover, signup and saved logins (Phase 6) ─────────────
+
+def _task(db: Session, task_id: int) -> Any:
+    from app.models import ApplicationExecutionTask
+
+    task = db.get(ApplicationExecutionTask, task_id)
+    if task is None or task.user_id != db.info.get("user_id"):  # tenancy filters it too; never trust one check
+        raise HTTPException(404, "Execution not found")
+    return task
+
+
+def _login_domain(db: Session, task: Any) -> str:
+    from app.services import ats_map
+
+    domain = (task.interrupt or {}).get("login_domain")
+    if not domain:
+        match = ats_map.for_job(_job(db, task.job_id))
+        domain = match.login_domain or match.apply_domain if match else None
+    if not domain:
+        raise HTTPException(409, "This application has no login domain")
+    return domain
+
+
+@router.post("/api/application-executions/{task_id}/continue")
+def continue_execution(task_id: int, db: Session = Depends(get_user_db)) -> dict[str, Any]:
+    from app.services import application_execution
+
+    try:
+        task = application_execution.continue_after_takeover(db, task_id)
+    except application_execution.ExecutionRefused as exc:
+        raise HTTPException(409, {"message": str(exc), "code": exc.code}) from exc
+    return {"execution": application_execution.view(task)}
+
+
+@router.post("/api/application-executions/{task_id}/signup")
+def begin_signup(task_id: int, db: Session = Depends(get_user_db)) -> dict[str, Any]:
+    """The run stopped at a signup: a pending login for the site with the profile's email and a generated password,
+    returned this once so the person types exactly these into the site's signup form."""
+    from app.services import ats_auth
+    from app.services.workflow import get_profile
+
+    task = _task(db, task_id)
+    domain = _login_domain(db, task)
+    try:
+        row, password = ats_auth.begin_signup(db, task.user_id, domain, get_profile(db).email or "")
+    except ats_auth.AuthRefused as exc:
+        raise HTTPException(409, {"message": str(exc), "code": exc.code}) from exc
+    db.commit()
+    return {"domain": row.domain, "username": row.username, "password": password, "status": row.status,
+            "note": "Use exactly these on the site's signup form, then click Save this login. The password is not "
+                    "shown again."}
+
+
+@router.post("/api/application-executions/{task_id}/save-login")
+def save_login(task_id: int, payload: SaveLoginIn, db: Session = Depends(get_user_db)) -> dict[str, Any]:
+    """Keep the login the person just made in the kept window: the password (typed here, or the pending one from a
+    signup) in the vault, and the window's session for that domain only."""
+    from app.infrastructure.application_browser.browser_use_sidecar import get_sidecars
+    from app.services import ats_auth
+
+    from app.services.workflow import get_profile
+
+    task = _task(db, task_id)
+    domain = _login_domain(db, task)
+    pending = db.scalar(select(AtsCredential).where(AtsCredential.user_id == task.user_id,
+                                                    AtsCredential.domain == domain))
+    username = payload.username or (pending.username if pending else None) or get_profile(db).email
+    try:
+        credential = ats_auth.save_login(db, task.user_id, domain, username=username, password=payload.password)
+    except ats_auth.AuthRefused as exc:
+        raise HTTPException(409, {"message": str(exc), "code": exc.code}) from exc
+    saved_session = False
+    manager = get_sidecars()
+    session = manager.get(task.user_id, task.id)  # only this account's own execution's window
+    if session is not None:
+        try:
+            state = manager.run_threadsafe(session.call("storage_state"), timeout=30).get("state") or {}
+            saved_session = ats_auth.save_session(db, task.user_id, domain, state, ats=task.route) is not None
+        except Exception:  # noqa: BLE001  the password is still saved; the session is optional
+            saved_session = False
+    db.commit()
+    return {"credential": ats_auth.credential_view(credential), "session_saved": saved_session}
+
+
+@router.get("/api/settings/guarded-application")
+def guarded_consent(db: Session = Depends(get_user_db), user: CurrentUser = Depends(current_user)) -> dict[str, Any]:
+    from app.services import application_execution, submission
+    from app.settings import get_settings
+
+    return {**submission.consent(db, user.id), "server_mode": application_execution.available_mode(db),
+            "allowlisted_routes": sorted(get_settings().guarded_routes)}
+
+
+@router.put("/api/settings/guarded-application")
+def set_guarded_consent(payload: ConsentIn, db: Session = Depends(get_user_db),
+                        user: CurrentUser = Depends(current_user)) -> dict[str, Any]:
+    from app.services import submission
+
+    result = submission.set_consent(db, user.id, enabled=payload.enabled, attestations=payload.attestations)
+    db.commit()
+    return result
+
+
+@router.get("/api/settings/ats-credentials")
+def ats_credentials(db: Session = Depends(get_user_db), user: CurrentUser = Depends(current_user)) -> dict[str, Any]:
+    from app.services import ats_auth
+
+    return {"credentials": ats_auth.credentials(db, user.id), "sessions": ats_auth.sessions(db, user.id)}
+
+
+@router.put("/api/settings/ats-credentials/{domain}")
+def put_ats_credential(domain: str, payload: CredentialIn, db: Session = Depends(get_user_db),
+                       user: CurrentUser = Depends(current_user)) -> dict[str, Any]:
+    from app.services import ats_auth
+
+    try:
+        row = ats_auth.save_credential(db, user.id, domain, payload.username, payload.password)
+    except ats_auth.AuthRefused as exc:
+        raise HTTPException(422, {"message": str(exc), "code": exc.code}) from exc
+    db.commit()
+    return {"credential": ats_auth.credential_view(row)}
+
+
+@router.delete("/api/settings/ats-credentials/{domain}")
+def delete_ats_credential(domain: str, db: Session = Depends(get_user_db),
+                          user: CurrentUser = Depends(current_user)) -> dict[str, Any]:
+    from app.services import ats_auth
+
+    try:
+        deleted = ats_auth.delete_credential(db, user.id, domain)
+    except ats_auth.AuthRefused as exc:
+        raise HTTPException(422, {"message": str(exc), "code": exc.code}) from exc
+    db.commit()
+    return {"deleted": deleted}
+
+
+@router.delete("/api/settings/ats-sessions/{domain}")
+def revoke_ats_session(domain: str, db: Session = Depends(get_user_db),
+                       user: CurrentUser = Depends(current_user)) -> dict[str, Any]:
+    from app.services import ats_auth
+
+    try:
+        revoked = ats_auth.revoke_session(db, user.id, domain)
+    except ats_auth.AuthRefused as exc:
+        raise HTTPException(422, {"message": str(exc), "code": exc.code}) from exc
+    db.commit()
+    return {"revoked": revoked}
+
+
+@router.get("/api/application-routes")
+def application_routes(db: Session = Depends(get_user_db), user: CurrentUser = Depends(current_user)) -> dict[str, Any]:
+    from sqlalchemy import select
+
+    from app.models import AtsRoute
+    from app.services import ats_map
+
+    ats_map.refresh(db, user.id)
+    db.commit()
+    rows = db.scalars(select(AtsRoute).where(AtsRoute.user_id == user.id).order_by(AtsRoute.ats, AtsRoute.tenant)
+                      .limit(500)).all()
+    return {"routes": [ats_map.view(db, r) for r in rows]}
+
+
+@router.get("/api/application-backends")
+def application_backends_status(user: CurrentUser = Depends(current_user)) -> dict[str, Any]:
+    from app.services import application_backends, browser_use_webui
+
+    out: dict[str, Any] = {"backends": application_backends.status()}
+    if user.is_admin:  # the Web UI probe starts a process and calls a local service: an operator's check
+        out["browser_use_webui"] = browser_use_webui.probe()
+    return out

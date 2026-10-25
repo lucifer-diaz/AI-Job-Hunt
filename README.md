@@ -2458,6 +2458,61 @@ It appears in **Running workers → Application** (Kill, Retry, Run now, setting
 python scripts/application_dry_run.py postgresql+psycopg://localhost/jobhunt_test
 ```
 
+### 10b. Guarded submission and the browser-use backend (Phase 6, off by default)
+
+Phase 6 lets the application worker submit for you, in one narrow case, and read forms no adapter knows.
+Everything below is off unless you turn it on, and autonomous submission does not exist (`autonomous` is refused when
+settings load).
+
+| Mode | What it does |
+| --- | --- |
+| `observe`, `assist` | As above (§10a), now also on dynamic forms through the browser-use backend. |
+| `guarded_auto` | A run may press the final Submit **once**, only when every condition below holds; otherwise it stops and waits for you. |
+
+**When a guarded run may submit.**
+- **Server and account:** the server runs `guarded_auto`, and your account turned it on (Settings → Guarded
+  submission).
+- **Route:** it has a deterministic form adapter (Greenhouse) and is listed in `APPLICATION_GUARDED_ROUTES`.
+- **PreSubmitValidator:** passes twice, before the claim and again just before the click. It checks:
+  - the approved packet is unchanged, and the exact approved resume and cover letter files are attached;
+  - every required field holds exactly its verified answer, and sensitive answers were confirmed for this application;
+  - any attestation the form asks for ("I certify…") is one you approved word for word;
+  - the page shows no CAPTCHA, code or login, and the form's shape is the one planned for.
+- **Claim and intent:** the run takes the same pre-submit claim Claude Desktop and the Apply kit use, then writes a
+  SubmissionIntent. It commits CLICKING just before the click.
+
+It is recorded as Applied (READY_TO_APPLY → APPLYING → APPLIED) only when the site's own evidence confirms it: a
+successful response from the application's domain, the form gone, and a confirmation page. Anything less, or a crash,
+a timeout or a Kill once the click was authorized, is **submission uncertain**. The posting stays reserved, nothing is
+ever clicked again, and the Apply kit asks you whether it went through. While a guarded run owns a posting, Claude
+Desktop and the Apply kit cannot start a submission of it (`ROUTE_HELD`).
+
+**The browser-use backend.** For forms without an adapter (Lever, Workable, employer sites), Job Hunt OS runs its own
+small runner, `sidecars/browser_use_runner`, with the Python of your browser-use Web UI checkout (browser-use
+0.1.48). It uses only the runner's page reading and element actions. Job Hunt OS decides every step:
+- Python fills every verified answer into the element it was resolved for.
+- The **Browser Navigator** worker proposes steps only where Python cannot reach: opening the form, declining a
+  cookie banner, scrolling. It goes through the LLM gateway, as an element key and an answer reference, never a value.
+- Each proposed step is checked by Python before the browser acts.
+- Nothing can submit from there.
+
+The running Web UI itself (`BROWSER_USE_WEBUI_URL`) is only health-checked: its HTTP interface has no authentication,
+no per-user sessions and no way to veto an action (docs/architecture/agentic-roadmap.md, ADR-031).
+
+**Logins.** A login wall, a code or a signup stops the run and, on a local install with
+`BROWSER_USE_HEADLESS=false`, keeps the browser window open for `APPLICATION_TAKEOVER_TTL_MINUTES` (15).
+- **Finishing in the window:** you finish there and press **I'm done — continue** in the Apply kit; the run looks at
+  the page afresh.
+- **Signup:** a signup gets a generated password, shown once, so you sign up with exactly that.
+- **Save this login:** stores the password (encrypted, never shown again) and the window's session, for that site
+  only.
+- **Next time:** the run starts signed in (`APPLICATION_AUTH_SESSIONS_ENABLED`). On a domain in
+  `APPLICATION_LOGIN_DOMAINS`, it can also fill the saved login itself, once. A failed login, a code or a CAPTCHA
+  always waits for you.
+
+Setup, the variables, the ATS matrix measured on real postings and the rollout steps:
+[docs/operations/browser-use.md](docs/operations/browser-use.md).
+
 ### Recommended batch sizes
 
 ```text

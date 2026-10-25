@@ -7,9 +7,11 @@
     a person answers or confirms              → wake: the waiting task becomes claimable again
 
 APPLICATION_EXECUTION_MODE (off by default) chooses what a run may do: `observe` reads the form and resolves where
-each answer comes from; `assist` also fills it in an ephemeral browser page and validates it, ending READY_TO_SUBMIT.
-Neither submits — the stages after READY_TO_SUBMIT are refused here (`set_stage`) — and a person submits through the
-Apply kit, which takes the pre-submit claim (apply_queue.begin_submission).
+each answer comes from; `assist` also fills it in an ephemeral browser page and validates it, ending READY_TO_SUBMIT,
+and a person submits through the Apply kit, which takes the pre-submit claim (apply_queue.begin_submission).
+`guarded_auto` (Phase 6) also lets a run of a consenting account, on an allowlisted route, click the final Submit —
+only through app.services.submission, holding the same claim and a SubmissionIntent. The submit stages (SUBMITTING,
+CONFIRMING, CONFIRMED) are refused here (`set_stage`) unless that intent is passed, and by the column otherwise.
 
 PostgreSQL is the only queue. Waiting for a person uses no attempt and no polling: a task waiting at NEEDS_INPUT is
 not claimable until a person answers or confirms (or asks to Run now). Kill stops the task and its thread; nothing
@@ -53,9 +55,15 @@ PENDING, PROCESSING, COMPLETED, FAILED, SKIPPED = "PENDING", "PROCESSING", "COMP
 OUTCOMES = ("completed", "waiting", "retrying", "failed", "stopped", "busy", "lost")
 MODE_OFF = "MODE_OFF"
 ERROR_LIMIT = 300
-# Phase 5 never submits: these execution stages exist in the vocabulary and are refused.
+# Reached only by a guarded run holding its SubmissionIntent (app.services.submission); refused otherwise.
 SUBMIT_STAGES = frozenset({"SUBMITTING", "CONFIRMING", "CONFIRMED"})
+# The intent status each submit stage needs.
+STAGE_INTENT = {"SUBMITTING": ("CLICKING",), "CONFIRMING": ("CLICKING",), "CONFIRMED": ("CONFIRMED",)}
+SERVER_MODES = {"OBSERVE": ("observe", "assist", "guarded_auto"), "ASSIST": ("assist", "guarded_auto"),
+                "GUARDED_AUTO": ("guarded_auto",)}
 WAITING = "NEEDS_INPUT"
+# Stages a PENDING task waits in for a person: answers (NEEDS_INPUT) or the takeover window (NEEDS_HUMAN, Phase 6).
+WAITING_STAGES = ("NEEDS_INPUT", "NEEDS_HUMAN")
 
 
 class ExecutionRefused(ValueError):
@@ -65,7 +73,7 @@ class ExecutionRefused(ValueError):
 
 
 class SubmitForbidden(RuntimeError):
-    """Something tried to move an execution into a submit stage. Phase 5 has no submit path."""
+    """Something tried to move an execution into a submit stage without the SubmissionIntent that authorizes it."""
 
 
 def utcnow() -> datetime:
@@ -92,20 +100,29 @@ def available_mode(db: Session) -> str:
     return mode() if routes(db) else "off"
 
 
-def set_stage(task: ApplicationExecutionTask, stage: str) -> None:
-    """The only way an execution's stage changes. Refuses the submit stages (SubmitForbidden) and unknown names."""
-    if stage in SUBMIT_STAGES:
-        raise SubmitForbidden(f"{stage} is not reachable: Job Hunt OS does not submit applications (Phase 5)")
+def set_stage(task: ApplicationExecutionTask, stage: str, *, intent: Any = None) -> None:
+    """The only way an execution's stage changes. Refuses unknown names, and the submit stages (SubmitForbidden)
+    unless `intent` is this execution's SubmissionIntent in the status that stage needs."""
     if stage not in APPLICATION_EXECUTION_STAGES:
         raise ValueError(f"unknown execution stage {stage}")
+    if stage in SUBMIT_STAGES:
+        if intent is None or intent.execution_task_id != task.id or intent.status not in STAGE_INTENT[stage] \
+                or task.mode != "GUARDED_AUTO":
+            raise SubmitForbidden(f"{stage} needs this guarded execution's SubmissionIntent "
+                                  "(app.services.submission); nothing else may reach it")
+        task._submit_stage_allowed = stage  # read once by the column guard below
     task.stage = stage
 
 
 @event.listens_for(ApplicationExecutionTask.stage, "set", retval=True)
-def _no_submit_stage(_target: Any, value: str, _old: Any, _initiator: Any) -> str:
-    """Belt and braces: whatever code sets the column, a submit stage never reaches the database."""
+def _no_submit_stage(target: Any, value: str, _old: Any, _initiator: Any) -> str:
+    """Belt and braces: whatever code sets the column, a submit stage reaches the database only through set_stage
+    with the execution's intent."""
     if value in SUBMIT_STAGES:
-        raise SubmitForbidden(f"{value} is not reachable: Job Hunt OS does not submit applications (Phase 5)")
+        allowed = target.__dict__.pop("_submit_stage_allowed", None)
+        if allowed != value:
+            raise SubmitForbidden(f"{value} needs this guarded execution's SubmissionIntent "
+                                  "(app.services.submission); nothing else may reach it")
     return value
 
 
@@ -130,11 +147,11 @@ def enqueue(db: Session, job: Job, *, execution_mode: str | None = None, reason:
     from app.services import apply_queue, approval
 
     server = mode()
-    wanted = (execution_mode or server).upper()
+    wanted = (execution_mode or ("ASSIST" if server == "guarded_auto" else server)).upper()
     if not routes(db):
         raise ExecutionRefused("The application worker is off (APPLICATION_EXECUTION_MODE, AGENT_GRAPHS_ENABLED and "
                                "PostgreSQL are needed)", "OFF")
-    if wanted not in ("OBSERVE", "ASSIST") or (wanted == "ASSIST" and server != "assist"):
+    if server not in SERVER_MODES.get(wanted, ()):
         raise ExecutionRefused(f"This server runs the application worker in {server} mode", "MODE")
     existing = active_task(db, job.id)
     if existing is not None:
@@ -145,6 +162,8 @@ def enqueue(db: Session, job: Job, *, execution_mode: str | None = None, reason:
     claim = apply_queue.open_claim(db, job)
     if claim is not None:
         raise ExecutionRefused("A submission of this posting is in progress or its outcome is unknown", "CLAIMED")
+    if wanted == "GUARDED_AUTO":
+        guarded_refusal(db, job)
     packet = approval.live(db, job.application)
     now = now or utcnow()
     q = ApplicationExecutionTask
@@ -165,6 +184,22 @@ def enqueue(db: Session, job: Job, *, execution_mode: str | None = None, reason:
     return task
 
 
+def guarded_refusal(db: Session, job: Job) -> None:
+    """Why this job may not run in GUARDED_AUTO (ExecutionRefused), checked when it is queued; the PreSubmitValidator
+    checks all of it again before the click."""
+    from app.services import ats_map, submission
+
+    if not submission.consent(db, job.user_id)["enabled"]:
+        raise ExecutionRefused("Guarded submission is off for this account (Settings → Guarded submission)",
+                               "NO_CONSENT")
+    match = ats_map.for_job(job)
+    if match is None or not match.guarded_capable:
+        raise ExecutionRefused("Guarded submission needs a route with a deterministic form adapter (Greenhouse)",
+                               "ROUTE_NOT_GUARDED")
+    if not match.allowed_by(get_settings().guarded_routes):
+        raise ExecutionRefused(f"The route {match.route} is not in APPLICATION_GUARDED_ROUTES", "ROUTE_NOT_ALLOWED")
+
+
 def _nudge_after_commit(db: Session) -> None:
     if db.info.get("application_execution_nudge"):
         return
@@ -183,6 +218,8 @@ def _nudge_after_commit(db: Session) -> None:
 
 def _ready_to_continue(db: Session, task: ApplicationExecutionTask) -> bool:
     waiting = task.interrupt or {}
+    if waiting.get("kind") == "NEEDS_HUMAN":
+        return bool(waiting.get("continued"))  # the person said they finished in the window
     needed = list(waiting.get("question_ids") or [])
     if needed:
         rows = db.scalars(select(KnowledgeAnswer).where(KnowledgeAnswer.id.in_(needed))).all()
@@ -195,9 +232,9 @@ def _ready_to_continue(db: Session, task: ApplicationExecutionTask) -> bool:
 def wake(db: Session, task: ApplicationExecutionTask) -> bool:
     """A waiting task whose questions are now answered and confirmed becomes claimable (stage ANSWERING). Does not
     commit."""
-    if task.status != PENDING or task.stage != WAITING or not _ready_to_continue(db, task):
+    if task.status != PENDING or task.stage not in WAITING_STAGES or not _ready_to_continue(db, task):
         return False
-    set_stage(task, "ANSWERING")
+    set_stage(task, "ANSWERING" if task.stage == WAITING else "ROUTED")
     task.next_attempt_at = None
     _nudge_after_commit(db)
     return True
@@ -217,6 +254,53 @@ def wake_waiting(db: Session, user_id: int) -> int:
     except Exception:
         log.warning("could not wake waiting application executions", exc_info=True)
     return woken
+
+
+def continue_after_takeover(db: Session, task_id: int) -> ApplicationExecutionTask:
+    """The person finished in the kept window (logged in, entered the code, signed up): the run resumes and re-observes
+    the page, revalidating everything before it acts. Commits."""
+    task = db.get(ApplicationExecutionTask, task_id)
+    if task is None:
+        raise ExecutionRefused("Execution not found", "NOT_FOUND")
+    waiting = dict(task.interrupt or {})
+    if task.status != PENDING or task.stage != "NEEDS_HUMAN" or not waiting.get("takeover"):
+        raise ExecutionRefused("This execution is not waiting for you in its browser window", "NOT_WAITING")
+    waiting["continued"] = True
+    task.interrupt = waiting
+    wake(db, task)
+    db.commit()
+    return task
+
+
+def end_expired_takeovers(db: Session, now: datetime | None = None, limit: int = 200) -> int:
+    """Takeovers nobody came back to: the window is closed (SidecarManager.reap) and the run ends NEEDS_HUMAN
+    (TAKEOVER_EXPIRED) with the shared blocker, as a Phase 5 run would; a person retries when ready. Commits."""
+    from app.services import apply_queue, qualification
+
+    now = now or utcnow()
+    q = ApplicationExecutionTask
+    ended = 0
+    for task in db.scalars(select(q).where(q.status == PENDING, q.stage == "NEEDS_HUMAN").limit(limit)).all():
+        waiting = task.interrupt or {}
+        try:
+            expires = datetime.fromisoformat(waiting.get("expires_at") or "")
+        except ValueError:
+            continue
+        if waiting.get("continued") or expires > now:
+            continue
+        task.status, task.completed_at, task.outcome, task.result_code = COMPLETED, now, "NEEDS_HUMAN", \
+            "TAKEOVER_EXPIRED"
+        qualification.stop_threads(db, [task.agent_thread_id], now, note="Nobody took over the browser window")
+        job = db.get(Job, task.job_id)
+        reason = {"ACCOUNT_REQUIRED": "account_required", "CAPTCHA_OR_ANTI_BOT": "captcha"}.get(
+            waiting.get("reason") or "", "login_required")
+        if job is not None and job.application is not None and job.application.status == "approved":
+            db.commit()
+            apply_queue.record_blocker(db, job, reason, recorded_by="application_worker",
+                                       detail=f"The browser window waited for you and closed: {waiting.get('reason')}")
+        ended += 1
+    db.commit()
+    return ended
 
 
 def confirmations(db: Session, task: ApplicationExecutionTask) -> list[dict[str, Any]]:
@@ -265,7 +349,7 @@ def claim(db: Session, *, worker_id: str, limit: int, now: datetime | None = Non
     q = ApplicationExecutionTask
     query = (select(q.id, q.user_id, q.job_id, q.run_now_at)
              .where(q.status == PENDING, or_(q.next_attempt_at.is_(None), q.next_attempt_at <= now),
-                    or_(q.stage != WAITING, q.run_now_at.is_not(None)))
+                    or_(q.stage.not_in(WAITING_STAGES), q.run_now_at.is_not(None)))
              .order_by(q.run_now_at.is_(None), q.id).limit(max(1, limit)))
     paused = worker_settings.paused(db, KIND)
     if paused:
@@ -301,12 +385,26 @@ def _clear_lease(task: ApplicationExecutionTask) -> None:
 def recover_expired(db: Session, now: datetime | None = None) -> int:
     """PROCESSING tasks whose worker died: RETRYING (pending again) or FAILED at the attempt limit. A dead worker
     never moves a task towards a submit: there is no such stage to move to. Commits."""
+    from app.services import submission
+
     now = now or utcnow()
     q = ApplicationExecutionTask
     rows = db.scalars(select(q).where(q.status == PROCESSING, q.lock_expires_at < now).limit(200)).all()
     for task in rows:
         limit = worker_settings.get(db, task.user_id, KIND, "max_attempts")
         _clear_lease(task)
+        if task.mode == "GUARDED_AUTO" and submission.reconcile(db, task, "The worker stopped answering") in (
+                submission.UNCERTAIN, submission.CONFIRMED):
+            # A click may have happened: the outcome is established by a person, never by another attempt.
+            task = db.get(ApplicationExecutionTask, task.id, populate_existing=True)
+            _clear_lease(task)
+            task.status, task.completed_at, task.outcome = COMPLETED, now, "SUBMISSION_UNCERTAIN"
+            task.result_code = "SUBMISSION_UNCERTAIN"
+            task.last_error = "The worker stopped after the final click started; say whether it was submitted"
+            from app.services import qualification
+
+            qualification.stop_threads(db, [task.agent_thread_id], now, note="Submission outcome unknown")
+            continue
         if task.attempt_count >= limit:
             task.status, task.completed_at, task.outcome = FAILED, now, "FAILED"
             set_stage(task, "FAILED")
@@ -454,7 +552,7 @@ def _settle(sessions: SessionFactory, c: ExecutionClaim, thread_pk: int) -> str:
         status = thread.status if thread is not None else "STOPPED"
         _clear_lease(task)
         if status == "INTERRUPTED":
-            if task.stage != WAITING:
+            if task.stage not in WAITING_STAGES:
                 set_stage(task, WAITING)
             attempt_note(db, task, stage_reached=task.stage, outcome="WAITING", ended_at=now)
             task.status, task.attempt_count = PENDING, max(0, task.attempt_count - 1)  # waiting uses no attempt
@@ -516,13 +614,32 @@ def _settle_error(sessions: SessionFactory, c: ExecutionClaim, exc: Exception) -
 # ───────────── stopping, retrying, mode off ─────────────
 
 def on_stopped(db: Session, task: ApplicationExecutionTask, now: datetime) -> None:
-    """Kill from Running workers: the task is already SKIPPED with STOPPED_BY_USER; stop its thread too."""
-    from app.services import qualification
+    """Kill from Running workers: the task is already SKIPPED with STOPPED_BY_USER; stop its thread too. A guarded run
+    stopped after its click started stays SUBMISSION_UNCERTAIN (a kill is not a "not submitted"); one stopped before
+    gives its claim back."""
+    from app.services import qualification, submission
 
     task.outcome = "STOPPED"
-    set_stage(task, "CANCELLED")
+    _close_window(task)
+    if task.mode == "GUARDED_AUTO" and submission.reconcile(db, task, "Stopped by you") == submission.UNCERTAIN:
+        task = db.get(ApplicationExecutionTask, task.id, populate_existing=True)
+        task.outcome = "SUBMISSION_UNCERTAIN"
+    else:
+        set_stage(task, "CANCELLED")
     if task.agent_thread_id:
         qualification.stop_threads(db, [task.agent_thread_id], now)
+
+
+def _close_window(task: ApplicationExecutionTask) -> None:
+    """A kept browser-use window (takeover) closes with its execution. Never raises."""
+    try:
+        from app.infrastructure.application_browser.browser_use_sidecar import get_sidecars
+
+        manager = get_sidecars()
+        if manager.get(task.user_id, task.id) is not None:
+            manager.run_threadsafe(manager.close(task.user_id, task.id), timeout=20)
+    except Exception:  # noqa: BLE001  the reaper closes it at the end of its takeover time anyway
+        log.debug("could not close the browser window of execution %s", task.id)
 
 
 def on_job_deleted(db: Session, job_id: int) -> None:
@@ -577,7 +694,7 @@ def view(task: ApplicationExecutionTask) -> dict[str, Any]:
                "source": (plan.get(f["id"]) or {}).get("source"),
                "question_id": (plan.get(f["id"]) or {}).get("question_id")} for f in form.get("fields") or []]
     return {"id": task.id, "job_id": task.job_id, "mode": task.mode, "status": task.status, "stage": task.stage,
-            "outcome": task.outcome, "result_code": task.result_code, "route": task.route,
+            "outcome": task.outcome, "result_code": task.result_code, "route": task.route, "backend": task.backend,
             "interrupt": task.interrupt, "attempts": task.attempt_count, "last_error": task.last_error,
             "submit_control": (form.get("submit") or {}).get("label") if form else None, "fields": fields,
             "created_at": task.created_at.isoformat() if task.created_at else None,
