@@ -74,6 +74,26 @@ describe('the Apply kit claim', () => {
     expect(resolved[2]).toEqual({ claim_id: 6, submitted: false });
   });
 
+  it('asks the questions the worker is waiting for, saves each as a verified answer, and links to them', async () => {
+    const waiting = { id: 9, mode: 'ASSIST', status: 'PENDING', stage: 'NEEDS_INPUT', interrupt: { kind: 'NEEDS_INPUT', question_ids: [21, 22], confirm_question_ids: [] } };
+    const questions = [
+      { id: 21, question: 'Why Examplecorp?', answer: '', verified: false, answered: false, answer_type: 'text', answer_options: [], category: 'general', sensitive: false },
+      { id: 22, question: 'Do you require visa sponsorship?', answer: '', verified: false, answered: false, answer_type: 'boolean', answer_options: [], category: 'general', sensitive: true }];
+    const el = html(kit({ execution_mode: 'assist', execution: waiting, execution_questions: questions }));
+    expect(el.textContent).toContain('2 of 2 questions to answer');
+    expect(el.textContent).toContain('Why Examplecorp?');
+    expect(el.querySelector('#kitq-q21').tagName).toBe('TEXTAREA');
+    expect([...el.querySelector('#kitq-q22').options].map(o => o.value)).toEqual(['', 'Yes', 'No']);
+    ui.S.forms.kitq = { q21: 'I build payment systems like yours.' };
+    await ui.A['kit-answer']({ dataset: { qid: '21' } });
+    const saved = calls.find(([m, u]) => m === 'PUT' && u === '/api/knowledge/21');
+    expect(saved[2]).toEqual({ question: 'Why Examplecorp?', answer: 'I build payment systems like yours.', category: 'general', answer_type: 'text', verified: true, sensitive: false });
+    ui.S.forms.kitq = {};
+    await ui.A['kit-answer']({ dataset: { qid: '22' } });  // nothing chosen: nothing is saved
+    expect(calls.some(([m, u]) => m === 'PUT' && u === '/api/knowledge/22')).toBe(false);
+    expect(acts(el)).toContain('kit-open-questions');
+  });
+
   it('shows the application worker only when it is on, and never offers to submit', () => {
     expect(acts(html(kit()))).not.toContain('kit-prepare');
     const el = html(kit({ execution_mode: 'assist', execution: { id: 9, mode: 'ASSIST', status: 'COMPLETED', stage: 'READY_TO_SUBMIT', interrupt: null, result_code: 'READY_TO_SUBMIT' } }));

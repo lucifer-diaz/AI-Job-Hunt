@@ -1488,6 +1488,24 @@ function renderKitIntent(k) {
   const tone = i.status === 'CONFIRMED' ? 'good' : ['UNCERTAIN', 'CLICKING'].includes(i.status) ? 'warn' : 'muted';
   return `<div class="row gap8 mt8">${pill(`Submit ${i.status.replaceAll('_', ' ').toLowerCase()}`, tone)}${i.reason ? `<span class="xs muted pretty">${esc(i.reason)}</span>` : ''}</div>`;
 }
+// The questions the application worker could not answer from a verified source: answer them here (saved to the
+// Knowledge bank as verified, your own words), or open just these in the Knowledge bank. The run continues by itself
+// once the last one is answered. Yes/no and choice questions offer the form's own options.
+function renderKitQuestions(k) {
+  const qs = k.execution_questions || [], left = qs.filter(q => !q.answered).length;
+  if (!qs.length) return `<div class="xs muted mt6">Answer ${(k.execution?.interrupt?.question_ids || []).length} question(s) in the Knowledge bank; it continues by itself.</div>`;
+  const field = q => {
+    const opts = q.answer_options?.length ? q.answer_options : q.answer_type === 'boolean' ? ['Yes', 'No'] : [];
+    return opts.length ? selectF('kitq', `q${q.id}`, q.answer, [['', 'Choose…'], ...opts.map(o => [o, o])], `aria-label="${attr(q.question)}"`)
+      : textareaF('kitq', `q${q.id}`, q.answer, `rows="2" aria-label="${attr(q.question)}" placeholder="Your answer, in your own words"`);
+  };
+  return `<div class="mt10"><div class="small b">${left ? `${left} of ${qs.length} question${qs.length === 1 ? '' : 's'} to answer` : 'All answered: it continues on the next pass'}</div>
+    <div class="xs muted mt4 pretty">The form asks these and nothing verified answers them yet. What you save here goes to the Knowledge bank as a verified answer, and is reused for the same question on other applications.</div>
+    ${qs.map(q => `<div class="box mt8" style="padding:10px;border-radius:10px"><div class="small pretty">${esc(q.question)}${q.sensitive ? ` ${pill('Sensitive · confirmed per application', 'bad')}` : ''}</div>
+      ${q.answered ? `<div class="row gap8 mt6"><span class="small b pretty grow">${esc(q.answer)}</span>${pill('Saved', 'good')}</div>`
+        : `<div class="mt6">${field(q)}</div>${btn(label(`kitq-${q.id}`, 'Save answer', 'Saving…'), 'kit-answer', { qid: q.id }, 'sm mt6', isBusy(`kitq-${q.id}`))}`}</div>`).join('')}
+    ${btn('Open these in the Knowledge bank', 'kit-open-questions', { ids: qs.map(q => q.id).join(',') }, 'sm ghost mt8')}</div>`;
+}
 function renderKitExecution(k) {
   const x = k.execution, mode = k.execution_mode;
   if (!mode || mode === 'off') return '';
@@ -1497,7 +1515,7 @@ function renderKitExecution(k) {
   const confirm = waiting ? (k.execution_confirmations || []) : [];
   const confirmList = confirm.length ? `<div class="mt8">${confirm.map(c => `<div class="small mt6"><div class="ink2 pretty">${esc(c.question)}</div><div class="b pretty">${esc(c.answer || '(no saved answer)')}</div></div>`).join('')}</div>` : '';
   const state = !x ? '' : `<div class="row gap8 mt8">${pill(x.stage.replaceAll('_', ' '), x.stage === 'READY_TO_SUBMIT' ? 'good' : ['BLOCKED', 'NEEDS_HUMAN', 'FAILED'].includes(x.stage) ? 'warn' : 'muted')}${x.result_code ? `<span class="xs muted">${esc(x.result_code)}</span>` : ''}</div>
-    ${waiting && (x.interrupt.question_ids || []).length ? `<div class="xs muted mt6">Answer ${x.interrupt.question_ids.length} question(s) in the Knowledge bank; it continues by itself.</div>` : ''}
+    ${waiting && (x.interrupt.question_ids || []).length ? renderKitQuestions(k) : ''}
     ${waiting && confirm.length ? `${confirmList}${btn(confirm.length === 1 ? 'Use this answer for this application' : `Use these ${confirm.length} answers for this application`, 'kit-confirm', { exec: x.id, ids: confirm.map(c => c.id).join(',') }, 'sm mt8')}` : ''}
     ${x.stage === 'READY_TO_SUBMIT' ? `<div class="xs muted mt6 pretty">${x.mode === 'ASSIST' ? 'Every required field was filled from a verified source in a private browser page, which was then closed: nothing was kept there or sent.' : 'Every required field has a verified source.'} Open the posting and fill it in yourself with the answers in this kit, then submit it there.</div>` : ''}`;
   const active = x && ['PENDING', 'PROCESSING'].includes(x.status);
@@ -2812,6 +2830,24 @@ const A = {
     await api(`/api/jobs/${el.dataset.id}/application-execution`, { method: 'POST', body: {} });
     D.kit = await api(`/api/jobs/${el.dataset.id}/apply-kit`);
   }, 'Queued for the application worker'),
+  'kit-answer': el => {
+    const q = (D.kit?.execution_questions || []).find(x => x.id === Number(el.dataset.qid));
+    const answer = String(fv('kitq', `q${el.dataset.qid}`, q?.answer || '')).trim();
+    if (!q) return;
+    if (!answer) { toast('Type or choose an answer first', true); return; }
+    return busy(`kitq-${q.id}`, async () => {
+      await api(`/api/knowledge/${q.id}`, { method: 'PUT', body: { question: q.question, answer, category: q.category, answer_type: q.answer_type, verified: true, sensitive: q.sensitive } });
+      if (S.forms.kitq) delete S.forms.kitq[`q${q.id}`];
+      D.kit = await api(`/api/jobs/${S.kitJob}/apply-kit`);
+    }, 'Saved to the Knowledge bank');
+  },
+  'kit-open-questions': el => {
+    const ids = el.dataset.ids.split(',').map(Number).filter(Boolean);
+    S.kitJob = null;
+    const f = knowledgeState().filters.answers;
+    Object.assign(f, { q: '', status: 'all', category: 'all', sensitive: 'all', ids });
+    go('knowledge');
+  },
   'kit-guarded': el => busy('kit-guarded', async () => {
     await api(`/api/jobs/${el.dataset.id}/application-execution`, { method: 'POST', body: { mode: 'GUARDED_AUTO' } });
     D.kit = await api(`/api/jobs/${el.dataset.id}/apply-kit`);

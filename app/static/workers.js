@@ -252,7 +252,7 @@ function wkTable(kind, data) {
       <div style="min-width:0"><div class="small b ellipsis">${wkTaskName(r)}</div>
         <div class="wk-detail xs ${['FAILED', 'BLOCKED'].includes(r.status) ? 'orch-bad' : 'muted'}"><span class="ellipsis" title="${attr(wkDetail(r))}">${wkTries(r)}${esc(wkDetail(r))}</span>${wkRowWhy(r)}</div></div>
       ${wkLastRun(r)}${wkModel(r)}${wkModelChange(r)}
-      <div class="wk-row-actions">${r.retried_by ? `<span class="orch-chip muted" title="${attr(`A newer task (#${r.retried_by.task_id}) is handling this job`)}">↻ Run again</span>` : ''}${wkButtons(kind, r.task_id, { kill: r.can_kill, runNow: r.can_run_now })}${wkRowNudge(kind, r.job_id, r.status)}${r.job_id != null ? btn('Job', 'open-job', { id: r.job_id }, 'sm') : ''}</div></div>`).join('')}</div></section>`;
+      <div class="wk-row-actions">${r.retried_by ? `<span class="orch-chip muted" title="${attr(`A newer task (#${r.retried_by.task_id}) is handling this job`)}">↻ Run again</span>` : ''}${wkButtons(kind, r.task_id, { kill: r.can_kill, runNow: r.can_run_now })}${wkRowNudge(kind, r.job_id, r.status)}${r.waiting_for === 'YOU' && r.job_id != null ? btn(r.waiting_detail?.kind === 'NEEDS_HUMAN' ? 'Open Apply kit' : 'Answer questions', 'open-kit', { id: r.job_id }, 'sm primary') : ''}${r.job_id != null ? btn('Job', 'open-job', { id: r.job_id }, 'sm') : ''}</div></div>`).join('')}</div></section>`;
 }
 
 /* ───────────── overview: hero, queue and the last 24 hours ───────────── */

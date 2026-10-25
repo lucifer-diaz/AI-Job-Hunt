@@ -306,6 +306,23 @@ def test_a_run_waiting_for_answers_says_so_and_shows_no_model_in_running_workers
     assert row["waiting_detail"]["kind"] == "NEEDS_INPUT" and row["waiting_detail"]["questions"] >= 1
     assert row["backend"] == "playwright" and row["model"] == {"model": None, "source": "none"}
     assert row["model_change"] is None
+    # The Apply kit asks exactly those questions in place, with the form's own options.
+    with sessions() as db:
+        db.info["user_id"] = user
+        task = db.get(ApplicationExecutionTask, row["task_id"])
+        asked = application_execution.questions(db, task)
+    assert [q["id"] for q in asked] == task.interrupt["question_ids"]
+    assert aps.PYTHON_QUESTION in [q["question"] for q in asked] and not any(q["answered"] for q in asked)
+    with sessions() as db:  # answering every one of them, the way the Apply kit does, wakes the run
+        db.info["user_id"] = user
+        for q in asked:
+            saved = db.get(KnowledgeAnswer, q["id"])
+            saved.answer = "8" if q["question"] == aps.PYTHON_QUESTION else (q["answer_options"] or ["Yes"])[0]
+            saved.verified = True
+        db.flush()
+        assert application_execution.wake_waiting(db, user) == 1
+        db.commit()
+    assert aps.task_of(sessions, job_id).stage == "ANSWERING"
 
 
 def test_the_application_worker_is_visible_in_running_workers_for_its_owner_only(sessions, browser):

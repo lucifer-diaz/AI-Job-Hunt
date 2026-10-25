@@ -303,6 +303,20 @@ def end_expired_takeovers(db: Session, now: datetime | None = None, limit: int =
     return ended
 
 
+def questions(db: Session, task: ApplicationExecutionTask) -> list[dict[str, Any]]:
+    """The questions this execution waits for the person to answer (saved in the Knowledge bank by the resolver), with
+    what the Apply kit needs to ask them in place: the wording, the form's own options, whether it is sensitive and
+    what is saved so far. For the account's own Apply kit only; nothing here is stored on the task."""
+    ids = list((task.interrupt or {}).get("question_ids") or []) if task.stage == WAITING else []
+    if not ids:
+        return []
+    rows = {r.id: r for r in db.scalars(select(KnowledgeAnswer).where(KnowledgeAnswer.id.in_(ids))).all()}
+    return [{"id": i, "question": rows[i].question, "answer": rows[i].answer or "", "verified": rows[i].verified,
+             "answered": bool(rows[i].verified and (rows[i].answer or "").strip()),
+             "answer_type": rows[i].answer_type, "answer_options": rows[i].answer_options or [],
+             "category": rows[i].category, "sensitive": rows[i].sensitive} for i in ids if i in rows]
+
+
 def confirmations(db: Session, task: ApplicationExecutionTask) -> list[dict[str, Any]]:
     """The saved sensitive answers this execution waits for the person to confirm: each question and the answer that
     would be filled, so a person sees exactly what they authorize. For the account's own Apply kit only (it shows
