@@ -126,8 +126,12 @@ def test_the_runner_clicks_submit_controls_only_when_signed_and_runs_only_its_ow
                 script = node.args[0] if node.args else None
                 assert isinstance(script, ast.Name) and script.id.isupper(), \
                     f"{function.name} evaluates something other than a constant script"
-    assert clicking == {"click", "_signed_click"}
+    assert clicking == {"click", "_signed_click", "choose"}
     source = RUNNER.read_text()
+    choose = source[source.index("    async def choose("):source.index("    async def scroll(")]
+    # `choose` clicks only the dropdown itself (after refusing anything submit-like) and one of its role=option items.
+    assert choose.index('element.get("role") != "combobox" or element.get("submit_like")') < choose.index(".click(")
+    assert choose.count(".click(") == 2 and "'[role=\"option\"]:visible'" in choose
     click = source[source.index("    async def click("):source.index("    async def scroll(")]
     assert 'element.get("submit_like")' in click and "SUBMIT_REFUSED" in click
     signed = source[source.index("    async def _signed_click("):source.index("    async def submit(")]

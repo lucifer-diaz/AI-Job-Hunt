@@ -50,6 +50,13 @@ def detect(url: str, html: str) -> bool:
     return form is not None and form.find(attrs={"name": re.compile(r"^job_application\[")}) is not None
 
 
+def _helper(element: Tag) -> bool:
+    """Inputs no person fills: hidden from assistive technology and the tab order, or with neither id nor name (the
+    new board pairs each dropdown with such an input to make the browser enforce `required`)."""
+    hidden = element.get("aria-hidden") == "true" or element.get("tabindex") == "-1"
+    return (hidden and not element.get("role")) or not (element.get("id") or element.get("name"))
+
+
 def _text(node: Tag | None) -> str:
     return re.sub(r"\s+", " ", node.get_text(" ", strip=True)).strip() if node is not None else ""
 
@@ -104,10 +111,14 @@ def analyze(url: str, html: str) -> ApplicationForm | None:
         kind = (element.get("type") or "text").lower() if element.name == "input" else element.name
         if kind in ("hidden", "submit", "button", "reset", "image", "password"):
             continue
+        if _helper(element):  # a dropdown widget's hidden required-shim, not a question
+            continue
+        if element.get("role") == "combobox":
+            kind = "combobox"
         if kind == "radio":
             radios.setdefault(element.get("name") or "", []).append(element)
             continue
-        if kind not in ("text", "email", "tel", "url", "number", "textarea", "select", "checkbox", "file"):
+        if kind not in ("text", "email", "tel", "url", "number", "textarea", "select", "checkbox", "file", "combobox"):
             kind = "text"
         label, starred = _label(soup, element)
         required = starred or element.has_attr("required") or element.get("aria-required") == "true"
@@ -148,6 +159,9 @@ async def fill(page: Any, form: ApplicationForm, values: dict[str, Any]) -> dict
         if field.id not in values:
             continue
         value = values[field.id]
+        if field.kind == "combobox":  # opening a dropdown takes a click, which this page never makes
+            report[field.id] = "not filled (a dropdown: the browser-use backend sets it)"
+            continue
         try:
             if field.kind == "file":
                 await page.upload(field.locator, value["path"])

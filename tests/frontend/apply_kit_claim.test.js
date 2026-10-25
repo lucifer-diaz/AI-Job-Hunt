@@ -94,6 +94,16 @@ describe('the Apply kit claim', () => {
     expect(acts(el)).toContain('kit-open-questions');
   });
 
+  it('runs a job on browser-use when the backend is set up, and never offers it otherwise', async () => {
+    const done = { id: 9, mode: 'ASSIST', status: 'FAILED', stage: 'FAILED', interrupt: null, result_code: null };
+    expect(acts(html(kit({ execution_mode: 'assist', execution: done, browser_use_ready: false })))).not.toContain('kit-browser-use');
+    const el = html(kit({ execution_mode: 'assist', execution: done, browser_use_ready: true }));
+    expect(acts(el)).toContain('kit-browser-use');
+    await ui.A['kit-browser-use']({ dataset: { id: '11' } });
+    const queued = calls.find(([m, u]) => m === 'POST' && u === '/api/jobs/11/application-execution');
+    expect(queued[2]).toEqual({ backend: 'browser_use_webui' });
+  });
+
   it('shows the application worker only when it is on, and never offers to submit', () => {
     expect(acts(html(kit()))).not.toContain('kit-prepare');
     const el = html(kit({ execution_mode: 'assist', execution: { id: 9, mode: 'ASSIST', status: 'COMPLETED', stage: 'READY_TO_SUBMIT', interrupt: null, result_code: 'READY_TO_SUBMIT' } }));

@@ -77,8 +77,22 @@ DESCRIBE_JS = """(el) => {
           group_label: legend.slice(0, 500), required, options, value_present: valuePresent,
           checked: !!el.checked, value: (type === 'radio' || type === 'checkbox') ? (el.value || '') : '',
           in_form: !!form, role: el.getAttribute('role') || '', href_host: href,
+          aria_hidden: el.getAttribute('aria-hidden') === 'true', tabindex: el.getAttribute('tabindex') || '',
           autocomplete: (el.getAttribute('autocomplete') || '').toLowerCase()};
 }"""
+# What a dropdown widget (role=combobox) shows as chosen: its single-value text (React Select and similar), else the
+# input's own value.
+COMBO_VALUE_JS = """(el) => {
+  let box = el;
+  for (let i = 0; i < 5 && box; i++) {
+    const shown = box.querySelector && box.querySelector('[class*="single-value"], [class*="singleValue"]');
+    if (shown) return (shown.innerText || shown.textContent || '').trim();
+    box = box.parentElement;
+  }
+  return (el.value || '').trim();
+}"""
+OPTION_TEXTS_JS = """() => Array.from(document.querySelectorAll('[role="option"]'))
+  .filter(o => o.offsetParent !== null).map(o => (o.innerText || o.textContent || '').replace(/\\s+/g, ' ').trim())"""
 FILE_NAMES_JS = "(el) => Array.from(el.files || []).map(f => f.name)"
 FILE_SIZES_JS = "(el) => Array.from(el.files || []).map(f => f.size)"
 FORM_INPUTS_JS = """() => Array.from(document.querySelectorAll('form input, form select, form textarea'))
@@ -295,6 +309,8 @@ class Runner:
             return {"files": await handle.evaluate(FILE_NAMES_JS), "sizes": await handle.evaluate(FILE_SIZES_JS)}
         if kind == "password":
             return {"present": bool(await handle.input_value())}  # never the value
+        if element.get("role") == "combobox":
+            return {"value": await handle.evaluate(COMBO_VALUE_JS)}
         return {"value": await handle.input_value()}
 
     # ───────────── acting ─────────────
@@ -353,6 +369,34 @@ class Runner:
         await self.ctx._click_element_node(element["node"])
         page = await self._page()
         return {"url": page.url}
+
+    async def choose(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Set a dropdown widget (role=combobox) to the option whose text is exactly `text` (ignoring case and
+        surrounding spaces): open it, type the text to filter, click that option. Anything else (no option, several
+        partial matches) closes the list and refuses: a person's answer is never mapped to a nearby option."""
+        element = self._element(args["key"])
+        if element.get("role") != "combobox" or element.get("submit_like"):
+            raise Refused("WRONG_KIND", "choose is for dropdown widgets (role=combobox)")
+        wanted = " ".join(str(args.get("text") or "").split()).lower()
+        if not wanted:
+            raise Refused("NO_SUCH_OPTION", "No answer to choose")
+        page = await self._page()
+        handle = await self._handle(element)
+        await handle.click(timeout=5000)  # the combobox itself: opens its list, never submits
+        await handle.fill(str(args["text"]), timeout=5000)
+        try:
+            await page.wait_for_selector('[role="option"]', state="visible", timeout=4000)
+        except Exception:  # noqa: BLE001  no list opened
+            pass
+        texts = [" ".join(t.split()).lower() for t in await page.evaluate(OPTION_TEXTS_JS)]
+        exact = [i for i, t in enumerate(texts) if t == wanted]
+        partial = [i for i, t in enumerate(texts) if wanted in t]
+        index = exact[0] if len(exact) == 1 else partial[0] if not exact and len(partial) == 1 else None
+        if index is None:
+            await page.keyboard.press("Escape")
+            raise Refused("NO_SUCH_OPTION", f"{len(texts)} options, none exactly matching the answer")
+        await page.locator('[role="option"]:visible').nth(index).click(timeout=5000)
+        return {"chosen": True, "value": await handle.evaluate(COMBO_VALUE_JS)}
 
     async def scroll(self, args: dict[str, Any]) -> dict[str, Any]:
         page = await self._page()
@@ -473,7 +517,8 @@ class Runner:
         return {"closed": True}
 
 
-COMMANDS = ("health", "open", "goto", "observe", "read", "fill", "select", "check", "upload", "click", "scroll",
+COMMANDS = ("health", "open", "goto", "observe", "read", "fill", "select", "check", "upload", "click", "choose",
+            "scroll",
             "login_fill", "login_submit", "submit", "evidence", "set_takeover", "storage_state", "close")
 
 

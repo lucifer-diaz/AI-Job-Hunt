@@ -890,7 +890,8 @@ class LLMClient:
                     if labels.get(key, "").startswith(wanted):
                         return {"action": "click_control", "element_key": key, "step_note": "Mock: open the form."}
             return {"action": "done", "step_note": "Mock: nothing to open."}
-        verbs = {"select": "select_option", "checkbox": "check_box", "radio": "check_box", "file": "upload_file"}
+        verbs = {"select": "select_option", "combobox": "select_option", "checkbox": "check_box", "radio": "check_box",
+                 "file": "upload_file"}
         for field in fields:
             key = str(field.get("ref") or "").removeprefix("bu_")
             if field.get("status") != "RESOLVED" or field.get("filled") or key not in elements:

@@ -50,6 +50,7 @@ class ResolveIn(BaseModel):
 
 class ExecutionIn(BaseModel):
     mode: Literal["OBSERVE", "ASSIST", "GUARDED_AUTO"] | None = None
+    backend: Literal["browser_use_webui"] | None = None  # "Run with browser-use": a person's choice of backend
 
 
 class ConsentIn(BaseModel):
@@ -166,7 +167,8 @@ def queue_execution(job_id: int, payload: ExecutionIn, db: Session = Depends(get
 
     job = _job(db, job_id)
     try:
-        task = application_execution.enqueue(db, job, execution_mode=payload.mode)
+        task = application_execution.enqueue(db, job, execution_mode=payload.mode, backend=payload.backend,
+                                             reason="browser_use_chosen" if payload.backend else "user_request")
     except application_execution.ExecutionRefused as exc:
         raise HTTPException(409, {"message": str(exc), "code": exc.code}) from exc
     db.commit()

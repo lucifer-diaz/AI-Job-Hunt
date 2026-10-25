@@ -220,3 +220,76 @@ def test_a_dynamic_form_is_revealed_and_filled_through_the_scheduler_with_zero_p
         steps = db.scalars(select(LLMRequestLog).where(LLMRequestLog.prompt_name == "browser_navigation")).all()
         assert steps and all(s.stage == "BROWSER_NAVIGATION" for s in steps)  # the reveal went through the gateway
     assert posts == []  # the page's beacon and its instructions to "click Submit" changed nothing
+
+
+def test_choose_sets_a_dropdown_to_the_exact_option_only(runner, tmp_path):
+    from app.services import application_execution
+
+    manager = bus.get_sidecars()
+    with gs.FakeATS("confirm") as ats, application_execution.background_loop() as loop:
+        run = application_execution.loop_runner(loop, timeout=90)
+        session = run(manager.start(user_id=1, task_id=40, job_id=5, allowed_hosts=["127.0.0.1"],
+                                    upload_dir=str(tmp_path), allow_private=True))
+        try:
+            run(session.call("goto", url=ats.url("greenhouse_board_form")))
+            observation = run(session.call("observe", html=True))
+            form = generic.analyze(observation["url"], observation["elements"])
+            combo = next(e for e in observation["elements"] if e.get("role") == "combobox")
+            refused = None
+            try:
+                run(session.call("choose", key=combo["key"], text="Maybe"))
+            except bus.SidecarRefused as exc:
+                refused = exc.code
+            chosen = run(session.call("choose", key=combo["key"], text=" yes "))
+            read = run(session.call("read", key=combo["key"]))
+        finally:
+            run(manager.close(1, 40))
+        posts = list(ats.posts)
+    kinds = {f.label: f.kind for f in form.fields}
+    assert kinds["Are you open to relocation for this role?"] == "combobox"
+    assert not any(f.label in ("", "field") or f.id.startswith("bu_") and not f.label for f in form.fields)
+    assert refused == "NO_SUCH_OPTION" and chosen["value"] == "Yes" and read["value"] == "Yes"
+    assert posts == []
+
+
+def test_a_board_with_dropdowns_goes_to_browser_use_and_ends_ready_to_submit(runner, pg_sessions, pg_engine,
+                                                                             monkeypatch, tmp_path):
+    """The Playwright read finds a required dropdown it cannot open, hands the run to the browser-use backend, which
+    fills every field from verified answers (the dropdown with `choose`) and stops at READY_TO_SUBMIT. Zero POSTs."""
+    from app.infrastructure.application_browser import set_application_sessions
+    from app.infrastructure.application_browser.ephemeral import EphemeralApplicationSessions
+    from app.infrastructure.browser import playwright_service as pw
+
+    aps.configure(monkeypatch, "assist")
+    monkeypatch.setattr(aps.get_settings(), "browser_use_webui_enabled", True)  # configure() turns it off
+    monkeypatch.setattr(aps.get_settings(), "mcp_packet_dir", str(tmp_path / "packets"))
+    gs.route_greenhouse_here(monkeypatch)
+    checkpoint.forget_setup()
+    qs.clear_checkpoints(pg_engine)
+    sessions = qs.app_sessions(pg_engine)
+    browser = pw.PlaywrightBrowserService(allow_private_hosts=True, record_telemetry=False,
+                                          navigation_timeout_seconds=20)
+    set_application_sessions(EphemeralApplicationSessions(browser, record_telemetry=False))
+    try:
+        with gs.FakeATS("confirm") as ats:
+            user = aps.owner(sessions)
+            aps.answer(sessions, user, aps.PYTHON_QUESTION, "8")
+            aps.answer(sessions, user, "Are you open to relocation for this role?", "Yes")
+            job_id = aps.approved_job(sessions, user, ats.url("greenhouse_board_form"))
+            aps.enqueue(sessions, user, job_id)
+
+            async def go():
+                try:
+                    await aps.drive_async(sessions, passes=6)
+                finally:
+                    await browser.stop()
+            asyncio.run(go())
+            posts = list(ats.posts)
+    finally:
+        set_application_sessions(None)
+    task = aps.task_of(sessions, job_id)
+    assert (task.backend, task.status, task.stage, task.outcome) == ("browser_use_webui", "COMPLETED",
+                                                                     "READY_TO_SUBMIT", "READY_TO_SUBMIT"), \
+        (task.result_code, task.last_error)
+    assert any(f["kind"] == "combobox" for f in task.form["fields"])
+    assert posts == []

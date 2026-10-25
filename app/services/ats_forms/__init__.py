@@ -20,7 +20,10 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.services import jd_quality
 
-FIELD_KINDS = ("text", "email", "tel", "url", "number", "textarea", "select", "radio", "checkbox", "file")
+# `combobox`: a searchable dropdown widget (role="combobox", e.g. React Select on new Greenhouse boards). Its options
+# are often not in the page until it is opened, so only the browser-use backend can set it (runner `choose`).
+FIELD_KINDS = ("text", "email", "tel", "url", "number", "textarea", "select", "radio", "checkbox", "file", "combobox")
+DROPDOWN_FIELDS = "DROPDOWN_FIELDS"  # a required combobox the Playwright path cannot set: browser-use or a person
 # What a field asks for, when the adapter can tell from the form's own markup; anything else is a "question".
 ROLES = ("first_name", "last_name", "full_name", "email", "phone", "resume", "cover_letter", "linkedin", "github",
          "website", "location", "question")
@@ -58,7 +61,8 @@ class FormField(BaseModel):
     model_config = ConfigDict(extra="forbid")
     id: str = Field(max_length=200)
     label: str = Field(max_length=500)
-    kind: Literal["text", "email", "tel", "url", "number", "textarea", "select", "radio", "checkbox", "file"]
+    kind: Literal["text", "email", "tel", "url", "number", "textarea", "select", "radio", "checkbox", "file",
+                  "combobox"]
     role: Literal["first_name", "last_name", "full_name", "email", "phone", "resume", "cover_letter", "linkedin",
                   "github", "website", "location", "question"] = "question"
     required: bool = False
@@ -86,6 +90,9 @@ class ApplicationForm(BaseModel):
 
     def required_fields(self) -> list[FormField]:
         return [f for f in self.fields if f.required]
+
+    def required_dropdowns(self) -> list[FormField]:
+        return [f for f in self.fields if f.required and f.kind == "combobox"]
 
 
 def fingerprint(fields: list[FormField]) -> str:

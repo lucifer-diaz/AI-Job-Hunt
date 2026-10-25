@@ -98,7 +98,9 @@ These rules keep the model a worker uses a matter of configuration, never of cod
   creates a version). Keep that pairing: a refused save must never leave edits silently waiting in the draft.
 * **Deleting a model is a soft removal** (`ai_model_config.remove_model`, `AIModel.removed_at`): it leaves the draft,
   every picker and the next version, and `ai_registry.discover` never brings it back; Restore (or a rollback to a version
-  that had it) does. It is refused while anything still uses it (`model_references`). Only a deployment Job Hunt OS owns
+  that had it) does. Disabling or removing a model first drops it from worker backups and model fallbacks
+  (`drop_backup_uses`), never from a main model, a tier or the router; it is refused while anything still uses it
+  (`model_references`). Only a deployment Job Hunt OS owns
   leaves LiteLLM (through the normal apply; `managed` is kept, so Restore redeploys it); a discovered model stays in
   LiteLLM. Undo (`discard_draft`) removes again a model restored since the active version.
 * **Prompts remain under `app/prompts/`.** Prompts say *what* a model is asked to do; worker configuration decides
@@ -636,6 +638,15 @@ ADR-035). The rules a change has to keep:
 
   The model's contract (`BrowserActionProposal`) has no field for a value and no submit action. Deterministic filling
   comes first; the navigator only reaches what it cannot.
+* **Dropdown widgets (`role=combobox`, the newer Greenhouse board) are set only by the runner's `choose`.** It opens
+  the widget, types the verified answer and clicks the option whose text matches it exactly; anything else is
+  refused (`NO_SUCH_OPTION`). The Playwright path never clicks, so a form with a required dropdown goes to browser-use
+  (OBSERVE/ASSIST only), or waits for the person (`DROPDOWN_FIELDS`). Guarded submission never takes such a form. A
+  widget's hidden helper inputs (`aria-hidden`, `tabindex=-1`, no id or name) are never fields. Each ephemeral-page
+  field action waits at most `FIELD_TIMEOUT_MS`.
+* **A person may send a run to browser-use** (`enqueue(backend="browser_use_webui")`, the Apply kit and the history
+  panel): OBSERVE/ASSIST only, refused while another run of the job is active or when the runner is not configured;
+  Retry and Run now keep that choice.
 * **The Web UI's own HTTP interface is not an automation API.** `browser_use_webui.probe` GETs its `/config` for
   health and compatibility, nothing else. Never drive its Gradio endpoints (positional, auto-named, unauthenticated,
   one global session, no pre-action veto).

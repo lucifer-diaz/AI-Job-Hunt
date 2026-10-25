@@ -1523,7 +1523,7 @@ function renderKitExecution(k) {
   const what = mode === 'observe' ? '' : guarded ? ', fills it and, on an allowlisted route, submits it once after every check — only the site’s confirmation marks it applied' : ', then fills it in a private page. It never submits';
   return `<div class="box mb12" style="padding:13px;border-radius:12px"><div class="small b">Application worker · ${esc(mode)}${x && x.backend ? ` · ${esc(x.backend.replaceAll('_', ' '))}` : ''}</div>
     <div class="xs muted mt4 pretty">Reads the form and finds a verified source for every answer${what}.</div>
-    ${state}${renderKitIntent(k)}${renderKitTakeover(k)}${active ? '' : `<div class="row gap8 wrap">${btn(label('kit-prepare', x ? 'Prepare again' : 'Prepare the form', 'Queueing…'), 'kit-prepare', { id: k.job.id }, 'sm mt8', isBusy('kit-prepare'))}${guarded ? btn(label('kit-guarded', 'Submit for me (guarded)', 'Queueing…'), 'kit-guarded', { id: k.job.id }, 'sm mt8 primary', isBusy('kit-guarded')) : ''}</div>`}</div>`;
+    ${state}${renderKitIntent(k)}${renderKitTakeover(k)}${active ? '' : `<div class="row gap8 wrap">${btn(label('kit-prepare', x ? 'Prepare again' : 'Prepare the form', 'Queueing…'), 'kit-prepare', { id: k.job.id }, 'sm mt8', isBusy('kit-prepare'))}${k.browser_use_ready && mode !== 'off' ? `<span title="${attr('Opens a browser window (browser-use) that fills the form from your verified answers, step by step, checked by Job Hunt OS. It never submits: you do.')}">${btn(label('kit-browser-use', 'Run with browser-use', 'Queueing…'), 'kit-browser-use', { id: k.job.id }, 'sm mt8', isBusy('kit-browser-use'))}</span>` : ''}${guarded ? btn(label('kit-guarded', 'Submit for me (guarded)', 'Queueing…'), 'kit-guarded', { id: k.job.id }, 'sm mt8 primary', isBusy('kit-guarded')) : ''}</div>`}</div>`;
 }
 
 /* ───────────── tracker ───────────── */
@@ -1804,7 +1804,8 @@ function renderJobModal() {
       <div style="flex:1 1 240px;min-width:0"><div style="font-size:21px;font-weight:600;letter-spacing:-.02em">${esc(j.title)}</div><div class="muted mt4" style="font-size:13.5px">${esc(j.company)}${j.location ? ' · ' + esc(j.location) : ''} · ${esc(j.board)} · ${postedTxt(j) ? `<span class="ink2">${esc(postedTxt(j))}</span>` : '<span class="faint" title="The job board did not give a posting date">posting date not listed</span>'} · found ${esc(j.posted)}</div></div>
       <div class="row gap8 wrap"><div class="scorebox sm"><div class="n">${fitTxt(j.fit)}</div><div class="l">FIT</div></div>
         ${j.url ? `<a class="btn" href="${attr(j.url)}" target="_blank" rel="noopener">Open posting ↗</a>` : ''}
-        ${j.resume_id ? btn('Open packet', 'modal-tailor', { id: j.id }, 'primary')
+        ${['approved', 'applied'].includes(j.status) ? btn('Open apply kit', 'modal-kit', { id: j.id }, 'primary')
+          : j.resume_id ? btn('Open packet', 'modal-tailor', { id: j.id }, 'primary')
           : j.needs_description ? `<span title="Ranking and tailoring need the job description">${btn('Add description', 'edit-job-description', { id: j.id }, 'primary')}</span>`
           : j.fit == null ? `<span title="Tailoring works from the ranking: rank this job first">${btn(label('rank' + j.id, 'Rank first', 'Queueing…'), 'rank-job', { id: j.id }, 'primary', isBusy('rank' + j.id))}</span>`
           : btn('Tailor resume', 'modal-tailor', { id: j.id }, 'primary')}${btn('Close', 'close-job')}</div></div>
@@ -2246,6 +2247,8 @@ const A = {
     else if (j.status === 'applied') go('tracker', { selApp: j.application_id });
     else go('tailor', { tailorJob: id });
   },
+  // An approved or applied job's next step is its Apply kit: open it in place of the job, not over it.
+  'modal-kit': el => { S.jobOpen = null; openKit(el.dataset.id); },
   'modal-triage': async el => { await triageJob(el.dataset.id, el.dataset.action); if (S.jobOpen) openJob(S.jobOpen); },
   'save-job-notes': el => busy('jobnotes', () => api(`/api/jobs/${el.dataset.id}/notes`, { method: 'PUT', body: { notes: fv('jobnotes', el.dataset.id, D.jobModal.notes) } }), 'Notes saved'),
   'add-evidence-for': el => {
@@ -2848,6 +2851,11 @@ const A = {
     Object.assign(f, { q: '', status: 'all', category: 'all', sensitive: 'all', ids });
     go('knowledge');
   },
+  'kit-browser-use': el => busy('kit-browser-use', async () => {
+    await api(`/api/jobs/${el.dataset.id}/application-execution`, { method: 'POST', body: { backend: 'browser_use_webui' } });
+    if (S.kitJob) D.kit = await api(`/api/jobs/${el.dataset.id}/apply-kit`);
+    if (S.screen === 'workers' && typeof loadWorkers === 'function') await loadWorkers();
+  }, 'Queued on browser-use: a browser window opens on the next pass'),
   'kit-guarded': el => busy('kit-guarded', async () => {
     await api(`/api/jobs/${el.dataset.id}/application-execution`, { method: 'POST', body: { mode: 'GUARDED_AUTO' } });
     D.kit = await api(`/api/jobs/${el.dataset.id}/apply-kit`);

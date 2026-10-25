@@ -472,11 +472,10 @@ def test_removing_a_model_is_refused_while_used_and_a_sync_does_not_bring_it_bac
                         json={"revision": account.revision()})["detail"]
     assert "tier PRIMARY_REASONING" in used["references"]
     account.call("PUT", "/models/tier-2-reasoning", json={"revision": account.revision(), "fallback_models": ["cloud-mini"]})
-    refused = account.call("POST", "/models/cloud-mini/remove", expect=409, json={"revision": account.revision()})
-    assert "tier-2-reasoning's fallbacks" in refused["detail"]["references"]
-    account.call("PUT", "/models/tier-2-reasoning", json={"revision": account.revision(), "fallback_models": []})
     before = account.get("")["active_version"]
-    account.call("POST", "/models/cloud-mini/remove", json={"revision": account.revision()})
+    removed = account.call("POST", "/models/cloud-mini/remove", json={"revision": account.revision()})
+    assert removed["dropped"] == ["tier-2-reasoning's fallbacks"]  # a fallback is dropped, not a reason to refuse
+    assert account.get("")["draft"]["models"]["tier-2-reasoning"]["fallback_models"] == []
     out = account.apply()
     overview = account.get("")
     assert "cloud-mini" not in [m["name"] for m in overview["models"]]
@@ -491,6 +490,54 @@ def test_removing_a_model_is_refused_while_used_and_a_sync_does_not_bring_it_bac
     assert "cloud-mini" not in [m["name"] for m in account.get("")["models"]]
     assert [r["name"] for r in account.get("")["removed_models"]] == ["cloud-mini"]
     account.call("POST", "/models/nothing-here/remove", expect=404, json={"revision": account.revision()})
+
+
+def _backups(data, worker_type):
+    config = data["draft"]["workers"][worker_type]
+    return config["fallback_model"], config["secondary_models"]
+
+
+def test_disabling_a_model_drops_it_from_backups_and_model_fallbacks_and_applies(account, litellm):
+    account.call("POST", "/models/sync")
+    account.worker("RANKER", fallback_model="cloud-mini", secondary_models=["tier-3-review"])
+    account.worker("REVIEWER", fallback_model="tier-1-fast", secondary_models=["cloud-mini", "tier-2-reasoning"])
+    account.call("PUT", "/models/tier-2-reasoning", json={"revision": account.revision(),
+                                                          "fallback_models": ["cloud-mini", "tier-1-fast"]})
+    account.apply()
+    out = account.call("PUT", "/models/cloud-mini", json={"revision": account.revision(), "enabled": False})
+    assert out["dropped"] == ["Ranker (backup 1)", "Reviewer (backup 2)", "tier-2-reasoning's fallbacks"]
+    data = account.get("")
+    assert _backups(data, "RANKER") == ("tier-3-review", [])  # the next backup moves up
+    assert _backups(data, "REVIEWER") == ("tier-1-fast", ["tier-2-reasoning"])  # order kept
+    assert data["draft"]["models"]["tier-2-reasoning"]["fallback_models"] == ["tier-1-fast"]
+    assert account.apply()["status"] != "FAILED"
+    active = model_resolution.active_snapshot(account.user_id)[1]
+    assert active["models"]["cloud-mini"]["enabled"] is False and active["workers"]["RANKER"]["fallback_model"] == "tier-3-review"
+    with SessionLocal() as db:
+        entry = db.scalar(select(AIConfigAuditEntry).where(AIConfigAuditEntry.user_id == account.user_id,
+                                                           AIConfigAuditEntry.action == "DISABLE"))
+        assert entry.changes == [{"model": "cloud-mini", "dropped_from": out["dropped"]}]
+    again = account.call("PUT", "/models/cloud-mini", json={"revision": account.revision(), "enabled": True})
+    assert again["dropped"] == [] and _backups(account.get(""), "RANKER") == ("tier-3-review", [])  # not restored
+
+
+def test_a_main_or_tier_model_is_never_dropped_and_still_blocks_removal(account, litellm):
+    account.call("POST", "/models/sync")
+    account.worker("REVIEWER", model_mode="FIXED", primary_model="cloud-mini")
+    account.worker("RANKER", fallback_model="cloud-mini")
+    account.apply()
+    out = account.call("PUT", "/models/cloud-mini", json={"revision": account.revision(), "enabled": False})
+    assert out["dropped"] == ["Ranker (backup 1)"]
+    assert account.get("")["draft"]["workers"]["REVIEWER"]["primary_model"] == "cloud-mini"  # its own model: kept
+    applied = account.apply()
+    assert any("Reviewer has no usable model" in w["message"] for w in applied["warnings"])
+    account.call("PUT", "/models/cloud-mini", json={"revision": account.revision(), "enabled": True})
+    account.worker("RANKER", fallback_model="cloud-mini")
+    used = account.call("POST", "/models/cloud-mini/remove", expect=409, json={"revision": account.revision()})
+    assert used["detail"]["references"] == ["Reviewer (its model)"]
+    assert _backups(account.get(""), "RANKER") == ("cloud-mini", [])  # a refused removal drops nothing
+    tier = account.call("POST", "/models/tier-1-fast/remove", expect=409, json={"revision": account.revision()})
+    assert "tier FAST" in tier["detail"]["references"]
 
 
 def test_removing_a_managed_model_deletes_its_deployment_and_a_rollback_brings_it_back(account, litellm):

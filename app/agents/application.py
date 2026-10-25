@@ -402,18 +402,34 @@ def analyze_form(state: ApplicationState, runtime: Runtime[ApplicationContext]) 
         read = _analyze_browser_use(ctx, task_id, job, url, attempt)
     else:
         read = ctx.run_async(_read_form(ctx.browser, user_id, job_id, url))
-        if read.get("problem") in (ats_forms.NO_FORM, ats_forms.UNSUPPORTED) and state.get("mode") != "GUARDED_AUTO" \
-                and _browser_use_on():
-            # The adapter does not know this markup (a redesigned board): the generic reader may, for a person to
-            # submit. Guarded submission never falls back: it needs the route's own adapter.
+        dropdowns = bool(read.get("form")) and ats_forms.ApplicationForm.model_validate(read["form"]) \
+            .required_dropdowns()
+        if (read.get("problem") in (ats_forms.NO_FORM, ats_forms.UNSUPPORTED) or dropdowns) \
+                and state.get("mode") != "GUARDED_AUTO" and _browser_use_on():
+            # The adapter does not know this markup, or the form has dropdown widgets this page cannot open: the
+            # browser-use backend can, for a person to submit. Guarded submission never falls back: it needs the
+            # route's own adapter end to end.
             read = _analyze_browser_use(ctx, task_id, job, url, attempt)
             backend = "browser_use_webui"
+        elif dropdowns:
+            read = {"problem": ats_forms.DROPDOWN_FIELDS, "route": read.get("route"),
+                    "detail": f"{len(dropdowns)} required dropdown question(s) need the browser-use backend or you"}
     _hold(ctx, "after_browser")
     with _session(ctx) as db:
         task, job = _load(db, state)
         problem = read.get("problem")
         if problem and read.get("takeover"):
             return _takeover(db, ctx, state, task, job, problem, "analyze_form")
+        if problem == ats_forms.DROPDOWN_FIELDS:
+            created = _record(db, ctx, _key(state, ANALYZE_FORM), task, "NEEDS_HUMAN", result_code=problem,
+                              route=read.get("route"), last_error=read.get("detail"),
+                              interrupt={"kind": "NEEDS_HUMAN", "reason": problem})
+            if created and job is not None and job.application is not None and job.application.status == "approved":
+                apply_queue.record_blocker(db, job, "form_error", recorded_by="application_worker",
+                                           detail=read.get("detail") or problem)
+            ats_map.observe(db, job, last_outcome=problem, checked=True)
+            db.commit()
+            return _end(ANALYZE_FORM, NEEDS_HUMAN, problem)
         if problem in (*ats_forms.HUMAN_BLOCKERS, "LOGIN_FAILED", ats_forms.POSTING_CLOSED):
             stage = "BLOCKED" if problem == ats_forms.POSTING_CLOSED else "NEEDS_HUMAN"
             created = _record(db, ctx, _key(state, ANALYZE_FORM), task, stage, result_code=problem,

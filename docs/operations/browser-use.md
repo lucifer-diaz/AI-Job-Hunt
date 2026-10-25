@@ -98,7 +98,7 @@ What that means per ATS:
 
 | ATS | OBSERVE / ASSIST | GUARDED_AUTO | A person is needed for |
 | --- | --- | --- | --- |
-| Greenhouse (classic `boards.greenhouse.io` and new `job-boards.greenhouse.io`) | Adapter reads and fills (Playwright) | Capable; only when allowlisted. Confirmation rule tested on the fake ATS only; no real submission made yet | Custom select widgets (they may not read back, so no click), EEO, unapproved attestations |
+| Greenhouse (classic `boards.greenhouse.io` and new `job-boards.greenhouse.io`) | Adapter reads and fills (Playwright); a new board's required dropdowns send the run to browser-use, which sets them with `choose` | Capable; only when allowlisted. Confirmation rule tested on the fake ATS only; no real submission made yet | Custom select widgets (they may not read back, so no click), EEO, unapproved attestations |
 | Lever | browser-use reader (deterministic fill, navigator for the rest) | Not capable | Final submit, anything unread back |
 | Workable | browser-use reader after declining cookies and opening the Application tab | Not capable | Final submit |
 | Workday, iCIMS, Taleo, SuccessFactors, SmartRecruiters | browser-use reader, with a per-tenant login (saved session or vault) | Not capable | First login or signup, codes, final submit. Not measured live: these have no public posting API; run the live check on your own approved jobs' URLs |

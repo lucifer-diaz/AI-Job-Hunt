@@ -56,6 +56,10 @@ def _clean(text: Any, limit: int = 500) -> str:
 
 def _kind(element: dict[str, Any]) -> str | None:
     tag, kind = (element.get("tag") or "").lower(), (element.get("type") or "text").lower()
+    if element.get("aria_hidden") or (element.get("tabindex") == "-1" and not element.get("role")):
+        return None  # a widget's hidden helper input, not a question
+    if tag == "input" and element.get("role") == "combobox":
+        return "combobox"
     if tag == "textarea":
         return "textarea"
     if tag == "select":
