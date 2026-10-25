@@ -1088,14 +1088,8 @@ def build_application_form_context(db: Session, profile: CandidateProfile, job: 
     if asked:
         terms.focus |= tokens(asked) - jc.FILLER
         terms.text = f"{terms.text} {asked}"
-    context, data, every, _resume = _base(db, profile, job, "application_form", VERIFIED_ONLY, FORM_EVIDENCE,
-                                          terms=terms, out_of_scope=out_of_scope)
-    if _status((data or {}).get("summary") or {}) != "VERIFIED":
-        # sr.derive reads the summary's text whatever its status; an unverified summary must not become a "verified"
-        # background flag (leadership, AI, cloud ...) here.
-        unsummarised = {k: v for k, v in (data or {}).items() if k != "summary"}
-        derived = sr.derive(_filtered(unsummarised, VERIFIED_ONLY))
-        context.candidate["verified_background"] = {k: v for k, v in derived.items() if v not in (None, [], False)}
+    context, _data, every, _resume = _base(db, profile, job, "application_form", VERIFIED_ONLY, FORM_EVIDENCE,
+                                           terms=terms, out_of_scope=out_of_scope)
     context.candidate = {k: v for k, v in context.candidate.items() if k not in FORM_PRIVATE_FIELDS and v}
     context.unverified_facts = []
     context.job = {}
