@@ -496,12 +496,17 @@ def release_claim(db: Session, job: Job, token: str, reason: str) -> Application
         # The sweep may not have run yet: past its lease the outcome is unknown whatever the status column says.
         db.rollback()
         raise ValueError(LEASE_RAN_OUT)
+    from app.services import submission
+
     intent = _intent(db, claim)
     if intent is not None and intent.status in CLICKED_INTENT_STATUSES:
         db.rollback()
         raise ValueError(CLICKED)
-    if intent is not None:
-        intent.status, intent.resolved_at, intent.reason = "ABORTED", _now(), f"released: {reason}"[:300]
+    # ARMED → ABORTED in one conditional UPDATE: a worker committing CLICKING at this moment wins or loses cleanly.
+    if intent is not None and intent.status != "ABORTED" and not submission.move(
+            db, intent.id, "ABORTED", only_from=("ARMED",), resolved_at=_now(), reason=f"released: {reason}"[:300]):
+        db.rollback()
+        raise ValueError(CLICKED)
     _finish(claim, RELEASED, f"not submitted: {(reason or 'no reason given').strip()}")
     db.commit()
     return claim
@@ -542,7 +547,8 @@ def resolve_uncertain(db: Session, job: Job, claim_id: int, *, submitted: bool,
         if result.status == "SUBMITTED":
             _settle_intent(db, claim_id, "RESOLVED_SUBMITTED", "a person said it was submitted")
         return result
-    from app.services.lifecycle import PERSON, WorkflowState as S, parse_state
+    from app.services.lifecycle import PERSON, parse_state
+    from app.services.lifecycle import WorkflowState as S
     from app.services.work_queue import transition
 
     lock_application(db, job)

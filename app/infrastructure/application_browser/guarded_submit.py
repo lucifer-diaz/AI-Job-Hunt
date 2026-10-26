@@ -18,6 +18,7 @@ claim and the CLICKING commit; `tests/test_no_automated_submit.py` allows `click
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from collections.abc import Callable
@@ -74,13 +75,11 @@ class GuardedPage(_Page):
             log.debug("guarded page routing ended early")
 
     def _on_response(self, response: Any) -> None:
-        try:
+        with contextlib.suppress(Exception):
             if response.request.method.upper() != "GET" and len(self._responses) < 50:
                 parsed = urlparse(response.url)
                 self._responses.append({"method": response.request.method.upper(), "status": response.status,
                                         "host": (parsed.hostname or "").lower(), "path": parsed.path[:200]})
-        except Exception:  # noqa: BLE001
-            pass
 
     @property
     def host(self) -> str:
@@ -115,29 +114,21 @@ class GuardedPage(_Page):
         try:
             await control.first.click(timeout=10000)
             for state in ("load", "networkidle"):
-                try:
+                with contextlib.suppress(Exception):
                     await self._page.wait_for_load_state(state, timeout=15000)
-                except Exception:  # noqa: BLE001
-                    pass
         finally:
             self._armed = None
-            try:
+            with contextlib.suppress(Exception):
                 self._page.remove_listener("response", self._on_response)
-            except Exception:  # noqa: BLE001
-                pass
         return {"clicked": True, "seconds": round(time.monotonic() - started, 2)}
 
     async def evidence(self) -> dict[str, Any]:
         html = ""
-        try:
+        with contextlib.suppress(Exception):
             html = await self._page.content()
-        except Exception:  # noqa: BLE001
-            pass
         title = ""
-        try:
+        with contextlib.suppress(Exception):
             title = await self._page.title()
-        except Exception:  # noqa: BLE001
-            pass
         return {"url": self._page.url, "title": title, "responses": list(self._responses), "html": html}
 
     async def close(self) -> None:

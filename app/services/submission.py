@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any
 
 from bs4 import BeautifulSoup
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -195,6 +195,17 @@ def intents(db: Session, task_id: int) -> list[SubmissionIntent]:
                            .order_by(SubmissionIntent.id).execution_options(populate_existing=True)).all())
 
 
+def move(db: Session, intent_id: int, to: str, *, only_from: tuple[str, ...], **values: Any) -> bool:
+    """Change an intent's status only if it is still in one of `only_from`, as one conditional UPDATE: a worker about
+    to click, a Kill, the lease sweep and a release race on the same row, and whichever commits first wins (the
+    others see no row). A read-then-write would let an ABORTED overwrite a CLICKING written meanwhile, freeing the
+    claim of a submission that may have happened. Does not commit."""
+    moved = db.execute(update(SubmissionIntent)
+                       .where(SubmissionIntent.id == intent_id, SubmissionIntent.status.in_(only_from))
+                       .values(status=to, **values).execution_options(synchronize_session=False)).rowcount
+    return bool(moved)
+
+
 def clicked(db: Session, task_id: int) -> SubmissionIntent | None:
     """The run's intent that got as far as the click, if any: it is never clicked again."""
     return next((i for i in intents(db, task_id) if i.status in CLICKED_INTENT_STATUSES), None)
@@ -226,23 +237,26 @@ def arm(db: Session, task: ApplicationExecutionTask, job: Job, *, route: str, do
     return Armed(intent=intent, claim=claim)
 
 
-def abort(db: Session, intent: SubmissionIntent, job: Job, reason: str) -> None:
+def abort(db: Session, intent: SubmissionIntent, job: Job, reason: str, *,
+          refused_at_click: bool = False) -> bool:
     """Give up before the click: the intent is ABORTED and the claim released (nothing left the browser). Only an
-    ARMED intent, or a CLICKING one whose click provably never happened (`GuardedPage.submit` refused before it).
-    Commits."""
+    ARMED intent, or — with `refused_at_click` — a CLICKING one whose click provably never happened
+    (`GuardedPage.submit` refused before it). False when the intent had moved on meanwhile (it reached CLICKING, or
+    someone settled it): nothing is changed then. Commits."""
     from app.services import apply_queue
 
-    intent = db.get(SubmissionIntent, intent.id, populate_existing=True)
-    claim = db.get(ApplicationClaim, intent.claim_id, populate_existing=True)
-    if intent.status not in (ARMED, CLICKING):
-        return
-    intent.status, intent.resolved_at, intent.reason = ABORTED, utcnow(), reason[:300]
+    claim_id = intent.claim_id
+    if not move(db, intent.id, ABORTED, only_from=(ARMED, CLICKING) if refused_at_click else (ARMED,),
+                resolved_at=utcnow(), reason=reason[:300]):
+        return False  # nothing was written (and a Kill's own pending changes stay for it to commit)
     db.commit()
+    claim = db.get(ApplicationClaim, claim_id, populate_existing=True)
     if claim is not None and claim.status == apply_queue.CLAIMED:
         try:
             apply_queue.release_claim(db, job, claim.token, reason)
         except ValueError:
             log.warning("claim %s could not be released after an aborted intent", claim.id)
+    return True
 
 
 def commit_clicking(db: Session, task: ApplicationExecutionTask, intent: SubmissionIntent) -> Validation:
@@ -257,10 +271,15 @@ def commit_clicking(db: Session, task: ApplicationExecutionTask, intent: Submiss
     if claim is None or claim.status != apply_queue.CLAIMED or claim.lease_expires_at <= utcnow() \
             or claim.execution_id != task.id:
         return _refuse("CLAIM_LOST", "This run's claim is no longer open")
+    if task.status != "PROCESSING":
+        return _refuse("RUN_STOPPED", "This run was stopped or handed back")
     checked = approval.verify(db, job.application if job else None)
     if not checked.ok or (checked.packet.digest if checked.packet else None) != intent.packet_digest:
         return _refuse("PACKET_CHANGED", "The approved packet changed")
-    intent.status, intent.clicking_at = CLICKING, utcnow()
+    # Only from ARMED, in one statement: a Kill, the lease sweep or a release that aborted it first wins.
+    if not move(db, intent.id, CLICKING, only_from=(ARMED,), clicking_at=utcnow()):
+        return _refuse("INTENT_NOT_ARMED", "The submission intent was aborted or settled before the click")
+    intent = db.get(SubmissionIntent, intent.id, populate_existing=True)
     application_execution.set_stage(task, "SUBMITTING", intent=intent)
     db.commit()
     return Validation(True)
@@ -388,9 +407,9 @@ def reconcile(db: Session, task: ApplicationExecutionTask, why: str) -> str | No
     for intent in intents(db, task.id):
         if intent.status == ARMED:
             job = db.get(Job, task.job_id)
-            if job is not None:
-                abort(db, intent, job, f"{why} before the click")
-            return ABORTED
+            if job is None or abort(db, intent, job, f"{why} before the click"):
+                return ABORTED
+            intent = db.get(SubmissionIntent, intent.id, populate_existing=True)  # it reached CLICKING meanwhile
         if intent.status == CLICKING:
             uncertain(db, task, intent, f"{why} after the click started; whether it was submitted is unknown")
             return UNCERTAIN

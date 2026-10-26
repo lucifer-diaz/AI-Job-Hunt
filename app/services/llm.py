@@ -875,11 +875,15 @@ class LLMClient:
             found = re.search(rf"^{name}:\n(.*)$", user, re.MULTILINE)
             return json.loads(found.group(1)) if found else []
 
+        def wrapped(tag: str) -> list[dict[str, Any]]:
+            raw = user.split(f"<{tag}>", 1)[-1].split(f"</{tag}>", 1)[0].strip() if f"<{tag}>" in user else ""
+            return json.loads(raw) if raw else []
+
         elements = {e.get("key"): e for e in part("ELEMENTS")}
         fields = part("FIELDS")
+        field_labels = {f.get("ref"): (f.get("label") or "").lower() for f in wrapped("untrusted_field_labels")}
         if not fields:  # nothing to fill yet: open the form with a control that cannot submit
-            raw = user.split("<untrusted_element_labels>", 1)[-1].split("</untrusted_element_labels>", 1)[0].strip()
-            labels = {e.get("key"): (e.get("label") or "").lower() for e in (json.loads(raw) if raw else [])}
+            labels = {e.get("key"): (e.get("label") or "").lower() for e in wrapped("untrusted_element_labels")}
             controls = [k for k, e in elements.items() if e.get("tag") in ("a", "button") and not e.get("submit_like")]
             for wanted in (("decline", "reject", "necessary only"), ("apply", "application")):
                 for key in controls:
@@ -896,7 +900,7 @@ class LLMClient:
             out = {"action": action, "element_key": key, "answer_ref": field["ref"],
                    "step_note": "Mock: the next resolved field."}
             if action == "upload_file":
-                out["file_ref"] = "cover_letter" if "cover" in (field.get("label") or "").lower() else "resume"
+                out["file_ref"] = "cover_letter" if "cover" in field_labels.get(field["ref"], "") else "resume"
             return out
         return {"action": "done", "step_note": "Mock: every resolved field is filled."}
 
