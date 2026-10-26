@@ -228,8 +228,8 @@ function aimRequestSize() {
         : `<p>Cap answers at <b>${esc(aimTokens(cap.value))}</b> tokens and these requests fit.${cap.known_safe ? ` This worker's answers are about ${esc(aimTokens(cap.typical_output))}, so they are not cut short.` : ' This worker has no answers on record yet, so check that a cap this size does not cut them short.'}</p><div class="row gap8">${btn(isBusy('aim-size') ? 'Saving…' : `Cap answers at ${aimTokens(cap.value)}`, 'aim-size-cap', { worker: g.worker_type, value: cap.value }, 'primary sm', isBusy('aim-size'))}</div>`)
       : g.input_over ? `<p>The prompt alone is over ${esc(g.model)}'s limit, so capping answers cannot help. Use a model with more room.</p>`
         : `<p>Prompt and answer together are more than ${esc(g.model)} accepts in a minute, and a smaller answer cap would cut this worker's answers short. Use a model with more room.</p>`;
-    const models = g.models.map(m => `<li class="row between gap8 wrap"><span><span class="mono">${esc(m.name)}</span> <span class="xs muted">${m.context_window ? `${esc(aimTokens(m.context_window))} context` : 'context unknown'}${m.proven ? ' · has answered requests this size for this worker' : ''}</span></span><span class="row gap6">${m.in_chain ? '<span class="xs muted">already a backup</span>' : backups.length < AIM_BACKUPS ? btn('Add as backup', 'aim-size-backup', { worker: g.worker_type, model: m.name }, 'sm', isBusy('aim-size')) : ''}${btn(`Use instead of ${g.model}`, 'aim-size-use', { worker: g.worker_type, model: m.name }, 'sm', isBusy('aim-size'))}</span></li>`).join('');
-    return `<article class="aim-size"><div class="row between gap8 wrap"><div><b>${esc(g.label)}</b> → <span class="mono">${esc(g.model)}</span>: ${g.count} request${g.count === 1 ? '' : 's'} refused as too large</div><span class="xs muted">last ${esc(fmtDateTime(g.last_at))}</span></div>
+    const models = g.models.map(m => `<li class="row between gap8 wrap"><span><span class="mono">${esc(m.name)}</span> <span class="xs muted">${m.context_window ? `${esc(aimTokens(m.context_window))} context` : 'context unknown'}${m.proven ? ' · has answered requests this size for this worker' : ''}</span></span><span class="row gap6">${m.in_chain ? '<span class="xs muted">already a backup</span>' : backups.length < AIM_BACKUPS ? btn('Add as backup', 'aim-size-backup', { worker: g.worker_type, model: m.name }, 'sm', isBusy('aim-size')) : ''}${btn(`Use instead of ${g.model}`, 'aim-size-use', { worker: g.worker_type, model: m.name, replace: g.model, role: g.role || 'primary' }, 'sm', isBusy('aim-size'))}</span></li>`).join('');
+    return `<article class="aim-size"><div class="row between gap8 wrap"><div><b>${esc(g.label)}</b> → <span class="mono">${esc(g.model)}</span>${g.role && g.role !== 'primary' ? ` <span class="xs muted">(its ${esc(g.role === 'backup' ? 'backup' : 'escalation model')})</span>` : ''}: ${g.count} request${g.count === 1 ? '' : 's'} refused as too large</div><span class="xs muted">last ${esc(fmtDateTime(g.last_at))}</span></div>
       <p class="settings-help">${esc(g.model)}'s limits: ${limits}. ${sizes}</p>${verdict}
       ${models ? `<p class="xs muted mt8">Models with room for these requests</p><ul class="aim-size-models">${models}</ul>` : '<p class="settings-help">No model in your catalog is known to have room for these requests. Add one in Models.</p>'}</article>`;
   };
@@ -479,11 +479,22 @@ const AI_MODELS_ACTIONS = {
     const w = aimWorkerByType(el.dataset.worker), list = [...new Set([...aimBackups(w.config), el.dataset.model])].slice(0, AIM_BACKUPS);
     return aimSave('aim-size', () => api(`/api/settings/ai/workers/${encodeURIComponent(w.worker_type)}`, { method: 'PUT', body: { revision: aimRev(), fallback_model: list[0], secondary_models: list.slice(1) } }), `${el.dataset.model} is now a backup for ${w.label}`);
   },
+  // Replaces the refusing model in the role it has for this worker: its model, one of its backups, or its escalation.
   'aim-size-use': el => {
-    const w = aimWorkerByType(el.dataset.worker), name = el.dataset.model;
-    // The new primary leaves the backups, where it would only be tried after itself.
-    const list = aimBackups(w.config).filter(m => m !== name);
-    return aimSave('aim-size', () => api(`/api/settings/ai/workers/${encodeURIComponent(w.worker_type)}`, { method: 'PUT', body: { revision: aimRev(), ...aimTargetFields(`model:${name}`, w.config), fallback_model: list[0] || null, secondary_models: list.slice(1) } }), `${w.label} now uses ${name}`);
+    const w = aimWorkerByType(el.dataset.worker), c = w.config || {}, { model: name, replace: old, role } = el.dataset;
+    let change;
+    if (role === 'backup') {
+      const list = [...new Set(aimBackups(c).map(m => m === old ? name : m))];
+      change = { fallback_model: list[0] || null, secondary_models: list.slice(1) };
+    } else if (role === 'escalation') {
+      change = { escalation: { ...(c.escalation || {}), model: name, tier: null } };
+    } else {
+      // The new primary leaves the backups, where it would only be tried after itself.
+      const list = aimBackups(c).filter(m => m !== name);
+      change = { ...aimTargetFields(`model:${name}`, c), fallback_model: list[0] || null, secondary_models: list.slice(1) };
+    }
+    const where = role === 'backup' ? ' as a backup' : role === 'escalation' ? ' for escalation' : '';
+    return aimSave('aim-size', () => api(`/api/settings/ai/workers/${encodeURIComponent(w.worker_type)}`, { method: 'PUT', body: { revision: aimRev(), ...change } }), `${w.label} now uses ${name}${where} instead of ${old}`);
   },
   'aim-drawer-close': () => { AIM.drawer = null; delete S.forms.aiw; render(); },
   'aim-worker-save': async el => {

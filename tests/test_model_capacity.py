@@ -34,10 +34,12 @@ def owner():
         db.commit()
 
 
-def log(owner, *, status="FAILED", message=None, model="Groq", tokens_in=None, tokens_out=None, estimate=None):
+def log(owner, *, status="FAILED", message=None, model="Groq", tokens_in=None, tokens_out=None, estimate=None,
+        group=None, fallback_used=None):
     with SessionLocal() as db:
         db.add(LLMRequestLog(request_id=f"capacity-test-{uuid.uuid4()}", user_id=owner, provider="litellm",
                              stage="OTHER", requested_model=model, model=model, worker_type="RANKER", status=status,
+                             model_group=group, fallback_used=fallback_used,
                              error_type="RATE_LIMIT" if status == "FAILED" else None, error_message=message,
                              input_tokens=tokens_in, output_tokens=tokens_out, estimated_context_tokens=estimate,
                              latency_ms=100, created_at=model_health.utcnow()))
@@ -83,3 +85,33 @@ def test_no_cap_when_it_would_cut_answers_short_or_the_prompt_alone_is_over(owne
 def test_a_model_the_worker_no_longer_uses_is_not_reported(owner):
     log(owner, message=TPM.replace("{n}", "9000"), estimate=5000, model="old")
     assert report(owner) == []
+
+
+def test_only_models_with_evidence_of_room_are_offered(owner):
+    roomy_unknown = {**snapshot()["models"], "mystery": {"enabled": True, "model_type": "CUSTOM", "context_window": None}}
+    log(owner, message=OTPM.replace("{n}", "4096"), estimate=3000)
+    with SessionLocal() as db:
+        [group] = model_capacity.report(db, owner, {**snapshot(), "models": roomy_unknown})
+    assert "mystery" not in [m["name"] for m in group["models"]]  # an unknown window is not room
+    log(owner, status="SUCCEEDED", model="mystery", tokens_in=3500, tokens_out=500)
+    with SessionLocal() as db:
+        [group] = model_capacity.report(db, owner, {**snapshot(), "models": roomy_unknown})
+    assert {"name": "mystery", "context_window": None, "proven": True, "in_chain": False} in group["models"]
+
+
+def test_a_fallback_answer_is_credited_to_the_model_that_answered(owner):
+    log(owner, message=OTPM.replace("{n}", "4096"), estimate=3000)
+    # Asked roomy, LiteLLM fell back to tiny's group, which answered: tiny is proven, roomy is not.
+    log(owner, status="SUCCEEDED", model="roomy", group="tiny", fallback_used=True, tokens_in=3500, tokens_out=500)
+    [group] = report(owner)
+    proven = {m["name"]: m["proven"] for m in group["models"]}
+    assert proven == {"tiny": True, "roomy": False}
+    log(owner, status="SUCCEEDED", model="roomy", fallback_used=True, tokens_in=3500, tokens_out=500)  # no group
+    assert {m["name"]: m["proven"] for m in report(owner)[0]["models"]}["roomy"] is False
+
+
+def test_a_refusing_backup_is_reported_in_its_role(owner):
+    log(owner, message=OTPM.replace("{n}", "4096"), estimate=3000, model="tiny")
+    [group] = report(owner, fallback_model="tiny")
+    assert (group["model"], group["role"]) == ("tiny", "backup")
+    assert report(owner) == []  # once tiny is no longer a backup, there is nothing to fix

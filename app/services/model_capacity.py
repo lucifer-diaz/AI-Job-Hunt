@@ -5,8 +5,9 @@ A provider such as Groq refuses a single request that is larger than a per-minut
 this module shows, per worker and model, what was refused and the options that fit:
 
 * a cap on the worker's output tokens, when the limit counts output and the worker's own answers fit under it;
-* other models with room for the worker's requests: a known context window large enough, and no refusal of a
-  request that size, proven first when they have already answered this worker's requests of that size;
+* other models with room for the worker's requests: no refusal of a request that size, and either a known context
+  window large enough or proof (they have already answered this worker's requests of that size; proven come first).
+  A model with an unknown window and no such answer is never offered: unknown stays unknown;
 * plainly, when the prompt alone is over the limit: only another model helps.
 
 Read-only and deterministic: everything comes from the account's own `llm_request_logs` rows (bounded, filtered by
@@ -44,15 +45,20 @@ def _p90(values: list[int]) -> int | None:
     return values[min(len(values) - 1, max(0, math.ceil(0.9 * len(values)) - 1))] if values else None
 
 
-def _uses(snapshot: dict[str, Any], worker_type: str) -> tuple[set[str], list[str]]:
-    """The models a worker sends to (primary, backups, escalation target), and its backups in order."""
+def _roles(snapshot: dict[str, Any], worker_type: str) -> tuple[dict[str, str], list[str]]:
+    """Each model a worker sends to with its role there (primary, backup, escalation), and its backups in order.
+    A fix replaces the model in the role it has; the primary wins when a model has more than one."""
     config = (snapshot.get("workers") or {}).get(worker_type) or {}
     primary = model_resolution.resolve_model(snapshot, worker_type)[0]
     chain = [m for m in [config.get("fallback_model"), *(config.get("secondary_models") or [])] if m]
     escalation = config.get("escalation") or {}
     target = escalation.get("model") or (model_resolution.tier_model(snapshot, escalation["tier"])[0]
                                          if escalation.get("tier") else None)
-    return {m for m in (primary, target, *chain) if m}, chain
+    roles = {target: "escalation"} if target else {}
+    roles.update(dict.fromkeys(chain, "backup"))
+    if primary:
+        roles[primary] = "primary"
+    return roles, chain
 
 
 def report(db: Session, user_id: int, snapshot: dict[str, Any], *, now: Any = None) -> list[dict[str, Any]]:
@@ -94,16 +100,19 @@ def _report(db: Session, user_id: int, snapshot: dict[str, Any], *, now: Any = N
 
     workers = {w for w, _ in groups}
     succeeded = db.execute(
-        select(LLMRequestLog.worker_type, LLMRequestLog.requested_model, LLMRequestLog.input_tokens,
-               LLMRequestLog.output_tokens)
+        select(LLMRequestLog.worker_type, LLMRequestLog.requested_model, LLMRequestLog.model_group,
+               LLMRequestLog.fallback_used, LLMRequestLog.input_tokens, LLMRequestLog.output_tokens)
         .where(LLMRequestLog.user_id == user_id, LLMRequestLog.status == "SUCCEEDED",
                LLMRequestLog.created_at >= since, LLMRequestLog.worker_type.in_(workers))
         .order_by(LLMRequestLog.created_at.desc()).limit(MAX_SUCCESSES)).all()
     outputs: dict[str, list[int]] = defaultdict(list)
     largest_answered: dict[tuple[str, str], int] = {}
-    for worker_type, model, tokens_in, tokens_out in succeeded:
+    for worker_type, requested, group, fell_back, tokens_in, tokens_out in succeeded:
         if tokens_out is not None:
             outputs[worker_type].append(tokens_out)
+        # Credit the catalog model that answered: LiteLLM's model group, or the requested model when nothing fell
+        # back. A fallback answer without a group names no catalog model, so it proves nothing.
+        model = group or (requested if not fell_back else None)
         if model and tokens_in is not None:
             key = (worker_type, model)
             largest_answered[key] = max(largest_answered.get(key, 0), tokens_in + (tokens_out or 0))
@@ -111,8 +120,8 @@ def _report(db: Session, user_id: int, snapshot: dict[str, Any], *, now: Any = N
     catalog = snapshot.get("models") or {}
     out = []
     for (worker_type, model), group in groups.items():
-        uses, chain = _uses(snapshot, worker_type)
-        if model not in uses:
+        roles, chain = _roles(snapshot, worker_type)
+        if model not in roles:
             continue  # the worker no longer sends to this model: nothing to fix
         config = (snapshot.get("workers") or {}).get(worker_type) or {}
         typical_input = _p90(group["inputs"])
@@ -143,13 +152,15 @@ def _report(db: Session, user_id: int, snapshot: dict[str, Any], *, now: Any = N
             if name == model or not entry.get("enabled", True) or entry.get("model_type") in ("EMBEDDING",):
                 continue
             window = entry.get("context_window")
-            if (window and need and window < need * INPUT_MARGIN) or smallest_refused.get(name, need + 1) <= need:
+            if smallest_refused.get(name, need + 1) <= need:
                 continue
             proven = largest_answered.get((worker_type, name), 0) >= need > 0
+            if not proven and not (window and window >= need * INPUT_MARGIN):
+                continue  # no evidence it has room: an unknown window is not room
             models.append({"name": name, "context_window": window, "proven": proven, "in_chain": name in chain})
         models.sort(key=lambda m: (not m["proven"], m["context_window"] is None, -(m["context_window"] or 0),
                                    m["name"]))
-        out.append({"worker_type": worker_type, "label": label(worker_type), "model": model,
+        out.append({"worker_type": worker_type, "label": label(worker_type), "model": model, "role": roles[model],
                     "count": group["count"], "last_at": group["last"].isoformat() if group["last"] else None,
                     "limits": limits, "typical_input": typical_input, "typical_output": typical_output,
                     "input_over": input_over, "output_cap": cap, "models": models[:MAX_MODELS],

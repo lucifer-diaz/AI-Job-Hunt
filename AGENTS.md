@@ -150,12 +150,14 @@ rules a change has to keep:
 * **A 429 rests the model for as long as the provider said** (`app/services/rate_limits.py`, read from the full 429
   response before its text is cut): never before a reset it named (a header, `X-RateLimit-Reset` in the body, "try
   again in 8.4s"); a usage cap with no reset (Ollama's 5-hour / weekly limits) for the account's
-  `usage_limit_rest_minutes`. "Request too large" refused one request, not the model: it never rests it and is not
-  counted in the health window. A reset is a provider fact; never invent one.
+  `usage_limit_rest_minutes`. "Request too large" refused one request, not the model: it never rests it, starts no
+  request cooldown (`external_api` marks the call `oversized_request`) and is not counted in the health window. A reset is a provider fact; never invent one.
 * **Requests too big for a model are shown, not rerouted** (`app/services/model_capacity.py`, Workers tab). From the
   account's own refusals (the provider's stated limit and request size) and successes, it offers an answer cap only
-  when this worker's answers fit under it, and models with room (a known context window large enough, no refusal of a
-  request that size). It recommends; a person applies a fix through draft → apply.
+  when this worker's answers fit under it, and models with room: no refusal of a request that size, and a known context
+  window large enough or an answer to one (credited to the model that answered: `model_group`, never the requested
+  model of a fallback). A fix replaces the model in the role it has (primary, backup, escalation). It recommends; a
+  person applies a fix through draft → apply.
 * **A 429 rests the model, not the gateway.** The LiteLLM cooldown is kept per model (`external_api.cooldown_provider`,
   `LITELLM:<model>`), so a rate-limited model never blocks the model failover sends the request to. Other providers
   still cool down as a whole.

@@ -255,6 +255,15 @@ describe('AI Orchestration → Models & routing', () => {
     expect(body('PUT', '/api/settings/ai/workers/RANKER')).toEqual({ revision: 7, fallback_model: 'local-deep', secondary_models: [] });
     await ui.A['aim-size-use'](view.querySelector('[data-act="aim-size-use"]'));
     expect(body('PUT', '/api/settings/ai/workers/RANKER')).toMatchObject({ model_mode: 'FIXED', primary_model: 'local-deep', fallback_model: null, secondary_models: [] });
+    // A refusing backup or escalation model is replaced where it is; the worker's own model stays.
+    const use = (role, replace) => ({ dataset: { worker: 'RANKER', model: 'local-deep', replace, role } });
+    const ranker = overview().workers.find(w => w.worker_type === 'RANKER');
+    ui.AIM.data.workers = ui.AIM.data.workers.map(w => w.worker_type === 'RANKER' ? { ...ranker, config: { ...ranker.config, fallback_model: 'local-fast', secondary_models: ['mystery'], escalation: { model: 'mystery', tier: null, conditions: ['LOW_CONFIDENCE'], confidence_threshold: 0.8 } } } : w);
+    await ui.A['aim-size-use'](use('backup', 'local-fast'));
+    expect(body('PUT', '/api/settings/ai/workers/RANKER')).toEqual({ revision: 7, fallback_model: 'local-deep', secondary_models: ['mystery'] });
+    ui.AIM.data.workers = ui.AIM.data.workers.map(w => w.worker_type === 'RANKER' ? { ...ranker, config: { ...ranker.config, escalation: { model: 'mystery', tier: null, conditions: ['LOW_CONFIDENCE'], confidence_threshold: 0.8 } } } : w);
+    await ui.A['aim-size-use'](use('escalation', 'mystery'));
+    expect(body('PUT', '/api/settings/ai/workers/RANKER')).toEqual({ revision: 7, escalation: { model: 'local-deep', tier: null, conditions: ['LOW_CONFIDENCE'], confidence_threshold: 0.8 } });
   });
   it('saves backups in order as the fallback and secondary models, growing the list as it fills', async () => {
     routes['PUT /api/settings/ai/workers/RANKER'] = () => ({ worker: {}, draft_revision: 8 });
