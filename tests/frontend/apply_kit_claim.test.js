@@ -125,4 +125,25 @@ describe('the Apply kit claim', () => {
     const button = [...el.querySelectorAll('[data-act="kit-confirm"]')][0];
     expect(button.dataset.ids).toBe('3');
   });
+
+  it('lists the fields highlighted in the open window, continues without reloading, and offers to save what was typed', async () => {
+    const waiting = { id: 9, mode: 'ASSIST', status: 'QUEUED', stage: 'NEEDS_HUMAN', interrupt: { reason: 'FIELDS_NEED_YOU', question_ids: [3] }, fields: [] };
+    const takeover = { reason: 'FIELDS_NEED_YOU', expires_at: '2026-10-26T12:00:00', fields: [{ id: 'bu_py', label: 'Years of Python?' }] };
+    const el = html(kit({ execution_mode: 'assist', execution: waiting, execution_takeover: takeover,
+      execution_questions: [{ id: 3, question: 'Years of Python?', answered: false, answer_type: 'text', answer_options: [] }] }));
+    expect(el.textContent).toContain('1 field needs you');
+    expect(el.textContent).toContain('Years of Python?');
+    expect(el.textContent).toContain('the page is not reloaded');
+    expect(acts(el)).toContain('kit-continue');
+    expect(acts(el)).not.toContain('kit-save-login');
+    expect(acts(el)).not.toContain('kit-save-window');
+    const done = { id: 9, mode: 'ASSIST', status: 'COMPLETED', stage: 'READY_TO_SUBMIT', interrupt: null, result_code: 'READY_TO_SUBMIT',
+      fields: [{ id: 'bu_py', label: 'Years of Python?', status: 'PERSON' }, { id: 'bu_name', label: 'Name', status: 'RESOLVED' }] };
+    const ready = html(kit({ execution_mode: 'assist', execution: done }));
+    expect(ready.textContent).toContain('You filled 1 field yourself in the window (Years of Python?)');
+    expect(acts(ready)).toContain('kit-save-window');
+    ui.D.kit = kit({ execution_mode: 'assist', execution: done });
+    await ui.A['kit-save-window']({ dataset: { exec: '9' } });
+    expect(calls.some(([m, u]) => m === 'POST' && u.endsWith('/api/application-executions/9/save-window-answers'))).toBe(true);
+  });
 });

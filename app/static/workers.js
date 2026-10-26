@@ -159,6 +159,7 @@ function wkCooldowns(list) {
 // An application run waiting for the person (it is not claimable, so it is not "waiting its turn").
 function wkWaitingText(r) {
   const w = r.waiting_detail || {};
+  if (w.kind === 'NEEDS_HUMAN' && w.fields) return `Waiting for you in the browser window: fill ${w.fields} highlighted field${w.fields === 1 ? '' : 's'}, then Continue in the Apply kit${w.expires_at ? ` · until ${fmtDateTime(w.expires_at)}` : ''}`;
   if (w.kind === 'NEEDS_HUMAN') return `Waiting for you to finish in the browser window${w.reason ? ` (${wkHumanize(w.reason).toLowerCase()})` : ''}, then Continue in the Apply kit${w.expires_at ? ` · until ${fmtDateTime(w.expires_at)}` : ''}`;
   const parts = [w.questions ? `answer ${w.questions} question${w.questions === 1 ? '' : 's'} in the Knowledge bank (and verify them)` : '', w.confirmations ? `confirm ${w.confirmations} saved answer${w.confirmations === 1 ? '' : 's'} in the Apply kit` : ''].filter(Boolean);
   return `Waiting for you: ${parts.join(', then ') || 'see the Apply kit'}. It continues by itself`;

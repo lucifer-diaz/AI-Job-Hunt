@@ -293,3 +293,87 @@ def test_a_board_with_dropdowns_goes_to_browser_use_and_ends_ready_to_submit(run
         (task.result_code, task.last_error)
     assert any(f["kind"] == "combobox" for f in task.form["fields"])
     assert posts == []
+
+
+def test_point_marks_the_fields_and_shows_a_banner_and_unpoint_clears_them(runner, tmp_path):
+    from app.services import application_execution
+
+    manager = bus.get_sidecars()
+    with gs.FakeATS("confirm") as ats, application_execution.background_loop() as loop:
+        run = application_execution.loop_runner(loop, timeout=90)
+        session = run(manager.start(user_id=1, task_id=50, job_id=5, allowed_hosts=["127.0.0.1"],
+                                    upload_dir=str(tmp_path), allow_private=True))
+        try:
+            run(session.call("goto", url=ats.url()))
+            observation = run(session.call("observe"))
+            email = next(e for e in observation["elements"] if e["type"] == "email")
+            marked = run(session.call("point", keys=[email["key"], "no-such-key"], note="Needs you",
+                                      message="Job Hunt OS needs you: fill the 1 highlighted field"))
+            shown = run(session.call("observe", html=True))
+            run(session.call("unpoint"))
+            cleared = run(session.call("observe", html=True))
+            read = run(session.call("read", key=email["key"]))
+        finally:
+            run(manager.close(1, 50))
+        posts = list(ats.posts)
+    assert marked == {"marked": 1}
+    assert "fill the 1 highlighted field" in shown["text"] and "data-jobhunt-needs-you" in shown["html"]
+    assert "highlighted field" not in cleared["text"] and "data-jobhunt-needs-you" not in cleared["html"]
+    assert read["filled"] is False and posts == []
+
+
+class _VisibleWindow(bus.SidecarManager):
+    """The real runner, headless in tests, treated as a visible window so the run may keep it for a person."""
+
+    async def start(self, **kwargs):
+        session = await super().start(**{**kwargs, "headless": True})
+        session.headless = False
+        return session
+
+
+def test_the_window_points_at_an_unanswered_field_and_resumes_in_place(runner, pg_sessions, pg_engine, monkeypatch,
+                                                                       tmp_path):
+    from app.services import application_execution
+
+    aps.configure(monkeypatch, "assist")
+    for name, value in (("browser_use_webui_enabled", True), ("browser_use_headless", False),
+                        ("mcp_packet_dir", str(tmp_path / "packets"))):
+        monkeypatch.setattr(aps.get_settings(), name, value)
+    checkpoint.forget_setup()
+    qs.clear_checkpoints(pg_engine)
+    sessions = qs.app_sessions(pg_engine)
+    manager = _VisibleWindow()
+    bus.set_sidecars(manager)
+    with gs.FakeATS("confirm") as ats:
+        user = aps.owner(sessions)  # no saved answer to the Python question
+        job_id = aps.approved_job(sessions, user, ats.url("dynamic_form"))
+        aps.enqueue(sessions, user, job_id)
+
+        async def go():
+            await aps.drive_async(sessions, passes=6)
+            task = aps.task_of(sessions, job_id)
+            assert (task.stage, task.interrupt["reason"]) == ("NEEDS_HUMAN", "FIELDS_NEED_YOU"), task.result_code
+            assert [f["label"] for f in task.interrupt["fields"]] == [aps.PYTHON_QUESTION]
+            session = manager.get(user, task.id)
+            page = await session.call("observe", html=True)
+            assert "fill the 1 highlighted field" in page["text"]
+            loads = [p for m, p in ats.requests if m == "GET" and "dynamic_form" in p]
+            field = next(e for e in page["elements"]
+                         if e.get("tag") == "input" and aps.PYTHON_QUESTION in (e.get("label") or ""))
+            await session.call("fill", key=field["key"], text="11")  # the person types it in the window
+            with sessions() as db:
+                db.info["user_id"] = user
+                application_execution.continue_after_takeover(db, task.id)
+            await aps.drive_async(sessions, passes=6)
+            await manager.close(user, task.id)
+            return loads, [p for m, p in ats.requests if m == "GET" and "dynamic_form" in p]
+        before, after = asyncio.run(go())
+        posts = list(ats.posts)
+    bus.set_sidecars(None)
+    task = aps.task_of(sessions, job_id)
+    assert (task.status, task.stage, task.outcome) == ("COMPLETED", "READY_TO_SUBMIT", "READY_TO_SUBMIT"), \
+        (task.result_code, task.last_error)
+    assert after == before  # continued in the same page: never reloaded, the typed answer kept
+    field_id = next(f["id"] for f in task.form["fields"] if f["label"] == aps.PYTHON_QUESTION)
+    assert task.plan["fields"][field_id]["status"] == "PERSON"
+    assert posts == []

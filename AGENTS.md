@@ -665,6 +665,17 @@ ADR-035). The rules a change has to keep:
     (`continue_after_takeover`).
   * Then the run re-observes the page from its apply URL and re-validates everything. It never replays an old action.
   * An unclaimed takeover ends TAKEOVER_EXPIRED with the shared blocker. Kill closes the window.
+* **Fields the run could not fill are pointed out, not guessed** (`FIELDS_NEED_YOU`, headful browser-use, OBSERVE or
+  ASSIST only).
+  * The runner outlines them with a banner (`point`, constant JavaScript, no click). The interrupt holds field ids and
+    labels only.
+  * Continue resumes in the same page (`session.resume_in_place`, no reload): the run removes the marks, fills what was
+    answered meanwhile, and reads back every required field.
+  * A required field with no verified source passes only when it now holds a value, and becomes `PERSON`. Guarded
+    submission never accepts a `PERSON` field.
+  * The person's values are never stored on the task, the checkpoint or a log. They are read from the window only when
+    the person asks to save them to the Knowledge bank (`save-window-answers`, as their verified answers).
+  * Headless runs end NEEDS_HUMAN and list the fields instead.
 * **The ATS map is facts, per account** (`ats_routes`, `ats_map.observe`): from posting URLs and run outcomes, never a
   model, never a guessed employer site. A login belongs to a route's `login_domain`: per tenant where the ATS has
   per-employer accounts (Workday, iCIMS, Taleo, SuccessFactors). Ashby (its form loads through POST), LinkedIn and

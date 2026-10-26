@@ -230,6 +230,18 @@ BLOCKER_FOR = {"LOGIN_REQUIRED": "login_required", "OTP_REQUIRED": "login_requir
                "ACCOUNT_REQUIRED": "account_required", "CAPTCHA_OR_ANTI_BOT": "captcha",
                "POSTING_CLOSED": "posting_closed"}
 TAKEOVER_PROBLEMS = ("LOGIN_REQUIRED", "OTP_REQUIRED", "LOGIN_FAILED", "ACCOUNT_REQUIRED", "CAPTCHA_OR_ANTI_BOT")
+FIELDS_NEED_YOU = "FIELDS_NEED_YOU"  # required fields nothing verified could fill: the person fills them in the window
+
+
+def _takeover_problem(problem: str | None) -> bool:
+    return bool(problem) and (problem in TAKEOVER_PROBLEMS or problem == FIELDS_NEED_YOU
+                              or problem.startswith("NAVIGATOR_"))
+
+
+def _headful() -> bool:
+    from app.settings import get_settings
+
+    return not get_settings().browser_use_headless
 
 
 def _facts(job: Any) -> Any:
@@ -304,7 +316,7 @@ def _park_or_close(ctx: ApplicationContext, session: Any, problem: str | None) -
     from app.settings import get_settings
 
     manager = get_sidecars()
-    if problem in TAKEOVER_PROBLEMS:
+    if _takeover_problem(problem):
         return bool(ctx.run_async(manager.park(session, get_settings().application_takeover_ttl_minutes)))
     ctx.run_async(manager.close(session.user_id, session.task_id))
     return False
@@ -363,7 +375,7 @@ def _browser_use_on() -> bool:
 
 
 def _takeover(db: Session, ctx: ApplicationContext, state: ApplicationState, task: Any, job: Any, problem: str,
-              resume_at: str) -> dict[str, Any]:
+              resume_at: str, **extra: Any) -> dict[str, Any]:
     """Wait for the person in the kept window; the run resumes at `resume_at` and re-observes everything."""
     from datetime import UTC, datetime, timedelta
 
@@ -373,11 +385,15 @@ def _takeover(db: Session, ctx: ApplicationContext, state: ApplicationState, tas
     match = ats_map.for_job(job)
     expires = datetime.now(UTC).replace(tzinfo=None) + timedelta(
         minutes=get_settings().application_takeover_ttl_minutes)
-    _record(db, ctx, _key(state, resume_at, f":takeover:a{task.attempt_count}:{problem}"), task, "NEEDS_HUMAN",
-            result_code=problem, interrupt={"kind": "NEEDS_HUMAN", "reason": problem, "takeover": True,
-                                            "resume_at": resume_at, "expires_at": expires.isoformat(),
-                                            "login_domain": match.login_domain if match else None})
-    ats_map.observe(db, job, needs_login=problem != "CAPTCHA_OR_ANTI_BOT", last_outcome=problem, checked=True)
+    fields = extra.get("fields") or []
+    _record(db, ctx, _key(state, resume_at, f":takeover:a{task.attempt_count}:{problem}:{len(fields)}"), task,
+            "NEEDS_HUMAN", result_code=problem,
+            interrupt={"kind": "NEEDS_HUMAN", "reason": problem, "takeover": True, "resume_at": resume_at,
+                       "expires_at": expires.isoformat(), "login_domain": match.login_domain if match else None,
+                       **({"fields": fields} if fields else {}),
+                       **({"question_ids": extra["question_ids"]} if extra.get("question_ids") else {})})
+    login = problem in TAKEOVER_PROBLEMS and problem != "CAPTCHA_OR_ANTI_BOT"
+    ats_map.observe(db, job, needs_login=login or None, last_outcome=problem, checked=True)
     db.commit()
     return {"step": resume_at.upper(), "waiting_for": HUMAN, "resume_at": resume_at}
 
@@ -389,7 +405,8 @@ def analyze_form(state: ApplicationState, runtime: Runtime[ApplicationContext]) 
     with _session(ctx) as db:
         task, job = _load(db, state)
         if task.form and task.form_fingerprint:
-            return {"step": ANALYZE_FORM, "route": task.route, "form_fingerprint": task.form_fingerprint,
+            return {"step": ANALYZE_FORM, "route": task.route, "backend": task.backend,
+                    "form_fingerprint": task.form_fingerprint,
                     "field_count": len(task.form.get("fields") or []), "waiting_for": None}
         url = apply_queue.apply_url(job)
         user_id, job_id, backend, task_id, attempt = job.user_id, job.id, task.backend, task.id, task.attempt_count
@@ -450,7 +467,7 @@ def analyze_form(state: ApplicationState, runtime: Runtime[ApplicationContext]) 
         ats_map.observe(db, job, form_fingerprint=form.fingerprint, last_outcome="FORM_READ", checked=True,
                         needs_login=False)
         db.commit()
-    return {"step": ANALYZE_FORM, "route": read["route"], "form_fingerprint": form.fingerprint,
+    return {"step": ANALYZE_FORM, "route": read["route"], "backend": backend, "form_fingerprint": form.fingerprint,
             "field_count": len(form.fields), "required_count": len(form.required_fields()), "waiting_for": None,
             "model_steps": read.get("model_steps") or 0}
 
@@ -475,6 +492,10 @@ def resolve_answers(state: ApplicationState, runtime: Runtime[ApplicationContext
                   "needs_confirmation_count": len(plan["needs_confirmation"])}
         waiting = plan["needs_input"] or plan["needs_confirmation"]
         attempt = f":a{task.attempt_count}:{len(plan['needs_input'])}:{len(plan['needs_confirmation'])}"
+        if waiting and _in_window(state, task):
+            # The browser fills what is verified, then shows the person the rest in the open window (FILL).
+            _record(db, ctx, _key(state, RESOLVE_ANSWERS, attempt), task, "ANSWERING", plan=plan, interrupt=None)
+            return {"step": RESOLVE_ANSWERS, "waiting_for": None, "resume_at": None, **counts}
         if waiting:
             _record(db, ctx, _key(state, RESOLVE_ANSWERS, attempt), task, "NEEDS_INPUT", plan=plan,
                     interrupt={"kind": "NEEDS_INPUT", "question_ids": plan["needs_input"],
@@ -482,6 +503,13 @@ def resolve_answers(state: ApplicationState, runtime: Runtime[ApplicationContext
             return {"step": RESOLVE_ANSWERS, "waiting_for": INPUT, "resume_at": "resolve_answers", **counts}
         _record(db, ctx, _key(state, RESOLVE_ANSWERS, attempt), task, "ANSWERING", plan=plan, interrupt=None)
     return {"step": RESOLVE_ANSWERS, "waiting_for": None, "resume_at": None, **counts}
+
+
+def _in_window(state: ApplicationState, task: Any) -> bool:
+    """An ASSIST run on the browser-use backend with a visible window: what nothing verified answers, the person fills
+    in that window instead of the run stopping first."""
+    return state.get("mode") == "ASSIST" and (task.backend or state.get("backend")) == "browser_use_webui" \
+        and _headful()
 
 
 def _after_resolve(state: ApplicationState) -> str:
@@ -560,18 +588,35 @@ def fill(state: ApplicationState, runtime: Runtime[ApplicationContext]) -> dict[
     values.clear()  # the values never leave this step
     with _session(ctx) as db:
         task, job = _load(db, state)
+        fields_problem = (result.get("problem") or "") == FIELDS_NEED_YOU or \
+            (result.get("problem") or "").startswith("NAVIGATOR_")
         if result.get("problem") and result.get("takeover"):
-            return _takeover(db, ctx, state, task, job, result["problem"], "fill")
+            # Fields the person fills in the window: on Continue, answers saved in the Apply kit are resolved again
+            # first (RESOLVE_ANSWERS), then FILL picks up the page where it is, without reloading it.
+            return _takeover(db, ctx, state, task, job, result["problem"],
+                             "resolve_answers" if fields_problem else "fill", fields=result.get("fields"),
+                             question_ids=result.get("question_ids"))
         if result.get("problem"):
             code = result["problem"]
-            stage = "NEEDS_HUMAN" if code in (*ats_forms.HUMAN_BLOCKERS, "LOGIN_FAILED") or \
-                code.startswith("NAVIGATOR_") else "BLOCKED"
+            stage = "NEEDS_HUMAN" if code in (*ats_forms.HUMAN_BLOCKERS, "LOGIN_FAILED") or fields_problem \
+                else "BLOCKED"
             _record(db, ctx, _key(state, FILL, f":a{task.attempt_count}:done"), task, stage, result_code=code,
                     form=None if code == "FORM_CHANGED" else task.form,
-                    form_fingerprint=None if code == "FORM_CHANGED" else task.form_fingerprint)
+                    form_fingerprint=None if code == "FORM_CHANGED" else task.form_fingerprint,
+                    **({"interrupt": {"kind": "NEEDS_HUMAN", "reason": code, "fields": result["fields"]}}
+                       if result.get("fields") else {}))
             return _end(FILL, NEEDS_HUMAN if stage == "NEEDS_HUMAN" else BLOCKED, code)
         filled = sum(1 for v in result["report"].values() if v == "filled")
-        _record(db, ctx, _key(state, FILL, f":a{task.attempt_count}:done"), task, "PRE_SUBMIT_VALIDATION")
+        plan = dict(task.plan or {})
+        if result.get("person_filled"):
+            # Filled by the person in the window: accepted for ASSIST (never for guarded submission); what they typed
+            # is not read or stored here.
+            entries = dict(plan.get("fields") or {})
+            for fid in result["person_filled"]:
+                entries[fid] = {**(entries.get(fid) or {}), "status": "PERSON", "source": "person_in_window"}
+            plan["fields"] = entries
+        _record(db, ctx, _key(state, FILL, f":a{task.attempt_count}:done"), task, "PRE_SUBMIT_VALIDATION",
+                plan=plan, interrupt=None)
     return {"step": FILL, "filled_count": filled, "missing_required_count": len(result["missing"]),
             "blocked_requests": result["blocked_requests"], "actions": result.get("actions") or 0,
             "model_steps": result.get("model_steps") or 0}
@@ -580,14 +625,18 @@ def fill(state: ApplicationState, runtime: Runtime[ApplicationContext]) -> dict[
 def _fill_browser_use(ctx: ApplicationContext, task_id: int, job: Any, url: str, form: Any, plan: dict[str, Any],
                       values: dict[str, Any], expected: str, attempt: int) -> dict[str, Any]:
     """Fill a form no adapter knows through the sidecar: every resolved field into its own element without a model,
-    then the navigator for what that could not reach, then a read-back. In ASSIST a headful window is kept for the
-    person to submit in (after starting the submission in the Apply kit)."""
+    the navigator only for resolved fields that could not be reached, then a read-back.
+
+    Required fields nothing verified fills (and anything the navigator asks a person about) are pointed out in the
+    page: outlined, a banner, the window in front. With a visible window it is kept for the person (FIELDS_NEED_YOU),
+    who fills them there; the next pass picks the page up where it is, without reloading it, and accepts a required
+    field the person filled. In ASSIST a finished form stays open for the person to submit."""
     from app.infrastructure.application_browser.browser_use_sidecar import (
         SidecarRefused,
         SidecarUnavailable,
         get_sidecars,
     )
-    from app.services import application_backends, ats_map, browser_actions
+    from app.services import application_backends, ats_forms, ats_map, browser_actions
     from app.services.ats_forms import generic
     from app.settings import get_settings
 
@@ -596,43 +645,72 @@ def _fill_browser_use(ctx: ApplicationContext, task_id: int, job: Any, url: str,
         session = _bu_session(ctx, job.user_id, task_id, job.id, match, _packet_dir(job))
     except SidecarUnavailable:
         return {"problem": "BACKEND_UNAVAILABLE"}
+    in_place = bool(getattr(session, "resume_in_place", False))
+    session.resume_in_place = False
     keep = False
     try:
-        problem, observation = _bu_load(ctx, session, job.user_id, match, url)
+        if in_place:  # the person filled fields in this very page: never reload it
+            ctx.run_async(session.call("unpoint"))
+            observation = ctx.run_async(session.call("observe", html=True))
+            problem = ats_forms.page_problem(observation.get("html") or "", title=observation.get("title"))
+        else:
+            problem, observation = _bu_load(ctx, session, job.user_id, match, url)
         if problem:
             keep = _park_or_close(ctx, session, problem)
             return {"problem": problem, "takeover": keep}
         current = generic.analyze(observation.get("url") or url, observation.get("elements") or [])
         result = browser_actions.FillResult()
         limit = get_settings().application_max_actions
-        if current is None or current.fingerprint != expected:  # a fresh page: reveal the form again first
+        planned = {f.id for f in form.fields}
+        if in_place and current is not None and current.fingerprint != expected and \
+                planned <= {f.id for f in current.fields}:
+            pass  # the page grew (a conditional question appeared): the planned fields are all still there
+        elif current is None or current.fingerprint != expected:  # a fresh page: reveal the form again first
             propose, builder = _navigator(ctx, job, attempt)
             observation = browser_actions.navigate(session, ctx.run_async, propose, builder, None, {}, {}, result,
                                                    hosts=set(application_backends.allowed_hosts(match)),
                                                    max_actions=browser_actions.REVEAL_STEPS, reveal_only=True)
             current = generic.analyze(observation.get("url") or url, observation.get("elements") or []) \
                 if result.outcome == "FILLED" else None
-        if current is None or current.fingerprint != expected:
-            keep = _park_or_close(ctx, session, result.code if result.outcome == "NEEDS_HUMAN" else None)
-            return {"problem": result.code if result.outcome != "FILLED" else "FORM_CHANGED", "takeover": keep}
+            if current is None or current.fingerprint != expected:
+                keep = _park_or_close(ctx, session, result.code if result.outcome == "NEEDS_HUMAN" else None)
+                return {"problem": result.code if result.outcome != "FILLED" else "FORM_CHANGED", "takeover": keep}
         browser_actions.fill_deterministic(session, ctx.run_async, current, plan, values, observation, result, limit)
         observation = ctx.run_async(session.call("observe", html=True))
-        missing = browser_actions.read_back(session, ctx.run_async, current, values, observation)
-        if missing:
+        missing, person = browser_actions.read_required(session, ctx.run_async, current, values, observation)
+        if any(m in values for m in missing):  # resolved but not reached: the navigator may find the way
             propose, builder = _navigator(ctx, job, attempt)
             observation = browser_actions.navigate(session, ctx.run_async, propose, builder, current, plan, values,
                                                    result, hosts=set(application_backends.allowed_hosts(match)),
                                                    max_actions=limit)
-            if result.outcome != "FILLED":
-                keep = _park_or_close(ctx, session, result.code if result.outcome == "NEEDS_HUMAN" else None)
-                return {"problem": result.code or "NAVIGATION_FAILED", "takeover": keep}
-            missing = browser_actions.read_back(session, ctx.run_async, current, values, observation)
-        if not get_settings().browser_use_headless and not missing:
+            if result.outcome == "BLOCKED":
+                _park_or_close(ctx, session, None)
+                return {"problem": result.code or "NAVIGATION_FAILED", "takeover": False}
+            missing, person = browser_actions.read_required(session, ctx.run_async, current, values, observation)
+        if missing or result.outcome == "NEEDS_HUMAN":
+            labels = {f.id: f.label for f in current.fields}
+            fields = [{"id": fid, "label": labels.get(fid, fid)[:200]} for fid in missing]
+            code = result.code if result.outcome == "NEEDS_HUMAN" else FIELDS_NEED_YOU
+            if _headful():
+                keys = [e["key"] for f in current.fields if f.id in missing
+                        if (e := browser_actions.element_for(f, observation)) is not None]
+                keys += [result.ask_element] if result.ask_element and result.ask_element not in keys else []
+                count = len(fields)
+                message = (f"Job Hunt OS needs you: fill the {count} highlighted field{'s' if count != 1 else ''}, "
+                           "then press Continue in the Apply kit. Do not submit yet." if count else
+                           "Job Hunt OS needs you on this page. When you are done, press Continue in the Apply kit.")
+                ctx.run_async(session.call("point", keys=keys, message=message, note="Job Hunt OS needs you here"))
+                keep = _park_or_close(ctx, session, code)
+                session.resume_in_place = keep
+            return {"problem": code, "takeover": keep, "fields": fields, "person_filled": person,
+                    "question_ids": list(plan.get("needs_input") or [])}
+        if _headful():
             # ASSIST: the filled form stays open for the person to review and submit themselves.
             keep = bool(ctx.run_async(get_sidecars().park(session, get_settings().application_takeover_ttl_minutes)))
         report = {fid: "filled" for fid in result.filled}
-        return {"report": report, "missing": missing, "blocked_requests": observation.get("blocked_requests") or 0,
-                "actions": result.actions, "model_steps": result.model_steps, "handed_over": keep}
+        return {"report": report, "missing": [], "person_filled": person,
+                "blocked_requests": observation.get("blocked_requests") or 0, "actions": result.actions,
+                "model_steps": result.model_steps, "handed_over": keep}
     except application_backends.NavigatorUnavailable:
         return {"problem": "NAVIGATOR_UNAVAILABLE"}
     except (SidecarRefused, SidecarUnavailable) as exc:
@@ -656,7 +734,7 @@ def validate(state: ApplicationState, runtime: Runtime[ApplicationContext]) -> d
                     result_code=problem[0], last_error=problem[1][:300])
             return _end(VALIDATE, BLOCKED, problem[0])
         unresolved = [fid for fid, f in ((task.plan or {}).get("fields") or {}).items()
-                      if f.get("required") and f.get("status") != "RESOLVED"]
+                      if f.get("required") and f.get("status") not in ("RESOLVED", "PERSON")]
         if unresolved or state.get("missing_required_count"):
             _record(db, ctx, _key(state, VALIDATE, f":a{task.attempt_count}"), task, "BLOCKED",
                     result_code="REQUIRED_FIELDS_MISSING")

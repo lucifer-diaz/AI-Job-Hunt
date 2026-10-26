@@ -78,7 +78,13 @@ class FakeSession:
             return {"uploaded": True}
         if cmd == "read":
             value = self.values.get(args["key"])
-            return {"files": value} if isinstance(value, list) else {"value": value or ""}
+            out = {"files": value} if isinstance(value, list) else {"value": value or ""}
+            return {**out, "filled": bool(value)}
+        if cmd == "point":
+            self.manager.pointed.append((list(args.get("keys") or []), args.get("message")))
+            return {"marked": len(args.get("keys") or [])}
+        if cmd == "unpoint":
+            return {"cleared": True}
         if cmd == "login_fill":
             self.manager.secrets.append((args["key"], args["secret"], args["domain"],
                                          redaction.redact_text(args["secret"])))
@@ -114,6 +120,7 @@ class FakeManager:
         self.sessions: dict[tuple[int, int], FakeSession] = {}
         self.started: list[dict[str, Any]] = []
         self.secrets: list[tuple] = []
+        self.pointed: list[tuple] = []
         self.loop = None
 
     def available(self) -> bool:
@@ -322,3 +329,58 @@ def test_another_account_cannot_touch_someone_elses_window(sessions, monkeypatch
     assert aps.task_of(sessions, job_id).stage == "NEEDS_HUMAN"
     with sessions() as db:
         assert db.scalar(select(AtsCredential)) is None
+
+
+
+def test_a_field_nothing_verified_fills_is_pointed_out_in_the_open_window_and_kept(sessions, monkeypatch):
+    """The Python question has no verified answer: the run fills the rest, points to that field in the window and
+    waits (FIELDS_NEED_YOU, its label listed). The person types in the window and continues: the page is not reloaded,
+    the field is accepted as theirs (PERSON), the run ends READY_TO_SUBMIT, and what they typed can be saved."""
+    fake = FakeManager("form")
+    bus.set_sidecars(fake)
+    user = aps.owner(sessions)  # no saved answer to the Python question
+    job_id = aps.approved_job(sessions, user, URL)
+    aps.enqueue(sessions, user, job_id)
+    drive(sessions)
+    task = aps.task_of(sessions, job_id)
+    assert (task.status, task.stage, task.interrupt["reason"]) == ("PENDING", "NEEDS_HUMAN", "FIELDS_NEED_YOU")
+    assert [f["label"] for f in task.interrupt["fields"]] == [aps.PYTHON_QUESTION]
+    assert task.interrupt["question_ids"] and fake.pointed[-1][0] == ["q"]
+    assert "fill the 1 highlighted field" in fake.pointed[-1][1]
+    client = client_as(user, monkeypatch, sessions)
+    kit = client.get(f"/api/jobs/{job_id}/apply-kit").json()
+    assert kit["execution_takeover"]["fields"][0]["label"] == aps.PYTHON_QUESTION
+    assert [q["question"] for q in kit["execution_questions"]] == [aps.PYTHON_QUESTION]  # answer here or in the page
+    session = fake.sessions[(user, task.id)]
+    before = [c for c, _ in session.commands].count("goto")
+    session.values["q"] = "11"  # the person types it in the window
+    assert client.post(f"/api/application-executions/{task.id}/continue").status_code == 200
+    drive(sessions)
+    task = aps.task_of(sessions, job_id)
+    assert (task.status, task.stage, task.outcome) == ("COMPLETED", "READY_TO_SUBMIT", "READY_TO_SUBMIT")
+    assert [c for c, _ in session.commands].count("goto") == before  # picked up in place, never reloaded
+    field_id = next(f["id"] for f in task.form["fields"] if f["label"] == aps.PYTHON_QUESTION)
+    assert task.plan["fields"][field_id]["status"] == "PERSON" and "11" not in str(task.plan)
+    stranger = aps.owner(sessions)
+    assert client_as(stranger, monkeypatch, sessions).post(
+        f"/api/application-executions/{task.id}/save-window-answers").status_code == 404
+    saved = client_as(user, monkeypatch, sessions).post(f"/api/application-executions/{task.id}/save-window-answers")
+    assert saved.json() == {"saved": 1} and "11" not in saved.text
+    with sessions() as db:
+        from app.models import KnowledgeAnswer
+        row = db.scalar(select(KnowledgeAnswer).where(KnowledgeAnswer.question == aps.PYTHON_QUESTION))
+        assert (row.answer, row.verified) == ("11", True)
+
+
+def test_without_a_visible_window_the_questions_go_to_the_apply_kit(sessions, monkeypatch):
+    """Headless (or remote) installs cannot hand a page to a person: an unanswered question stops the run before the
+    browser fills (NEEDS_INPUT, answered in the Apply kit), and nothing is pointed at."""
+    monkeypatch.setattr(aps.get_settings(), "browser_use_headless", True)
+    fake = FakeManager("form")
+    bus.set_sidecars(fake)
+    user = aps.owner(sessions)
+    job_id = aps.approved_job(sessions, user, URL)
+    aps.enqueue(sessions, user, job_id)
+    drive(sessions)
+    task = aps.task_of(sessions, job_id)
+    assert (task.status, task.stage) == ("PENDING", "NEEDS_INPUT") and fake.pointed == []

@@ -272,6 +272,12 @@ describe('Running workers', () => {
     expect(view().querySelector('.wk-row [data-act="wk-run-now"]')).toBeNull();
   });
 
+  it('points the person at the browser window when fields are highlighted there', async () => {
+    routes.parsing = { ...parsing(), rows: [row({ kind: 'application', status: 'QUEUED', can_run_now: false, waiting_for: 'YOU', backend: 'browser_use_webui', waiting_detail: { kind: 'NEEDS_HUMAN', reason: 'FIELDS_NEED_YOU', fields: 2 } })] };
+    const text = (await open()).querySelector('.wk-row').textContent;
+    expect(text).toContain('Waiting for you in the browser window: fill 2 highlighted fields, then Continue in the Apply kit');
+  });
+
   it('opens a task’s history from its name, newest first, with the browser-use option for an application', async () => {
     routes.history = { task: row({ kind: 'application', status: 'FAILED', job_id: 7 }), browser_use_ready: true, events: [
       { at: '2026-10-25T22:38:15', title: 'Attempt 3 failed', detail: 'reached filling · OTHER', tone: 'bad', source: 'attempt' },

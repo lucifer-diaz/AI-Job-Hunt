@@ -329,7 +329,7 @@ def questions(db: Session, task: ApplicationExecutionTask) -> list[dict[str, Any
     """The questions this execution waits for the person to answer (saved in the Knowledge bank by the resolver), with
     what the Apply kit needs to ask them in place: the wording, the form's own options, whether it is sensitive and
     what is saved so far. For the account's own Apply kit only; nothing here is stored on the task."""
-    ids = list((task.interrupt or {}).get("question_ids") or []) if task.stage == WAITING else []
+    ids = list((task.interrupt or {}).get("question_ids") or []) if task.stage in WAITING_STAGES else []
     if not ids:
         return []
     rows = {r.id: r for r in db.scalars(select(KnowledgeAnswer).where(KnowledgeAnswer.id.in_(ids))).all()}

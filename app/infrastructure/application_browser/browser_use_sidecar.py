@@ -81,6 +81,8 @@ class SidecarSession:
     headless: bool = True
     parked_until: float | None = None
     domain_for_login: str | None = None
+    # Parked for the person to fill fields in this page: the next FILL re-observes it instead of reloading it.
+    resume_in_place: bool = False
     _next: int = 0
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 

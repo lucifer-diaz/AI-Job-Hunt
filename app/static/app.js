@@ -1474,13 +1474,24 @@ function renderKitClaim(k) {
 function renderKitTakeover(k) {
   const t = k.execution_takeover, x = k.execution;
   if (!t || !x) return '';
-  const why = { LOGIN_REQUIRED: 'The site wants you to sign in', LOGIN_FAILED: 'The saved login did not work', OTP_REQUIRED: 'The site sent a one-time code', ACCOUNT_REQUIRED: 'The site wants a new account', CAPTCHA_OR_ANTI_BOT: 'The site shows a CAPTCHA' }[t.reason] || 'The page needs you';
+  const fields = t.fields || [], login = ['LOGIN_REQUIRED', 'LOGIN_FAILED', 'OTP_REQUIRED', 'ACCOUNT_REQUIRED'].includes(t.reason);
+  const why = { LOGIN_REQUIRED: 'The site wants you to sign in', LOGIN_FAILED: 'The saved login did not work', OTP_REQUIRED: 'The site sent a one-time code', ACCOUNT_REQUIRED: 'The site wants a new account', CAPTCHA_OR_ANTI_BOT: 'The site shows a CAPTCHA',
+    FIELDS_NEED_YOU: `${fields.length} field${fields.length === 1 ? '' : 's'} need${fields.length === 1 ? 's' : ''} you`, NAVIGATOR_UNEXPECTED_PAGE: 'The page needs a look', NAVIGATOR_LEGAL: 'The form asks you to agree to something' }[t.reason]
+    || (String(t.reason || '').startsWith('NAVIGATOR_') ? 'The page needs you' : 'The page needs you');
+  const list = fields.length ? `<ul class="small mt6" style="margin:6px 0 0 18px">${fields.map(f => `<li class="pretty">${esc(f.label || f.id)}</li>`).join('')}</ul>` : '';
   return `<div class="banner warn mt8"><div class="b">${esc(why)}</div>
-    <div class="small mt4 pretty">Finish it in the browser window Job Hunt OS opened (until ${fmtDateTime(t.expires_at)}), then continue. Nothing is submitted from that window unless you do it.</div>
+    <div class="small mt4 pretty">${fields.length ? 'The browser window is open with these fields highlighted. Fill them there' + ((k.execution_questions || []).length ? ', or answer the questions below' : '') + ', then press Continue: the page is not reloaded.' : 'Finish it in the browser window Job Hunt OS opened, then continue.'} Kept until ${fmtDateTime(t.expires_at)}. Nothing is submitted from that window unless you do it.</div>${list}
     <div class="row gap8 mt10 wrap">${btn(label('kit-continue', 'I’m done — continue', 'Continuing…'), 'kit-continue', { exec: x.id }, 'sm', isBusy('kit-continue'))}
     ${t.reason === 'ACCOUNT_REQUIRED' ? btn('Sign up with a generated password', 'kit-signup', { exec: x.id }, 'sm') : ''}
-    ${btn('Save this login', 'kit-save-login', { exec: x.id }, 'sm ghost')}</div>
+    ${login ? btn('Save this login', 'kit-save-login', { exec: x.id }, 'sm ghost') : ''}</div>
     ${S.kitSignup && S.kitSignup.exec === x.id ? `<div class="box mt8" style="padding:10px"><div class="xs muted">Use exactly these on ${esc(S.kitSignup.domain)}; the password is not shown again.</div><div class="small mono mt4">${esc(S.kitSignup.username)}</div><div class="row gap8 mt4"><span class="small mono">${esc(S.kitSignup.password)}</span>${btn('Copy', 'kit-copy-password', {}, 'sm none')}</div></div>` : ''}</div>`;
+}
+// Fields the person filled in the window: offer to keep those answers for next time.
+function renderKitPersonFilled(k) {
+  const x = k.execution, filled = (x?.fields || []).filter(f => f.status === 'PERSON');
+  if (!filled.length || x.stage !== 'READY_TO_SUBMIT') return '';
+  return `<div class="box mt8" style="padding:10px;border-radius:10px"><div class="small">You filled ${filled.length} field${filled.length === 1 ? '' : 's'} yourself in the window (${esc(filled.map(f => f.label).join(', '))}).</div>
+    ${btn(label('kit-save-window', 'Save what you typed to the Knowledge bank', 'Saving…'), 'kit-save-window', { exec: x.id }, 'sm mt6', isBusy('kit-save-window'))}<div class="xs muted mt4">Saved as your verified answers, reused for the same questions on other applications. Only while the window is still open.</div></div>`;
 }
 function renderKitIntent(k) {
   const i = k.execution_intent;
@@ -1523,7 +1534,7 @@ function renderKitExecution(k) {
   const what = mode === 'observe' ? '' : guarded ? ', fills it and, on an allowlisted route, submits it once after every check — only the site’s confirmation marks it applied' : ', then fills it in a private page. It never submits';
   return `<div class="box mb12" style="padding:13px;border-radius:12px"><div class="small b">Application worker · ${esc(mode)}${x && x.backend ? ` · ${esc(x.backend.replaceAll('_', ' '))}` : ''}</div>
     <div class="xs muted mt4 pretty">Reads the form and finds a verified source for every answer${what}.</div>
-    ${state}${renderKitIntent(k)}${renderKitTakeover(k)}${active ? '' : `<div class="row gap8 wrap">${btn(label('kit-prepare', x ? 'Prepare again' : 'Prepare the form', 'Queueing…'), 'kit-prepare', { id: k.job.id }, 'sm mt8', isBusy('kit-prepare'))}${k.browser_use_ready && mode !== 'off' ? `<span title="${attr('Opens a browser window (browser-use) that fills the form from your verified answers, step by step, checked by Job Hunt OS. It never submits: you do.')}">${btn(label('kit-browser-use', 'Run with browser-use', 'Queueing…'), 'kit-browser-use', { id: k.job.id }, 'sm mt8', isBusy('kit-browser-use'))}</span>` : ''}${guarded ? btn(label('kit-guarded', 'Submit for me (guarded)', 'Queueing…'), 'kit-guarded', { id: k.job.id }, 'sm mt8 primary', isBusy('kit-guarded')) : ''}</div>`}</div>`;
+    ${state}${renderKitIntent(k)}${renderKitTakeover(k)}${renderKitPersonFilled(k)}${active ? '' : `<div class="row gap8 wrap">${btn(label('kit-prepare', x ? 'Prepare again' : 'Prepare the form', 'Queueing…'), 'kit-prepare', { id: k.job.id }, 'sm mt8', isBusy('kit-prepare'))}${k.browser_use_ready && mode !== 'off' ? `<span title="${attr('Opens a browser window (browser-use) that fills the form from your verified answers, step by step, checked by Job Hunt OS. It never submits: you do.')}">${btn(label('kit-browser-use', 'Run with browser-use', 'Queueing…'), 'kit-browser-use', { id: k.job.id }, 'sm mt8', isBusy('kit-browser-use'))}</span>` : ''}${guarded ? btn(label('kit-guarded', 'Submit for me (guarded)', 'Queueing…'), 'kit-guarded', { id: k.job.id }, 'sm mt8 primary', isBusy('kit-guarded')) : ''}</div>`}</div>`;
 }
 
 /* ───────────── tracker ───────────── */
@@ -2851,6 +2862,11 @@ const A = {
     Object.assign(f, { q: '', status: 'all', category: 'all', sensitive: 'all', ids });
     go('knowledge');
   },
+  'kit-save-window': el => busy('kit-save-window', async () => {
+    const out = await api(`/api/application-executions/${el.dataset.exec}/save-window-answers`, { method: 'POST' });
+    D.kit = await api(`/api/jobs/${S.kitJob}/apply-kit`);
+    return out;
+  }, out => `${out.saved} answer${out.saved === 1 ? '' : 's'} saved to the Knowledge bank`),
   'kit-browser-use': el => busy('kit-browser-use', async () => {
     await api(`/api/jobs/${el.dataset.id}/application-execution`, { method: 'POST', body: { backend: 'browser_use_webui' } });
     if (S.kitJob) D.kit = await api(`/api/jobs/${el.dataset.id}/apply-kit`);

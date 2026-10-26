@@ -121,7 +121,8 @@ def _takeover_view(task: Any) -> dict[str, Any] | None:
     if task is None or task.status != "PENDING" or task.stage != "NEEDS_HUMAN" or not waiting.get("takeover"):
         return None
     return {"reason": waiting.get("reason"), "expires_at": waiting.get("expires_at"),
-            "login_domain": waiting.get("login_domain"), "continued": bool(waiting.get("continued"))}
+            "login_domain": waiting.get("login_domain"), "continued": bool(waiting.get("continued")),
+            "fields": [{"id": f.get("id"), "label": f.get("label")} for f in waiting.get("fields") or []]}
 
 
 @router.post("/api/jobs/{job_id}/submission/start")
@@ -357,3 +358,51 @@ def application_backends_status(user: CurrentUser = Depends(current_user)) -> di
     if user.is_admin:  # the Web UI probe starts a process and calls a local service: an operator's check
         out["browser_use_webui"] = browser_use_webui.probe()
     return out
+
+
+@router.post("/api/application-executions/{task_id}/save-window-answers")
+def save_window_answers(task_id: int, db: Session = Depends(get_user_db)) -> dict[str, Any]:
+    """Keep what the person typed in the open browser window for fields nothing verified could fill: each one becomes
+    their verified answer to that question in the Knowledge bank, reused on the next application. Read straight from
+    the run's own window into the database; never returned, logged or stored on the run."""
+    from app.infrastructure.application_browser.browser_use_sidecar import get_sidecars
+    from app.models import KnowledgeAnswer
+    from app.services.ats_forms import ApplicationForm, generic
+    from app.services.knowledge import question_key
+
+    task = _task(db, task_id)
+    entries = (task.plan or {}).get("fields") or {}
+    person = [fid for fid, e in entries.items() if e.get("status") == "PERSON"]
+    if not person or not task.form:
+        raise HTTPException(409, "Nothing you typed in the window is waiting to be saved")
+    manager = get_sidecars()
+    session = manager.get(task.user_id, task.id)
+    if session is None:
+        raise HTTPException(409, "The browser window is closed; answer these questions in the Knowledge bank")
+    form = ApplicationForm.model_validate(task.form)
+    manager.run_threadsafe(session.call("observe"), timeout=60)
+    saved = 0
+    for field in form.fields:
+        key = generic.key_of(field.locator)
+        if field.id not in person or key is None or field.kind == "file":
+            continue
+        try:
+            read = manager.run_threadsafe(session.call("read", key=key), timeout=30)
+        except Exception:  # noqa: BLE001  a field that left the page is skipped
+            continue
+        value = ("Yes" if read.get("checked") else "No") if field.kind == "checkbox" else \
+            str(read.get("value") or "").strip()
+        if not value:
+            continue
+        question_id = entries[field.id].get("question_id")
+        row = db.get(KnowledgeAnswer, question_id) if question_id else db.scalar(
+            select(KnowledgeAnswer).where(KnowledgeAnswer.question_key == question_key(field.label)))
+        if row is None:
+            row = KnowledgeAnswer(user_id=task.user_id, question=field.label, question_key=question_key(field.label),
+                                  category="general", answer_type="choice" if field.options else "text",
+                                  source_job_id=task.job_id)
+            db.add(row)
+        row.answer, row.verified = value, True
+        saved += 1
+    db.commit()
+    return {"saved": saved}

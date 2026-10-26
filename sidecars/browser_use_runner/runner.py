@@ -93,6 +93,35 @@ COMBO_VALUE_JS = """(el) => {
 }"""
 OPTION_TEXTS_JS = """() => Array.from(document.querySelectorAll('[role="option"]'))
   .filter(o => o.offsetParent !== null).map(o => (o.innerText || o.textContent || '').replace(/\\s+/g, ' ').trim())"""
+# Pointing a person at the fields that need them (takeover): an outline and a tag per field, one banner on the page.
+MARK_JS = """(el, note) => {
+  el.setAttribute('data-jobhunt-needs-you', '1');
+  el.style.setProperty('outline', '3px solid #e5484d', 'important');
+  el.style.setProperty('outline-offset', '2px', 'important');
+  const tag = document.createElement('div');
+  tag.setAttribute('data-jobhunt-mark', '1');
+  tag.textContent = note;
+  tag.style.cssText = 'all:initial;display:block;margin:4px 0;padding:2px 8px;font:600 12px system-ui;'
+    + 'color:#fff;background:#e5484d;border-radius:4px;width:max-content';
+  el.insertAdjacentElement('afterend', tag);
+}"""
+BANNER_JS = """(message) => {
+  document.querySelectorAll('[data-jobhunt-banner]').forEach(b => b.remove());
+  const banner = document.createElement('div');
+  banner.setAttribute('data-jobhunt-banner', '1');
+  banner.setAttribute('role', 'status');
+  banner.textContent = message;
+  banner.style.cssText = 'all:initial;position:fixed;top:0;left:0;right:0;z-index:2147483647;padding:12px 16px;'
+    + 'font:600 14px system-ui;color:#fff;background:#1f2937;box-shadow:0 2px 8px rgba(0,0,0,.3)';
+  document.body.appendChild(banner);
+}"""
+UNMARK_JS = """() => {
+  document.querySelectorAll('[data-jobhunt-mark], [data-jobhunt-banner]').forEach(n => n.remove());
+  document.querySelectorAll('[data-jobhunt-needs-you]').forEach(el => {
+    el.removeAttribute('data-jobhunt-needs-you'); el.style.removeProperty('outline');
+    el.style.removeProperty('outline-offset');
+  });
+}"""
 FILE_NAMES_JS = "(el) => Array.from(el.files || []).map(f => f.name)"
 FILE_SIZES_JS = "(el) => Array.from(el.files || []).map(f => f.size)"
 FORM_INPUTS_JS = """() => Array.from(document.querySelectorAll('form input, form select, form textarea'))
@@ -294,6 +323,12 @@ class Runner:
         return handle
 
     async def read(self, args: dict[str, Any]) -> dict[str, Any]:
+        out = await self._read(args)
+        out["filled"] = bool(out.get("present") or out.get("checked") or out.get("files")
+                             or str(out.get("value") or "").strip())
+        return out
+
+    async def _read(self, args: dict[str, Any]) -> dict[str, Any]:
         element = self._element(args["key"])
         page = await self._page()
         kind = element["type"]
@@ -397,6 +432,40 @@ class Runner:
             raise Refused("NO_SUCH_OPTION", f"{len(texts)} options, none exactly matching the answer")
         await page.locator('[role="option"]:visible').nth(index).click(timeout=5000)
         return {"chosen": True, "value": await handle.evaluate(COMBO_VALUE_JS)}
+
+    async def point(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Show the person what needs them: outline each keyed element, one banner with `message`, the first element
+        scrolled into view and focused, the window in front. Reads and marks only; never clicks or types."""
+        page = await self._page()
+        await page.evaluate(UNMARK_JS)
+        marked, first = 0, None
+        for key in args.get("keys") or []:
+            element = self.elements.get(str(key))
+            if element is None:
+                continue
+            handle = await self.ctx.get_locate_element(element["node"])
+            if handle is None:
+                continue
+            await handle.evaluate(MARK_JS, str(args.get("note") or "Job Hunt OS needs you here"))
+            first = first or handle
+            marked += 1
+        await page.evaluate(BANNER_JS, str(args.get("message") or ""))
+        if first is not None:
+            try:
+                await first.scroll_into_view_if_needed(timeout=3000)
+                await first.focus()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            await page.bring_to_front()
+        except Exception:  # noqa: BLE001
+            pass
+        return {"marked": marked}
+
+    async def unpoint(self, args: dict[str, Any]) -> dict[str, Any]:
+        page = await self._page()
+        await page.evaluate(UNMARK_JS)
+        return {"cleared": True}
 
     async def scroll(self, args: dict[str, Any]) -> dict[str, Any]:
         page = await self._page()
@@ -518,7 +587,7 @@ class Runner:
 
 
 COMMANDS = ("health", "open", "goto", "observe", "read", "fill", "select", "check", "upload", "click", "choose",
-            "scroll",
+            "point", "unpoint", "scroll",
             "login_fill", "login_submit", "submit", "evidence", "set_takeover", "storage_state", "close")
 
 

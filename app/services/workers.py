@@ -318,7 +318,7 @@ def _application_facts(task: Any, status: str) -> dict[str, Any]:
         out["waiting_detail"] = {"kind": waiting.get("kind") or task.stage, "reason": waiting.get("reason"),
                                  "questions": len(waiting.get("question_ids") or []),
                                  "confirmations": len(waiting.get("confirm_question_ids") or []),
-                                 "expires_at": waiting.get("expires_at")}
+                                 "fields": len(waiting.get("fields") or []), "expires_at": waiting.get("expires_at")}
         out["can_run_now"] = False  # it resumes by itself once the person has done what it needs
     return out
 

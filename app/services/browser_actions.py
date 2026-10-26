@@ -59,6 +59,7 @@ class FillResult:
     model_steps: int = 0
     blocked_requests: int = 0
     refused: list[dict[str, Any]] = field(default_factory=list)
+    ask_element: str | None = None  # the element the navigator asked a person about, if it named one
 
 
 def _elements(observation: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -229,6 +230,8 @@ def navigate(session: Any, run: Run, propose: Callable[[Any], BrowserActionPropo
             break
         if decided == "ask_human":
             result.outcome, result.code = "NEEDS_HUMAN", f"NAVIGATOR_{proposal.human_reason or 'OTHER'}"
+            if proposal.element_key and proposal.element_key in _elements(observation):
+                result.ask_element = proposal.element_key
             return observation
         if isinstance(decided, Refusal):
             result.refusals += 1
@@ -257,15 +260,19 @@ def navigate(session: Any, run: Run, propose: Callable[[Any], BrowserActionPropo
     return observation
 
 
-def read_back(session: Any, run: Run, form: ApplicationForm, values: dict[str, Any],
-              observation: dict[str, Any]) -> list[str]:
-    """Required fields whose element does not hold what was resolved for them (or is missing)."""
+def read_required(session: Any, run: Run, form: ApplicationForm, values: dict[str, Any],
+                  observation: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """Each required field, read back: (missing, person_filled).
+
+    A field with a verified answer must hold exactly that answer. A required field without one passes only when it
+    holds something a person entered in the window (a takeover): its id goes to `person_filled`; what it holds is
+    never returned. Anything else, or a field not on the page, is missing."""
     from app.infrastructure.application_browser.browser_use_sidecar import SidecarRefused
 
-    missing = []
+    missing, person = [], []
     for field_ in form.required_fields():
         element = element_for(field_, observation)
-        if element is None or field_.id not in values:
+        if element is None:
             missing.append(field_.id)
             continue
         try:
@@ -273,9 +280,20 @@ def read_back(session: Any, run: Run, form: ApplicationForm, values: dict[str, A
         except SidecarRefused:
             missing.append(field_.id)
             continue
-        if not holds(field_, values[field_.id], read):
+        if field_.id in values:
+            if not holds(field_, values[field_.id], read):
+                missing.append(field_.id)
+        elif read.get("filled"):
+            person.append(field_.id)
+        else:
             missing.append(field_.id)
-    return missing
+    return missing, person
+
+
+def read_back(session: Any, run: Run, form: ApplicationForm, values: dict[str, Any],
+              observation: dict[str, Any]) -> list[str]:
+    """Required fields that do not hold what they should (see read_required)."""
+    return read_required(session, run, form, values, observation)[0]
 
 
 def holds(field_: FormField, value: Any, read: dict[str, Any]) -> bool:
