@@ -194,21 +194,76 @@ describe('AI Orchestration → Models & routing', () => {
 
   it('shows a refused save with its reasons, keeps the drawer, and undoes it on request', async () => {
     routes['PUT /api/settings/ai/workers/RANKER'] = () => ({});
-    routes['POST /api/settings/ai/apply'] = () => [{ detail: { message: 'invalid', validation: { errors: [{ message: 'A model can appear only once' }], warnings: [{ message: 'unknown JSON support' }] } } }, 422];
+    routes['POST /api/settings/ai/apply'] = () => [{ detail: { message: 'invalid', validation: { errors: [{ message: 'A model can appear only once', subject: 'Ranker' }], warnings: [{ message: 'unknown JSON support', subject: 'Ranker' }, { message: 'unknown JSON support', subject: 'Ranker' }, { message: 'Reviewer has no usable model', subject: 'Reviewer' }] } } }, 422];
     routes['POST /api/settings/ai/discard'] = () => ({ status: 'DISCARDED' });
     await open('workers');
     ui.A['aim-worker']({ dataset: { worker: 'RANKER' } });
     ui.setF('aiw', 'backup_0', 'local-reasoning');
     await ui.A['aim-worker-save']({ dataset: { worker: 'RANKER' } });
     expect(ui.AIM.drawer).toBe('RANKER'); expect(ui.S.forms.aiw.backup_0).toBe('local-reasoning');
-    expect(document.getElementById('toast').textContent).toContain('Not saved: A model can appear only once');
-    expect(text()).toContain('Not saved.'); expect(text()).toContain('unknown JSON support');
+    expect(document.getElementById('toast').textContent).toContain('Not saved: Ranker: A model can appear only once');
+    expect(text()).toContain('Not saved.');
+    expect(ui.AIM.failed.warnings.map(w => w.text)).toEqual(['Ranker: unknown JSON support', 'Reviewer has no usable model']);
     await ui.A['aim-discard']();
     expect(call('POST', '/api/settings/ai/discard').length).toBe(1);
     expect(ui.AIM.failed).toBeNull(); expect(ui.S.forms.aiw).toBeUndefined();
     routes['POST /api/settings/ai/apply'] = () => [{ detail: 'LiteLLM refused the deployment' }, 502];
     await ui.A['aim-apply']();
-    expect(ui.AIM.failed.errors).toEqual(['LiteLLM refused the deployment']);
+    expect(ui.AIM.failed.errors.map(e => e.text)).toEqual(['LiteLLM refused the deployment']);
+  });
+  it('links each refused-save problem to where it is fixed, and names every worker a repeated warning is about', async () => {
+    const issue = (path, subject, message) => ({ path, subject, message });
+    routes['POST /api/settings/ai/apply'] = () => [{ detail: { message: 'invalid', validation: {
+      errors: [issue('workers.RANKER.fallback_model', 'Ranker', 'The fallback model cannot be the primary model'), issue('workers.REVIEWER.escalation', 'Reviewer', 'Escalation model local-fast is disabled'), issue('models.local-deep.fallback_models.0', 'Model local-deep', 'Fallback model mystery is disabled'), issue('routing.tier_models.SIMPLE', 'Auto Router', 'Map the SIMPLE routing tier to a model'), issue('somewhere', undefined, 'Odd')],
+      warnings: [issue('workers.RANKER.primary_model', 'Ranker', 'unknown JSON'), issue('workers.REVIEWER.primary_model', 'Reviewer', 'unknown JSON')] } } }, 422];
+    await open('workers');
+    await ui.A['aim-apply']();
+    const view = document.getElementById('view');
+    expect(view.querySelectorAll('.aim-failed [data-act="aim-fix"]').length).toBe(6);  // 4 errors with a place, 2 workers
+    expect(text()).toContain('unknown JSON — Ranker, Reviewer');
+    const fix = path => view.querySelector(`[data-act="aim-fix"][data-path="${path}"]`);
+    ui.A['aim-fix'](fix('workers.RANKER.fallback_model'));
+    expect(ui.AIM.drawer).toBe('RANKER'); expect(document.activeElement.id).toBe('aiw-backup_0');
+    ui.A['aim-fix'](fix('workers.REVIEWER.escalation'));
+    expect(ui.AIM.drawer).toBe('REVIEWER'); expect(document.activeElement.id).toBe('aiw-esc_target');
+    ui.A['aim-fix'](fix('models.local-deep.fallback_models.0'));
+    expect(ui.AIM.tab).toBe('models'); expect(ui.AIM.drawer).toBeNull(); expect(ui.AIM.fbEdit).toBe('local-deep');
+    expect(document.activeElement.dataset.model).toBe('local-deep');
+    ui.A['aim-fix'](fix('routing.tier_models.SIMPLE'));
+    expect(document.activeElement.id).toBe('aim-route-tier_SIMPLE');
+    expect(view.querySelector('[data-act="aim-fix"][data-path="somewhere"]')).toBeNull();
+  });
+  it('shows requests too big for their model with the fixes that fit, and applies the one a person picks', async () => {
+    const size = (extra = {}) => ({ worker_type: 'RANKER', label: 'Ranker', model: 'local-reasoning', count: 36, last_at: '2026-10-25T22:37:42',
+      limits: [{ deployment: 'openai/gpt-oss-120b', kind: 'TPM', counts: 'total', limit: 8000, requested: 10159 }, { deployment: 'qwen/qwen3.8-27b', kind: 'OTPM', counts: 'output', limit: 1000, requested: 1667 }],
+      typical_input: 6327, typical_output: 800, input_over: false, output_cap: { value: 1000, typical_output: 800, known_safe: true, applied: false, current: null },
+      models: [{ name: 'local-deep', context_window: 131072, proven: true, in_chain: false }], has_backup: false, ...extra });
+    routes['GET /api/settings/ai'] = () => ({ ...overview(), request_size: [size(), size({ worker_type: 'REVIEWER', label: 'Reviewer', input_over: true, output_cap: null, models: [] })] });
+    routes['PUT /api/settings/ai/workers/RANKER'] = () => ({});
+    routes['POST /api/settings/ai/apply'] = () => ({ status: 'APPLIED', version: 5 });
+    await open('workers');
+    expect(text()).toContain('Requests too big for their model');
+    expect(text()).toContain('36 requests refused as too large');
+    expect(text()).toContain('8K prompt + answer tokens/min (TPM)');
+    expect(text()).toContain('they are not cut short');
+    expect(text()).toContain('The prompt alone is over');  // the Reviewer: no cap is offered
+    expect(text()).toContain('No model in your catalog is known to have room');
+    const view = document.getElementById('view');
+    await ui.A['aim-size-cap'](view.querySelector('[data-act="aim-size-cap"]'));
+    expect(body('PUT', '/api/settings/ai/workers/RANKER')).toEqual({ revision: 7, max_output_tokens: 1000 });
+    await ui.A['aim-size-backup'](view.querySelector('[data-act="aim-size-backup"]'));
+    expect(body('PUT', '/api/settings/ai/workers/RANKER')).toEqual({ revision: 7, fallback_model: 'local-deep', secondary_models: [] });
+    await ui.A['aim-size-use'](view.querySelector('[data-act="aim-size-use"]'));
+    expect(body('PUT', '/api/settings/ai/workers/RANKER')).toMatchObject({ model_mode: 'FIXED', primary_model: 'local-deep', fallback_model: null, secondary_models: [] });
+    // A refusing backup or escalation model is replaced where it is; the worker's own model stays.
+    const use = (role, replace) => ({ dataset: { worker: 'RANKER', model: 'local-deep', replace, role } });
+    const ranker = overview().workers.find(w => w.worker_type === 'RANKER');
+    ui.AIM.data.workers = ui.AIM.data.workers.map(w => w.worker_type === 'RANKER' ? { ...ranker, config: { ...ranker.config, fallback_model: 'local-fast', secondary_models: ['mystery'], escalation: { model: 'mystery', tier: null, conditions: ['LOW_CONFIDENCE'], confidence_threshold: 0.8 } } } : w);
+    await ui.A['aim-size-use'](use('backup', 'local-fast'));
+    expect(body('PUT', '/api/settings/ai/workers/RANKER')).toEqual({ revision: 7, fallback_model: 'local-deep', secondary_models: ['mystery'] });
+    ui.AIM.data.workers = ui.AIM.data.workers.map(w => w.worker_type === 'RANKER' ? { ...ranker, config: { ...ranker.config, escalation: { model: 'mystery', tier: null, conditions: ['LOW_CONFIDENCE'], confidence_threshold: 0.8 } } } : w);
+    await ui.A['aim-size-use'](use('escalation', 'mystery'));
+    expect(body('PUT', '/api/settings/ai/workers/RANKER')).toEqual({ revision: 7, escalation: { model: 'local-deep', tier: null, conditions: ['LOW_CONFIDENCE'], confidence_threshold: 0.8 } });
   });
   it('saves backups in order as the fallback and secondary models, growing the list as it fills', async () => {
     routes['PUT /api/settings/ai/workers/RANKER'] = () => ({ worker: {}, draft_revision: 8 });

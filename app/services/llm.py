@@ -42,12 +42,12 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
-from app.services import failover, llm_telemetry, model_resolution, tracing
+from app.services import failover, llm_telemetry, model_resolution, rate_limits, tracing
 from app.services.ai_config import is_free_model
 from app.services.ai_config import resolve as resolve_ai_config
 from app.services.ai_workers import label as worker_label
 from app.services.ai_workers import worker_for_prompt
-from app.services.external_api import RateLimitedCooldown, external_operation, too_large
+from app.services.external_api import RateLimitedCooldown, external_operation
 from app.services.llm_telemetry import Attempt, LLMCall, Usage
 from app.settings import get_settings
 
@@ -76,8 +76,15 @@ class LLMTimeoutError(LLMError):
 
 
 class LLMRateLimitError(LLMError):
-    def __init__(self, *args: Any, held_seconds: int | None = None):
+    """A 429. `rate_limit` says what kind and, when the provider named it, when it clears (app.services.rate_limits)."""
+
+    def __init__(self, *args: Any, rate_limit: Any = None, held_seconds: int | None = None):
         super().__init__(*args)
+        if rate_limit is None and args:
+            from app.services import rate_limits
+
+            rate_limit = rate_limits.classify(str(args[0]))
+        self.rate_limit = rate_limit
         # Set when token pacing held the request (app.services.token_pacing): nothing was sent, and the model's
         # token window resets in this many seconds. Queued workers wait for it without spending an attempt.
         self.held_seconds = held_seconds
@@ -274,12 +281,13 @@ def _gateway_error(model: str, exc: Exception) -> LLMError:
     text = str(exc)
     if isinstance(exc, LiteLLMAuthError):
         return LLMConfigError(f"LiteLLM refused the API key saved in AI Orchestration → Models: {text}")
-    if too_large(text):  # Groq: larger than the model's whole per-minute token limit; no wait makes it fit
-        return LLMContextOverflowError(
-            f"{model} refused the request as larger than its whole per-minute token limit, so waiting cannot help: "
-            f"shorten the prompt (a prompt token budget) or use a model with a higher limit. {detail}")
     if status == 429:
-        return LLMRateLimitError(detail)
+        limit = getattr(exc, "rate_limit", None)
+        if getattr(limit, "kind", None) == rate_limits.TOO_LARGE:
+            # larger than the model's whole per-minute limit (Groq): no wait makes it fit, so it is never retried
+            detail += (" — waiting cannot help: shorten the prompt (a prompt token budget) or use a model with a "
+                       "higher limit")
+        return LLMRateLimitError(detail, rate_limit=limit)
     if status in (408, 504) or "did not answer in time" in text or "Timeout" in text:
         return LLMTimeoutError(detail)
     if status == 413 or CONTEXT_OVERFLOW.search(text):

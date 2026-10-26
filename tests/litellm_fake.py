@@ -75,6 +75,7 @@ class FakeLiteLLM:
         self.down = False
         self.unavailable: set[str] = set()  # model groups that fail (503) unless the request names fallbacks
         self.rate_limited: set[str] = set()
+        self.rate_limit_messages: dict[str, str] = {}  # model → the provider's 429 text (default: a plain one)
         self.provider_headers: dict[str, list[dict[str, str]]] = {}  # group → raw provider headers, one per answer
         self.too_large: set[str] = set()  # groups that refuse every request as Groq does past the whole TPM limit
         self.answers: dict[str, list[Any]] = {}  # model → queued answers (dict → JSON content, str → raw content)
@@ -209,7 +210,8 @@ class FakeLiteLLM:
                 "type": "throttling_error", "param": None, "code": "429"}},
                 headers=forwarded(raw, refused=True) if raw else None)
         if group in self.rate_limited:
-            return self._json(429, {"error": {"message": "Rate limit reached", "type": "error", "code": "429"}},
+            return self._json(429, {"error": {"message": self.rate_limit_messages.get(group, "Rate limit reached"),
+                                              "type": "error", "code": "429"}},
                               headers=forwarded(raw, refused=True) if raw else None)
         if group in self.unavailable:
             fallbacks = body.get("fallbacks") or []

@@ -64,11 +64,6 @@ REQUEST_LIMIT, REQUEST_REMAINING, REQUEST_RESET = ("x-ratelimit-limit-requests",
                                                    "x-ratelimit-reset-requests")
 # "7.66s", "2m59.56s", "1h2m", "120ms" (Groq, OpenAI); a plain number is seconds.
 _DURATION = re.compile(r"(?:(\d+(?:\.\d+)?)h)?(?:(\d+(?:\.\d+)?)m(?!s))?(?:(\d+(?:\.\d+)?)s)?(?:(\d+(?:\.\d+)?)ms)?")
-# A request larger than the model's whole per-minute token limit (Groq: HTTP 413, or a 429 once LiteLLM maps it to its
-# RateLimitError): "Request too large for model `x` ... on tokens per minute (TPM): Limit 8000, Requested 9500".
-# No wait can make it fit, so it is a client error, never a cooldown.
-_TOO_LARGE = re.compile(r"request too large\b.*?(?:tokens per minute|\bTPM\b)", re.IGNORECASE | re.DOTALL)
-_TOO_LARGE_FIGURES = re.compile(r"Limit\s+(\d+)\s*,\s*Requested\s+(\d+)", re.IGNORECASE)
 
 
 def utcnow() -> datetime:
@@ -249,18 +244,6 @@ def _window_note(window: token_pacing.Window) -> dict[str, Any] | None:
     return note or None
 
 
-def too_large(text: str | bytes | None) -> dict[str, Any] | None:
-    """Groq's refusal of a request larger than the whole per-minute token limit, with its figures; None otherwise."""
-    if not text:
-        return None
-    body = text.decode("utf-8", "replace") if isinstance(text, bytes) else str(text)
-    if not _TOO_LARGE.search(body[:20_000]):
-        return None
-    figures = _TOO_LARGE_FIGURES.search(body[:20_000])
-    return {"refused": "REQUEST_TOO_LARGE", **({"tokens_per_minute_limit": int(figures.group(1)),
-                                                 "tokens_requested": int(figures.group(2))} if figures else {})}
-
-
 def _duration_reset(headers: Any, status: int | None) -> float | None:
     """Seconds to a reset written as a duration, or forwarded by LiteLLM. A 429's Retry-After comes first, then —
     when the tokens ran out, or for Groq, whose request reset is the daily window — the token reset."""
@@ -380,11 +363,28 @@ def record(call: ExternalCall, **measurements: Any) -> str | None:
         return None
 
 
+def _note_oversized(call: ExternalCall, response: httpx.Response, streamed: bool) -> None:
+    """Mark a 429 that refused one oversized request ("Request too large"), so it starts no cooldown: the provider
+    refused that request, not the next, smaller one (app.services.rate_limits). Only the mark is kept, never the
+    body. Never raises."""
+    if response.status_code != 429 or streamed:
+        return
+    try:
+        from app.services.rate_limits import too_large
+
+        if too_large(response.text):
+            call.note(oversized_request=True)
+    except Exception:  # noqa: BLE001  an unreadable body is an ordinary 429
+        log.debug("could not read a 429 body", exc_info=True)
+
+
 def _apply_backoff(entry: dict[str, Any]) -> None:
-    """A 429 starts or lengthens this provider's cooldown; a normal answer ends it."""
+    """A 429 starts or lengthens this provider's cooldown; a normal answer ends it. A 429 for one oversized request
+    does neither."""
     user_id = entry["user_id"]
     provider = cooldown_provider(entry["provider"], entry.get("service"), entry.get("request_metadata"))
-    if entry["error_type"] == "RATE_LIMIT" and not (entry["request_metadata"] or {}).get("skipped_by"):
+    metadata = entry["request_metadata"] or {}
+    if entry["error_type"] == "RATE_LIMIT" and not metadata.get("skipped_by") and not metadata.get("oversized_request"):
         backoff.record_limit(user_id, provider, retry_after=entry["rate_limit_reset_at"])
     elif entry["status"] == "SUCCEEDED":
         backoff.note_success(user_id, provider)
@@ -400,7 +400,7 @@ def _observe_window(entry: dict[str, Any], headers: Any) -> None:
         return
     reserved = metadata.get("tokens_reserved")
     reserved = reserved if isinstance(reserved, int) and not isinstance(reserved, bool) else 0
-    window = (rate_window(headers, metadata) if headers is not None and not metadata.get("refused")
+    window = (rate_window(headers, metadata) if headers is not None and not metadata.get("oversized_request")
               else token_pacing.Window())
     group = headers.get("x-litellm-model-group") if headers is not None else None
     answered = f"LITELLM:{group}"[:230] if isinstance(group, str) and group else key
@@ -561,27 +561,14 @@ class InstrumentedClient(httpx.Client):
                       response_payload=_payload_extract(response.content),
                       request_headers=_debug_headers(request.headers))
             capture_payload(call, request, response)
+        _note_oversized(call, response, bool(kwargs.get("stream")))
         _report_response(request, response, call)
-        refused = _refused_as_too_large(response, kwargs.get("stream"))
-        if refused:
-            call.note(**refused)
         self.last_request_id = record(
             call, started_at=started, completed_at=_finished(started, clock), method=request.method,
             url=str(request.url), status_code=response.status_code, request_bytes=request_bytes,
-            response_bytes=_response_size(response), headers=response.headers,
-            error_type="CLIENT_ERROR" if refused else None)
+            response_bytes=_response_size(response), headers=response.headers)
         response.extensions["jobhunt_request_id"] = self.last_request_id
         return response
-
-
-def _refused_as_too_large(response: httpx.Response, stream: Any) -> dict[str, Any] | None:
-    """A 413/429 that is Groq's "request too large" refusal: recorded as a client error, so no cooldown starts."""
-    if response.status_code not in (413, 429) or stream:
-        return None
-    try:
-        return too_large(response.content)
-    except Exception:  # noqa: BLE001  telemetry only
-        return None
 
 
 class InstrumentedAsyncClient(httpx.AsyncClient):
@@ -613,6 +600,7 @@ class InstrumentedAsyncClient(httpx.AsyncClient):
             record(call, started_at=started, completed_at=_finished(started, clock), method=request.method,
                    url=str(request.url), request_bytes=request_bytes, error=exc)
             raise
+        _note_oversized(call, response, bool(kwargs.get("stream")))
         record(call, started_at=started, completed_at=_finished(started, clock), method=request.method,
                url=str(request.url), status_code=response.status_code, request_bytes=request_bytes,
                response_bytes=_response_size(response), headers=response.headers)

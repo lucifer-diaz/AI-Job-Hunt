@@ -47,9 +47,10 @@ class LiteLLMError(RuntimeError):
 
     status: str = "UNAVAILABLE"
 
-    def __init__(self, message: str, *, http_status: int | None = None):
+    def __init__(self, message: str, *, http_status: int | None = None, rate_limit: Any = None):
         super().__init__(redact_text(message, 500))
         self.http_status = http_status
+        self.rate_limit = rate_limit  # a 429's reading (app.services.rate_limits), made before the text is cut
 
 
 class LiteLLMUnavailable(LiteLLMError):
@@ -197,6 +198,11 @@ class LiteLLMAPI:
         if response.status_code >= 500 and "STORE_MODEL_IN_DB" not in response.text:
             raise LiteLLMUnavailable(f"LiteLLM failed ({response.status_code}): {_error_message(response)}",
                                      http_status=response.status_code)
+        if response.status_code == 429:
+            from app.services import rate_limits
+
+            raise LiteLLMRejected(_error_message(response), http_status=429,
+                                  rate_limit=rate_limits.classify(response.text, response.headers))
         if response.status_code >= 400:
             raise LiteLLMRejected(_error_message(response), http_status=response.status_code)
 

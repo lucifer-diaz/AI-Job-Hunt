@@ -109,6 +109,25 @@ def test_after_a_rate_limit_the_provider_is_left_alone(owner):
     assert row.until > utcnow()
 
 
+def test_a_request_too_large_starts_no_cooldown_so_the_next_smaller_one_goes_through(owner):
+    too_large = {"error": {"message": "Request too large for model `openai/gpt-oss-20b` on tokens per minute (TPM): "
+                                      "Limit 8000, Requested 9197, please reduce your message size and try again."}}
+    sent = []
+
+    def handle(request):
+        sent.append(request)
+        return httpx.Response(429, json=too_large) if len(sent) == 1 else httpx.Response(200, json={"ok": True})
+
+    with external_api.external_client("OPENROUTER", service="api", operation="request",
+                                      transport=httpx.MockTransport(handle), user_id=owner) as http:
+        assert http.get("https://openrouter.test/v1/big").status_code == 429
+        assert http.get("https://openrouter.test/v1/small").status_code == 200  # not held off locally
+    assert cooldown(owner) is None
+    with SessionLocal() as db:
+        refused = db.scalar(select(ExternalAPIRequestLog).where(ExternalAPIRequestLog.http_status_code == 429))
+    assert refused.request_metadata.get("oversized_request") is True  # a mark only: no body is stored
+
+
 def test_the_calls_it_saved_are_visible_in_monitoring(owner):
     upstream = Provider()
     upstream.limit = True

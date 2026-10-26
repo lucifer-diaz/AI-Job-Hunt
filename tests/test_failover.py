@@ -1,6 +1,6 @@
 """Model failover: route health, thresholds, ordering by algorithm, the API and an end-to-end switch."""
 import uuid
-from datetime import timedelta
+from datetime import UTC, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -9,7 +9,7 @@ from sqlalchemy import delete, select
 from app.db import SessionLocal
 from app.main import app
 from app.models import AppSetting, FailoverEvent, LLMRequestLog, ModelRouteState
-from app.services import failover, failover_settings, model_health, model_resolution
+from app.services import failover, failover_settings, model_health, model_resolution, rate_limits
 from app.services.llm import LLMClient, LLMRateLimitError
 from app.services.llm_telemetry import LLMCall
 from app.services.model_resolution import resolve
@@ -44,10 +44,11 @@ def clean():
     wipe()
 
 
-def outcome(owner, model="mid", status="SUCCEEDED", error_type=None, worker="RANKER", fallback_used=False):
+def outcome(owner, model="mid", status="SUCCEEDED", error_type=None, worker="RANKER", fallback_used=False,
+            rate_limit=None):
     model_health.record_outcome({"user_id": owner, "provider": "litellm", "requested_model": model,
                                  "status": status, "error_type": error_type, "worker_type": worker,
-                                 "fallback_used": fallback_used})
+                                 "fallback_used": fallback_used}, rate_limit=rate_limit)
 
 
 def route(owner, model="mid", worker=""):
@@ -312,6 +313,66 @@ def test_a_model_rests_for_its_own_time_before_it_is_tried_again(owner, monkeypa
     assert model_health._cooldown(CFG, 1) == timedelta(seconds=CFG["cooldown_seconds"])  # no rest time: the setting
     assert model_health._cooldown(CFG, 3, 3600) == timedelta(hours=1)  # a model's own rest time never grows
     assert model_health._cooldown(CFG, 2) == timedelta(seconds=2 * CFG["cooldown_seconds"])  # the setting doubles
+
+
+def test_a_rate_limit_rests_the_model_for_the_accounts_rate_limit_rest(owner):
+    with SessionLocal() as db:
+        failover_settings.update(db, owner, {"rate_limit_rest_minutes": 30})
+    outcome(owner, status="FAILED", error_type="RATE_LIMIT")
+    rest = route(owner).cooling_until - model_health.utcnow()
+    assert timedelta(minutes=29) < rest <= timedelta(minutes=30)
+    cfg = {**CFG, "rate_limit_rest_minutes": 30}
+    assert model_health._cooldown(cfg, 4, None, "RATE_LIMIT") == timedelta(minutes=30)  # never grows
+    assert model_health._cooldown(cfg, 1, None, "ERROR_RATE") == timedelta(seconds=CFG["cooldown_seconds"])  # 429s only
+    assert model_health._cooldown(cfg, 1, 3600, "RATE_LIMIT") == timedelta(hours=1)  # the model's own time wins
+
+
+OLLAMA_CAP = ('Ollama_chatException - {"error":"You reached the Free usage limit. Pro is $20/month for $60 of usage, '
+              'with no 5-hour or weekly caps: https://ollama.com/upgrade"}')
+
+
+def test_a_usage_cap_rests_the_model_for_the_accounts_usage_rest(owner):
+    outcome(owner, status="FAILED", error_type="RATE_LIMIT", rate_limit=rate_limits.classify(OLLAMA_CAP))
+    rest = route(owner).cooling_until - model_health.utcnow()
+    assert timedelta(hours=4, minutes=59) < rest <= timedelta(hours=5)  # the default: 300 minutes, not 60 seconds
+    assert "usage limit reached" in route(owner).reason
+
+
+def test_a_named_reset_holds_the_model_until_then_even_when_it_is_already_resting(owner):
+    outcome(owner, status="FAILED", error_type="RATE_LIMIT")  # a plain 429: the 60-second cooldown
+    assert route(owner).cooling_until - model_health.utcnow() <= timedelta(seconds=60)
+    reset = model_health.utcnow() + timedelta(hours=3)
+    quota = rate_limits.classify('"free-models-per-day" "X-RateLimit-Reset":"%d"' % (reset.replace(
+        tzinfo=UTC).timestamp() * 1000))
+    assert quota.kind == rate_limits.QUOTA
+    outcome(owner, status="FAILED", error_type="RATE_LIMIT", rate_limit=quota)
+    assert abs((route(owner).cooling_until - reset).total_seconds()) < 1  # held until the provider's reset
+    assert [e.cause for e in events(owner)] == ["RATE_LIMIT"]  # one outage, one event
+
+
+def test_a_request_too_large_for_the_rate_limit_does_not_rest_the_model(owner):
+    too_large = rate_limits.classify("Request too large for model `x` on tokens per minute (TPM): Limit 8000, "
+                                     "Requested 9197, please reduce your message size and try again")
+    outcome(owner, status="FAILED", error_type="RATE_LIMIT", rate_limit=too_large)
+    assert route(owner) is None and not model_health.resting(owner, "mid")
+    stats = model_health.summarize([{"status": "FAILED", "error_type": "RATE_LIMIT",
+                                     "error_message": "Request too large for model x"}] * 5)
+    assert stats.rate_limits == 0 and stats.samples == 0
+
+
+def test_a_usage_capped_model_through_the_gateway_rests_until_the_usage_rest(gateway, litellm):  # noqa: F811
+    gateway.worker("RANKER", fallback_model="tier-1-fast")
+    gateway.apply()
+    uid = gateway.user_id
+    primary = model_resolution.get(uid, "RANKER").model
+    litellm.rate_limited.add(primary)
+    litellm.rate_limit_messages[primary] = OLLAMA_CAP
+    with pytest.raises(LLMRateLimitError) as raised:
+        run(gateway, ranking_prompt())
+    assert raised.value.rate_limit.kind == rate_limits.USAGE_CAP
+    with SessionLocal() as db:
+        row = db.scalar(select(ModelRouteState).where(ModelRouteState.user_id == uid, ModelRouteState.model == primary))
+    assert row.cooling_until - model_health.utcnow() > timedelta(hours=4)
 
 
 def test_a_rate_limited_model_test_rests_that_model_not_the_gateways_admin_calls():

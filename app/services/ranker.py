@@ -61,7 +61,7 @@ from app.prompts.ranking import (
     posting_facts,
     ranking_profile_facts,
 )
-from app.services import backoff, job_description, user_settings, worker_settings
+from app.services import backoff, job_description, rate_limits, user_settings, worker_settings
 from app.services import resume_verification as rv
 from app.services.context_builder import build_ranking_context, latest_ranking_context_hash
 from app.services.lifecycle import STOPPED_BY_USER, ErrorCategory, InvalidTransition
@@ -847,6 +847,8 @@ def classify(exc: Exception) -> tuple[ErrorCategory, bool, bool]:
     if isinstance(exc, (LLMTimeoutError, TimeoutError)):
         return ErrorCategory.TIMEOUT, True, False
     if isinstance(exc, LLMRateLimitError):
+        if getattr(exc.rate_limit, "kind", None) == rate_limits.TOO_LARGE:
+            return ErrorCategory.VALIDATION, False, False  # larger than the model's whole limit: no wait makes it fit
         return ErrorCategory.RATE_LIMITED, True, False
     if isinstance(exc, LLMContextOverflowError):
         return ErrorCategory.VALIDATION, False, False  # the same prompt cannot fit next time either

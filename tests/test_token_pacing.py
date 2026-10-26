@@ -12,10 +12,10 @@ from sqlalchemy import delete, select
 
 from app.db import SessionLocal
 from app.models import ExternalAPIRequestLog, LLMRequestLog, ProviderCooldown, ProviderRateWindow
-from app.services import backoff, external_api, failover, model_health, ranker, token_pacing
+from app.services import backoff, failover, model_health, ranker, rate_limits, token_pacing
 from app.services.external_api import RateLimitedCooldown, duration_seconds, external_client
 from app.services.lifecycle import ErrorCategory
-from app.services.llm import LLMContextOverflowError, LLMRateLimitError
+from app.services.llm import LLMRateLimitError
 from app.services.model_resolution import resolve
 from tests.conftest import ensure_test_user
 from tests.litellm_fake import forwarded, groq_raw
@@ -296,42 +296,36 @@ TOO_LARGE = ("Request too large for model `openai/gpt-oss-120b` in organization 
              "tokens per minute (TPM): Limit 8000, Requested 9500, please reduce your message size and try again.")
 
 
-@pytest.mark.parametrize("status", [413, 429])  # Groq's own 413, or the 429 LiteLLM maps it to
-def test_too_large_is_a_client_error_not_a_cooldown(owner, status):
+def test_too_large_starts_no_cooldown_and_gives_its_reservation_back(owner):
     gw = Gateway()
-    gw.answers.append((status, forwarded(groq_raw(8000), refused=True),
+    gw.answers.append((200, forwarded(groq_raw(7000, tokens_reset="50s")), {"ok": True}))
+    chat(gw, owner, need=10)
+    gw.answers.append((429, forwarded(groq_raw(7000), refused=True),
                        {"error": {"message": TOO_LARGE, "type": "tokens", "code": "rate_limit_exceeded"}}))
-    chat(gw, owner, need=9500)
+    chat(gw, owner, need=6000)  # reserved, then refused as larger than the whole limit (LiteLLM's 429)
     row = rows()[-1]
-    assert row.error_type == "CLIENT_ERROR" and row.status == "FAILED"
-    assert row.request_metadata["refused"] == "REQUEST_TOO_LARGE"
-    assert row.request_metadata["tokens_requested"] == 9500 and row.request_metadata["tokens_per_minute_limit"] == 8000
+    assert row.error_type == "RATE_LIMIT" and row.request_metadata["oversized_request"] is True
     with SessionLocal() as db:
         assert db.scalar(select(ProviderCooldown)) is None
-    assert window(owner) is None  # a refusal says nothing about the minute's window
+    assert window(owner).tokens_remaining == 7000 and window(owner).tokens_reserved == 0  # nothing was spent
     assert chat(gw, owner, need=10).status_code == 200  # nothing is held afterwards
-
-
-def test_too_large_is_recognised_only_by_its_message():
-    assert external_api.too_large(TOO_LARGE)["tokens_requested"] == 9500
-    assert external_api.too_large("Rate limit reached for model on tokens per minute (TPM): try again in 7s") is None
-    assert external_api.too_large(b"") is None
 
 
 def test_through_the_gateway_too_large_fails_once_with_its_reason(gateway, litellm):  # noqa: F811
     uid = gateway.user_id
     model = "tier-2-reasoning"
     litellm.too_large.add(model)
-    with pytest.raises(LLMContextOverflowError) as refused:
+    with pytest.raises(LLMRateLimitError) as refused:
         run(gateway, ranking_prompt())
-    assert "per-minute token limit" in str(refused.value) and "waiting cannot help" in str(refused.value)
+    assert refused.value.rate_limit.kind == rate_limits.TOO_LARGE and "waiting cannot help" in str(refused.value)
     assert ranker.classify(refused.value) == (ErrorCategory.VALIDATION, False, False)  # one failure, no retries
     assert not model_health.resting(uid, model, "RANKER")
     with SessionLocal() as db:
         assert db.scalar(select(ProviderCooldown).where(ProviderCooldown.user_id == uid)) is None
         last = db.scalars(select(LLMRequestLog).where(LLMRequestLog.user_id == uid)
                           .order_by(LLMRequestLog.id.desc())).first()
-    assert last.error_type == "CONTEXT_OVERFLOW"
+    # still a RATE_LIMIT row with the provider's figures: Model capacity reads it to suggest a smaller request
+    assert last.error_type == "RATE_LIMIT" and rate_limits.size_limit(last.error_message).requested == 9500
 
 
 def test_through_the_gateway_a_spent_minute_waits_instead_of_a_429(gateway, litellm):  # noqa: F811

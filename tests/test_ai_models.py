@@ -216,7 +216,8 @@ def test_invalid_configurations_are_rejected_before_anything_changes(account, ch
     account.worker("RANKER", **changes)
     preview = account.call("POST", "/preview")
     assert not preview["can_apply"]
-    assert any(message in e["message"] for e in preview["validation"]["errors"]), preview["validation"]["errors"]
+    assert any(message in e["message"] and e["subject"] == "Ranker" for e in preview["validation"]["errors"]), \
+        preview["validation"]["errors"]
     rejected = account.apply(expect=422)
     assert rejected["detail"]["validation"]["errors"]
     assert account.get("")["active_version"] == 2
@@ -244,7 +245,8 @@ def test_structured_output_requirements_warn_or_block(account, litellm):
     account.call("POST", "/models/sync")
     account.worker("REVIEWER", model_mode="FIXED", primary_model="no-json")
     warnings = account.call("POST", "/preview")["validation"]["warnings"]
-    assert any("Structured Output Required" in w["message"] for w in warnings)  # unknown: warn, allow
+    assert any("Structured Output Required" in w["message"] and w["subject"] == "Reviewer"
+               for w in warnings)  # unknown: warn, allow, and say which worker
     account.call("PUT", "/models/no-json", json={"overrides": {"supports_structured_output": False}})
     errors = account.call("POST", "/preview")["validation"]["errors"]
     assert any("cannot return structured output" in e["message"] for e in errors)  # known lack: block
@@ -567,3 +569,15 @@ def test_verification_counts_a_primary_models_own_fallbacks():
     snap["models"]["mid"]["fallback_models"] = ["deep"]
     snap["models"]["fast"]["fallback_models"] = ["never-used"]  # not a primary: its fallbacks join no chain
     assert "deep" in _referenced(snap) and "never-used" not in _referenced(snap)
+
+
+def test_validation_issues_name_what_they_are_about():
+    from app.services.ai_model_config import _issue, issue_text
+    assert _issue("workers.RANKER.fallback_model", "x")["subject"] == "Ranker"
+    assert _issue("tiers.FAST.model", "x")["subject"] == "Tier FAST"
+    assert _issue("routing.tier_models.SIMPLE", "x")["subject"] == "Auto Router"
+    assert _issue("models.gpt-4.1.fallback_models.0", "x")["subject"] == "Model gpt-4.1"
+    assert "subject" not in _issue("somewhere", "x")
+    assert issue_text(_issue("workers.RANKER.fallback_model", "The fallback model cannot be the primary model")) == \
+        "Ranker: The fallback model cannot be the primary model"
+    assert issue_text(_issue("workers.REVIEWER.mode", "Reviewer has no usable model")) == "Reviewer has no usable model"
