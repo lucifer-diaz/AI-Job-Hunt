@@ -50,7 +50,10 @@ SUBMIT_WORDS = ("submit", "apply", "send", "finish", "complete", "confirm")
 DESCRIBE_JS = """(el) => {
   const text = (n) => (n ? (n.innerText || n.textContent || '') : '').replace(/\\s+/g, ' ').trim();
   const tag = el.tagName.toLowerCase();
-  const type = (el.getAttribute('type') || (tag === 'button' ? 'button' : (tag === 'input' ? 'text' : ''))).toLowerCase();
+  // The form a control belongs to (its `form` attribute included). A <button> with no type submits that form.
+  const owner = el.form || el.closest('form');
+  const type = (el.getAttribute('type') || (tag === 'button' ? (owner ? 'submit' : 'button')
+                                            : (tag === 'input' ? 'text' : ''))).toLowerCase();
   let label = '';
   if (el.labels && el.labels.length) label = text(el.labels[0]);
   if (!label && el.getAttribute('aria-labelledby')) {
@@ -66,7 +69,7 @@ DESCRIBE_JS = """(el) => {
   }
   const fieldset = el.closest('fieldset');
   const legend = fieldset ? text(fieldset.querySelector('legend')) : '';
-  const form = el.closest('form');
+  const form = owner;
   const required = el.required || el.getAttribute('aria-required') === 'true' || /\\*\\s*$/.test(label);
   const options = tag === 'select' ? Array.from(el.options).slice(0, 200).map(o => ({label: text(o), value: o.value})) : [];
   const valuePresent = tag === 'select' ? !!el.value : (type === 'file' ? !!(el.files && el.files.length) :
@@ -76,7 +79,7 @@ DESCRIBE_JS = """(el) => {
   return {tag, type, name: el.getAttribute('name') || '', id: el.id || '', label: label.slice(0, 500),
           group_label: legend.slice(0, 500), required, options, value_present: valuePresent,
           checked: !!el.checked, value: (type === 'radio' || type === 'checkbox') ? (el.value || '') : '',
-          in_form: !!form, role: el.getAttribute('role') || '', href_host: href,
+          in_form: !!form, form_index: form ? Array.prototype.indexOf.call(document.forms, form) : -1, role: el.getAttribute('role') || '', href_host: href,
           aria_hidden: el.getAttribute('aria-hidden') === 'true', tabindex: el.getAttribute('tabindex') || '',
           autocomplete: (el.getAttribute('autocomplete') || '').toLowerCase()};
 }"""
@@ -122,6 +125,16 @@ UNMARK_JS = """() => {
     el.style.removeProperty('outline-offset');
   });
 }"""
+# Whether a control's own form holds a password field: a signed LOGIN click is only ever the login form's control.
+LOGIN_FORM_JS = """(el) => {
+  const form = el.form || el.closest('form');
+  return !!(form && form.querySelector('input[type="password"]'));
+}"""
+# Restore a saved session's local storage for the page's origin (the items come from the person's own saved session).
+RESTORE_STORAGE_JS = """(items) => {
+  for (const item of items) { window.localStorage.setItem(String(item.name), String(item.value)); }
+  return items.length;
+}"""
 FILE_NAMES_JS = "(el) => Array.from(el.files || []).map(f => f.name)"
 FILE_SIZES_JS = "(el) => Array.from(el.files || []).map(f => f.size)"
 FORM_INPUTS_JS = """() => Array.from(document.querySelectorAll('form input, form select, form textarea'))
@@ -143,13 +156,30 @@ def _host(url: str) -> str:
     return (urlparse(url or "").hostname or "").lower().strip(".")
 
 
+INTERNAL_SUFFIXES = (".localhost", ".local", ".internal", ".lan", ".home.arpa")
+
+
 def _private(host: str) -> bool:
-    if host == "localhost" or host.endswith((".localhost", ".local")):
+    """A host that is internal by its name or its literal address (no DNS): checked on every request."""
+    host = host.strip("[]")
+    if host == "localhost" or host.endswith(INTERNAL_SUFFIXES):
         return True
     try:
         return not ipaddress.ip_address(host).is_global
     except ValueError:
         return False
+
+
+async def _resolves_private(host: str) -> bool:
+    """Whether a host name resolves to any non-public address (app.services.url_safety.check_public_url, which this
+    process cannot import). A name that does not resolve is treated as unsafe."""
+    if _private(host):
+        return True
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(host, None)
+    except OSError:
+        return True
+    return any(not ipaddress.ip_address(info[4][0].split("%")[0]).is_global for info in infos)
 
 
 def _key(info: dict[str, Any]) -> str:
@@ -184,6 +214,8 @@ class Runner:
         self.upload_dir = ""
         self.armed: tuple[str, str, float] | None = None  # (kind, domain, until)
         self.takeover = False
+        self.takeover_writes = False  # a person's login may POST; a filled application form waits for the claim
+        self.origin_storage: dict[str, list[dict[str, Any]]] = {}  # a saved session's local storage, per origin
         self.blocked = 0
         self.navigation_blocked = 0
         self.responses: list[dict[str, Any]] = []
@@ -218,9 +250,14 @@ class Runner:
         self.ctx = BrowserContext(browser=self.bu_browser, config=config)
         session = await self.ctx.get_session()
         await session.context.route("**/*", self._guard)
-        cookies = (args.get("storage_state") or {}).get("cookies") or []
+        state = args.get("storage_state") or {}
+        cookies = state.get("cookies") or []
         if cookies:
             await session.context.add_cookies(cookies)
+        for origin in state.get("origins") or []:  # restored on the first visit to that origin (goto)
+            items = [i for i in origin.get("localStorage") or [] if isinstance(i, dict) and "name" in i]
+            if items and origin.get("origin"):
+                self.origin_storage[str(origin["origin"]).rstrip("/").lower()] = items
         return {"opened": True, "headless": headless}
 
     async def _guard(self, route: Any) -> None:
@@ -229,13 +266,20 @@ class Runner:
             host = _host(request.url)
             top = request.is_navigation_request() and request.frame.parent_frame is None and \
                 request.url.startswith(("http:", "https:"))
-            if top and ((self.allowed and host not in self.allowed) or (_private(host) and not self.allow_private)):
+            if top and self.allowed and host not in self.allowed:
+                self.navigation_blocked += 1
+                await route.abort("blockedbyclient")
+                return
+            # The page may not make the browser reach internal services: any request by name or literal address,
+            # and every navigation (a frame's too) by the addresses its host resolves to.
+            if not self.allow_private and (_private(host) or (
+                    request.is_navigation_request() and await _resolves_private(host))):
                 self.navigation_blocked += 1
                 await route.abort("blockedbyclient")
                 return
             if request.method.upper() != "GET":
                 armed = self.armed is not None and self.armed[1] == host and time.monotonic() < self.armed[2]
-                person = self.takeover and host in self.allowed
+                person = self.takeover and self.takeover_writes and host in self.allowed
                 if not (armed or person):
                     self.blocked += 1
                     await route.abort("blockedbyclient")
@@ -266,7 +310,7 @@ class Runner:
         host = _host(url)
         if not url.startswith(("http://", "https://")) or (self.allowed and host not in self.allowed):
             raise Refused("URL_NOT_ALLOWED", "That address is not on this application's allowed hosts")
-        if _private(host) and not self.allow_private:
+        if not self.allow_private and await _resolves_private(host):
             raise Refused("URL_NOT_ALLOWED", "Private addresses are not allowed")
         page = await self._page()
         response = await page.goto(url, wait_until="domcontentloaded")
@@ -274,6 +318,11 @@ class Runner:
             await page.wait_for_load_state("load", timeout=8000)
         except Exception:  # noqa: BLE001
             pass
+        parsed = urlparse(page.url)
+        items = self.origin_storage.pop(f"{parsed.scheme}://{parsed.netloc}".lower(), None)
+        if items:  # a saved session's local storage, then the page again so it starts signed in
+            await page.evaluate(RESTORE_STORAGE_JS, items)
+            response = await page.reload(wait_until="domcontentloaded")
         return {"final_url": page.url, "status": response.status if response is not None else None,
                 "title": await page.title()}
 
@@ -510,6 +559,8 @@ class Runner:
         self._verify(args.get("token") or "", kind, element["key"], domain)
         if kind == "SUBMIT" and not element.get("submit_like"):
             raise Refused("NOT_A_SUBMIT", "The signed element is not the form's submit control")
+        if kind == "LOGIN" and not await (await self._handle(element)).evaluate(LOGIN_FORM_JS):
+            raise Refused("NOT_A_LOGIN", "The signed element is not in the form that holds the password field")
         self.responses = []
         page.on("response", self._on_response)
         self.armed = (kind, domain, time.monotonic() + 30)
@@ -552,9 +603,12 @@ class Runner:
 
     async def set_takeover(self, args: dict[str, Any]) -> dict[str, Any]:
         self.takeover = bool(args.get("on"))
+        # Non-GET requests while a person has the window only when the caller says so: a login needs them; a filled
+        # application form gets them only once the person's submission holds the shared claim.
+        self.takeover_writes = self.takeover and bool(args.get("writes"))
         if self.takeover:
             self.deadline = time.monotonic() + float(args.get("seconds") or 900)
-        return {"takeover": self.takeover}
+        return {"takeover": self.takeover, "writes": self.takeover_writes}
 
     async def storage_state(self, args: dict[str, Any]) -> dict[str, Any]:
         session = await self.ctx.get_session()

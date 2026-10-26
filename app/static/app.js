@@ -1480,7 +1480,7 @@ function renderKitTakeover(k) {
     || (String(t.reason || '').startsWith('NAVIGATOR_') ? 'The page needs you' : 'The page needs you');
   const list = fields.length ? `<ul class="small mt6" style="margin:6px 0 0 18px">${fields.map(f => `<li class="pretty">${esc(f.label || f.id)}</li>`).join('')}</ul>` : '';
   return `<div class="banner warn mt8"><div class="b">${esc(why)}</div>
-    <div class="small mt4 pretty">${fields.length ? 'The browser window is open with these fields highlighted. Fill them there' + ((k.execution_questions || []).length ? ', or answer the questions below' : '') + ', then press Continue: the page is not reloaded.' : 'Finish it in the browser window Job Hunt OS opened, then continue.'} Kept until ${fmtDateTime(t.expires_at)}. Nothing is submitted from that window unless you do it.</div>${list}
+    <div class="small mt4 pretty">${fields.length ? 'The browser window is open with these fields highlighted. Fill them there' + ((k.execution_questions || []).length ? ', or answer the questions below' : '') + ', then press Continue: the page is not reloaded.' : 'Finish it in the browser window Job Hunt OS opened, then continue.'} Kept until ${fmtDateTime(t.expires_at)}. Nothing is submitted from that window unless you do it, and the form can only be sent after you press Start submission (which reserves the posting for you).</div>${list}
     <div class="row gap8 mt10 wrap">${btn(label('kit-continue', 'I’m done — continue', 'Continuing…'), 'kit-continue', { exec: x.id }, 'sm', isBusy('kit-continue'))}
     ${t.reason === 'ACCOUNT_REQUIRED' ? btn('Sign up with a generated password', 'kit-signup', { exec: x.id }, 'sm') : ''}
     ${login ? btn('Save this login', 'kit-save-login', { exec: x.id }, 'sm ghost') : ''}</div>
@@ -2829,8 +2829,9 @@ const A = {
   'close-kit': () => { S.kitJob = null; render(); },
   'copy-answer': el => { copyText(el.dataset.text); api(`/api/knowledge/${el.dataset.id}/used`, { method: 'POST' }).catch(() => {}); },
   'kit-start': el => busy('kit-start', async () => {
-    await api(`/api/jobs/${el.dataset.id}/submission/start`, { method: 'POST' });
+    const out = await api(`/api/jobs/${el.dataset.id}/submission/start`, { method: 'POST' });
     D.kit = await api(`/api/jobs/${el.dataset.id}/apply-kit`);
+    if (out && out.window_can_submit) toast('The open browser window can send the form now');
   }, 'Submission started · this posting is reserved for you'),
   'kit-release': el => busy('kit-release', async () => {
     await api(`/api/jobs/${el.dataset.id}/submission/release`, { method: 'POST', body: { claim_token: el.dataset.token, reason: 'Not submitted (Apply kit)' } });

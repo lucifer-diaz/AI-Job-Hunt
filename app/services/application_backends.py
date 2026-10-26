@@ -105,12 +105,19 @@ def saved_session(sessions: Callable[[], Session], user_id: int, match: ats_map.
 
 
 def _login_parts(observation: dict[str, Any]) -> tuple[dict | None, dict | None, dict | None]:
+    """The login form's username field, password field and button — all three from the form that holds the password
+    field, never another form on the page (an application form's Submit must never get a LOGIN signature). A password
+    field outside any form gives nothing: a person signs in."""
     elements = observation.get("elements") or []
     password = next((e for e in elements if e.get("type") == "password"), None)
-    username = next((e for e in elements if e.get("tag") == "input" and e.get("type") in ("email", "text") and (
+    form = password.get("form_index") if password is not None else None
+    if form is None or form < 0:
+        return None, password, None
+    own = [e for e in elements if e.get("form_index") == form]
+    username = next((e for e in own if e.get("tag") == "input" and e.get("type") in ("email", "text") and (
         e.get("autocomplete") in ("username", "email") or
         any(w in (e.get("label") or "").lower() for w in ("email", "user")))), None)
-    submit = next((e for e in elements if e.get("submit_like") and e.get("in_form")), None)
+    submit = next((e for e in own if e.get("submit_like")), None)
     return username, password, submit
 
 

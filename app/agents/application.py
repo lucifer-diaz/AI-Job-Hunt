@@ -230,6 +230,7 @@ BLOCKER_FOR = {"LOGIN_REQUIRED": "login_required", "OTP_REQUIRED": "login_requir
                "ACCOUNT_REQUIRED": "account_required", "CAPTCHA_OR_ANTI_BOT": "captcha",
                "POSTING_CLOSED": "posting_closed"}
 TAKEOVER_PROBLEMS = ("LOGIN_REQUIRED", "OTP_REQUIRED", "LOGIN_FAILED", "ACCOUNT_REQUIRED", "CAPTCHA_OR_ANTI_BOT")
+LOGIN_NAVIGATOR_PROBLEMS = ("NAVIGATOR_LOGIN", "NAVIGATOR_SIGNUP", "NAVIGATOR_OTP", "NAVIGATOR_CAPTCHA")
 FIELDS_NEED_YOU = "FIELDS_NEED_YOU"  # required fields nothing verified could fill: the person fills them in the window
 
 
@@ -317,7 +318,10 @@ def _park_or_close(ctx: ApplicationContext, session: Any, problem: str | None) -
 
     manager = get_sidecars()
     if _takeover_problem(problem):
-        return bool(ctx.run_async(manager.park(session, get_settings().application_takeover_ttl_minutes)))
+        # Signing in (or up, or a code) needs the window to send its forms; fields left to fill wait for the claim.
+        writes = problem in TAKEOVER_PROBLEMS or problem in LOGIN_NAVIGATOR_PROBLEMS
+        return bool(ctx.run_async(manager.park(session, get_settings().application_takeover_ttl_minutes,
+                                               writes=writes)))
     ctx.run_async(manager.close(session.user_id, session.task_id))
     return False
 
@@ -708,8 +712,10 @@ def _fill_browser_use(ctx: ApplicationContext, task_id: int, job: Any, url: str,
             return {"problem": code, "takeover": keep, "fields": fields, "person_filled": person,
                     "question_ids": list(plan.get("needs_input") or [])}
         if _headful():
-            # ASSIST: the filled form stays open for the person to review and submit themselves.
-            keep = bool(ctx.run_async(get_sidecars().park(session, get_settings().application_takeover_ttl_minutes)))
+            # ASSIST: the filled form stays open for the person to review. It cannot send anything until they press
+            # Start submission in the Apply kit, which takes the shared claim (application_execution.window_writes).
+            keep = bool(ctx.run_async(get_sidecars().park(session, get_settings().application_takeover_ttl_minutes,
+                                                          writes=False)))
         report = {fid: "filled" for fid in result.filled}
         return {"report": report, "missing": [], "person_filled": person,
                 "blocked_requests": observation.get("blocked_requests") or 0, "actions": result.actions,

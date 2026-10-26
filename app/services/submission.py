@@ -286,8 +286,10 @@ def commit_clicking(db: Session, task: ApplicationExecutionTask, intent: Submiss
 
 
 def still_clicking(sessions: Any, user_id: int, task_id: int, intent_id: int) -> bool:
-    """The ticket's re-check, on its own session, immediately before the click."""
-    from app.services import apply_queue
+    """The ticket's re-check, on its own session, immediately before the click: the intent CLICKING, the run still
+    processing, its claim open — and, read again, the server's mode and the account's consent (switching guarded
+    submission off stops even a click that was already authorized)."""
+    from app.services import application_execution, apply_queue
 
     with sessions() as db:
         db.info["user_id"] = user_id
@@ -296,7 +298,8 @@ def still_clicking(sessions: Any, user_id: int, task_id: int, intent_id: int) ->
         claim = db.get(ApplicationClaim, intent.claim_id) if intent is not None else None
         return bool(intent is not None and task is not None and claim is not None and intent.status == CLICKING
                     and intent.execution_task_id == task_id and task.status == "PROCESSING"
-                    and claim.status == apply_queue.CLAIMED and claim.lease_expires_at > utcnow())
+                    and claim.status == apply_queue.CLAIMED and claim.lease_expires_at > utcnow()
+                    and application_execution.mode() == "guarded_auto" and consent(db, user_id)["enabled"])
 
 
 def after_click(db: Session, task: ApplicationExecutionTask, intent: SubmissionIntent) -> None:
@@ -333,9 +336,13 @@ class ConfirmationVerifier:
         responses = [r for r in evidence.get("responses") or [] if r.get("host") == domain]
         posted = [r for r in responses if 200 <= int(r.get("status") or 0) < 400]
         failed = [r for r in responses if int(r.get("status") or 0) >= 400]
+        from app.services.ats_forms import greenhouse
+
         soup = BeautifulSoup(evidence.get("html") or "", "html.parser")
-        form_gone = soup.select_one("#application_form" if adapter == "greenhouse" else "form input[type=file]") \
-            is None
+        # Every form markup the adapter reads (the classic board and the newer ones): any of them still there means
+        # the application was not taken.
+        form_gone = soup.select_one(greenhouse.FORM_SELECTOR if adapter == "greenhouse"
+                                    else "form input[type=file]") is None
         text = " ".join(soup.get_text(" ", strip=True).lower().split())[:20000]
         segments = [s for s in re.sub(r"^https?://[^/]+", "", (evidence.get("url") or "").lower().split("?")[0])
                     .split("/") if s]

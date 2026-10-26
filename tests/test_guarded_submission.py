@@ -253,6 +253,29 @@ def test_consent_revoked_after_the_claim_means_no_click(sessions, monkeypatch):
     assert f["state"] == "READY_TO_APPLY" and f["job_status"] == "approved"
 
 
+
+def test_consent_revoked_after_clicking_was_authorized_still_stops_the_click(sessions, monkeypatch):
+    """The ticket's last check, immediately before the click, reads the account's consent again."""
+    holder = {}
+    from app.agents import application as graph
+
+    original = graph._hold
+
+    def hold(ctx, at):
+        if at == "before_click":
+            gs.consent(sessions, holder["user"], enabled=False)
+        return original(ctx, at)
+    monkeypatch.setattr(graph, "_hold", hold)
+    with gs.FakeATS("confirm") as ats:
+        holder["user"], job_id = guarded_job(sessions, ats)
+        run(sessions)
+        submits = list(ats.submits)
+    f = facts(sessions, job_id)
+    assert submits == []
+    assert f["intents"] == ["ABORTED"] and [c[0] for c in f["claims"]] == ["RELEASED"]
+    assert f["state"] == "READY_TO_APPLY" and f["job_status"] == "approved"
+
+
 def test_a_packet_changed_after_the_claim_means_no_click(sessions, monkeypatch):
     from app.agents import application as graph
     from app.services import approval

@@ -23,6 +23,7 @@ only inside the execution worker (app.services.submission).
 """
 from __future__ import annotations
 
+import contextlib
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -128,21 +129,29 @@ def _takeover_view(task: Any) -> dict[str, Any] | None:
 @router.post("/api/jobs/{job_id}/submission/start")
 def start_submission(job_id: int, db: Session = Depends(get_user_db)) -> dict[str, Any]:
     job = _job(db, job_id)
+    from app.services import application_execution
+
     result = apply_queue.begin_submission(db, job, client="apply_kit")
     if not result.ok:
         raise HTTPException(409, {"message": result.reason, "status": result.status,
                                   "conflict_job_id": result.conflict_job_id,
                                   "claim": claim_view(result.claim)})
-    return {"status": "CLAIMED", "claim": claim_view(result.claim, with_token=True, job_id=job.id)}
+    # A kept browser window holding this job's filled form may send it now, and only now that the claim is held.
+    window = application_execution.window_writes(db, job, True)
+    return {"status": "CLAIMED", "claim": claim_view(result.claim, with_token=True, job_id=job.id),
+            "window_can_submit": window}
 
 
 @router.post("/api/jobs/{job_id}/submission/release")
 def release_submission(job_id: int, payload: ReleaseIn, db: Session = Depends(get_user_db)) -> dict[str, Any]:
     job = _job(db, job_id)
+    from app.services import application_execution
+
     try:
         claim = apply_queue.release_claim(db, job, payload.claim_token, payload.reason)
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
+    application_execution.window_writes(db, job, False)  # no claim, no submission from the kept window
     return {"status": claim.status, "claim": claim_view(claim)}
 
 
@@ -204,6 +213,9 @@ def _login_domain(db: Session, task: Any) -> str:
     domain = (task.interrupt or {}).get("login_domain")
     if not domain:
         match = ats_map.for_job(_job(db, task.job_id))
+        if match is not None and match.shared_login_host:
+            raise HTTPException(409, "Employers share this site's sign-in host, so a login saved for one could be "
+                                     "used for another: sign in yourself each time")
         domain = match.login_domain or match.apply_domain if match else None
     if not domain:
         raise HTTPException(409, "This application has no login domain")
@@ -385,9 +397,10 @@ def save_window_answers(task_id: int, db: Session = Depends(get_user_db)) -> dic
         key = generic.key_of(field.locator)
         if field.id not in person or key is None or field.kind == "file":
             continue
-        try:
+        read = None
+        with contextlib.suppress(Exception):  # a field that left the page is skipped
             read = manager.run_threadsafe(session.call("read", key=key), timeout=30)
-        except Exception:  # noqa: BLE001  a field that left the page is skipped
+        if read is None:
             continue
         value = ("Yes" if read.get("checked") else "No") if field.kind == "checkbox" else \
             str(read.get("value") or "").strip()

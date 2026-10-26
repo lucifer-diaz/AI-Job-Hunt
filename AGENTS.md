@@ -620,9 +620,14 @@ ADR-035). The rules a change has to keep:
   * Its environment holds only PATH and HOME. Telemetry is off. Chromium is launched plainly: no debugging port, no
     anti-detection flags (browser-use's own launcher is not used).
   * It reuses browser-use's DOM indexing and element actions only: no browser-use Agent, no LLM.
-  * It aborts every non-GET until a SUBMIT/LOGIN token armed one domain, refuses a submit-like click without one,
-    refuses navigation off the allowed hosts, uploads only from the run's packet folder and fills password fields only
-    through `login_fill`.
+  * It aborts every non-GET until a SUBMIT/LOGIN token armed one domain, refuses a submit-like click without one (a
+    `<button>` with no type inside a form is a submit), refuses navigation off the allowed hosts, uploads only from the
+    run's packet folder and fills password fields only through `login_fill`.
+  * Like the shared browser, it never reaches internal services: every request is checked by host name and literal
+    address, and every navigation (a frame's too) by the addresses its host resolves to (`_resolves_private`).
+  * A LOGIN token works only on a control of the form that holds the password field, and `_login_parts` takes the
+    username, password and button from that one form.
+  * A saved session restores its cookies and its origins' local storage.
   * The only scripts it evaluates are its own constants.
   * Only `submission` may sign SUBMIT, and nothing does today, because guarded submission needs a deterministic
     adapter. Only `application_backends` signs LOGIN.
@@ -659,8 +664,11 @@ ADR-035). The rules a change has to keep:
     domain (`APPLICATION_AUTH_SESSIONS_ENABLED`). A login is attempted once per run.
   * OTP, CAPTCHA, a failed login and every signup wait for the person. No run ever creates an account or accepts terms.
 * **Takeover keeps the window, then starts over.**
-  * A headful session is parked for `APPLICATION_TAKEOVER_TTL_MINUTES`, with non-GET allowed to the route's hosts while
-    the person has it.
+  * A headful session is parked for `APPLICATION_TAKEOVER_TTL_MINUTES`. Non-GET requests to the route's hosts are
+    allowed while the person has it only for a login, a code or a signup (`park(writes=True)`). A window holding the
+    application form (fields left for the person, or a filled ASSIST form) sends nothing until the person's own
+    submission holds the shared claim: the Apply kit's Start submission switches it on
+    (`application_execution.window_writes`) and releasing the claim switches it off. The window never takes a claim.
   * The task waits PENDING at NEEDS_HUMAN, not claimable, until the person continues
     (`continue_after_takeover`).
   * Then the run re-observes the page from its apply URL and re-validates everything. It never replays an old action.
@@ -678,7 +686,9 @@ ADR-035). The rules a change has to keep:
   * Headless runs end NEEDS_HUMAN and list the fields instead.
 * **The ATS map is facts, per account** (`ats_routes`, `ats_map.observe`): from posting URLs and run outcomes, never a
   model, never a guessed employer site. A login belongs to a route's `login_domain`: per tenant where the ATS has
-  per-employer accounts (Workday, iCIMS, Taleo, SuccessFactors). Ashby (its form loads through POST), LinkedIn and
+  per-employer accounts (Workday, iCIMS, Taleo, SuccessFactors). Where employers share a host (SuccessFactors,
+  `tenant_in_host=False`), a host cannot keep their logins apart: `login_domain` is None, nothing is saved or reused
+  there, and a person signs in each time. Ashby (its form loads through POST), LinkedIn and
   Indeed are `unsupported`.
 
 ## Candidate knowledge retrieval (RAG)

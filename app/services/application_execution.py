@@ -678,6 +678,25 @@ def _close_window(task: ApplicationExecutionTask) -> None:
         log.debug("could not close the browser window of execution %s", task.id)
 
 
+
+def window_writes(db: Session, job: Job, on: bool) -> bool:
+    """The job's kept browser window (a filled ASSIST form, or fields left for the person) may submit only while the
+    person's own submission holds the shared claim: on when the Apply kit's Start submission took it, off again when
+    it is released. The window is never given a claim of its own. True when a window was switched. Never raises."""
+    task = latest(db, job.id)
+    if task is None:
+        return False
+    try:
+        from app.infrastructure.application_browser.browser_use_sidecar import get_sidecars
+
+        manager = get_sidecars()
+        if manager.get(task.user_id, task.id) is None:
+            return False
+        return bool(manager.run_threadsafe(manager.allow_writes(task.user_id, task.id, on), timeout=20))
+    except Exception:  # noqa: BLE001  the window stays as it was: unable to submit unless it already could
+        log.debug("could not switch the browser window of execution %s", task.id)
+        return False
+
 def on_job_deleted(db: Session, job_id: int) -> None:
     from app.services import qualification
 

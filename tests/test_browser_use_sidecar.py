@@ -222,6 +222,77 @@ def test_a_dynamic_form_is_revealed_and_filled_through_the_scheduler_with_zero_p
     assert posts == []  # the page's beacon and its instructions to "click Submit" changed nothing
 
 
+
+BOUNDARY_PAGE = b"""<html><body>
+<p id="ls"></p>
+<script>document.getElementById('ls').textContent = 'stored:' + (localStorage.getItem('jh') || 'none');</script>
+<form id="app" method="get" action="/apply/next">
+  <label for="q">Your answer</label><input id="q" name="q">
+  <button>Continue</button>
+</form>
+<form id="login" method="post" action="/login">
+  <label for="u">Email</label><input id="u" name="u" type="email" autocomplete="username">
+  <label for="p">Password</label><input id="p" name="p" type="password">
+  <button type="submit">Sign in</button>
+</form>
+<a href="#" id="ping" onclick="fetch('/ping', {method: 'POST'}); return false">Ping the site</a>
+</body></html>"""
+
+
+def test_the_runner_keeps_its_boundaries_on_buttons_logins_storage_and_the_kept_window(runner, tmp_path):
+    """* a <button> with no type inside a form submits it: it is submit-like and an unsigned click is refused;
+    * a LOGIN signature works only on the control of the form that holds the password field, and the login parts are
+      taken from that form, never the application's;
+    * a saved session's local storage is restored, not only its cookies;
+    * a kept window sends nothing until the person's submission holds the claim (allow_writes)."""
+    import time
+
+    from app.infrastructure.application_browser.browser_use_sidecar import sign_action
+    from app.services import application_backends, application_execution
+
+    manager = bus.get_sidecars()
+    with gs.FakeATS("confirm", pages={"boundary.html": BOUNDARY_PAGE}) as ats, \
+            application_execution.background_loop() as loop:
+        run = application_execution.loop_runner(loop, timeout=90)
+        origin = ats.url("boundary").rsplit("/", 1)[0]
+        session = run(manager.start(user_id=1, task_id=60, job_id=5, allowed_hosts=["127.0.0.1"],
+                                    upload_dir=str(tmp_path), allow_private=True,
+                                    storage_state={"cookies": [], "origins": [
+                                        {"origin": origin, "localStorage": [{"name": "jh", "value": "signed-in"}]}]}))
+        outcomes = {}
+        try:
+            run(session.call("goto", url=ats.url("boundary")))
+            seen = run(session.call("observe"))
+            by_label = {e["label"]: e for e in seen["elements"]}
+            proceed, sign_in, ping = by_label["Continue"], by_label["Sign in"], by_label["Ping the site"]
+            username, password, login_button = application_backends._login_parts(seen)
+            for name, command, args in (
+                    ("unsigned_continue", "click", {"key": proceed["key"]}),
+                    ("login_token_on_continue", "login_submit",
+                     {"key": proceed["key"], "token": sign_action(session, "LOGIN", proceed["key"], "127.0.0.1")})):
+                try:
+                    run(session.call(command, **args))
+                    outcomes[name] = None
+                except bus.SidecarRefused as exc:
+                    outcomes[name] = exc.code
+            session.parked_until = time.monotonic() + 60  # a kept window, as park leaves it (headless here)
+            run(session.call("set_takeover", on=True, writes=False, seconds=60))
+            run(session.call("click", key=ping["key"]))
+            time.sleep(0.5)
+            before_claim = list(ats.posts)
+            assert run(manager.allow_writes(1, 60, True))
+            run(session.call("click", key=ping["key"]))
+            time.sleep(0.5)
+            after_claim = list(ats.posts)
+        finally:
+            run(manager.close(1, 60))
+    assert "stored:signed-in" in seen["text"]
+    assert proceed["type"] == "submit" and proceed["submit_like"]
+    assert outcomes == {"unsigned_continue": "SUBMIT_REFUSED", "login_token_on_continue": "NOT_A_LOGIN"}
+    assert login_button["key"] == sign_in["key"] and username["label"] == "Email" and password["type"] == "password"
+    assert before_claim == [] and after_claim == ["/ping"]
+
+
 def test_choose_sets_a_dropdown_to_the_exact_option_only(runner, tmp_path):
     from app.services import application_execution
 

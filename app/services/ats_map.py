@@ -62,6 +62,10 @@ class Ats:
     backend: str | None
     # Login per employer (Workday, iCIMS, Taleo, SuccessFactors) or per ATS (one account for every employer).
     login_per_tenant: bool = True
+    # The employer is part of the host name (acme.wd5.myworkdayjobs.com), so a login kept per host is kept per employer.
+    # Where employers share a host (SuccessFactors' career hosts, told apart by `?company=`), a host cannot tell their
+    # logins apart: no saved login or session is used there, and a person signs in each time.
+    tenant_in_host: bool = True
     # Guarded submission may ever be allowed here: a deterministic form adapter and a confirmation rule exist.
     guarded_capable: bool = False
     adapter: str | None = None
@@ -90,7 +94,8 @@ ATSES: tuple[Ats, ...] = (
     Ats("recruitee", "Recruitee", ("recruitee.com",), _label, NONE, BROWSER_USE),
     Ats("teamtailor", "Teamtailor", ("teamtailor.com",), _label, NONE, BROWSER_USE),
     Ats("successfactors", "SAP SuccessFactors", ("successfactors.com", "successfactors.eu"),
-        lambda p: (parse_qs(p.query).get("company") or [_label(p)])[0].lower(), ACCOUNT, BROWSER_USE),
+        lambda p: (parse_qs(p.query).get("company") or [_label(p)])[0].lower(), ACCOUNT, BROWSER_USE,
+        tenant_in_host=False),
     Ats("taleo", "Oracle Taleo", ("taleo.net",), _label, ACCOUNT, BROWSER_USE),
     # In-board applications behind the board's own login: Job Hunt OS never automates them.
     Ats("linkedin", "LinkedIn Easy Apply", _hosts("linkedin"), lambda p: "", UNSUPPORTED, None, login_per_tenant=False,
@@ -113,6 +118,11 @@ class AtsMatch:
     guarded_capable: bool
     adapter: str | None
     note: str = ""
+
+    @property
+    def shared_login_host(self) -> bool:
+        """Employers share this host (its logins cannot be kept apart per employer): nothing is saved for it."""
+        return self.auth_required in (ACCOUNT, OPTIONAL) and self.login_domain is None
 
     @property
     def route(self) -> str:
@@ -140,7 +150,7 @@ def detect(url: str | None) -> AtsMatch | None:
     if ats.auth == UNSUPPORTED:
         return AtsMatch(ats=ats.name, label=ats.label, tenant=tenant, apply_domain=host, login_domain=None,
                         auth_required=UNSUPPORTED, backend=None, guarded_capable=False, adapter=None, note=ats.note)
-    if ats.auth in (ACCOUNT, OPTIONAL):
+    if ats.auth in (ACCOUNT, OPTIONAL) and (ats.tenant_in_host or not ats.login_per_tenant):
         login = host if ats.login_per_tenant else next((h for h in ats.hosts if host.endswith(h)), host)
     return AtsMatch(ats=ats.name, label=ats.label, tenant=tenant, apply_domain=host, login_domain=login,
                     auth_required=ats.auth, backend=ats.backend, guarded_capable=ats.guarded_capable,
