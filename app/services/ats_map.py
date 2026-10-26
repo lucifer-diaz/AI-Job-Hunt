@@ -2,8 +2,7 @@
 
     detect(url)                    → AtsMatch: the ATS, its tenant (the employer's account on it), the apply domain,
                                      the login domain (per tenant where the ATS has per-employer accounts), whether an
-                                     account is needed, the preferred backend and whether guarded submission can ever
-                                     be allowed there
+                                     account is needed and the preferred backend
     observe(db, job, **facts)      → the account's AtsRoute row for that tenant, created or updated from the posting
                                      and from what a run saw (a login wall, the form's fingerprint, the outcome)
 
@@ -66,9 +65,7 @@ class Ats:
     # Where employers share a host (SuccessFactors' career hosts, told apart by `?company=`), a host cannot tell their
     # logins apart: no saved login or session is used there, and a person signs in each time.
     tenant_in_host: bool = True
-    # Guarded submission may ever be allowed here: a deterministic form adapter and a confirmation rule exist.
-    guarded_capable: bool = False
-    adapter: str | None = None
+    adapter: str | None = None  # a deterministic form adapter (Playwright), when one exists
     note: str = ""  # why the route is limited, when it is
 
     def matches(self, host: str) -> bool:
@@ -76,8 +73,7 @@ class Ats:
 
 
 ATSES: tuple[Ats, ...] = (
-    Ats("greenhouse", "Greenhouse", _hosts("greenhouse"), _greenhouse_tenant, NONE, PLAYWRIGHT,
-        guarded_capable=True, adapter="greenhouse"),
+    Ats("greenhouse", "Greenhouse", _hosts("greenhouse"), _greenhouse_tenant, NONE, PLAYWRIGHT, adapter="greenhouse"),
     Ats("lever", "Lever", _hosts("lever"), _first_path, NONE, BROWSER_USE),
     # Ashby's hosted form loads through GraphQL POST requests; the application browsers send no POST until a guarded
     # click, so the form never renders there ("Application submission is unavailable"): a person applies.
@@ -115,7 +111,6 @@ class AtsMatch:
     login_domain: str | None
     auth_required: str
     backend: str | None
-    guarded_capable: bool
     adapter: str | None
     note: str = ""
 
@@ -126,12 +121,14 @@ class AtsMatch:
 
     @property
     def route(self) -> str:
-        """The route key settings and the allowlist use: "greenhouse:acme", "generic:careers.example.com"."""
+        """The route key: "greenhouse:acme", "generic:careers.example.com"."""
         return f"{self.ats}:{self.tenant}" if self.tenant else self.ats
 
-    def allowed_by(self, allowlist: frozenset[str]) -> bool:
-        """A route is allowlisted by its exact key or by its ATS as a whole ("greenhouse")."""
-        return self.guarded_capable and (self.route in allowlist or self.ats in allowlist)
+    @property
+    def auto_submit(self) -> bool:
+        """Auto submit may run here: any route a browser can complete. In-board applications behind a board's own
+        login (LinkedIn, Indeed) and Ashby are never automated."""
+        return self.auth_required != UNSUPPORTED
 
 
 def ats_named(name: str) -> Ats:
@@ -149,12 +146,11 @@ def detect(url: str | None) -> AtsMatch | None:
     login = None
     if ats.auth == UNSUPPORTED:
         return AtsMatch(ats=ats.name, label=ats.label, tenant=tenant, apply_domain=host, login_domain=None,
-                        auth_required=UNSUPPORTED, backend=None, guarded_capable=False, adapter=None, note=ats.note)
+                        auth_required=UNSUPPORTED, backend=None, adapter=None, note=ats.note)
     if ats.auth in (ACCOUNT, OPTIONAL) and (ats.tenant_in_host or not ats.login_per_tenant):
         login = host if ats.login_per_tenant else next((h for h in ats.hosts if host.endswith(h)), host)
     return AtsMatch(ats=ats.name, label=ats.label, tenant=tenant, apply_domain=host, login_domain=login,
-                    auth_required=ats.auth, backend=ats.backend, guarded_capable=ats.guarded_capable,
-                    adapter=ats.adapter)
+                    auth_required=ats.auth, backend=ats.backend, adapter=ats.adapter)
 
 
 def for_job(job: Job) -> AtsMatch | None:
@@ -207,15 +203,14 @@ def refresh(db: Session, user_id: int, limit: int = 300) -> int:
 
 
 def view(db: Session, route: AtsRoute) -> dict[str, Any]:
-    """A route for Settings → Application routes: what it is, whether a login is saved, and whether guarded
-    submission could run there (capable and allowlisted on this server)."""
+    """A route for Settings → Application routes: what it is, whether a login is saved, and whether auto submit can
+    run there."""
     from app.models import AtsCredential, AtsSession
-    from app.settings import get_settings
 
     ats = ats_named(route.ats)
     match = AtsMatch(ats=route.ats, label=ats.label, tenant=route.tenant, apply_domain=route.apply_domain,
                      login_domain=route.login_domain, auth_required=route.auth_required, backend=route.backend,
-                     guarded_capable=ats.guarded_capable, adapter=ats.adapter)
+                     adapter=ats.adapter)
     domain = route.login_domain
     credential = db.scalar(select(AtsCredential.status).where(AtsCredential.user_id == route.user_id,
                                                               AtsCredential.domain == domain)) if domain else None
@@ -228,5 +223,4 @@ def view(db: Session, route: AtsRoute) -> dict[str, Any]:
             "last_checked_at": route.last_checked_at.isoformat() if route.last_checked_at else None,
             "has_credential": credential == "ACTIVE",
             "has_session": session is not None and session.expires_at > utcnow(),
-            "guarded_capable": ats.guarded_capable, "note": ats.note or None,
-            "guarded_allowed": match.allowed_by(get_settings().guarded_routes)}
+            "auto_submit": match.auto_submit, "note": ats.note or None}

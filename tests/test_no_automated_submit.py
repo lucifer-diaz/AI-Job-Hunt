@@ -8,11 +8,12 @@ Guarantees, each tested here:
   2. `ApplicationPage`, what Phase 5 application code can do to a page, still has no such method;
   3. an execution can never be moved into a submit stage (SUBMITTING, CONFIRMING, CONFIRMED) without its own
      SubmissionIntent in the right status, by `set_stage` or by setting the column directly;
-  4. only app.services.submission may sign a SUBMIT action for the browser-use runner (none does today: guarded
-     submission needs a deterministic adapter), and the runner clicks a submit-like control only in its signed
-     handler and evaluates only its own constant scripts;
-  5. the application browsers abort every non-GET request until a ticket arms one domain (tests/
-     test_application_browser.py and tests/test_guarded_submission.py, with real Chromium).
+  4. only app.services.submission may sign a SUBMIT action for the browser-use runner (`signed_submit`, which only
+     the guarded SUBMIT node calls, after its CLICKING commit), and the runner clicks a submit-like control only in
+     its signed handler and evaluates only its own constant scripts;
+  5. while Job Hunt OS drives a page, the application browsers abort every non-GET request except a file upload and
+     a ticket's click (tests/test_application_browser.py, tests/test_guarded_submission.py and
+     tests/test_browser_use_sidecar.py, with real Chromium).
 """
 import ast
 import inspect
@@ -111,8 +112,14 @@ def test_only_the_submission_service_signs_a_submit():
             if isinstance(node, ast.Call) and getattr(node.func, "id", getattr(node.func, "attr", "")) == "sign_action":
                 kinds = [a.value for a in node.args if isinstance(a, ast.Constant)]
                 signers.setdefault(_relative(path), set()).update(kinds or {"<dynamic>"})
-    assert all(kinds == {"LOGIN"} for kinds in signers.values()), signers
-    assert set(signers) <= {"app/services/application_backends.py", "app/services/submission.py"}
+    assert signers == {"app/services/application_backends.py": {"LOGIN"}, "app/services/submission.py": {"SUBMIT"}}
+    graph = ast.parse((ROOT / "app/agents/application.py").read_text())
+    callers = [n for n in ast.walk(graph) if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "signed_submit"]
+    assert len(callers) == 1, "one signed submit, in the guarded SUBMIT node"
+    source = (ROOT / "app/agents/application.py").read_text()
+    body = source[source.index("def _submit_browser_use("):]
+    assert body.index("submission.commit_clicking(") < body.index("submission.still_clicking(") \
+        < body.index("submission.signed_submit("), "the token is signed only after CLICKING and its re-check"
 
 
 def test_the_runner_clicks_submit_controls_only_when_signed_and_runs_only_its_own_scripts():

@@ -96,10 +96,9 @@ def route_greenhouse_here(monkeypatch) -> None:
     monkeypatch.setattr(ats_map, "ATSES", patched)
 
 
-def configure(monkeypatch, *, routes: str = "greenhouse") -> None:
+def configure(monkeypatch) -> None:
     aps.configure(monkeypatch, "guarded_auto")
     settings = aps.get_settings()
-    monkeypatch.setattr(settings, "application_guarded_routes", routes)
     monkeypatch.setattr(settings, "application_allow_private_hosts", True)
     route_greenhouse_here(monkeypatch)
 

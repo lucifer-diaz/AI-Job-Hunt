@@ -85,7 +85,7 @@ async def check_one(sessions: EphemeralApplicationSessions, url: str, *, fill: b
                            "tenant": match.tenant if match else None, "auth": match.auth_required if match else None,
                            "login_domain": match.login_domain if match else None,
                            "backend": match.backend if match else None,
-                           "guarded_capable": bool(match and match.guarded_capable)}
+                           "auto_submit": bool(match and match.auto_submit)}
     if match is None or match.auth_required == ats_map.UNSUPPORTED:
         row["result"] = "UNSUPPORTED_ROUTE"
         return row

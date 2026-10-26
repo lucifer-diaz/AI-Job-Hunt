@@ -236,6 +236,19 @@ BOUNDARY_PAGE = b"""<html><body>
   <button type="submit">Sign in</button>
 </form>
 <a href="#" id="ping" onclick="fetch('/ping', {method: 'POST'}); return false">Ping the site</a>
+<div id="cv-box"><label for="cv">Resume/CV</label><input id="cv" type="file"></div>
+<script>
+  // Like the newer Greenhouse board: the chosen file is sent at once (XHR, multipart) and the input is replaced by
+  // the file's name.
+  document.getElementById('cv').addEventListener('change', function (e) {
+    var file = e.target.files[0], body = new FormData();
+    body.append('file', file);
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', '/upload');
+    xhr.onload = function () { document.getElementById('cv-box').innerHTML = '<p class="file-upload__filename">' + file.name + '</p>'; };
+    xhr.send(body);
+  });
+</script>
 </body></html>"""
 
 
@@ -244,7 +257,9 @@ def test_the_runner_keeps_its_boundaries_on_buttons_logins_storage_and_the_kept_
     * a LOGIN signature works only on the control of the form that holds the password field, and the login parts are
       taken from that form, never the application's;
     * a saved session's local storage is restored, not only its cookies;
-    * a kept window sends nothing until the person's submission holds the claim (allow_writes)."""
+    * an upload the page starts when a file is chosen goes out, and the runner remembers the file once the page took
+      it, even after the page replaced the input with the file's name;
+    * while Job Hunt OS drives, the page sends nothing else; a window handed to the person sends what they send."""
     import time
 
     from app.infrastructure.application_browser.browser_use_sidecar import sign_action
@@ -275,22 +290,29 @@ def test_the_runner_keeps_its_boundaries_on_buttons_logins_storage_and_the_kept_
                     outcomes[name] = None
                 except bus.SidecarRefused as exc:
                     outcomes[name] = exc.code
-            session.parked_until = time.monotonic() + 60  # a kept window, as park leaves it (headless here)
-            run(session.call("set_takeover", on=True, writes=False, seconds=60))
+            (tmp_path / "resume.pdf").write_bytes(b"%PDF-1.4 test")
+            uploaded = run(session.call("upload", key=by_label["Resume/CV"]["key"], path=str(tmp_path / "resume.pdf")))
+            after_upload = run(session.call("observe"))
+            attached = run(session.call("read", key=by_label["Resume/CV"]["key"]))
+            run(session.call("click", key=ping["key"]))  # Job Hunt OS drives: nothing else goes out
+            time.sleep(0.5)
+            while_driving = list(ats.posts)
+            session.parked_until = time.monotonic() + 60  # handed to the person (park; headless here)
+            run(session.call("set_takeover", on=True, writes=True, seconds=60))
             run(session.call("click", key=ping["key"]))
             time.sleep(0.5)
-            before_claim = list(ats.posts)
-            assert run(manager.allow_writes(1, 60, True))
-            run(session.call("click", key=ping["key"]))
-            time.sleep(0.5)
-            after_claim = list(ats.posts)
+            handed_over = list(ats.posts)
         finally:
             run(manager.close(1, 60))
     assert "stored:signed-in" in seen["text"]
     assert proceed["type"] == "submit" and proceed["submit_like"]
     assert outcomes == {"unsigned_continue": "SUBMIT_REFUSED", "login_token_on_continue": "NOT_A_LOGIN"}
     assert login_button["key"] == sign_in["key"] and username["label"] == "Email" and password["type"] == "password"
-    assert before_claim == [] and after_claim == ["/ping"]
+    assert uploaded["uploaded"] and uploaded["upload_requests"] == 1
+    assert "Resume/CV" not in {e["label"] for e in after_upload["elements"]}  # the input became the file's name
+    assert after_upload["attached"] == {by_label["Resume/CV"]["key"]: "resume.pdf"}
+    assert attached["files"] == ["resume.pdf"] and attached["filled"]
+    assert while_driving == ["/upload"] and handed_over == ["/upload", "/ping"]
 
 
 def test_choose_sets_a_dropdown_to_the_exact_option_only(runner, tmp_path):
@@ -394,15 +416,6 @@ def test_point_marks_the_fields_and_shows_a_banner_and_unpoint_clears_them(runne
     assert read["filled"] is False and posts == []
 
 
-class _VisibleWindow(bus.SidecarManager):
-    """The real runner, headless in tests, treated as a visible window so the run may keep it for a person."""
-
-    async def start(self, **kwargs):
-        session = await super().start(**{**kwargs, "headless": True})
-        session.headless = False
-        return session
-
-
 def test_the_window_points_at_an_unanswered_field_and_resumes_in_place(runner, pg_sessions, pg_engine, monkeypatch,
                                                                        tmp_path):
     from app.services import application_execution
@@ -449,3 +462,105 @@ def test_the_window_points_at_an_unanswered_field_and_resumes_in_place(runner, p
     field_id = next(f["id"] for f in task.form["fields"] if f["label"] == aps.PYTHON_QUESTION)
     assert task.plan["fields"][field_id]["status"] == "PERSON"
     assert posts == []
+
+
+def _auto_submit(monkeypatch, tmp_path, mode: str = "guarded_auto") -> None:
+    aps.configure(monkeypatch, mode)
+    for name, value in (("browser_use_webui_enabled", True), ("application_allow_private_hosts", True),
+                        ("mcp_packet_dir", str(tmp_path / "packets"))):
+        monkeypatch.setattr(aps.get_settings(), name, value)
+
+
+def test_auto_submit_on_a_board_no_adapter_knows_submits_once_after_approval(runner, pg_sessions, pg_engine,
+                                                                             monkeypatch, tmp_path):
+    """Auto submit is on: approving the job queues the run by itself; the browser-use backend reveals and fills the
+    form, attaches the approved resume, and clicks the form's own Submit once (signed, after the checks and the
+    claim). Applied is recorded from the site's confirmation, as a verified submission."""
+    from app.models import Job, SubmissionIntent
+
+    _auto_submit(monkeypatch, tmp_path)
+    checkpoint.forget_setup()
+    qs.clear_checkpoints(pg_engine)
+    sessions = qs.app_sessions(pg_engine)
+    with gs.FakeATS("confirm") as ats:
+        user = aps.owner(sessions)
+        aps.answer(sessions, user, aps.PYTHON_QUESTION, "8")
+        gs.consent(sessions, user)  # Settings → Auto submit
+        job_id = aps.approved_job(sessions, user, ats.url("dynamic_form"))  # nothing else: approval queues it
+        assert aps.task_of(sessions, job_id).mode == "GUARDED_AUTO"
+        asyncio.run(aps.drive_async(sessions, passes=6))
+        submits = list(ats.submits)
+    task = aps.task_of(sessions, job_id)
+    assert (task.backend, task.outcome) == ("browser_use_webui", "CONFIRMED"), (task.result_code, task.last_error)
+    assert submits == ["/apply/submit"]
+    with sessions() as db:
+        job = db.get(Job, job_id)
+        intent = db.scalar(select(SubmissionIntent).where(SubmissionIntent.execution_task_id == task.id))
+        assert job.status == "applied" and intent.status == "CONFIRMED" and intent.backend == "browser_use_webui"
+        assert intent.evidence["form_gone"] and intent.evidence["confirmation_wording"]
+    assert bus.get_sidecars().get(user, task.id) is None  # the window was closed after the confirmation
+
+
+class _VisibleWindow(bus.SidecarManager):
+    """The real runner, headless in tests, treated as a visible window so the run may hand it to a person."""
+
+    async def start(self, **kwargs):
+        session = await super().start(**{**kwargs, "headless": True})
+        session.headless = False
+        return session
+
+
+SELF_SUBMIT_PAGE = b"""<!doctype html><html><head><title>Apply</title></head><body>
+<form id="apply" action="/apply/submit" method="post">
+  <div class="field"><label for="name">Full name *</label><input type="text" id="name" name="name" required></div>
+  <div class="field"><label for="mail">Email address *</label><input type="email" id="mail" name="mail" required></div>
+  <button type="submit">Submit application</button>
+</form>
+<a href="#" id="send" onclick="fetch('/apply/submit', {method: 'POST'}).then(function () {
+  location.href = '/confirmation.html'; }); return false">Send it myself</a>
+</body></html>"""
+
+
+def test_a_submission_the_person_makes_in_the_window_is_recorded_from_the_sites_confirmation(
+        runner, pg_sessions, pg_engine, monkeypatch, tmp_path):
+    """A filled form handed to the person works like a normal browser: when they submit there, the next pass sees the
+    site's confirmation in that window and records Applied, without Start submission or "I applied"."""
+    from app.models import Job
+    from app.services import application_execution
+
+    _auto_submit(monkeypatch, tmp_path, "assist")
+    monkeypatch.setattr(aps.get_settings(), "browser_use_headless", False)
+    checkpoint.forget_setup()
+    qs.clear_checkpoints(pg_engine)
+    sessions = qs.app_sessions(pg_engine)
+    manager = _VisibleWindow()
+    bus.set_sidecars(manager)
+    with gs.FakeATS("confirm", pages={"self_submit.html": SELF_SUBMIT_PAGE}) as ats:
+        user = aps.owner(sessions)
+        job_id = aps.approved_job(sessions, user, ats.url("self_submit"))
+        aps.enqueue(sessions, user, job_id)
+
+        async def go():
+            await aps.drive_async(sessions, passes=6)
+            task = aps.task_of(sessions, job_id)
+            assert (task.stage, task.outcome) == ("READY_TO_SUBMIT", "READY_TO_SUBMIT"), task.result_code
+            session = manager.get(user, task.id)
+            assert session is not None and session.parked_until is not None  # handed over, open
+            page = await session.call("observe")
+            send = next(e for e in page["elements"] if e["label"] == "Send it myself")
+            await session.call("click", key=send["key"])  # the person submits, in the window
+            await asyncio.sleep(1.0)
+
+            def watch():
+                with sessions() as db:
+                    return application_execution.watch_windows(db)
+            seen = await asyncio.to_thread(watch)
+            await manager.close(user, task.id)
+            return seen
+        recorded = asyncio.run(go())
+        submits = list(ats.submits)
+    assert recorded == 1 and submits == ["/apply/submit"]
+    task = aps.task_of(sessions, job_id)
+    assert task.result_code == application_execution.SUBMITTED_IN_WINDOW
+    with sessions() as db:
+        assert db.get(Job, job_id).status == "applied"

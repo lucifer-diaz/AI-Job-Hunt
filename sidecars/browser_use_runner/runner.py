@@ -13,10 +13,13 @@ bug upstream must still not be able to submit an application:
 
   * Chromium is launched plainly by Playwright: no remote-debugging port, no anti-detection flags, no user-agent
     spoofing (browser-use's own launcher adds the first two, so it is not used). Telemetry is off.
-  * Every non-GET request is aborted unless a valid, unexpired HMAC token armed it for one domain (a SUBMIT or LOGIN
-    token Job Hunt OS signs only after its pre-submit validator and the shared claim), or a person has the window
-    (takeover). A top-level navigation outside the allowed hosts is aborted, and private addresses are refused
-    unless the caller allows them (tests).
+  * While Job Hunt OS drives the page, every non-GET request is aborted, so a stray key press or a page script
+    cannot send a half-filled form. Three exceptions: a valid, unexpired HMAC token (SUBMIT, signed only after the
+    pre-submit validator and the shared claim, lets the page send for its click; LOGIN, only to the login domain),
+    the upload a file selection starts (an XHR/fetch PUT or multipart POST, for a few seconds after `upload`), and a
+    window handed to a person (takeover with writes), which behaves like a normal browser. A top-level navigation
+    outside the allowed hosts is aborted while Job Hunt OS drives, and private addresses are always refused unless
+    the caller allows them (tests).
   * A click on a submit-like element (type=submit, a form button without a type, or a Submit/Apply/Send label inside
     a form) is refused unless it is `submit` / `login_submit` with that token. Nothing evaluates script a caller
     sent: the only scripts are the constants below, which read the page.
@@ -213,12 +216,18 @@ class Runner:
         self.allow_private = False
         self.upload_dir = ""
         self.armed: tuple[str, str, float] | None = None  # (kind, domain, until)
+        self.uploading_until = 0.0  # a file was just attached: the page may send it (XHR/fetch upload) until then
+        # Files this session attached and saw taken: element key -> file name. A board may replace its file input
+        # with the file's name once the upload is done (the newer Greenhouse board), so the input is not there to read.
+        self.attached: dict[str, str] = {}
         self.takeover = False
-        self.takeover_writes = False  # a person's login may POST; a filled application form waits for the claim
+        self.takeover_writes = False  # a person has the window: it sends what they send, like a normal browser
         self.origin_storage: dict[str, list[dict[str, Any]]] = {}  # a saved session's local storage, per origin
         self.blocked = 0
         self.navigation_blocked = 0
         self.responses: list[dict[str, Any]] = []
+        self.response_seq = 0
+        self.uploads_started = 0  # upload requests let out (see _upload)
         self.elements: dict[str, dict[str, Any]] = {}  # key -> description (+ node)
         self.deadline = 0.0
 
@@ -250,6 +259,9 @@ class Runner:
         self.ctx = BrowserContext(browser=self.bu_browser, config=config)
         session = await self.ctx.get_session()
         await session.context.route("**/*", self._guard)
+        # Every non-GET response the site sends (method, status, host, path: never a body), the last 50: the evidence a
+        # submission went through, whether the signed click or the person in the window sent it.
+        session.context.on("response", self._on_response)
         state = args.get("storage_state") or {}
         cookies = state.get("cookies") or []
         if cookies:
@@ -266,7 +278,8 @@ class Runner:
             host = _host(request.url)
             top = request.is_navigation_request() and request.frame.parent_frame is None and \
                 request.url.startswith(("http:", "https:"))
-            if top and self.allowed and host not in self.allowed:
+            person = self.takeover and self.takeover_writes
+            if top and self.allowed and host not in self.allowed and not person:
                 self.navigation_blocked += 1
                 await route.abort("blockedbyclient")
                 return
@@ -278,23 +291,36 @@ class Runner:
                 await route.abort("blockedbyclient")
                 return
             if request.method.upper() != "GET":
-                armed = self.armed is not None and self.armed[1] == host and time.monotonic() < self.armed[2]
-                person = self.takeover and self.takeover_writes and host in self.allowed
-                if not (armed or person):
+                armed = self.armed is not None and time.monotonic() < self.armed[2] and (
+                    self.armed[0] == "SUBMIT" or self.armed[1] == host)  # a submit lets the page send (captcha too)
+                upload = not (armed or person) and self._upload(request)
+                if not (armed or person or upload):
                     self.blocked += 1
                     await route.abort("blockedbyclient")
                     return
+                self.uploads_started += upload
             await route.continue_()
         except Exception:  # noqa: BLE001  a page closing mid-request is normal
             pass
 
+    def _upload(self, request: Any) -> bool:
+        """The upload a file selection starts: an XHR/fetch PUT, or a multipart POST, shortly after `upload`."""
+        if time.monotonic() > self.uploading_until or request.resource_type not in ("xhr", "fetch"):
+            return False
+        kind = (request.headers.get("content-type") or "").lower()
+        return request.method.upper() == "PUT" or kind.startswith("multipart/form-data")
+
     def _on_response(self, response: Any) -> None:
         try:
             request = response.request
-            if request.method.upper() != "GET" and len(self.responses) < 50:
+            if request.method.upper() != "GET":
                 parsed = urlparse(response.url)
-                self.responses.append({"method": request.method.upper(), "status": response.status,
-                                       "host": (parsed.hostname or "").lower(), "path": parsed.path[:200]})
+                self.response_seq += 1
+                self.responses.append({"seq": self.response_seq, "method": request.method.upper(),
+                                       "status": response.status,
+                                       "host": (parsed.hostname or "").lower(), "path": parsed.path[:200],
+                                       "upload": self._upload(request)})
+                del self.responses[:-50]
         except Exception:  # noqa: BLE001
             pass
 
@@ -357,6 +383,7 @@ class Runner:
             pass
         html = (await page.content())[:MAX_HTML] if args.get("html") else ""
         return {"url": page.url, "title": await page.title(), "elements": elements, "text": text, "html": html,
+                "attached": {k: n for k, n in self.attached.items() if k not in mapped},
                 "blocked_requests": self.blocked, "blocked_navigations": self.navigation_blocked}
 
     def _element(self, key: str) -> dict[str, Any]:
@@ -372,6 +399,8 @@ class Runner:
         return handle
 
     async def read(self, args: dict[str, Any]) -> dict[str, Any]:
+        if str(args["key"]) not in self.elements and str(args["key"]) in self.attached:
+            return {"files": [self.attached[str(args["key"])]], "filled": True}  # the input became its file's name
         out = await self._read(args)
         out["filled"] = bool(out.get("present") or out.get("checked") or out.get("files")
                              or str(out.get("value") or "").strip())
@@ -441,8 +470,40 @@ class Runner:
             raise Refused("WRONG_KIND", "upload is for file inputs")
         if os.path.commonpath([path, self.upload_dir]) != self.upload_dir or not os.path.isfile(path):
             raise Refused("FILE_NOT_ALLOWED", "Only this run's own packet files can be uploaded")
-        await (await self._handle(element)).set_input_files(path)
-        return {"uploaded": True}
+        name = os.path.basename(path)
+        handle = await self._handle(element)
+        page = await self._page()
+        before, started = self.response_seq, self.uploads_started
+        begun = time.monotonic()
+        self.uploading_until = begun + 30
+        try:
+            await handle.set_input_files(path)
+            # The page sends the file as soon as it is chosen (Greenhouse: to its storage bucket). Wait for that upload
+            # to start (a moment) and to be answered (up to 20 s); a page that uploads nothing goes on at once.
+            while time.monotonic() - begun < 20:
+                answered = sum(1 for r in self.responses if r.get("upload") and r["seq"] > before)
+                if self.uploads_started > started and answered >= self.uploads_started - started:
+                    break
+                if self.uploads_started == started and time.monotonic() - begun > 1.5:
+                    break
+                await asyncio.sleep(0.2)
+            await asyncio.sleep(0.3)  # the page shows what it did with the answer
+        finally:
+            self.uploading_until = 0.0
+        sent = [r for r in self.responses if r.get("upload") and r["seq"] > before]
+        failed = any(int(r.get("status") or 0) >= 400 for r in sent) or len(sent) < self.uploads_started - started
+        try:
+            names = await handle.evaluate(FILE_NAMES_JS)
+        except Exception:  # noqa: BLE001  the input was replaced by the file's name
+            names = []
+        try:
+            shown = name in await page.inner_text("body")
+        except Exception:  # noqa: BLE001
+            shown = False
+        if failed or not (name in names or shown):
+            raise Refused("UPLOAD_FAILED", "The site did not take the file")
+        self.attached[element["key"]] = name
+        return {"uploaded": True, "upload_requests": len(sent)}
 
     async def click(self, args: dict[str, Any]) -> dict[str, Any]:
         element = self._element(args["key"])
@@ -562,7 +623,6 @@ class Runner:
         if kind == "LOGIN" and not await (await self._handle(element)).evaluate(LOGIN_FORM_JS):
             raise Refused("NOT_A_LOGIN", "The signed element is not in the form that holds the password field")
         self.responses = []
-        page.on("response", self._on_response)
         self.armed = (kind, domain, time.monotonic() + 30)
         started = time.monotonic()
         try:
@@ -574,10 +634,6 @@ class Runner:
                     pass
         finally:
             self.armed = None
-            try:
-                page.remove_listener("response", self._on_response)
-            except Exception:  # noqa: BLE001
-                pass
         return {"clicked": True, "seconds": round(time.monotonic() - started, 2)}
 
     async def submit(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -603,8 +659,7 @@ class Runner:
 
     async def set_takeover(self, args: dict[str, Any]) -> dict[str, Any]:
         self.takeover = bool(args.get("on"))
-        # Non-GET requests while a person has the window only when the caller says so: a login needs them; a filled
-        # application form gets them only once the person's submission holds the shared claim.
+        # A person has the window: with `writes` it sends what they send (any public host), like a normal browser.
         self.takeover_writes = self.takeover and bool(args.get("writes"))
         if self.takeover:
             self.deadline = time.monotonic() + float(args.get("seconds") or 900)

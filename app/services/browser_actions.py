@@ -75,7 +75,12 @@ def element_for(field_: FormField, observation: dict[str, Any]) -> dict[str, Any
     key = generic.key_of(field_.locator)
     if key is None:
         return None
-    return _elements(observation).get(key) or _group_keys(observation).get(key)
+    found = _elements(observation).get(key) or _group_keys(observation).get(key)
+    attached = (observation.get("attached") or {}).get(key)
+    if found is None and attached and field_.kind == "file":
+        # The board replaced the file input with the file's name once the upload was taken (the runner saw it).
+        return {"key": key, "tag": "input", "type": "file", "attached": attached}
+    return found
 
 
 def _compatible(field_: FormField, element: dict[str, Any]) -> bool:
@@ -180,6 +185,9 @@ def fill_deterministic(session: Any, run: Run, form: ApplicationForm, plan: dict
             continue
         element = element_for(field_, observation)
         if element is None or not _compatible(field_, element):
+            continue
+        if element.get("attached"):  # already uploaded in this window: the same file, or the person's own choice
+            result.filled.add(field_.id)
             continue
         step = step_for(field_, element, values[field_.id])
         if step is None:

@@ -383,16 +383,23 @@ def test_an_unapproved_legal_attestation_waits_for_the_person(sessions):
     assert submits == ["/apply/submit"] and facts(sessions, job_id)["state"] == "APPLIED"
 
 
-def test_guarded_mode_is_refused_without_consent_an_allowlisted_route_or_the_server_mode(sessions, monkeypatch):
+def test_guarded_mode_is_refused_without_consent_on_an_unsupported_site_or_the_server_mode(sessions, monkeypatch):
+    import dataclasses
+
+    from app.services import ats_map
+
     settings = aps.get_settings()
+    supported = ats_map.ATSES
+    unsupported = tuple(dataclasses.replace(a, auth=ats_map.UNSUPPORTED) if a.name == "greenhouse" else a
+                        for a in supported)
     with gs.FakeATS("confirm") as ats:
         user = aps.owner(sessions)
         aps.answer(sessions, user, aps.PYTHON_QUESTION, "8")
         job_id = aps.approved_job(sessions, user, ats.url())
         steps = [("NO_CONSENT", lambda: None),
-                 ("ROUTE_NOT_ALLOWED", lambda: (gs.consent(sessions, user),
-                                                monkeypatch.setattr(settings, "application_guarded_routes", "lever"))),
-                 ("MODE", lambda: (monkeypatch.setattr(settings, "application_guarded_routes", "greenhouse"),
+                 ("ROUTE_NOT_SUPPORTED", lambda: (gs.consent(sessions, user),
+                                                  monkeypatch.setattr(ats_map, "ATSES", unsupported))),
+                 ("MODE", lambda: (monkeypatch.setattr(ats_map, "ATSES", supported),
                                    monkeypatch.setattr(settings, "application_execution_mode", "assist")))]
         for code, setup in steps:
             setup()

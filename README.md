@@ -2460,29 +2460,33 @@ python scripts/application_dry_run.py postgresql+psycopg://localhost/jobhunt_tes
 
 ### 10b. Guarded submission and the browser-use backend (Phase 6, off by default)
 
-Phase 6 lets the application worker submit for you, in one narrow case, and read forms no adapter knows.
-Everything below is off unless you turn it on, and autonomous submission does not exist (`autonomous` is refused when
-settings load).
+Phase 6 lets the application worker submit applications for you (auto submit), and read forms no adapter knows.
+Everything below is off unless you turn it on.
 
 | Mode | What it does |
 | --- | --- |
 | `observe`, `assist` | As above (§10a), now also on dynamic forms through the browser-use backend. |
-| `guarded_auto` | A run may press the final Submit **once**, only when every condition below holds; otherwise it stops and waits for you. |
+| `guarded_auto` | Auto submit: a run fills the form and presses the final Submit **once**, after every check below; it stops and opens the browser window for you only when something needs you. |
 
-**When a guarded run may submit.**
-- **Server and account:** the server runs `guarded_auto`, and your account turned it on (Settings → Guarded
-  submission).
-- **Route:** it has a deterministic form adapter (Greenhouse) and is listed in `APPLICATION_GUARDED_ROUTES`.
+**Auto submit.**
+- **Server and account:** the server runs `guarded_auto`, and your account turned it on (Settings → Auto submit).
+  Then every job you approve is queued for submission at once; "Apply for me" in the Apply kit does the same by hand.
+- **Sites:** any board the browser can complete: Greenhouse through its form adapter, anything else through the
+  browser-use backend. LinkedIn, Indeed and Ashby applications are never automated.
 - **PreSubmitValidator:** passes twice, before the claim and again just before the click. It checks:
   - the approved packet is unchanged, and the exact approved resume and cover letter files are attached;
-  - every required field holds exactly its verified answer, and sensitive answers were confirmed for this application;
-  - any attestation the form asks for ("I certify…") is one you approved word for word;
+  - every required field holds exactly its verified answer (or one you filled in the window and then pressed
+    Continue), and sensitive answers were confirmed for this application;
+  - any attestation the form asks for ("I certify…") is one you approved word for word, or ticked yourself;
   - the page shows no CAPTCHA, code or login, and the form's shape is the one planned for.
+- **When it needs you:** a question with no saved answer, an attestation, a login, a code or CAPTCHA, or a form whose
+  Submit button it cannot tell apart. The window opens with the reason on the page; fill it there and press Continue
+  (it checks everything again and submits), or submit it yourself there.
 - **Claim and intent:** the run takes the same pre-submit claim Claude Desktop and the Apply kit use, then writes a
   SubmissionIntent. It commits CLICKING just before the click.
 
 It is recorded as Applied (READY_TO_APPLY → APPLYING → APPLIED) only when the site's own evidence confirms it: a
-successful response from the application's domain, the form gone, and a confirmation page. Anything less, or a crash,
+successful response from the application's site, the form gone, and a confirmation page. Anything less, or a crash,
 a timeout or a Kill once the click was authorized, is **submission uncertain**. The posting stays reserved, nothing is
 ever clicked again, and the Apply kit asks you whether it went through. While a guarded run owns a posting, Claude
 Desktop and the Apply kit cannot start a submission of it (`ROUTE_HELD`).

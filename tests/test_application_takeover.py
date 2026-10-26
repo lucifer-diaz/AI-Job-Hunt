@@ -140,14 +140,10 @@ class FakeManager:
         session = self.sessions.get((user_id, task_id))
         return session if session is not None and session.alive else None
 
-    async def park(self, session, minutes, *, writes=False):
+    async def park(self, session, minutes):
         session.parked_until = time.monotonic() + minutes * 60
-        self.parked.append(writes)
+        self.parked.append(True)  # handed to the person: the window works like a normal browser
         return True
-
-    async def allow_writes(self, user_id, task_id, on):
-        self.parked.append(on)
-        return self.get(user_id, task_id) is not None
 
     async def hold(self, session, minutes):
         session.parked_until = time.monotonic() + minutes * 60
@@ -221,7 +217,7 @@ def test_a_login_wall_waits_in_the_window_and_the_run_resumes_from_a_fresh_look(
     assert task.interrupt["takeover"] and task.interrupt["reason"] == "LOGIN_REQUIRED"
     assert task.interrupt["login_domain"] == DOMAIN
     assert fake.get(user, task.id).parked_until is not None  # the window is kept for the person
-    assert fake.parked == [True]  # signing in needs the window to send its login form
+    assert fake.parked == [True]  # handed to the person, who signs in there
     drive(sessions)
     assert aps.task_of(sessions, job_id).stage == "NEEDS_HUMAN"  # nothing happens until they say so
 
@@ -355,7 +351,7 @@ def test_a_field_nothing_verified_fills_is_pointed_out_in_the_open_window_and_ke
     assert [f["label"] for f in task.interrupt["fields"]] == [aps.PYTHON_QUESTION]
     assert task.interrupt["question_ids"] and fake.pointed[-1][0] == ["q"]
     assert "fill the 1 highlighted field" in fake.pointed[-1][1]
-    assert fake.parked == [False]  # fields to fill, not a login: the window cannot send the form
+    assert fake.parked == [True]  # handed to the person to fill the fields (and submit, if they choose)
     client = client_as(user, monkeypatch, sessions)
     kit = client.get(f"/api/jobs/{job_id}/apply-kit").json()
     assert kit["execution_takeover"]["fields"][0]["label"] == aps.PYTHON_QUESTION
@@ -368,14 +364,8 @@ def test_a_field_nothing_verified_fills_is_pointed_out_in_the_open_window_and_ke
     task = aps.task_of(sessions, job_id)
     assert (task.status, task.stage, task.outcome) == ("COMPLETED", "READY_TO_SUBMIT", "READY_TO_SUBMIT")
     assert [c for c, _ in session.commands].count("goto") == before  # picked up in place, never reloaded
-    # The filled form stays open for the person, still unable to send anything until their submission holds the
-    # shared claim (Start submission in the Apply kit); releasing the claim stops it again.
-    assert fake.parked[-1] is False
-    started = client.post(f"/api/jobs/{job_id}/submission/start")
-    assert started.status_code == 200 and started.json()["window_can_submit"] and fake.parked[-1] is True
-    released = client.post(f"/api/jobs/{job_id}/submission/release",
-                           json={"claim_token": started.json()["claim"]["claim_token"], "reason": "not yet"})
-    assert released.status_code == 200 and fake.parked[-1] is False
+    # The filled form stays open for the person to submit, like a normal browser: nothing to start first.
+    assert fake.parked == [True, True] and fake.get(user, task.id).parked_until is not None
     field_id = next(f["id"] for f in task.form["fields"] if f["label"] == aps.PYTHON_QUESTION)
     assert task.plan["fields"][field_id]["status"] == "PERSON" and "11" not in str(task.plan)
     stranger = aps.owner(sessions)

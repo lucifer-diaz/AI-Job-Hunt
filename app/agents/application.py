@@ -311,17 +311,14 @@ def _bu_load(ctx: ApplicationContext, session: Any, user_id: int, match: Any, ur
 
 
 def _park_or_close(ctx: ApplicationContext, session: Any, problem: str | None) -> bool:
-    """A problem a person can fix in the window: keep a headful session for them (takeover). Anything else, or a
-    headless session: close it."""
+    """A problem a person can fix in the window: hand a headful session to them (takeover; the window then works like
+    a normal browser). Anything else, or a headless session: close it."""
     from app.infrastructure.application_browser.browser_use_sidecar import get_sidecars
     from app.settings import get_settings
 
     manager = get_sidecars()
     if _takeover_problem(problem):
-        # Signing in (or up, or a code) needs the window to send its forms; fields left to fill wait for the claim.
-        writes = problem in TAKEOVER_PROBLEMS or problem in LOGIN_NAVIGATOR_PROBLEMS
-        return bool(ctx.run_async(manager.park(session, get_settings().application_takeover_ttl_minutes,
-                                               writes=writes)))
+        return bool(ctx.run_async(manager.park(session, get_settings().application_takeover_ttl_minutes)))
     ctx.run_async(manager.close(session.user_id, session.task_id))
     return False
 
@@ -425,11 +422,9 @@ def analyze_form(state: ApplicationState, runtime: Runtime[ApplicationContext]) 
         read = ctx.run_async(_read_form(ctx.browser, user_id, job_id, url))
         dropdowns = bool(read.get("form")) and ats_forms.ApplicationForm.model_validate(read["form"]) \
             .required_dropdowns()
-        if (read.get("problem") in (ats_forms.NO_FORM, ats_forms.UNSUPPORTED) or dropdowns) \
-                and state.get("mode") != "GUARDED_AUTO" and _browser_use_on():
+        if (read.get("problem") in (ats_forms.NO_FORM, ats_forms.UNSUPPORTED) or dropdowns) and _browser_use_on():
             # The adapter does not know this markup, or the form has dropdown widgets this page cannot open: the
-            # browser-use backend can, for a person to submit. Guarded submission never falls back: it needs the
-            # route's own adapter end to end.
+            # browser-use backend can.
             read = _analyze_browser_use(ctx, task_id, job, url, attempt)
             backend = "browser_use_webui"
         elif dropdowns:
@@ -513,10 +508,10 @@ def resolve_answers(state: ApplicationState, runtime: Runtime[ApplicationContext
 
 
 def _in_window(state: ApplicationState, task: Any) -> bool:
-    """An ASSIST run on the browser-use backend with a visible window: what nothing verified answers, the person fills
-    in that window instead of the run stopping first."""
-    return state.get("mode") == "ASSIST" and (task.backend or state.get("backend")) == "browser_use_webui" \
-        and _headful()
+    """A filling run (ASSIST or auto submit) on the browser-use backend with a visible window: what nothing verified
+    answers, the person fills in that window instead of the run stopping first."""
+    return state.get("mode") in ("ASSIST", "GUARDED_AUTO") \
+        and (task.backend or state.get("backend")) == "browser_use_webui" and _headful()
 
 
 def _after_resolve(state: ApplicationState) -> str:
@@ -630,14 +625,16 @@ def fill(state: ApplicationState, runtime: Runtime[ApplicationContext]) -> dict[
 
 
 def _fill_browser_use(ctx: ApplicationContext, task_id: int, job: Any, url: str, form: Any, plan: dict[str, Any],
-                      values: dict[str, Any], expected: str, attempt: int) -> dict[str, Any]:
+                      values: dict[str, Any], expected: str, attempt: int, *, for_submit: bool = False
+                      ) -> dict[str, Any]:
     """Fill a form no adapter knows through the sidecar: every resolved field into its own element without a model,
     the navigator only for resolved fields that could not be reached, then a read-back.
 
     Required fields nothing verified fills (and anything the navigator asks a person about) are pointed out in the
     page: outlined, a banner, the window in front. With a visible window it is kept for the person (FIELDS_NEED_YOU),
     who fills them there; the next pass picks the page up where it is, without reloading it, and accepts a required
-    field the person filled. In ASSIST a finished form stays open for the person to submit."""
+    field the person filled. In ASSIST a finished form stays open for the person to submit; `for_submit` (auto submit)
+    keeps the session for the SUBMIT node instead and returns it with the form as read now."""
     from app.infrastructure.application_browser.browser_use_sidecar import (
         SidecarRefused,
         SidecarUnavailable,
@@ -703,19 +700,24 @@ def _fill_browser_use(ctx: ApplicationContext, task_id: int, job: Any, url: str,
                         if (e := browser_actions.element_for(f, observation)) is not None]
                 keys += [result.ask_element] if result.ask_element and result.ask_element not in keys else []
                 count = len(fields)
+                then = "press Continue in the Apply kit and Job Hunt OS submits it" if for_submit else \
+                    "press Continue in the Apply kit, or submit here yourself"
                 message = (f"Job Hunt OS needs you: fill the {count} highlighted field{'s' if count != 1 else ''}, "
-                           "then press Continue in the Apply kit. Do not submit yet." if count else
-                           "Job Hunt OS needs you on this page. When you are done, press Continue in the Apply kit.")
+                           f"then {then}." if count else
+                           f"Job Hunt OS needs you on this page. When you are done, {then}.")
                 ctx.run_async(session.call("point", keys=keys, message=message, note="Job Hunt OS needs you here"))
                 keep = _park_or_close(ctx, session, code)
                 session.resume_in_place = keep
             return {"problem": code, "takeover": keep, "fields": fields, "person_filled": person,
                     "question_ids": list(plan.get("needs_input") or [])}
+        if for_submit:  # auto submit: the SUBMIT node validates this very page and clicks
+            keep = True
+            ctx.run_async(get_sidecars().hold(session, get_settings().application_takeover_ttl_minutes))
+            return {"session": session, "current": current, "observation": observation, "missing": [],
+                    "person_filled": person, "actions": result.actions, "model_steps": result.model_steps}
         if _headful():
-            # ASSIST: the filled form stays open for the person to review. It cannot send anything until they press
-            # Start submission in the Apply kit, which takes the shared claim (application_execution.window_writes).
-            keep = bool(ctx.run_async(get_sidecars().park(session, get_settings().application_takeover_ttl_minutes,
-                                                          writes=False)))
+            # ASSIST: the filled form stays open for the person to review and submit, like a normal browser.
+            keep = bool(ctx.run_async(get_sidecars().park(session, get_settings().application_takeover_ttl_minutes)))
         report = {fid: "filled" for fid in result.filled}
         return {"report": report, "missing": [], "person_filled": person,
                 "blocked_requests": observation.get("blocked_requests") or 0, "actions": result.actions,
@@ -860,7 +862,11 @@ def submit(state: ApplicationState, runtime: Runtime[ApplicationContext]) -> dic
         expected = task.form_fingerprint
         service.attempt_note(db, task, file_digests=digests)
         _record(db, ctx, _key(state, SUBMIT, f":a{task.attempt_count}:fill"), task, "FILLING")
+        backend, attempt, plan, facts_of_job = task.backend, task.attempt_count, dict(task.plan or {}), _facts(job)
     _hold(ctx, "before_fill")
+    if backend == "browser_use_webui":
+        return _submit_browser_use(ctx, state, facts_of_job, url, form, plan, values, files, digests, expected,
+                                   task_id, attempt, match)
     page = ctx.run_async(get_guarded_sessions().open(user_id=user_id, job_id=job_id, ats=form.adapter))
     try:
         facts = ctx.run_async(_guarded_fill(page, url, form, values, expected))
@@ -948,6 +954,216 @@ def submit(state: ApplicationState, runtime: Runtime[ApplicationContext]) -> dic
     finally:
         values.clear()
         ctx.run_async(page.close())
+
+
+def _bu_facts(ctx: ApplicationContext, session: Any, planned: Any, values: dict[str, Any]) -> dict[str, Any]:
+    """What the browser-use page shows now, for the PreSubmitValidator: its host and address, any problem, the form's
+    fingerprint (the planned one while every planned field is still there: a conditional question may have grown it),
+    the required fields that do not hold their answer (or a person's), the file attached to each file field, and the
+    submit control. Never a value."""
+    from urllib.parse import urlparse
+
+    from app.services import ats_forms, browser_actions
+    from app.services.ats_forms import generic
+
+    observation = ctx.run_async(session.call("observe", html=True))
+    url = observation.get("url") or ""
+    facts: dict[str, Any] = {"host": (urlparse(url).hostname or "").lower(), "url": url,
+                             "problem": ats_forms.page_problem(observation.get("html") or "",
+                                                               title=observation.get("title"))}
+    current = generic.analyze(url, observation.get("elements") or []) if not facts["problem"] else None
+    if current is None:
+        return {**facts, "fingerprint": None, "missing": [], "uploaded": {}, "submit_key": None}
+    grown = {f.id for f in planned.fields} <= {f.id for f in current.fields}
+    facts["fingerprint"] = planned.fingerprint if grown else current.fingerprint
+    facts["missing"], facts["person"] = browser_actions.read_required(session, ctx.run_async, current, values,
+                                                                      observation)
+    uploaded = {}
+    for field_ in planned.fields:
+        element = browser_actions.element_for(field_, observation) if field_.kind == "file" else None
+        if element is not None:
+            read = ctx.run_async(session.call("read", key=element["key"]))
+            uploaded[field_.id] = ", ".join(read.get("files") or [])
+    facts["uploaded"] = uploaded
+    facts["submit_key"] = _submit_control(observation, current)
+    return facts
+
+
+def _submit_control(observation: dict[str, Any], form: Any) -> str | None:
+    """The key of the form's own submit control: a submit-like element in the form that holds the most fields,
+    preferring the label the form was read with. None when there is none, or no single best one."""
+    from collections import Counter
+
+    from app.services.ats_forms import generic
+
+    elements = observation.get("elements") or []
+    keys = {generic.key_of(f.locator) for f in form.fields}
+    forms = Counter(e.get("form_index") for e in elements if e.get("key") in keys or e.get("group_key") in keys)
+    home = forms.most_common(1)[0][0] if forms else None
+    candidates = [e for e in elements if e.get("submit_like") and e.get("in_form")
+                  and (home is None or e.get("form_index") == home)]
+    wanted = " ".join((form.submit.label or "").lower().split())
+    exact = [e for e in candidates if " ".join((e.get("label") or "").lower().split()) == wanted] if wanted else []
+    chosen = exact or candidates
+    return chosen[0]["key"] if len(chosen) == 1 else None
+
+
+def _submit_browser_use(ctx: ApplicationContext, state: ApplicationState, job: Any, url: str, form: Any,
+                        plan: dict[str, Any], values: dict[str, Any], files: dict[str, str], digests: dict[str, str],
+                        expected: str, task_id: int, attempt: int, match: Any) -> dict[str, Any]:
+    """Auto submit on the browser-use backend: fill the page (fields nothing verified fills go to the person in the
+    window, as in ASSIST), then the same order as the Playwright path — validate, claim and intent, the page again,
+    validate again, CLICKING, one signed click on the form's own submit control, the site's confirmation. An unknown
+    outcome keeps the window open for the person."""
+    from app.infrastructure.application_browser.browser_use_sidecar import (
+        SidecarRefused,
+        get_sidecars,
+    )
+    from app.services import application_execution as service
+    from app.services import ats_forms, ats_map, submission
+    from app.services.submission import ConfirmationVerifier, PreSubmitValidator
+    from app.settings import get_settings
+
+    manager = get_sidecars()
+    filled = _fill_browser_use(ctx, task_id, job, url, form, plan, values, expected, attempt, for_submit=True)
+    if filled.get("problem"):
+        values.clear()
+        with _session(ctx) as db:
+            task, job_row = _load(db, state)
+            code = filled["problem"]
+            fields_problem = code == FIELDS_NEED_YOU or code.startswith("NAVIGATOR_")
+            if filled.get("takeover"):
+                return _takeover(db, ctx, state, task, job_row, code, "resolve_answers" if fields_problem else "submit",
+                                 fields=filled.get("fields"), question_ids=filled.get("question_ids"))
+            human = code in (*ats_forms.HUMAN_BLOCKERS, "LOGIN_FAILED") or fields_problem
+            return _end_guarded(db, ctx, state, task, "NEEDS_HUMAN" if human else "BLOCKED", code,
+                                NEEDS_HUMAN if human else BLOCKED)
+    session, keep = filled["session"], False
+    try:
+        if filled.get("person_filled"):
+            with _session(ctx) as db:
+                task, _ = _load(db, state)
+                entries = dict((task.plan or {}).get("fields") or {})
+                for fid in filled["person_filled"]:
+                    entries[fid] = {**(entries.get(fid) or {}), "status": "PERSON", "source": "person_in_window"}
+                _record(db, ctx, _key(state, SUBMIT, f":a{attempt}:person"), task, "FILLING",
+                        plan={**(task.plan or {}), "fields": entries})
+        facts = _bu_facts(ctx, session, form, values)
+        with _session(ctx) as db:
+            task, job_row = _load(db, state)
+            checked = PreSubmitValidator.check(db, task, job_row, form=form, page=facts, files=files,
+                                               expected_digests=digests)
+            if checked.ok and not facts.get("submit_key"):
+                checked = submission.Validation(False, "SUBMIT_NOT_FOUND", "No single submit control on the form",
+                                                human=True)
+            if not checked.ok and checked.human and _headful():
+                # Something only the person can settle (an attestation, a sensitive answer, no clear Submit): the
+                # window is theirs, with the reason on the page; Continue checks everything again and submits.
+                ctx.run_async(session.call("point", keys=[], note="", message=(
+                    f"Job Hunt OS needs you: {checked.reason}. Then press Continue in the Apply kit, "
+                    "or submit here yourself.")[:300]))
+                keep = _park_or_close(ctx, session, FIELDS_NEED_YOU)
+                if keep:
+                    session.resume_in_place = True
+                    return _takeover(db, ctx, state, task, job_row, checked.code or FIELDS_NEED_YOU,
+                                     "resolve_answers")
+            if not checked.ok:
+                return _end_guarded(db, ctx, state, task, "NEEDS_HUMAN" if checked.human else "BLOCKED",
+                                    checked.code or "VALIDATION_FAILED", NEEDS_HUMAN if checked.human else BLOCKED)
+            _record(db, ctx, _key(state, SUBMIT, f":a{attempt}:validated"), task, "PRE_SUBMIT_VALIDATION")
+            effects.held(db, ctx.run)
+            armed = submission.arm(db, task, job_row, route=match.route, domain=facts["host"],
+                                   backend="browser_use_webui", file_digests=digests)
+            if armed.intent is None:
+                task, _ = _load(db, state)
+                return _end_guarded(db, ctx, state, task, "BLOCKED", armed.status, BLOCKED)
+            intent_id, claim_id = armed.intent.id, armed.claim.id
+        _hold(ctx, "armed")
+        again = _bu_facts(ctx, session, form, values)  # the page, again, immediately before the click
+        with _session(ctx) as db:
+            task, job_row = _load(db, state)
+            intent = db.get(submission.SubmissionIntent, intent_id)
+            claim = db.get(submission.ApplicationClaim, claim_id, populate_existing=True)
+            checked = PreSubmitValidator.check(db, task, job_row, form=form, page=again, files=files,
+                                               expected_digests=digests, claim=claim)
+            if checked.ok and (again.get("submit_key") != facts.get("submit_key") or again["host"] != facts["host"]):
+                checked = submission.Validation(False, "FORM_CHANGED", "The submit control moved since the check")
+            if not checked.ok:
+                submission.abort(db, intent, job_row, f"Revalidation failed: {checked.code}")
+                task, _ = _load(db, state)
+                return _end_guarded(db, ctx, state, task, "NEEDS_HUMAN" if checked.human else "BLOCKED",
+                                    checked.code or "VALIDATION_FAILED", NEEDS_HUMAN if checked.human else BLOCKED,
+                                    ":recheck")
+            effects.within(db, ctx.run, _key(state, SUBMIT, f":clicking:{intent_id}"))
+            clicking = submission.commit_clicking(db, task, intent)
+            if not clicking.ok:
+                db.rollback()
+                intent = db.get(submission.SubmissionIntent, intent_id)
+                submission.abort(db, intent, job_row, f"Not authorized at the click: {clicking.code}")
+                task, _ = _load(db, state)
+                return _end_guarded(db, ctx, state, task, "NEEDS_HUMAN" if clicking.human else "BLOCKED",
+                                    clicking.code or "NOT_AUTHORIZED", NEEDS_HUMAN if clicking.human else BLOCKED,
+                                    ":clicking")
+        _hold(ctx, "before_click")
+        user_id = job.user_id
+        if not submission.still_clicking(ctx.sessions, user_id, task_id, intent_id):
+            with _session(ctx) as db:
+                task, job_row = _load(db, state)
+                effects.held(db, ctx.run)
+                submission.abort(db, db.get(submission.SubmissionIntent, intent_id), job_row,
+                                 "Refused before the click: NOT_AUTHORIZED", refused_at_click=True)
+                task, _ = _load(db, state)
+                service.set_stage(task, "BLOCKED")
+                task.result_code = "NOT_AUTHORIZED"
+                db.commit()
+            return _end(SUBMIT, BLOCKED, "NOT_AUTHORIZED")
+        token = submission.signed_submit(session, again["submit_key"], again["host"])
+        try:
+            ctx.run_async(session.call("submit", key=again["submit_key"], token=token))
+        except SidecarRefused as exc:  # refused by the runner before its click: nothing was sent
+            with _session(ctx) as db:
+                task, job_row = _load(db, state)
+                effects.held(db, ctx.run)
+                submission.abort(db, db.get(submission.SubmissionIntent, intent_id), job_row,
+                                 f"Refused before the click: {exc.code}", refused_at_click=True)
+                task, _ = _load(db, state)
+                service.set_stage(task, "BLOCKED")
+                task.result_code = exc.code
+                db.commit()
+            return _end(SUBMIT, BLOCKED, exc.code)
+        except Exception as exc:  # noqa: BLE001  the click may have happened: the outcome is unknown
+            keep = _park_or_close(ctx, session, FIELDS_NEED_YOU)
+            with _session(ctx) as db:
+                task, _ = _load(db, state)
+                effects.held(db, ctx.run)
+                submission.uncertain(db, task, db.get(submission.SubmissionIntent, intent_id),
+                                     f"The browser failed during the final click ({type(exc).__name__})")
+            return _end(SUBMIT, SUBMISSION_UNCERTAIN, SUBMISSION_UNCERTAIN)
+        _hold(ctx, "after_click")
+        evidence = ctx.run_async(session.call("evidence"))
+        with _session(ctx) as db:
+            task, job_row = _load(db, state)
+            intent = db.get(submission.SubmissionIntent, intent_id)
+            effects.within(db, ctx.run, _key(state, SUBMIT, f":clicked:{intent_id}"))
+            submission.after_click(db, task, intent)
+            db.commit()
+            confirmation = ConfirmationVerifier.verify(form.adapter, again["host"], evidence)
+            evidence.clear()
+            if confirmation.confirmed:
+                recorded = submission.confirm(db, task, intent, confirmation)
+                outcome = CONFIRMED if recorded == "SUBMITTED" else SUBMISSION_UNCERTAIN
+            else:
+                submission.uncertain(db, task, intent, confirmation.reason, confirmation.facts)
+                outcome = SUBMISSION_UNCERTAIN
+            ats_map.observe(db, job_row, last_outcome=outcome, checked=True)
+            db.commit()
+        if outcome != CONFIRMED:  # the person looks at the page to say what happened
+            keep = bool(ctx.run_async(manager.park(session, get_settings().application_takeover_ttl_minutes)))
+        return _end(SUBMIT, outcome, outcome)
+    finally:
+        values.clear()
+        if not keep:
+            ctx.run_async(manager.close(job.user_id, task_id))
 
 
 # ───────────── waiting ─────────────

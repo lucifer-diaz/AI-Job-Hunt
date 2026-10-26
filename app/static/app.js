@@ -1434,7 +1434,7 @@ function renderKit() {
         <div class="caps mb10">3 · SUBMIT ON THEIR SITE</div>
         ${k.status === 'applied' ? '' : renderKitClaim(k)}
         ${job.url ? `<a class="btn primary block lg" style="border-radius:11px;padding:14px" href="${attr(job.url)}" target="_blank" rel="noopener">Open ${esc(job.company)} application ↗</a>` : `<div class="banner warn">No posting URL was captured for this job.</div>`}
-        <div class="small muted mt10 pretty" style="line-height:1.55">Opens in a new tab. Job Hunt OS does not bypass logins or CAPTCHAs — the submit click stays yours.</div>
+        <div class="small muted mt10 pretty" style="line-height:1.55">Opens in a new tab. Job Hunt OS never bypasses logins or CAPTCHAs.</div>
         <div class="hr"></div>
         <div class="caps mb10">4 · CONFIRM BACK HERE</div>
         ${k.status === 'applied' ? `<div class="box good"><div class="b" style="color:var(--good)">Already marked applied</div><div class="small ink2 mt4">Track replies and follow-ups in the Tracker.</div>${btn('Open tracker', 'go', { screen: 'tracker', app: job.application_id }, 'block mt12')}</div>` : `
@@ -1446,16 +1446,12 @@ function renderKit() {
       </div></div></div></div>`;
 }
 
-// The pre-submit claim (Phase 5): start the submission here so Claude Desktop (or another tab) cannot submit the
-// same posting at the same time; a claim whose outcome is unknown waits for you to say what happened.
+// A submission in progress somewhere (auto submit, Claude Desktop) or whose outcome is unknown. Nothing to start here:
+// the duplicate check is automatic, and a submission you make yourself is recorded when you confirm it below.
 function renderKitClaim(k) {
   const c = k.claim, job = k.job;
   const execution = renderKitExecution(k);
-  if (!c) {
-    return `<div class="box mb12" style="padding:13px;border-radius:12px"><div class="small ink2 pretty" style="line-height:1.55">Start the submission first: it reserves this posting (and any other saved copy of it) so nothing else submits it twice.</div>
-      ${btn(label('kit-start', 'Start submission', 'Starting…'), 'kit-start', { id: job.id }, 'block mt10', isBusy('kit-start'))}
-      <div class="xs muted mt8 pretty">Applications you send entirely outside Job Hunt OS cannot be locked here.</div></div>${execution}`;
-  }
+  if (!c) return execution;
   if (c.status === 'UNCERTAIN') {
     return `<div class="banner warn mb12"><div class="b">A submission was started ${fmtDateTime(c.claimed_at)} and never reported</div>
       <div class="small mt4">Did it go through? This posting stays reserved until you say.</div>
@@ -1469,14 +1465,16 @@ function renderKitClaim(k) {
     ${btn("I didn't submit — release it", 'kit-release', { id: job.id, token: c.claim_token }, 'ghost sm mt8')}</div>${execution}`;
 }
 // The application worker (APPLICATION_EXECUTION_MODE): reads and, in assist mode, fills the form. In guarded_auto
-// (Phase 6) a run of a consenting account on an allowlisted route may submit once, after the pre-submit checks and
-// the shared claim; an unknown outcome waits for you (the claim banner above).
+// (auto submit) a run of an account that turned Auto submit on submits it, after the pre-submit checks and the shared
+// claim; an unknown outcome waits for you (the claim banner above).
 function renderKitTakeover(k) {
   const t = k.execution_takeover, x = k.execution;
   if (!t || !x) return '';
   const fields = t.fields || [], login = ['LOGIN_REQUIRED', 'LOGIN_FAILED', 'OTP_REQUIRED', 'ACCOUNT_REQUIRED'].includes(t.reason);
   const why = { LOGIN_REQUIRED: 'The site wants you to sign in', LOGIN_FAILED: 'The saved login did not work', OTP_REQUIRED: 'The site sent a one-time code', ACCOUNT_REQUIRED: 'The site wants a new account', CAPTCHA_OR_ANTI_BOT: 'The site shows a CAPTCHA',
-    FIELDS_NEED_YOU: `${fields.length} field${fields.length === 1 ? '' : 's'} need${fields.length === 1 ? 's' : ''} you`, NAVIGATOR_UNEXPECTED_PAGE: 'The page needs a look', NAVIGATOR_LEGAL: 'The form asks you to agree to something' }[t.reason]
+    FIELDS_NEED_YOU: `${fields.length} field${fields.length === 1 ? '' : 's'} need${fields.length === 1 ? 's' : ''} you`, NAVIGATOR_UNEXPECTED_PAGE: 'The page needs a look', NAVIGATOR_LEGAL: 'The form asks you to agree to something',
+    LEGAL_ATTESTATION: 'The form asks you to agree to something: tick it in the window', SENSITIVE_NOT_CONFIRMED: 'A sensitive answer needs your OK',
+    SUBMIT_NOT_FOUND: 'Job Hunt OS could not tell which button submits this form', REQUIRED_FIELDS_MISSING: 'A required field is still empty' }[t.reason]
     || (String(t.reason || '').startsWith('NAVIGATOR_') ? 'The page needs you' : 'The page needs you');
   const list = fields.length ? `<ul class="small mt6" style="margin:6px 0 0 18px">${fields.map(f => `<li class="pretty">${esc(f.label || f.id)}</li>`).join('')}</ul>` : '';
   return `<div class="banner warn mt8"><div class="b">${esc(why)}</div>
@@ -1528,13 +1526,13 @@ function renderKitExecution(k) {
   const state = !x ? '' : `<div class="row gap8 mt8">${pill(x.stage.replaceAll('_', ' '), x.stage === 'READY_TO_SUBMIT' ? 'good' : ['BLOCKED', 'NEEDS_HUMAN', 'FAILED'].includes(x.stage) ? 'warn' : 'muted')}${x.result_code ? `<span class="xs muted">${esc(x.result_code)}</span>` : ''}</div>
     ${waiting && (x.interrupt.question_ids || []).length ? renderKitQuestions(k) : ''}
     ${waiting && confirm.length ? `${confirmList}${btn(confirm.length === 1 ? 'Use this answer for this application' : `Use these ${confirm.length} answers for this application`, 'kit-confirm', { exec: x.id, ids: confirm.map(c => c.id).join(',') }, 'sm mt8')}` : ''}
-    ${x.stage === 'READY_TO_SUBMIT' ? `<div class="xs muted mt6 pretty">${x.mode === 'ASSIST' ? 'Every required field was filled from a verified source in a private browser page, which was then closed: nothing was kept there or sent.' : 'Every required field has a verified source.'} Open the posting and fill it in yourself with the answers in this kit, then submit it there.</div>` : ''}`;
+    ${x.stage === 'READY_TO_SUBMIT' ? `<div class="xs muted mt6 pretty">${x.result_code === 'SUBMITTED_IN_WINDOW' ? 'You submitted it in the browser window; the site confirmed it.' : x.backend === 'browser_use_webui' ? 'Every required field is filled in the open browser window: check it and submit it there.' : x.mode === 'ASSIST' ? 'Every required field was filled from a verified source in a private browser page, which was then closed. Open the posting, fill it in with the answers in this kit and submit it there.' : 'Every required field has a verified source.'}</div>` : ''}`;
   const active = x && ['PENDING', 'PROCESSING'].includes(x.status);
   const guarded = mode === 'guarded_auto' && k.guarded_consent;
-  const what = mode === 'observe' ? '' : guarded ? ', fills it and, on an allowlisted route, submits it once after every check — only the site’s confirmation marks it applied' : ', then fills it in a private page. It never submits';
+  const what = mode === 'observe' ? '' : guarded ? ', fills it and submits it for you — only the site’s confirmation marks it applied; it stops for you only when something needs you' : ', then fills it. You submit';
   return `<div class="box mb12" style="padding:13px;border-radius:12px"><div class="small b">Application worker · ${esc(mode)}${x && x.backend ? ` · ${esc(x.backend.replaceAll('_', ' '))}` : ''}</div>
     <div class="xs muted mt4 pretty">Reads the form and finds a verified source for every answer${what}.</div>
-    ${state}${renderKitIntent(k)}${renderKitTakeover(k)}${renderKitPersonFilled(k)}${active ? '' : `<div class="row gap8 wrap">${btn(label('kit-prepare', x ? 'Prepare again' : 'Prepare the form', 'Queueing…'), 'kit-prepare', { id: k.job.id }, 'sm mt8', isBusy('kit-prepare'))}${k.browser_use_ready && mode !== 'off' ? `<span title="${attr('Opens a browser window (browser-use) that fills the form from your verified answers, step by step, checked by Job Hunt OS. It never submits: you do.')}">${btn(label('kit-browser-use', 'Run with browser-use', 'Queueing…'), 'kit-browser-use', { id: k.job.id }, 'sm mt8', isBusy('kit-browser-use'))}</span>` : ''}${guarded ? btn(label('kit-guarded', 'Submit for me (guarded)', 'Queueing…'), 'kit-guarded', { id: k.job.id }, 'sm mt8 primary', isBusy('kit-guarded')) : ''}</div>`}</div>`;
+    ${state}${renderKitIntent(k)}${renderKitTakeover(k)}${renderKitPersonFilled(k)}${active ? '' : `<div class="row gap8 wrap">${btn(label('kit-prepare', x ? 'Fill again' : 'Fill the form', 'Queueing…'), 'kit-prepare', { id: k.job.id, mode: mode === 'observe' ? '' : 'ASSIST' }, 'sm mt8', isBusy('kit-prepare'))}${k.browser_use_ready && mode !== 'off' ? `<span title="${attr('Opens a browser window (browser-use) that fills the form from your verified answers, step by step, checked by Job Hunt OS, and leaves it open for you to submit.')}">${btn(label('kit-browser-use', 'Run with browser-use', 'Queueing…'), 'kit-browser-use', { id: k.job.id }, 'sm mt8', isBusy('kit-browser-use'))}</span>` : ''}${guarded ? btn(label('kit-guarded', 'Apply for me', 'Queueing…'), 'kit-guarded', { id: k.job.id }, 'sm mt8 primary', isBusy('kit-guarded')) : ''}</div>`}</div>`;
 }
 
 /* ───────────── tracker ───────────── */
@@ -2828,11 +2826,6 @@ const A = {
   'open-kit': el => openKit(el.dataset.id),
   'close-kit': () => { S.kitJob = null; render(); },
   'copy-answer': el => { copyText(el.dataset.text); api(`/api/knowledge/${el.dataset.id}/used`, { method: 'POST' }).catch(() => {}); },
-  'kit-start': el => busy('kit-start', async () => {
-    const out = await api(`/api/jobs/${el.dataset.id}/submission/start`, { method: 'POST' });
-    D.kit = await api(`/api/jobs/${el.dataset.id}/apply-kit`);
-    if (out && out.window_can_submit) toast('The open browser window can send the form now');
-  }, 'Submission started · this posting is reserved for you'),
   'kit-release': el => busy('kit-release', async () => {
     await api(`/api/jobs/${el.dataset.id}/submission/release`, { method: 'POST', body: { claim_token: el.dataset.token, reason: 'Not submitted (Apply kit)' } });
     D.kit = await api(`/api/jobs/${el.dataset.id}/apply-kit`);
@@ -2842,7 +2835,7 @@ const A = {
     D.kit = await api(`/api/jobs/${el.dataset.id}/apply-kit`);
   }, 'Saved'),
   'kit-prepare': el => busy('kit-prepare', async () => {
-    await api(`/api/jobs/${el.dataset.id}/application-execution`, { method: 'POST', body: {} });
+    await api(`/api/jobs/${el.dataset.id}/application-execution`, { method: 'POST', body: el.dataset.mode ? { mode: el.dataset.mode } : {} });
     D.kit = await api(`/api/jobs/${el.dataset.id}/apply-kit`);
   }, 'Queued for the application worker'),
   'kit-answer': el => {
@@ -2876,7 +2869,7 @@ const A = {
   'kit-guarded': el => busy('kit-guarded', async () => {
     await api(`/api/jobs/${el.dataset.id}/application-execution`, { method: 'POST', body: { mode: 'GUARDED_AUTO' } });
     D.kit = await api(`/api/jobs/${el.dataset.id}/apply-kit`);
-  }, 'Queued: it submits only if every check passes'),
+  }, 'Queued: it fills and submits the application, and asks you only if something needs you'),
   'kit-continue': el => busy('kit-continue', async () => {
     await api(`/api/application-executions/${el.dataset.exec}/continue`, { method: 'POST' });
     S.kitSignup = null;

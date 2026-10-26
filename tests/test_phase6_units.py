@@ -255,12 +255,13 @@ def test_the_ats_map_reads_routes_from_urls(url, ats, tenant, login, auth, backe
         (ats, tenant, login, auth, backend)
 
 
-def test_only_a_capable_and_allowlisted_route_can_be_guarded():
-    gh, lever = ats_map.detect("https://boards.greenhouse.io/acme/jobs/1"), ats_map.detect("https://jobs.lever.co/a/b")
-    assert not gh.allowed_by(frozenset())
-    assert gh.allowed_by(frozenset({"greenhouse"})) and gh.allowed_by(frozenset({"greenhouse:acme"}))
-    assert not gh.allowed_by(frozenset({"greenhouse:other"}))
-    assert not lever.allowed_by(frozenset({"lever"}))  # no deterministic adapter: assist only
+def test_auto_submit_covers_every_board_a_browser_can_complete():
+    for url in ("https://boards.greenhouse.io/acme/jobs/1", "https://jobs.lever.co/a/b",
+                "https://acme.wd5.myworkdayjobs.com/x/job/1", "https://careers.example.test/jobs/9"):
+        assert ats_map.detect(url).auto_submit, url
+    for url in ("https://jobs.ashbyhq.com/acme/1", "https://www.linkedin.com/jobs/view/1",
+                "https://www.indeed.com/viewjob?jk=1"):
+        assert not ats_map.detect(url).auto_submit, url  # in-board or POST-loaded forms: the person applies
     assert ats_map.detect("javascript:alert(1)") is None and ats_map.detect("") is None
 
 
@@ -397,11 +398,11 @@ def test_only_the_candidate_moves_a_started_submission_back(db):
     db.rollback()
 
 
-def test_autonomous_mode_does_not_exist_and_guarded_is_off_by_default():
+def test_autonomous_mode_does_not_exist_and_auto_submit_is_off_by_default():
     with pytest.raises(ValidationError):
         Settings(application_execution_mode="autonomous")
     fresh = Settings(_env_file=None)
-    assert fresh.application_execution_mode == "off" and fresh.guarded_routes == frozenset()
+    assert fresh.application_execution_mode == "off"
     assert not fresh.browser_use_webui_enabled and not fresh.application_auth_sessions_enabled
     assert fresh.login_domains == frozenset()
     assert Settings(_env_file=None, agent_graphs_enabled=True,

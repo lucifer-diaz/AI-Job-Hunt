@@ -3,19 +3,22 @@
 A GUARDED_AUTO execution reaches the final click only through these steps, in this order, and no database
 transaction is held while the browser works:
 
-    1. PreSubmitValidator.check     deterministic: mode, the account's consent, an allowlisted route with a
-                                    deterministic adapter, ownership, the shared readiness rules, the approved digest,
-                                    the exact packet files on the page, every required field read back, sensitive
-                                    answers confirmed, legal attestations the person approved word for word, no other
+    1. PreSubmitValidator.check     deterministic: mode, the account's Auto submit switch, a route a browser can
+                                    complete (not LinkedIn/Indeed/Ashby), the form read by the route's adapter or the
+                                    browser-use backend, ownership, the shared readiness rules, the approved digest,
+                                    the exact packet files on the page, every required field read back (from a verified
+                                    source, or filled by the person in the window), sensitive answers confirmed, legal
+                                    attestations the person approved word for word or ticked themselves, no other
                                     claim, no CAPTCHA/OTP/login, the form's fingerprint unchanged
     2. arm                          apply_queue.begin_submission(client="worker") — the same claim MCP and the Apply
                                     kit take — then a SubmissionIntent ARMED, bound to that claim
     3. the page is checked again    (the caller re-reads the form and its values)
     4. commit_clicking              re-reads consent, mode, the claim (CLAIMED, in its lease) and the digest; the
                                     intent becomes CLICKING and the execution SUBMITTING in one commit
-    5. the click                    GuardedPage.submit(ticket): the ticket re-reads that CLICKING intent first
+    5. the click                    GuardedPage.submit(ticket) on a Playwright page, or the browser-use runner's signed
+                                    `submit` (`signed_submit`); either way the CLICKING intent is re-read first
     6. after_click                  CONFIRMING, and the canonical state READY_TO_APPLY → APPLYING
-    7. ConfirmationVerifier         the adapter's evidence rule; anything less is UNCERTAIN
+    7. ConfirmationVerifier         the site's evidence; anything less is UNCERTAIN
     8. confirm / uncertain          confirmed → apply_queue.record_submission (the one recorder: APPLYING → APPLIED,
                                     provenance verified_browser); otherwise the claim and the intent are UNCERTAIN
                                     and a person says what happened. Nothing ever clicks again for that claim.
@@ -44,7 +47,6 @@ from app.models import (
     Job,
     SubmissionIntent,
 )
-from app.settings import get_settings
 
 log = logging.getLogger("jobhunt.submission")
 ARMED, CLICKING, CONFIRMED, UNCERTAIN, ABORTED = "ARMED", "CLICKING", "CONFIRMED", "UNCERTAIN", "ABORTED"
@@ -126,23 +128,30 @@ class PreSubmitValidator:
     def check(db: Session, task: ApplicationExecutionTask, job: Job | None, *, form: Any, page: dict[str, Any],
               files: dict[str, str], expected_digests: dict[str, str], claim: ApplicationClaim | None = None,
               ) -> Validation:
-        from app.services import application_execution, apply_queue, approval, ats_forms, ats_map
+        from app.services import (
+            application_backends,
+            application_execution,
+            apply_queue,
+            approval,
+            ats_forms,
+            ats_map,
+        )
+        from app.services.ats_forms import generic
 
-        settings = get_settings()
         if job is None or task is None or job.id != task.job_id or job.user_id != task.user_id:
             return _refuse("OWNERSHIP", "The execution and the job do not belong together")
         if db.info.get("user_id") not in (None, task.user_id):
             return _refuse("OWNERSHIP", "This run does not belong to the signed-in account")
         if application_execution.mode() != "guarded_auto" or task.mode != "GUARDED_AUTO":
-            return _refuse("MODE", "Guarded submission is not enabled on this server")
+            return _refuse("MODE", "Auto submit is not enabled on this server")
         if not consent(db, task.user_id)["enabled"]:
-            return _refuse("NO_CONSENT", "Guarded submission is off for this account", human=True)
+            return _refuse("NO_CONSENT", "Auto submit is off for this account", human=True)
         match = ats_map.for_job(job)
-        if match is None or not match.allowed_by(settings.guarded_routes):
-            return _refuse("ROUTE_NOT_ALLOWED", "This application's route is not allowlisted for guarded submission")
-        if form is None or form.adapter != match.adapter:
-            return _refuse("NO_DETERMINISTIC_ADAPTER", "Guarded submission needs the route's own form adapter")
-        if (page.get("host") or "") != match.apply_domain:
+        if match is None or not match.auto_submit:
+            return _refuse("ROUTE_NOT_SUPPORTED", "Applications on this site are not automated")
+        if form is None or form.adapter not in {a for a in (match.adapter, generic.NAME) if a}:
+            return _refuse("UNKNOWN_FORM", "The form was not read by the route's adapter or the browser-use backend")
+        if (page.get("host") or "") not in application_backends.allowed_hosts(match, page.get("url")):
             return _refuse("WRONG_DOMAIN", "The page is not on the application's own domain")
         if page.get("problem"):
             human = page["problem"] in ats_forms.HUMAN_BLOCKERS
@@ -162,13 +171,15 @@ class PreSubmitValidator:
         approved = set(consent(db, task.user_id)["attestations"])
         for f in form.fields:
             entry = plan.get(f.id) or {}
-            if f.required and entry.get("status") != "RESOLVED":
+            person = entry.get("status") == "PERSON"  # the person filled it in the window, then pressed Continue
+            if f.required and entry.get("status") != "RESOLVED" and not person:
                 return _refuse("REQUIRED_FIELDS_MISSING", f"A required field has no verified answer ({f.label[:80]})",
                                human=True)
             if entry.get("sensitive") and entry.get("status") == "RESOLVED" and not entry.get("confirmed"):
                 return _refuse("SENSITIVE_NOT_CONFIRMED", "A sensitive answer was not confirmed for this run",
                                human=True)
-            if f.legal and (f.required or entry.get("status") == "RESOLVED") and normalize(f.label) not in approved:
+            if f.legal and not person and (f.required or entry.get("status") == "RESOLVED") \
+                    and normalize(f.label) not in approved:
                 return _refuse("LEGAL_ATTESTATION", f"The form asks for an attestation you have not approved: "
                                                     f"{f.label[:200]}", human=True)
         if page.get("missing"):
@@ -185,7 +196,7 @@ class PreSubmitValidator:
             return _refuse("CLAIM_CONFLICT", "Another submission of this posting is open, recorded or uncertain")
         if claim is not None and (claim.status != apply_queue.CLAIMED or claim.lease_expires_at <= utcnow()):
             return _refuse("CLAIM_LOST", "This run's claim is no longer open")
-        return Validation(True, facts={"route": match.route, "domain": match.apply_domain})
+        return Validation(True, facts={"route": match.route, "domain": page.get("host") or match.apply_domain})
 
 
 # ───────────── the intent ─────────────
@@ -267,7 +278,7 @@ def commit_clicking(db: Session, task: ApplicationExecutionTask, intent: Submiss
     claim = db.get(ApplicationClaim, intent.claim_id, populate_existing=True)
     job = db.get(Job, task.job_id)
     if application_execution.mode() != "guarded_auto" or not consent(db, task.user_id)["enabled"]:
-        return _refuse("NO_CONSENT", "Guarded submission was switched off", human=True)
+        return _refuse("NO_CONSENT", "Auto submit was switched off", human=True)
     if claim is None or claim.status != apply_queue.CLAIMED or claim.lease_expires_at <= utcnow() \
             or claim.execution_id != task.id:
         return _refuse("CLAIM_LOST", "This run's claim is no longer open")
@@ -302,6 +313,14 @@ def still_clicking(sessions: Any, user_id: int, task_id: int, intent_id: int) ->
                     and application_execution.mode() == "guarded_auto" and consent(db, user_id)["enabled"])
 
 
+def signed_submit(session: Any, key: str, domain: str) -> str:
+    """The browser-use runner's one-click authorization for `key` (the form's submit control) on `domain`. Only
+    called by the SUBMIT node after `commit_clicking` (the intent CLICKING) and `still_clicking`."""
+    from app.infrastructure.application_browser.browser_use_sidecar import sign_action
+
+    return sign_action(session, "SUBMIT", key, domain)
+
+
 def after_click(db: Session, task: ApplicationExecutionTask, intent: SubmissionIntent) -> None:
     """The click happened (or may have): CONFIRMING, and the job is APPLYING. Does not commit."""
     from app.services import application_execution
@@ -327,29 +346,37 @@ class Confirmation:
 
 class ConfirmationVerifier:
     """Whether the site's own evidence shows the application was received. All three of: a successful non-GET response
-    from the application's domain after the click, the application form gone from the page, and the site's
-    confirmation (a confirmation path, or its wording). A click, a navigation or a success-looking page alone is
-    never enough."""
+    from the application's site after the click (its own domain, or another host of the same site: a board may post
+    to its API host), the application form gone from the page, and the site's confirmation (a confirmation path, or
+    its wording). A click, a navigation or a success-looking page alone is never enough. Uploads do not count.
+
+    `evidence` is a Playwright page's (html) or the browser-use runner's (text and the count of form inputs left)."""
 
     @staticmethod
     def verify(adapter: str, domain: str, evidence: dict[str, Any]) -> Confirmation:
-        responses = [r for r in evidence.get("responses") or [] if r.get("host") == domain]
+        site = same_site(domain)
+        responses = [r for r in evidence.get("responses") or [] if not r.get("upload") and site(r.get("host"))]
         posted = [r for r in responses if 200 <= int(r.get("status") or 0) < 400]
         failed = [r for r in responses if int(r.get("status") or 0) >= 400]
         from app.services.ats_forms import greenhouse
 
         soup = BeautifulSoup(evidence.get("html") or "", "html.parser")
-        # Every form markup the adapter reads (the classic board and the newer ones): any of them still there means
-        # the application was not taken.
-        form_gone = soup.select_one(greenhouse.FORM_SELECTOR if adapter == "greenhouse"
-                                    else "form input[type=file]") is None
-        text = " ".join(soup.get_text(" ", strip=True).lower().split())[:20000]
+        if evidence.get("html"):
+            # Every form markup the adapter reads (the classic board and the newer ones): any of them still there
+            # means the application was not taken.
+            form_gone = soup.select_one(greenhouse.FORM_SELECTOR if adapter == "greenhouse"
+                                        else "form input[type=file]") is None
+            page_text = soup.get_text(" ", strip=True)
+        else:
+            form_gone = int(evidence.get("form_inputs") or 0) == 0
+            page_text = evidence.get("text") or ""
+        text = " ".join(page_text.lower().split())[:20000]
         segments = [s for s in re.sub(r"^https?://[^/]+", "", (evidence.get("url") or "").lower().split("?")[0])
                     .split("/") if s]
         worded = any(marker in text for marker in CONFIRMATION_MARKERS)
         at_path = any(p in segment for segment in segments[-2:] for p in CONFIRMATION_PATHS)
         found = re.search(r"(?:confirmation|reference|application)\s*(?:number|id|#)\s*[:#]?\s*([A-Z0-9-]{4,40})",
-                          soup.get_text(" ", strip=True), re.IGNORECASE)
+                          page_text, re.IGNORECASE)
         facts = {"responses": [{k: r.get(k) for k in ("method", "status", "host")} for r in responses][:10],
                  "form_gone": form_gone, "confirmation_wording": worded, "confirmation_path": at_path,
                  "final_host": (re.sub(r"^https?://", "", evidence.get("url") or "").split("/")[0])[:200]}
@@ -362,6 +389,19 @@ class ConfirmationVerifier:
         if not (worded or at_path):
             return Confirmation(False, facts, reason="The site showed no confirmation")
         return Confirmation(True, facts, confirmation_id=found.group(1)[:200] if found else None)
+
+
+def same_site(domain: str) -> Any:
+    """A test for hosts of the same site as `domain`: the domain itself, or a host under its last two labels
+    (job-boards.greenhouse.io → boards-api.greenhouse.io)."""
+    domain = (domain or "").lower().strip(".")
+    parts = domain.split(".")
+    base = ".".join(parts[-2:]) if len(parts) > 2 else domain
+
+    def test(host: Any) -> bool:
+        host = str(host or "").lower().strip(".")
+        return bool(host) and (host == domain or host == base or host.endswith("." + base))
+    return test
 
 
 def confirm(db: Session, task: ApplicationExecutionTask, intent: SubmissionIntent, confirmation: Confirmation) -> str:

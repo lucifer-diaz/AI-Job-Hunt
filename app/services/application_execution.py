@@ -8,9 +8,10 @@
 
 APPLICATION_EXECUTION_MODE (off by default) chooses what a run may do: `observe` reads the form and resolves where
 each answer comes from; `assist` also fills it in an ephemeral browser page and validates it, ending READY_TO_SUBMIT,
-and a person submits through the Apply kit, which takes the pre-submit claim (apply_queue.begin_submission).
-`guarded_auto` (Phase 6) also lets a run of a consenting account, on an allowlisted route, click the final Submit —
-only through app.services.submission, holding the same claim and a SubmissionIntent. The submit stages (SUBMITTING,
+and a person submits (in the kept browser window, or on the site). `guarded_auto` (Phase 6, auto submit) lets a run
+of an account that turned Auto submit on submit the application itself, on any route a browser can complete — only
+through app.services.submission, holding the shared claim and a SubmissionIntent — and queues that run when the job is
+approved (`on_approved`). The submit stages (SUBMITTING,
 CONFIRMING, CONFIRMED) are refused here (`set_stage`) unless that intent is passed, and by the column otherwise.
 
 PostgreSQL is the only queue. Waiting for a person uses no attempt and no polling: a task waiting at NEEDS_INPUT is
@@ -150,7 +151,9 @@ def enqueue(db: Session, job: Job, *, execution_mode: str | None = None, reason:
     from app.services import apply_queue, approval
 
     server = mode()
-    wanted = (execution_mode or ("ASSIST" if server == "guarded_auto" else server)).upper()
+    # A run sent to the browser-use window by a person fills it for them to submit (ASSIST) unless they say otherwise.
+    fallback = "ASSIST" if backend is not None and server in ("assist", "guarded_auto") else None
+    wanted = (execution_mode or fallback or default_mode(db, job.user_id)).upper()
     if not routes(db):
         raise ExecutionRefused("The application worker is off (APPLICATION_EXECUTION_MODE, AGENT_GRAPHS_ENABLED and "
                                "PostgreSQL are needed)", "OFF")
@@ -192,15 +195,24 @@ def enqueue(db: Session, job: Job, *, execution_mode: str | None = None, reason:
     return task
 
 
+def default_mode(db: Session, user_id: int) -> str:
+    """The mode a run gets when nobody names one: auto submit (GUARDED_AUTO) for an account that turned it on, on a
+    server that allows it; otherwise fill only (ASSIST), or the server's own mode when it is lower."""
+    from app.services import submission
+
+    server = mode()
+    if server == "guarded_auto":
+        return "GUARDED_AUTO" if submission.consent(db, user_id)["enabled"] else "ASSIST"
+    return server.upper()
+
+
 def backend_refusal(backend: str, mode_: str) -> None:
-    """A person may send a run to the browser-use backend (a visible window when BROWSER_USE_HEADLESS is false) for
-    OBSERVE or ASSIST. Never for GUARDED_AUTO, which needs the route's own form adapter end to end."""
+    """A person may send a run to the browser-use backend (a visible window when BROWSER_USE_HEADLESS is false), in
+    any mode."""
     from app.infrastructure.application_browser.browser_use_sidecar import configured
 
     if backend != BROWSER_USE:
         raise ExecutionRefused("The only backend a run can be sent to is browser_use_webui", "BACKEND")
-    if mode_ == "GUARDED_AUTO":
-        raise ExecutionRefused("Guarded submission runs only on the route's own form adapter", "BACKEND")
     if not configured():
         raise ExecutionRefused("The browser-use backend is not set up on this server (BROWSER_USE_WEBUI_ENABLED, "
                                "BROWSER_USE_PYTHON)", "BACKEND_UNAVAILABLE")
@@ -212,14 +224,26 @@ def guarded_refusal(db: Session, job: Job) -> None:
     from app.services import ats_map, submission
 
     if not submission.consent(db, job.user_id)["enabled"]:
-        raise ExecutionRefused("Guarded submission is off for this account (Settings → Guarded submission)",
-                               "NO_CONSENT")
+        raise ExecutionRefused("Auto submit is off for this account (Settings → Auto submit)", "NO_CONSENT")
     match = ats_map.for_job(job)
-    if match is None or not match.guarded_capable:
-        raise ExecutionRefused("Guarded submission needs a route with a deterministic form adapter (Greenhouse)",
-                               "ROUTE_NOT_GUARDED")
-    if not match.allowed_by(get_settings().guarded_routes):
-        raise ExecutionRefused(f"The route {match.route} is not in APPLICATION_GUARDED_ROUTES", "ROUTE_NOT_ALLOWED")
+    if match is None or not match.auto_submit:
+        raise ExecutionRefused((match.note if match else None) or "Applications on this site are not automated",
+                               "ROUTE_NOT_SUPPORTED")
+
+
+def on_approved(db: Session, job: Job) -> None:
+    """Auto submit: a job the person approved is queued for submission at once (GUARDED_AUTO), when the account
+    turned Auto submit on and the server allows it. Anything that refuses it (not ready, an unsupported site, a claim
+    already open) leaves the job for the person, as before. Runs in a savepoint: approval never fails because of it."""
+    try:
+        if mode() != "guarded_auto" or not routes(db) or default_mode(db, job.user_id) != "GUARDED_AUTO":
+            return
+        with db.begin_nested():
+            enqueue(db, job, execution_mode="GUARDED_AUTO", reason="auto_submit")
+    except ExecutionRefused as exc:
+        log.info("auto submit not queued for job %s: %s", job.id, exc.code)
+    except Exception:
+        log.warning("auto submit could not be queued for job %s", job.id, exc_info=True)
 
 
 def _nudge_after_commit(db: Session) -> None:
@@ -323,6 +347,72 @@ def end_expired_takeovers(db: Session, now: datetime | None = None, limit: int =
         ended += 1
     db.commit()
     return ended
+
+
+SUBMITTED_IN_WINDOW = "SUBMITTED_IN_WINDOW"
+
+
+def watch_windows(db: Session, limit: int = 20) -> int:
+    """A window handed to the person works like a normal browser, so they may submit there themselves. Each pass reads
+    what those windows saw (non-GET responses, the page; never a value) and records a submission the site confirmed
+    (the same ConfirmationVerifier evidence as auto submit): an open claim of the run's own is resolved as submitted,
+    anything else is recorded as the person's report. The run then ends SUBMITTED_IN_WINDOW. Never raises. Commits."""
+    from urllib.parse import urlparse
+
+    from app.services import apply_queue, qualification, submission
+
+    try:
+        from app.infrastructure.application_browser.browser_use_sidecar import get_sidecars
+
+        manager = get_sidecars()
+        windows = manager.handed_over()[:limit]
+    except Exception:  # noqa: BLE001
+        return 0
+    recorded = 0
+    account = db.info.get("user_id")
+    for user_id, task_id in windows:
+        if account not in (None, user_id):
+            continue  # a session that belongs to one account only looks at that account's windows
+        db.info["user_id"] = user_id  # the recorder works as the window's own account
+        try:
+            task = db.get(ApplicationExecutionTask, task_id)
+            job = db.get(Job, task.job_id) if task is not None and task.user_id == user_id else None
+            if job is None or job.status != "approved":
+                continue
+            session = manager.get(user_id, task_id)
+            evidence = manager.run_threadsafe(session.call("evidence"), timeout=20) if session is not None else None
+            if not isinstance(evidence, dict):
+                continue
+            host = (urlparse(evidence.get("url") or "").hostname or "").lower()
+            confirmation = submission.ConfirmationVerifier.verify("browser_use", host, evidence)
+            evidence.clear()
+            if not confirmation.confirmed:
+                continue
+            claim = apply_queue.open_claim(db, job)
+            if claim is not None and claim.execution_id == task.id:
+                result = apply_queue.resolve_uncertain(db, job, claim.id, submitted=True,
+                                                       confirmation_id=confirmation.confirmation_id)
+            else:
+                result = apply_queue.record_submission(db, job, client="apply_kit",
+                                                       confirmation_id=confirmation.confirmation_id,
+                                                       submitted_via="browser_window")
+            if getattr(result, "status", "SUBMITTED") not in ("SUBMITTED", "ALREADY_APPLIED"):
+                db.rollback()
+                continue
+            task = db.get(ApplicationExecutionTask, task_id, populate_existing=True)
+            if task.status == PENDING:
+                task.status, task.completed_at = COMPLETED, utcnow()
+                qualification.stop_threads(db, [task.agent_thread_id], note="Submitted in the browser window")
+            task.outcome = task.outcome or "READY_TO_SUBMIT"
+            task.result_code, task.interrupt = SUBMITTED_IN_WINDOW, None
+            db.commit()
+            recorded += 1
+        except Exception:  # one window never stops the others, nor the pass
+            db.rollback()
+            log.warning("could not check the browser window of execution %s", task_id, exc_info=True)
+        finally:
+            db.info["user_id"] = account
+    return recorded
 
 
 def questions(db: Session, task: ApplicationExecutionTask) -> list[dict[str, Any]]:
@@ -678,24 +768,6 @@ def _close_window(task: ApplicationExecutionTask) -> None:
         log.debug("could not close the browser window of execution %s", task.id)
 
 
-
-def window_writes(db: Session, job: Job, on: bool) -> bool:
-    """The job's kept browser window (a filled ASSIST form, or fields left for the person) may submit only while the
-    person's own submission holds the shared claim: on when the Apply kit's Start submission took it, off again when
-    it is released. The window is never given a claim of its own. True when a window was switched. Never raises."""
-    task = latest(db, job.id)
-    if task is None:
-        return False
-    try:
-        from app.infrastructure.application_browser.browser_use_sidecar import get_sidecars
-
-        manager = get_sidecars()
-        if manager.get(task.user_id, task.id) is None:
-            return False
-        return bool(manager.run_threadsafe(manager.allow_writes(task.user_id, task.id, on), timeout=20))
-    except Exception:  # noqa: BLE001  the window stays as it was: unable to submit unless it already could
-        log.debug("could not switch the browser window of execution %s", task.id)
-        return False
 
 def on_job_deleted(db: Session, job_id: int) -> None:
     from app.services import qualification

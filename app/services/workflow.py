@@ -484,6 +484,9 @@ def approve_job(db: Session, job: Job, *, override: bool = False, note: str = ""
     from app.services import preparation
 
     preparation.on_decision(db, job, "approved")  # a preparation graph run waiting for this ends (never blocks)
+    from app.services import application_execution
+
+    application_execution.on_approved(db, job)  # auto submit, when the account turned it on (never blocks)
     db.commit()
     db.refresh(application)
     return application

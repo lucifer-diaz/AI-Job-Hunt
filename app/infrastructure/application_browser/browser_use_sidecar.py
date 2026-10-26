@@ -236,26 +236,15 @@ class SidecarManager:
             return None
         return session
 
-    async def park(self, session: SidecarSession, minutes: int, *, writes: bool = False) -> bool:
-        """Keep a headful session for a person to finish something in the window. Headless sessions cannot be taken
-        over and are closed instead. `writes`: the window may send non-GET requests to the route's hosts — a login,
-        a one-time code or a signup needs them. A form left for the person to fill or submit never gets them here: a
-        submission starts only with the shared claim (`allow_writes`, from the Apply kit's Start submission)."""
+    async def park(self, session: SidecarSession, minutes: int) -> bool:
+        """Hand a headful session to the person for `minutes`: it then behaves like a normal browser (it sends what they
+        send, uploads and their own submission included). Headless sessions cannot be taken over and are closed
+        instead."""
         if session.headless or not session.alive:
             await self.close(session.user_id, session.task_id)
             return False
         session.parked_until = time.monotonic() + minutes * 60
-        await session.call("set_takeover", on=True, writes=writes, seconds=minutes * 60)
-        return True
-
-    async def allow_writes(self, user_id: int, task_id: int, on: bool) -> bool:
-        """Let a parked window submit (the person's submission now holds the shared claim), or stop it again (the
-        claim was released). False when that execution has no parked window."""
-        session = self.get(user_id, task_id)
-        if session is None or session.parked_until is None:
-            return False
-        await session.call("set_takeover", on=True, writes=on,
-                           seconds=max(1, int(session.parked_until - time.monotonic())))
+        await session.call("set_takeover", on=True, writes=True, seconds=minutes * 60)
         return True
 
     async def hold(self, session: SidecarSession, minutes: int) -> None:
@@ -286,6 +275,12 @@ class SidecarManager:
         now = time.monotonic()
         return [task for (user, task), s in self._sessions.items()
                 if user == user_id and s.parked_until is not None and s.parked_until >= now and s.alive]
+
+    def handed_over(self) -> list[tuple[int, int]]:
+        """Every (account, execution) whose window a person has now (parked, alive, in its time)."""
+        now = time.monotonic()
+        return [key for key, s in list(self._sessions.items())
+                if s.parked_until is not None and s.parked_until >= now and s.alive and not s.headless]
 
 
 _manager: SidecarManager | None = None

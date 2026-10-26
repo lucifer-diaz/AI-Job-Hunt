@@ -197,8 +197,7 @@ def configure(monkeypatch, mode: str = "assist") -> None:
     for name, value in (("agent_graphs_enabled", True), ("application_execution_mode", mode),
                         ("llm_provider", "mock"), ("rag_retrieval_mode", "off"), ("rag_vector_enabled", False),
                         ("job_insights_enabled", False), ("browser_use_webui_enabled", False),
-                        ("application_auth_sessions_enabled", False), ("application_login_domains", ""),
-                        ("application_guarded_routes", "")):
+                        ("application_auth_sessions_enabled", False), ("application_login_domains", "")):
         monkeypatch.setattr(settings, name, value)
 
 

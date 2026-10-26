@@ -397,11 +397,10 @@ class Settings(BaseSettings):
     application_execution_retry_seconds: int = 120
     application_execution_lease_seconds: int = 300
     application_execution_step_timeout_seconds: int = 90
-    # Phase 6 (app.services.submission, README §10b). APPLICATION_EXECUTION_MODE also takes guarded_auto: a run may
-    # click a form's final Submit, only for an account that consented, on a route listed here, after the pre-submit
-    # validator, the shared claim and a SubmissionIntent, and only once (an unknown outcome waits for a person).
-    # `autonomous` is refused when settings load: there is no unattended production mode.
-    application_guarded_routes: str = ""  # comma-separated ATS routes ("greenhouse", "greenhouse:acme"); empty = none
+    # Phase 6 (app.services.submission, README §10b). APPLICATION_EXECUTION_MODE also takes guarded_auto (auto
+    # submit): a run of an account that turned Auto submit on submits the application itself, on any route a browser
+    # can complete, after the pre-submit validator, the shared claim and a SubmissionIntent, and only once; it stops
+    # for the person only when something needs them (an unknown outcome included). `autonomous` is refused.
     application_max_actions: int = 60  # browser actions per run (fills, clicks, uploads), whatever proposes them
     application_takeover_ttl_minutes: int = 15  # how long a paused headful session waits for the person
     # Saved ATS logins (app.services.ats_auth): a session a person logged in to, and an encrypted password vault.
@@ -483,8 +482,8 @@ class Settings(BaseSettings):
     @classmethod
     def _no_autonomous_mode(cls, value: str) -> str:
         if (value or "").strip().lower() == "autonomous":
-            raise ValueError("APPLICATION_EXECUTION_MODE=autonomous is not available: the furthest a run may go is "
-                             "guarded_auto, per consenting account and allowlisted route")
+            raise ValueError("APPLICATION_EXECUTION_MODE=autonomous is not available: auto submit is guarded_auto, "
+                             "for accounts that turned Auto submit on")
         return value
 
     @property
@@ -492,10 +491,6 @@ class Settings(BaseSettings):
         """off, observe, assist or guarded_auto; anything else, or agent graphs being off, is off."""
         mode = (self.application_execution_mode or "off").strip().lower()
         return mode if self.agent_graphs_enabled and mode in ("observe", "assist", "guarded_auto") else "off"
-
-    @property
-    def guarded_routes(self) -> frozenset[str]:
-        return frozenset(r.strip().lower() for r in (self.application_guarded_routes or "").split(",") if r.strip())
 
     @property
     def login_domains(self) -> frozenset[str]:

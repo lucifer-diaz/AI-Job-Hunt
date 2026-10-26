@@ -60,8 +60,7 @@ Job Hunt OS runs the same browser-use release itself, from the checkout's own Py
 
 | Variable | Default | What it does |
 | --- | --- | --- |
-| `APPLICATION_EXECUTION_MODE` | `off` | `observe`, `assist` or `guarded_auto` (needs `AGENT_GRAPHS_ENABLED`, PostgreSQL). `autonomous` is refused at startup. |
-| `APPLICATION_GUARDED_ROUTES` | empty | Routes guarded runs may submit on: `greenhouse` (every tenant) or `greenhouse:acme`. Only guarded-capable ATSs count. |
+| `APPLICATION_EXECUTION_MODE` | `off` | `observe`, `assist` or `guarded_auto` (auto submit, for accounts that turned it on; needs `AGENT_GRAPHS_ENABLED`, PostgreSQL). `autonomous` is refused at startup. |
 | `APPLICATION_MAX_ACTIONS` | 60 | Browser actions per run, whatever proposes them. |
 | `APPLICATION_TAKEOVER_TTL_MINUTES` | 15 | How long a kept window waits for you. |
 | `APPLICATION_AUTH_SESSIONS_ENABLED` | false | Start runs with your saved session for the site. |
@@ -115,12 +114,12 @@ Each step is separately reversible. A merged pull request turns nothing on.
 2. **`assist`.** You submit every application yourself; the browser window can stay open for you (headful).
 3. **Logins.** Saved sessions first (`APPLICATION_AUTH_SESSIONS_ENABLED`), then the vault for chosen domains
    (`APPLICATION_LOGIN_DOMAINS`).
-4. **Guarded submission.** Requires your explicit go-ahead for one real application chosen by you.
-   - Set `APPLICATION_EXECUTION_MODE=guarded_auto` and `APPLICATION_GUARDED_ROUTES=greenhouse:<one tenant>`.
-   - Turn it on in Settings → Guarded submission, with the attestations you approve.
-   - Watch the first run end CONFIRMED with the site's evidence before you widen the allowlist.
-5. **Rollback.** `APPLICATION_EXECUTION_MODE=assist` stops guarded runs immediately; uncertain submissions stay for
-   you to resolve. `BROWSER_USE_WEBUI_ENABLED=false` sends every form back to the Phase 5 path.
+4. **Auto submit.** Real applications are sent.
+   - Set `APPLICATION_EXECUTION_MODE=guarded_auto`.
+   - Turn it on in Settings → Auto submit, with the attestations you approve.
+   - Every job you approve is then submitted; watch the first runs end CONFIRMED with the site's evidence.
+5. **Rollback.** `APPLICATION_EXECUTION_MODE=assist` (or Auto submit off in Settings) stops auto submit immediately;
+   uncertain submissions stay for you to resolve. `BROWSER_USE_WEBUI_ENABLED=false` sends every form back to the Phase 5 path.
 
 ## Security notes
 

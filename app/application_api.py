@@ -129,29 +129,21 @@ def _takeover_view(task: Any) -> dict[str, Any] | None:
 @router.post("/api/jobs/{job_id}/submission/start")
 def start_submission(job_id: int, db: Session = Depends(get_user_db)) -> dict[str, Any]:
     job = _job(db, job_id)
-    from app.services import application_execution
-
     result = apply_queue.begin_submission(db, job, client="apply_kit")
     if not result.ok:
         raise HTTPException(409, {"message": result.reason, "status": result.status,
                                   "conflict_job_id": result.conflict_job_id,
                                   "claim": claim_view(result.claim)})
-    # A kept browser window holding this job's filled form may send it now, and only now that the claim is held.
-    window = application_execution.window_writes(db, job, True)
-    return {"status": "CLAIMED", "claim": claim_view(result.claim, with_token=True, job_id=job.id),
-            "window_can_submit": window}
+    return {"status": "CLAIMED", "claim": claim_view(result.claim, with_token=True, job_id=job.id)}
 
 
 @router.post("/api/jobs/{job_id}/submission/release")
 def release_submission(job_id: int, payload: ReleaseIn, db: Session = Depends(get_user_db)) -> dict[str, Any]:
     job = _job(db, job_id)
-    from app.services import application_execution
-
     try:
         claim = apply_queue.release_claim(db, job, payload.claim_token, payload.reason)
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
-    application_execution.window_writes(db, job, False)  # no claim, no submission from the kept window
     return {"status": claim.status, "claim": claim_view(claim)}
 
 
@@ -285,10 +277,8 @@ def save_login(task_id: int, payload: SaveLoginIn, db: Session = Depends(get_use
 @router.get("/api/settings/guarded-application")
 def guarded_consent(db: Session = Depends(get_user_db), user: CurrentUser = Depends(current_user)) -> dict[str, Any]:
     from app.services import application_execution, submission
-    from app.settings import get_settings
 
-    return {**submission.consent(db, user.id), "server_mode": application_execution.available_mode(db),
-            "allowlisted_routes": sorted(get_settings().guarded_routes)}
+    return {**submission.consent(db, user.id), "server_mode": application_execution.available_mode(db)}
 
 
 @router.put("/api/settings/guarded-application")

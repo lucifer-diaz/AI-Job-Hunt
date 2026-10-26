@@ -882,7 +882,8 @@ Allowed status: NOT_STARTED, PLANNING, IN_PROGRESS, IN_REVIEW, MERGED, BLOCKED, 
 - New migrations, flags, APIs:
   - **Migration:** `0055` (`submission_intents`, `ats_routes`, `ats_credentials`, `ats_sessions`;
     `application_execution_tasks.backend`; mode GUARDED_AUTO; LLM stage BROWSER_NAVIGATION).
-  - **Flags:** `APPLICATION_EXECUTION_MODE=guarded_auto` (autonomous refused), `APPLICATION_GUARDED_ROUTES`,
+  - **Migration:** `0056` re-asserts the BROWSER_NAVIGATION stage check (databases stamped by an early 0055 draft).
+  - **Flags:** `APPLICATION_EXECUTION_MODE=guarded_auto` (auto submit, per account; autonomous refused),
     `APPLICATION_MAX_ACTIONS`, `APPLICATION_TAKEOVER_TTL_MINUTES`, `APPLICATION_AUTH_SESSIONS_ENABLED`,
     `APPLICATION_LOGIN_DOMAINS`, `ATS_SESSION_MAX_DAYS`, `BROWSER_USE_WEBUI_ENABLED`, `BROWSER_USE_WEBUI_URL`,
     `BROWSER_USE_WEBUI_PATH`, `BROWSER_USE_PYTHON`, `BROWSER_USE_TIMEOUT_SECONDS`,
