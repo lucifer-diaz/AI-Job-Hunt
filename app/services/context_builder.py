@@ -712,8 +712,11 @@ def _drop_project(context: TaskContext) -> Any:
     def drop() -> bool:
         if not context.relevant_projects:
             return False
-        context.relevant_projects.pop()  # ordered most relevant first (_select_projects)
         shown = context.source_resume.get("projects")
+        rest = any(v for k, v in context.source_resume.items() if k != "projects")
+        if shown and len(shown) == 1 and not rest and not context.relevant_evidence:
+            return False  # the only thing left to tailor from (validate_tailoring_context): it stays
+        context.relevant_projects.pop()  # ordered most relevant first (_select_projects)
         if shown:
             shown.pop()
             if not shown:
@@ -732,6 +735,20 @@ def _drop_preferred_map_row(context: TaskContext) -> Any:
     return drop
 
 
+def _drop_tailoring_evidence(context: TaskContext, score: Any) -> Any:
+    """The Tailor needs something to tailor from: with no source resume left (projects may have gone before), the
+    last evidence item stays. Decided at each drop, not when the steps are built."""
+    from app.services.prompt_budget import drop_lowest
+
+    lowest = drop_lowest(context.relevant_evidence, score)
+
+    def drop() -> bool:
+        if not context.source_resume and len(context.relevant_evidence) <= 1:
+            return False
+        return lowest()
+    return drop
+
+
 def _refresh_targets(context: TaskContext, job: Job) -> None:
     """After a tailoring fact left the prompt: the requirement map cites only ids still shown, and the keyword
     targets count as supported only what the remaining facts prove."""
@@ -745,6 +762,30 @@ def _refresh_targets(context: TaskContext, job: Job) -> None:
     context.keyword_targets = keyword_targets(job, _shown_texts(context), _tailoring_sources(context))
 
 
+def _rematching(context: TaskContext) -> Any:
+    """Wraps a ranking drop of a candidate fact: the term overlap (candidate_matches / candidate_gaps) is counted
+    again from the facts still shown, so it never names a term only a dropped fact had. Only when the overlap was
+    counted from these facts in the first place (not with resume_source master_text, whose overlap comes from data
+    the prompt does not show): otherwise it is left as the builder made it."""
+    job = context.job_context or {}
+
+    def requirements() -> list[dict[str, Any]]:
+        return list(job.get("required") or []) + list(job.get("preferred") or [])
+
+    current = bool(job.get("structured")) and (job.get("candidate_matches"), job.get("candidate_gaps")) == tuple(
+        jc.candidate_match(requirements(), context))
+
+    def wrap(drop: Any) -> Any:
+        def run() -> bool:
+            if not drop():
+                return False
+            if current:
+                job["candidate_matches"], job["candidate_gaps"] = jc.candidate_match(requirements(), context)
+            return True
+        return run
+    return wrap
+
+
 def trim_steps(context: TaskContext, job: Job) -> list[Any]:
     """The trim steps of a ranking or tailoring context, in RANKING_TRIM_ORDER / TAILORING_TRIM_ORDER."""
     from app.services.prompt_budget import Step, drop_last, drop_lowest
@@ -756,12 +797,14 @@ def trim_steps(context: TaskContext, job: Job) -> list[Any]:
     responsibilities = listed if isinstance(listed, list) else []
     if context.task == "ranking":
         terms = job_terms(job)
+        rematched = _rematching(context)  # skills, bullets and evidence are what the term overlap counts
         steps = {"unverified_facts": drop_last(context.unverified_facts),
-                 "extra_skills": _drop_extra_skill(context, terms), "projects": drop_last(context.relevant_projects),
+                 "extra_skills": rematched(_drop_extra_skill(context, terms)),
+                 "projects": drop_last(context.relevant_projects),
                  "preferred_requirements": _drop_preferred(context),
                  "responsibilities": drop_last(responsibilities, TRIM_KEEP_RESPONSIBILITIES),
-                 "evidence": drop_lowest(context.relevant_evidence, evidence_score),
-                 "bullets": _drop_ranking_bullet(context, terms)}
+                 "evidence": rematched(drop_lowest(context.relevant_evidence, evidence_score)),
+                 "bullets": rematched(_drop_ranking_bullet(context, terms))}
         return [Step(kind, steps[kind]) for kind in RANKING_TRIM_ORDER]
     if context.task != "tailoring":
         return []
@@ -780,9 +823,7 @@ def trim_steps(context: TaskContext, job: Job) -> list[Any]:
              "preferred_requirement_map": _drop_preferred_map_row(context),
              "preferred_requirements": _drop_preferred(context),
              "responsibilities": drop_last(responsibilities, TRIM_KEEP_RESPONSIBILITIES),
-             # the Tailor needs something to tailor from: with no source resume, the last evidence item stays
-             "evidence": refreshed(drop_lowest(context.relevant_evidence, evidence_score,
-                                               floor=0 if context.source_resume else 1))}
+             "evidence": refreshed(_drop_tailoring_evidence(context, evidence_score))}
     return [Step(kind, steps[kind]) for kind in TAILORING_TRIM_ORDER]
 
 

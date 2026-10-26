@@ -974,6 +974,17 @@ def _failed(db: Session, claimed: TaskClaim, exc: Exception, now: datetime) -> s
     return outcome
 
 
+def ranking_job_hash(job: Job, context: Any) -> str:
+    """The posting side of a ranking's identity. The structured requirements are part of the input: a posting
+    parsed after a ranking is a new input. A prompt trimmed to a budget may also keep fewer responsibilities, so
+    then they count too; untrimmed they follow from the structured hash, and the hash stays what it always was."""
+    job_context = context.job_context
+    return _hash({**posting_facts(job), "description": job.description or "",
+                  "structured": job.structured_description_hash,
+                  "requirements": job_context.get("required", []) + job_context.get("preferred", []),
+                  **({"responsibilities": job_context.get("responsibilities", [])} if context.stats.trimmed else {})})
+
+
 def _identical(db: Session, job_id: int, inputs: RankingInputs) -> JobRanking | None:
     return db.scalars(select(JobRanking).where(
         JobRanking.job_id == job_id, JobRanking.forced.is_(False),
@@ -1095,10 +1106,7 @@ def _process(db: Session, claimed: TaskClaim, clock: Callable[[], datetime]) -> 
         resume_content_hash=snapshot.content_hash, profile_hash=_hash(ranking_profile_facts(profile)),
         # Covers the selected resume facts and their verification too, so verifying data leads to a fresh ranking.
         evidence_hash=_hash({"evidence": evidence, "context": latest_ranking_context_hash(context)}),
-        # The structured requirements are part of the input: a posting parsed after a ranking is a new input.
-        job_hash=_hash({**posting_facts(job), "description": job.description or "",
-                        "structured": job.structured_description_hash,
-                        "requirements": context.job_context.get("required", []) + context.job_context.get("preferred", [])}),
+        job_hash=ranking_job_hash(job, context),
         # Citable: the evidence list and the evidence behind each verified bullet (app.services.context_builder).
         verified_ids=frozenset(context.evidence_ids), policy=policy_for(db, claimed.user_id))
     if not claimed.force:

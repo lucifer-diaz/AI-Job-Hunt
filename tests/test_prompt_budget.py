@@ -186,7 +186,60 @@ def test_an_impossible_budget_keeps_what_a_decision_rests_on(ranked):
     assert context.candidate.get("summary")
 
 
-# ───────────── tailoring ─────────────
+def test_ranking_term_overlap_is_recounted_from_the_facts_still_shown(ranked):
+    from app.services import job_context as jc
+
+    user_id, job_id = ranked
+    plain, _ = build_and_render(user_id, job_id, "ranking")
+    context, _ = build_and_render(user_id, job_id, "ranking", 300)
+    assert plain.relevant_evidence and context.relevant_evidence == []
+    job = context.job_context
+    assert (job["candidate_matches"], job["candidate_gaps"]) == tuple(
+        jc.candidate_match(job["required"] + job["preferred"], context))
+    shown = jc._tokens(" ".join([*context.relevant_skills, *[
+        f"{r.get('job_title', '')} {r.get('company', '')} " + " ".join(b["text"] for b in r["bullets"])
+        for r in context.relevant_experience]]))
+    assert all(set(m["matched_terms"]) <= shown for m in job["candidate_matches"])
+
+
+def test_a_trimmed_rankings_identity_covers_the_responsibilities_it_kept(ranked):
+    from app.services import ranker
+
+    user_id, job_id = ranked
+    with session(user_id) as db:
+        job = db.get(Job, job_id)
+        plain, _ = build_and_render(user_id, job_id, "ranking")
+        # Untrimmed, the hash is what it always was: no existing ranking is invalidated.
+        assert ranker.ranking_job_hash(job, plain) == ranker._hash({
+            **ranker.posting_facts(job), "description": job.description or "",
+            "structured": job.structured_description_hash,
+            "requirements": plain.job_context["required"] + plain.job_context["preferred"]})
+        trimmed, _ = build_and_render(user_id, job_id, "ranking", 300)
+        fewer = copy.deepcopy(trimmed)
+        fewer.job_context["responsibilities"].pop()
+        assert ranker.ranking_job_hash(job, fewer) != ranker.ranking_job_hash(job, trimmed)
+        db.rollback()
+
+
+
+def test_tailoring_keeps_the_last_thing_it_can_tailor_from(ranked):
+    user_id, job_id = ranked
+    with session(user_id) as db:
+        profile, job = profile_for(db), db.get(Job, job_id)
+        context = cb.build_tailoring_context(db, profile, job)
+        project = {"name": "Stream", "bullets": [{"text": "Built a Kafka stream processor"}]}
+        context.relevant_projects, context.relevant_evidence = [project], []
+        context.source_resume = {"projects": [{"name": "Stream", "bullets": ["Built a Kafka stream processor"]}]}
+        steps = {step.kind: step.drop for step in cb.trim_steps(context, job)}
+        assert steps["projects"]() is False and context.source_resume["projects"]
+        evidence = {"id": 1, "claim": "Ran Kafka", "company": "A", "role": "Engineer"}
+        context.relevant_evidence.append(evidence)
+        assert steps["projects"]() is True and not context.source_resume
+        assert steps["evidence"]() is False and context.relevant_evidence == [evidence]
+        cb.validate_tailoring_context(context, len(context.roles))
+        db.rollback()
+
+
 
 def test_tailoring_trims_spare_bullets_first_and_keeps_citations_consistent(ranked):
     user_id, job_id = ranked
