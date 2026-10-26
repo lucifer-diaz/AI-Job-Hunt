@@ -130,8 +130,6 @@ class Config:
     needs: str = ""  # what else must be set for this to do anything, in words
 
 
-OFF_SHADOW_ON = ("Off: as before, without the graph. Shadow: as before, and the graph re-checks a few finished runs "
-                 "read-only to compare. On: the graph runs it.")
 GROUPS = (("graphs", "Agent graphs (LangGraph)",
            ("LangGraph runs a workflow as a checkpointed graph that can pause for you and resume. Nothing here calls "
             "a model by itself: each graph drives the same workers and models as before.")),
@@ -145,21 +143,24 @@ CONFIG: dict[str, Config] = {c.name: c for c in (
            (Choice("false", "Off", "Every workflow runs the classic way; the graph modes and the application worker "
                                    "below do nothing."),
             Choice("true", "On", "Graph runs are allowed: the modes below decide which workflows use them."))),
-    Config("qualification_graph_mode", "graphs", "Qualification (screen, recover, parse, rank)", OFF_SHADOW_ON,
+    Config("qualification_graph_mode", "graphs", "Qualification",
+           "Screening new jobs, recovering missing descriptions, parsing and ranking them.",
            "choice", (Choice("off", "Off", "Jobs are screened, recovered, parsed and ranked by the services, as before."),
                       Choice("shadow", "Shadow", "As before, and a few decided jobs a day are re-run through the graph "
                                                  "read-only and compared. No model call unless a paid budget is set."),
                       Choice("on", "On", "New jobs are qualified by the graph, which drives the same recovery, parse "
                                          "and ranking tasks.")),
            needs="LangGraph agent graphs on"),
-    Config("preparation_graph_mode", "graphs", "Resume preparation (tailor, check, review)", OFF_SHADOW_ON, "choice",
+    Config("preparation_graph_mode", "graphs", "Resume preparation",
+           "Tailoring a qualified job's resume, checking it against your evidence and reviewing it.", "choice",
            (Choice("off", "Off", "Automatic tailoring queues the tailor worker, as before."),
             Choice("shadow", "Shadow", "As before, and a few reviewed packets a day are re-checked by the graph "
                                        "read-only. Never a model call."),
             Choice("on", "On", "Qualified jobs are prepared by the graph: tailoring, evidence checks, the review "
                                "decision, a bounded revision loop, then your approval.")),
            needs="LangGraph agent graphs on"),
-    Config("job_insights_graph_mode", "graphs", "Job insights research", OFF_SHADOW_ON, "choice",
+    Config("job_insights_graph_mode", "graphs", "Job insights research",
+           "Company, salary and interview research for approved jobs.", "choice",
            (Choice("off", "Off", "Company, salary and interview research runs as before."),
             Choice("shadow", "Shadow", "As before, and the graph's own checks re-run each finished research read-only."),
             Choice("on", "On", "Each research task runs as a graph on the same task.")),

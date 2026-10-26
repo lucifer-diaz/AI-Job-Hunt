@@ -342,18 +342,38 @@ function renderApplyingSettings() {
     `${(a.routes || []).map(r => `<div class="row gap8 mt6 wrap"><span class="small b">${esc(r.label)}</span><span class="small mono">${esc(r.route)}</span><span class="xs muted grow">${esc(r.company || '')}${r.source_board ? ` · via ${esc(r.source_board)}` : ''}</span>${r.auth_required !== 'none' ? pill(r.has_session ? 'signed in' : r.has_credential ? 'login saved' : `needs ${r.auth_required}`, r.has_session || r.has_credential ? 'good' : 'warn') : ''}${pill(r.auto_submit ? 'auto submit' : 'you apply', r.auto_submit ? 'good' : 'muted')}${r.last_outcome ? `<span class="xs muted">${esc(r.last_outcome)}</span>` : ''}</div>`).join('') || '<p class="settings-help">No approved applications yet.</p>'}`);
   return consent + logins + routes;
 }
-// Settings → AI agents & automation (app.services.server_settings.CONFIG): every option is a choice with what it does.
-// A preset fills the choices for a way of working; nothing is saved until Save. Only an admin may change them.
+// Settings → AI agents & automation (app.services.server_settings.CONFIG): every option is a choice that says what it
+// does. A preset fills the choices for a way of working; nothing is saved until Save. Only an admin may change them.
+const AUTOMATION_GRAPH_MODES = ['qualification_graph_mode', 'preparation_graph_mode', 'job_insights_graph_mode', 'application_execution_mode'];
 function automationValue(a, item) {
   const draft = S.forms.automation || {};
   return item.name in draft ? String(draft[item.name]) : item.value;
 }
+function automationOf(a, name) {
+  const item = a.settings.find(s => s.name === name);
+  return item ? automationValue(a, item) : '';
+}
+function automationChanges(a) {
+  return Object.entries(S.forms.automation || {}).filter(([k, v]) => { const item = a.settings.find(s => s.name === k); return item && String(v) !== item.value; });
+}
+// What happens to an approved job with the choices as they stand (unsaved ones included), in one sentence.
+function automationSummary(a) {
+  const graphs = automationOf(a, 'agent_graphs_enabled') === 'true' && a.environment.postgres;
+  const mode = graphs ? automationOf(a, 'application_execution_mode') : 'off';
+  const visible = automationOf(a, 'browser_use_headless') === 'false';
+  const browser = automationOf(a, 'browser_use_webui_enabled') === 'true' && a.environment.browser_use_python;
+  return {
+    off: ['You apply yourself', 'Approved jobs wait for you in the Apply kit; nothing runs on its own.'],
+    observe: ['Forms are read, not filled', 'For each approved job the worker reads the form and lists the questions that still need an answer.'],
+    assist: ['Forms are filled, you submit', `Each approved job’s form is filled${browser ? (visible ? ' in a visible browser window, left open for you to check and submit' : ' in a hidden browser; you submit on the site') : ' where a built-in adapter exists (Greenhouse); other sites wait for you'}.`],
+    guarded_auto: ['Applications are submitted for you', `Approving a job submits it, for accounts with Auto submit on${browser ? '' : ' (Greenhouse only until browser-use is on)'}. It stops for you only when something needs you.`],
+  }[mode] || ['You apply yourself', ''];
+}
 function automationWarnings(a, item, v) {
-  const on = name => automationValue(a, a.settings.find(s => s.name === name)) === 'true';
   const out = [];
-  const graphs = ['qualification_graph_mode', 'preparation_graph_mode', 'job_insights_graph_mode', 'application_execution_mode'];
-  if (graphs.includes(item.name) && v !== 'off' && !on('agent_graphs_enabled')) out.push('Does nothing until LangGraph agent graphs are on.');
-  if ((graphs.includes(item.name) && v !== 'off' || item.name === 'agent_graphs_enabled' && v === 'true') && !a.environment.postgres) out.push('Needs PostgreSQL: this server uses another database, so it acts as off.');
+  const graphsOn = automationOf(a, 'agent_graphs_enabled') === 'true';
+  if (AUTOMATION_GRAPH_MODES.includes(item.name) && v !== 'off' && !graphsOn) out.push('Turn on LangGraph agent graphs above, or this stays off.');
+  if ((AUTOMATION_GRAPH_MODES.includes(item.name) && v !== 'off' || item.name === 'agent_graphs_enabled' && v === 'true') && !a.environment.postgres) out.push('Needs PostgreSQL: this server uses another database, so it acts as off.');
   if (item.name === 'application_execution_mode' && v === 'guarded_auto') out.push('Each account also turns on Auto submit in Settings → Auto submit.');
   if (item.name === 'browser_use_webui_enabled' && v === 'true' && !a.environment.browser_use_python) out.push('Set BROWSER_USE_PYTHON in .env to the browser-use Web UI’s Python; until then it stays off.');
   if (item.name === 'agent_langsmith_export_enabled' && v === 'true' && !a.environment.langsmith_api_key) out.push('Set AGENT_LANGSMITH_API_KEY in .env; until then nothing is sent.');
@@ -361,25 +381,36 @@ function automationWarnings(a, item, v) {
 }
 function automationControl(a, item, v) {
   const lock = a.editable ? '' : 'disabled';
+  const id = `aria-describedby="am-help-${item.name}"`;
   if (item.choices.length) {
     const options = item.choices.map(c => [c.value, c.label]);
     if (!options.some(([value]) => value === v)) options.push([v, `${v} (custom)`]);
-    return selectF('automation', item.name, v, options, `data-rerender aria-label="${attr(item.label)}" ${lock}`);
+    return selectF('automation', item.name, v, options, `data-rerender ${id} ${lock}`);
   }
-  const type = item.kind === 'int' ? `type="number" min="${item.min}" max="${item.max}"` : 'spellcheck="false"';
-  return inputF('automation', item.name, v, `${type} aria-label="${attr(item.label)}" ${lock}`);
+  const type = item.kind === 'int' ? `type="number" inputmode="numeric" min="${item.min}" max="${item.max}"` : 'spellcheck="false" autocomplete="off"';
+  return inputF('automation', item.name, v, `${type} ${id} ${lock}`);
 }
 function automationRow(a, item) {
   const v = automationValue(a, item);
   const chosen = item.choices.find(c => c.value === v);
-  const meanings = item.choices.some(c => c.help) ? `<ul class="automation-choices">${item.choices.filter(c => c.help).map(c => `<li class="${c.value === v ? 'b' : 'muted'}"><span>${esc(c.label)}</span> — ${esc(c.help)}</li>`).join('')}</ul>` : '';
-  const source = item.overridden ? pill('Set here', 'good') : pill('From .env', 'plain');
-  const fallback = item.overridden ? `<span class="xs muted">.env: ${esc((item.choices.find(c => c.value === item.default) || {}).label || item.default || '(empty)')}</span>` : '';
-  const warnings = automationWarnings(a, item, v).map(w => `<div class="xs mt4" style="color:var(--warn)">${esc(w)}</div>`).join('');
-  return `<div class="automation-row" data-automation="${item.name}" style="padding:12px 0;border-top:1px solid var(--line)">
-    <div class="row gap8 wrap"><span class="small b">${esc(item.label)}</span><span class="xs mono muted">${esc(item.env)}</span>${source}${fallback}</div>
-    <div class="row gap12 wrap mt6" style="align-items:flex-start"><div style="min-width:220px;max-width:320px;flex:1">${automationControl(a, item, v)}</div>
-      <div class="grow" style="min-width:240px"><div class="xs muted pretty">${esc(item.help)}${item.needs ? ` Needs: ${esc(item.needs)}.` : ''}</div>${chosen && !meanings ? `<div class="xs mt4">${esc(chosen.help)}</div>` : ''}${meanings}${warnings}</div></div></div>`;
+  const inactive = AUTOMATION_GRAPH_MODES.includes(item.name) && automationOf(a, 'agent_graphs_enabled') !== 'true';
+  const envLabel = (item.choices.find(c => c.value === item.default) || {}).label || item.default || 'empty';
+  const changed = v !== item.default;
+  const origin = changed
+    ? `<span class="am-origin am-origin-set">Set here · .env says ${esc(envLabel)}</span>${a.editable ? btn('Use .env value', 'automation-reset', { name: item.name }, 'am-link') : ''}`
+    : '<span class="am-origin">Same as .env</span>';
+  const warnings = automationWarnings(a, item, v);
+  return `<div class="am-row${inactive ? ' am-row-inactive' : ''}" data-automation="${item.name}">
+    <div class="am-row-text"><label class="am-label" for="automation-${item.name}">${esc(item.label)}</label>
+      <p class="am-help" id="am-help-${item.name}">${esc(item.help)}</p>
+      <div class="am-meta"><code>${esc(item.env)}</code>${origin}</div></div>
+    <div class="am-row-control">${automationControl(a, item, v)}${chosen && chosen.help ? `<p class="am-choice">${esc(chosen.help)}</p>` : ''}
+      ${warnings.map(w => `<p class="am-warn" role="note">${esc(w)}</p>`).join('')}</div></div>`;
+}
+function automationStatus(a) {
+  const on = automationOf(a, 'agent_graphs_enabled') === 'true';
+  const chip = (ok, yes, no, title) => `<span class="am-chip ${ok ? 'am-ok' : 'am-no'}" title="${attr(title)}"><span aria-hidden="true">${ok ? '●' : '○'}</span>${esc(ok ? yes : no)}</span>`;
+  return `<div class="am-chips">${chip(on, 'LangGraph on', 'LangGraph off', 'AGENT_GRAPHS_ENABLED')}${chip(a.environment.postgres, 'PostgreSQL', 'Not PostgreSQL', 'Agent graphs need PostgreSQL')}${chip(a.environment.browser_use_ready, 'browser-use ready', a.environment.browser_use_python ? 'browser-use off' : 'BROWSER_USE_PYTHON not set', 'The browser-use runner')}${chip(a.environment.langsmith_api_key, 'LangSmith key set', 'No LangSmith key', 'AGENT_LANGSMITH_API_KEY in .env')}</div>`;
 }
 function renderAutomationSettings() {
   const a = D.automation;
@@ -388,16 +419,24 @@ function renderAutomationSettings() {
     return loading();
   }
   if (a.error) return `<p class="settings-help">${esc(a.error)}</p>`;
-  const byName = Object.fromEntries(a.settings.map(s => [s.name, s]));
-  const current = a.presets.find(p => Object.entries(p.values).every(([k, v]) => automationValue(a, byName[k]) === v));
-  const presets = settingsGroup('How should Job Hunt OS handle approved jobs?', 'Pick a way of working to fill the choices below, then adjust anything and save.',
-    `<div class="grid-auto" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px">${a.presets.map(p => `<button class="box ${current && current.id === p.id ? 'good' : ''}" style="text-align:left;padding:12px;border-radius:12px" data-act="automation-preset" data-id="${attr(p.id)}" ${a.editable ? '' : 'disabled'} aria-pressed="${current && current.id === p.id ? 'true' : 'false'}"><div class="small b">${esc(p.label)}</div><div class="xs muted mt4 pretty">${esc(p.help)}</div></button>`).join('')}</div>`);
-  const groups = a.groups.map(g => settingsGroup(esc(g.label), esc(g.help), a.settings.filter(s => s.group === g.id).map(s => automationRow(a, s)).join(''))).join('');
-  const dirty = Object.entries(S.forms.automation || {}).some(([k, v]) => byName[k] && String(v) !== byName[k].value);
-  const notice = a.editable ? '<p class="settings-help">Server-wide: these steer every account’s background work. They override .env and take effect without a restart; choosing the .env value again hands a setting back to .env. API keys and paths stay in .env.</p>'
-    : '<p class="settings-help">Only an admin can change these server-wide settings. They are shown so you can see what this server does.</p>';
-  const footer = a.editable ? `<footer class="settings-footer"><span role="status">${isBusy('automation') ? 'Saving…' : dirty ? 'Unsaved changes' : 'All changes saved'}</span><div class="row gap8">${btn('Discard', 'automation-discard', {}, '', !dirty)}${btn(label('automation', 'Save changes', 'Saving…'), 'automation-save', {}, 'primary', !dirty || isBusy('automation'))}</div></footer>` : '';
-  return notice + presets + groups + footer;
+  const [headline, sentence] = automationSummary(a);
+  const changes = automationChanges(a);
+  const current = a.presets.find(p => Object.entries(p.values).every(([k, v]) => automationOf(a, k) === v));
+  const summary = `<section class="am-summary" aria-live="polite"><div class="caps">${changes.length ? 'With your unsaved changes' : 'What happens now'}</div>
+    <div class="am-summary-head">${esc(headline)}</div><p>${esc(sentence)}</p>${automationStatus(a)}
+    ${a.editable ? '' : '<p class="am-readonly">Only an admin can change these server-wide settings.</p>'}</section>`;
+  const presets = settingsGroup('Choose a way of working', 'This fills in the settings below. Adjust anything, then save.',
+    `<div class="am-presets" role="radiogroup" aria-label="Way of working">${a.presets.map(p => {
+      const selected = current && current.id === p.id;
+      return `<button type="button" role="radio" aria-checked="${selected ? 'true' : 'false'}" class="am-preset${selected ? ' is-selected' : ''}" data-act="automation-preset" data-id="${attr(p.id)}" ${a.editable ? '' : 'disabled'}>
+        <span class="am-radio" aria-hidden="true"></span><span class="am-preset-label">${esc(p.label)}</span><span class="am-preset-help">${esc(p.help)}</span></button>`;
+    }).join('')}</div>${current ? '' : '<p class="am-custom">Custom: your settings don’t match a preset exactly.</p>'}`);
+  const rows = id => a.settings.filter(s => s.group === id).map(s => automationRow(a, s)).join('');
+  const main = a.groups.filter(g => g.id !== 'retention').map(g => settingsGroup(esc(g.label), esc(g.help), `<div class="am-rows">${rows(g.id)}</div>`)).join('');
+  const advanced = a.groups.filter(g => g.id === 'retention').map(g => settingsDetails('automation-advanced', `Advanced: ${esc(g.label.toLowerCase())}`, `<p class="settings-help">${esc(g.help)}</p><div class="am-rows">${rows(g.id)}</div>`)).join('');
+  const footer = a.editable ? `<footer class="settings-footer am-footer${changes.length ? ' is-dirty' : ''}"><span role="status">${isBusy('automation') ? 'Saving…' : changes.length ? `${changes.length} unsaved change${changes.length === 1 ? '' : 's'} · they apply as soon as you save, no restart` : 'Saved. These override .env for the whole server; API keys and paths stay in .env.'}</span>
+    <div class="row gap8">${btn('Discard', 'automation-discard', {}, '', !changes.length)}${btn(label('automation', 'Save changes', 'Saving…'), 'automation-save', {}, 'primary', !changes.length || isBusy('automation'))}</div></footer>` : '';
+  return `<div class="am">${summary}${presets}${main}${advanced}${footer}</div>`;
 }
 const SETTINGS_RENDERERS = { automation: renderAutomationSettings, applying: renderApplyingSettings, profile: renderProfileSettings, preferences: renderPreferenceSettings, resumes: renderResumeSettings, 'resume-data': () => renderResumeDataSettings(), account: renderAccountSettings, 'api-keys': renderKeySettings, domain: renderDomainSettings, gmail: () => renderInboxSettings() };
 function renderSettings() {
@@ -504,6 +543,10 @@ const SETTINGS_ACTIONS = {
     render();
   },
   'automation-discard': () => { delete S.forms.automation; render(); },
+  'automation-reset': el => {
+    const item = (D.automation?.settings || []).find(x => x.name === el.dataset.name);
+    if (item) { S.forms.automation = { ...(S.forms.automation || {}), [item.name]: item.default }; render(); }
+  },
   'automation-save': () => busy('automation', async () => {
     const byName = Object.fromEntries((D.automation?.settings || []).map(s => [s.name, s]));
     const values = Object.fromEntries(Object.entries(S.forms.automation || {}).filter(([k, v]) => byName[k] && String(v) !== byName[k].value));
