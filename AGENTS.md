@@ -153,9 +153,13 @@ rules a change has to keep:
   token headers (`x-ratelimit-*-tokens`, bare or LiteLLM's `llm_provider-` form; resets are durations such as
   `2m59.56s`) are kept per `LITELLM:<model>` in `provider_rate_windows`; `external_api.hold_off` reserves the request's
   `tokens_needed` (estimated prompt + `max_tokens`) with one guarded UPDATE and holds it with `RateLimitedCooldown`
-  until the token reset when the window cannot take it. Failover moves such a model behind its backups (an overlay,
-  never a health trip), and a request that was never sent never counts against a model's health. Only what the
-  provider said paces: no row, an expired reset or a request larger than the whole limit is sent. Fails open.
+  until the token reset when the window cannot take it. A reservation stays on the window (`tokens_reserved`) until its
+  request's answer, so a provider figure that has not seen requests in flight never frees their tokens; a failure gives
+  it back. A window belongs to the model that answered (`x-litellm-model-group`), never to the requested one when a
+  fallback answered. Failover moves a waiting model behind its backups (an overlay, never a health trip); a request
+  that was never sent counts against a model's health nowhere (`record_outcome`, `window_stats`); a held ranking gives
+  its attempt back and comes back at the reset (`LLMRateLimitError.held_seconds`). Only what the provider said paces:
+  no row, an expired reset or a request larger than the whole limit is sent. Fails open.
   Groq's request counter is per DAY: never report it as the figure that runs out first.
 * **A request larger than the whole per-minute limit is a client error, never a cooldown.** Groq's "Request too
   large … tokens per minute" (413, or the 429 LiteLLM maps it to) is recorded as `CLIENT_ERROR` with

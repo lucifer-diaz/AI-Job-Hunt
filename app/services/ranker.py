@@ -967,10 +967,27 @@ def _failed(db: Session, claimed: TaskClaim, exc: Exception, now: datetime) -> s
     message = f"{type(exc).__name__}: {exc}"
     if wait:
         return _wait(db, claimed, message, now)
+    if isinstance(exc, LLMRateLimitError) and exc.held_seconds:
+        return _paced(db, claimed, message, exc.held_seconds, now)
     task, job = _owned(db, claimed)
     outcome = _retry_or_fail(db, task, job, category, message, retryable=retryable, actor=claimed.worker_id, now=now)
     db.commit()
     return outcome
+
+
+def _paced(db: Session, claimed: TaskClaim, message: str, seconds: int, now: datetime) -> str:
+    """Token pacing held the request until the model's token window resets: nothing was sent, so the attempt is given
+    back and the task comes back at the reset, not on the failure backoff."""
+    task, job = _owned(db, claimed)
+    _clear_lease(task)
+    task.attempt_count = max(0, task.attempt_count - 1)
+    task.status, task.next_attempt_at = PENDING, now + timedelta(seconds=max(1, seconds))
+    task.last_error, task.error_category = message[:MAX_ERROR_LENGTH], ErrorCategory.RATE_LIMITED
+    if job is not None and job.state is S.RANKING:
+        transition(db, job, S.RANK_PENDING, actor=claimed.worker_id, now=now,
+                   reason=f"Waiting {seconds}s for the model's token window; no request was sent")
+    db.commit()
+    return "retrying"
 
 
 def _identical(db: Session, job_id: int, inputs: RankingInputs) -> JobRanking | None:

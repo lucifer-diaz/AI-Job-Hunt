@@ -76,7 +76,15 @@ class LLMTimeoutError(LLMError):
 
 
 class LLMRateLimitError(LLMError):
-    pass
+    def __init__(self, *args: Any, held_seconds: int | None = None):
+        super().__init__(*args)
+        # Set when token pacing held the request (app.services.token_pacing): nothing was sent, and the model's
+        # token window resets in this many seconds. Queued workers wait for it without spending an attempt.
+        self.held_seconds = held_seconds
+
+
+def _rate_limited(waiting: RateLimitedCooldown) -> LLMRateLimitError:
+    return LLMRateLimitError(str(waiting), held_seconds=waiting.retry_after_seconds if waiting.paced else None)
 
 
 class LLMContextOverflowError(LLMError):
@@ -374,7 +382,7 @@ class LLMClient:
             try:
                 return self._gateway(system, user, task, prompt_name, prompt_version, call or LLMCall())
             except RateLimitedCooldown as waiting:
-                raise LLMRateLimitError(str(waiting)) from waiting
+                raise _rate_limited(waiting) from waiting
         model = config["stage_models"].get(task) or config["model"]
         attempt = Attempt(provider=provider, requested_model=model, user_id=self.user_id, call=call or LLMCall(),
                           prompt_name=prompt_name, prompt_version=prompt_version, system=system, user=user)
@@ -384,7 +392,7 @@ class LLMClient:
         try:
             return self._instrumented(system, user, task, model, config, attempt, prompt_name, prompt_version, started)
         except RateLimitedCooldown as waiting:
-            raise LLMRateLimitError(str(waiting)) from waiting
+            raise _rate_limited(waiting) from waiting
 
     def _instrumented(self, system: str, user: str, task: str, model: str, config: dict[str, Any], attempt: Attempt,
                       prompt_name: str | None, prompt_version: str | None, started: float) -> LLMResult:

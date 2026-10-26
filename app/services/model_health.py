@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from app.services import failover_settings
 
@@ -166,7 +166,9 @@ def window_stats(db: Session, user_id: int, model: str, worker_type: str = "", *
     query = select(LLMRequestLog.status, LLMRequestLog.error_type, LLMRequestLog.latency_ms,
                    LLMRequestLog.fallback_used).where(
         LLMRequestLog.user_id == user_id, LLMRequestLog.provider == "litellm",
-        LLMRequestLog.requested_model == model, LLMRequestLog.created_at >= since)
+        LLMRequestLog.requested_model == model, LLMRequestLog.created_at >= since,
+        # a request never sent (held by a cooldown or token pacing) says nothing about the model
+        or_(LLMRequestLog.cost_source.is_(None), LLMRequestLog.cost_source != "not_sent"))
     if until is not None:
         query = query.where(LLMRequestLog.created_at < until)
     if worker_type:

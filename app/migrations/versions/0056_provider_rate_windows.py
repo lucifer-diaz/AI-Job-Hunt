@@ -1,9 +1,9 @@
 """Per-model token windows for proactive rate-limit pacing
 
 * provider_rate_windows: what a provider last said about one account's per-minute token window for one model
-  (`x-ratelimit-limit/remaining/reset-tokens`), plus its request counters and the window they count. Read on the way
-  into a model request so one that would certainly be refused for the minute waits for the reset
-  (app.services.token_pacing).
+  (`x-ratelimit-limit/remaining/reset-tokens`), the tokens reserved by requests still in flight, and its request
+  counters with the window they count. Read on the way into a model request so one that would certainly be refused
+  for the minute waits for the reset (app.services.token_pacing).
 
 Additive; nothing existing changes. Downgrade drops the table (it is a cache of provider headers).
 
@@ -33,6 +33,7 @@ def upgrade() -> None:
         sa.Column('tokens_limit', sa.Integer(), nullable=True),
         sa.Column('tokens_remaining', sa.Integer(), nullable=True),
         sa.Column('tokens_reset_at', sa.DateTime(), nullable=True),
+        sa.Column('tokens_reserved', sa.Integer(), server_default='0', nullable=False),
         sa.Column('requests_limit', sa.Integer(), nullable=True),
         sa.Column('requests_remaining', sa.Integer(), nullable=True),
         sa.Column('requests_reset_at', sa.DateTime(), nullable=True),

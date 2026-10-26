@@ -1863,6 +1863,8 @@ class ProviderRateWindow(Base):
     tokens_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
     tokens_remaining: Mapped[int | None] = mapped_column(Integer, nullable=True)
     tokens_reset_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Tokens reserved by requests sent but not answered yet: kept off the provider's figure, which has not seen them.
+    tokens_reserved: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     # The request counters, with the window they count: Groq's are per day, OpenAI's per minute. Shown, never paced on.
     requests_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
     requests_remaining: Mapped[int | None] = mapped_column(Integer, nullable=True)

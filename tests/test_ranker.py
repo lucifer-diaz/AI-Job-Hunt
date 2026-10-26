@@ -652,6 +652,18 @@ def test_temporary_failures_retry_with_backoff_and_never_archive(pg_sessions, ow
         assert job.state is S.QUALIFIED and job.last_error is None and task.status == "COMPLETED"
 
 
+def test_a_request_held_by_token_pacing_waits_for_the_reset_without_spending_an_attempt(pg_sessions, owner, model):
+    job_id, = add_jobs(pg_sessions, 1, owner)
+    model.answer(job_id, LLMRateLimitError("waiting 400s for the provider's reset", held_seconds=400), {})
+    assert rank(pg_sessions)["retrying"] == 1
+    with pg_sessions() as db:
+        job, (task,) = db.get(Job, job_id), tasks_of(db, job_id)
+        assert job.state is S.RANK_PENDING and task.status == "PENDING"
+        assert task.attempt_count == 0  # nothing was sent: the attempt is given back
+        assert timedelta(seconds=395) < task.next_attempt_at - utcnow() <= timedelta(seconds=400)  # the reset
+        assert task.error_category is ErrorCategory.RATE_LIMITED
+
+
 @pytest.mark.parametrize("make_raw,problem", [
     (lambda job_id: {"job_id": job_id, "overall_fit_score": "high"}, "Ranking output failed validation"),
     (lambda job_id: "not an object", "Ranking output failed validation"),

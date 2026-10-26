@@ -166,15 +166,58 @@ def test_a_minute_the_last_answer_says_is_spent_is_waited_out_without_a_429(owne
     with SessionLocal() as db:
         assert db.scalar(select(ProviderCooldown)) is None  # a planned wait never climbs the 429 ladder
     chat(gw, owner, need=1000)  # a small request still fits the minute ...
-    assert gw.calls == 2 and window(owner).tokens_remaining == 500  # ... and its tokens are reserved
+    assert gw.calls == 2 and window(owner).tokens_remaining == 500  # ... and its tokens stay spent
+    assert window(owner).tokens_reserved == 0  # answered (without headers): no longer in flight
 
 
 def test_the_reservation_is_shared_so_two_workers_never_both_spend_the_minute(owner):
     gw = Gateway()
     gw.answers.append((200, forwarded(groq_raw(7000, tokens_reset="50s")), {"ok": True}))
     chat(gw, owner, need=100)
-    assert token_pacing.reserve(owner, "LITELLM:groq-120b", 6000) is None  # the first worker takes it
-    assert token_pacing.reserve(owner, "LITELLM:groq-120b", 6000) is not None  # the second waits for the reset
+    assert token_pacing.reserve(owner, "LITELLM:groq-120b", 6000) == (None, 6000)  # the first worker takes it
+    wait, taken = token_pacing.reserve(owner, "LITELLM:groq-120b", 6000)
+    assert wait and not taken  # the second waits for the reset
+
+
+def test_an_answer_keeps_the_reservations_of_requests_still_in_flight(owner):
+    key = "LITELLM:groq-120b"
+    token_pacing.observe(owner, key, token_pacing.Window(tokens_limit=8000, tokens_remaining=8000,
+                                                         tokens_reset_seconds=50))
+    assert token_pacing.reserve(owner, key, 3500) == (None, 3500)  # worker A
+    assert token_pacing.reserve(owner, key, 3500) == (None, 3500)  # worker B, still in flight
+    # A's answer: the provider has seen A only, so it says 4500 left; B's 3500 stays reserved
+    token_pacing.observe(owner, key, token_pacing.Window(tokens_limit=8000, tokens_remaining=4500,
+                                                         tokens_reset_seconds=45), released=3500)
+    assert window(owner).tokens_remaining == 1000 and window(owner).tokens_reserved == 3500
+    wait, taken = token_pacing.reserve(owner, key, 3500)
+    assert wait and not taken  # a third request would overrun the minute
+
+
+def test_a_failed_request_gives_its_reservation_back(owner):
+    gw = Gateway()
+    gw.answers.append((200, forwarded(groq_raw(7000, tokens_reset="50s")), {"ok": True}))
+    chat(gw, owner, need=10)
+
+    def down(request):
+        raise httpx.ConnectError("refused", request=request)
+    with external_client("LITELLM", service="llm", transport=httpx.MockTransport(down)) as client, \
+            pytest.raises(httpx.ConnectError):
+        client.post("http://litellm.test/v1/chat/completions", json={},
+                    extensions={"user_id": owner, "metadata": {"model": "groq-120b", "tokens_needed": 6000}})
+    assert window(owner).tokens_remaining == 7000 and window(owner).tokens_reserved == 0
+
+
+def test_a_fallbacks_window_is_kept_under_the_model_that_answered(owner):
+    gw = Gateway()
+    gw.answers.append((200, forwarded(groq_raw(7000, tokens_reset="50s")), {"ok": True}))
+    chat(gw, owner, need=10)  # the primary's own window
+    gw.answers.append((200, {**forwarded(groq_raw(0, tokens_reset="50s")), "x-litellm-model-group": "groq-20b"},
+                       {"ok": True}))
+    chat(gw, owner, need=1000)  # LiteLLM's fallback answered, with a spent window of its own
+    primary, fallback = window(owner), window(owner, "groq-20b")
+    assert primary.tokens_remaining == 7000 and primary.tokens_reserved == 0  # the reservation went back
+    assert fallback.tokens_remaining == 0
+    assert chat(gw, owner, need=1000).status_code == 200  # the primary is not held for the fallback's minute
 
 
 def test_after_the_reset_or_without_a_window_the_request_is_sent(owner):
@@ -183,14 +226,14 @@ def test_after_the_reset_or_without_a_window_the_request_is_sent(owner):
     gw.answers.append((200, forwarded(groq_raw(100, tokens_reset="1s")), {"ok": True}))
     chat(gw, owner, need=10)
     later = utcnow() + timedelta(seconds=5)
-    assert token_pacing.reserve(owner, "LITELLM:groq-120b", 6000, now=later) is None  # the window has reset
+    assert token_pacing.reserve(owner, "LITELLM:groq-120b", 6000, now=later) == (None, 0)  # the window has reset
 
 
 def test_a_request_larger_than_the_whole_limit_is_sent_once_for_the_providers_reason(owner):
     gw = Gateway()
     gw.answers.append((200, forwarded(groq_raw(100, tokens_reset="50s")), {"ok": True}))
     chat(gw, owner, need=10)
-    assert token_pacing.reserve(owner, "LITELLM:groq-120b", 9500) is None  # waiting could never make it fit
+    assert token_pacing.reserve(owner, "LITELLM:groq-120b", 9500) == (None, 0)  # waiting could never make it fit
 
 
 def test_pacing_fails_open(owner, monkeypatch):
@@ -221,6 +264,22 @@ def test_a_model_waiting_for_its_window_moves_behind_its_backups(owner):
     assert moved.model == "fast" and moved.failed_over_from == "mid" and "token window" in moved.note
     assert failover.apply(w, owner, tokens_needed=100) is w  # a request the minute can still take stays put
     assert model_health.states(owner) == {}  # an overlay: route health is untouched
+
+
+def test_held_requests_never_reach_the_scheduled_health_sweep(owner):
+    import uuid
+
+    now = model_health.utcnow()
+    with SessionLocal() as db:
+        for _ in range(6):
+            db.add(LLMRequestLog(request_id=str(uuid.uuid4()), user_id=owner, provider="litellm",
+                                 requested_model="paced-model", model="paced-model", worker_type="RANKER",
+                                 status="FAILED", error_type="RATE_LIMIT", cost_source="not_sent", created_at=now))
+        db.commit()
+        stats = model_health.window_stats(db, owner, "paced-model", since=now - timedelta(minutes=5))
+        db.execute(delete(LLMRequestLog).where(LLMRequestLog.requested_model == "paced-model"))
+        db.commit()
+    assert stats.samples == 0
 
 
 def test_a_held_request_never_counts_against_the_models_health(owner):

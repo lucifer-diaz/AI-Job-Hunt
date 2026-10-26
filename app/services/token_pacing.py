@@ -2,8 +2,9 @@
 
     response → x-ratelimit-{limit,remaining,reset}-tokens → observe(): one provider_rate_windows row per account and
                LITELLM:<model>, overwritten by every answer
-    request  → reserve(need): enough left → the need is taken off the row and the request goes
+    request  → reserve(need): enough left → the need is reserved on the row and the request goes
                               not enough left before the reset → wait (external_api.hold_off raises RateLimitedCooldown)
+    answer   → observe(released=need) under the model that answered; a failure → release(need)
 
 A provider such as Groq's Free plan allows ~8K tokens a minute; with ~6K-token prompts, every second request would
 otherwise be a 429 that starts a cooldown and rests the model. The window is what the provider said, never a guess:
@@ -81,8 +82,13 @@ def paced(key: str | None) -> bool:
     return bool(key) and key.upper().startswith(PREFIX)
 
 
-def observe(user_id: int | None, key: str, window: Window, *, now: datetime | None = None) -> None:
-    """Store what the provider just said about this model's window. Never raises."""
+def observe(user_id: int | None, key: str, window: Window, *, released: int = 0,
+            now: datetime | None = None) -> None:
+    """Store what the provider just said about this model's window. Never raises.
+
+    The provider's figure counts only requests it has already seen, so the reservations of requests still in flight
+    are kept off it: `released` is what the request that brought this answer had reserved. A window whose reset has
+    passed forgets its reservations (a request lost in flight cannot hold tokens for ever)."""
     if user_id is None or not paced(key) or not window.paceable():
         return
     moment = now or utcnow()
@@ -94,11 +100,15 @@ def observe(user_id: int | None, key: str, window: Window, *, now: datetime | No
 
         with _session_factory()() as db:
             row = db.scalar(select(ProviderRateWindow).where(ProviderRateWindow.user_id == user_id,
-                                                             ProviderRateWindow.provider == name))
+                                                             ProviderRateWindow.provider == name)
+                            .with_for_update())  # a reservation made meanwhile is not lost
             if row is None:
-                row = ProviderRateWindow(user_id=user_id, provider=name)
+                row = ProviderRateWindow(user_id=user_id, provider=name, tokens_reserved=0)
                 db.add(row)
-            row.tokens_limit, row.tokens_remaining = window.tokens_limit, max(0, window.tokens_remaining or 0)
+            current = row.tokens_reset_at is not None and row.tokens_reset_at > moment
+            row.tokens_reserved = max(0, (row.tokens_reserved or 0) - max(0, released)) if current else 0
+            row.tokens_limit = window.tokens_limit
+            row.tokens_remaining = max(0, (window.tokens_remaining or 0) - row.tokens_reserved)
             row.tokens_reset_at = moment + timedelta(seconds=max(0.0, window.tokens_reset_seconds or 0.0))
             row.requests_limit, row.requests_remaining = window.requests_limit, window.requests_remaining
             row.requests_reset_at = (moment + timedelta(seconds=max(0.0, window.requests_reset_seconds))
@@ -111,6 +121,31 @@ def observe(user_id: int | None, key: str, window: Window, *, now: datetime | No
         log.warning("could not record the %s token window", key, exc_info=True)
 
 
+def release(user_id: int | None, key: str, amount: int | None, *, spent: bool = False) -> None:
+    """Settle a reservation whose request brought no window of this model: given back when it failed or another
+    model answered, or — `spent`, answered without rate-limit headers — no longer in flight but still spent.
+    Never raises."""
+    if user_id is None or not paced(key) or not isinstance(amount, int) or amount <= 0:
+        return
+    try:
+        from sqlalchemy import case, update
+
+        from app.models import ProviderRateWindow
+
+        row = ProviderRateWindow
+        with _session_factory()() as db:
+            db.execute(update(row).where(row.user_id == user_id, row.provider == key[:230])
+                       .values(tokens_reserved=case((row.tokens_reserved > amount, row.tokens_reserved - amount),
+                                                    else_=0),
+                               tokens_remaining=row.tokens_remaining if spent else row.tokens_remaining + case(
+                                   (row.tokens_reserved > amount, amount), else_=row.tokens_reserved))
+                       .execution_options(synchronize_session=False))
+            db.commit()
+        reset_cache()
+    except Exception:  # noqa: BLE001
+        log.warning("could not release tokens on the %s window", key, exc_info=True)
+
+
 def _wait(remaining: int | None, limit: int | None, reset_at: datetime | None, need: int,
           moment: datetime) -> int | None:
     """Seconds to wait, or None to send: only a known, unexpired window too small for a request that fits it waits."""
@@ -121,12 +156,14 @@ def _wait(remaining: int | None, limit: int | None, reset_at: datetime | None, n
     return max(1, math.ceil((reset_at - moment).total_seconds()))
 
 
-def reserve(user_id: int | None, key: str, need: int | None, *, now: datetime | None = None) -> int | None:
-    """Take `need` tokens off the model's window, or say how many seconds to wait first. None means send it.
+def reserve(user_id: int | None, key: str, need: int | None, *,
+            now: datetime | None = None) -> tuple[int | None, int]:
+    """Take `need` tokens off the model's window: (None, tokens reserved) to send it, (seconds, 0) to wait first.
+    The reservation stays on the window until the request's answer (`observe`) or failure (`release`).
 
-    Fails open: any error is a None (send)."""
+    Fails open: any error is (None, 0), send."""
     if user_id is None or not paced(key) or not isinstance(need, int) or need <= 0:
-        return None
+        return None, 0
     moment = now or utcnow()
     name = key[:230]
     try:
@@ -139,17 +176,19 @@ def reserve(user_id: int | None, key: str, need: int | None, *, now: datetime | 
             taken = db.execute(update(ProviderRateWindow)
                                .where(*where, ProviderRateWindow.tokens_reset_at > moment,
                                       ProviderRateWindow.tokens_remaining >= need)
-                               .values(tokens_remaining=ProviderRateWindow.tokens_remaining - need)
+                               .values(tokens_remaining=ProviderRateWindow.tokens_remaining - need,
+                                       tokens_reserved=ProviderRateWindow.tokens_reserved + need)
                                .execution_options(synchronize_session=False))
             db.commit()
             if taken.rowcount:
-                return None
+                reset_cache()
+                return None, need
             row = db.execute(select(ProviderRateWindow.tokens_remaining, ProviderRateWindow.tokens_limit,
                                     ProviderRateWindow.tokens_reset_at).where(*where)).first()
-        return _wait(row[0], row[1], row[2], need, moment) if row else None
+        return (_wait(row[0], row[1], row[2], need, moment) if row else None), 0
     except Exception:  # noqa: BLE001  a window that cannot be read must not stop the call
         log.warning("could not reserve tokens on the %s window", key, exc_info=True)
-        return None
+        return None, 0
 
 
 def waiting(user_id: int | None, key: str, need: int | None, *, now: datetime | None = None) -> int | None:

@@ -128,8 +128,9 @@ class RateLimitedCooldown(httpx.HTTPError):
     a call that was deliberately not made should look like a call that did not get through.
     """
 
-    def __init__(self, provider: str, retry_after_seconds: int, reason: str | None = None):
-        self.provider, self.retry_after_seconds = provider, retry_after_seconds
+    def __init__(self, provider: str, retry_after_seconds: int, reason: str | None = None, *, paced: bool = False):
+        # paced: held by token pacing (app.services.token_pacing) — nothing was sent, and the wait is the token reset
+        self.provider, self.retry_after_seconds, self.paced = provider, retry_after_seconds, paced
         super().__init__(reason or f"{provider} is rate limiting this account; "
                                    f"not calling again for {retry_after_seconds}s")
 
@@ -390,14 +391,26 @@ def _apply_backoff(entry: dict[str, Any]) -> None:
 
 
 def _observe_window(entry: dict[str, Any], headers: Any) -> None:
-    """Keep the model's token window for pacing (app.services.token_pacing). A refusal of a too-large request says
-    nothing about the window."""
-    if headers is None or (entry["request_metadata"] or {}).get("refused"):
+    """Keep the token window of the model that answered for pacing (app.services.token_pacing), and settle the
+    request's own reservation: taken into the answer's figure, or given back when the request brought no window of
+    its model (it failed, was refused as too large, or LiteLLM's fallback or router answered with another model)."""
+    metadata = entry["request_metadata"] or {}
+    key = cooldown_provider(entry["provider"], entry.get("service"), metadata)
+    if not token_pacing.paced(key):
         return
-    key = cooldown_provider(entry["provider"], entry.get("service"), entry.get("request_metadata"))
-    if token_pacing.paced(key):
-        token_pacing.observe(entry["user_id"], key, rate_window(headers, entry.get("request_metadata")),
-                             now=entry["completed_at"])
+    reserved = metadata.get("tokens_reserved")
+    reserved = reserved if isinstance(reserved, int) and not isinstance(reserved, bool) else 0
+    window = (rate_window(headers, metadata) if headers is not None and not metadata.get("refused")
+              else token_pacing.Window())
+    group = headers.get("x-litellm-model-group") if headers is not None else None
+    answered = f"LITELLM:{group}"[:230] if isinstance(group, str) and group else key
+    if window.paceable() and answered == key:
+        token_pacing.observe(entry["user_id"], key, window, released=reserved, now=entry["completed_at"])
+        return
+    token_pacing.release(entry["user_id"], key, reserved,
+                         spent=entry["status"] == "SUCCEEDED" and answered == key)
+    if window.paceable():
+        token_pacing.observe(entry["user_id"], answered, window, now=entry["completed_at"])
 
 
 def _log_notable(entry: dict[str, Any]) -> None:
@@ -638,10 +651,13 @@ def hold_off(call: ExternalCall, *, method: str | None = None, url: str | None =
         raise RateLimitedCooldown(limited.provider, limited.retry_after_seconds) from limited
     # A model request the last answer says this minute cannot take: wait for the token reset instead of a 429.
     need = call.metadata.get("tokens_needed")
-    wait = token_pacing.reserve(owner, key, need) if token_pacing.paced(key) else None
+    wait, reserved = token_pacing.reserve(owner, key, need) if token_pacing.paced(key) else (None, 0)
+    if reserved:
+        call.note(tokens_reserved=reserved)  # settled when the answer (or the failure) is recorded
     if wait:
         held = RateLimitedCooldown(key.upper(), wait, f"{key} has fewer tokens left this minute than this request needs "
-                                                      f"(about {need}); waiting {wait}s for the provider's reset")
+                                                      f"(about {need}); waiting {wait}s for the provider's reset",
+                                   paced=True)
         call.note(skipped_by="token_pacing", retry_after_seconds=wait)
         moment = utcnow()
         record(call, started_at=moment, completed_at=moment, method=method, url=url, error=held,
