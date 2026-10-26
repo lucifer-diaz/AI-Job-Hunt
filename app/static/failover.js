@@ -5,7 +5,7 @@ const FO = { settings: null, routes: null, error: '', loading: false };
 const FO_KEYS = { on: 'jobhunt.notify.failover', seen: 'jobhunt.failover.seen' };
 const FO_POLL_MS = 20000;
 // Shown up front; the remaining thresholds fold away.
-const FO_MAIN = ['enabled', 'algorithm', 'notify'];
+const FO_MAIN = ['enabled', 'algorithm', 'rate_limit_rest_minutes', 'usage_limit_rest_minutes', 'notify'];
 let foTimer = null;
 
 /* ── notifications: the same browser Notification API and fallbacks as the approval alerts (app.js) ── */

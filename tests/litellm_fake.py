@@ -50,6 +50,7 @@ class FakeLiteLLM:
         self.down = False
         self.unavailable: set[str] = set()  # model groups that fail (503) unless the request names fallbacks
         self.rate_limited: set[str] = set()
+        self.rate_limit_messages: dict[str, str] = {}  # model → the provider's 429 text (default: a plain one)
         self.answers: dict[str, list[Any]] = {}  # model → queued answers (dict → JSON content, str → raw content)
         self.route_tier = "SIMPLE"
         self.spend: dict[str, dict[str, Any]] = {}
@@ -173,7 +174,7 @@ class FakeLiteLLM:
             group = router["litellm_params"]["complexity_router_config"]["tiers"][self.route_tier]
         attempted = 0
         if group in self.rate_limited:
-            return self._error(429, "Rate limit reached")
+            return self._error(429, self.rate_limit_messages.get(group, "Rate limit reached"))
         if group in self.unavailable:
             fallbacks = body.get("fallbacks") or []
             if not fallbacks:

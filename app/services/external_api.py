@@ -257,11 +257,28 @@ def record(call: ExternalCall, **measurements: Any) -> str | None:
         return None
 
 
+def _note_oversized(call: ExternalCall, response: httpx.Response, streamed: bool) -> None:
+    """Mark a 429 that refused one oversized request ("Request too large"), so it starts no cooldown: the provider
+    refused that request, not the next, smaller one (app.services.rate_limits). Only the mark is kept, never the
+    body. Never raises."""
+    if response.status_code != 429 or streamed:
+        return
+    try:
+        from app.services.rate_limits import too_large
+
+        if too_large(response.text):
+            call.note(oversized_request=True)
+    except Exception:  # noqa: BLE001  an unreadable body is an ordinary 429
+        log.debug("could not read a 429 body", exc_info=True)
+
+
 def _apply_backoff(entry: dict[str, Any]) -> None:
-    """A 429 starts or lengthens this provider's cooldown; a normal answer ends it."""
+    """A 429 starts or lengthens this provider's cooldown; a normal answer ends it. A 429 for one oversized request
+    does neither."""
     user_id = entry["user_id"]
     provider = cooldown_provider(entry["provider"], entry.get("service"), entry.get("request_metadata"))
-    if entry["error_type"] == "RATE_LIMIT" and not (entry["request_metadata"] or {}).get("skipped_by"):
+    metadata = entry["request_metadata"] or {}
+    if entry["error_type"] == "RATE_LIMIT" and not metadata.get("skipped_by") and not metadata.get("oversized_request"):
         backoff.record_limit(user_id, provider, retry_after=entry["rate_limit_reset_at"])
     elif entry["status"] == "SUCCEEDED":
         backoff.note_success(user_id, provider)
@@ -415,6 +432,7 @@ class InstrumentedClient(httpx.Client):
                       response_payload=_payload_extract(response.content),
                       request_headers=_debug_headers(request.headers))
             capture_payload(call, request, response)
+        _note_oversized(call, response, bool(kwargs.get("stream")))
         _report_response(request, response, call)
         self.last_request_id = record(
             call, started_at=started, completed_at=_finished(started, clock), method=request.method,
@@ -453,6 +471,7 @@ class InstrumentedAsyncClient(httpx.AsyncClient):
             record(call, started_at=started, completed_at=_finished(started, clock), method=request.method,
                    url=str(request.url), request_bytes=request_bytes, error=exc)
             raise
+        _note_oversized(call, response, bool(kwargs.get("stream")))
         record(call, started_at=started, completed_at=_finished(started, clock), method=request.method,
                url=str(request.url), status_code=response.status_code, request_bytes=request_bytes,
                response_bytes=_response_size(response), headers=response.headers)
