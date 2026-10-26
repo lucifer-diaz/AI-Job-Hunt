@@ -76,7 +76,15 @@ class LLMTimeoutError(LLMError):
 
 
 class LLMRateLimitError(LLMError):
-    pass
+    """A 429. `rate_limit` says what kind and, when the provider named it, when it clears (app.services.rate_limits)."""
+
+    def __init__(self, *args: Any, rate_limit: Any = None):
+        super().__init__(*args)
+        if rate_limit is None and args:
+            from app.services import rate_limits
+
+            rate_limit = rate_limits.classify(str(args[0]))
+        self.rate_limit = rate_limit
 
 
 class LLMContextOverflowError(LLMError):
@@ -267,7 +275,7 @@ def _gateway_error(model: str, exc: Exception) -> LLMError:
     if isinstance(exc, LiteLLMAuthError):
         return LLMConfigError(f"LiteLLM refused the API key saved in AI Orchestration → Models: {text}")
     if status == 429:
-        return LLMRateLimitError(detail)
+        return LLMRateLimitError(detail, rate_limit=getattr(exc, "rate_limit", None))
     if status in (408, 504) or "did not answer in time" in text or "Timeout" in text:
         return LLMTimeoutError(detail)
     if status == 413 or CONTEXT_OVERFLOW.search(text):

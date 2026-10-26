@@ -141,11 +141,21 @@ rules a change has to keep:
   request's outcome (`record_outcome` and `failover.apply` catch everything).
 * **A chain is the worker's backups, then its model's own fallbacks** (`AIModel.fallback_models`, `ResolvedWorker.chain`).
   Only the primary model's fallbacks join it, never a fallback's fallbacks, so two models may name each other without a
-  loop. A model's `rest_seconds` is exactly how long it rests after a trip, every time; without it the account's cooldown
-  doubles per trip. Both are configuration (versioned, draft → apply).
+  loop. A model's `rest_seconds` is exactly how long it rests after a trip, every time; without it a 429 rests it for the
+  account's `rate_limit_rest_minutes` (also fixed) when set, and otherwise the account's cooldown doubles per trip. The
+  model's fallbacks and rest time are configuration (versioned, draft → apply); the account's are failover settings.
 * **A resting model is a last resort, not removed**, so a request is never left with nothing to call. After its
   cooldown a route is half-open: traffic probes it, `recovery_successes` successes restore it, one failure rests it
   again for twice as long.
+* **A 429 rests the model for as long as the provider said** (`app/services/rate_limits.py`, read from the full 429
+  response before its text is cut): never before a reset it named (a header, `X-RateLimit-Reset` in the body, "try
+  again in 8.4s"); a usage cap with no reset (Ollama's 5-hour / weekly limits) for the account's
+  `usage_limit_rest_minutes`. "Request too large" refused one request, not the model: it never rests it and is not
+  counted in the health window. A reset is a provider fact; never invent one.
+* **Requests too big for a model are shown, not rerouted** (`app/services/model_capacity.py`, Workers tab). From the
+  account's own refusals (the provider's stated limit and request size) and successes, it offers an answer cap only
+  when this worker's answers fit under it, and models with room (a known context window large enough, no refusal of a
+  request that size). It recommends; a person applies a fix through draft → apply.
 * **A 429 rests the model, not the gateway.** The LiteLLM cooldown is kept per model (`external_api.cooldown_provider`,
   `LITELLM:<model>`), so a rate-limited model never blocks the model failover sends the request to. Other providers
   still cool down as a whole.

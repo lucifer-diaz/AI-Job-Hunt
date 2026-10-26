@@ -597,6 +597,12 @@ p.settings-help{margin:10px 0}
 .aim-ws{display:flex;flex-direction:column;gap:14px}
 .aim-hero{display:flex;flex-direction:column;gap:12px}
 .aim-failed{margin:0}
+.aim-size{padding:12px 0;border-top:1px solid var(--line)}
+.aim-size:first-child{border-top:0;padding-top:0}
+.aim-size p{margin:6px 0}
+.aim-size-models{list-style:none;margin:4px 0 0;padding:0;display:flex;flex-direction:column;gap:6px}
+.aim-fix{border:0;background:none;padding:0;color:var(--brand);font:inherit;font-weight:600;text-decoration:underline;text-underline-offset:2px;cursor:pointer}
+.aim-fix:hover{color:var(--ink,inherit)}
 .aim-wk-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:14px;background:#fff}
 .aim-workers{width:100%;border-collapse:collapse;font-size:13px}
 .aim-workers thead th{position:sticky;top:0;text-align:left;font-size:10.5px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--caps);background:var(--softer);padding:10px;border-bottom:1px solid var(--line)}

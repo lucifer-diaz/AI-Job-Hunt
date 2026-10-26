@@ -44,7 +44,7 @@ from app.models import (
     WorkerModelConfig,
 )
 from app.security import decrypt_secret, encrypt_secret
-from app.services import model_resolution
+from app.services import model_capacity, model_resolution
 from app.services.ai_workers import (
     AUTO_ROUTER_TIERS,
     DEFAULT_TIERS,
@@ -571,8 +571,37 @@ def load_live_from(url: str | None, key: str | None, user_id: int) -> LiveState:
         return LiveState(error=str(exc))
 
 
+# A model's issue paths end in one of these; the name before it may itself contain dots ("gpt-4.1").
+MODEL_ISSUE_FIELD = re.compile(r"\.(fallback_models\.\d+|rest_seconds|model_type|deployment_params)$")
+
+
+def _subject(path: str) -> str | None:
+    """What an issue is about, named as the screens name it ("Ranker", "Tier FAST", "Auto Router")."""
+    head, _, rest = path.partition(".")
+    if head == "workers" and rest:
+        return label(rest.split(".", 1)[0])
+    if head == "tiers" and rest:
+        return f"Tier {rest.split('.', 1)[0]}"
+    if head == "models" and rest:
+        return f"Model {MODEL_ISSUE_FIELD.sub('', rest)}"
+    if head == "routing":
+        return "Auto Router"
+    if head in ("connection", "litellm"):
+        return "LiteLLM"
+    return None
+
+
 def _issue(path: str, message: str) -> dict[str, str]:
-    return {"path": path, "message": message}
+    issue = {"path": path, "message": message}
+    if subject := _subject(path):
+        issue["subject"] = subject
+    return issue
+
+
+def issue_text(issue: dict[str, str]) -> str:
+    """An issue as one line, with what it is about in front unless the message already starts with it."""
+    subject, message = issue.get("subject"), issue["message"]
+    return message if not subject or message.startswith(subject) else f"{subject}: {message}"
 
 
 def _in_range(value: Any, name: str) -> bool:
@@ -644,14 +673,16 @@ def validate(snapshot: dict[str, Any], *, live: LiveState | None = None, gateway
         entry = models.get(name)
         if entry is None and name not in managed_names:
             if live.known and name not in live.names:
-                errors.append(_issue(path, f"{what} {name} does not exist in LiteLLM or the model registry"))
+                errors.append(_issue(path, f"{what.capitalize()} {name} does not exist in LiteLLM or the model "
+                                           "registry"))
             elif not live.known:
-                warnings.append(_issue(path, f"{what} {name} is not in the model registry; run model discovery"))
+                warnings.append(_issue(path, f"{what.capitalize()} {name} is not in the model registry; run model "
+                                             "discovery"))
             return None
         if entry is not None and not entry.get("enabled", True):
-            errors.append(_issue(path, f"{what} {name} is disabled"))
+            errors.append(_issue(path, f"{what.capitalize()} {name} is disabled"))
         if live.known and name not in live.names and name not in managed_names:
-            errors.append(_issue(path, f"{what} {name} is not served by LiteLLM"))
+            errors.append(_issue(path, f"{what.capitalize()} {name} is not served by LiteLLM"))
         return entry
 
     def not_for_chat(path: str, entry: dict[str, Any] | None, name: str, worker_type: str) -> None:
@@ -755,7 +786,8 @@ def validate(snapshot: dict[str, Any], *, live: LiveState | None = None, gateway
         fallback = config.get("fallback_model")
         if fallback:
             if fallback == model:
-                errors.append(_issue(f"{base}.fallback_model", "The fallback model cannot be the primary model"))
+                errors.append(_issue(f"{base}.fallback_model", f"The fallback model cannot be the primary model "
+                                                                  f"({model})"))
             else:
                 not_for_chat(f"{base}.fallback_model", check_model(f"{base}.fallback_model", fallback,
                                                                    what="fallback model"), fallback, worker_type)
@@ -1414,7 +1446,7 @@ def apply(db: Session, user_id: int, *, actor: str | None = None, source: str = 
                 "message": "Nothing changed since the active version"}
     if checked.report["errors"]:
         audit(db, user_id, action, result="REJECTED", source=source, actor=actor, changes=checked.changes,
-              error="; ".join(e["message"] for e in checked.report["errors"])[:1000])
+              error="; ".join(issue_text(e) for e in checked.report["errors"])[:1000])
         db.commit()
         raise ValidationFailed("The configuration is not valid", validation=checked.report)
 
@@ -1686,6 +1718,7 @@ def overview(db: Session, user_id: int) -> dict[str, Any]:
                     "discovered": {name: getattr(m, name) for name in OVERRIDABLE},
                     "used_by": sorted(used.get(m.litellm_model_name, []))} for m in models],
         "removed_models": removed,
+        "request_size": model_capacity.report(db, user_id, draft),  # requests too big for their model, and fixes
         "tiers": draft["tiers"], "routing": draft["routing"],
         "options": {"model_modes": list(WORKER_MODEL_MODES), "reasoning_efforts": list(REASONING_EFFORTS),
                     "model_types": list(AI_MODEL_TYPES), "classifiers": list(AUTO_ROUTER_CLASSIFIERS),

@@ -24,6 +24,7 @@ const settings = () => ({
     { name: 'enabled', label: 'Automatic failover', help: 'on/off', type: 'bool', min: 0, max: 0, default: true },
     { name: 'algorithm', label: 'Routing algorithm', help: 'how', type: 'choice', min: 0, max: 0, default: 'PRIORITY' },
     { name: 'max_failure_pct', label: 'Failure rate limit (%)', help: 'limit', type: 'int', min: 1, max: 100, default: 50 },
+    { name: 'rate_limit_rest_minutes', label: 'Rest after a rate limit (minutes, 0 = cooldown)', help: 'not used for this long', type: 'int', min: 0, max: 1440, default: 0 },
   ],
 });
 const route = (extra = {}) => ({ worker_type: 'RANKER', model: 'big-model', state: 'COOLING', resting: true, half_open: false, score: 40, cooling_until: '2026-10-10T12:00:00Z', reason: '3 rate limits in the last 60 minutes', samples: 10, failure_pct: 60, rate_limits: 3, p95_ms: 1200, ...extra });
@@ -106,6 +107,9 @@ describe('failover settings and route health', () => {
     expect(html).toContain('3 rate limits in the last 60 minutes');
     expect(html).toContain('Put back in service');
     expect(document.querySelectorAll('#view [data-act="fo-reset"]')).toHaveLength(1);  // not offered for a healthy route
+    // The rest after a rate limit is a main setting, not hidden among the thresholds.
+    const rest = document.querySelector('#view [data-field="rate_limit_rest_minutes"]');
+    expect(rest).not.toBeNull(); expect(rest.closest('details')).toBeNull();
   });
 
   it('saves only the changed settings and shows the saved values', async () => {
