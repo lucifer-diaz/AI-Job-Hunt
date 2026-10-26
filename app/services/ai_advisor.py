@@ -14,6 +14,7 @@ tests enforce that.
 """
 from __future__ import annotations
 
+import copy
 import logging
 import uuid
 from collections.abc import Callable
@@ -32,7 +33,7 @@ from app.prompts.ai_optimization import (
     AI_OPTIMIZATION_PROMPT_VERSION,
     build_ai_optimization_prompt,
 )
-from app.services import external_monitoring, monitoring
+from app.services import external_monitoring, monitoring, prompt_budget
 from app.services.llm import LLMCall, LLMClient
 from app.services.user_settings import ai_ready
 
@@ -533,6 +534,59 @@ def _owned(db: Session, claim: Claim) -> AIOptimizationTask | None:
     return task if task is not None and task.status == PROCESSING and task.lock_token == claim.token else None
 
 
+# What the advisor's prompt loses, in this order, when it is over the AI Optimization worker's prompt token budget
+# (app.services.prompt_budget): first the external aggregates the usage aggregates repeat, then detail lists, each
+# from its last (least significant) row. Never trimmed: the ranges, the totals, the rule findings, per-worker routing,
+# external providers and the Apify totals; stages and models keep their first ADVISOR_TRIM_KEEP rows. The report keeps
+# the full aggregates; only the prompt is trimmed.
+ADVISOR_TRIM_ORDER = (
+    ("duplicate_external", None),
+    ("outliers", ("outliers", "most_expensive")), ("outliers", ("outliers", "largest_context")),
+    ("external_operations", ("external", "operations")),
+    ("apify_by_saved_search", ("external", "apify_by_saved_search")),
+    ("apify_by_actor", ("external", "apify_by_actor")),
+    ("external_workflows", ("external", "workflows")),
+    ("external_errors", ("external", "errors")),
+    ("prompt_versions", ("prompt_versions",)),
+    ("stage_models", ("stage_models",)),
+    ("context_buckets", ("context_buckets",)),
+    ("worker_models", ("routing", "worker_models")),
+    ("errors", ("errors",)),
+    ("models", ("models",)),
+    ("stages", ("stages",)),
+)
+ADVISOR_TRIM_KEEP = 3
+
+
+def fit_advisor_prompt(aggregates: dict[str, Any], findings: list[dict[str, Any]], budget: int | None
+                       ) -> tuple[Any, dict[str, Any] | None]:
+    """The advisor's prompt within `budget`, and the context stats to record with it (None without a budget).
+    Without a budget the prompt is exactly build_ai_optimization_prompt(aggregates, findings, external)."""
+    from app.services.context_builder import ContextStats
+
+    if not budget:
+        return build_ai_optimization_prompt(aggregates, findings, aggregates.get("external")), None
+    shown = copy.deepcopy(aggregates)
+    external = shown.get("external") or {}
+
+    def lookup(path: tuple[str, ...]) -> list[Any]:
+        node: Any = {**shown, "external": external}
+        for key in path:
+            node = node.get(key) if isinstance(node, dict) else None
+        return node if isinstance(node, list) else []
+
+    def drop_duplicate() -> bool:  # EXTERNAL API AGGREGATES carries it already
+        return shown.pop("external", None) is not None
+
+    steps = [prompt_budget.Step(kind, drop_duplicate if path is None else prompt_budget.drop_last(
+        lookup(path), ADVISOR_TRIM_KEEP if kind in ("models", "stages") else 0)) for kind, path in ADVISOR_TRIM_ORDER]
+    prompt, trim = prompt_budget.fit(lambda: build_ai_optimization_prompt(shown, findings, external), steps, budget)
+    stats = ContextStats.measure(trim.tokens_before, trim.tokens_after)
+    stats.prompt_token_budget, stats.prompt_tokens_before_trim = budget, trim.tokens_before
+    stats.prompt_tokens, stats.trimmed = trim.tokens_after, dict(trim.removed)
+    return prompt, stats.as_dict()
+
+
 def analyse(db: Session, user_id: int, start: datetime, end: datetime) -> AIOptimizationReport:
     """Aggregate, detect findings and (when possible) ask the model to write recommendations. Does not commit."""
     aggregates = monitoring.advisor_aggregates(db, user_id, start, end)
@@ -545,11 +599,12 @@ def analyse(db: Session, user_id: int, start: datetime, end: datetime) -> AIOpti
     if not has_settings or not ai_ready(db, user_id)[0]:
         return build_report(user_id, start, end, aggregates, findings,
                             note="written from rule findings: no AI provider is available for this account")
-    prompt = build_ai_optimization_prompt(aggregates, [{k: v for k, v in f.items() if k != "recommendation"}
-                                                       for f in findings], aggregates.get("external"))
+    prompt, stats = fit_advisor_prompt(aggregates, [{k: v for k, v in f.items() if k != "recommendation"}
+                                                    for f in findings],
+                                       prompt_budget.budget_for(db, user_id, "AI_OPTIMIZATION"))
     try:
         result = LLMClient.for_user(db, user_id).generate_prompt(
-            prompt, LLMCall(workflow_type="system", validate=validate_report))
+            prompt, LLMCall(workflow_type="system", validate=validate_report, context_stats=stats))
     except Exception as exc:  # the rule findings still make a useful report
         log.info("advisor LLM call failed for user %s: %s", user_id, exc)
         return build_report(user_id, start, end, aggregates, findings,

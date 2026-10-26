@@ -128,6 +128,12 @@ class ContextStats:
     full_available_context_tokens: int = 0
     selected_context_tokens: int = 0
     context_reduction_percent: float = 0.0
+    # Set only when the worker has a prompt token budget (fit_prompt): the budget, the prompt's estimated tokens
+    # before and after trimming, and how many items of each kind were dropped to fit it.
+    prompt_token_budget: int | None = None
+    prompt_tokens_before_trim: int | None = None
+    prompt_tokens: int | None = None
+    trimmed: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def measure(cls, full: int, selected: int) -> ContextStats:
@@ -136,7 +142,11 @@ class ContextStats:
         return cls(full, selected, max(0.0, reduction))
 
     def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        out = asdict(self)
+        if self.prompt_token_budget is None:  # no budget: the stats are exactly what they were before budgets
+            for key in ("prompt_token_budget", "prompt_tokens_before_trim", "prompt_tokens", "trimmed"):
+                out.pop(key)
+        return out
 
 
 @dataclass
@@ -600,6 +610,214 @@ def _measure(context: TaskContext, raw_text: str, every_evidence: list[dict[str,
 
 def has_verified_facts(data: dict[str, Any] | None, evidence: list[dict[str, Any]]) -> bool:
     return bool(rv.verified_facts(data) or evidence)
+
+
+# ───────────── prompt token budget ─────────────
+
+# What a context loses, in this order, when its prompt is over the worker's prompt token budget
+# (app.services.prompt_budget). Each step drops one item at a time, the least relevant first, until the prompt fits.
+# Never trimmed: REQUIRED requirements (job_context.required, hard_requirements and the employer's sentences for them,
+# REQUIRED rows of the requirement map), the candidate's identity, summary and verified background, role headers,
+# each role's most relevant bullet (ranking) or its budgeted bullets (tailoring), the fit analysis and the length plan.
+RANKING_TRIM_ORDER = (
+    "unverified_facts",        # lower-confidence facts, the last listed first
+    "extra_skills",            # skills the posting does not mention, the last listed first
+    "projects",                # resume projects, the least relevant first
+    "preferred_requirements",  # PREFERRED requirements, the lowest parse confidence first, then the last listed
+    "responsibilities",        # beyond the first TRIM_KEEP_RESPONSIBILITIES, the last listed first
+    "evidence",                # verified evidence, the lowest relevance score first
+    "bullets",                 # each role's last (least relevant) bullet, the lowest-scoring first; a role keeps one
+)
+TAILORING_TRIM_ORDER = (
+    "spare_bullets",              # source bullets beyond a role's budget (its CANDIDATE_SLACK), each role's last first
+    "projects",                   # read-only project context, the least relevant first
+    "preferred_requirement_map",  # PREFERRED rows of the requirement map, the last listed first
+    "preferred_requirements",
+    "responsibilities",
+    "evidence",
+)
+TRIM_KEEP_RESPONSIBILITIES = 3
+
+
+def _drop_preferred(context: TaskContext) -> Any:
+    from app.services.prompt_budget import drop_lowest
+
+    job = context.job_context
+
+    def forget(item: dict[str, Any]) -> None:  # the term overlap names requirement ids: never one no longer shown
+        for key in ("candidate_matches", "candidate_gaps"):
+            job[key] = [m for m in job.get(key) or [] if not (m.get("id") == item.get("id")
+                                                              and m.get("level") != jc.REQUIRED)]
+
+    items = job.get("preferred") if isinstance(job.get("preferred"), list) else []
+    return drop_lowest(items, lambda r: (r.get("confidence") or 0,), removed=forget)
+
+
+def _drop_extra_skill(context: TaskContext, terms: JobTerms) -> Any:
+    def drop() -> bool:
+        matched = set(sr._mentions(terms.text, context.relevant_skills))
+        for index in range(len(context.relevant_skills) - 1, -1, -1):
+            if context.relevant_skills[index] not in matched:
+                del context.relevant_skills[index]
+                return True
+        return False
+    return drop
+
+
+def _drop_ranking_bullet(context: TaskContext, terms: JobTerms) -> Any:
+    def drop() -> bool:
+        # A role's bullets are already most relevant first (_select_experience): each role offers its last one, and
+        # the least relevant of those goes (an older role first on a tie).
+        spare = [(terms.score(role["bullets"][-1]["text"]), -r, r) for r, role in enumerate(context.relevant_experience)
+                 if len(role.get("bullets") or []) > 1]
+        if not spare:
+            return False
+        *_, r = min(spare)
+        context.relevant_experience[r]["bullets"].pop()
+        return True
+    return drop
+
+
+def _drop_spare_bullet(context: TaskContext, terms: JobTerms) -> Any:
+    """A source bullet beyond its role's budget, from context.roles, the source resume and the selection behind it
+    alike, so the citable ids (citable_ids, evidence_ids) are exactly the bullets the prompt still shows."""
+    caps = (context.length_plan or {}).get("role_caps") or {}
+    source = {role["role_index"]: role for role in context.source_resume.get("roles") or []}
+
+    def drop() -> bool:
+        # Each role over its budget offers its last bullet (they are most relevant first), the least relevant goes.
+        spare = [(terms.score(role["bullets"][-1]), -r, r) for r, role in enumerate(context.roles)
+                 if len(role["bullets"]) > caps.get(str(role["role_index"]), len(role["bullets"]))]
+        if not spare:
+            return False
+        *_, r = min(spare)
+        role = context.roles[r]
+        i = len(role["bullets"]) - 1
+        ids = role.get("bullet_ids") or []
+        item_id = ids[i] if i < len(ids) else None
+        for key in ("bullets", "bullet_ids", "bullet_evidence_ids"):
+            if i < len(role.get(key) or []):
+                del role[key][i]
+        shown = source.get(role["role_index"])
+        if shown is not None and i < len(shown.get("bullets") or []):
+            del shown["bullets"][i]
+        if item_id is not None:
+            for unit in context.relevant_experience:
+                unit["bullets"] = [b for b in unit.get("bullets") or [] if b.get("id") != item_id]
+        return True
+    return drop
+
+
+def _drop_project(context: TaskContext) -> Any:
+    def drop() -> bool:
+        if not context.relevant_projects:
+            return False
+        context.relevant_projects.pop()  # ordered most relevant first (_select_projects)
+        shown = context.source_resume.get("projects")
+        if shown:
+            shown.pop()
+            if not shown:
+                del context.source_resume["projects"]
+        return True
+    return drop
+
+
+def _drop_preferred_map_row(context: TaskContext) -> Any:
+    def drop() -> bool:
+        for index in range(len(context.requirement_map) - 1, -1, -1):
+            if context.requirement_map[index].get("level") != jc.REQUIRED:
+                del context.requirement_map[index]
+                return True
+        return False
+    return drop
+
+
+def _refresh_targets(context: TaskContext, job: Job) -> None:
+    """After a tailoring fact left the prompt: the requirement map cites only ids still shown, and the keyword
+    targets count as supported only what the remaining facts prove."""
+    citable = context.citable_ids
+    for row in context.requirement_map:
+        ids = [i for i in row.get("evidence_ids") or [] if i in citable]
+        if ids:
+            row["evidence_ids"] = ids
+        else:
+            row.pop("evidence_ids", None)
+    context.keyword_targets = keyword_targets(job, _shown_texts(context), _tailoring_sources(context))
+
+
+def trim_steps(context: TaskContext, job: Job) -> list[Any]:
+    """The trim steps of a ranking or tailoring context, in RANKING_TRIM_ORDER / TAILORING_TRIM_ORDER."""
+    from app.services.prompt_budget import Step, drop_last, drop_lowest
+
+    def evidence_score(e: dict[str, Any]) -> tuple:
+        return (terms.score(" ".join(str(e.get(k) or "") for k in ("company", "role", "claim"))),)
+
+    listed = (context.job_context or {}).get("responsibilities")
+    responsibilities = listed if isinstance(listed, list) else []
+    if context.task == "ranking":
+        terms = job_terms(job)
+        steps = {"unverified_facts": drop_last(context.unverified_facts),
+                 "extra_skills": _drop_extra_skill(context, terms), "projects": drop_last(context.relevant_projects),
+                 "preferred_requirements": _drop_preferred(context),
+                 "responsibilities": drop_last(responsibilities, TRIM_KEEP_RESPONSIBILITIES),
+                 "evidence": drop_lowest(context.relevant_evidence, evidence_score),
+                 "bullets": _drop_ranking_bullet(context, terms)}
+        return [Step(kind, steps[kind]) for kind in RANKING_TRIM_ORDER]
+    if context.task != "tailoring":
+        return []
+    terms = generation_terms(job)
+
+    def refreshed(drop: Any) -> Any:
+        def run() -> bool:
+            if not drop():
+                return False
+            _refresh_targets(context, job)
+            return True
+        return run
+
+    steps = {"spare_bullets": refreshed(_drop_spare_bullet(context, terms)),
+             "projects": refreshed(_drop_project(context)),
+             "preferred_requirement_map": _drop_preferred_map_row(context),
+             "preferred_requirements": _drop_preferred(context),
+             "responsibilities": drop_last(responsibilities, TRIM_KEEP_RESPONSIBILITIES),
+             # the Tailor needs something to tailor from: with no source resume, the last evidence item stays
+             "evidence": refreshed(drop_lowest(context.relevant_evidence, evidence_score,
+                                               floor=0 if context.source_resume else 1))}
+    return [Step(kind, steps[kind]) for kind in TAILORING_TRIM_ORDER]
+
+
+def fit_prompt(context: TaskContext, job: Job, render: Any, budget: int | None) -> Any:
+    """The context's prompt (`render()` builds it from `context`) within the worker's prompt token budget.
+
+    Without a budget this is `render()` and nothing else: the prompt and the context are exactly what the builder
+    made. With one, the least relevant items are dropped in the task's trim order until the prompt fits; the context
+    is changed in place, so everything computed from it afterwards (the citable ids a validator accepts, ranking
+    hashes) matches the prompt that is sent. What was dropped is recorded on context.stats."""
+    from app.services import prompt_budget
+
+    if not budget:
+        return render()
+    rendered = bool(context.relevant_experience) and context.resume_text == _render(context)
+    prompt, trim = prompt_budget.fit(render, trim_steps(context, job), budget)
+    if trim.trimmed:
+        if rendered:
+            context.resume_text = _render(context)
+            prompt = render()
+        sent_job = 0 if (context.job_context or {}).get("structured") else estimate_tokens(job.description or "")
+        selected = estimate_tokens(json.dumps(context.selected_payload(), default=str)) + sent_job
+        context.stats = ContextStats.measure(max(context.stats.full_available_context_tokens, selected), selected)
+        if context.job_context:
+            job_selected = estimate_tokens(json.dumps(context.job_context, default=str))
+            context.job_stats = jc.JobContextStats.measure(max(context.job_stats.raw_job_tokens, job_selected),
+                                                           job_selected)
+    context.stats.prompt_token_budget = budget
+    context.stats.prompt_tokens_before_trim = trim.tokens_before
+    context.stats.prompt_tokens = prompt_budget.prompt_tokens(prompt)
+    context.stats.trimmed = dict(trim.removed)
+    if not trim.fits:
+        log.info("%s prompt is %s tokens after trimming, over its %s-token budget", context.task,
+                 context.stats.prompt_tokens, budget)
+    return prompt
 
 
 # ───────────── builders ─────────────

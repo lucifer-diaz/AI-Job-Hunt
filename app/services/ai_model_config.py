@@ -54,6 +54,7 @@ from app.services.ai_workers import (
 )
 from app.services.litellm_client import LiteLLMAPI, LiteLLMError, normalize_base_url
 from app.services.litellm_config_manager import LiteLLMConfigManager, literal_secrets, render
+from app.services.prompt_budget import TRIMMED_WORKERS
 from app.services.redaction import redact_text, redact_value
 from app.settings import get_settings
 
@@ -65,12 +66,12 @@ TIER_NAME = re.compile(r"^[A-Z][A-Z0-9_]{1,59}$")
 MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+\-]{0,199}$")
 PLUGIN_PATH = re.compile(r"^[A-Za-z_]\w*(\.[A-Za-z_]\w*)+$")
 LIMITS = {"temperature": (0.0, 2.0), "max_output_tokens": (1, 200_000), "context_window": (512, 2_000_000),
-          "timeout_seconds": (1, 3600), "retry_count": (0, 10), "max_concurrency": (1, 100),
+          "prompt_token_budget": (256, 2_000_000), "timeout_seconds": (1, 3600), "retry_count": (0, 10), "max_concurrency": (1, 100),
           "rest_seconds": (10, 604_800), "embedding_dimensions": (1, 65_536)}
 MAX_MODEL_FALLBACKS = 4
 WORKER_FIELDS = ("model_mode", "primary_model", "tier_name", "fallback_model", "secondary_models", "temperature", "max_output_tokens",
-                 "context_window", "reasoning_effort", "timeout_seconds", "retry_count", "max_concurrency",
-                 "use_structured_output", "enabled", "escalation")
+                 "context_window", "prompt_token_budget", "reasoning_effort", "timeout_seconds", "retry_count",
+                 "max_concurrency", "use_structured_output", "enabled", "escalation")
 ROUTING_FIELDS = ("auto_router_enabled", "auto_router_model_name", "manage_auto_router", "classifier",
                   "classifier_model", "classifier_plugin", "tier_models", "default_model", "send_metadata")
 CAPABILITIES = ("supports_structured_output", "supports_tools", "supports_reasoning", "supports_vision")
@@ -78,7 +79,8 @@ OVERRIDABLE = (*CAPABILITIES, "context_window", "max_output_tokens", "embedding_
 FIELD_LABELS = {"mode": "mode", "primary_model": "model", "tier": "tier", "fallback_model": "fallback model", "secondary_models": "secondary models",
                 "fallback_models": "model fallbacks", "rest_seconds": "rest time",
                 "temperature": "temperature", "max_output_tokens": "max output tokens",
-                "context_window": "context window", "reasoning_effort": "reasoning effort",
+                "context_window": "context window", "prompt_token_budget": "prompt token budget",
+                "reasoning_effort": "reasoning effort",
                 "timeout_seconds": "timeout", "retry_count": "retries", "max_concurrency": "max concurrency",
                 "use_structured_output": "structured output", "enabled": "enabled", "escalation": "escalation",
                 "model": "model", "description": "description", "auto_router_enabled": "Auto Router",
@@ -451,6 +453,7 @@ def worker_snapshot(row: WorkerModelConfig) -> dict[str, Any]:
             "fallback_model": row.fallback_model, "secondary_models": list(row.secondary_models or []),
             "temperature": row.temperature,
             "max_output_tokens": row.max_output_tokens, "context_window": row.context_window,
+            "prompt_token_budget": row.prompt_token_budget,
             "reasoning_effort": row.reasoning_effort, "timeout_seconds": row.timeout_seconds,
             "retry_count": row.retry_count, "max_concurrency": row.max_concurrency,
             "use_structured_output": row.use_structured_output, "enabled": row.enabled,
@@ -802,8 +805,8 @@ def validate(snapshot: dict[str, Any], *, live: LiveState | None = None, gateway
                 continue
             seen.add(extra)
             not_for_chat(path, check_model(path, extra, what="secondary model"), extra, worker_type)
-        for name in ("temperature", "max_output_tokens", "context_window", "timeout_seconds", "retry_count",
-                     "max_concurrency"):
+        for name in ("temperature", "max_output_tokens", "context_window", "prompt_token_budget", "timeout_seconds",
+                     "retry_count", "max_concurrency"):
             value = config.get(name)
             if value is not None and not _in_range(value, name):
                 low, high = LIMITS[name]
@@ -813,6 +816,13 @@ def validate(snapshot: dict[str, Any], *, live: LiveState | None = None, gateway
                 config["context_window"] > caps["context_window"]:
             errors.append(_issue(f"{base}.context_window", f"{config['context_window']} tokens exceeds the "
                                  f"{caps['context_window']}-token context {model} runs with"))
+        if config.get("prompt_token_budget") and worker_type not in TRIMMED_WORKERS:
+            warnings.append(_issue(f"{base}.prompt_token_budget", f"{label(worker_type)} does not trim its prompt "
+                                   "yet, so a prompt token budget has no effect"))
+        window = config.get("context_window") or caps.get("context_window")
+        if config.get("prompt_token_budget") and window and config["prompt_token_budget"] >= window:
+            warnings.append(_issue(f"{base}.prompt_token_budget", f"A {config['prompt_token_budget']}-token prompt "
+                                   f"budget is no smaller than the {window}-token context, so it never trims"))
         if config.get("max_output_tokens") and caps.get("max_output_tokens") and \
                 config["max_output_tokens"] > caps["max_output_tokens"]:
             errors.append(_issue(f"{base}.max_output_tokens", f"{model} produces at most "
@@ -983,7 +993,8 @@ def update_worker(db: Session, user_id: int, worker_type: str, changes: dict[str
             value = (str(value).strip().upper() or None) if value not in (None, "") else None
         elif name == "temperature":
             value = _number(value, name, float)
-        elif name in ("max_output_tokens", "context_window", "timeout_seconds", "retry_count", "max_concurrency"):
+        elif name in ("max_output_tokens", "context_window", "prompt_token_budget", "timeout_seconds", "retry_count",
+                      "max_concurrency"):
             value = _number(value, name, int)
         elif name == "reasoning_effort":
             value = (str(value).lower() or None) if value not in (None, "") else None
@@ -1317,8 +1328,9 @@ def write_snapshot_to_draft(db: Session, user_id: int, snapshot: dict[str, Any])
                                                             created_at=utcnow())
         row.model_mode, row.primary_model, row.tier_name = config.get("mode") or "TIER", config.get("primary_model"), \
             config.get("tier")
-        for name in ("fallback_model", "secondary_models", "temperature", "max_output_tokens", "context_window", "reasoning_effort",
-                     "timeout_seconds", "retry_count", "max_concurrency", "escalation"):
+        for name in ("fallback_model", "secondary_models", "temperature", "max_output_tokens", "context_window",
+                     "prompt_token_budget", "reasoning_effort", "timeout_seconds", "retry_count", "max_concurrency",
+                     "escalation"):
             setattr(row, name, config.get(name))
         row.use_structured_output = config.get("use_structured_output", True)
         row.enabled = config.get("enabled", True)
@@ -1707,6 +1719,7 @@ def overview(db: Session, user_id: int) -> dict[str, Any]:
                      "structured_output_required": w.structured_output_required,
                      "min_context_tokens": w.min_context_tokens, "has_prompt": bool(w.prompts),
                      "capability": w.capability, "optional": w.optional,
+                     "trims_prompt": w.worker_type in TRIMMED_WORKERS,
                      "config": draft["workers"].get(w.worker_type),
                      "resolved": dict(zip(("model", "assignment", "note"),
                                           model_resolution.resolve_model(draft, w.worker_type), strict=True))}

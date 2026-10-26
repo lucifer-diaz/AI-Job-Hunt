@@ -112,6 +112,14 @@ These rules keep the model a worker uses a matter of configuration, never of cod
 * **Routing policy is central.** Quality escalation (`escalation_reason`), request metadata and parameter filtering
   (`request_params`) live in `app/services/model_resolution.py`. A worker never decides to retry on a bigger model.
   Infrastructure fallback (the worker's `fallback_model`, sent to LiteLLM) and quality escalation stay separate.
+* **A prompt token budget trims; a context window refuses.** `WorkerModelConfig.prompt_token_budget` (versioned, draft →
+  apply) is read through `prompt_budget.budget_for` (LiteLLM gateway mode only). Over it, `context_builder.fit_prompt`
+  (Ranker, Tailor) and `ai_advisor.fit_advisor_prompt` (AI Optimization) render, measure and drop one item at a time in
+  their documented order (`RANKING_TRIM_ORDER`, `TAILORING_TRIM_ORDER`, `ADVISOR_TRIM_ORDER`) — deterministic, no
+  model. Trim before anything is computed from the context (ranking hashes, citable ids), so a validator never accepts
+  an id the prompt no longer shows. Never drop a REQUIRED requirement, the employer's sentences for it, the fit
+  analysis or rule findings. Unset, the builders' prompts stay byte-identical (`tests/test_prompt_budget.py`). A worker
+  joins `prompt_budget.TRIMMED_WORKERS` only with trim steps of its own.
 * **Unsupported parameters are never sent blindly**: a parameter goes out only when the model is not known to lack
   it; reasoning effort needs a model known to reason. Unknown capability stays unknown (NULL), never guessed.
 * **Job Hunt OS never destroys LiteLLM configuration it does not own.** `LiteLLMConfigManager` creates and removes

@@ -49,6 +49,7 @@ class WorkerIn(Revisioned):
     temperature: float | None = None
     max_output_tokens: int | None = None
     context_window: int | None = None
+    prompt_token_budget: int | None = None
     reasoning_effort: str | None = None
     timeout_seconds: int | None = None
     retry_count: int | None = None
