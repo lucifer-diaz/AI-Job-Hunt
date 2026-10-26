@@ -41,16 +41,14 @@ const html = k => { ui.D.kit = k; const el = document.createElement('div'); el.i
 const acts = el => [...el.querySelectorAll('[data-act]')].map(b => b.dataset.act);
 
 describe('the Apply kit claim', () => {
-  it('asks to start the submission and warns that outside submissions cannot be locked', () => {
+  it('has nothing to start before submitting: the duplicate check is automatic', () => {
     const el = html(kit());
-    expect(acts(el)).toContain('kit-start');
-    expect(el.textContent).toContain('cannot be locked here');
+    expect(acts(el)).not.toContain('kit-start');
+    expect(el.textContent).not.toContain('Start submission');
+    expect(acts(el)).toContain('mark-applied');
   });
 
-  it('starts the submission and reports with the claim token', async () => {
-    ui.D.kit = kit();
-    await ui.A['kit-start']({ dataset: { id: '11' } });
-    expect(calls.some(([m, u]) => m === 'POST' && u.endsWith('/api/jobs/11/submission/start'))).toBe(true);
+  it('reports with the claim token of a submission already in progress', async () => {
     ui.D.kit = kit({ claim: { id: 4, job_id: 11, status: 'CLAIMED', client: 'apply_kit', claim_token: 'tok-123',
       claimed_at: '2026-10-19T10:00:00', lease_expires_at: '2026-10-19T11:00:00', started_by: 'you' } });
     expect(acts(html(ui.D.kit))).toContain('kit-release');
@@ -74,13 +72,52 @@ describe('the Apply kit claim', () => {
     expect(resolved[2]).toEqual({ claim_id: 6, submitted: false });
   });
 
-  it('shows the application worker only when it is on, and never offers to submit', () => {
+  it('asks the questions the worker is waiting for, saves each as a verified answer, and links to them', async () => {
+    const waiting = { id: 9, mode: 'ASSIST', status: 'PENDING', stage: 'NEEDS_INPUT', interrupt: { kind: 'NEEDS_INPUT', question_ids: [21, 22], confirm_question_ids: [] } };
+    const questions = [
+      { id: 21, question: 'Why Examplecorp?', answer: '', verified: false, answered: false, answer_type: 'text', answer_options: [], category: 'general', sensitive: false },
+      { id: 22, question: 'Do you require visa sponsorship?', answer: '', verified: false, answered: false, answer_type: 'boolean', answer_options: [], category: 'general', sensitive: true }];
+    const el = html(kit({ execution_mode: 'assist', execution: waiting, execution_questions: questions }));
+    expect(el.textContent).toContain('2 of 2 questions to answer');
+    expect(el.textContent).toContain('Why Examplecorp?');
+    expect(el.querySelector('#kitq-q21').tagName).toBe('TEXTAREA');
+    expect([...el.querySelector('#kitq-q22').options].map(o => o.value)).toEqual(['', 'Yes', 'No']);
+    ui.S.forms.kitq = { q21: 'I build payment systems like yours.' };
+    await ui.A['kit-answer']({ dataset: { qid: '21' } });
+    const saved = calls.find(([m, u]) => m === 'PUT' && u === '/api/knowledge/21');
+    expect(saved[2]).toEqual({ question: 'Why Examplecorp?', answer: 'I build payment systems like yours.', category: 'general', answer_type: 'text', verified: true, sensitive: false });
+    ui.S.forms.kitq = {};
+    await ui.A['kit-answer']({ dataset: { qid: '22' } });  // nothing chosen: nothing is saved
+    expect(calls.some(([m, u]) => m === 'PUT' && u === '/api/knowledge/22')).toBe(false);
+    expect(acts(el)).toContain('kit-open-questions');
+  });
+
+  it('runs a job on browser-use when the backend is set up, and never offers it otherwise', async () => {
+    const done = { id: 9, mode: 'ASSIST', status: 'FAILED', stage: 'FAILED', interrupt: null, result_code: null };
+    expect(acts(html(kit({ execution_mode: 'assist', execution: done, browser_use_ready: false })))).not.toContain('kit-browser-use');
+    const el = html(kit({ execution_mode: 'assist', execution: done, browser_use_ready: true }));
+    expect(acts(el)).toContain('kit-browser-use');
+    await ui.A['kit-browser-use']({ dataset: { id: '11' } });
+    const queued = calls.find(([m, u]) => m === 'POST' && u === '/api/jobs/11/application-execution');
+    expect(queued[2]).toEqual({ backend: 'browser_use_webui' });
+  });
+
+  it('shows the application worker only when it is on, and offers Apply for me only with Auto submit on', async () => {
     expect(acts(html(kit()))).not.toContain('kit-prepare');
-    const el = html(kit({ execution_mode: 'assist', execution: { id: 9, mode: 'ASSIST', status: 'COMPLETED', stage: 'READY_TO_SUBMIT', interrupt: null, result_code: 'READY_TO_SUBMIT' } }));
-    expect(el.textContent).toContain('It never submits');
-    // The filled page is gone: the kit says so instead of implying a filled form is waiting somewhere.
+    const done = { id: 9, mode: 'ASSIST', status: 'COMPLETED', stage: 'READY_TO_SUBMIT', interrupt: null, result_code: 'READY_TO_SUBMIT' };
+    const el = html(kit({ execution_mode: 'assist', execution: done }));
+    expect(el.textContent).toContain('You submit');
+    // The private page is gone: the kit says so instead of implying a filled form is waiting somewhere.
     expect(el.textContent).toContain('which was then closed');
-    expect(el.textContent).toContain('fill it in yourself');
+    expect(acts(el)).not.toContain('kit-guarded');
+    const window = html(kit({ execution_mode: 'assist', execution: { ...done, backend: 'browser_use_webui' } }));
+    expect(window.textContent).toContain('filled in the open browser window');
+    expect(acts(html(kit({ execution_mode: 'guarded_auto', guarded_consent: false, execution: done })))).not.toContain('kit-guarded');
+    const auto = html(kit({ execution_mode: 'guarded_auto', guarded_consent: true, execution: done }));
+    expect(auto.textContent).toContain('submits it for you');
+    expect(acts(auto)).toContain('kit-guarded');
+    await ui.A['kit-prepare']({ dataset: { id: '11', mode: 'ASSIST' } });
+    expect(calls.find(([m, u]) => m === 'POST' && u.endsWith('/api/jobs/11/application-execution'))[2]).toEqual({ mode: 'ASSIST' });
   });
 
   it('shows each sensitive question and its saved answer before they are confirmed, and sends only those', async () => {
@@ -94,5 +131,26 @@ describe('the Apply kit claim', () => {
     expect(acts(el)).toContain('kit-confirm');
     const button = [...el.querySelectorAll('[data-act="kit-confirm"]')][0];
     expect(button.dataset.ids).toBe('3');
+  });
+
+  it('lists the fields highlighted in the open window, continues without reloading, and offers to save what was typed', async () => {
+    const waiting = { id: 9, mode: 'ASSIST', status: 'QUEUED', stage: 'NEEDS_HUMAN', interrupt: { reason: 'FIELDS_NEED_YOU', question_ids: [3] }, fields: [] };
+    const takeover = { reason: 'FIELDS_NEED_YOU', expires_at: '2026-10-26T12:00:00', fields: [{ id: 'bu_py', label: 'Years of Python?' }] };
+    const el = html(kit({ execution_mode: 'assist', execution: waiting, execution_takeover: takeover,
+      execution_questions: [{ id: 3, question: 'Years of Python?', answered: false, answer_type: 'text', answer_options: [] }] }));
+    expect(el.textContent).toContain('1 field needs you');
+    expect(el.textContent).toContain('Years of Python?');
+    expect(el.textContent).toContain('the page is not reloaded');
+    expect(acts(el)).toContain('kit-continue');
+    expect(acts(el)).not.toContain('kit-save-login');
+    expect(acts(el)).not.toContain('kit-save-window');
+    const done = { id: 9, mode: 'ASSIST', status: 'COMPLETED', stage: 'READY_TO_SUBMIT', interrupt: null, result_code: 'READY_TO_SUBMIT',
+      fields: [{ id: 'bu_py', label: 'Years of Python?', status: 'PERSON' }, { id: 'bu_name', label: 'Name', status: 'RESOLVED' }] };
+    const ready = html(kit({ execution_mode: 'assist', execution: done }));
+    expect(ready.textContent).toContain('You filled 1 field yourself in the window (Years of Python?)');
+    expect(acts(ready)).toContain('kit-save-window');
+    ui.D.kit = kit({ execution_mode: 'assist', execution: done });
+    await ui.A['kit-save-window']({ dataset: { exec: '9' } });
+    expect(calls.some(([m, u]) => m === 'POST' && u.endsWith('/api/application-executions/9/save-window-answers'))).toBe(true);
   });
 });

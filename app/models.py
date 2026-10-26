@@ -77,6 +77,10 @@ class User(Base):
     application_claim_keys: Mapped[list[ApplicationClaimKey]] = relationship(back_populates="user", passive_deletes=True)
     application_execution_tasks: Mapped[list[ApplicationExecutionTask]] = relationship(back_populates="user", passive_deletes=True)
     application_execution_attempts: Mapped[list[ApplicationExecutionAttempt]] = relationship(back_populates="user", passive_deletes=True)
+    submission_intents: Mapped[list[SubmissionIntent]] = relationship(back_populates="user", passive_deletes=True)
+    ats_routes: Mapped[list[AtsRoute]] = relationship(back_populates="user", passive_deletes=True)
+    ats_credentials: Mapped[list[AtsCredential]] = relationship(back_populates="user", passive_deletes=True)
+    ats_sessions: Mapped[list[AtsSession]] = relationship(back_populates="user", passive_deletes=True)
     evidence_resume_links: Mapped[list[EvidenceResumeLink]] = relationship(back_populates="user",
                                                                            passive_deletes=True)
     rag_index_versions: Mapped[list[RagIndexVersion]] = relationship(back_populates="user", passive_deletes=True)
@@ -1577,7 +1581,7 @@ class JobRankingTask(Base):
 
 
 LLM_STAGES = ("RANKER", "TAILOR", "REVIEWER", "RESUME_PARSER", "JD_PARSER", "JD_RECOVERY", "APPLICATION", "FOLLOW_UP",
-              "INBOX", "COMPANY_INSIGHTS", "INTERVIEW_INSIGHTS", "ADVISOR", "OTHER")
+              "INBOX", "COMPANY_INSIGHTS", "INTERVIEW_INSIGHTS", "ADVISOR", "BROWSER_NAVIGATION", "OTHER")
 LLM_ERROR_TYPES = ("TIMEOUT", "RATE_LIMIT", "INVALID_JSON", "SCHEMA_VALIDATION", "PROVIDER_ERROR", "CONTEXT_OVERFLOW",
                    "CONFIGURATION", "OTHER")
 OPTIMIZATION_TASK_STATUSES = ("PENDING", "PROCESSING", "COMPLETED", "FAILED")
@@ -1805,15 +1809,15 @@ class ExternalAPIRequestLog(Base):
 
 
 class ServerSetting(Base):
-    """A server-wide worker setting an admin changed in Running workers → Settings (app.services.server_settings).
-
-    Not owned by an account: it paces the scheduler jobs every account shares. No row means the environment value.
+    """A server-wide setting an admin changed (app.services.server_settings): a worker limit in Running workers →
+    Settings, or the agent and application configuration in Settings → AI agents & automation. Stored as text (a
+    number, a mode, a switch). Not owned by an account. No row means the environment value.
     """
 
     __tablename__ = "server_settings"
 
     name: Mapped[str] = mapped_column(String(64), primary_key=True)
-    value: Mapped[int] = mapped_column(Integer)
+    value: Mapped[str] = mapped_column(String(500))
     updated_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
 
@@ -2571,9 +2575,11 @@ HELD_APPLICATION_CLAIM_STATUSES = ("CLAIMED", "UNCERTAIN", "RECORDED")
 APPLICATION_CLAIM_CLIENTS = ("mcp", "apply_kit", "worker")
 APPLICATION_EXECUTION_TASK_STATUSES = ("PENDING", "PROCESSING", "COMPLETED", "FAILED", "SKIPPED")
 ACTIVE_APPLICATION_EXECUTION_TASK_STATUSES = ("PENDING", "PROCESSING")
-APPLICATION_EXECUTION_MODES = ("OBSERVE", "ASSIST")
+APPLICATION_EXECUTION_MODES = ("OBSERVE", "ASSIST", "GUARDED_AUTO")
+APPLICATION_BACKENDS = ("ats_api", "playwright", "browser_use_webui")
 # The roadmap's execution states (docs/architecture/agentic-roadmap.md §5). SUBMITTING, CONFIRMING and CONFIRMED are
-# part of the vocabulary and refused in Phase 5 (application_execution.set_stage).
+# reached only by a GUARDED_AUTO run holding a SubmissionIntent (application_execution.set_stage refuses them
+# otherwise, and so does the column).
 APPLICATION_EXECUTION_STAGES = ("QUEUED", "DISCOVERING", "ROUTED", "FORM_ANALYZING", "ANSWERING", "FILLING",
                                 "PRE_SUBMIT_VALIDATION", "READY_TO_SUBMIT", "SUBMITTING", "CONFIRMING", "CONFIRMED",
                                 "NEEDS_INPUT", "NEEDS_HUMAN", "RETRYING", "BLOCKED", "SUBMISSION_UNCERTAIN", "FAILED",
@@ -2679,11 +2685,12 @@ class ApplicationExecutionTask(Base):
     agent_thread_id: Mapped[int | None] = mapped_column(
         ForeignKey("agent_threads.id", ondelete="SET NULL", name="fk_application_execution_tasks_agent_thread_id"),
         nullable=True, index=True)
-    mode: Mapped[str] = mapped_column(String(10), default="OBSERVE")
+    mode: Mapped[str] = mapped_column(String(20), default="OBSERVE")
     status: Mapped[str] = mapped_column(String(20), default="PENDING")
     stage: Mapped[str] = mapped_column(String(30), default="QUEUED")
     reason: Mapped[str] = mapped_column(String(40), default="user_request")
     route: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    backend: Mapped[str | None] = mapped_column(String(30), nullable=True)  # APPLICATION_BACKENDS, chosen at ROUTE
     form_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     form: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     plan: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
@@ -2729,6 +2736,129 @@ class ApplicationExecutionAttempt(Base):
     file_digests: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     started_at: Mapped[datetime] = mapped_column(DateTime, default=now)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+# ───────────── Guarded submission and ATS logins (Phase 6, app.services.submission / ats_map / ats_auth) ─────────────
+# A SubmissionIntent is written, bound to the posting's claim, before the one click that may submit an application; it
+# is CLICKING from the commit just before that click, so a crash afterwards is never mistaken for "not submitted".
+
+SUBMISSION_INTENT_STATUSES = ("ARMED", "CLICKING", "CONFIRMED", "UNCERTAIN", "ABORTED", "RESOLVED_SUBMITTED",
+                              "RESOLVED_NOT_SUBMITTED")
+# Statuses after which the click may have happened: never clicked again, only reconciled.
+CLICKED_INTENT_STATUSES = ("CLICKING", "CONFIRMED", "UNCERTAIN", "RESOLVED_SUBMITTED", "RESOLVED_NOT_SUBMITTED")
+ATS_CREDENTIAL_STATUSES = ("PENDING", "ACTIVE")
+
+
+class SubmissionIntent(Base):
+    """One authorized final click of one execution, bound to the posting's pre-submit claim (one intent per claim).
+
+    ARMED: the claim is held and the intent recorded; nothing has been clicked. CLICKING: committed immediately before
+    the click; from here on the outcome is a fact to establish, never a retry. CONFIRMED: the confirmation verifier
+    found the site's evidence and the submission was recorded. UNCERTAIN: anything less (or a crash after CLICKING);
+    a person resolves it (RESOLVED_SUBMITTED / RESOLVED_NOT_SUBMITTED). ABORTED: given up before the click.
+    `evidence` is metadata only: response statuses, hosts, path patterns, a confirmation id; never page text."""
+
+    __tablename__ = "submission_intents"
+    __table_args__ = (
+        CheckConstraint(f"status IN ({_values(SUBMISSION_INTENT_STATUSES)})", name="ck_submission_intents_status"),
+        UniqueConstraint("claim_id", name="uq_submission_intents_claim"),
+        Index("ix_submission_intents_task", "execution_task_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("submission_intents")
+    user: Mapped[User] = relationship(back_populates="submission_intents")
+    claim_id: Mapped[int] = mapped_column(
+        ForeignKey("application_claims.id", ondelete="CASCADE", name="fk_submission_intents_claim_id"))
+    claim: Mapped[ApplicationClaim] = relationship()
+    execution_task_id: Mapped[int | None] = mapped_column(
+        ForeignKey("application_execution_tasks.id", ondelete="SET NULL",
+                   name="fk_submission_intents_execution_task_id"), nullable=True)
+    job_id: Mapped[int] = mapped_column(
+        ForeignKey("jobs.id", ondelete="CASCADE", name="fk_submission_intents_job_id"), index=True)
+    job: Mapped[Job] = relationship()
+    status: Mapped[str] = mapped_column(String(30), default="ARMED")
+    packet_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    form_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    backend: Mapped[str] = mapped_column(String(30))
+    route: Mapped[str] = mapped_column(String(240))  # ats_map route key ("greenhouse:acme")
+    domain: Mapped[str] = mapped_column(String(255))  # the only host a non-GET request may reach after the click
+    file_digests: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    evidence: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    reason: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    clicking_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class AtsRoute(Base):
+    """Where an account's applications go: one ATS tenant (ats_map), its apply and login domains and what runs there
+    taught Job Hunt OS (the backend, a login wall, the last outcome). Facts from postings and runs; never a model's."""
+
+    __tablename__ = "ats_routes"
+    __table_args__ = (UniqueConstraint("user_id", "ats", "tenant", name="uq_ats_routes_user_ats_tenant"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("ats_routes")
+    user: Mapped[User] = relationship(back_populates="ats_routes")
+    ats: Mapped[str] = mapped_column(String(40))
+    tenant: Mapped[str] = mapped_column(String(200), default="")
+    apply_domain: Mapped[str] = mapped_column(String(255))
+    login_domain: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    auth_required: Mapped[str] = mapped_column(String(20), default="none")  # none | optional | account | unsupported
+    backend: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    source_board: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    company: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    form_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_job_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_outcome: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    needs_login: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+
+class AtsCredential(Base):
+    """A login a person saved for one ATS domain: the username and the password, encrypted (app.security). Write-only:
+    no API returns the password; it is decrypted only to fill that domain's own login form (ats_auth.login_secret).
+    PENDING: generated for a signup the person has not finished; ACTIVE once they saved the login."""
+
+    __tablename__ = "ats_credentials"
+    __table_args__ = (
+        UniqueConstraint("user_id", "domain", name="uq_ats_credentials_user_domain"),
+        CheckConstraint(f"status IN ({_values(ATS_CREDENTIAL_STATUSES)})", name="ck_ats_credentials_status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("ats_credentials")
+    user: Mapped[User] = relationship(back_populates="ats_credentials")
+    domain: Mapped[str] = mapped_column(String(255))
+    username: Mapped[str] = mapped_column(String(320))
+    password_encrypted: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class AtsSession(Base):
+    """A browser session a person logged in to on one ATS domain, kept so the next application there needs no login:
+    the site's storage state (cookies, local storage), encrypted. Captured only when the person clicks "Save this
+    login"; used only by that account's application browser for that domain, never by JD recovery."""
+
+    __tablename__ = "ats_sessions"
+    __table_args__ = (UniqueConstraint("user_id", "domain", name="uq_ats_sessions_user_domain"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("ats_sessions")
+    user: Mapped[User] = relationship(back_populates="ats_sessions")
+    domain: Mapped[str] = mapped_column(String(255))
+    ats: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    storage_state_encrypted: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 # ───────────── Candidate knowledge retrieval (RAG, app.services.rag_*) ─────────────

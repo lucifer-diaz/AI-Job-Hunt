@@ -17,6 +17,7 @@ from app.prompts import (
     build_application_form_prompt,
     build_application_inbox_prompt,
     build_application_question_prompt,
+    build_browser_navigation_prompt,
     build_company_insights_prompt,
     build_cover_letter_prompt,
     build_followup_prompt,
@@ -91,6 +92,12 @@ def build(fixture: dict[str, Any]) -> Prompt:
                                              context=given["context"], fit_analysis=given["fit_analysis"],
                                              evidence=evidence, knowledge=given["knowledge"], company=given["company"],
                                              form_questions=given["form_questions"])
+    if name == "browser_navigation":
+        return build_browser_navigation_prompt(job={"title": "Staff Platform Engineer", "company": job.company},
+                                               fields=given["fields"], files=given["files"],
+                                               elements=given["elements"], page_text=given["page_text"],
+                                               history=given["history"], step=given["step"],
+                                               max_steps=given["max_steps"])
     raise KeyError(f"no builder for golden prompt {name}")
 
 

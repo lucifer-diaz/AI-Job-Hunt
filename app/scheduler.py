@@ -99,6 +99,9 @@ class Scheduler:
             saved = server_settings.interval_override(self.specs[name].interval_setting)
             if saved is not None:
                 return max(0, saved)
+            # Read again each time: an interval that follows a switch an admin changed in Settings → AI agents &
+            # automation (AGENT_GRAPHS_ENABLED) moves with it, without a restart.
+            return max(0, int(getattr(get_settings(), self.specs[name].interval_setting) or 0))
         return max(0, int(self.intervals.get(name) or 0))
 
     # ───────────── lifecycle ─────────────

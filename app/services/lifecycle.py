@@ -87,7 +87,9 @@ TRANSITIONS: dict[WorkflowState, frozenset[WorkflowState]] = {
     S.REVIEWED: frozenset({S.READY_TO_APPLY, S.TAILORING, S.SKIPPED, S.FAILED}),
     # An approval is revoked when its packet is edited (app.services.approval): back to the reviewed packet.
     S.READY_TO_APPLY: frozenset({S.APPLYING, S.REVIEWED, S.ARCHIVED, S.SKIPPED}),
-    S.APPLYING: frozenset({S.APPLIED, S.SKIPPED, S.FAILED}),
+    # A submission whose outcome was unknown, that a person says was never sent, goes back to the approved packet
+    # (apply_queue.resolve_uncertain, actor "person" only: PERSON_ONLY below).
+    S.APPLYING: frozenset({S.APPLIED, S.READY_TO_APPLY, S.SKIPPED, S.FAILED}),
     # After submission the job never becomes FAILED: a failed follow-up must not erase that we applied.
     S.APPLIED: frozenset({S.FOLLOWUP_DUE, S.INTERVIEW, S.REJECTED, S.OFFER, S.ARCHIVED}),
     S.FOLLOWUP_DUE: frozenset({S.FOLLOWED_UP, S.INTERVIEW, S.REJECTED, S.OFFER, S.ARCHIVED}),
@@ -110,6 +112,10 @@ REOPENABLE_ARCHIVE_SOURCES: frozenset[WorkflowState] = frozenset({S.RANKED, S.QU
 # code decides which skips those are (app.services.ranker.reopen_for_description, removed_by_user); nothing else
 # about a skip is reversible.
 REOPENABLE_SKIP_SOURCES: frozenset[WorkflowState] = frozenset({S.NORMALIZED, S.FILTERED, S.RANK_PENDING})
+# Moves only a person may make (work_queue.transition checks the actor): a submission that was started is only ever
+# said not to have happened by the candidate, never by a worker, a sweep or an expired lease.
+PERSON = "person"
+PERSON_ONLY: frozenset[tuple[WorkflowState, WorkflowState]] = frozenset({(S.APPLYING, S.READY_TO_APPLY)})
 
 
 class InvalidState(ValueError):

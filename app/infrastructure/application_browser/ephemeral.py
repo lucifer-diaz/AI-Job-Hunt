@@ -28,6 +28,7 @@ from app.infrastructure.application_browser.service import (
 from app.infrastructure.browser.service import BLOCKED_URL, BrowserService, NavigationFailed
 
 log = logging.getLogger("jobhunt.application_browser")
+FIELD_TIMEOUT_MS = 5000
 
 
 def _utcnow() -> datetime:
@@ -105,23 +106,25 @@ class _Page(ApplicationPage):
     async def html(self) -> str:
         return await self._page.content()
 
+    # Each field action waits at most FIELD_TIMEOUT_MS: a field that cannot be acted on (hidden, detached, not
+    # editable) is reported quickly and validation decides, instead of one field using up the whole step.
     async def fill(self, locator: str, text: str) -> None:
-        await self._page.locator(locator).first.fill(text)
+        await self._page.locator(locator).first.fill(text, timeout=FIELD_TIMEOUT_MS)
 
     async def select(self, locator: str, value: str) -> None:
-        await self._page.locator(locator).first.select_option(value=value)
+        await self._page.locator(locator).first.select_option(value=value, timeout=FIELD_TIMEOUT_MS)
 
     async def check(self, locator: str) -> None:
-        await self._page.locator(locator).first.check()
+        await self._page.locator(locator).first.check(timeout=FIELD_TIMEOUT_MS)
 
     async def upload(self, locator: str, path: str) -> None:
-        await self._page.locator(locator).first.set_input_files(path)
+        await self._page.locator(locator).first.set_input_files(path, timeout=FIELD_TIMEOUT_MS)
 
     async def value_of(self, locator: str) -> str:
-        return await self._page.locator(locator).first.input_value()
+        return await self._page.locator(locator).first.input_value(timeout=FIELD_TIMEOUT_MS)
 
     async def is_checked(self, locator: str) -> bool:
-        return await self._page.locator(locator).first.is_checked()
+        return await self._page.locator(locator).first.is_checked(timeout=FIELD_TIMEOUT_MS)
 
 
 class EphemeralApplicationSessions(ApplicationSessionManager):

@@ -1187,3 +1187,49 @@ form#settings-editor.wk-settings{background:none;border:0;box-shadow:none;border
 .ins-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px}
 .ins-form label,.ins label.xs{display:flex;flex-direction:column;gap:4px}
 @media (max-width:640px){.ins-table{display:block;overflow-x:auto}}
+
+/* Settings → AI agents & automation */
+.am .settings-group-title{margin-bottom:16px}
+.am-summary{margin:24px 30px 4px;padding:18px 20px;border:1px solid var(--brand-line);background:var(--brand-softer);border-radius:14px}
+.am-summary-head{font-size:17px;font-weight:600;color:var(--ink);margin-top:6px;letter-spacing:-.01em}
+.am-summary>p{font-size:13px;color:var(--ink2);line-height:1.55;margin:4px 0 0;max-width:68ch}
+.am-readonly{font-size:12px!important;color:var(--muted)!important;margin-top:10px!important}
+.am-chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:12px}
+.am-chip{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:99px;font-size:11.5px;font-weight:500;background:#fff;border:1px solid var(--line)}
+.am-chip.am-ok{color:var(--good)}.am-chip.am-no{color:var(--muted)}
+.am-chip>span{font-size:9px}
+.am-presets{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}
+.am-preset{display:grid;grid-template-columns:18px 1fr;grid-template-rows:auto 1fr;column-gap:10px;row-gap:4px;align-items:start;align-content:start;text-align:left;padding:14px;border:1px solid var(--btnline);border-radius:12px;background:#fff;cursor:pointer;font:inherit;color:var(--ink2);transition:border-color .15s,background .15s}
+.am-preset:hover:not(:disabled){border-color:var(--brand-lilac)}
+.am-preset:focus-visible{outline:2px solid var(--brand);outline-offset:2px}
+.am-preset:disabled{cursor:default}
+.am-preset.is-selected{border-color:var(--brand);background:var(--brand-softer);box-shadow:0 0 0 1px var(--brand) inset}
+.am-radio{width:16px;height:16px;border-radius:50%;border:1.5px solid var(--grey);margin-top:1px;box-sizing:border-box}
+.am-preset-help{grid-column:2}
+.am-preset.is-selected .am-radio{border:5px solid var(--brand)}
+.am-preset-label{font-size:13px;font-weight:600;color:var(--ink)}
+.am-preset-help{font-size:11.5px;line-height:1.5;color:var(--muted)}
+.am-custom{font-size:12px;color:var(--muted);margin:10px 0 0}
+.am-rows{display:flex;flex-direction:column}
+.am-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(240px,320px);gap:12px 28px;padding:16px 0;border-top:1px solid var(--line2)}
+.am-row:first-child{border-top:0;padding-top:0}
+.am-row-inactive .am-row-text{opacity:.6}
+.am-label{font-size:13px;font-weight:600;color:var(--ink);display:block}
+.am-help{font-size:12px;line-height:1.55;color:var(--muted);margin:4px 0 0;max-width:62ch}
+.am-meta{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:8px}
+.am-meta code{font-family:var(--mono);font-size:10.5px;color:var(--faint);background:var(--soft);padding:2px 6px;border-radius:5px}
+.am-origin{font-size:11px;color:var(--faint)}
+.am-origin-set{color:var(--brand-ink);font-weight:500}
+.btn.am-link{padding:0;border:0;background:none;color:var(--brand);font-size:11px;font-weight:600}
+.btn.am-link:hover{text-decoration:underline}
+.am-row-control .select,.am-row-control .input{width:100%}
+.am-choice{font-size:12px;line-height:1.5;color:var(--ink2);margin:8px 0 0}
+.am-warn{font-size:12px;line-height:1.5;color:var(--warn-deep);background:var(--warn-soft);border:1px solid var(--warn-line);border-radius:8px;padding:7px 10px;margin:8px 0 0}
+.am-footer{border-top:1px solid var(--line2);flex-direction:row-reverse;justify-content:flex-end}
+.am-footer>span{flex:1}
+.am-footer.is-dirty{position:sticky;bottom:0;z-index:2;background:var(--brand-softer);border-top-color:var(--brand-line)}
+.am-footer.is-dirty>span{color:var(--brand-ink);font-weight:500}
+@media(max-width:1200px){.am-summary{margin:24px 24px 4px}}
+@media(max-width:700px){.am-row{grid-template-columns:1fr}.am-summary{margin:18px 18px 4px;padding:16px}
+  .am-footer{flex-direction:column-reverse;align-items:stretch;gap:10px}.am-footer .row>.btn{flex:1}}
+@media(prefers-reduced-motion:reduce){.am-preset{transition:none}}

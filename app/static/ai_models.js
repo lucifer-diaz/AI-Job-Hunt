@@ -54,7 +54,9 @@ function aimTargetOptions(selected, capability = 'CHAT') {
     + (models.length ? `<optgroup label="Models">${models.map(n => aimOpt(`model:${n}`, n, selected)).join('')}</optgroup>` : '')
     + (router || selected === 'auto' ? `<optgroup label="Auto router">${aimOpt('auto', `Auto router${router ? ` · ${d.routing.auto_router_model_name}` : ' (off)'}`, selected)}</optgroup>` : '');
 }
-function aimTargetFields(target, c = {}) {
+// `c` is null for a worker added after the account's configuration was seeded (no row yet; saving creates it).
+function aimTargetFields(target, c) {
+  c = c || {};
   const [kind, name] = String(target || '').split(/:(.*)/s);
   if (kind === 'model') return { model_mode: 'FIXED', primary_model: name || null, tier_name: c.tier || null };
   if (kind === 'auto') return { model_mode: 'AUTO_ROUTER', primary_model: c.primary_model || null, tier_name: c.tier || null };

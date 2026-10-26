@@ -829,11 +829,45 @@ class OptimizationReport(Contract):
     recommendations: list[Recommendation] = Field(default_factory=list, max_length=10)
 
 
+# ───────────── Browser navigator (Phase 6) ─────────────
+# The navigator names the next step on an application page by element key and answer reference only. It never writes
+# a value: the value of `answer_ref` comes from the AnswerResolver at execution time, and Python checks every proposal
+# (app.services.browser_actions) before the browser does anything. It has no action that can submit.
+
+BROWSER_ACTIONS = ("fill_field", "select_option", "check_box", "upload_file", "click_control", "scroll", "ask_human",
+                   "done")
+HUMAN_REASONS = ("LOGIN", "SIGNUP", "OTP", "CAPTCHA", "MISSING_INFORMATION", "LEGAL", "UNEXPECTED_PAGE", "OTHER")
+
+
+class BrowserActionProposal(Contract):
+    """The next step the navigator proposes on an application page: one action on one element."""
+
+    worker: ClassVar[str] = "BROWSER_NAVIGATOR"
+
+    action: Annotated[Literal["fill_field", "select_option", "check_box", "upload_file", "click_control", "scroll",
+                              "ask_human", "done"], BeforeValidator(lambda v: v.strip().lower()
+                                                                    if isinstance(v, str) else v)] = Field(
+        description="fill_field/select_option/check_box put a RESOLVED answer into its element; upload_file attaches "
+                    "a packet file; click_control opens or reveals part of the form (never a submit); scroll; "
+                    "ask_human when a person must act; done when every resolved field is filled")
+    element_key: Annotated[str | None, BeforeValidator(_text_id)] = Field(
+        default=None, max_length=40, description="the key of the ELEMENTS entry acted on, or null")
+    answer_ref: Annotated[str | None, BeforeValidator(_text_id)] = Field(
+        default=None, max_length=210, description="the ref of the FIELDS entry whose answer goes in, or null")
+    file_ref: Literal["resume", "cover_letter"] | None = Field(
+        default=None, description="which packet file to upload, or null")
+    human_reason: Annotated[Literal["LOGIN", "SIGNUP", "OTP", "CAPTCHA", "MISSING_INFORMATION", "LEGAL",
+                                    "UNEXPECTED_PAGE", "OTHER"] | None, BeforeValidator(_upper)] = Field(
+        default=None, description="why a person must act (ask_human only)")
+    step_note: Annotated[str, BeforeValidator(_phrase)] = Field(
+        default="", max_length=200, description="one short phrase on why this step; never quote the page")
+
+
 CONTRACTS: tuple[type[Contract], ...] = (
     RankingResult, TailoringResult, ReviewResult, CoverLetterResult, FollowUpResult, ApplicationAnswerResult,
     InboxClassificationResult, ApplicationEmailAnalysis, ApplicationEmailMatchResult, ResumeParserOutput,
     EvidenceExtractionResult, JobDescriptionParserOutput, JobDescriptionRecoveryResult, OptimizationReport,
-    CompanyInsightSynthesis, InterviewPrepResult, ApplicationFormPrepResult)
+    CompanyInsightSynthesis, InterviewPrepResult, ApplicationFormPrepResult, BrowserActionProposal)
 # Field names older prompts (or a confused model) use for another worker's output, beyond the contracts' own fields.
 LEGACY_FIELDS = {
     "RANKER": {"score", "fit_score", "gaps", "must_have_missing", "keywords", "application_strategy", "matches"},

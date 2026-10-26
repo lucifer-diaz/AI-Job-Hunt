@@ -78,6 +78,7 @@ beforeEach(() => {
       : url.endsWith('/activity') ? routes.activity
       : url.includes('/performance?') ? (routes.perfCalls = [...(routes.perfCalls || []), url], performance(url.split('/')[3]))
       : url === '/api/settings' ? routes.settings
+      : url.includes('/history') ? (routes.historyUrl = url, routes.history || { task: row(), events: [] })
       : url.startsWith('/api/workers/parsing') ? routes.parsing
       : url.startsWith('/api/workers/reviewing') ? { kind: 'reviewing', rows: [
         row({ task_id: 51, job_id: 8, kind: 'reviewing', stage: 'reviewing', title: 'Backend Lead', company: 'Stripe' }),
@@ -259,6 +260,40 @@ describe('Running workers', () => {
     routes.parsing = { ...parsing(), rows: [row({ status: 'RETRYING', run_now: true, can_run_now: true, attempt: 1 })] };
     await open();
     expect(view().querySelector('.wk-row').textContent).toContain('First in line');
+  });
+
+  it('shows an application run waiting for the person as such, never as first in line, and with no model', async () => {
+    routes.parsing = { ...parsing(), rows: [row({ kind: 'application', status: 'QUEUED', run_now: true, can_run_now: false, waiting_for: 'YOU', backend: 'playwright', waiting_detail: { kind: 'NEEDS_INPUT', questions: 11, confirmations: 0 }, model: { model: null, source: 'none' }, model_change: null })] };
+    const text = (await open()).querySelector('.wk-row').textContent;
+    expect(text).toContain('Waiting for you');
+    expect(text).toContain('answer 11 questions in the Knowledge bank');
+    expect(text).not.toContain('First in line');
+    expect(text).toContain('No model call');
+    expect(view().querySelector('.wk-row [data-act="wk-run-now"]')).toBeNull();
+  });
+
+  it('points the person at the browser window when fields are highlighted there', async () => {
+    routes.parsing = { ...parsing(), rows: [row({ kind: 'application', status: 'QUEUED', can_run_now: false, waiting_for: 'YOU', backend: 'browser_use_webui', waiting_detail: { kind: 'NEEDS_HUMAN', reason: 'FIELDS_NEED_YOU', fields: 2 } })] };
+    const text = (await open()).querySelector('.wk-row').textContent;
+    expect(text).toContain('Waiting for you in the browser window: fill 2 highlighted fields, then Continue in the Apply kit');
+  });
+
+  it('opens a task’s history from its name, newest first, with the browser-use option for an application', async () => {
+    routes.history = { task: row({ kind: 'application', status: 'FAILED', job_id: 7 }), browser_use_ready: true, events: [
+      { at: '2026-10-25T22:38:15', title: 'Attempt 3 failed', detail: 'reached filling · OTHER', tone: 'bad', source: 'attempt' },
+      { at: '2026-10-25T22:36:45', title: 'Opened job-boards.greenhouse.io', detail: 'HTTP 200 · 754 ms', tone: 'muted', source: 'browser' }] };
+    await open();
+    const name = view().querySelector('.wk-row [data-act="wk-history"]');
+    expect(name).not.toBeNull();
+    await ui.A['wk-history']({ dataset: { kind: name.dataset.kind, id: name.dataset.id } });
+    ui.render();
+    expect(routes.historyUrl).toBe(`/api/workers/${name.dataset.kind}/tasks/${name.dataset.id}/history`);
+    const panel = view().querySelector('.wk-history');
+    expect(panel.textContent).toContain('Attempt 3 failed');
+    expect(panel.textContent.indexOf('Attempt 3 failed')).toBeLessThan(panel.textContent.indexOf('Opened job-boards'));
+    await ui.A['wk-history-close']();
+    ui.render();
+    expect(view().querySelector('.wk-history')).toBeNull();
   });
 
   it('nudges finished jobs on to the next stage, and only offers it when some are waiting', async () => {

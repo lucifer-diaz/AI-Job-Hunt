@@ -484,18 +484,61 @@ def approve_job(db: Session, job: Job, *, override: bool = False, note: str = ""
     from app.services import preparation
 
     preparation.on_decision(db, job, "approved")  # a preparation graph run waiting for this ends (never blocks)
+    from app.services import application_execution
+
+    application_execution.on_approved(db, job)  # auto submit, when the account turned it on (never blocks)
     db.commit()
     db.refresh(application)
     return application
 
 
+# Where a submitted job's canonical state already is, or has moved past: nothing to advance.
+_SUBMITTED_STATES = ("APPLIED", "FOLLOWUP_DUE", "FOLLOWED_UP", "INTERVIEW", "REJECTED", "OFFER")
+
+
+def advance_to_applied(db: Session, job: Job, *, actor: str, reason: str) -> str | None:
+    """Move the canonical state READY_TO_APPLY → APPLYING → APPLIED through validated transitions (work_queue),
+    reconciling an older approval to READY_TO_APPLY first where the stored facts back it (approval.reconcile_to_ready).
+    Never forges a step: when no backed path exists the state stays where it is and the reason is returned for the
+    audit trail. Does not commit."""
+    from app.services import approval
+    from app.services.lifecycle import InvalidTransition, parse_state
+    from app.services.lifecycle import WorkflowState as S
+    from app.services.work_queue import transition
+
+    state = parse_state(job.state) if job.state else None
+    if state is not None and state.value in _SUBMITTED_STATES:
+        return None
+    try:
+        if state not in (S.READY_TO_APPLY, S.APPLYING):
+            variant = db.get(ResumeVariant, job.application.approved_resume_id) if job.application and \
+                job.application.approved_resume_id else None
+            if variant is None:
+                return f"the canonical state stayed {state.value if state else 'unset'}: no approved version"
+            approval.reconcile_to_ready(db, job, variant)
+        if parse_state(job.state) is S.READY_TO_APPLY:
+            transition(db, job, S.APPLYING, actor=actor, reason=reason)
+        transition(db, job, S.APPLIED, actor=actor, reason=reason)
+    except (approval.ApprovalRefused, InvalidTransition) as exc:
+        return f"the canonical state stayed {job.state}: {exc}"[:300]
+    return None
+
+
 def mark_applied(db: Session, job: Job, *, submitted_by: str = "you", submitted_via: str | None = None,
-                 confirmation_id: str | None = None, claim: dict | None = None) -> Application:
-    """Record the submission on the application and the job. Callers go through apply_queue.record_submission, which
-    takes the account lock and checks the packet, duplicates and claims first; `claim` is its provenance."""
+                 confirmation_id: str | None = None, claim: dict | None = None,
+                 evidence: dict | None = None) -> Application:
+    """Record the submission on the application and the job, and move the canonical state to APPLIED (through
+    APPLYING). Callers go through apply_queue.record_submission, which takes the account lock and checks the packet,
+    duplicates and claims first; `claim` is its provenance and `evidence` says how the submission is known:
+    `verified_browser` (the confirmation verifier saw the site's evidence) or `reported` (a person or Claude Desktop
+    said so). A report is never treated as verified."""
     application = job.application or approve_job(db, job)
     if application.status != "approved":
         raise ValueError("Application must be approved before marking applied")
+    provenance = {"evidence": (evidence or {}).get("kind") or "reported",
+                  **({"verification": evidence.get("facts")} if evidence and evidence.get("facts") else {})}
+    not_advanced = advance_to_applied(db, job, actor=(submitted_via or "person")[:60],
+                                      reason=f"Submitted by {submitted_by} ({provenance['evidence']})")
     applied_at = datetime.now(UTC).replace(tzinfo=None)
     application.status = "applied"
     application.stage = "applied"
@@ -510,7 +553,8 @@ def mark_applied(db: Session, job: Job, *, submitted_by: str = "you", submitted_
                             detail=detail + (f" · confirmation {confirmation_id}" if confirmation_id else ""),
                             occurred_at=applied_at,
                             meta={**({"confirmation_id": confirmation_id} if confirmation_id else {}),
-                                  **(claim or {})} or None))
+                                  **(claim or {}), **provenance,
+                                  **({"state_not_advanced": not_advanced} if not_advanced else {})}))
     db.commit()
     db.refresh(application)
     return application

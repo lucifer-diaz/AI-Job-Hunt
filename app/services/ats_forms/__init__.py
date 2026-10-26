@@ -20,16 +20,33 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.services import jd_quality
 
-FIELD_KINDS = ("text", "email", "tel", "url", "number", "textarea", "select", "radio", "checkbox", "file")
+# `combobox`: a searchable dropdown widget (role="combobox", e.g. React Select on new Greenhouse boards). Its options
+# are often not in the page until it is opened, so only the browser-use backend can set it (runner `choose`).
+FIELD_KINDS = ("text", "email", "tel", "url", "number", "textarea", "select", "radio", "checkbox", "file", "combobox")
+DROPDOWN_FIELDS = "DROPDOWN_FIELDS"  # a required combobox the Playwright path cannot set: browser-use or a person
 # What a field asks for, when the adapter can tell from the form's own markup; anything else is a "question".
 ROLES = ("first_name", "last_name", "full_name", "email", "phone", "resume", "cover_letter", "linkedin", "github",
          "website", "location", "question")
 # Why a page is not a usable form (ApplicationExecutionTask.interrupt.reason / result_code).
 LOGIN_REQUIRED, OTP_REQUIRED, CAPTCHA = "LOGIN_REQUIRED", "OTP_REQUIRED", "CAPTCHA_OR_ANTI_BOT"
+ACCOUNT_REQUIRED = "ACCOUNT_REQUIRED"  # the site wants a new account first: a person signs up (never automated)
 POSTING_CLOSED, NO_FORM, UNSUPPORTED = "POSTING_CLOSED", "NO_FORM", "UNSUPPORTED_SITE"
-HUMAN_BLOCKERS = (LOGIN_REQUIRED, OTP_REQUIRED, CAPTCHA)
+HUMAN_BLOCKERS = (LOGIN_REQUIRED, OTP_REQUIRED, CAPTCHA, ACCOUNT_REQUIRED)
 OTP_MARKERS = ("one-time code", "one time code", "verification code", "enter the code", "6-digit code",
                "security code", "two-factor", "2fa", "one-time passcode", "authenticator app")
+SIGNUP_MARKERS = ("create an account", "create account", "create your account", "sign up", "register now",
+                  "confirm password", "verify password", "re-enter password", "new account")
+# A field that makes the candidate attest, consent or agree to something. Never answered from a saved answer alone in
+# guarded mode: its exact wording must be one the person approved (submission.PreSubmitValidator).
+LEGAL_MARKERS = ("i certify", "i attest", "i agree", "i acknowledge", "i consent", "i confirm", "i understand",
+                 "i hereby", "true and complete", "accurate and complete", "terms and conditions", "terms of use",
+                 "privacy policy", "privacy notice", "data processing", "background check", "consent to",
+                 "agree to", "acknowledge that", "electronic signature", "e-signature", "signature")
+
+
+def is_legal(label: str) -> bool:
+    lowered = " ".join((label or "").lower().split())
+    return any(marker in lowered for marker in LEGAL_MARKERS)
 
 
 class FormOption(BaseModel):
@@ -44,13 +61,15 @@ class FormField(BaseModel):
     model_config = ConfigDict(extra="forbid")
     id: str = Field(max_length=200)
     label: str = Field(max_length=500)
-    kind: Literal["text", "email", "tel", "url", "number", "textarea", "select", "radio", "checkbox", "file"]
+    kind: Literal["text", "email", "tel", "url", "number", "textarea", "select", "radio", "checkbox", "file",
+                  "combobox"]
     role: Literal["first_name", "last_name", "full_name", "email", "phone", "resume", "cover_letter", "linkedin",
                   "github", "website", "location", "question"] = "question"
     required: bool = False
     options: list[FormOption] = Field(default_factory=list, max_length=200)
     locator: str = Field(max_length=400)
     eeo: bool = False  # voluntary self-identification: never answered automatically
+    legal: bool = False  # an attestation or consent (is_legal): guarded mode needs the person's approval of its text
 
 
 class SubmitControl(BaseModel):
@@ -71,6 +90,9 @@ class ApplicationForm(BaseModel):
 
     def required_fields(self) -> list[FormField]:
         return [f for f in self.fields if f.required]
+
+    def required_dropdowns(self) -> list[FormField]:
+        return [f for f in self.fields if f.required and f.kind == "combobox"]
 
 
 def fingerprint(fields: list[FormField]) -> str:
@@ -97,6 +119,9 @@ def page_problem(html: str, *, status: int | None = None, title: str | None = No
     if soup.find("input", attrs={"autocomplete": "one-time-code"}) is not None or (
             len(lowered) < 4000 and any(marker in lowered for marker in OTP_MARKERS)):
         return OTP_REQUIRED
+    passwords = len(soup.find_all("input", attrs={"type": "password"}))
+    if passwords >= 2 or (passwords and len(lowered) < 4000 and any(m in lowered for m in SIGNUP_MARKERS)):
+        return ACCOUNT_REQUIRED
     if kind == jd_quality.LOGIN_REQUIRED or (has_password and len(lowered) < 4000):
         return LOGIN_REQUIRED
     if kind == jd_quality.JOB_REMOVED or jd_quality.closed_or_error(text, title):
@@ -105,6 +130,8 @@ def page_problem(html: str, *, status: int | None = None, title: str | None = No
 
 
 def adapters() -> list[Any]:
+    """The deterministic form adapters (the Playwright backend). Forms they do not recognise go to the browser-use
+    backend's generic reader (app.services.ats_forms.generic) when that backend is on."""
     from app.services.ats_forms import greenhouse
 
     return [greenhouse]
@@ -115,4 +142,6 @@ def adapter_for(url: str, html: str) -> Any | None:
 
 
 def adapter_named(name: str) -> Any | None:
-    return next((a for a in adapters() if a.NAME == name), None)
+    from app.services.ats_forms import generic
+
+    return next((a for a in [*adapters(), generic] if a.NAME == name), None)

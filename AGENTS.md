@@ -534,12 +534,13 @@ hand-back) qualify a job when `QUALIFICATION_GRAPH_MODE=on` (README §9c). The r
 `app/services/answer_resolver.py`, `app/services/ats_forms/` and `app/infrastructure/application_browser/` (README
 §10a). The rules a change has to keep:
 
-* **Nothing in Job Hunt OS clicks a final Submit.** Phase 5 fills a form at most (ASSIST) and ends at
-  READY_TO_SUBMIT; a person submits. The execution stages SUBMITTING, CONFIRMING and CONFIRMED exist in the vocabulary
-  and are refused by `application_execution.set_stage`. `ApplicationPage` has no click, press, submit, tap or evaluate,
-  and the application browser aborts every non-GET request. `tests/test_no_automated_submit.py` fails the build on a
-  submit-capable call under the application modules. Do not add one before the Phase 6 SubmissionIntent, pre-submit
-  validator and confirmation verifier exist and are reviewed.
+* **Only the guarded path clicks a final Submit (Phase 6, next section).** OBSERVE and ASSIST fill a form at most and
+  end at READY_TO_SUBMIT; a person submits. The execution stages SUBMITTING, CONFIRMING and CONFIRMED are refused by
+  `application_execution.set_stage` (and the column) unless a GUARDED_AUTO execution passes its own SubmissionIntent.
+  `ApplicationPage` has no click, press, submit, tap or evaluate, and while Job Hunt OS drives a page the application
+  browsers abort every non-GET request except a file upload and a SubmitTicket's click. `tests/test_no_automated_submit.py`
+  allows exactly one `click` (GuardedPage.submit), one `.submit(ticket)` and one `signed_submit` (the SUBMIT node);
+  never add another.
 * **`apply_queue` stays the one domain boundary.** Readiness (`not_ready_reason`), duplicates (`applied_duplicate`,
   over `posting_identity`), blockers and recording (`record_submission`, `record_blocker`) are shared by MCP, the Apply
   kit, `POST /api/jobs/{id}/applied` and the execution worker. Never add a second readiness, duplicate or result path.
@@ -569,8 +570,8 @@ hand-back) qualify a job when `QUALIFICATION_GRAPH_MODE=on` (README §9c). The r
   `app.infrastructure.application_browser` (`ApplicationSessionManager`). Its only implementation is ephemeral: a fresh
   context per step, no storage state, cookies, credentials or profile, closed in `finally`. It never passes anything
   to `BrowserService.fetch_rendered_page` or JD recovery, and JD recovery never receives an application context.
-  Persisting an authenticated session needs a reviewed `AuthenticatedApplicationBrowser` implementation, an ADR and an
-  update of this section first. A login wall, OTP or CAPTCHA pauses as NEEDS_HUMAN; it is never solved or retried.
+  It never holds a saved login: saved ATS sessions exist only for the browser-use runner, per account and domain
+  (Phase 6, ADR-035). A login wall, OTP or CAPTCHA pauses as NEEDS_HUMAN; it is never solved or retried.
 * **The execution worker is a normal queued worker.** `application_execution_tasks` (one active per job), WorkerKind
   `application`, scheduler job `application_execution`, orchestration node `application_execution`, worker-owned graph
   `application` (`api_resumable=False`; thread key `application:<job>:<task>:<created>:a<attempt>`). Kill stops the
@@ -580,6 +581,142 @@ hand-back) qualify a job when `QUALIFICATION_GRAPH_MODE=on` (README §9c). The r
   holds ids, enums and counts only — never form values, page HTML or answers. ASSIST fills a page that is closed when
   the step ends: READY_TO_SUBMIT means every required field could be filled from verified sources, not that a filled
   form is waiting anywhere. Never present it as one; a person fills and submits on the site.
+
+## Guarded submission, the browser-use backend and ATS logins (Phase 6)
+
+`app/services/submission.py` (PreSubmitValidator, SubmissionIntent, ConfirmationVerifier, reconcile),
+`app/infrastructure/application_browser/guarded_submit.py` (the one page that clicks),
+`app/services/application_backends.py`, `app/services/browser_actions.py`, `app/prompts/browser_navigation.py`,
+`app/infrastructure/application_browser/browser_use_sidecar.py` + `sidecars/browser_use_runner/runner.py`,
+`app/services/ats_map.py`, `app/services/ats_auth.py`, `app/services/browser_use_webui.py` (README §10b, ADR-031 –
+ADR-035). The rules a change has to keep:
+
+* **Auto submit is per account, and stops only for the person.** `guarded_auto` is auto submit:
+  * it needs the server mode (`APPLICATION_EXECUTION_MODE=guarded_auto`) and the account's switch (Settings → Auto
+    submit, `submission.consent`, re-read at every check). `autonomous` is refused when settings load;
+  * with both on, approving a job queues its run (`application_execution.on_approved`, in a savepoint: approval never
+    fails because of it), and a run named by no one gets GUARDED_AUTO (`default_mode`);
+  * it covers every route a browser can complete (`AtsMatch.auto_submit`): the Greenhouse adapter on Playwright, or the
+    browser-use backend for any other form. LinkedIn, Indeed and Ashby are never automated;
+  * anything only the person can settle (a question with no verified answer, an attestation they have not approved, a
+    sensitive answer, a login, a code, a CAPTCHA, no single Submit control) hands them the window with the reason on
+    the page; Continue checks everything again and submits.
+* **The order is fixed and every step is re-checked.**
+  1. `PreSubmitValidator.check`.
+  2. `apply_queue.begin_submission(client="worker", execution_id=…)` — the shared claim, never a second mechanism.
+  3. A SubmissionIntent ARMED.
+  4. The page read again.
+  5. `PreSubmitValidator.check` again (with the claim).
+  6. `commit_clicking`: CLICKING + SUBMITTING in one commit, under the run's lease.
+  7. The click: `GuardedPage.submit(ticket)` (Playwright), or the runner's `submit` with `submission.signed_submit`
+     (browser-use) after `still_clicking`. Either way the intent is re-read first.
+  8. `after_click`: CONFIRMING, READY_TO_APPLY → APPLYING.
+  9. `ConfirmationVerifier`.
+  10. `confirm` (through `record_submission`) or `uncertain`.
+
+  No transaction is held while the browser works.
+* **After CLICKING, the outcome is a fact to establish, never a retry.** A crash, a timeout, a Kill, a lease running out
+  or an ambiguous page makes the intent and the claim UNCERTAIN (`submission.reconcile`, `recover_expired`,
+  `on_stopped`). A replayed SUBMIT node never clicks again (`submission.clicked`). Only an ARMED intent (nothing
+  clicked) is aborted and its claim released. Only a person resolves an uncertain submission, and only a person moves
+  APPLYING back to READY_TO_APPLY (`lifecycle.PERSON_ONLY`, enforced in `work_queue.transition`).
+* **Confirmation needs the site's evidence.** It needs all three:
+  * a 2xx/3xx non-GET response from the application's own site after the click (`same_site`; uploads never count);
+  * the form gone;
+  * a confirmation path or the site's confirmation wording.
+
+  A click, a navigation or a success-looking page alone is never enough. The evidence stored is metadata (statuses,
+  hosts, flags, a confirmation id), never page text.
+* **One recorder, two provenances.** Every submission is recorded by `apply_queue.record_submission`, which moves
+  READY_TO_APPLY → APPLYING → APPLIED (`workflow.advance_to_applied`, never a forged step) and labels the event
+  `evidence: verified_browser` only when the worker passes its own claim token and the verifier's facts. MCP, the Apply
+  kit and `POST /api/jobs/{id}/applied` are always `reported`.
+* **Route exclusivity.** While a GUARDED_AUTO task is active for a posting (any alias), `begin_submission` refuses every
+  other client (`ROUTE_HELD`) and MCP `get_job_packet` refuses the packet. A guarded enqueue is refused while any claim
+  on the posting is open or uncertain.
+* **The browser-use backend never decides, and submits only with a signed token.**
+  * The runner is a child process per execution, started with `BROWSER_USE_PYTHON`. It speaks JSON lines and has no
+    port.
+  * Its environment holds only PATH and HOME. Telemetry is off. Chromium is launched plainly: no debugging port, no
+    anti-detection flags (browser-use's own launcher is not used).
+  * It reuses browser-use's DOM indexing and element actions only: no browser-use Agent, no LLM.
+  * While Job Hunt OS drives, it aborts every non-GET except:
+    * the upload a file selection starts: an XHR/fetch PUT or multipart POST, for the seconds after `upload`
+      (Greenhouse sends the file to its storage bucket);
+    * during a signed SUBMIT click, whatever the page sends (its CAPTCHA script included);
+    * during a signed LOGIN click, the login domain only.
+
+    It refuses a submit-like click without a token (a `<button>` with no type inside a form is a submit), refuses
+    navigation off the allowed hosts, uploads only from the run's packet folder and fills password fields only through
+    `login_fill`. An upload counts only once the site took it (`UPLOAD_FAILED` otherwise); a board that replaces the
+    input with the file's name is read from `observe`'s `attached`.
+  * Like the shared browser, it never reaches internal services: every request is checked by host name and literal
+    address, and every navigation (a frame's too) by the addresses its host resolves to (`_resolves_private`).
+  * A LOGIN token works only on a control of the form that holds the password field, and `_login_parts` takes the
+    username, password and button from that one form.
+  * A saved session restores its cookies and its origins' local storage.
+  * The only scripts it evaluates are its own constants.
+  * Only `submission` signs SUBMIT (`signed_submit`, called once, by the SUBMIT node after CLICKING), for the form's
+    own submit control (`_submit_control`: one submit-like element of the form that holds the fields). Only
+    `application_backends` signs LOGIN.
+* **Every navigator step is checked by Python** (`browser_actions.check`):
+  * the element is in the latest observation;
+  * an answer goes only into the element it was resolved for (the field's locator is that element's key), and only a
+    RESOLVED answer;
+  * a select value is one of the element's own options;
+  * an upload is a packet file of the matching role;
+  * a click never lands on a submit-like control, a link off the route, or an accept/agree/consent button
+    (declining non-essential cookies is allowed);
+  * three refusals end the run.
+
+  The model's contract (`BrowserActionProposal`) has no field for a value and no submit action. Deterministic filling
+  comes first; the navigator only reaches what it cannot.
+* **Dropdown widgets (`role=combobox`, the newer Greenhouse board) are set only by the runner's `choose`.** It opens
+  the widget, types the verified answer and clicks the option whose text matches it exactly; anything else is
+  refused (`NO_SUCH_OPTION`). The Playwright path never clicks, so a form with a required dropdown goes to browser-use
+  (auto submit included), or waits for the person (`DROPDOWN_FIELDS`) when browser-use is off. A widget's hidden helper
+  inputs (`aria-hidden`, `tabindex=-1`, no id or name) are never fields. Each ephemeral-page field action waits at most
+  `FIELD_TIMEOUT_MS`.
+* **A person may send a run to browser-use** (`enqueue(backend="browser_use_webui")`, the Apply kit and the history
+  panel): fill only (ASSIST) unless a mode is named, refused while another run of the job is active or when the runner is
+  not configured; Retry and Run now keep that choice.
+* **The Web UI's own HTTP interface is not an automation API.** `browser_use_webui.probe` GETs its `/config` for
+  health and compatibility, nothing else. Never drive its Gradio endpoints (positional, auto-named, unauthenticated,
+  one global session, no pre-action veto).
+* **Logins are the person's, scoped to one domain** (`ats_auth`).
+  * Passwords and sessions are encrypted (`encrypt_secret`) in their own owned tables, never in settings or
+    preferences.
+  * No API returns a password, except a signup's generated one, once. A password is decrypted only to fill that very
+    domain's login form, on a domain in `APPLICATION_LOGIN_DOMAINS`, inside `redaction.holding`.
+  * A saved session keeps only its own domain's cookies and origins and is used only by that account's runner for that
+    domain (`APPLICATION_AUTH_SESSIONS_ENABLED`). A login is attempted once per run.
+  * OTP, CAPTCHA, a failed login and every signup wait for the person. No run ever creates an account or accepts terms.
+* **A window handed to the person is a normal browser.**
+  * A headful session is parked for `APPLICATION_TAKEOVER_TTL_MINUTES` and then sends what the person sends (logins,
+    uploads, their own submission); there is nothing to start first, and no Start submission in the Apply kit.
+  * `watch_windows` (every `applications` pass) reads those windows' evidence and records a submission the site
+    confirmed (`ConfirmationVerifier`): the run's own open claim is resolved as submitted, anything else is a
+    `reported` submission; the run ends `SUBMITTED_IN_WINDOW`. It works as the window's own account.
+  * The task waits PENDING at NEEDS_HUMAN, not claimable, until the person continues
+    (`continue_after_takeover`).
+  * Then the run re-observes the page from its apply URL and re-validates everything. It never replays an old action.
+  * An unclaimed takeover ends TAKEOVER_EXPIRED with the shared blocker. Kill closes the window.
+* **Fields the run could not fill are pointed out, not guessed** (`FIELDS_NEED_YOU`, headful browser-use).
+  * The runner outlines them with a banner (`point`, constant JavaScript, no click). The interrupt holds field ids and
+    labels only.
+  * Continue resumes in the same page (`session.resume_in_place`, no reload): the run removes the marks, fills what was
+    answered meanwhile, and reads back every required field.
+  * A required field with no verified source passes only when it now holds a value, and becomes `PERSON`. Auto submit
+    accepts a `PERSON` field (and an attestation the person ticked) only after the person pressed Continue.
+  * The person's values are never stored on the task, the checkpoint or a log. They are read from the window only when
+    the person asks to save them to the Knowledge bank (`save-window-answers`, as their verified answers).
+  * Headless runs end NEEDS_HUMAN and list the fields instead.
+* **The ATS map is facts, per account** (`ats_routes`, `ats_map.observe`): from posting URLs and run outcomes, never a
+  model, never a guessed employer site. A login belongs to a route's `login_domain`: per tenant where the ATS has
+  per-employer accounts (Workday, iCIMS, Taleo, SuccessFactors). Where employers share a host (SuccessFactors,
+  `tenant_in_host=False`), a host cannot keep their logins apart: `login_domain` is None, nothing is saved or reused
+  there, and a person signs in each time. Ashby (its form loads through POST), LinkedIn and
+  Indeed are `unsupported`.
 
 ## Candidate knowledge retrieval (RAG)
 

@@ -127,11 +127,11 @@ def _resolve(db: Session, job: Job, profile: Any, field: FormField, confirmed: s
     status = found["status"]
     if status == "ANSWERED" and (found.get("answer_source") or "").startswith("knowledge_answer:"):
         answer = found["answer"]
-        if field.kind in ("select", "radio") and _option_for(field, answer) is None:
+        if _chooses(field) and _option_for(field, answer) is None:
             return _entry(field, NEEDS_INPUT, why="the saved answer is not one of the form's options")
         return _entry(field, RESOLVED, found["answer_source"])
     if status == "ANSWERED" and (found.get("answer_source") or "").startswith("candidate_profile."):
-        return _entry(field, RESOLVED, found["answer_source"]) if field.kind not in ("select", "radio") \
+        return _entry(field, RESOLVED, found["answer_source"]) if not _chooses(field) \
             else _entry(field, NEEDS_INPUT)
     if status == "NEEDS_CONFIRMATION":
         # knowledge.search withholds sensitive answers to *similar* questions too (for a person reading them). A form
@@ -191,9 +191,17 @@ def values(db: Session, job: Job, form: ApplicationForm, field_plan: dict[str, A
     return out
 
 
+def _chooses(field: FormField) -> bool:
+    """A field whose value must be one of its options. A dropdown widget whose options are not in the page yet takes
+    the verified answer's own text, and the runner's `choose` requires an exact option match when it opens."""
+    return field.kind in ("select", "radio") or (field.kind == "combobox" and bool(field.options))
+
+
 def _form_value(field: FormField, answer: str) -> Any:
-    if field.kind in ("select", "radio"):
+    if _chooses(field):
         return _option_for(field, answer)
+    if field.kind == "combobox":
+        return answer.strip()
     if field.kind == "checkbox":
         return answer.strip().lower() in YES
     return answer.strip()
