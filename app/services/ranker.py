@@ -70,6 +70,7 @@ from app.services.llm import (
     LLMCall,
     LLMClient,
     LLMConfigError,
+    LLMContextOverflowError,
     LLMError,
     LLMRateLimitError,
     LLMResponseError,
@@ -847,6 +848,8 @@ def classify(exc: Exception) -> tuple[ErrorCategory, bool, bool]:
         return ErrorCategory.TIMEOUT, True, False
     if isinstance(exc, LLMRateLimitError):
         return ErrorCategory.RATE_LIMITED, True, False
+    if isinstance(exc, LLMContextOverflowError):
+        return ErrorCategory.VALIDATION, False, False  # the same prompt cannot fit next time either
     if isinstance(exc, (LLMResponseError, RankingSchemaError)):
         return ErrorCategory.VALIDATION, True, False  # the model may answer correctly next time
     if isinstance(exc, LLMError):

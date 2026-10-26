@@ -47,7 +47,7 @@ from app.services.ai_config import is_free_model
 from app.services.ai_config import resolve as resolve_ai_config
 from app.services.ai_workers import label as worker_label
 from app.services.ai_workers import worker_for_prompt
-from app.services.external_api import RateLimitedCooldown, external_operation
+from app.services.external_api import RateLimitedCooldown, external_operation, too_large
 from app.services.llm_telemetry import Attempt, LLMCall, Usage
 from app.settings import get_settings
 
@@ -213,7 +213,7 @@ def error_type(exc: BaseException, *, validation: bool = False) -> str:
     if validation or (isinstance(exc, LLMSchemaError) and exc.reason != "INVALID_JSON"):
         return "SCHEMA_VALIDATION"
     return ("CONFIGURATION" if isinstance(exc, LLMConfigError) else "TIMEOUT" if isinstance(exc, (LLMTimeoutError, TimeoutError))
-            else "RATE_LIMIT" if isinstance(exc, LLMRateLimitError)
+            else "RATE_LIMIT" if isinstance(exc, (LLMRateLimitError, RateLimitedCooldown))
             else "CONTEXT_OVERFLOW" if isinstance(exc, LLMContextOverflowError)
             else "INVALID_JSON" if isinstance(exc, LLMResponseError)
             else "PROVIDER_ERROR" if isinstance(exc, LLMError) else "OTHER")
@@ -266,6 +266,10 @@ def _gateway_error(model: str, exc: Exception) -> LLMError:
     text = str(exc)
     if isinstance(exc, LiteLLMAuthError):
         return LLMConfigError(f"LiteLLM refused the API key saved in AI Orchestration → Models: {text}")
+    if too_large(text):  # Groq: larger than the model's whole per-minute token limit; no wait makes it fit
+        return LLMContextOverflowError(
+            f"{model} refused the request as larger than its whole per-minute token limit, so waiting cannot help: "
+            f"shorten the prompt (a prompt token budget) or use a model with a higher limit. {detail}")
     if status == 429:
         return LLMRateLimitError(detail)
     if status in (408, 504) or "did not answer in time" in text or "Timeout" in text:
@@ -482,7 +486,12 @@ class LLMClient:
         """One logical request: the worker's model, then — only when its escalation policy says so — one
         escalated request to a stronger model. Each is recorded as its own telemetry row."""
         worker_type = call.worker_type or worker_for_prompt(prompt_name) or STAGE_WORKERS.get(task)
-        resolved = failover.apply(call.resolved or model_resolution.get(self.user_id, worker_type), self.user_id)
+        resolved = call.resolved or model_resolution.get(self.user_id, worker_type)
+        # What the request will take off a per-minute token window (app.services.token_pacing): a model whose window
+        # cannot take it this minute moves behind its backups, like a resting one.
+        need = (llm_telemetry.estimate_tokens(system) + llm_telemetry.estimate_tokens(user)
+                + (resolved.max_output_tokens or 0))
+        resolved = failover.apply(resolved, self.user_id, tokens_needed=need)
         try:
             first = self._gateway_attempt(system, user, resolved.model, resolved, call, prompt_name, prompt_version)
         except Exception as exc:
@@ -582,7 +591,7 @@ class LLMClient:
         external = {"model": model, "stage": llm_telemetry.STAGE_BY_PROMPT.get(attempt.prompt_name or "", "OTHER"),
                     "worker_type": resolved.worker_type, "prompt_name": attempt.prompt_name,
                     "prompt_version": attempt.prompt_version, "params_withheld": withheld or None,
-                    "escalation": escalation}
+                    "escalation": escalation, "tokens_needed": estimated + int(params.get("max_tokens") or 0)}
         waiting = time.monotonic()
         with model_resolution.concurrency_slot(resolved, self.user_id, timeout) as free:
             if resolved.max_concurrency:  # without a limit there is no queue to measure

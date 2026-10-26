@@ -22,6 +22,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import re
 import time
 import uuid
 from collections.abc import Callable, Iterable
@@ -34,7 +35,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from app.services import backoff, tracing
+from app.services import backoff, token_pacing, tracing
 from app.services.redaction import redact_body, redact_headers, redact_text, redact_url, redact_value
 from app.settings import get_settings
 
@@ -51,6 +52,23 @@ REMAINING_HEADERS = ("x-ratelimit-remaining-requests", "x-ratelimit-remaining", 
                      "x-rate-limit-remaining", "anthropic-ratelimit-requests-remaining")
 RESET_HEADERS = ("x-ratelimit-reset-requests", "x-ratelimit-reset", "ratelimit-reset", "x-rate-limit-reset",
                  "anthropic-ratelimit-requests-reset", "retry-after")
+# The LiteLLM proxy forwards every provider header with this prefix (`llm_provider-retry-after`). On a success the
+# OpenAI-named `x-ratelimit-*` headers also arrive bare; on a refusal only the remaining/limit counters do, so a 429's
+# Retry-After and resets are only ever in the prefixed form (litellm get_response_headers / process_response_headers).
+FORWARDED = "llm_provider-"
+# Groq and OpenAI split a limit into requests and tokens. Tokens are always per minute; requests are per minute at
+# OpenAI but per DAY at Groq, so a Groq response's request counter is never the figure that runs out first.
+TOKEN_LIMIT, TOKEN_REMAINING, TOKEN_RESET = ("x-ratelimit-limit-tokens", "x-ratelimit-remaining-tokens",
+                                             "x-ratelimit-reset-tokens")
+REQUEST_LIMIT, REQUEST_REMAINING, REQUEST_RESET = ("x-ratelimit-limit-requests", "x-ratelimit-remaining-requests",
+                                                   "x-ratelimit-reset-requests")
+# "7.66s", "2m59.56s", "1h2m", "120ms" (Groq, OpenAI); a plain number is seconds.
+_DURATION = re.compile(r"(?:(\d+(?:\.\d+)?)h)?(?:(\d+(?:\.\d+)?)m(?!s))?(?:(\d+(?:\.\d+)?)s)?(?:(\d+(?:\.\d+)?)ms)?")
+# A request larger than the model's whole per-minute token limit (Groq: HTTP 413, or a 429 once LiteLLM maps it to its
+# RateLimitError): "Request too large for model `x` ... on tokens per minute (TPM): Limit 8000, Requested 9500".
+# No wait can make it fit, so it is a client error, never a cooldown.
+_TOO_LARGE = re.compile(r"request too large\b.*?(?:tokens per minute|\bTPM\b)", re.IGNORECASE | re.DOTALL)
+_TOO_LARGE_FIGURES = re.compile(r"Limit\s+(\d+)\s*,\s*Requested\s+(\d+)", re.IGNORECASE)
 
 
 def utcnow() -> datetime:
@@ -110,9 +128,10 @@ class RateLimitedCooldown(httpx.HTTPError):
     a call that was deliberately not made should look like a call that did not get through.
     """
 
-    def __init__(self, provider: str, retry_after_seconds: int):
+    def __init__(self, provider: str, retry_after_seconds: int, reason: str | None = None):
         self.provider, self.retry_after_seconds = provider, retry_after_seconds
-        super().__init__(f"{provider} is rate limiting this account; not calling again for {retry_after_seconds}s")
+        super().__init__(reason or f"{provider} is rate limiting this account; "
+                                   f"not calling again for {retry_after_seconds}s")
 
 
 def _classify_exception(exc: BaseException) -> str:
@@ -160,11 +179,108 @@ def _header_int(headers: Any, names: Iterable[str]) -> int | None:
     return None
 
 
-def _reset_at(headers: Any, at: datetime) -> datetime | None:
-    """A rate-limit reset, whether the provider sends seconds-from-now or an epoch timestamp."""
+def _header(headers: Any, name: str) -> Any:
+    """A header as the provider sent it, or as the LiteLLM proxy forwarded it (`llm_provider-<name>`)."""
+    if headers is None:
+        return None
+    value = headers.get(name)
+    return value if value is not None else headers.get(FORWARDED + name)
+
+
+def duration_seconds(raw: Any) -> float | None:
+    """A reset written as a duration ("7.66s", "2m59.56s", "1h2m", "120ms") or plain seconds; None when unreadable."""
+    if raw is None:
+        return None
+    text = str(raw).strip().lower()
+    try:
+        return max(0.0, float(text))
+    except ValueError:
+        pass
+    match = _DURATION.fullmatch(text)
+    if not text or not match or not any(match.groups()):
+        return None
+    hours, minutes, seconds, millis = (float(part) if part else 0.0 for part in match.groups())
+    return hours * 3600 + minutes * 60 + seconds + millis / 1000
+
+
+def _count(headers: Any, name: str) -> int | None:
+    raw = _header(headers, name)
+    try:
+        return int(float(str(raw).strip())) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def is_groq(headers: Any, metadata: dict[str, Any] | None = None) -> bool:
+    """Whether the answer came from Groq: its own `x-groq-*` headers (forwarded or not), the deployment LiteLLM
+    reports, or a `groq/` model name. Only then is the request counter known to be per day."""
+    try:
+        if headers is not None and any("x-groq-" in str(name).lower() for name in headers):
+            return True
+        base = str(headers.get("x-litellm-model-api-base") or "") if headers is not None else ""
+        names = [headers.get("x-litellm-model-name") if headers is not None else None, (metadata or {}).get("model")]
+        return "groq.com" in base.lower() or any(isinstance(n, str) and n.lower().startswith("groq/") for n in names)
+    except Exception:  # noqa: BLE001  telemetry only
+        return False
+
+
+def rate_window(headers: Any, metadata: dict[str, Any] | None = None) -> token_pacing.Window:
+    """The token and request limits a response reported, each with its own window. Never raises."""
+    try:
+        groq = is_groq(headers, metadata)
+        return token_pacing.Window(
+            tokens_limit=_count(headers, TOKEN_LIMIT), tokens_remaining=_count(headers, TOKEN_REMAINING),
+            tokens_reset_seconds=duration_seconds(_header(headers, TOKEN_RESET)),
+            requests_limit=_count(headers, REQUEST_LIMIT), requests_remaining=_count(headers, REQUEST_REMAINING),
+            requests_reset_seconds=duration_seconds(_header(headers, REQUEST_RESET)),
+            requests_window="day" if groq else None)
+    except Exception:  # noqa: BLE001
+        return token_pacing.Window()
+
+
+def _window_note(window: token_pacing.Window) -> dict[str, Any] | None:
+    """The limits for the request row's metadata, labelled with their windows; None when the provider sent none."""
+    note = {"tokens_per_minute_limit": window.tokens_limit, "tokens_per_minute_remaining": window.tokens_remaining,
+            "tokens_reset_seconds": window.tokens_reset_seconds, "requests_limit": window.requests_limit,
+            "requests_remaining": window.requests_remaining, "requests_reset_seconds": window.requests_reset_seconds,
+            "requests_window": window.requests_window}
+    note = {k: v for k, v in note.items() if v is not None}
+    return note or None
+
+
+def too_large(text: str | bytes | None) -> dict[str, Any] | None:
+    """Groq's refusal of a request larger than the whole per-minute token limit, with its figures; None otherwise."""
+    if not text:
+        return None
+    body = text.decode("utf-8", "replace") if isinstance(text, bytes) else str(text)
+    if not _TOO_LARGE.search(body[:20_000]):
+        return None
+    figures = _TOO_LARGE_FIGURES.search(body[:20_000])
+    return {"refused": "REQUEST_TOO_LARGE", **({"tokens_per_minute_limit": int(figures.group(1)),
+                                                 "tokens_requested": int(figures.group(2))} if figures else {})}
+
+
+def _duration_reset(headers: Any, status: int | None) -> float | None:
+    """Seconds to a reset written as a duration, or forwarded by LiteLLM. A 429's Retry-After comes first, then —
+    when the tokens ran out, or for Groq, whose request reset is the daily window — the token reset."""
+    if status == 429:
+        after = duration_seconds(_header(headers, "retry-after"))
+        if after is not None:
+            return after
+    if (status == 429 and _count(headers, TOKEN_REMAINING) == 0) or is_groq(headers):
+        tokens = duration_seconds(_header(headers, TOKEN_RESET))
+        if tokens is not None:
+            return tokens
+    return next((seconds for seconds in (duration_seconds(_header(headers, name)) for name in RESET_HEADERS)
+                 if seconds is not None), None)
+
+
+def _reset_at(headers: Any, at: datetime, *, status: int | None = None) -> datetime | None:
+    """A rate-limit reset, whether the provider sends seconds-from-now, an epoch timestamp or a duration ("2m59.56s")."""
     value = _header_int(headers, RESET_HEADERS)
     if value is None:
-        return None
+        seconds = _duration_reset(headers, status) if headers is not None else None
+        return at + timedelta(seconds=seconds) if seconds is not None else None
     if value > 10_000_000_000:  # milliseconds since the epoch
         return datetime.fromtimestamp(value / 1000, UTC).replace(tzinfo=None)
     if value > 1_000_000_000:  # seconds since the epoch
@@ -198,9 +314,14 @@ def build_entry(call: ExternalCall, *, started_at: datetime, completed_at: datet
     """One telemetry row. Pure: everything it needs has already been measured."""
     ctx = tracing.current()
     code = status_code if status_code is not None else call.http_status_code
-    failure = error_type or _classify_exception(error) if error is not None else _classify_status(code)
+    failure = error_type or (_classify_exception(error) if error is not None else _classify_status(code))
     parsed = httpx.URL(url) if url else None
-    metadata = redact_value(dict(list(call.metadata.items())[:MAX_METADATA_KEYS])) if call.metadata else None
+    window = rate_window(headers, call.metadata) if headers is not None else token_pacing.Window()
+    noted = {**call.metadata, "rate_limits": _window_note(window)} if _window_note(window) else call.metadata
+    metadata = redact_value(dict(list(noted.items())[:MAX_METADATA_KEYS])) if noted else None
+    # Groq's request counter is per day: its row shows the per-minute tokens left, the limit that runs out first.
+    remaining = (window.tokens_remaining if window.requests_window == "day" and window.tokens_remaining is not None
+                 else _header_int(headers, REMAINING_HEADERS))
     return {
         "request_id": call.request_id,
         "trace_id": (call.metadata.get("trace_id") if isinstance(call.metadata.get("trace_id"), str) else None)
@@ -224,8 +345,8 @@ def build_entry(call: ExternalCall, *, started_at: datetime, completed_at: datet
         "latency_ms": max(0, int((completed_at - started_at).total_seconds() * 1000)),
         "request_size_bytes": request_bytes, "response_size_bytes": response_bytes,
         "attempt": max(1, call.attempt), "retry_count": max(0, call.attempt - 1),
-        "rate_limit_remaining": _header_int(headers, REMAINING_HEADERS),
-        "rate_limit_reset_at": _reset_at(headers, completed_at),
+        "rate_limit_remaining": remaining,
+        "rate_limit_reset_at": _reset_at(headers, completed_at, status=code),
         "error_type": failure,
         "error_message": redact_text(f"{type(error).__name__}: {error}") if error is not None
                          else (f"HTTP {code}" if failure else None),
@@ -247,6 +368,7 @@ def record(call: ExternalCall, **measurements: Any) -> str | None:
     try:
         entry = build_entry(call, **measurements)
         _apply_backoff(entry)
+        _observe_window(entry, measurements.get("headers"))
         if not get_settings().external_api_telemetry_enabled:
             return None
         persist(entry)
@@ -265,6 +387,17 @@ def _apply_backoff(entry: dict[str, Any]) -> None:
         backoff.record_limit(user_id, provider, retry_after=entry["rate_limit_reset_at"])
     elif entry["status"] == "SUCCEEDED":
         backoff.note_success(user_id, provider)
+
+
+def _observe_window(entry: dict[str, Any], headers: Any) -> None:
+    """Keep the model's token window for pacing (app.services.token_pacing). A refusal of a too-large request says
+    nothing about the window."""
+    if headers is None or (entry["request_metadata"] or {}).get("refused"):
+        return
+    key = cooldown_provider(entry["provider"], entry.get("service"), entry.get("request_metadata"))
+    if token_pacing.paced(key):
+        token_pacing.observe(entry["user_id"], key, rate_window(headers, entry.get("request_metadata")),
+                             now=entry["completed_at"])
 
 
 def _log_notable(entry: dict[str, Any]) -> None:
@@ -416,12 +549,26 @@ class InstrumentedClient(httpx.Client):
                       request_headers=_debug_headers(request.headers))
             capture_payload(call, request, response)
         _report_response(request, response, call)
+        refused = _refused_as_too_large(response, kwargs.get("stream"))
+        if refused:
+            call.note(**refused)
         self.last_request_id = record(
             call, started_at=started, completed_at=_finished(started, clock), method=request.method,
             url=str(request.url), status_code=response.status_code, request_bytes=request_bytes,
-            response_bytes=_response_size(response), headers=response.headers)
+            response_bytes=_response_size(response), headers=response.headers,
+            error_type="CLIENT_ERROR" if refused else None)
         response.extensions["jobhunt_request_id"] = self.last_request_id
         return response
+
+
+def _refused_as_too_large(response: httpx.Response, stream: Any) -> dict[str, Any] | None:
+    """A 413/429 that is Groq's "request too large" refusal: recorded as a client error, so no cooldown starts."""
+    if response.status_code not in (413, 429) or stream:
+        return None
+    try:
+        return too_large(response.content)
+    except Exception:  # noqa: BLE001  telemetry only
+        return None
 
 
 class InstrumentedAsyncClient(httpx.AsyncClient):
@@ -479,16 +626,27 @@ def hold_off(call: ExternalCall, *, method: str | None = None, url: str | None =
     owner = owner_of(call)
     if backoff.bypassing():  # a task a person asked to run now (app.services.workers)
         return
+    key = cooldown_provider(call.provider, call.service, call.metadata)
     try:
-        backoff.check(owner, cooldown_provider(call.provider, call.service, call.metadata))
-        return
+        backoff.check(owner, key)
     except backoff.RateLimited as limited:
         call.note(skipped_by="cooldown", retry_after_seconds=limited.retry_after_seconds)
-        backoff.note_skipped(owner, cooldown_provider(call.provider, call.service, call.metadata))
+        backoff.note_skipped(owner, key)
         moment = utcnow()
         record(call, started_at=moment, completed_at=moment, method=method, url=url,
                error=RateLimitedCooldown(limited.provider, limited.retry_after_seconds), error_type="RATE_LIMIT")
         raise RateLimitedCooldown(limited.provider, limited.retry_after_seconds) from limited
+    # A model request the last answer says this minute cannot take: wait for the token reset instead of a 429.
+    need = call.metadata.get("tokens_needed")
+    wait = token_pacing.reserve(owner, key, need) if token_pacing.paced(key) else None
+    if wait:
+        held = RateLimitedCooldown(key.upper(), wait, f"{key} has fewer tokens left this minute than this request needs "
+                                                      f"(about {need}); waiting {wait}s for the provider's reset")
+        call.note(skipped_by="token_pacing", retry_after_seconds=wait)
+        moment = utcnow()
+        record(call, started_at=moment, completed_at=moment, method=method, url=url, error=held,
+               error_type="RATE_LIMIT")
+        raise held
 
 
 def _finished(started: datetime, clock: float) -> datetime:

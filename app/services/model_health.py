@@ -352,8 +352,8 @@ def record_outcome(entry: dict[str, Any]) -> None:
             return
         failed = entry.get("status") == "FAILED"
         kind = entry.get("error_type")
-        if failed and kind in NOT_HEALTH:
-            return
+        if failed and (kind in NOT_HEALTH or entry.get("cost_source") == "not_sent"):
+            return  # a request never sent (held by a cooldown or token pacing) says nothing about the model
         worker_type = entry.get("worker_type") or ""
         known = states(user_id)
         keys = [("", model), (worker_type, model)]

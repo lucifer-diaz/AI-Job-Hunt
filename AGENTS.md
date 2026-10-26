@@ -149,6 +149,17 @@ rules a change has to keep:
 * **A 429 rests the model, not the gateway.** The LiteLLM cooldown is kept per model (`external_api.cooldown_provider`,
   `LITELLM:<model>`), so a rate-limited model never blocks the model failover sends the request to. Other providers
   still cool down as a whole.
+* **A spent minute is waited out, not sent into a 429** (`app/services/token_pacing.py`). Each gateway response's
+  token headers (`x-ratelimit-*-tokens`, bare or LiteLLM's `llm_provider-` form; resets are durations such as
+  `2m59.56s`) are kept per `LITELLM:<model>` in `provider_rate_windows`; `external_api.hold_off` reserves the request's
+  `tokens_needed` (estimated prompt + `max_tokens`) with one guarded UPDATE and holds it with `RateLimitedCooldown`
+  until the token reset when the window cannot take it. Failover moves such a model behind its backups (an overlay,
+  never a health trip), and a request that was never sent never counts against a model's health. Only what the
+  provider said paces: no row, an expired reset or a request larger than the whole limit is sent. Fails open.
+  Groq's request counter is per DAY: never report it as the figure that runs out first.
+* **A request larger than the whole per-minute limit is a client error, never a cooldown.** Groq's "Request too
+  large … tokens per minute" (413, or the 429 LiteLLM maps it to) is recorded as `CLIENT_ERROR` with
+  `refused: REQUEST_TOO_LARGE` and raised as `LLMContextOverflowError`, which the ranker does not retry.
 * **Quality escalation and infrastructure failover stay separate.** Failover never decides on answer quality, and an
   escalated request gets no failover.
 * **Notifications are metadata only** (`/api/failover/events`: model names, cause, counts) and use the existing browser
