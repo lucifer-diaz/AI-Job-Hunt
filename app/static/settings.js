@@ -11,6 +11,8 @@ const SETTINGS_SECTIONS = [
   ['gmail', 'Gmail inbox', 'Read-only updates on the applications you submitted', '07'],
   // Phase 6: whether the application worker may submit for you, what you approve it to attest, and saved logins.
   ['applying', 'Auto submit', 'Submit applications for you, saved ATS logins and routes', '08'],
+  // Server-wide (admin): the LangGraph switch and graph modes, the application worker, browser-use and tracing.
+  ['automation', 'AI agents & automation', 'LangGraph, the application worker and browser-use', '09'],
 ];
 // AI models moved to AI Orchestration → Models (ai_models.js); its direct-provider form ('ai') is still saved here.
 const SETTINGS_FORMS = ['profile', 'preferences', 'resumes', 'resume-data', 'account', 'keys', 'domain'];
@@ -340,7 +342,64 @@ function renderApplyingSettings() {
     `${(a.routes || []).map(r => `<div class="row gap8 mt6 wrap"><span class="small b">${esc(r.label)}</span><span class="small mono">${esc(r.route)}</span><span class="xs muted grow">${esc(r.company || '')}${r.source_board ? ` · via ${esc(r.source_board)}` : ''}</span>${r.auth_required !== 'none' ? pill(r.has_session ? 'signed in' : r.has_credential ? 'login saved' : `needs ${r.auth_required}`, r.has_session || r.has_credential ? 'good' : 'warn') : ''}${pill(r.auto_submit ? 'auto submit' : 'you apply', r.auto_submit ? 'good' : 'muted')}${r.last_outcome ? `<span class="xs muted">${esc(r.last_outcome)}</span>` : ''}</div>`).join('') || '<p class="settings-help">No approved applications yet.</p>'}`);
   return consent + logins + routes;
 }
-const SETTINGS_RENDERERS = { applying: renderApplyingSettings, profile: renderProfileSettings, preferences: renderPreferenceSettings, resumes: renderResumeSettings, 'resume-data': () => renderResumeDataSettings(), account: renderAccountSettings, 'api-keys': renderKeySettings, domain: renderDomainSettings, gmail: () => renderInboxSettings() };
+// Settings → AI agents & automation (app.services.server_settings.CONFIG): every option is a choice with what it does.
+// A preset fills the choices for a way of working; nothing is saved until Save. Only an admin may change them.
+function automationValue(a, item) {
+  const draft = S.forms.automation || {};
+  return item.name in draft ? String(draft[item.name]) : item.value;
+}
+function automationWarnings(a, item, v) {
+  const on = name => automationValue(a, a.settings.find(s => s.name === name)) === 'true';
+  const out = [];
+  const graphs = ['qualification_graph_mode', 'preparation_graph_mode', 'job_insights_graph_mode', 'application_execution_mode'];
+  if (graphs.includes(item.name) && v !== 'off' && !on('agent_graphs_enabled')) out.push('Does nothing until LangGraph agent graphs are on.');
+  if ((graphs.includes(item.name) && v !== 'off' || item.name === 'agent_graphs_enabled' && v === 'true') && !a.environment.postgres) out.push('Needs PostgreSQL: this server uses another database, so it acts as off.');
+  if (item.name === 'application_execution_mode' && v === 'guarded_auto') out.push('Each account also turns on Auto submit in Settings → Auto submit.');
+  if (item.name === 'browser_use_webui_enabled' && v === 'true' && !a.environment.browser_use_python) out.push('Set BROWSER_USE_PYTHON in .env to the browser-use Web UI’s Python; until then it stays off.');
+  if (item.name === 'agent_langsmith_export_enabled' && v === 'true' && !a.environment.langsmith_api_key) out.push('Set AGENT_LANGSMITH_API_KEY in .env; until then nothing is sent.');
+  return out;
+}
+function automationControl(a, item, v) {
+  const lock = a.editable ? '' : 'disabled';
+  if (item.choices.length) {
+    const options = item.choices.map(c => [c.value, c.label]);
+    if (!options.some(([value]) => value === v)) options.push([v, `${v} (custom)`]);
+    return selectF('automation', item.name, v, options, `data-rerender aria-label="${attr(item.label)}" ${lock}`);
+  }
+  const type = item.kind === 'int' ? `type="number" min="${item.min}" max="${item.max}"` : 'spellcheck="false"';
+  return inputF('automation', item.name, v, `${type} aria-label="${attr(item.label)}" ${lock}`);
+}
+function automationRow(a, item) {
+  const v = automationValue(a, item);
+  const chosen = item.choices.find(c => c.value === v);
+  const meanings = item.choices.some(c => c.help) ? `<ul class="automation-choices">${item.choices.filter(c => c.help).map(c => `<li class="${c.value === v ? 'b' : 'muted'}"><span>${esc(c.label)}</span> — ${esc(c.help)}</li>`).join('')}</ul>` : '';
+  const source = item.overridden ? pill('Set here', 'good') : pill('From .env', 'plain');
+  const fallback = item.overridden ? `<span class="xs muted">.env: ${esc((item.choices.find(c => c.value === item.default) || {}).label || item.default || '(empty)')}</span>` : '';
+  const warnings = automationWarnings(a, item, v).map(w => `<div class="xs mt4" style="color:var(--warn)">${esc(w)}</div>`).join('');
+  return `<div class="automation-row" data-automation="${item.name}" style="padding:12px 0;border-top:1px solid var(--line)">
+    <div class="row gap8 wrap"><span class="small b">${esc(item.label)}</span><span class="xs mono muted">${esc(item.env)}</span>${source}${fallback}</div>
+    <div class="row gap12 wrap mt6" style="align-items:flex-start"><div style="min-width:220px;max-width:320px;flex:1">${automationControl(a, item, v)}</div>
+      <div class="grow" style="min-width:240px"><div class="xs muted pretty">${esc(item.help)}${item.needs ? ` Needs: ${esc(item.needs)}.` : ''}</div>${chosen && !meanings ? `<div class="xs mt4">${esc(chosen.help)}</div>` : ''}${meanings}${warnings}</div></div></div>`;
+}
+function renderAutomationSettings() {
+  const a = D.automation;
+  if (a === undefined) {
+    api('/api/settings/automation').then(v => { D.automation = v; render(); }).catch(err => { D.automation = { error: err.message }; render(); });
+    return loading();
+  }
+  if (a.error) return `<p class="settings-help">${esc(a.error)}</p>`;
+  const byName = Object.fromEntries(a.settings.map(s => [s.name, s]));
+  const current = a.presets.find(p => Object.entries(p.values).every(([k, v]) => automationValue(a, byName[k]) === v));
+  const presets = settingsGroup('How should Job Hunt OS handle approved jobs?', 'Pick a way of working to fill the choices below, then adjust anything and save.',
+    `<div class="grid-auto" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px">${a.presets.map(p => `<button class="box ${current && current.id === p.id ? 'good' : ''}" style="text-align:left;padding:12px;border-radius:12px" data-act="automation-preset" data-id="${attr(p.id)}" ${a.editable ? '' : 'disabled'} aria-pressed="${current && current.id === p.id ? 'true' : 'false'}"><div class="small b">${esc(p.label)}</div><div class="xs muted mt4 pretty">${esc(p.help)}</div></button>`).join('')}</div>`);
+  const groups = a.groups.map(g => settingsGroup(esc(g.label), esc(g.help), a.settings.filter(s => s.group === g.id).map(s => automationRow(a, s)).join(''))).join('');
+  const dirty = Object.entries(S.forms.automation || {}).some(([k, v]) => byName[k] && String(v) !== byName[k].value);
+  const notice = a.editable ? '<p class="settings-help">Server-wide: these steer every account’s background work. They override .env and take effect without a restart; choosing the .env value again hands a setting back to .env. API keys and paths stay in .env.</p>'
+    : '<p class="settings-help">Only an admin can change these server-wide settings. They are shown so you can see what this server does.</p>';
+  const footer = a.editable ? `<footer class="settings-footer"><span role="status">${isBusy('automation') ? 'Saving…' : dirty ? 'Unsaved changes' : 'All changes saved'}</span><div class="row gap8">${btn('Discard', 'automation-discard', {}, '', !dirty)}${btn(label('automation', 'Save changes', 'Saving…'), 'automation-save', {}, 'primary', !dirty || isBusy('automation'))}</div></footer>` : '';
+  return notice + presets + groups + footer;
+}
+const SETTINGS_RENDERERS = { automation: renderAutomationSettings, applying: renderApplyingSettings, profile: renderProfileSettings, preferences: renderPreferenceSettings, resumes: renderResumeSettings, 'resume-data': () => renderResumeDataSettings(), account: renderAccountSettings, 'api-keys': renderKeySettings, domain: renderDomainSettings, gmail: () => renderInboxSettings() };
 function renderSettings() {
   if (D.settingsLoadError) return `<div class="settings-content"><div class="settings-error" role="alert">Settings could not be loaded: ${esc(D.settingsLoadError)}</div>${btn('Try again', 'settings-retry', {}, 'mt16')}</div>`;
   if (!D.profile || !D.settings || !D.prefs) return loading();
@@ -438,6 +497,19 @@ async function settingsUploadResume(file) {
     : 'Resume uploaded. Review its data below, and make it active when you want it used');
 }
 const SETTINGS_ACTIONS = {
+  'automation-preset': el => {
+    const preset = (D.automation?.presets || []).find(p => p.id === el.dataset.id);
+    if (!preset) return;
+    S.forms.automation = { ...(S.forms.automation || {}), ...preset.values };
+    render();
+  },
+  'automation-discard': () => { delete S.forms.automation; render(); },
+  'automation-save': () => busy('automation', async () => {
+    const byName = Object.fromEntries((D.automation?.settings || []).map(s => [s.name, s]));
+    const values = Object.fromEntries(Object.entries(S.forms.automation || {}).filter(([k, v]) => byName[k] && String(v) !== byName[k].value));
+    D.automation = await api('/api/settings/automation', { method: 'PUT', body: { values } });
+    delete S.forms.automation;
+  }, 'Saved: in effect now'),
   'applying-consent': el => busy('applying', async () => {
     const text = document.getElementById('applying-attest')?.value || '';
     const lines = text.split('\n').map(x => x.trim()).filter(Boolean);

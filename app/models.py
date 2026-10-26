@@ -1809,15 +1809,15 @@ class ExternalAPIRequestLog(Base):
 
 
 class ServerSetting(Base):
-    """A server-wide worker setting an admin changed in Running workers → Settings (app.services.server_settings).
-
-    Not owned by an account: it paces the scheduler jobs every account shares. No row means the environment value.
+    """A server-wide setting an admin changed (app.services.server_settings): a worker limit in Running workers →
+    Settings, or the agent and application configuration in Settings → AI agents & automation. Stored as text (a
+    number, a mode, a switch). Not owned by an account. No row means the environment value.
     """
 
     __tablename__ = "server_settings"
 
     name: Mapped[str] = mapped_column(String(64), primary_key=True)
-    value: Mapped[int] = mapped_column(Integer)
+    value: Mapped[str] = mapped_column(String(500))
     updated_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
 
