@@ -14,7 +14,7 @@ from app.services import model_resolution
 from app.services.ai_workers import WORKERS
 from app.services.model_resolution import resolve, resolve_model
 from app.settings import get_settings
-from tests.litellm_fake import MASTER_KEY, Account, deployment
+from tests.litellm_fake import MASTER_KEY, Account, deployment, embedding_deployment
 
 
 def snapshot(**workers):
@@ -249,6 +249,53 @@ def test_a_prompt_token_budget_is_versioned_and_resolved(account):
 def test_out_of_range_values_are_refused_at_edit_time(account, changes):
     response = account.client.put("/api/settings/ai/workers/RANKER", json=changes)
     assert response.status_code == 422, response.text
+
+
+@pytest.mark.parametrize("worker_type", sorted(WORKERS))
+def test_a_litellm_model_name_with_spaces_can_be_assigned_to_every_worker(account, litellm, worker_type):
+    chat = {"max_input_tokens": 128000, "supports_response_schema": True}
+    if WORKERS[worker_type].capability == "EMBEDDING":
+        litellm.deployments.append(embedding_deployment("Embed Small v3", "openai/text-embedding-3-small", 16))
+        changes = {"primary_model": "Embed Small v3", "enabled": True}
+    else:
+        for name in ("Groq B4", "Groq B4 backup", "Groq B4 second"):
+            litellm.deployments.append(deployment(name, f"groq/{name.replace(' ', '-').lower()}", info=chat))
+        changes = {"primary_model": "Groq B4", "fallback_model": "Groq B4 backup",
+                   "secondary_models": ["Groq B4 second"]}
+    account.call("POST", "/models/sync")
+    account.apply()
+    account.worker(worker_type, model_mode="FIXED", **changes)
+    preview = account.call("POST", "/preview")
+    assert preview["can_apply"], preview["validation"]["errors"]
+    account.apply()
+    resolved = model_resolution.get(account.user_id, worker_type)
+    assert resolved.model == changes["primary_model"]
+    assert resolved.fallback_model == changes.get("fallback_model")
+
+
+def test_tiers_model_fallbacks_and_the_auto_router_accept_model_names_with_spaces(account, litellm):
+    chat = {"max_input_tokens": 128000, "supports_response_schema": True}
+    litellm.deployments += [deployment("Groq B4", "groq/b4", info=chat), deployment("Groq B5", "groq/b5", info=chat),
+                            deployment("Auto Router", "auto_router/auto_router", info=chat)]
+    account.call("POST", "/models/sync")
+    account.apply()
+    account.call("PUT", "/tiers/FAST", json={"revision": account.revision(), "litellm_model_name": "Groq B4"})
+    account.call("PUT", "/models/Groq B4", json={"revision": account.revision(), "fallback_models": ["Groq B5"]})
+    account.call("PUT", "/routing", json={"revision": account.revision(), "auto_router_model_name": "Auto Router",
+                                          "tier_models": {"SIMPLE": "Groq B4"}})
+    errors = account.call("POST", "/preview")["validation"]["errors"]
+    assert not [e for e in errors if "valid" in e["message"] and "name" in e["message"]], errors
+    active = account.get("")["draft"]
+    assert active["tiers"]["FAST"]["model"] == "Groq B4"
+    assert active["models"]["Groq B4"]["fallback_models"] == ["Groq B5"]
+    assert active["routing"]["auto_router_model_name"] == "Auto Router"
+
+
+def test_a_model_name_with_other_characters_is_still_refused(account):
+    for bad in ("Groq\nB4", "Groq\tB4", "x;y", "-leading"):
+        response = account.client.put("/api/settings/ai/workers/JD_PARSER",
+                                      json={"model_mode": "FIXED", "primary_model": bad})
+        assert response.status_code == 422, (bad, response.text)
 
 
 def test_a_circular_fallback_through_litellm_router_settings_is_rejected(account, litellm):

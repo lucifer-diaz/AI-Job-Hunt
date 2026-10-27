@@ -63,7 +63,7 @@ log = logging.getLogger("jobhunt.ai_model_config")
 SNAPSHOT_SCHEMA = 1
 APPLY_LEASE = timedelta(minutes=10)
 TIER_NAME = re.compile(r"^[A-Z][A-Z0-9_]{1,59}$")
-MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+\-]{0,199}$")
+MODEL_NAME = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._:/@+\- ]{0,198}[A-Za-z0-9._:/@+\-])?$")  # LiteLLM aliases may hold spaces
 PLUGIN_PATH = re.compile(r"^[A-Za-z_]\w*(\.[A-Za-z_]\w*)+$")
 LIMITS = {"temperature": (0.0, 2.0), "max_output_tokens": (1, 200_000), "context_window": (512, 2_000_000),
           "prompt_token_budget": (256, 2_000_000), "timeout_seconds": (1, 3600), "retry_count": (0, 10), "max_concurrency": (1, 100),
@@ -879,7 +879,7 @@ def validate(snapshot: dict[str, Any], *, live: LiveState | None = None, gateway
         if entry.get("managed"):
             params = entry.get("deployment_params") or {}
             if not MODEL_NAME.match(name):
-                errors.append(_issue(f"models.{name}", "Model names are letters, digits and . _ : / @ + -"))
+                errors.append(_issue(f"models.{name}", "Model names are letters, digits, spaces and . _ : / @ + -"))
             if not params.get("model"):
                 errors.append(_issue(f"models.{name}.deployment_params", "A managed model needs a LiteLLM model "
                                      "(e.g. ollama_chat/llama3.2:3b)"))
