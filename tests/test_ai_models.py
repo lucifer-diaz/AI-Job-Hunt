@@ -232,6 +232,19 @@ def test_out_of_range_values_are_refused_at_edit_time(account, changes):
     assert response.status_code == 422, response.text
 
 
+def test_a_litellm_model_name_with_spaces_can_be_assigned(account, litellm):
+    litellm.deployments.append(deployment("Groq B4", "groq/some-model", info={"max_input_tokens": 128000}))
+    account.call("POST", "/models/sync")
+    account.apply()
+    account.worker("JD_PARSER", model_mode="FIXED", primary_model="Groq B4")
+    account.apply()
+    assert model_resolution.get(account.user_id, "JD_PARSER").model == "Groq B4"
+    for bad in ("Groq\nB4", "Groq\tB4", "x;y", "-leading"):
+        response = account.client.put("/api/settings/ai/workers/JD_PARSER",
+                                      json={"model_mode": "FIXED", "primary_model": bad})
+        assert response.status_code == 422, (bad, response.text)
+
+
 def test_a_circular_fallback_through_litellm_router_settings_is_rejected(account, litellm):
     litellm.router_settings["fallbacks"] = [{"tier-1-fast": ["tier-2-reasoning"]}]
     account.call("POST", "/models/sync")
