@@ -32,6 +32,7 @@ from app.prompts import (
     build_review_prompt,
     build_tailoring_prompt,
 )
+from app.services import prompt_budget
 from app.services import resume_verification as rv
 from app.services.contacts import recruiters_of
 from app.services.context_builder import (
@@ -40,6 +41,7 @@ from app.services.context_builder import (
     build_followup_context,
     build_review_context,
     build_tailoring_context,
+    fit_prompt,
 )
 from app.services.llm import LLMCall, LLMClient, LLMResult
 from app.services.resume_format import (
@@ -103,7 +105,10 @@ def tailor_job(db: Session, job: Job, progress: Progress = _no_progress, pages: 
         context.revision_feedback = feedback
     progress("tailoring")
     llm = LLMClient.for_user(db)
-    prompt = build_tailoring_prompt(candidate_profile=profile, job=job, context=context)
+    # Within the Tailor's prompt token budget, when it has one; the citable ids below are taken after trimming.
+    prompt = fit_prompt(context, job, lambda: build_tailoring_prompt(candidate_profile=profile, job=job,
+                                                                     context=context),
+                        prompt_budget.budget_for(db, job.user_id, "TAILOR"))
     result = llm.generate_prompt(prompt, LLMCall(workflow_type="job", entity_id=job.id,
                                                  context_stats=context.call_stats()))
     # Citable: the evidence list, and the id of every source bullet and project bullet the context showed.

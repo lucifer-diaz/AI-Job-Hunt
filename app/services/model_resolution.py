@@ -58,6 +58,8 @@ class ResolvedWorker:
     temperature: float | None = None
     max_output_tokens: int | None = None
     context_window: int | None = None
+    # Tokens the built prompt may use before its context builder trims it (app.services.prompt_budget); None = no trim.
+    prompt_token_budget: int | None = None
     reasoning_effort: str | None = None
     timeout_seconds: int | None = None
     retry_count: int | None = None
@@ -200,7 +202,8 @@ def resolve(snapshot: dict[str, Any], worker_type: str | None, version: int | No
         fallback_model=fallback if fallback != model else None, secondary_models=secondary,
         model_fallbacks=model_fallbacks,
         temperature=config.get("temperature"), max_output_tokens=config.get("max_output_tokens"),
-        context_window=config.get("context_window"), reasoning_effort=config.get("reasoning_effort"),
+        context_window=config.get("context_window"), prompt_token_budget=config.get("prompt_token_budget"),
+        reasoning_effort=config.get("reasoning_effort"),
         timeout_seconds=config.get("timeout_seconds"), retry_count=config.get("retry_count"),
         max_concurrency=config.get("max_concurrency"),
         use_structured_output=config.get("use_structured_output", True),

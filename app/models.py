@@ -2188,6 +2188,9 @@ class WorkerModelConfig(Base):
     temperature: Mapped[float | None] = mapped_column(Float, nullable=True)
     max_output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     context_window: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Tokens the built prompt may use (app.services.prompt_budget): over it, the context builders drop their least
+    # relevant items before the request is sent. Blank = no trimming. Part of the versioned config.
+    prompt_token_budget: Mapped[int | None] = mapped_column(Integer, nullable=True)
     reasoning_effort: Mapped[str | None] = mapped_column(String(10), nullable=True)
     timeout_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     retry_count: Mapped[int | None] = mapped_column(Integer, nullable=True)

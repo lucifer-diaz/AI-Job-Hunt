@@ -573,7 +573,9 @@ def _rank_with_model(db: Session, job: Any) -> Any:
     if profile is None:
         raise LookupError("no candidate profile")
     context = ranker.build_ranking_context(db, profile, job, get_settings().ranking_max_evidence)
-    prompt = ranker.build_ranking_prompt(candidate_profile=profile, job=job, context=context)
+    prompt = ranker.fit_prompt(context, job, lambda: ranker.build_ranking_prompt(candidate_profile=profile, job=job,
+                                                                                  context=context),
+                               ranker.prompt_budget.budget_for(db, job.user_id, "RANKER"))
     verified, job_id = set(context.evidence_ids), job.id
     result = ranker.LLMClient.for_user(db, job.user_id).generate_prompt(prompt, LLMCall(
         workflow_type="agent", entity_id=job_id, validate=lambda data: ranker.validate_output(data, job_id, verified),

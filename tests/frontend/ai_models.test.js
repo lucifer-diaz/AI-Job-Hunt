@@ -155,6 +155,23 @@ describe('AI Orchestration → Models & routing', () => {
     expect(document.getElementById('toast').textContent).toBe('Ranker saved · v5');
   });
 
+  it('offers a prompt token budget only to a worker that trims its prompt, and saves it', async () => {
+    routes['GET /api/settings/ai'] = () => ({ ...overview(), workers: [
+      worker('RANKER', 'Ranker', { tier: 'PRIMARY_REASONING', prompt_token_budget: 6000 }, 'local-reasoning', { trims_prompt: true }),
+      ...overview().workers.slice(1)] });
+    routes['PUT /api/settings/ai/workers/RANKER'] = () => ({ worker: {}, draft_revision: 8 });
+    routes['POST /api/settings/ai/apply'] = () => ({ status: 'SYNCED', version: 5 });
+    await open('workers');
+    ui.A['aim-worker']({ dataset: { worker: 'REVIEWER' } });
+    expect(document.getElementById('aiw-prompt_token_budget')).toBeNull();
+    ui.A['aim-worker']({ dataset: { worker: 'RANKER' } });
+    expect(document.getElementById('aiw-prompt_token_budget').value).toBe('6000');
+    expect(document.querySelector('.aim-drawer').textContent).toContain('Required requirements are never left out');
+    ui.setF('aiw', 'prompt_token_budget', '7000');
+    await ui.A['aim-worker-save']({ dataset: { worker: 'RANKER' } });
+    expect(body('PUT', '/api/settings/ai/workers/RANKER')).toMatchObject({ prompt_token_budget: 7000 });
+  });
+
   it('gives the Embedder its own dialog: embedding models only, no tiers, backups or generation settings', async () => {
     const embedder = worker('EMBEDDER', 'Embedder', { mode: 'FIXED', primary_model: null, tier: null, enabled: false }, null,
       { capability: 'EMBEDDING', optional: true, structured_output_required: false, min_context_tokens: 0 });
