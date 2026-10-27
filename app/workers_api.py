@@ -219,6 +219,14 @@ def nudge_forward(kind: str, payload: NudgeIn | None = None, user: CurrentUser =
     return worker_handoff.nudge_forward(db, user.id, kind, payload.job_ids if payload else None)
 
 
+@router.get("/{kind}/tasks/{task_id}/history")
+def task_history(kind: str, task_id: int, user: CurrentUser = Depends(current_user),
+                 db: Session = Depends(get_user_db)) -> dict[str, Any]:
+    """What happened to one task, newest first: its attempts, graph steps, the job's moves and events, page loads
+    and model calls. Metadata only."""
+    return _guard(workers.history, db, user.id, kind, task_id)
+
+
 @router.post("/{kind}/tasks/{task_id}/run-now")
 def run_task_now(kind: str, task_id: int, request: Request, background: BackgroundTasks,
                  user: CurrentUser = Depends(current_user), db: Session = Depends(get_user_db)) -> dict[str, Any]:

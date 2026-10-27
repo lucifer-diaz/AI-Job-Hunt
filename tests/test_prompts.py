@@ -20,6 +20,7 @@ from app.prompts import (
     build_application_form_prompt,
     build_application_inbox_prompt,
     build_application_question_prompt,
+    build_browser_navigation_prompt,
     build_company_insights_prompt,
     build_cover_letter_prompt,
     build_evidence_extraction_prompt,
@@ -140,6 +141,11 @@ def all_prompts() -> dict[str, Prompt]:
             knowledge=[{"id": 4, "question": "Why are you leaving?", "answer": "To own an LLM platform."}],
             company={"summary": "Globex builds AI tools."},
             form_questions=[{"ref": "F1", "question": f"Why Globex? {EMAIL_INJECTION}"}]),
+        "browser_navigation": build_browser_navigation_prompt(
+            job={"title": "Lead AI Engineer", "company": "Globex"},
+            fields=[{"ref": "bu_a1", "label": "Email", "kind": "email", "status": "RESOLVED", "filled": False}],
+            files=["resume"], elements=[{"key": "a1", "tag": "input", "type": "email", "label": "Email"}],
+            page_text=f"Apply now. {EMAIL_INJECTION}", history=[], step=1, max_steps=60),
     }
 
 

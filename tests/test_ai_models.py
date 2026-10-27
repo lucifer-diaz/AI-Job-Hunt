@@ -224,7 +224,26 @@ def test_invalid_configurations_are_rejected_before_anything_changes(account, ch
     assert ("APPLY", "REJECTED") in [(a["action"], a["result"]) for a in account.get("/audit")["entries"]]
 
 
+def test_a_prompt_token_budget_is_versioned_and_resolved(account):
+    account.call("POST", "/models/sync")
+    account.apply()
+    account.worker("RANKER", prompt_token_budget=7000)
+    account.worker("REVIEWER", prompt_token_budget=7000)
+    preview = account.call("POST", "/preview")
+    labels = {c["label"]: c for c in preview["changes"]}
+    assert labels["Ranker · prompt token budget"]["before"] is None
+    assert labels["Ranker · prompt token budget"]["after"] == 7000
+    assert any("Reviewer does not trim its prompt" in w["message"] for w in preview["validation"]["warnings"])
+    assert model_resolution.get(account.user_id, "RANKER").prompt_token_budget is None  # the draft is not live
+    assert account.apply()["status"] == "SYNCED"
+    assert model_resolution.get(account.user_id, "RANKER").prompt_token_budget == 7000
+    workers = {w["worker_type"]: w for w in account.get("")["workers"]}
+    assert workers["RANKER"]["trims_prompt"] and not workers["REVIEWER"]["trims_prompt"]
+    assert workers["RANKER"]["config"]["prompt_token_budget"] == 7000
+
+
 @pytest.mark.parametrize("changes", [{"temperature": 3}, {"max_output_tokens": 0}, {"retry_count": 50},
+                                     {"prompt_token_budget": 100},
                                      {"model_mode": "SOMETIMES"}, {"reasoning_effort": "extreme"},
                                      {"escalation": {"conditions": ["WHENEVER"]}}])
 def test_out_of_range_values_are_refused_at_edit_time(account, changes):

@@ -1,4 +1,6 @@
 from functools import lru_cache
+
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -395,6 +397,29 @@ class Settings(BaseSettings):
     application_execution_retry_seconds: int = 120
     application_execution_lease_seconds: int = 300
     application_execution_step_timeout_seconds: int = 90
+    # Phase 6 (app.services.submission, README §10b). APPLICATION_EXECUTION_MODE also takes guarded_auto (auto
+    # submit): a run of an account that turned Auto submit on submits the application itself, on any route a browser
+    # can complete, after the pre-submit validator, the shared claim and a SubmissionIntent, and only once; it stops
+    # for the person only when something needs them (an unknown outcome included). `autonomous` is refused.
+    application_max_actions: int = 60  # browser actions per run (fills, clicks, uploads), whatever proposes them
+    application_takeover_ttl_minutes: int = 15  # how long a paused headful session waits for the person
+    # Saved ATS logins (app.services.ats_auth): a session a person logged in to, and an encrypted password vault.
+    # A password is filled only on a domain listed in APPLICATION_LOGIN_DOMAINS, never anywhere else.
+    application_auth_sessions_enabled: bool = False
+    application_login_domains: str = ""
+    ats_session_max_days: int = 30
+    # The browser-use backend (app.infrastructure.application_browser.browser_use_sidecar): a runner Job Hunt OS owns
+    # (sidecars/browser_use_runner) started with the browser-use Web UI's own Python (BROWSER_USE_PYTHON), one process
+    # per execution. BROWSER_USE_WEBUI_URL is only health-checked; Job Hunt OS never drives the Web UI's own agent.
+    browser_use_webui_enabled: bool = False
+    browser_use_webui_url: str = ""
+    browser_use_webui_path: str = ""
+    browser_use_python: str = ""
+    browser_use_timeout_seconds: int = 300  # one execution's whole browser-use session
+    browser_use_command_timeout_seconds: int = 60  # one command (load, observe, fill)
+    browser_use_headless: bool = True  # False shows the window, so a person can take over (local installs only)
+    # Tests and local fixtures only: let the application browsers reach 127.0.0.1 / private hosts.
+    application_allow_private_hosts: bool = False
     # Candidate knowledge retrieval (RAG, app.services.rag_retrieval). RAG_RETRIEVAL_MODE: off (default; the context
     # builders select evidence exactly as before), shadow (they still do, and the retrieval result is computed beside
     # it and compared in Monitoring → Logs, ids only), on (job contexts take their evidence from retrieval, scoped to
@@ -453,11 +478,24 @@ class Settings(BaseSettings):
         tasks left over from on, the job still runs to hand them back (preparation.release)."""
         return max(0, self.preparation_minutes) if self.agent_graphs_enabled else 0
 
+    @field_validator("application_execution_mode")
+    @classmethod
+    def _no_autonomous_mode(cls, value: str) -> str:
+        if (value or "").strip().lower() == "autonomous":
+            raise ValueError("APPLICATION_EXECUTION_MODE=autonomous is not available: auto submit is guarded_auto, "
+                             "for accounts that turned Auto submit on")
+        return value
+
     @property
     def application_execution_mode_value(self) -> str:
-        """off, observe or assist; anything else, or agent graphs being off, is off."""
+        """off, observe, assist or guarded_auto; anything else, or agent graphs being off, is off."""
         mode = (self.application_execution_mode or "off").strip().lower()
-        return mode if self.agent_graphs_enabled and mode in ("observe", "assist") else "off"
+        return mode if self.agent_graphs_enabled and mode in ("observe", "assist", "guarded_auto") else "off"
+
+    @property
+    def login_domains(self) -> frozenset[str]:
+        return frozenset(d.strip().lower().strip(".") for d in (self.application_login_domains or "").split(",")
+                         if d.strip())
 
     @property
     def application_execution_interval_minutes(self) -> int:

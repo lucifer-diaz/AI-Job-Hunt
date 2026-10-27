@@ -800,3 +800,70 @@ describe('structured job description', () => {
     expect(document.querySelector('[data-jd-change-source="USER"]').textContent).toContain('job_identity.seniority');
   });
 });
+
+// Settings → AI agents & automation: what happens now in one sentence, presets that fill the choices, each setting's
+// meaning beside its dropdown, prerequisites spelt out, and only the changed values sent.
+describe('AI agents & automation', () => {
+  const choice = (value, label, help = `${label} means this`) => ({ value, label, help });
+  function automation(editable = true, environment = {}) {
+    const item = (name, group, kind, value, choices = [], extra = {}) => ({ name, env: name.toUpperCase(), group, label: name, help: `${name} help`, kind, needs: null, min: 1, max: 300, choices, value, default: value, overridden: false, ...extra });
+    const bool = [choice('false', 'Off'), choice('true', 'On')];
+    return { editable, groups: [{ id: 'graphs', label: 'Agent graphs', help: '' }, { id: 'applications', label: 'Applications', help: '' }, { id: 'browser', label: 'Browser', help: '' }, { id: 'retention', label: 'Checkpoints and tracing', help: '' }],
+      settings: [item('agent_graphs_enabled', 'graphs', 'bool', 'false', bool),
+        item('qualification_graph_mode', 'graphs', 'choice', 'off', [choice('off', 'Off'), choice('shadow', 'Shadow'), choice('on', 'On')]),
+        item('application_execution_mode', 'applications', 'choice', 'off', [choice('off', 'Off'), choice('observe', 'Read forms'), choice('assist', 'Fill forms, I submit'), choice('guarded_auto', 'Auto submit')]),
+        item('application_max_actions', 'applications', 'int', '60'),
+        item('browser_use_webui_enabled', 'browser', 'bool', 'false', bool),
+        item('browser_use_headless', 'browser', 'bool', 'true', [choice('false', 'Visible'), choice('true', 'Hidden')]),
+        item('agent_langsmith_export_enabled', 'retention', 'bool', 'false', bool)],
+      presets: [{ id: 'manual', label: 'I apply myself', help: '', values: { agent_graphs_enabled: 'false', application_execution_mode: 'off' } },
+        { id: 'fill', label: 'Fill forms; I submit', help: '', values: { agent_graphs_enabled: 'true', application_execution_mode: 'assist', browser_use_webui_enabled: 'true', browser_use_headless: 'false' } }],
+      environment: { postgres: true, browser_use_python: true, browser_use_ready: true, langsmith_api_key: false, ...environment } };
+  }
+  const view = () => document.getElementById('view');
+
+  it('says what happens now, marks the matching preset and explains the chosen option beside each control', () => {
+    ui.D.automation = automation();
+    section('automation');
+    expect(view().querySelector('.am-summary-head').textContent).toBe('You apply yourself');
+    expect(view().querySelector('.am-preset.is-selected').textContent).toContain('I apply myself');
+    expect(view().querySelector('[data-automation="application_execution_mode"] .am-choice').textContent).toBe('Off means this');
+    expect(view().querySelector('[data-automation="application_execution_mode"] code').textContent).toBe('APPLICATION_EXECUTION_MODE');
+    expect(view().querySelector('[data-settings-details="automation-advanced"] [data-automation="agent_langsmith_export_enabled"]')).not.toBeNull();
+    expect(view().querySelector('.am-footer.is-dirty')).toBeNull();  // nothing to save
+  });
+
+  it('fills the choices from a preset, warns about what is missing, and saves only the changes', async () => {
+    ui.D.automation = automation(true, { browser_use_python: false, browser_use_ready: false });
+    section('automation');
+    await ui.A['automation-preset']({ dataset: { id: 'fill' } });
+    expect(view().querySelector('.am-summary .caps').textContent).toBe('With your unsaved changes');
+    expect(view().querySelector('.am-summary-head').textContent).toBe('Forms are filled, you submit');
+    expect(view().querySelector('[data-automation="browser_use_webui_enabled"] .am-warn').textContent).toContain('BROWSER_USE_PYTHON');
+    expect(view().querySelector('.am-footer.is-dirty span').textContent).toContain('4 unsaved changes');
+    await ui.A['automation-reset']({ dataset: { name: 'browser_use_headless' } });
+    expect(view().querySelector('.am-footer span').textContent).toContain('3 unsaved changes');
+    fetchMock.mockImplementation(async () => response(automation()));
+    await ui.A['automation-save']();
+    const [, options] = fetchMock.mock.calls.find(([url, o]) => url === '/api/settings/automation' && o?.method === 'PUT');
+    expect(JSON.parse(options.body)).toEqual({ values: { agent_graphs_enabled: 'true', application_execution_mode: 'assist', browser_use_webui_enabled: 'true' } });
+  });
+
+  it('dims a graph mode while LangGraph is off and says so when it is chosen', () => {
+    ui.D.automation = automation();
+    ui.S.forms.automation = { qualification_graph_mode: 'on' };
+    section('automation');
+    const row = view().querySelector('[data-automation="qualification_graph_mode"]');
+    expect(row.classList.contains('am-row-inactive')).toBe(true);
+    expect(row.querySelector('.am-warn').textContent).toContain('Turn on LangGraph');
+  });
+
+  it('is read-only for someone who is not an admin', () => {
+    ui.D.automation = automation(false);
+    section('automation');
+    expect(view().querySelector('.am-readonly')).not.toBeNull();
+    expect(view().querySelector('#automation-application_execution_mode').disabled).toBe(true);
+    expect(view().querySelector('[data-act="automation-save"]')).toBeNull();
+    expect([...view().querySelectorAll('.am-preset')].every(b => b.disabled)).toBe(true);
+  });
+});

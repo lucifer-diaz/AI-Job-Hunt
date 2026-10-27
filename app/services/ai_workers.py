@@ -85,6 +85,11 @@ WORKERS: dict[str, Worker] = {w.worker_type: w for w in (
            PRIMARY_REASONING, "tailor", description="Extracts verifiable claims from the master resume"),
     # Candidate knowledge retrieval (app.services.embeddings / rag_index): embeds verified evidence and saved answers
     # so retrieval can find them by meaning. Sends no prompt; off until a person assigns an EMBEDDING model.
+    # Phase 6: names the next step on an application page no deterministic adapter knows (browser-use backend).
+    # Never writes an answer and has no action that submits; Python checks every step (app.services.browser_actions).
+    Worker("BROWSER_NAVIGATOR", "Browser Navigator", ("browser_navigation",), True, 16384, "TIER", PRIMARY_REASONING,
+           description="Chooses the next step on an application form (an element and an answer reference, never a "
+                       "value); checked by Python before the browser acts"),
     Worker("EMBEDDER", "Embedder", (), False, 0, "FIXED", PRIMARY_REASONING, capability="EMBEDDING", optional=True,
            description="Turns verified evidence and saved answers into vectors for retrieval (never generates text)"),
 )}

@@ -155,6 +155,23 @@ describe('AI Orchestration → Models & routing', () => {
     expect(document.getElementById('toast').textContent).toBe('Ranker saved · v5');
   });
 
+  it('offers a prompt token budget only to a worker that trims its prompt, and saves it', async () => {
+    routes['GET /api/settings/ai'] = () => ({ ...overview(), workers: [
+      worker('RANKER', 'Ranker', { tier: 'PRIMARY_REASONING', prompt_token_budget: 6000 }, 'local-reasoning', { trims_prompt: true }),
+      ...overview().workers.slice(1)] });
+    routes['PUT /api/settings/ai/workers/RANKER'] = () => ({ worker: {}, draft_revision: 8 });
+    routes['POST /api/settings/ai/apply'] = () => ({ status: 'SYNCED', version: 5 });
+    await open('workers');
+    ui.A['aim-worker']({ dataset: { worker: 'REVIEWER' } });
+    expect(document.getElementById('aiw-prompt_token_budget')).toBeNull();
+    ui.A['aim-worker']({ dataset: { worker: 'RANKER' } });
+    expect(document.getElementById('aiw-prompt_token_budget').value).toBe('6000');
+    expect(document.querySelector('.aim-drawer').textContent).toContain('Required requirements are never left out');
+    ui.setF('aiw', 'prompt_token_budget', '7000');
+    await ui.A['aim-worker-save']({ dataset: { worker: 'RANKER' } });
+    expect(body('PUT', '/api/settings/ai/workers/RANKER')).toMatchObject({ prompt_token_budget: 7000 });
+  });
+
   it('gives the Embedder its own dialog: embedding models only, no tiers, backups or generation settings', async () => {
     const embedder = worker('EMBEDDER', 'Embedder', { mode: 'FIXED', primary_model: null, tier: null, enabled: false }, null,
       { capability: 'EMBEDDING', optional: true, structured_output_required: false, min_context_tokens: 0 });
@@ -190,6 +207,17 @@ describe('AI Orchestration → Models & routing', () => {
     expect(body('PUT', '/api/settings/ai/workers/RANKER')).toEqual({ revision: 7, model_mode: 'FIXED', primary_model: 'local-fast', tier_name: 'PRIMARY_REASONING' });
     await ui.A['aim-worker-target']({ dataset: { worker: 'INBOX_CLASSIFIER' }, value: 'auto' });
     expect(body('PUT', '/api/settings/ai/workers/INBOX_CLASSIFIER')).toMatchObject({ model_mode: 'AUTO_ROUTER', tier_name: 'FAST' });
+  });
+
+  it('sets a model for a worker added after the account was configured (no config row yet)', async () => {
+    routes['GET /api/settings/ai'] = () => ({ ...overview(), workers: [...overview().workers, { worker_type: 'BROWSER_NAVIGATOR', label: 'Browser Navigator', description: 'Next step', structured_output_required: true, min_context_tokens: 16384, has_prompt: true, config: null, resolved: { model: null, assignment: null, note: 'nothing assigned' } }] });
+    routes['PUT /api/settings/ai/workers/BROWSER_NAVIGATOR'] = () => ({});
+    routes['POST /api/settings/ai/apply'] = () => ({ status: 'PENDING', version: 5 });
+    await open('workers');
+    expect(text()).toContain('Browser Navigator');
+    await ui.A['aim-worker-target']({ dataset: { worker: 'BROWSER_NAVIGATOR' }, value: 'model:local-reasoning' });
+    expect(body('PUT', '/api/settings/ai/workers/BROWSER_NAVIGATOR')).toEqual({ revision: 7, model_mode: 'FIXED', primary_model: 'local-reasoning', tier_name: null });
+    expect(document.getElementById('toast').textContent).not.toContain('Cannot read properties');
   });
 
   it('shows a refused save with its reasons, keeps the drawer, and undoes it on request', async () => {

@@ -292,6 +292,39 @@ def test_an_expired_lease_retries_and_never_moves_towards_a_submit(sessions, bro
     assert (task.status, task.stage) == ("PENDING", "RETRYING") and claim.task_id == task_id
 
 
+def test_a_run_waiting_for_answers_says_so_and_shows_no_model_in_running_workers(sessions, browser):
+    """A run paused for the person is not "waiting its turn": it says what it needs, cannot be Run now, and a
+    Greenhouse (form adapter) run never shows a model it does not call."""
+    user = aps.owner(sessions)
+    job_id = aps.approved_job(sessions, user, FORM)
+    aps.enqueue(sessions, user, job_id)
+    aps.drive(sessions)  # the Python question has no verified answer and the sensitive one needs confirming
+    with sessions() as db:
+        db.info["user_id"] = user
+        (row,) = workers.rows(db, user, "application")["rows"]
+    assert row["status"] == "QUEUED" and row["waiting_for"] == "YOU" and row["can_run_now"] is False
+    assert row["waiting_detail"]["kind"] == "NEEDS_INPUT" and row["waiting_detail"]["questions"] >= 1
+    assert row["backend"] == "playwright" and row["model"] == {"model": None, "source": "none"}
+    assert row["model_change"] is None
+    # The Apply kit asks exactly those questions in place, with the form's own options.
+    with sessions() as db:
+        db.info["user_id"] = user
+        task = db.get(ApplicationExecutionTask, row["task_id"])
+        asked = application_execution.questions(db, task)
+    assert [q["id"] for q in asked] == task.interrupt["question_ids"]
+    assert aps.PYTHON_QUESTION in [q["question"] for q in asked] and not any(q["answered"] for q in asked)
+    with sessions() as db:  # answering every one of them, the way the Apply kit does, wakes the run
+        db.info["user_id"] = user
+        for q in asked:
+            saved = db.get(KnowledgeAnswer, q["id"])
+            saved.answer = "8" if q["question"] == aps.PYTHON_QUESTION else (q["answer_options"] or ["Yes"])[0]
+            saved.verified = True
+        db.flush()
+        assert application_execution.wake_waiting(db, user) == 1
+        db.commit()
+    assert aps.task_of(sessions, job_id).stage == "ANSWERING"
+
+
 def test_the_application_worker_is_visible_in_running_workers_for_its_owner_only(sessions, browser):
     user, other = aps.owner(sessions), aps.owner(sessions)
     job_id = aps.approved_job(sessions, user, FORM)
@@ -444,3 +477,93 @@ def test_a_run_stopped_while_saving_questions_saves_no_more(sessions, browser, m
         db.info["user_id"] = user
         asked = db.scalars(select(KnowledgeAnswer).where(KnowledgeAnswer.answer == "")).all()
         assert [q.question for q in asked] == saved
+
+
+# ───────────── the newer Greenhouse board, the browser-use choice, history ─────────────
+
+BOARD = "https://job-boards.greenhouse.io/examplecorp/jobs/9"
+
+
+def test_a_board_with_dropdowns_waits_for_a_person_when_browser_use_is_off(sessions, browser):
+    """The newer board's dropdown widgets cannot be opened by a page that never clicks: without the browser-use
+    backend the run says so at once (NEEDS_HUMAN DROPDOWN_FIELDS, the shared blocker) instead of timing out."""
+    browser.pages[BOARD] = "greenhouse_board_form"
+    user = aps.owner(sessions)
+    job_id = aps.approved_job(sessions, user, BOARD)
+    aps.enqueue(sessions, user, job_id)
+    aps.drive(sessions)
+    task = aps.task_of(sessions, job_id)
+    assert (task.status, task.stage, task.outcome, task.result_code) == ("COMPLETED", "NEEDS_HUMAN", "NEEDS_HUMAN",
+                                                                         "DROPDOWN_FIELDS")
+    assert browser.filled == []
+    with sessions() as db:
+        assert db.get(Job, job_id).application.apply_blocker["reason"] == "form_error"
+
+
+def test_the_board_adapter_skips_helper_inputs_and_reads_dropdowns():
+    from app.services.ats_forms import greenhouse
+
+    form = greenhouse.analyze(BOARD, aps.form("greenhouse_board_form"))
+    assert [f.id for f in form.fields] == ["first_name", "last_name", "email", "resume", "question_1001",
+                                           "question_1002"]
+    assert next(f for f in form.fields if f.id == "question_1001").kind == "combobox"
+    assert [f.id for f in form.required_dropdowns()] == ["question_1001"] and form.submit.present
+
+
+def test_a_person_can_send_a_run_to_browser_use_and_retry_keeps_it(sessions, browser, monkeypatch):
+    from app.infrastructure.application_browser import browser_use_sidecar
+
+    user = aps.owner(sessions)
+    job_id = aps.approved_job(sessions, user, FORM)
+    with sessions() as db:
+        db.info["user_id"] = user
+        job = db.get(Job, job_id)
+        with pytest.raises(application_execution.ExecutionRefused) as off:
+            application_execution.enqueue(db, job, backend="browser_use_webui")
+        assert off.value.code == "BACKEND_UNAVAILABLE"
+        monkeypatch.setattr(browser_use_sidecar, "configured", lambda: True)
+        with pytest.raises(application_execution.ExecutionRefused) as other:
+            application_execution.enqueue(db, job, backend="playwright")
+        assert other.value.code == "BACKEND"
+        task = application_execution.enqueue(db, job, backend="browser_use_webui", reason="browser_use_chosen")
+        db.commit()
+        assert task.backend == "browser_use_webui"
+
+        def end(t):
+            t.status = "SKIPPED"
+            application_execution.set_stage(t, "CANCELLED")
+            db.commit()
+        end(task)
+        fresh = application_execution.requeue(db, db.get(ApplicationExecutionTask, task.id), user)
+        db.commit()
+        assert fresh.id != task.id and fresh.backend == "browser_use_webui"
+        assert application_execution.enqueue(db, job, backend="browser_use_webui").id == fresh.id  # the same run
+        end(fresh)
+        plain = application_execution.enqueue(db, job)  # a run the route decides for
+        db.commit()
+        with pytest.raises(application_execution.ExecutionRefused) as busy:  # never silently the other run
+            application_execution.enqueue(db, job, backend="browser_use_webui")
+        assert busy.value.code == "ACTIVE" and plain.backend is None
+
+
+def test_a_tasks_history_tells_what_happened_and_only_to_its_owner(sessions, browser):
+    user, other = aps.owner(sessions), aps.owner(sessions)
+    job_id = aps.approved_job(sessions, user, FORM)
+    task_id = aps.enqueue(sessions, user, job_id)
+    aps.drive(sessions)  # reads the form, saves the question it cannot answer, waits
+    with sessions() as db:
+        db.info["user_id"] = user
+        out = workers.history(db, user, "application", task_id)
+    titles = [e["title"] for e in out["events"]]
+    assert out["task"]["task_id"] == task_id and out["events"] == sorted(out["events"], key=lambda e: e["at"],
+                                                                         reverse=True)
+    for wanted in ("Queued", "Checked the approved packet", "Chose how to open the form", "Read the application form",
+                   "Attempt 1 started"):
+        assert wanted in titles, wanted
+    assert any(t.startswith("Saved ") and "for you to answer" in t for t in titles)
+    assert "asha" not in str(out).lower()  # metadata only
+    with sessions() as db:
+        db.info["user_id"] = other
+        with pytest.raises(workers.WorkerError) as refused:
+            workers.history(db, other, "application", task_id)
+        assert refused.value.status == 404

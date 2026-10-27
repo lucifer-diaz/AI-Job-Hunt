@@ -33,16 +33,16 @@ from sqlalchemy.orm import Session
 
 from app import auth
 from app.agents_api import router as agents_router
-from app.application_api import router as application_router
-from app.rag_api import router as rag_router
 from app.ai_models_api import router as ai_models_router
-from app.failover_api import router as failover_router
+from app.application_api import router as application_router
 from app.application_inbox_api import router as application_inbox_router
 from app.auth import PASSWORD_MIN_LENGTH, CurrentUser, current_user, get_user_db
 from app.auth import router as auth_router
+from app.automation_api import router as automation_router
 from app.db import engine
 from app.db_migrations import run_migrations
 from app.discovery_api import router as discovery_router
+from app.failover_api import router as failover_router
 from app.hunter_api import router as hunter_router
 from app.infrastructure.browser import shutdown_browser_service
 from app.job_description_api import router as job_description_router
@@ -61,7 +61,7 @@ from app.models import (
 )
 from app.monitoring_api import router as monitoring_router
 from app.orchestration_api import router as orchestration_router
-from app.workers_api import router as workers_router
+from app.rag_api import router as rag_router
 from app.resume_api import router as resume_router
 from app.scheduler import build_scheduler
 from app.scheduler_hooks import run_soon
@@ -84,6 +84,7 @@ from app.schemas import (
     TailorTasksIn,
 )
 from app.security import SecretsUnavailable
+from app.services import approval as approval_service
 from app.services import (
     backoff,
     context_builder,
@@ -98,20 +99,19 @@ from app.services import (
     tracing,
 )
 from app.services.ai_config import PROVIDERS as AI_PROVIDERS
-from app.services import approval as approval_service
-from app.services.approval import ApprovalRefused
 from app.services.ai_config import STAGES as AI_STAGES
 from app.services.ai_config import env_defaults as ai_env_defaults
 from app.services.ai_config import resolve as resolve_ai_config
 from app.services.ai_model_config import gateway_settings
+from app.services.approval import ApprovalRefused
 from app.services.contacts import recruiters_of, set_primary_recruiter
 from app.services.exports import markdown_to_simple_pdf
 from app.services.knowledge import question_key
 from app.services.sources import (
     board_teams,
-    preview_board,
     import_greenhouse,
     import_lever,
+    preview_board,
     refresh_apify_run,
     start_apify_search,
     upsert_job,
@@ -140,10 +140,12 @@ from app.services.workflow import (
 from app.settings import get_settings
 from app.setup_guide_api import router as setup_guide_router
 from app.tenancy import require_user_id
+from app.workers_api import router as workers_router
 from app.workspace import download_headers, packet_download_name
 from app.workspace import router as workspace_router
 
 run_migrations(engine)
+server_settings.apply()  # the configuration an admin saved (Settings → AI agents & automation) over the environment's
 settings = get_settings()
 # One scheduler per process. Manual triggers use it even when the background loop is disabled.
 scheduler = build_scheduler()
@@ -195,6 +197,7 @@ app.include_router(application_router)
 app.include_router(setup_guide_router)
 app.include_router(agents_router)
 app.include_router(rag_router)
+app.include_router(automation_router)
 
 # Reachable without signing in. Cron and admin routes are protected by their own secrets.
 PUBLIC_PATHS = {"/health", "/login", "/signup", "/api/auth/login", "/api/auth/signup", "/api/auth/logout"}

@@ -208,13 +208,19 @@ NODES: tuple[Node, ...] = (
          "PREPARATION_GRAPH_MODE is on (or shadow, which only compares).", "support", (3, -1),
          workers_tab="preparation", screen="tailor"),
     # The application worker (app.agents.application, APPLICATION_EXECUTION_MODE): reads an approved job's form,
-    # resolves each answer's source in code and, in assist mode, fills it in an ephemeral browser page. It never
-    # submits and never calls a model, so it is not an AI node; it hands a filled, validated form to you.
-    Node("application_execution", "Application worker", (ASYNC, BROWSER, EXT, DET), "Reads an approved job's "
+    # resolves each answer's source in code and, in assist mode, fills it — on Playwright with a form adapter, or on
+    # the browser-use sidecar, where the Browser Navigator proposes steps Python checks (optional AI). In guarded
+    # mode it may click the final Submit once, behind the pre-submit validator, the shared claim and an intent.
+    Node("application_execution", "Application worker", (ASYNC, BROWSER, EXT, DET, AI), "Reads an approved job's "
          "application form, finds a verified source for every answer (unknown required answers wait for you) and, "
-         "in assist mode, fills it in a private browser page that cannot submit, ending at ready to submit. You "
-         "submit from the Apply kit. Off unless APPLICATION_EXECUTION_MODE is observe or assist.", "support", (1, -1),
-         external=(ExternalMatch("WEB", "application_browser"),), monitoring_tab="external",
+         "in assist mode, fills it in a private browser that cannot submit, ending at ready to submit. A form no "
+         "adapter knows goes to the browser-use backend, where the Browser Navigator proposes each step and code "
+         "checks it. In guarded mode (consenting accounts, allowlisted routes) it may submit once, after the "
+         "pre-submit validator and the shared claim, and records it only on the site's confirmation. Off unless "
+         "APPLICATION_EXECUTION_MODE is observe, assist or guarded_auto.", "support", (1, -1),
+         workers=("BROWSER_NAVIGATOR",), llm_stages=("BROWSER_NAVIGATION",), optional_ai=True,
+         external=(ExternalMatch("WEB", "application_browser"), ExternalMatch("BROWSER_USE"),
+                   ExternalMatch("BROWSER_USE_WEBUI")), monitoring_tab="external",
          workers_tab="application", screen="approvals"),
     Node("interview_insights", "Interview preparation", (AI,), "Writes interview preparation from the posting, the "
          "fit analysis and verified evidence, always labelled as generated (never as questions the company asks).",

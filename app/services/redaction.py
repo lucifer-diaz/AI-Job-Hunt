@@ -15,10 +15,33 @@ external_api (request logs), llm_telemetry (LLM logs and LLM_PROMPT_DEBUG text),
 from __future__ import annotations
 
 import re
+import threading
+from collections import Counter
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 REDACTED = "[redacted]"
+# Exact secret values in use right now (a saved ATS password while a run fills it): replaced wherever they appear,
+# whatever their shape, by every writer that goes through redact_text. Process-wide, held only while in use.
+_LIVE: Counter[str] = Counter()
+_LIVE_LOCK = threading.Lock()
+
+
+@contextmanager
+def holding(*values: str | None) -> Iterator[None]:
+    """While the block runs, `values` are redacted from every log line, error and telemetry text."""
+    held = [v for v in values if isinstance(v, str) and len(v) >= 4]
+    with _LIVE_LOCK:
+        _LIVE.update(held)
+    try:
+        yield
+    finally:
+        with _LIVE_LOCK:
+            _LIVE.subtract(held)
+            for value in [v for v, n in _LIVE.items() if n <= 0]:
+                del _LIVE[value]
 # Header names whose value is always a credential. Matched case-insensitively, in full.
 SECRET_HEADERS = frozenset({
     "authorization", "proxy-authorization", "www-authenticate", "proxy-authenticate",
@@ -73,6 +96,11 @@ def redact_text(value: str | None, limit: int = MAX_ERROR_MESSAGE) -> str | None
     if value is None:
         return None
     clean = value
+    if _LIVE:
+        with _LIVE_LOCK:
+            live = sorted(_LIVE, key=len, reverse=True)
+        for secret in live:
+            clean = clean.replace(secret, REDACTED)
     for pattern in SECRET_PATTERNS:
         clean = pattern.sub(lambda m: (m.group(1) if m.groups() and m.group(1) else "") + REDACTED, clean)
     return clean[:limit]

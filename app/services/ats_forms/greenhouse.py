@@ -18,12 +18,14 @@ from app.services.ats_forms import (
     FormField,
     FormOption,
     SubmitControl,
+    is_legal,
     with_fingerprint,
 )
 
 NAME = "greenhouse"
 HOSTS = ("greenhouse.io",)
-FORM_SELECTOR = "#application_form"
+# The classic hosted form (boards.greenhouse.io and embeds) and the newer job-boards.greenhouse.io one.
+FORM_SELECTOR = "#application_form, form#application-form, form.application--form"
 EEO_MARKERS = ("eeoc", "demographic", "gender", "race", "ethnicity", "veteran", "disability", "hispanic")
 ROLE_PATTERNS = (
     ("first_name", re.compile(r"(^|[\[_])first_name\]?$")),
@@ -44,8 +46,15 @@ def detect(url: str, html: str) -> bool:
     if any(host == h or host.endswith("." + h) for h in HOSTS):
         return True
     soup = BeautifulSoup(html or "", "html.parser")
-    form = soup.select_one(FORM_SELECTOR)
+    form = soup.select_one("#application_form")
     return form is not None and form.find(attrs={"name": re.compile(r"^job_application\[")}) is not None
+
+
+def _helper(element: Tag) -> bool:
+    """Inputs no person fills: hidden from assistive technology and the tab order, or with neither id nor name (the
+    new board pairs each dropdown with such an input to make the browser enforce `required`)."""
+    hidden = element.get("aria-hidden") == "true" or element.get("tabindex") == "-1"
+    return (hidden and not element.get("role")) or not (element.get("id") or element.get("name"))
 
 
 def _text(node: Tag | None) -> str:
@@ -102,10 +111,14 @@ def analyze(url: str, html: str) -> ApplicationForm | None:
         kind = (element.get("type") or "text").lower() if element.name == "input" else element.name
         if kind in ("hidden", "submit", "button", "reset", "image", "password"):
             continue
+        if _helper(element):  # a dropdown widget's hidden required-shim, not a question
+            continue
+        if element.get("role") == "combobox":
+            kind = "combobox"
         if kind == "radio":
             radios.setdefault(element.get("name") or "", []).append(element)
             continue
-        if kind not in ("text", "email", "tel", "url", "number", "textarea", "select", "checkbox", "file"):
+        if kind not in ("text", "email", "tel", "url", "number", "textarea", "select", "checkbox", "file", "combobox"):
             kind = "text"
         label, starred = _label(soup, element)
         required = starred or element.has_attr("required") or element.get("aria-required") == "true"
@@ -116,7 +129,7 @@ def analyze(url: str, html: str) -> ApplicationForm | None:
         field_id = (element.get("id") or element.get("name") or f"field_{len(fields)}")[:200]
         fields.append(FormField(id=field_id, label=label or field_id, kind=kind, role=_role(element, label),
                                 required=bool(required), options=options, locator=_locator(element),
-                                eeo=_is_eeo(element, label)))
+                                eeo=_is_eeo(element, label), legal=kind != "file" and is_legal(label)))
     for name, group in radios.items():
         first = group[0]
         legend = first.find_parent("fieldset")
@@ -127,8 +140,11 @@ def analyze(url: str, html: str) -> ApplicationForm | None:
         safe = name.replace("\\", "\\\\").replace('"', '\\"')
         fields.append(FormField(id=name[:200], label=label.replace("*", "").strip()[:500] or name, kind="radio",
                                 role="question", required=bool(required), options=options,
-                                locator=f'input[type="radio"][name="{safe}"]', eeo=_is_eeo(first, label)))
+                                locator=f'input[type="radio"][name="{safe}"]', eeo=_is_eeo(first, label),
+                                legal=is_legal(label)))
     submit = form.find(id="submit_app") or form.find(["button", "input"], attrs={"type": "submit"})
+    if submit is None:  # the newer board: a plain button labelled Submit inside the form
+        submit = next((b for b in form.find_all("button") if _text(b).lower().startswith("submit")), None)
     label = (submit.get("value") or _text(submit)) if submit is not None else ""
     host = (urlparse(url or "").hostname or "")[:200]
     return with_fingerprint(ApplicationForm(adapter=NAME, host=host, fields=fields,
@@ -143,6 +159,9 @@ async def fill(page: Any, form: ApplicationForm, values: dict[str, Any]) -> dict
         if field.id not in values:
             continue
         value = values[field.id]
+        if field.kind == "combobox":  # opening a dropdown takes a click, which this page never makes
+            report[field.id] = "not filled (a dropdown: the browser-use backend sets it)"
+            continue
         try:
             if field.kind == "file":
                 await page.upload(field.locator, value["path"])
