@@ -61,7 +61,7 @@ from app.prompts.ranking import (
     posting_facts,
     ranking_profile_facts,
 )
-from app.services import backoff, job_description, prompt_budget, user_settings, worker_settings
+from app.services import backoff, job_description, prompt_budget, rate_limits, user_settings, worker_settings
 from app.services import resume_verification as rv
 from app.services.context_builder import (
     build_ranking_context,
@@ -74,6 +74,7 @@ from app.services.llm import (
     LLMCall,
     LLMClient,
     LLMConfigError,
+    LLMContextOverflowError,
     LLMError,
     LLMRateLimitError,
     LLMResponseError,
@@ -850,7 +851,11 @@ def classify(exc: Exception) -> tuple[ErrorCategory, bool, bool]:
     if isinstance(exc, (LLMTimeoutError, TimeoutError)):
         return ErrorCategory.TIMEOUT, True, False
     if isinstance(exc, LLMRateLimitError):
+        if getattr(exc.rate_limit, "kind", None) == rate_limits.TOO_LARGE:
+            return ErrorCategory.VALIDATION, False, False  # larger than the model's whole limit: no wait makes it fit
         return ErrorCategory.RATE_LIMITED, True, False
+    if isinstance(exc, LLMContextOverflowError):
+        return ErrorCategory.VALIDATION, False, False  # the same prompt cannot fit next time either
     if isinstance(exc, (LLMResponseError, RankingSchemaError)):
         return ErrorCategory.VALIDATION, True, False  # the model may answer correctly next time
     if isinstance(exc, LLMError):
@@ -968,10 +973,27 @@ def _failed(db: Session, claimed: TaskClaim, exc: Exception, now: datetime) -> s
     message = f"{type(exc).__name__}: {exc}"
     if wait:
         return _wait(db, claimed, message, now)
+    if isinstance(exc, LLMRateLimitError) and exc.held_seconds:
+        return _paced(db, claimed, message, exc.held_seconds, now)
     task, job = _owned(db, claimed)
     outcome = _retry_or_fail(db, task, job, category, message, retryable=retryable, actor=claimed.worker_id, now=now)
     db.commit()
     return outcome
+
+
+def _paced(db: Session, claimed: TaskClaim, message: str, seconds: int, now: datetime) -> str:
+    """Token pacing held the request until the model's token window resets: nothing was sent, so the attempt is given
+    back and the task comes back at the reset, not on the failure backoff."""
+    task, job = _owned(db, claimed)
+    _clear_lease(task)
+    task.attempt_count = max(0, task.attempt_count - 1)
+    task.status, task.next_attempt_at = PENDING, now + timedelta(seconds=max(1, seconds))
+    task.last_error, task.error_category = message[:MAX_ERROR_LENGTH], ErrorCategory.RATE_LIMITED
+    if job is not None and job.state is S.RANKING:
+        transition(db, job, S.RANK_PENDING, actor=claimed.worker_id, now=now,
+                   reason=f"Waiting {seconds}s for the model's token window; no request was sent")
+    db.commit()
+    return "retrying"
 
 
 def ranking_job_hash(job: Job, context: Any) -> str:

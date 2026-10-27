@@ -42,7 +42,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
-from app.services import failover, llm_telemetry, model_resolution, tracing
+from app.services import failover, llm_telemetry, model_resolution, rate_limits, tracing
 from app.services.ai_config import is_free_model
 from app.services.ai_config import resolve as resolve_ai_config
 from app.services.ai_workers import label as worker_label
@@ -78,13 +78,20 @@ class LLMTimeoutError(LLMError):
 class LLMRateLimitError(LLMError):
     """A 429. `rate_limit` says what kind and, when the provider named it, when it clears (app.services.rate_limits)."""
 
-    def __init__(self, *args: Any, rate_limit: Any = None):
+    def __init__(self, *args: Any, rate_limit: Any = None, held_seconds: int | None = None):
         super().__init__(*args)
         if rate_limit is None and args:
             from app.services import rate_limits
 
             rate_limit = rate_limits.classify(str(args[0]))
         self.rate_limit = rate_limit
+        # Set when token pacing held the request (app.services.token_pacing): nothing was sent, and the model's
+        # token window resets in this many seconds. Queued workers wait for it without spending an attempt.
+        self.held_seconds = held_seconds
+
+
+def _rate_limited(waiting: RateLimitedCooldown) -> LLMRateLimitError:
+    return LLMRateLimitError(str(waiting), held_seconds=waiting.retry_after_seconds if waiting.paced else None)
 
 
 class LLMContextOverflowError(LLMError):
@@ -221,7 +228,7 @@ def error_type(exc: BaseException, *, validation: bool = False) -> str:
     if validation or (isinstance(exc, LLMSchemaError) and exc.reason != "INVALID_JSON"):
         return "SCHEMA_VALIDATION"
     return ("CONFIGURATION" if isinstance(exc, LLMConfigError) else "TIMEOUT" if isinstance(exc, (LLMTimeoutError, TimeoutError))
-            else "RATE_LIMIT" if isinstance(exc, LLMRateLimitError)
+            else "RATE_LIMIT" if isinstance(exc, (LLMRateLimitError, RateLimitedCooldown))
             else "CONTEXT_OVERFLOW" if isinstance(exc, LLMContextOverflowError)
             else "INVALID_JSON" if isinstance(exc, LLMResponseError)
             else "PROVIDER_ERROR" if isinstance(exc, LLMError) else "OTHER")
@@ -275,7 +282,12 @@ def _gateway_error(model: str, exc: Exception) -> LLMError:
     if isinstance(exc, LiteLLMAuthError):
         return LLMConfigError(f"LiteLLM refused the API key saved in AI Orchestration → Models: {text}")
     if status == 429:
-        return LLMRateLimitError(detail, rate_limit=getattr(exc, "rate_limit", None))
+        limit = getattr(exc, "rate_limit", None)
+        if getattr(limit, "kind", None) == rate_limits.TOO_LARGE:
+            # larger than the model's whole per-minute limit (Groq): no wait makes it fit, so it is never retried
+            detail += (" — waiting cannot help: shorten the prompt (a prompt token budget) or use a model with a "
+                       "higher limit")
+        return LLMRateLimitError(detail, rate_limit=limit)
     if status in (408, 504) or "did not answer in time" in text or "Timeout" in text:
         return LLMTimeoutError(detail)
     if status == 413 or CONTEXT_OVERFLOW.search(text):
@@ -378,7 +390,7 @@ class LLMClient:
             try:
                 return self._gateway(system, user, task, prompt_name, prompt_version, call or LLMCall())
             except RateLimitedCooldown as waiting:
-                raise LLMRateLimitError(str(waiting)) from waiting
+                raise _rate_limited(waiting) from waiting
         model = config["stage_models"].get(task) or config["model"]
         attempt = Attempt(provider=provider, requested_model=model, user_id=self.user_id, call=call or LLMCall(),
                           prompt_name=prompt_name, prompt_version=prompt_version, system=system, user=user)
@@ -388,7 +400,7 @@ class LLMClient:
         try:
             return self._instrumented(system, user, task, model, config, attempt, prompt_name, prompt_version, started)
         except RateLimitedCooldown as waiting:
-            raise LLMRateLimitError(str(waiting)) from waiting
+            raise _rate_limited(waiting) from waiting
 
     def _instrumented(self, system: str, user: str, task: str, model: str, config: dict[str, Any], attempt: Attempt,
                       prompt_name: str | None, prompt_version: str | None, started: float) -> LLMResult:
@@ -490,7 +502,12 @@ class LLMClient:
         """One logical request: the worker's model, then — only when its escalation policy says so — one
         escalated request to a stronger model. Each is recorded as its own telemetry row."""
         worker_type = call.worker_type or worker_for_prompt(prompt_name) or STAGE_WORKERS.get(task)
-        resolved = failover.apply(call.resolved or model_resolution.get(self.user_id, worker_type), self.user_id)
+        resolved = call.resolved or model_resolution.get(self.user_id, worker_type)
+        # What the request will take off a per-minute token window (app.services.token_pacing): a model whose window
+        # cannot take it this minute moves behind its backups, like a resting one.
+        need = (llm_telemetry.estimate_tokens(system) + llm_telemetry.estimate_tokens(user)
+                + (resolved.max_output_tokens or 0))
+        resolved = failover.apply(resolved, self.user_id, tokens_needed=need)
         try:
             first = self._gateway_attempt(system, user, resolved.model, resolved, call, prompt_name, prompt_version)
         except Exception as exc:
@@ -590,7 +607,7 @@ class LLMClient:
         external = {"model": model, "stage": llm_telemetry.STAGE_BY_PROMPT.get(attempt.prompt_name or "", "OTHER"),
                     "worker_type": resolved.worker_type, "prompt_name": attempt.prompt_name,
                     "prompt_version": attempt.prompt_version, "params_withheld": withheld or None,
-                    "escalation": escalation}
+                    "escalation": escalation, "tokens_needed": estimated + int(params.get("max_tokens") or 0)}
         waiting = time.monotonic()
         with model_resolution.concurrency_slot(resolved, self.user_id, timeout) as free:
             if resolved.max_concurrency:  # without a limit there is no queue to measure

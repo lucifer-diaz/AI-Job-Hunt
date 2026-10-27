@@ -65,6 +65,7 @@ class User(Base):
     search_profiles: Mapped[list[SearchProfile]] = relationship(back_populates="user", passive_deletes=True)
     saved_searches: Mapped[list[SavedSearch]] = relationship(back_populates="user", passive_deletes=True)
     provider_cooldowns: Mapped[list[ProviderCooldown]] = relationship(back_populates="user", passive_deletes=True)
+    provider_rate_windows: Mapped[list[ProviderRateWindow]] = relationship(back_populates="user", passive_deletes=True)
     model_route_states: Mapped[list[ModelRouteState]] = relationship(back_populates="user", passive_deletes=True)
     failover_events: Mapped[list[FailoverEvent]] = relationship(back_populates="user", passive_deletes=True)
     agent_threads: Mapped[list[AgentThread]] = relationship(back_populates="user", passive_deletes=True)
@@ -1845,6 +1846,35 @@ class ProviderCooldown(Base):
     # Calls not made because the cooldown was still running — what the backoff saved.
     calls_skipped: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     last_limited_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+
+class ProviderRateWindow(Base):
+    """What a provider last said about one account's per-minute token window for one model (app.services.token_pacing).
+
+    Read from the rate-limit headers of each response (Groq, OpenAI: `x-ratelimit-*-tokens`) and lowered by what each
+    request sent since then reserves, so a request that would certainly be refused for the minute is held until the
+    window resets instead. The provider's next answer overwrites the figures: they are a cache, never configuration.
+    """
+
+    __tablename__ = "provider_rate_windows"
+    __table_args__ = (UniqueConstraint("user_id", "provider", name="uq_provider_rate_windows_user_provider"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("provider_rate_windows")
+    user: Mapped[User] = relationship(back_populates="provider_rate_windows")
+    provider: Mapped[str] = mapped_column(String(230))  # LITELLM:<model> (external_api.cooldown_provider)
+    tokens_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    tokens_remaining: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    tokens_reset_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Tokens reserved by requests sent but not answered yet: kept off the provider's figure, which has not seen them.
+    tokens_reserved: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # The request counters, with the window they count: Groq's are per day, OpenAI's per minute. Shown, never paced on.
+    requests_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    requests_remaining: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    requests_reset_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    requests_window: Mapped[str | None] = mapped_column(String(10), nullable=True)  # "day", "minute" or unknown
+    observed_at: Mapped[datetime] = mapped_column(DateTime, default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
 
 

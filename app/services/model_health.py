@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from app.services import failover_settings
 
@@ -169,7 +169,9 @@ def window_stats(db: Session, user_id: int, model: str, worker_type: str = "", *
     query = select(LLMRequestLog.status, LLMRequestLog.error_type, LLMRequestLog.latency_ms,
                    LLMRequestLog.fallback_used, LLMRequestLog.error_message).where(
         LLMRequestLog.user_id == user_id, LLMRequestLog.provider == "litellm",
-        LLMRequestLog.requested_model == model, LLMRequestLog.created_at >= since)
+        LLMRequestLog.requested_model == model, LLMRequestLog.created_at >= since,
+        # a request never sent (held by a cooldown or token pacing) says nothing about the model
+        or_(LLMRequestLog.cost_source.is_(None), LLMRequestLog.cost_source != "not_sent"))
     if until is not None:
         query = query.where(LLMRequestLog.created_at < until)
     if worker_type:
@@ -367,8 +369,8 @@ def record_outcome(entry: dict[str, Any], rate_limit: Any = None) -> None:
             return
         failed = entry.get("status") == "FAILED"
         kind = entry.get("error_type")
-        if failed and kind in NOT_HEALTH:
-            return
+        if failed and (kind in NOT_HEALTH or entry.get("cost_source") == "not_sent"):
+            return  # a request never sent (held by a cooldown or token pacing) says nothing about the model
         worker_type = entry.get("worker_type") or ""
         known = states(user_id)
         keys = [("", model), (worker_type, model)]

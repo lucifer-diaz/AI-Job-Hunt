@@ -33,12 +33,12 @@ from app.models import (AgentEffect, ApplicationClaim, ApplicationClaimKey, Appl
                         JobDescriptionParseTask, JobFeedbackEvent, JobInsight, JobInsightTask, JobQualificationTask, JobPreparationTask, ApprovedPacket, JobRanking,
                         JobRankingTask, RemovedPosting,
                         JobRequirementEvidence, JobStructuredDataChange, KnowledgeAnswer, McpToken, Resume,
-                        ProviderCooldown, ResumeDataChange, ResumeDocument, ResumeVariant, ResumeVersion, SavedSearch,
+                        ProviderCooldown, ProviderRateWindow, ResumeDataChange, ResumeDocument, ResumeVariant, ResumeVersion, SavedSearch,
                         SearchProfile,
                         SearchRun, TailorTask, WorkflowTransition)
 
 OWNED_MODELS = (CandidateProfile, AppSetting, ResumeDocument, KnowledgeAnswer, Evidence, Job, SearchRun, SearchProfile,
-                SavedSearch, ProviderCooldown, Application, ResumeVariant, WorkflowTransition, ApplicationEvent, FollowUp, TailorTask, ResumeVersion,
+                SavedSearch, ProviderCooldown, ProviderRateWindow, Application, ResumeVariant, WorkflowTransition, ApplicationEvent, FollowUp, TailorTask, ResumeVersion,
                 JobRankingTask, JobRanking, AIOptimizationTask, AIOptimizationReport, ConversationAction, McpToken, Resume,
                 ResumeDataChange, JobRequirementEvidence, JobStructuredDataChange, JobDescriptionParseTask,
                 JobDescriptionFetchTask, RemovedPosting, JobFeedbackEvent,
