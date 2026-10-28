@@ -73,4 +73,23 @@ describe('a packet with no review', () => {
     expect(review.textContent).toContain('Review 1');
     expect(view().textContent).toContain('not reviewed');
   });
+
+  it('selects only the unreviewed packets, and Redo reviews reviewed ones again', async () => {
+    ui.S.tailorMode = 'bulk';
+    ui.D.tailorQueue = [queueRow(), queueRow({ id: 12, reviewer_score: 80 }), queueRow({ id: 13, has_resume: false, ats_pct: null })];
+    ui.render();
+    const select = buttons('tailor-select').find(b => b.dataset.which === 'unreviewed');
+    expect(select.textContent).toContain('Select not reviewed (1)');
+    ui.A['tailor-select'](select);
+    expect([...ui.S.tailorChecked]).toEqual([11]);
+
+    ui.S.tailorChecked = new Set([11, 12, 13]); ui.S.tailorRegenerate = true;
+    ui.render();
+    const review = buttons('bulk-tailor').find(b => b.dataset.mode === 'review');
+    expect(review.textContent).toContain('Review 2');
+    await ui.A['bulk-tailor'](review);
+    const post = fetchMock.mock.calls.find(([url, init]) => url.includes('/api/tailor-tasks') && init?.method === 'POST');
+    expect(JSON.parse(post[1].body)).toMatchObject({ ids: [11, 12], mode: 'review', regenerate: true });
+    ui.S.tailorRegenerate = false;
+  });
 });

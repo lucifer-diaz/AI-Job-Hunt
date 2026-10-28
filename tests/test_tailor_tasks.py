@@ -186,3 +186,5 @@ def test_a_packet_whose_review_failed_is_reviewed_without_tailoring_again(monkey
 
     again = client.post("/api/tailor-tasks", json={"ids": [job_id], "mode": "review"}).json()
     assert again["skipped"] == [{"id": job_id, "reason": "already reviewed"}]
+    redo = client.post("/api/tailor-tasks", json={"ids": [job_id], "mode": "review", "regenerate": True}).json()
+    assert [t["mode"] for t in redo["queued"]] == ["review"]  # Redo reviews a reviewed packet again

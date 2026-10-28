@@ -1153,13 +1153,15 @@ function renderTaskStack(tasks = D.tasks || [], all = tasks) {
 
 // A Tailor-queue job whose latest packet was saved but never reviewed (its review failed or never ran).
 const unreviewedPacket = j => j.has_resume && j.reviewer_score == null && j.status !== 'needs_retailor' && !activeTask(j.id);
+// What Review sends: unreviewed packets, and with "Redo" ticked every packet (reviewed again, never re-tailored).
+const reviewablePacket = j => unreviewedPacket(j) || (S.tailorRegenerate && j.has_resume && j.status !== 'needs_retailor' && !activeTask(j.id));
 
 function renderBulkTailor(queue) {
   const selected = queue.filter(j => S.tailorChecked.has(j.id));
   const needsWork = j => !j.has_resume || j.status === 'needs_retailor';
   const pending = selected.filter(j => !activeTask(j.id) && (S.tailorRegenerate || needsWork(j)));
   const eligible = pending.length, tailorable = pending.filter(j => j.fit != null).length;
-  const reviewable = selected.filter(unreviewedPacket).length;
+  const reviewable = selected.filter(reviewablePacket).length, unreviewed = queue.filter(unreviewedPacket);
   const untailored = queue.filter(needsWork);
   const allOn = queue.every(j => S.tailorChecked.has(j.id));
   const allToggle = `<input type="checkbox" data-act="tailor-select" data-which="${allOn ? 'none' : 'all'}" ${allOn ? 'checked' : ''} aria-label="Select all jobs">`;
@@ -1191,8 +1193,9 @@ function renderBulkTailor(queue) {
       <div class="grow" style="min-width:220px"><div class="card-title" style="font-size:16px">Bulk tailor</div>
         <div class="card-sub">${selected.length} of ${queue.length} selected · ${untailored.length} not tailored yet</div></div>
       ${btn(`Select not tailored (${untailored.length})`, 'tailor-select', { which: 'untailored' }, 'sm', !untailored.length)}
+      ${btn(`Select not reviewed (${unreviewed.length})`, 'tailor-select', { which: 'unreviewed' }, 'sm', !unreviewed.length)}
       ${btn(allOn ? 'Clear' : 'Select all', 'tailor-select', { which: allOn ? 'none' : 'all' }, 'sm')}
-      ${reviewable ? `<span title="Review the saved packets of the selected jobs whose review never ran or failed, without tailoring them again">${btn(`Review ${reviewable}`, 'bulk-tailor', { mode: 'review' }, 'sm', queueing)}</span>` : ''}
+      <span title="${attr(S.tailorRegenerate ? 'Review the saved packets of the selected jobs again, without tailoring them again' : 'Review the saved packets of the selected jobs whose review never ran or failed, without tailoring them again. Tick “Redo” to review reviewed packets again too.')}">${btn(`Review${reviewable ? ` ${reviewable}` : ''}`, 'bulk-tailor', { mode: 'review' }, 'sm', !reviewable || queueing)}</span>
       ${btn(`Skip tailoring${eligible ? ` ${eligible}` : ''}`, 'bulk-tailor', { mode: 'skip' }, 'sm', !eligible || queueing)}
       ${tailorPagesPicker()}
       <span title="${attr(eligible > tailorable ? `${eligible - tailorable} selected job${eligible - tailorable === 1 ? ' is' : 's are'} not ranked yet: rank first, or skip tailoring` : 'Tailor the selected jobs')}">${btn(queueing ? 'Queueing…' : `Tailor${tailorable ? ` ${tailorable}` : ''}`, 'bulk-tailor', { mode: 'tailor' }, 'sm primary', !tailorable || queueing)}</span>
@@ -2735,15 +2738,16 @@ const A = {
   },
   'tailor-select': el => {
     const queue = D.tailorQueue || [], which = el.dataset.which;
-    S.tailorChecked = new Set(which === 'all' ? queue.map(j => j.id) : which === 'untailored' ? queue.filter(j => !j.has_resume || j.status === 'needs_retailor').map(j => j.id) : []);
+    S.tailorChecked = new Set(which === 'all' ? queue.map(j => j.id) : which === 'untailored' ? queue.filter(j => !j.has_resume || j.status === 'needs_retailor').map(j => j.id)
+      : which === 'unreviewed' ? queue.filter(unreviewedPacket).map(j => j.id) : []);
     render();
   },
   'tailor-pages': el => { S.tailorPages = el.value; render(); },
   'tailor-regenerate': (el, e) => { e.stopPropagation(); S.tailorRegenerate = !S.tailorRegenerate; render(); },
   'bulk-tailor': el => {
     if (el.dataset.mode === 'review') {
-      const picked = (D.tailorQueue || []).filter(j => S.tailorChecked.has(j.id) && unreviewedPacket(j)).map(j => j.id);
-      return queueTailoring(picked, 'review', false, 'bulkTailor', () => picked.forEach(id => S.tailorChecked.delete(id)));
+      const picked = (D.tailorQueue || []).filter(j => S.tailorChecked.has(j.id) && reviewablePacket(j)).map(j => j.id);
+      return queueTailoring(picked, 'review', S.tailorRegenerate, 'bulkTailor', () => picked.forEach(id => S.tailorChecked.delete(id)));
     }
     const ids = (D.tailorQueue || []).filter(j => S.tailorChecked.has(j.id) && !activeTask(j.id) && (S.tailorRegenerate || !j.has_resume || j.status === 'needs_retailor')
       && (el.dataset.mode === 'skip' || j.fit != null)).map(j => j.id);
