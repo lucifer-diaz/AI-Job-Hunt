@@ -219,23 +219,67 @@ function aimWorkers() {
 // so this shows the provider's own limits, this worker's request sizes, and the fixes that fit: a cap on answers when
 // they fit under it, or a model with more room. A person applies a fix; nothing changes on its own.
 const AIM_COUNTS = { total: 'prompt + answer', input: 'prompt', output: 'answer' };
+const AIM_SIZE_SHOWN = 2;  // suggested models shown before "N more models"
+// The limit these requests overrun the most: what it counts (prompt, answer or both) against the limit itself. A limit
+// that counts the prompt comes first, so the bar shows the whole request; an answer-only limit is drawn only alone.
+function aimSizeBinding(g) {
+  const inp = g.typical_input, out = g.typical_output;
+  const counted = l => l.counts === 'input' ? inp : l.counts === 'output' ? out : inp != null ? inp + (out || 0) : null;
+  return g.limits.map(l => ({ ...l, used: counted(l) })).filter(l => l.used != null && l.limit > 0)
+    .sort((a, b) => (a.counts === 'output') - (b.counts === 'output') || b.used / b.limit - a.used / a.limit)[0] || null;
+}
+// A bar of this worker's typical request against the binding limit; unknown sizes draw nothing.
+function aimSizeMeter(g) {
+  const b = aimSizeBinding(g);
+  if (!b) return '';
+  const inp = b.counts === 'output' ? 0 : g.typical_input || 0, out = b.counts === 'input' ? 0 : g.typical_output || 0;
+  const scale = Math.max(b.limit, inp + out) || 1, pct = n => `${Math.round(n / scale * 1000) / 10}%`;
+  const parts = [b.counts !== 'output' ? `Prompt <b>~${esc(aimTokens(g.typical_input))}</b>` : '', b.counts !== 'input' && g.typical_output != null ? `Answer <b>~${esc(aimTokens(g.typical_output))}</b>` : '',
+    `Limit <b>${esc(aimTokens(b.limit))}</b> ${esc(AIM_COUNTS[b.counts] || b.counts)}/min on <span class="mono">${esc(b.deployment)}</span>`].filter(Boolean);
+  return `<div class="aim-size-meter" role="img" aria-label="${attr(`Typical request ${aimTokens(inp + out)} tokens against a limit of ${aimTokens(b.limit)} ${AIM_COUNTS[b.counts] || b.counts} tokens per minute`)}">
+      <div class="aim-size-bar">${inp ? `<span class="in" style="width:${pct(inp)}"></span>` : ''}${out ? `<span class="out" style="width:${pct(out)}"></span>` : ''}<i style="left:${pct(b.limit)}" title="${attr(`Limit ${aimTokens(b.limit)}/min`)}"></i></div>
+      <p class="aim-size-legend">${parts.join('<span aria-hidden="true">·</span>')}<span class="muted">9 in 10 requests are smaller</span></p></div>`;
+}
+function aimSizeLimits(g) {
+  const rows = g.limits.map(l => `<tr><td class="mono">${esc(l.deployment)}</td><td>${esc(aimTokens(l.limit))} ${esc(AIM_COUNTS[l.counts] || l.counts)} tokens/min (${esc(l.kind)})</td></tr>`).join('');
+  return rows ? settingsDetails(`aim-size-limits:${g.worker_type}:${g.model}`, `${esc(g.model)}'s limits (${g.limits.length})`, `<table class="aim-size-limits"><tbody>${rows}</tbody></table>`) : '';
+}
+function aimSizeVerdict(g) {
+  const cap = g.output_cap, box = (tone, head, why, act = '') => `<div class="aim-size-verdict ${tone}"><div><b>${head}</b><p>${why}</p></div>${act}</div>`;
+  if (cap?.applied) return box('good', `✓ Answers are capped at ${esc(aimTokens(cap.current))} tokens`, 'Requests like these now fit.');
+  if (cap) return box('brand', `Cap answers at ${esc(aimTokens(cap.value))} tokens`, `These requests then fit. ${cap.known_safe ? `This worker's answers are about ${esc(aimTokens(cap.typical_output))}, so they are not cut short.` : 'This worker has no answers on record yet, so check that a cap this size does not cut them short.'}`,
+    btn(isBusy('aim-size') ? 'Saving…' : `Cap answers at ${aimTokens(cap.value)}`, 'aim-size-cap', { worker: g.worker_type, value: cap.value }, 'primary sm', isBusy('aim-size')));
+  return box('warn', 'Switch to a model with more room', g.input_over ? `The prompt alone${g.typical_input != null ? ` (~${esc(aimTokens(g.typical_input))})` : ''} is over ${esc(g.model)}'s limit, so capping answers cannot help.`
+    : `Prompt and answer together are more than ${esc(g.model)} accepts in a minute, and a smaller answer cap would cut this worker's answers short.`);
+}
+function aimSizeModels(g, backups) {
+  if (!g.models.length) return `<div class="aim-size-none"><span>No model in your catalog is known to have room for these requests.</span>${btn('Add one in Models', 'aim-tab', { tab: 'models' }, 'ghost sm')}</div>`;
+  const busy = isBusy('aim-size'), primary = g.output_cap && !g.output_cap.applied ? '' : 'primary';
+  const row = (m, i) => {
+    const use = `Use ${m.name} instead of ${g.model} for ${g.label}`;
+    const tags = [i === 0 ? '<span class="pill brand">Recommended</span>' : '', m.proven ? '<span class="pill good">Proven for this worker</span>' : '',
+      `<span class="xs muted">${m.context_window ? `${esc(aimTokens(m.context_window))} context` : 'context unknown'}</span>`].join('');
+    const backup = m.in_chain ? '<span class="pill muted" title="Already in this worker\'s backups">Backup</span>'
+      : backups.length < AIM_BACKUPS ? btn('Add as backup', 'aim-size-backup', { worker: g.worker_type, model: m.name }, 'ghost sm', busy) : '';
+    return `<li class="aim-size-model"><div class="aim-size-model-name"><span class="aim-size-dot" style="--h:${aimHue(m.name)}" aria-hidden="true"></span><span class="mono" title="${attr(m.name)}">${esc(m.name)}</span>${tags}</div>
+      <div class="aim-size-model-act">${backup}<button class="btn sm ${i === 0 ? primary : ''}" data-act="aim-size-use" data-worker="${attr(g.worker_type)}" data-model="${attr(m.name)}" data-replace="${attr(g.model)}" data-role="${attr(g.role || 'primary')}" aria-label="${attr(use)}" title="${attr(use)}" ${busy ? 'disabled' : ''}>Switch</button></div></li>`;
+  };
+  const shown = g.models.slice(0, AIM_SIZE_SHOWN).map(row).join(''), rest = g.models.slice(AIM_SIZE_SHOWN);
+  return `<h4 class="aim-size-h">Models with room for these requests</h4><ul class="aim-size-models">${shown}</ul>${rest.length ? settingsDetails(`aim-size-more:${g.worker_type}:${g.model}`, `${rest.length} more model${rest.length === 1 ? '' : 's'}`, `<ul class="aim-size-models">${rest.map((m, i) => row(m, i + AIM_SIZE_SHOWN)).join('')}</ul>`) : ''}`;
+}
 function aimRequestSize() {
   const groups = aimData().request_size || [];
   if (!groups.length) return '';
   const card = g => {
-    const w = aimWorkerByType(g.worker_type), c = w?.config || {}, backups = aimBackups(c), cap = g.output_cap;
-    const limits = g.limits.map(l => `<span class="mono">${esc(l.deployment)}</span> ${esc(aimTokens(l.limit))} ${esc(AIM_COUNTS[l.counts] || l.counts)} tokens/min (${esc(l.kind)})`).join(' · ');
-    const sizes = g.typical_input != null ? `This worker's requests: prompt about ${esc(aimTokens(g.typical_input))}${g.typical_output != null ? `, answer about ${esc(aimTokens(g.typical_output))}` : ''} tokens (9 in 10 are smaller).` : '';
-    const verdict = cap ? (cap.applied ? `<p class="settings-help">✓ Answers are capped at ${esc(aimTokens(cap.current))} tokens, so requests like these now fit.</p>`
-        : `<p>Cap answers at <b>${esc(aimTokens(cap.value))}</b> tokens and these requests fit.${cap.known_safe ? ` This worker's answers are about ${esc(aimTokens(cap.typical_output))}, so they are not cut short.` : ' This worker has no answers on record yet, so check that a cap this size does not cut them short.'}</p><div class="row gap8">${btn(isBusy('aim-size') ? 'Saving…' : `Cap answers at ${aimTokens(cap.value)}`, 'aim-size-cap', { worker: g.worker_type, value: cap.value }, 'primary sm', isBusy('aim-size'))}</div>`)
-      : g.input_over ? `<p>The prompt alone is over ${esc(g.model)}'s limit, so capping answers cannot help. Use a model with more room.</p>`
-        : `<p>Prompt and answer together are more than ${esc(g.model)} accepts in a minute, and a smaller answer cap would cut this worker's answers short. Use a model with more room.</p>`;
-    const models = g.models.map(m => `<li class="row between gap8 wrap"><span><span class="mono">${esc(m.name)}</span> <span class="xs muted">${m.context_window ? `${esc(aimTokens(m.context_window))} context` : 'context unknown'}${m.proven ? ' · has answered requests this size for this worker' : ''}</span></span><span class="row gap6">${m.in_chain ? '<span class="xs muted">already a backup</span>' : backups.length < AIM_BACKUPS ? btn('Add as backup', 'aim-size-backup', { worker: g.worker_type, model: m.name }, 'sm', isBusy('aim-size')) : ''}${btn(`Use instead of ${g.model}`, 'aim-size-use', { worker: g.worker_type, model: m.name, replace: g.model, role: g.role || 'primary' }, 'sm', isBusy('aim-size'))}</span></li>`).join('');
-    return `<article class="aim-size"><div class="row between gap8 wrap"><div><b>${esc(g.label)}</b> → <span class="mono">${esc(g.model)}</span>${g.role && g.role !== 'primary' ? ` <span class="xs muted">(its ${esc(g.role === 'backup' ? 'backup' : 'escalation model')})</span>` : ''}: ${g.count} request${g.count === 1 ? '' : 's'} refused as too large</div><span class="xs muted">last ${esc(fmtDateTime(g.last_at))}</span></div>
-      <p class="settings-help">${esc(g.model)}'s limits: ${limits}. ${sizes}</p>${verdict}
-      ${models ? `<p class="xs muted mt8">Models with room for these requests</p><ul class="aim-size-models">${models}</ul>` : '<p class="settings-help">No model in your catalog is known to have room for these requests. Add one in Models.</p>'}</article>`;
+    const backups = aimBackups(aimWorkerByType(g.worker_type)?.config || {});
+    const role = g.role && g.role !== 'primary' ? ` <span class="pill muted">its ${esc(g.role === 'backup' ? 'backup' : 'escalation model')}</span>` : '';
+    return `<article class="aim-size" style="--h:${aimHue(g.worker_type)}"><header class="aim-size-head"><span class="aim-wk-mono" aria-hidden="true">${esc(aimMonogram(g.label))}</span>
+        <div class="aim-size-title"><b>${esc(g.label)}</b> <span aria-hidden="true">→</span><span class="sr-only">sends to</span> <span class="mono">${esc(g.model)}</span>${role}</div>
+        <div class="aim-size-when"><span class="pill bad">${g.count} request${g.count === 1 ? '' : 's'} refused as too large</span><span class="xs muted">last ${esc(fmtDateTime(g.last_at))}</span></div></header>
+      ${aimSizeMeter(g)}${aimSizeVerdict(g)}${aimSizeModels(g, backups)}${aimSizeLimits(g)}</article>`;
   };
-  return aimPanel(settingsGroup('Requests too big for their model', 'From the last 7 days. The provider refused each one as larger than its per-minute token limit; waiting does not help these, so the model is not rested for them.', groups.map(card).join('')), 'aim-size-panel');
+  const total = groups.reduce((n, g) => n + g.count, 0), workers = new Set(groups.map(g => g.worker_type)).size;
+  return aimPanel(settingsGroup('Requests too big for their model', `Last 7 days · ${workers} worker${workers === 1 ? '' : 's'} · ${total} request${total === 1 ? '' : 's'} refused. Each was over the provider's per-minute token limit, so waiting does not help and the model is not rested for them.`, `<div class="aim-size-list">${groups.map(card).join('')}</div>`), 'aim-size-panel');
 }
 function aimTestResult(t) {
   if (t.error && !t.success) return `<div class="settings-error aim-test">${esc(t.error)}</div>`;
