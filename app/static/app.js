@@ -334,12 +334,23 @@ function parseQueuedMsg(out) {
   const n = out.queued.length, why = [...new Set(out.skipped.map(s => s.reason))].join(', ');
   return `${n ? `Queued ${n} job${n === 1 ? '' : 's'} for parsing — ranking follows` : 'Nothing to parse'}${out.skipped.length ? ` · ${out.skipped.length} skipped (${why})` : ''}`;
 }
-// After a parse is queued from a job's own controls: re-read that job wherever it is shown.
+// After parses are queued: re-read the jobs wherever they are shown, then keep watching a few of them until their
+// parse ends (the worker runs in the background), so "Parsing…" turns into Rank, Tailor or Parse again on its own.
 async function refreshParsed(id) {
   const fresh = await api(`/api/jobs/${id}`).catch(() => null);
   if (fresh && D.selDetail?.id === id) D.selDetail = fresh;
   if (fresh && D.triageDetail?.id === id) D.triageDetail = fresh;
   if (fresh && D.jobModal?.id === id) D.jobModal = fresh;
+  return fresh;
+}
+async function watchParsing(ids) {
+  let watched = ids.slice(0, 10);
+  for (let i = 0; i < 40 && watched.length; i++) {
+    await new Promise(r => setTimeout(r, 3000));
+    const fresh = await Promise.all(watched.map(refreshParsed));
+    watched = watched.filter((id, n) => !fresh[n] || fresh[n].description_state === 'PARSING');
+    if (watched.length) render();
+  }
   await load();
 }
 function rankQueuedMsg(out) {
@@ -798,7 +809,8 @@ function noteRanked(rows) {
 const parseGate = () => D.jobs?.parse_enabled !== false;
 const parsedSelection = () => [...S.checked].filter(id => !parseGate() || S.parsedIds.has(id));
 const rankedSelection = () => parsedSelection().filter(id => S.rankedIds.has(id));
-const needsParse = j => !!j && j.parse_enabled !== false && !!j.description_state && !['PARSED', 'NO_DESCRIPTION'].includes(j.description_state);
+// Cards from /api/jobs/search (the table, triage) carry the switch on the response, details on the job itself.
+const needsParse = j => !!j && (j.parse_enabled ?? D.queue?.parse_enabled ?? D.jobs?.parse_enabled) !== false && !!j.description_state && !['PARSED', 'NO_DESCRIPTION'].includes(j.description_state);
 const parseBtn = (j, cls = '') => j.description_state === 'PARSING'
   ? `<span title="Ranking and tailoring start once the description is parsed">${btn('Parsing…', 'parse-job', { id: j.id }, cls, true)}</span>`
   : `<span title="${attr(j.description_state === 'FAILED' ? 'Parsing failed: ranking and tailoring wait for a parsed description' : 'Ranking and tailoring wait for a parsed description')}">${btn(label('parse' + j.id, j.description_state === 'FAILED' ? 'Parse again' : 'Parse', 'Queueing…'), 'parse-job', { id: j.id }, cls, isBusy('parse' + j.id))}</span>`;
@@ -2445,12 +2457,12 @@ const A = {
   }, rankQueuedMsg),
   'bulk-parse': () => busy('bulkParse', async () => {
     const out = await api('/api/jobs/bulk-parse', { method: 'POST', body: { ids: [...S.checked].filter(id => !S.parsedIds.has(id)) } });
-    out.queued.forEach(id => S.checked.delete(id)); await load();
+    out.queued.forEach(id => S.checked.delete(id)); await load(); watchParsing(out.queued);
     return out;
   }, parseQueuedMsg),
   'parse-job': el => busy('parse' + el.dataset.id, async () => {
     const out = await api('/api/jobs/bulk-parse', { method: 'POST', body: { ids: [Number(el.dataset.id)] } });
-    await refreshParsed(Number(el.dataset.id));
+    await refreshParsed(Number(el.dataset.id)); await load(); watchParsing(out.queued);
     return out;
   }, parseQueuedMsg),
   'bulk-delete': () => {

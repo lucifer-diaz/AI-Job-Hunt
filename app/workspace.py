@@ -20,6 +20,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Qu
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import and_, desc, exists, func, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.auth import get_user_db
@@ -1017,11 +1018,13 @@ def bulk_parse(payload: BulkIdsIn, request: Request, background: BackgroundTasks
                else "already parsed" if state == "PARSED"
                else "already parsing" if state == "PARSING"
                else None)
-        if why:
-            skipped.append({"id": job_id, "reason": why})
-            continue
-        job_description.queue_parse(db, job, reason="manual")
-        queued.append(job_id)
+        if not why:
+            try:  # the parse sweep may queue the same job at the same moment
+                with db.begin_nested():
+                    job_description.queue_parse(db, job, reason="manual")
+            except IntegrityError:
+                why = "already parsing"
+        (skipped.append({"id": job_id, "reason": why}) if why else queued.append(job_id))
     db.commit()
     if queued:
         run_soon(background, request.app, "jd_parsing")

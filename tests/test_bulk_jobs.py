@@ -111,6 +111,27 @@ def test_bulk_parse_queues_unparsed_and_failed_jobs_only():
     assert again["queued"] == [] and again["skipped"] == [{"id": failed, "reason": "already parsing"}]
 
 
+def test_bulk_parse_keeps_the_batch_when_another_worker_queues_a_job_first(monkeypatch):
+    from sqlalchemy.exc import IntegrityError
+
+    from app.services import job_description
+    first, raced = make_jobs(2, uuid.uuid4().hex[:8])
+    _finish_parse_tasks([first, raced])
+    real = job_description.queue_parse
+
+    def racing(db, job, **kwargs):
+        if job.id == raced:  # the sweep committed its task between our check and our insert
+            raise IntegrityError("insert", {}, Exception("uq_jd_parse_tasks_active_job"))
+        return real(db, job, **kwargs)
+
+    monkeypatch.setattr(job_description, "queue_parse", racing)
+    out = client.post("/api/jobs/bulk-parse", json={"ids": [first, raced]}).json()
+    assert out["queued"] == [first] and out["skipped"] == [{"id": raced, "reason": "already parsing"}]
+    states = {r["id"]: r["description_state"] for r in client.get(
+        "/api/jobs/search", params={"q": "Bulk Co", "per_page": 50}).json()["items"]}
+    assert states[first] == "PARSING"
+
+
 def test_select_all_matching_reports_parsed_ids():
     tag = uuid.uuid4().hex[:8]
     parsed, fresh = make_jobs(2, tag)

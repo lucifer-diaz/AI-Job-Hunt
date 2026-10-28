@@ -23,7 +23,7 @@ beforeEach(() => {
       runInContext(readFileSync(`app/static/${file}`, 'utf8'), context, { filename: resolve(`app/static/${file}`) });
     }
     runInContext(appSource, context, { filename: resolve('app/static/app.js') });
-    ui = runInContext('({ S, D, A, renderTable, freshFilters, tableQuery, DEFAULT_FILTERS, FILTERS_KEY })', context);
+    ui = runInContext('({ S, D, A, renderTable, renderTriage, freshFilters, tableQuery, DEFAULT_FILTERS, FILTERS_KEY })', context);
     runInContext('load = async () => {}; render = () => {};', context);
   }
   ui.S.checked = new Set(); ui.S.rankedIds = new Set(); ui.S.parsedIds = new Set(); ui.S.busy = {}; ui.S.selJob = null; ui.D.selDetail = null;
@@ -99,6 +99,21 @@ describe('Jobs · ranking and tailoring need a parsed description', () => {
     expect(root.querySelector('[data-act="parse-job"]').textContent.trim()).toBe('Parse again');
     expect(root.querySelector('[data-act="rank-job"]')).toBeNull();
     expect(root.querySelector('[data-act="triage"][data-tailor]')).toBeNull();
+  });
+
+  it('keeps Rank now in triage when parsing is off, though the card itself does not say so', () => {
+    const card = { ...row(1, null, 'NOT_PARSED'), agency: false, summary: '', matches: [], gaps: [], missing: [], keywords: [] };
+    ui.S.triagedThisSession = 0; ui.D.triageDetail = null; ui.D.setups = [];
+    ui.D.queue = { items: [card], total: 1, parse_enabled: false };
+    document.getElementById('view').innerHTML = ui.renderTriage();
+    let root = document.getElementById('view');
+    expect(root.querySelector('[data-act="rank-job"]')).not.toBeNull();
+    expect(root.querySelector('[data-act="parse-job"]')).toBeNull();
+    ui.D.queue = { ...ui.D.queue, parse_enabled: true };
+    document.getElementById('view').innerHTML = ui.renderTriage();
+    root = document.getElementById('view');
+    expect(root.querySelector('[data-act="parse-job"]')).not.toBeNull();
+    expect(root.querySelector('[data-act="rank-job"]')).toBeNull();
   });
 
   it('shows a disabled Parsing… while the parse runs', () => {
