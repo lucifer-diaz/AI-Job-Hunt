@@ -36,7 +36,8 @@ def test_select_all_matching_returns_every_id():
     assert sorted(out["ids"]) == sorted(ids) and out["total"] == 3
 
 
-def test_bulk_rank_queues_tasks_and_never_ranks_in_the_request():
+def test_bulk_rank_queues_tasks_and_never_ranks_in_the_request(monkeypatch):
+    monkeypatch.setattr(get_settings(), "jd_parse_enabled", False)  # without parsing there is nothing to wait for
     ids = make_jobs(3, uuid.uuid4().hex[:8])
     response = client.post("/api/jobs/bulk-rank", json={"ids": ids + [999999]})
     assert response.status_code == 202
@@ -56,6 +57,68 @@ def test_bulk_rank_queues_tasks_and_never_ranks_in_the_request():
         db.commit()
     unranked_only = client.post("/api/jobs/bulk-rank", json={"ids": ids}).json()
     assert unranked_only["queued"] == ids  # jobs still waiting for the ranker stay queued
+
+
+def _set_parse(job_id, status, *, current=True):
+    from app.db import SessionLocal
+    from app.models import Job
+    from app.services import job_description
+    with SessionLocal() as db:
+        job = db.get(Job, job_id)
+        job.structured_description_status = status
+        job.structured_description = {"title": job.title} if status == "PARSED" else None
+        job.structured_description_hash = job_description.description_hash(job.description) if current else "old"
+        db.commit()
+
+
+def _finish_parse_tasks(job_ids):
+    from sqlalchemy import update
+
+    from app.db import SessionLocal
+    from app.models import JobDescriptionParseTask
+    with SessionLocal() as db:
+        db.execute(update(JobDescriptionParseTask).where(JobDescriptionParseTask.job_id.in_(job_ids))
+                   .values(status="FAILED"))
+        db.commit()
+
+
+def test_bulk_rank_leaves_out_jobs_that_are_not_parsed():
+    parsed, failed, fresh = make_jobs(3, uuid.uuid4().hex[:8])
+    _finish_parse_tasks([parsed, failed, fresh])
+    _set_parse(parsed, "PARSED")
+    _set_parse(failed, "NEEDS_REVIEW")
+    out = client.post("/api/jobs/bulk-rank?rerank=true", json={"ids": [parsed, failed, fresh]}).json()
+    assert out["queued"] == [parsed]
+    assert {s["id"]: s["reason"] for s in out["skipped"]} == {failed: "not parsed yet", fresh: "not parsed yet"}
+
+
+def test_bulk_parse_queues_unparsed_and_failed_jobs_only():
+    tag = uuid.uuid4().hex[:8]
+    parsed, failed, stale, busy = make_jobs(4, tag)
+    _finish_parse_tasks([parsed, failed, stale])  # `busy` keeps the parse task it was created with
+    _set_parse(parsed, "PARSED")
+    _set_parse(failed, "NEEDS_REVIEW")
+    _set_parse(stale, "PARSED", current=False)  # parsed, but the description changed since
+    response = client.post("/api/jobs/bulk-parse", json={"ids": [parsed, failed, stale, busy, 999999]})
+    assert response.status_code == 202
+    out = response.json()
+    assert out["queued"] == [failed, stale]
+    assert {s["id"]: s["reason"] for s in out["skipped"]} == {
+        parsed: "already parsed", busy: "already parsing", 999999: "not found"}
+    states = {r["id"]: r["description_state"] for r in client.get("/api/jobs/search", params={"q": f"Bulk Co {tag}"}).json()["items"]}
+    assert states[failed] == states[stale] == "PARSING"
+    again = client.post("/api/jobs/bulk-parse", json={"ids": [failed]}).json()
+    assert again["queued"] == [] and again["skipped"] == [{"id": failed, "reason": "already parsing"}]
+
+
+def test_select_all_matching_reports_parsed_ids():
+    tag = uuid.uuid4().hex[:8]
+    parsed, fresh = make_jobs(2, tag)
+    _finish_parse_tasks([parsed])
+    _set_parse(parsed, "PARSED")
+    out = client.get("/api/jobs/search", params={"q": f"Bulk Co {tag}", "ids_only": True}).json()
+    assert out["parsed_ids"] == [parsed]
+    assert client.get("/api/jobs/search", params={"q": f"Bulk Co {tag}"}).json()["parse_enabled"] is True
 
 
 def test_bulk_delete_protects_submitted_jobs_and_cascades():

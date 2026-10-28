@@ -7,8 +7,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const appSource = readFileSync('app/static/app.js', 'utf8').split('/* ───────────── boot ───────────── */')[0];
 let ui;
 
-const row = (id, fit) => ({ id, title: `Product Manager ${id}`, company: 'Paytm', location: 'Bengaluru, India', fit,
-  status: 'discovered', board: 'Naukri', posted: '5d ago' });
+const row = (id, fit, description_state = 'PARSED') => ({ id, title: `Product Manager ${id}`, company: 'Paytm',
+  location: 'Bengaluru, India', fit, status: 'discovered', board: 'Naukri', posted: '5d ago', description_state });
 const jobs = items => ({ items, page: 1, pages: 1, per_page: 25, total: items.length, total_all: items.length,
   boards: ['Naukri'] });
 const view = () => { document.getElementById('view').innerHTML = ui.renderTable(); return document.getElementById('view'); };
@@ -26,7 +26,7 @@ beforeEach(() => {
     ui = runInContext('({ S, D, A, renderTable, freshFilters, tableQuery, DEFAULT_FILTERS, FILTERS_KEY })', context);
     runInContext('load = async () => {}; render = () => {};', context);
   }
-  ui.S.checked = new Set(); ui.S.rankedIds = new Set(); ui.S.busy = {}; ui.S.selJob = null; ui.D.selDetail = null;
+  ui.S.checked = new Set(); ui.S.rankedIds = new Set(); ui.S.parsedIds = new Set(); ui.S.busy = {}; ui.S.selJob = null; ui.D.selDetail = null;
   ui.S.filters = { q: '', min_fit: 0, board: 'all', stage: 'discovered', sort: 'fit', per_page: 25 };
 });
 
@@ -56,6 +56,58 @@ describe('Jobs · Bulk tailor needs a ranking', () => {
     const root = view();
     expect(root.querySelector('[data-act="rank-job"]').textContent.trim()).toBe('Rank first');
     expect(root.querySelector('[data-act="triage"][data-tailor]')).toBeNull();
+  });
+});
+
+describe('Jobs · ranking and tailoring need a parsed description', () => {
+  const bar = root => root.querySelector('.selbar');
+  const act = (root, name) => root.querySelector(`.selbar [data-act="${name}"]`);
+
+  it('offers only Parse when no selected job is parsed', () => {
+    ui.D.jobs = jobs([row(1, 88, 'FAILED'), row(2, null, 'NOT_PARSED')]);
+    ui.S.checked = new Set([1, 2]);
+    const root = view();
+    expect(act(root, 'bulk-parse').textContent.trim()).toBe('Parse 2');
+    expect(act(root, 'bulk-rank')).toBeNull();
+    expect(act(root, 'bulk-to-tailor')).toBeNull();
+    expect(bar(root).textContent).toContain('2 selected');
+  });
+
+  it('counts only parsed jobs for Rank and Bulk tailor in a mixed selection', () => {
+    ui.D.jobs = jobs([row(1, 88, 'FAILED'), row(2, 80), row(3, null)]);
+    ui.S.checked = new Set([1, 2, 3]);
+    const root = view();
+    expect(act(root, 'bulk-parse').textContent.trim()).toBe('Parse 1');
+    expect(act(root, 'bulk-rank').textContent.trim()).toBe('Rank 2');
+    expect(act(root, 'bulk-to-tailor').textContent.trim()).toBe('Bulk tailor 1');
+  });
+
+  it('keeps the old buttons when parsing is off', () => {
+    ui.D.jobs = { ...jobs([row(1, 88, 'NOT_PARSED')]), parse_enabled: false };
+    ui.S.checked = new Set([1]);
+    const root = view();
+    expect(act(root, 'bulk-parse')).toBeNull();
+    expect(act(root, 'bulk-rank').textContent.trim()).toBe('Rank 1');
+    expect(act(root, 'bulk-to-tailor').textContent.trim()).toBe('Bulk tailor 1');
+  });
+
+  it('offers Parse instead of Rank or Tailor for a job whose parse failed', () => {
+    ui.D.jobs = jobs([row(1, 88, 'FAILED')]);
+    ui.S.selJob = 1;
+    ui.D.selDetail = { ...row(1, 88, 'FAILED'), parse_enabled: true, matches: [], gaps: [], missing: [], summary: '' };
+    const root = view();
+    expect(root.querySelector('[data-act="parse-job"]').textContent.trim()).toBe('Parse again');
+    expect(root.querySelector('[data-act="rank-job"]')).toBeNull();
+    expect(root.querySelector('[data-act="triage"][data-tailor]')).toBeNull();
+  });
+
+  it('shows a disabled Parsing… while the parse runs', () => {
+    ui.D.jobs = jobs([row(1, null, 'PARSING')]);
+    ui.S.selJob = 1;
+    ui.D.selDetail = { ...row(1, null, 'PARSING'), parse_enabled: true, matches: [], gaps: [], missing: [], summary: '' };
+    const parse = view().querySelector('[data-act="parse-job"]');
+    expect(parse.disabled).toBe(true);
+    expect(parse.textContent.trim()).toBe('Parsing…');
   });
 });
 

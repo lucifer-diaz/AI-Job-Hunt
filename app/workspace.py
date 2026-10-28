@@ -874,7 +874,8 @@ def jobs_search(q: str = "", min_fit: int = 0, max_fit: int = 0, board: str = "a
     if ids_only:  # "select all matching" across every page
         chosen = rows[:5000]
         return {"ids": [j.id for j in chosen], "total": total,
-                "ranked_ids": [j.id for j in chosen if j.fit_score is not None]}
+                "ranked_ids": [j.id for j in chosen if j.fit_score is not None],
+                "parsed_ids": [j.id for j in chosen if described[j.id] == "PARSED"]}
     pages = max(1, -(-total // per_page))
     page = min(page, pages)
     boards = sorted({board_label(j.source) for j in jobs})
@@ -885,6 +886,7 @@ def jobs_search(q: str = "", min_fit: int = 0, max_fit: int = 0, board: str = "a
                                    for key, name in job_description.DESCRIPTION_STATES.items()],
             "total_all": total_all, "applied_hidden": applied_hidden,
             "domain_counts": {"matching": domain_counts["matching"], "not_matching": domain_counts["not_matching"]},
+            "parse_enabled": get_settings().jd_parse_enabled,
             "page": page, "pages": pages, "per_page": per_page, "boards": boards,
             "locations": location_facets([j.location for j in jobs]),
             "job_types": sorted({(j.job_type or "").strip().lower() for j in jobs} - {""}),
@@ -979,10 +981,51 @@ def bulk_delete(payload: BulkIdsIn, db: Session = Depends(get_user_db)):
 @router.post("/api/jobs/bulk-rank", status_code=202)
 def bulk_rank(payload: BulkIdsIn, request: Request, background: BackgroundTasks, rerank: bool = False,
               db: Session = Depends(get_user_db)):
-    """Queue ranking for selected jobs. `rerank` also re-ranks ranked jobs as a new version."""
-    out = ranker.request_ranking(db, payload.ids, force=rerank, only_unranked=not rerank, actor=f"user:{db.info['user_id']}")
+    """Queue ranking for selected jobs. `rerank` also re-ranks ranked jobs as a new version.
+
+    While parsing is on, only jobs whose current description is parsed are ranked: Parse them first."""
+    from app.services import job_description  # local import, as app.services.sources does
+
+    ids, unparsed = list(dict.fromkeys(payload.ids)), []
+    if get_settings().jd_parse_enabled:
+        jobs = db.scalars(select(Job).where(Job.id.in_(ids))).all()
+        statuses = job_description.latest_parse_statuses(db, [job.id for job in jobs])
+        parsed = {job.id for job in jobs if job_description.description_state(job, statuses.get(job.id)) == "PARSED"}
+        unparsed = [job.id for job in jobs if job.id not in parsed]
+        ids = [job_id for job_id in ids if job_id not in unparsed]
+    out = ranker.request_ranking(db, ids, force=rerank, only_unranked=not rerank, actor=f"user:{db.info['user_id']}")
+    out["skipped"] += [{"id": job_id, "reason": "not parsed yet"} for job_id in unparsed]
     run_soon(background, request.app, "ranking")
     return out
+
+
+@router.post("/api/jobs/bulk-parse", status_code=202)
+def bulk_parse(payload: BulkIdsIn, request: Request, background: BackgroundTasks, db: Session = Depends(get_user_db)):
+    """Queue a parse of each selected job's description. The parse worker does the model calls; ranking follows."""
+    from app.services import job_description  # local import, as app.services.sources does
+
+    ids = list(dict.fromkeys(payload.ids))
+    jobs = {job.id: job for job in db.scalars(select(Job).where(Job.id.in_(ids))).all()}
+    statuses = job_description.latest_parse_statuses(db, list(jobs))
+    queued, skipped = [], []
+    for job_id in ids:
+        job = jobs.get(job_id)
+        state = job_description.description_state(job, statuses.get(job_id)) if job else None
+        why = ("not found" if job is None
+               else "hidden: not matching your domain" if job.domain_match == "NOT_MATCHING"
+               else "no description" if state == "NO_DESCRIPTION"
+               else "already parsed" if state == "PARSED"
+               else "already parsing" if state == "PARSING"
+               else None)
+        if why:
+            skipped.append({"id": job_id, "reason": why})
+            continue
+        job_description.queue_parse(db, job, reason="manual")
+        queued.append(job_id)
+    db.commit()
+    if queued:
+        run_soon(background, request.app, "jd_parsing")
+    return {"queued": queued, "skipped": skipped}
 
 
 @router.get("/api/jobs/{job_id}")
@@ -1015,6 +1058,7 @@ def job_detail(job_id: int, db: Session = Depends(get_user_db)):
 
     return {**job_card(job), "description": job.description, "fit_analysis": job.fit_analysis or {},
             "description_state": job_description.description_state(job, parse_status),
+            "parse_enabled": get_settings().jd_parse_enabled,
             "description_recovery": jd_recovery.status_of(db, job),
             "rank_pct": rank, "wizard": [{"label": l, "done": d, "meta": m} for l, d, m in steps],
             "gap_notes": gap_notes, "notes": app.notes if app else "",

@@ -31,7 +31,7 @@ const S = {
   screen: 'overview', knowledgeSection: 'answers', settingsSection: 'profile', todayVariant: 'focus', discMode: 'triage',
   filters: storedFilters(), datePop: false, dateMode: null, moreFilters: false,
   triage: { min_fit: 0, location: 'all', hide_agencies: true, hide_reposts: true, keywords: [] }, triagedThisSession: 0,
-  checked: new Set(), rankedIds: new Set(), selJob: null, jobOpen: null, jobTab: 'description',
+  checked: new Set(), rankedIds: new Set(), parsedIds: new Set(), selJob: null, jobOpen: null, jobTab: 'description',
   paletteOpen: false, paletteQuery: '', paletteJobs: [],
   kitJob: null, tailorJob: null, tailorTab: 'diff', editing: null,
   tailorMode: 'single', tailorChecked: new Set(), tailorRegenerate: false, tailorPages: '',  // '' = the default length in Settings
@@ -328,6 +328,18 @@ async function watchRanking(ids) {
     if (!out || !out.active) break;
   }
   if (S.jobOpen) D.jobModal = await api(`/api/jobs/${S.jobOpen}`).catch(() => D.jobModal);
+  await load();
+}
+function parseQueuedMsg(out) {
+  const n = out.queued.length, why = [...new Set(out.skipped.map(s => s.reason))].join(', ');
+  return `${n ? `Queued ${n} job${n === 1 ? '' : 's'} for parsing — ranking follows` : 'Nothing to parse'}${out.skipped.length ? ` · ${out.skipped.length} skipped (${why})` : ''}`;
+}
+// After a parse is queued from a job's own controls: re-read that job wherever it is shown.
+async function refreshParsed(id) {
+  const fresh = await api(`/api/jobs/${id}`).catch(() => null);
+  if (fresh && D.selDetail?.id === id) D.selDetail = fresh;
+  if (fresh && D.triageDetail?.id === id) D.triageDetail = fresh;
+  if (fresh && D.jobModal?.id === id) D.jobModal = fresh;
   await load();
 }
 function rankQueuedMsg(out) {
@@ -755,7 +767,7 @@ function renderTriage() {
         <div class="avatar lg">${esc(initials(job.company))}</div>
         <div style="flex:1 1 210px;min-width:0"><div style="font-size:20px;font-weight:600;letter-spacing:-.01em">${esc(job.title)}</div><div class="muted mt4" style="font-size:13.5px">${esc(job.company)}${job.location ? ' · ' + esc(job.location) : ''}</div>
           <div class="row gap6 wrap mt10">${pill(`${job.board} · found ${job.posted}`, 'plain', 'lg')}${postedTxt(job) ? pill(postedTxt(job), 'plain', 'lg') : ''}${job.agency ? pill('Likely agency', 'warn', 'lg') : ''}${job.url ? `<a class="pill plain lg" href="${attr(job.url)}" target="_blank" rel="noopener">Posting ↗</a>` : ''}</div></div>
-        ${job.fit == null ? `<div class="scorebox"><div class="n" style="color:var(--grey)">—</div><div class="l">NOT RANKED</div>${job.needs_description ? btn('Add description', 'open-job', { id: job.id }, 'sm soft mt8') : btn(label('rank' + job.id, 'Rank now', 'Queueing…'), 'rank-job', { id: job.id }, 'sm soft mt8', isBusy('rank' + job.id))}</div>` : `<div class="scorebox"><div class="n">${fitTxt(job.fit)}</div><div class="l">FIT SCORE</div></div>`}
+        ${job.fit == null ? `<div class="scorebox"><div class="n" style="color:var(--grey)">—</div><div class="l">NOT RANKED</div>${job.needs_description ? btn('Add description', 'open-job', { id: job.id }, 'sm soft mt8') : needsParse(d) ? parseBtn(d, 'sm soft mt8') : btn(label('rank' + job.id, 'Rank now', 'Queueing…'), 'rank-job', { id: job.id }, 'sm soft mt8', isBusy('rank' + job.id))}</div>` : `<div class="scorebox"><div class="n">${fitTxt(job.fit)}</div><div class="l">FIT SCORE</div></div>`}
       </div>
       <div style="padding:18px 24px;border-bottom:1px solid var(--line2)">
         <div class="row gap8 mb10">${pill('AI', 'brand')}<span class="base b">${job.fit == null ? 'Not ranked yet' : `Why this scores ${fitTxt(job.fit)}`}</span></div>
@@ -777,8 +789,19 @@ function renderTriage() {
 }
 // Tailoring works from the Ranker's analysis, so only ranked jobs can be sent to tailoring. A job is ranked once it
 // has a fit score; rows on the page and "select all matching" both say which selected jobs are.
-function noteRanked(rows) { rows.forEach(r => r.fit == null ? S.rankedIds.delete(r.id) : S.rankedIds.add(r.id)); }
-const rankedSelection = () => [...S.checked].filter(id => S.rankedIds.has(id));
+function noteRanked(rows) {
+  rows.forEach(r => r.fit == null ? S.rankedIds.delete(r.id) : S.rankedIds.add(r.id));
+  rows.forEach(r => r.description_state === 'PARSED' ? S.parsedIds.add(r.id) : S.parsedIds.delete(r.id));
+}
+// Ranking and tailoring wait for a parsed description while parsing is on (parse_enabled): until then a job offers
+// Parse instead. With parsing off nothing is ever parsed, so every job counts as ready.
+const parseGate = () => D.jobs?.parse_enabled !== false;
+const parsedSelection = () => [...S.checked].filter(id => !parseGate() || S.parsedIds.has(id));
+const rankedSelection = () => parsedSelection().filter(id => S.rankedIds.has(id));
+const needsParse = j => !!j && j.parse_enabled !== false && !!j.description_state && !['PARSED', 'NO_DESCRIPTION'].includes(j.description_state);
+const parseBtn = (j, cls = '') => j.description_state === 'PARSING'
+  ? `<span title="Ranking and tailoring start once the description is parsed">${btn('Parsing…', 'parse-job', { id: j.id }, cls, true)}</span>`
+  : `<span title="${attr(j.description_state === 'FAILED' ? 'Parsing failed: ranking and tailoring wait for a parsed description' : 'Ranking and tailoring wait for a parsed description')}">${btn(label('parse' + j.id, j.description_state === 'FAILED' ? 'Parse again' : 'Parse', 'Queueing…'), 'parse-job', { id: j.id }, cls, isBusy('parse' + j.id))}</span>`;
 
 // ── Discovery table filters ──
 const DATE_WINDOW_NAMES = { '24h': '24 hours', '3d': '3 days', '7d': '7 days', '15d': '15 days', '30d': '30 days', '60d': '60 days', '90d': '90 days' };
@@ -876,7 +899,8 @@ function renderTable() {
   const j = D.jobs; if (!j) return loading();
   noteRanked(j.items);
   const f = S.filters;
-  const tailorable = rankedSelection().length, unranked = S.checked.size - tailorable;
+  const rankable = parsedSelection().length, unparsed = S.checked.size - rankable;
+  const tailorable = rankedSelection().length, unranked = rankable - tailorable;
   const sel = D.selDetail;
   const opts = (list, cur) => list.map(([v, t]) => `<option value="${attr(v)}" ${String(v) === String(cur) ? 'selected' : ''}>${esc(t)}</option>`).join('');
   const pages = []; for (let p = Math.max(1, j.page - 2); p <= Math.min(j.pages, Math.max(1, j.page - 2) + 4); p++) pages.push(p);
@@ -887,9 +911,10 @@ function renderTable() {
     ${filterBar(j, opts)}
     ${S.checked.size ? `<div class="selbar" role="toolbar" aria-label="Selected jobs">
       <span class="small b" style="color:var(--brand-ink)">${S.checked.size} selected</span>
-      ${btn(isBusy('bulkRank') ? esc(S.rankProgress || 'Queueing…') : `Rank ${S.checked.size}`, 'bulk-rank', {}, 'sm', isBusy('bulkRank'))}
+      ${unparsed ? `<span title="${attr(`${unparsed} selected job${unparsed === 1 ? ' is' : 's are'} not parsed yet: ranking and tailoring wait for a parsed description`)}">${btn(label('bulkParse', `Parse ${unparsed}`, 'Queueing…'), 'bulk-parse', {}, 'sm' + (rankable ? '' : ' primary'), isBusy('bulkParse'))}</span>` : ''}
+      ${rankable ? btn(isBusy('bulkRank') ? esc(S.rankProgress || 'Queueing…') : `Rank ${rankable}`, 'bulk-rank', {}, 'sm', isBusy('bulkRank')) : ''}
       ${btn(`Shortlist ${S.checked.size}`, 'bulk', { action: 'shortlist' }, 'sm soft')}
-      <span title="${attr(unranked ? `${unranked} selected job${unranked === 1 ? ' is' : 's are'} not ranked yet. Rank ${unranked === 1 ? 'it' : 'them'} first: tailoring works from the ranking.` : 'Send the selected ranked jobs to Bulk tailor')}">${btn(label('bulkToTailor', `Bulk tailor${tailorable ? ` ${tailorable}` : ''}`, 'Queueing…'), 'bulk-to-tailor', {}, 'sm primary', !tailorable || isBusy('bulkToTailor'))}</span>
+      ${rankable ? `<span title="${attr(unranked ? `${unranked} selected job${unranked === 1 ? ' is' : 's are'} not ranked yet. Rank ${unranked === 1 ? 'it' : 'them'} first: tailoring works from the ranking.` : 'Send the selected ranked jobs to Bulk tailor')}">${btn(label('bulkToTailor', `Bulk tailor${tailorable ? ` ${tailorable}` : ''}`, 'Queueing…'), 'bulk-to-tailor', {}, 'sm primary', !tailorable || isBusy('bulkToTailor'))}</span>` : ''}
       ${btn('Archive', 'bulk', { action: 'archive' }, 'sm')}
       ${btn('Dismiss', 'bulk', { action: 'dismiss' }, 'sm')}
       ${btn(label('bulkDelete', `Delete ${S.checked.size}`, 'Deleting…'), 'bulk-delete', {}, 'sm danger', isBusy('bulkDelete'))}
@@ -916,6 +941,7 @@ function renderTable() {
     <div class="base pretty" style="color:var(--ink3);line-height:1.6;border-top:1px solid var(--line2);padding-top:14px">${esc(sel.summary || (sel.description || '').slice(0, 420) || 'No description captured.')}</div>
     <div class="mt12"><div class="row gap8" style="align-items:center;min-width:0"><span class="xs muted" style="white-space:nowrap">Resume used</span>${resumeSelect('job-resume', sel.resume_choice_id, { id: sel.id, choice: sel.resume_choice })}</div>${sel.resume_choice === 'AUTO' ? '<div class="xs faint mt4">Matched by resume tags</div>' : ''}</div>
     <div class="row gap8 mt16">${['tailored', 'needs_retailor', 'approved', 'applied', 'pending_approval'].includes(sel.status) ? btn(sel.status === 'needs_retailor' ? 'Re-tailor' : 'Open packet', 'go', { screen: sel.status === 'applied' ? 'tracker' : sel.status === 'approved' ? 'approvals' : 'tailor', job: sel.id }, 'primary grow') : sel.needs_description ? `<span class="grow" title="Ranking needs the job description">${btn('Add description', 'open-job', { id: sel.id }, 'primary grow')}</span>`
+      : needsParse(sel) ? parseBtn(sel, 'primary')
       : sel.fit == null ? `<span class="grow" title="Tailoring works from the ranking: rank this job first">${btn(label('rank' + sel.id, 'Rank first', 'Queueing…'), 'rank-job', { id: sel.id }, 'primary', isBusy('rank' + sel.id))}</span>`
       : btn('Tailor', 'triage', { id: sel.id, action: 'shortlist', tailor: 1 }, 'primary grow')}${btn('Full description', 'open-job', { id: sel.id }, 'grow')}</div>` : empty('Select a job', 'Pick a row to see its details.')}
   </section></div>`;
@@ -1819,6 +1845,7 @@ function renderJobModal() {
         ${['approved', 'applied'].includes(j.status) ? btn('Open apply kit', 'modal-kit', { id: j.id }, 'primary')
           : j.resume_id ? btn('Open packet', 'modal-tailor', { id: j.id }, 'primary')
           : j.needs_description ? `<span title="Ranking and tailoring need the job description">${btn('Add description', 'edit-job-description', { id: j.id }, 'primary')}</span>`
+          : needsParse(j) ? parseBtn(j, 'primary')
           : j.fit == null ? `<span title="Tailoring works from the ranking: rank this job first">${btn(label('rank' + j.id, 'Rank first', 'Queueing…'), 'rank-job', { id: j.id }, 'primary', isBusy('rank' + j.id))}</span>`
           : btn('Tailor resume', 'modal-tailor', { id: j.id }, 'primary')}${btn('Close', 'close-job')}</div></div>
       <div class="wizard">${j.wizard.map((w, i) => `<div class="${w.done ? 'done' : i === hereIdx ? 'here' : ''}"><div class="row gap6"><span class="m">${w.done ? '✓' : i + 1}</span><span class="small b" style="color:${w.done ? 'var(--ink)' : i === hereIdx ? 'var(--brand-ink)' : 'var(--faint)'}">${w.label}</span></div><div class="xs muted mt4">${esc(i === hereIdx && !w.done ? 'next step' : w.meta)}</div></div>`).join('')}</div></div>
@@ -1831,6 +1858,7 @@ function renderJobModal() {
         <section class="card pad18"><div class="row gap8 mb14">${pill('AI', 'brand')}<span class="card-title sm">Fit breakdown</span></div>
           ${D.resumeChoices?.length ? `<div class="mb12"><div class="row gap8" style="align-items:center;min-width:0"><span class="xs muted" style="white-space:nowrap">Resume used</span>${resumeSelect('job-resume', j.resume_choice_id, { id: j.id, choice: j.resume_choice })}</div>${j.resume_choice === 'AUTO' ? '<div class="xs faint mt4">Matched by resume tags</div>' : ''}</div>` : ''}
           ${j.fit == null && j.needs_description ? '<div class="small muted">Not ranked: add the job description first — a score from a title alone would mean nothing.</div>'
+          : j.fit == null && needsParse(j) ? `<div class="small muted mb12">Not ranked yet: ranking waits for the description to be parsed.</div>${parseBtn(j, 'soft')}`
           : j.fit == null ? `<div class="small muted mb12">Not ranked yet.</div>${btn(label('rank' + j.id, 'Rank this job', 'Queueing…'), 'rank-job', { id: j.id }, 'soft', isBusy('rank' + j.id))}` : `
           <div class="row base gap8 mb14"><span class="mono bb" style="font-size:34px;color:var(--brand-ink);line-height:1">${fitTxt(j.fit)}</span><span class="small muted">${j.rank_pct != null ? `top ${j.rank_pct}% of your ranked jobs` : ''}</span></div>
           <div class="col gap10"><div><div class="row between small mb4"><span class="muted">Strong matches</span><span class="mono b">${j.matches.length}</span></div>${bar(Math.min(100, j.matches.length * 15) + '%', '#5b4ae8')}</div>
@@ -2388,30 +2416,43 @@ const A = {
   // Only ranked jobs go: tailoring works from the ranking. Unranked ones stay selected here, ready to rank.
   'bulk-to-tailor': () => busy('bulkToTailor', async () => {
     const ids = rankedSelection();
-    const unranked = S.checked.size - ids.length;
+    const unranked = parsedSelection().length - ids.length, unparsed = S.checked.size - parsedSelection().length;
     await api('/api/jobs/bulk-triage', { method: 'POST', body: { ids, action: 'shortlist' } });
     const queue = await api('/api/tailor/queue'), inQueue = new Set(queue.map(j => j.id));
     const queued = ids.filter(id => inQueue.has(id));
     ids.forEach(id => S.checked.delete(id));
     go('tailor', { tailorMode: 'bulk', tailorChecked: new Set(queued) });
-    return { queued: queued.length, left: ids.length - queued.length, unranked };
-  }, r => `${r.queued} job${r.queued === 1 ? '' : 's'} ready to bulk tailor${r.left ? ` · ${r.left} already approved or applied` : ''}${r.unranked ? ` · ${r.unranked} not ranked yet, left out` : ''}`),
+    return { queued: queued.length, left: ids.length - queued.length, unranked, unparsed };
+  }, r => `${r.queued} job${r.queued === 1 ? '' : 's'} ready to bulk tailor${r.left ? ` · ${r.left} already approved or applied` : ''}${r.unranked ? ` · ${r.unranked} not ranked yet, left out` : ''}${r.unparsed ? ` · ${r.unparsed} not parsed yet, left out` : ''}`),
   'select-all-matching': (el, e) => {
     e.preventDefault();
     return busy('selectAll', async () => {
       const f = S.filters;
       const out = await api('/api/jobs/search?' + tableQuery(f, { ids_only: true }));
       out.ids.forEach(id => S.checked.add(id));
-      const ranked = new Set(out.ranked_ids || []);
+      const ranked = new Set(out.ranked_ids || []), parsed = new Set(out.parsed_ids || []);
       out.ids.forEach(id => ranked.has(id) ? S.rankedIds.add(id) : S.rankedIds.delete(id));
+      out.ids.forEach(id => parsed.has(id) ? S.parsedIds.add(id) : S.parsedIds.delete(id));
     });
   },
   'clear-selection': (el, e) => { e.preventDefault(); S.checked.clear(); render(); },
+  // Only parsed jobs are ranked; the others stay selected, ready to parse.
   'bulk-rank': () => busy('bulkRank', async () => {
-    const out = await api('/api/jobs/bulk-rank?rerank=true', { method: 'POST', body: { ids: [...S.checked] } });
-    S.checked.clear(); await load(); watchRanking(out.queued);
+    const ids = parsedSelection();
+    const out = await api('/api/jobs/bulk-rank?rerank=true', { method: 'POST', body: { ids } });
+    ids.forEach(id => S.checked.delete(id)); await load(); watchRanking(out.queued);
     return out;
   }, rankQueuedMsg),
+  'bulk-parse': () => busy('bulkParse', async () => {
+    const out = await api('/api/jobs/bulk-parse', { method: 'POST', body: { ids: [...S.checked].filter(id => !S.parsedIds.has(id)) } });
+    out.queued.forEach(id => S.checked.delete(id)); await load();
+    return out;
+  }, parseQueuedMsg),
+  'parse-job': el => busy('parse' + el.dataset.id, async () => {
+    const out = await api('/api/jobs/bulk-parse', { method: 'POST', body: { ids: [Number(el.dataset.id)] } });
+    await refreshParsed(Number(el.dataset.id));
+    return out;
+  }, parseQueuedMsg),
   'bulk-delete': () => {
     const count = S.checked.size;
     if (!confirm(`Permanently delete ${count} job${count === 1 ? '' : 's'}? Tailored resumes for them are deleted too. Approved or applied jobs are kept unless you confirm again.`)) return;
