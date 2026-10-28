@@ -42,6 +42,7 @@ from urllib.parse import urlparse
 
 os.environ["ANONYMIZED_TELEMETRY"] = "false"
 os.environ.setdefault("BROWSER_USE_LOGGING_LEVEL", "result")
+LOAD_WAIT_MS = 8000  # how long observe waits for a page's `load` event before reading it as it is
 
 PROTOCOL = 1
 MAX_ELEMENTS = 200
@@ -354,11 +355,26 @@ class Runner:
 
     # ───────────── reading ─────────────
 
+    async def _elements(self, page: Any) -> dict[int, Any]:
+        """The page's interactive elements (browser-use's DOM indexing), read without `BrowserContext.get_state`: that
+        also takes a screenshot, which first waits for the page's `load` event with Playwright's 30 s default. A
+        headful window often never fires it (a long-lived request of the page), so the state read failed although the
+        form was there. Here the wait for `load` is bounded and a page still loading is read as it is."""
+        from browser_use.dom.service import DomService
+
+        try:
+            await page.wait_for_load_state("load", timeout=LOAD_WAIT_MS)
+        except Exception:  # noqa: BLE001  still loading: the form is usually there long before `load`
+            pass
+        content = await DomService(page).get_clickable_elements(focus_element=-1, viewport_expansion=-1,
+                                                                 highlight_elements=False)
+        return content.selector_map
+
     async def observe(self, args: dict[str, Any]) -> dict[str, Any]:
         page = await self._page()
-        state = await self.ctx.get_state(cache_clickable_elements_hashes=False)
+        selector_map = await self._elements(page)
         elements, mapped = [], {}
-        for index, node in list(state.selector_map.items())[:MAX_ELEMENTS]:
+        for index, node in list(selector_map.items())[:MAX_ELEMENTS]:
             handle = await self.ctx.get_locate_element(node)
             if handle is None:
                 continue
@@ -702,7 +718,19 @@ COMMANDS = ("health", "open", "goto", "observe", "read", "fill", "select", "chec
             "login_fill", "login_submit", "submit", "evidence", "set_takeover", "storage_state", "close")
 
 
+def _reply_channel() -> Any:
+    """stdout carries replies and nothing else. browser-use logs to sys.stdout and some of its helpers print(); one
+    stray line there broke the session in Job Hunt OS's client. Replies get a private copy of the stdout pipe, and
+    everything else written to stdout (Python or native) goes to stderr."""
+    replies = os.fdopen(os.dup(sys.stdout.fileno()), "w", encoding="utf-8")
+    sys.stdout.flush()
+    os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+    sys.stdout = sys.stderr
+    return replies
+
+
 async def main() -> None:
+    replies = _reply_channel()
     runner = Runner()
     loop = asyncio.get_running_loop()
     reader = asyncio.StreamReader(limit=4 * 1024 * 1024)
@@ -726,8 +754,8 @@ async def main() -> None:
         except Exception as exc:  # noqa: BLE001
             log(f"{cmd} failed: {type(exc).__name__}")
             reply = {"id": ident, "ok": False, "error": {"code": "BROWSER_ERROR", "message": type(exc).__name__}}
-        sys.stdout.write(json.dumps(reply, default=str) + "\n")
-        sys.stdout.flush()
+        replies.write(json.dumps(reply, default=str) + "\n")
+        replies.flush()
         if cmd == "close":
             break
     await runner.close({})

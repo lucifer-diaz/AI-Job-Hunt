@@ -226,6 +226,21 @@ async def _read_form(browser: Any, user_id: int, job_id: int, url: str) -> dict[
     return {"form": form.model_dump(), "route": adapter.NAME, "final_url": load.final_url}
 
 
+PAGE_UNAVAILABLE = "PAGE_UNAVAILABLE"  # the application page could not be loaded (NavigationFailed)
+
+
+def _load_form(ctx: ApplicationContext, user_id: int, job_id: int, url: str) -> dict[str, Any]:
+    """Read the form in a private page. A page that could not be loaded is a result, not a crash: a slow or unreachable
+    site is said in words (retryable or not), and analyze_form decides."""
+    from app.infrastructure.browser.service import NavigationFailed
+
+    try:
+        return ctx.run_async(_read_form(ctx.browser, user_id, job_id, url))
+    except NavigationFailed as exc:
+        return {"problem": PAGE_UNAVAILABLE, "category": exc.category, "retryable": exc.retryable,
+                "detail": str(exc)[:300]}
+
+
 BLOCKER_FOR = {"LOGIN_REQUIRED": "login_required", "OTP_REQUIRED": "login_required", "LOGIN_FAILED": "login_required",
                "ACCOUNT_REQUIRED": "account_required", "CAPTCHA_OR_ANTI_BOT": "captcha",
                "POSTING_CLOSED": "posting_closed"}
@@ -369,7 +384,8 @@ def _analyze_browser_use(ctx: ApplicationContext, task_id: int, job: Any, url: s
         return {"problem": "NAVIGATOR_UNAVAILABLE"}
     except (SidecarRefused, SidecarUnavailable) as exc:
         _park_or_close(ctx, session, None)
-        return {"problem": "BACKEND_UNAVAILABLE" if isinstance(exc, SidecarUnavailable) else exc.code}
+        return {"problem": "BACKEND_UNAVAILABLE" if isinstance(exc, SidecarUnavailable) else exc.code,
+                "detail": str(exc)[:200] or None}
 
 
 def _browser_use_on() -> bool:
@@ -419,7 +435,15 @@ def analyze_form(state: ApplicationState, runtime: Runtime[ApplicationContext]) 
     if backend == "browser_use_webui":
         read = _analyze_browser_use(ctx, task_id, job, url, attempt)
     else:
-        read = ctx.run_async(_read_form(ctx.browser, user_id, job_id, url))
+        read = _load_form(ctx, user_id, job_id, url)
+        if read.get("problem") == PAGE_UNAVAILABLE and _browser_use_on():
+            # The private page timed out or lost its connection: browser-use renders it in its own browser.
+            read = _analyze_browser_use(ctx, task_id, job, url, attempt)
+            backend = "browser_use_webui"
+        if read.get("problem") == PAGE_UNAVAILABLE:
+            if read.get("retryable"):
+                raise effects.StepUnavailable(read["category"], read["detail"])  # the worker retries it later
+            read = {"problem": f"PAGE_{read['category']}", "detail": read["detail"]}
         dropdowns = bool(read.get("form")) and ats_forms.ApplicationForm.model_validate(read["form"]) \
             .required_dropdowns()
         if (read.get("problem") in (ats_forms.NO_FORM, ats_forms.UNSUPPORTED) or dropdowns) and _browser_use_on():
@@ -459,7 +483,8 @@ def analyze_form(state: ApplicationState, runtime: Runtime[ApplicationContext]) 
             return _end(ANALYZE_FORM, NEEDS_HUMAN if stage == "NEEDS_HUMAN" else BLOCKED, problem)
         if problem:
             _record(db, ctx, _key(state, ANALYZE_FORM), task, "BLOCKED", result_code=problem,
-                    route=read.get("route"), last_error=(read.get("detail") or None))
+                    route=read.get("route"), last_error=(read.get("detail") or None),
+                    **({"backend": backend} if backend else {}))
             ats_map.observe(db, job, last_outcome=problem, checked=True)
             db.commit()
             return _end(ANALYZE_FORM, UNSUPPORTED, problem, route=read.get("route"))

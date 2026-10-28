@@ -40,6 +40,20 @@ EXPECTED_BROWSER_USE = "0.1.48"
 SIGNED_SECONDS = 60
 
 
+
+def _reply(line: bytes) -> dict[str, Any] | None:
+    """One protocol line, or None for anything else on the pipe (a library's log line from an older runner): skipped,
+    never mistaken for the session failing. Only the line's length is logged, never its text (it may hold page text)."""
+    try:
+        reply = json.loads(line)
+    except ValueError:
+        reply = None
+    if isinstance(reply, dict):
+        return reply
+    if line.strip():
+        log.warning("browser-use runner wrote a line that is not a reply (%d bytes); skipped", len(line))
+    return None
+
 class SidecarUnavailable(RuntimeError):
     """The browser-use backend is off, not installed, or its process died."""
 
@@ -109,8 +123,8 @@ class SidecarSession:
                     line = await asyncio.wait_for(self.process.stdout.readline(), timeout=limit)
                     if not line:
                         raise SidecarUnavailable("The browser-use session ended unexpectedly")
-                    reply = json.loads(line)
-                    if reply.get("id") == ident:
+                    reply = _reply(line)
+                    if reply is not None and reply.get("id") == ident:
                         break
             if not reply.get("ok"):
                 problem = reply.get("error") or {}

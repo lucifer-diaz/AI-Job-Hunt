@@ -279,7 +279,8 @@ describe('Running workers', () => {
   });
 
   it('opens a task’s history from its name, newest first, with the browser-use option for an application', async () => {
-    routes.history = { task: row({ kind: 'application', status: 'FAILED', job_id: 7 }), browser_use_ready: true, events: [
+    routes.history = { task: row({ kind: 'application', status: 'FAILED', job_id: 7 }), browser_use_ready: true,
+      trace_ids: ['abcdef0123456789', '0123456789abcdef'], log_count: 3, events: [
       { at: '2026-10-25T22:38:15', title: 'Attempt 3 failed', detail: 'reached filling · OTHER', tone: 'bad', source: 'attempt' },
       { at: '2026-10-25T22:36:45', title: 'Opened job-boards.greenhouse.io', detail: 'HTTP 200 · 754 ms', tone: 'muted', source: 'browser' }] };
     await open();
@@ -291,6 +292,14 @@ describe('Running workers', () => {
     const panel = view().querySelector('.wk-history');
     expect(panel.textContent).toContain('Attempt 3 failed');
     expect(panel.textContent.indexOf('Attempt 3 failed')).toBeLessThan(panel.textContent.indexOf('Opened job-boards'));
+    // Each run's Monitoring → Logs lines, newest first, one click away.
+    const logs = [...panel.querySelectorAll('[data-act="wk-logs"]')];
+    expect(panel.textContent).toContain('3 log lines in Monitoring → Logs');
+    expect(logs.map(b => b.dataset.id)).toEqual(['abcdef0123456789', '0123456789abcdef']);
+    expect(logs[0].textContent).toContain('Latest run');
+    ui.A['wk-logs'](logs[0]);
+    expect([ui.S.screen, ui.S.mon.tab, ui.S.mon.logs.trace_id]).toEqual(['monitoring', 'logs', 'abcdef0123456789']);
+    ui.S.screen = 'workers';
     await ui.A['wk-history-close']();
     ui.render();
     expect(view().querySelector('.wk-history')).toBeNull();

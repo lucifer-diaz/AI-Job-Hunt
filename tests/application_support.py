@@ -126,6 +126,10 @@ class FakePage(ApplicationPage):
 
     async def goto(self, url: str) -> PageLoad:
         self._browser.loads.append(url)
+        if url in self._browser.failures:  # a page that does not load: NavigationFailed(category, message)
+            from app.infrastructure.browser.service import NavigationFailed
+
+            raise NavigationFailed(*self._browser.failures[url])
         short = url.rsplit("/", 1)[-1].removesuffix(".html")
         self._html = form(self._browser.pages.get(url) or self._browser.pages.get(short) or short)
         self._soup = BeautifulSoup(self._html, "html.parser")
@@ -171,6 +175,7 @@ class FakeSessions(ApplicationSessionManager):
 
     def __init__(self) -> None:
         self.pages: dict[str, str] = {}
+        self.failures: dict[str, tuple[str, str]] = {}
         self.loads: list[str] = []
         self.opened = self.closed = 0
         self.filled: list[dict[str, Any]] = []

@@ -599,8 +599,9 @@ def process(sessions: SessionFactory, c: ExecutionClaim, *, browser: Any = None,
     from app.services import tracing
 
     try:
+        # Its own trace, not the scheduler pass's: Running workers links a task to exactly this run's log lines.
         with tracing.trace("application_execution", workflow_type="job", workflow_entity_id=c.job_id,
-                           job_id=c.job_id, user_id=c.user_id), backoff.bypass(c.run_now):
+                           job_id=c.job_id, user_id=c.user_id, inherit=False), backoff.bypass(c.run_now):
             return _process(sessions, c, browser=browser, run_async=run_async, saver=saver, hold=hold)
     except Exception as exc:
         log.warning("application execution task %s failed", c.task_id, exc_info=True)
@@ -688,12 +689,16 @@ def _settle(sessions: SessionFactory, c: ExecutionClaim, thread_pk: int) -> str:
             return "waiting"
         if status == "COMPLETED":
             result = thread.result or {}
-            task.status, task.completed_at, task.last_error = COMPLETED, now, None
+            task.status, task.completed_at = COMPLETED, now
             task.outcome = str(result.get("outcome") or "")[:30] or None
+            if task.outcome not in ("BLOCKED", "UNSUPPORTED"):  # a blocked run keeps why (the step recorded it)
+                task.last_error = None
             task.result_code = str(result.get("code") or "")[:60] or None
             attempt_note(db, task, stage_reached=task.stage, outcome=task.outcome,
                          form_fingerprint=task.form_fingerprint, ended_at=now)
             db.commit()
+            _log_end(task, "INFO", f"ended: {(task.outcome or 'done').lower()}"
+                     + (f" ({task.result_code.replace('_', ' ').lower()})" if task.result_code else ""))
             return "completed"
         if status == "STOPPED":
             task.status, task.completed_at = SKIPPED, now
@@ -715,12 +720,25 @@ def _retry_or_fail(db: Session, task: ApplicationExecutionTask, message: str, no
         task.status, task.completed_at, task.outcome = FAILED, now, "FAILED"
         set_stage(task, "FAILED")
         db.commit()
+        _log_end(task, "ERROR", f"failed after {task.attempt_count} attempt(s): {message}")
         return "failed"
     wait = worker_settings.get(db, task.user_id, KIND, "retry_seconds") * max(1, task.attempt_count)
     task.status, task.next_attempt_at = PENDING, now + timedelta(seconds=wait)
     set_stage(task, "RETRYING")
     db.commit()
+    _log_end(task, "WARNING", f"attempt {task.attempt_count} of {limit} failed, retrying in {wait}s: {message}")
     return "retrying"
+
+
+def _log_end(task: ApplicationExecutionTask, level: str, what: str) -> None:
+    """One Monitoring → Logs line for how a run ended, in the run's own trace (written after the commit). Never
+    raises: system_log catches its own errors."""
+    from app.services import system_log
+
+    system_log.log_event(category="APPLICATION", level=level, operation="application_execution", workflow=KIND,
+                         user_id=task.user_id, entity_type="job", entity_id=task.job_id,
+                         status=(task.outcome or task.stage or "")[:30] or None,
+                         message=f"Application run #{task.id} {what}")
 
 
 def _settle_error(sessions: SessionFactory, c: ExecutionClaim, exc: Exception) -> str:

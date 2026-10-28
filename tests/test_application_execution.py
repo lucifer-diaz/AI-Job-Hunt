@@ -567,3 +567,41 @@ def test_a_tasks_history_tells_what_happened_and_only_to_its_owner(sessions, bro
         with pytest.raises(workers.WorkerError) as refused:
             workers.history(db, other, "application", task_id)
         assert refused.value.status == 404
+
+
+# ───────────── a page that does not load, and where to look ─────────────
+
+def test_a_page_that_times_out_is_retried_without_a_traceback(sessions, browser, monkeypatch, caplog):
+    from app.services import system_log
+
+    monkeypatch.setattr(system_log, "_sessions", sessions)
+    user = aps.owner(sessions)
+    browser.failures[FORM] = ("TIMEOUT", "The application page did not load in time (TimeoutError)")
+    job_id = aps.approved_job(sessions, user, FORM)
+    task_id = aps.enqueue(sessions, user, job_id)
+    with caplog.at_level("WARNING"):
+        aps.drive(sessions, passes=1)
+    task = aps.task_of(sessions, job_id)
+    assert (task.status, task.stage) == ("PENDING", "RETRYING")
+    assert task.last_error == "The application page did not load in time (TimeoutError)"
+    assert not any(r.exc_info for r in caplog.records if "agent graph" in r.getMessage())  # one line, no traceback
+    with sessions() as db:
+        db.info["user_id"] = user
+        out = workers.history(db, user, "application", task_id)
+    assert out["trace_ids"] and out["log_count"] >= 1  # Running workers links to this run's Monitoring → Logs lines
+
+
+def test_a_page_that_cannot_be_reached_blocks_the_run_and_running_workers_says_so(sessions, browser):
+    user = aps.owner(sessions)
+    browser.failures[FORM] = ("SSL", "The application page could not be loaded (ssl) (Error)")
+    job_id = aps.approved_job(sessions, user, FORM)
+    aps.enqueue(sessions, user, job_id)
+    aps.drive(sessions)
+    task = aps.task_of(sessions, job_id)
+    assert (task.status, task.stage, task.outcome, task.result_code) == ("COMPLETED", "BLOCKED", "UNSUPPORTED",
+                                                                        "PAGE_SSL")
+    with sessions() as db:
+        db.info["user_id"] = user
+        (row,) = workers.rows(db, user, "application")["rows"]
+    assert (row["status"], row["result_code"]) == ("BLOCKED", "PAGE_SSL")  # not "Done"
+    assert "could not be loaded" in row["last_error"]  # and why

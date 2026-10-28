@@ -120,6 +120,18 @@ describe('the Apply kit claim', () => {
     expect(calls.find(([m, u]) => m === 'POST' && u.endsWith('/api/jobs/11/application-execution'))[2]).toEqual({ mode: 'ASSIST' });
   });
 
+  it('links a queued run to its task in Running workers, and says why it is retrying', async () => {
+    const queued = { id: 9, mode: 'GUARDED_AUTO', status: 'PENDING', stage: 'RETRYING', interrupt: null, result_code: null,
+      attempts: 1, last_error: 'The application page did not load in time (TimeoutError)' };
+    const el = html(kit({ execution_mode: 'guarded_auto', guarded_consent: true, execution: queued }));
+    const link = el.querySelector('[data-act="wk-open-task"]');
+    expect(link.textContent).toContain('Watch it in Running workers');
+    expect(link.dataset.id).toBe('9');
+    expect(el.textContent).toContain('Last try: The application page did not load in time');
+    await ui.A['wk-open-task'](link);
+    expect([ui.S.screen, ui.S.kitJob, ui.S.wk.tab, ui.S.wk.history]).toEqual(['workers', null, 'application', { kind: 'application', id: 9 }]);
+  });
+
   it('shows each sensitive question and its saved answer before they are confirmed, and sends only those', async () => {
     const execution = { id: 9, status: 'PENDING', stage: 'NEEDS_INPUT', interrupt: { question_ids: [], confirm_question_ids: [3] } };
     // Nothing to show (no confirmations sent): nothing to confirm blindly.
