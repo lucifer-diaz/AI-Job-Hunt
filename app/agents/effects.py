@@ -34,6 +34,16 @@ class LeaseLost(RuntimeError):
     """This run no longer holds the thread: it must stop without writing."""
 
 
+class StepUnavailable(RuntimeError):
+    """A node met an outside condition that trying again later may cure (a page that did not load in time, a
+    network error). The run fails like any other failure, so its worker retries it, but the cause is known: it is
+    logged as one line, without a traceback. `category` says why (for the attempt record)."""
+
+    def __init__(self, category: str, message: str):
+        self.category = category
+        super().__init__(message)
+
+
 @dataclass(frozen=True)
 class RunHandle:
     """Who is running a thread: its row, owner and lease token. Passed to nodes through the graph's config."""

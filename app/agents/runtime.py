@@ -29,7 +29,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.agents import checkpoint, pilot, safety, threads, tracing_boundary
-from app.agents.effects import LeaseLost, RunHandle
+from app.agents.effects import LeaseLost, RunHandle, StepUnavailable
 from app.models import AgentThread
 from app.services import tracing
 from app.services.lifecycle import STOPPED_BY_USER
@@ -243,8 +243,12 @@ def execute(sessions: Callable[[], Session], run: RunHandle, command: Any = None
         except LeaseLost:
             return "lost"
         except Exception as exc:
-            log.warning("agent graph %s thread %s failed", graph, run.thread_pk, exc_info=True)
-            message = redact_text(f"{type(exc).__name__}: {exc}", ERROR_LIMIT)
+            if isinstance(exc, StepUnavailable):  # a known outside cause: one line, no traceback
+                log.warning("agent graph %s thread %s stopped: %s", graph, run.thread_pk, redact_text(str(exc), 300))
+                message = redact_text(str(exc), ERROR_LIMIT)
+            else:
+                log.warning("agent graph %s thread %s failed", graph, run.thread_pk, exc_info=True)
+                message = redact_text(f"{type(exc).__name__}: {exc}", ERROR_LIMIT)
             done = _write(sessions, run, status="FAILED", last_error=message, lock_token=None,
                           lock_expires_at=None, completed_at=utcnow())
             return "failed" if done else "lost"

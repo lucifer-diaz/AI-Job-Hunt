@@ -261,7 +261,12 @@ def _display_status(spec: WorkerKind, task: Any, now: datetime) -> str:
         if (waiting is not None and waiting > now) or ((_attempts(spec, task) or 0) > 0 and not spec.tailor):
             return "RETRYING"
         return "QUEUED"
+    if spec.kind == "application" and status == "COMPLETED" and getattr(task, "outcome", None) in APPLICATION_BLOCKED:
+        return "BLOCKED"  # the run ended without reaching the form (a backend down, a route it cannot open): not done
     return dict(spec.shown).get(status, status).upper()
+
+
+APPLICATION_BLOCKED = ("BLOCKED", "UNSUPPORTED")  # app.agents.application outcomes a run ends at without a result
 
 
 def _started_graph_run(spec: WorkerKind, task: Any) -> bool:
@@ -710,12 +715,16 @@ def attach_models(db: Session, user_id: int, spec: WorkerKind | str, rows_: list
         by_job: dict[int, list[Any]] = {}
         for log in logs:  # newest first
             by_job.setdefault(log.workflow_entity_id, []).append(log)
+        browser_use = spec.kind == "application" and _browser_use_configured()
         for r in rows_:
-            if spec.kind == "application" and r.get("backend") != "browser_use_webui":
-                # Only the browser-use backend asks a model anything (the Browser Navigator); a form adapter never does.
+            active = status_of(r) in STATUS_FILTERS["active"]
+            if spec.kind == "application" and active and not (
+                    r.get("backend") == "browser_use_webui" or (r.get("backend") is None and browser_use)):
+                # Only the browser-use backend asks a model anything (the Browser Navigator); a form adapter never
+                # does. A run not routed yet may still go to browser-use (a form the adapters cannot read), so it
+                # shows the Navigator's model while browser-use is set up. A finished run shows what it really used.
                 r["model"], r["model_change"] = {"model": None, "source": "none"}, None
                 continue
-            active = status_of(r) in STATUS_FILTERS["active"]
             start = datetime.fromisoformat(r["created_at"]) if r.get("created_at") else None
             finished = r.get("finished_at") or r.get("completed_at")
             end = datetime.fromisoformat(finished) + timedelta(seconds=5) if finished and not active else None
@@ -735,6 +744,12 @@ def attach_models(db: Session, user_id: int, spec: WorkerKind | str, rows_: list
         import logging
 
         logging.getLogger("jobhunt.workers").warning("could not read task models", exc_info=True)
+
+
+def _browser_use_configured() -> bool:
+    from app.infrastructure.application_browser.browser_use_sidecar import configured
+
+    return configured()
 
 
 def _used(last: Any, plan: dict[str, Any]) -> dict[str, Any]:
@@ -1244,13 +1259,15 @@ def history(db: Session, user_id: int, kind: str, task_id: int, now: datetime | 
                 add(e.created_at, e.title or e.kind, detail=e.detail or "",
                     tone="warn" if e.kind == "blocker" else "muted", source="application")
     finished = end if end is not now else None
+    out_traces = _trace_ids(db, user_id, spec, task, job_id, start, end)
     if finished is not None:
         add(finished, f"Ended: {view['status'].lower()}", detail=" · ".join(filter(None, [
             (getattr(task, "result_code", None) or "").replace("_", " ").lower(),
             view.get("last_error") or ""])), tone="bad" if view["status"] in STATUS_FILTERS["failed"] else "good",
             source="task")
     events.sort(key=lambda e: e["at"], reverse=True)
-    out: dict[str, Any] = {"task": view, "events": events[:HISTORY_LIMIT]}
+    out: dict[str, Any] = {"task": view, "events": events[:HISTORY_LIMIT], "trace_ids": out_traces,
+                           "log_count": _log_count(db, user_id, out_traces)}
     if spec.kind == "application":
         from app.infrastructure.application_browser.browser_use_sidecar import configured
         from app.services import application_execution
@@ -1258,3 +1275,50 @@ def history(db: Session, user_id: int, kind: str, task_id: int, now: datetime | 
         out["browser_use_ready"] = configured() and application_execution.available_mode(db) in ("observe", "assist",
                                                                                                   "guarded_auto")
     return out
+
+
+TRACE_LIMIT = 8
+
+
+def _trace_ids(db: Session, user_id: int, spec: WorkerKind, task: Any, job_id: int | None, start: datetime,
+               end: datetime) -> list[str]:
+    """The traces this task's runs wrote under, newest first, so its history can open exactly their Monitoring → Logs
+    lines: its graph thread's, and those of the log lines, model calls and page loads made for its job while it ran.
+    Bounded; metadata only."""
+    from app.models import AgentThread, ExternalAPIRequestLog, LLMRequestLog, SystemLogEntry
+
+    found: dict[str, datetime] = {}
+
+    def take(rows: Any) -> None:
+        for trace_id, at in rows:
+            if trace_id and (trace_id not in found or (at and at > found[trace_id])):
+                found[trace_id] = at or start
+
+    thread_pk = getattr(task, "agent_thread_id", None)
+    if thread_pk:
+        take(db.execute(select(AgentThread.trace_id, AgentThread.updated_at).where(
+            AgentThread.id == thread_pk, AgentThread.user_id == user_id)).all())
+    if job_id is not None:
+        take(db.execute(select(SystemLogEntry.trace_id, SystemLogEntry.created_at).where(
+            SystemLogEntry.user_id == user_id, SystemLogEntry.entity_type == "job", SystemLogEntry.entity_id == job_id,
+            SystemLogEntry.workflow == spec.kind, SystemLogEntry.created_at >= start, SystemLogEntry.created_at <= end)
+            .order_by(SystemLogEntry.id.desc()).limit(50)).all())
+        take(db.execute(select(LLMRequestLog.trace_id, LLMRequestLog.created_at).where(
+            LLMRequestLog.user_id == user_id, LLMRequestLog.workflow_entity_id == job_id,
+            LLMRequestLog.created_at >= start, LLMRequestLog.created_at <= end)
+            .order_by(LLMRequestLog.id.desc()).limit(50)).all())
+        if spec.kind == "application":
+            take(db.execute(select(ExternalAPIRequestLog.trace_id, ExternalAPIRequestLog.created_at).where(
+                ExternalAPIRequestLog.user_id == user_id, ExternalAPIRequestLog.job_id == job_id,
+                ExternalAPIRequestLog.created_at >= start, ExternalAPIRequestLog.created_at <= end)
+                .order_by(ExternalAPIRequestLog.id.desc()).limit(50)).all())
+    return [t for t, _ in sorted(found.items(), key=lambda item: item[1], reverse=True)][:TRACE_LIMIT]
+
+
+def _log_count(db: Session, user_id: int, trace_ids: list[str]) -> int:
+    from app.models import SystemLogEntry
+
+    if not trace_ids:
+        return 0
+    return db.scalar(select(func.count(SystemLogEntry.id)).where(SystemLogEntry.user_id == user_id,
+                                                                   SystemLogEntry.trace_id.in_(trace_ids))) or 0

@@ -92,6 +92,7 @@ function wkHistoryPanel(tab) {
   return `<section class="card mb12 wk-history" aria-label="Task history"><div class="row between wrap gap10" style="padding:14px 18px;border-bottom:1px solid var(--line2)">
       <div><div class="card-title" style="font-size:16px">${wkTaskName(r)}</div><div class="card-sub">Task #${r.task_id} · ${esc(wkDetail(r))}</div></div>
       <div class="row gap8 wrap">${actions}${btn('Close', 'wk-history-close', {}, 'sm')}</div></div>
+    ${wkHistoryLogs(d)}
     <ol style="list-style:none;margin:0;padding:10px 18px;max-height:420px;overflow:auto">${(d.events || []).map(e => `<li class="row gap10" style="padding:6px 0;border-bottom:1px solid var(--line2);align-items:flex-start">
       <span aria-hidden="true" style="color:${tone[e.tone] || tone.muted};width:16px;text-align:center">${WK_SOURCE_ICON[e.source] || '•'}</span>
       <span class="xs muted mono" style="min-width:150px">${esc(fmtDateTime(e.at))}</span>
@@ -157,6 +158,13 @@ function wkCooldowns(list) {
     ${btn(label('wkCooldown', 'Reset backoff', 'Resetting…'), 'wk-reset-cooldowns', {}, 'sm', isBusy('wkCooldown'))}</div>`;
 }
 // An application run waiting for the person (it is not claimable, so it is not "waiting its turn").
+// The Monitoring → Logs lines this task's runs wrote: one button per run's trace, newest first.
+function wkHistoryLogs(d) {
+  const ids = d.trace_ids || [];
+  if (!ids.length) return '<div class="xs muted" style="padding:8px 18px;border-bottom:1px solid var(--line2)">No log lines were written for this task.</div>';
+  return `<div class="row gap6 wrap" style="padding:8px 18px;border-bottom:1px solid var(--line2);align-items:center"><span class="xs muted">${d.log_count ? `${d.log_count} log line${d.log_count === 1 ? '' : 's'} in Monitoring → Logs` : 'Its runs in Monitoring → Logs'}:</span>
+    ${ids.map((id, i) => btn(ids.length === 1 ? 'View logs' : `${i === 0 ? 'Latest run' : `Run ${ids.length - i}`} · ${id.slice(0, 8)}`, 'wk-logs', { id }, 'sm')).join('')}</div>`;
+}
 function wkWaitingText(r) {
   const w = r.waiting_detail || {};
   if (w.kind === 'NEEDS_HUMAN' && w.fields) return `Waiting for you in the browser window: fill ${w.fields} highlighted field${w.fields === 1 ? '' : 's'}, then Continue in the Apply kit${w.expires_at ? ` · until ${fmtDateTime(w.expires_at)}` : ''}`;
@@ -826,6 +834,18 @@ const WORKERS_ACTIONS = {
     D.wkHistory = null; render();
     D.wkHistory = await api(`/api/workers/${el.dataset.kind}/tasks/${el.dataset.id}/history`).catch(e => ({ error: e.message }));
     render();
+  },
+  'wk-logs': el => {
+    const m = monState();
+    Object.assign(m.logs, { category: '', level: '', provider: '', workflow: '', search: '', trace_id: el.dataset.id, page: 1, entry: null });
+    m.tab = 'logs'; go('monitoring');
+  },
+  // Running workers with one task's history open (the Apply kit's link to its application run).
+  'wk-open-task': el => {
+    const w = wkState();
+    w.tab = el.dataset.kind; w.history = { kind: el.dataset.kind, id: Number(el.dataset.id) };
+    wkFilter(el.dataset.kind).status = 'all'; D.wkHistory = null;
+    go('workers', { kitJob: null });
   },
   'wk-history-close': () => { wkState().history = null; D.wkHistory = null; render(); },
   'wk-run-now': el => busy(`wkRun${el.dataset.kind}${el.dataset.id}`, async () => {

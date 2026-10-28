@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -31,6 +32,7 @@ from tests import application_support as aps
 from tests import guarded_support as gs
 from tests import qualification_support as qs
 
+RUNNER = Path(__file__).resolve().parents[1] / "sidecars/browser_use_runner/runner.py"
 PYTHON = os.environ.get("BROWSER_USE_PYTHON") or "/Users/rohanroy/miniconda3/envs/web/bin/python"
 needs_runner = pytest.mark.skipif(not Path(PYTHON).exists(), reason="no browser-use Python (BROWSER_USE_PYTHON)")
 pytestmark = needs_runner
@@ -182,6 +184,41 @@ def test_a_dead_runner_is_unavailable_and_a_new_session_starts(runner, tmp_path)
         await manager.close(1, 30)
         return info
     assert asyncio.run(go())["protocol"] == 1
+
+
+def test_a_stray_line_on_the_pipe_never_breaks_a_session(runner, tmp_path):
+    """browser-use logs to stdout ("❌  Failed to update state: …") and some of its helpers print(). The runner keeps
+    stdout for replies only; the client also skips a line that is not a reply instead of failing the session."""
+    chatty = tmp_path / "chatty.py"
+    chatty.write_text("import json, sys\n"
+                      "line = json.loads(sys.stdin.readline())\n"
+                      "print('\\u274c  Failed to update state: Timeout 30000ms exceeded.', flush=True)\n"
+                      "print('', flush=True)\n"
+                      "print(json.dumps({'id': line['id'], 'ok': True, 'result': {'protocol': 1}}), flush=True)\n")
+
+    async def client():
+        process = await asyncio.create_subprocess_exec(sys.executable, str(chatty), stdin=asyncio.subprocess.PIPE,
+                                                       stdout=asyncio.subprocess.PIPE)
+        session = bus.SidecarSession(user_id=1, task_id=1, job_id=None, process=process)
+        return await session.call("health", timeout=10, record=False)
+    assert asyncio.run(client()) == {"protocol": 1}
+
+    # The runner itself: a library's print() and log lines go to stderr, the reply alone to stdout.
+    probe = tmp_path / "probe.py"
+    probe.write_text(f"import asyncio, logging, runpy, sys\n"
+                     f"runner = runpy.run_path({str(RUNNER)!r})\n"
+                     f"class Noisy(runner['Runner']):\n"
+                     f"    async def health(self, args):\n"
+                     f"        print('from a helper')\n"
+                     f"        logging.getLogger('browser_use').addHandler(logging.StreamHandler(sys.stdout))\n"
+                     f"        logging.getLogger('browser_use').error('a library log line')\n"
+                     f"        return {{'protocol': 1}}\n"
+                     f"runner['main'].__globals__['Runner'] = Noisy\n"
+                     f"asyncio.run(runner['main']())\n")
+    done = subprocess.run([PYTHON, str(probe)], input='{"id": 1, "cmd": "health", "args": {}}\n', text=True,
+                          capture_output=True, timeout=60, check=False)
+    assert done.stdout.splitlines() == ['{"id": 1, "ok": true, "result": {"protocol": 1}}']
+    assert "from a helper" in done.stderr and "a library log line" in done.stderr
 
 
 # ───────────── the whole browser-use path through the scheduler ─────────────

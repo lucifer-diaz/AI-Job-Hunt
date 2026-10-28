@@ -1530,8 +1530,11 @@ function renderKitExecution(k) {
   const active = x && ['PENDING', 'PROCESSING'].includes(x.status);
   const guarded = mode === 'guarded_auto' && k.guarded_consent;
   const what = mode === 'observe' ? '' : guarded ? ', fills it and submits it for you — only the site’s confirmation marks it applied; it stops for you only when something needs you' : ', then fills it. You submit';
-  return `<div class="box mb12" style="padding:13px;border-radius:12px"><div class="small b">Application worker · ${esc(mode)}${x && x.backend ? ` · ${esc(x.backend.replaceAll('_', ' '))}` : ''}</div>
-    <div class="xs muted mt4 pretty">Reads the form and finds a verified source for every answer${what}.</div>
+  // Where the run is: its task in Running workers (status, model, history and logs), one click away.
+  const link = x ? btn(active ? 'Watch it in Running workers →' : 'Open in Running workers →', 'wk-open-task', { kind: 'application', id: x.id }, 'sm ghost') : '';
+  const retry = active && x.last_error ? `<div class="xs muted mt6 pretty">Last try: ${esc(x.last_error)}${x.attempts ? ` · attempt ${x.attempts}` : ''}</div>` : '';
+  return `<div class="box mb12" style="padding:13px;border-radius:12px"><div class="row between wrap gap8"><div class="small b">Application worker · ${esc(mode)}${x && x.backend ? ` · ${esc(x.backend.replaceAll('_', ' '))}` : ''}</div>${link}</div>
+    <div class="xs muted mt4 pretty">Reads the form and finds a verified source for every answer${what}.</div>${retry}
     ${state}${renderKitIntent(k)}${renderKitTakeover(k)}${renderKitPersonFilled(k)}${active ? '' : `<div class="row gap8 wrap">${btn(label('kit-prepare', x ? 'Fill again' : 'Fill the form', 'Queueing…'), 'kit-prepare', { id: k.job.id, mode: mode === 'observe' ? '' : 'ASSIST' }, 'sm mt8', isBusy('kit-prepare'))}${k.browser_use_ready && mode !== 'off' ? `<span title="${attr('Opens a browser window (browser-use) that fills the form from your verified answers, step by step, checked by Job Hunt OS, and leaves it open for you to submit.')}">${btn(label('kit-browser-use', 'Run with browser-use', 'Queueing…'), 'kit-browser-use', { id: k.job.id }, 'sm mt8', isBusy('kit-browser-use'))}</span>` : ''}${guarded ? btn(label('kit-guarded', 'Apply for me', 'Queueing…'), 'kit-guarded', { id: k.job.id }, 'sm mt8 primary', isBusy('kit-guarded')) : ''}</div>`}</div>`;
 }
 
