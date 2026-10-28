@@ -1136,7 +1136,7 @@ function renderTaskStack(tasks = D.tasks || [], all = tasks) {
     return `<div class="lrow ${t.status === 'running' ? 'sel' : ''}" style="gap:12px">
       ${(t.status === 'failed' || wkStoppedTailor(t)) && !retried(t) && S.screen === 'workers' ? wkSelectBox('tailoring', t.id, t.title) : ''}
       <div class="grow" style="min-width:0"><div class="small b ellipsis">${esc(t.title)} <span class="muted" style="font-weight:400">· ${esc(t.company)}</span></div>
-        <div class="xs ${t.status === 'failed' ? '' : 'muted'} ellipsis" style="${t.status === 'failed' ? 'color:var(--bad)' : ''}">${t.mode === 'skip' ? 'Skip tailoring · ' : ''}${detail}</div>
+        <div class="xs ${t.status === 'failed' ? '' : 'muted'} ellipsis" style="${t.status === 'failed' ? 'color:var(--bad)' : ''}">${t.mode === 'skip' ? 'Skip tailoring · ' : t.mode === 'review' ? 'Review only · ' : ''}${detail}</div>
         ${active ? `<div class="row base gap8 mt6"><span class="grow">${bar(t.progress + '%', t.status === 'running' ? '#5b4ae8' : '#c9cbe0')}</span><span class="xs mono muted none" style="width:34px;text-align:right">${t.progress}%</span></div>` : ''}</div>
       ${typeof wkLastRun === 'function' ? wkLastRun(t) : ''}${typeof wkModelCells === 'function' ? wkModelCells(t) : ''}${wkTailorActions(t)}${S.screen === 'workers' ? wkRowNudge('tailoring', t.job_id, t.status.toUpperCase()) : ''}${actions}${taskPill(t)}</div>`;
   }).join('');
@@ -1151,11 +1151,15 @@ function renderTaskStack(tasks = D.tasks || [], all = tasks) {
     <div style="max-height:420px;overflow:auto" data-scroll-key="tailor-tasks">${rows || '<div class="small muted" style="padding:16px 18px">No tailoring tasks match these filters.</div>'}</div></section>`;
 }
 
+// A Tailor-queue job whose latest packet was saved but never reviewed (its review failed or never ran).
+const unreviewedPacket = j => j.has_resume && j.reviewer_score == null && j.status !== 'needs_retailor' && !activeTask(j.id);
+
 function renderBulkTailor(queue) {
   const selected = queue.filter(j => S.tailorChecked.has(j.id));
   const needsWork = j => !j.has_resume || j.status === 'needs_retailor';
   const pending = selected.filter(j => !activeTask(j.id) && (S.tailorRegenerate || needsWork(j)));
   const eligible = pending.length, tailorable = pending.filter(j => j.fit != null).length;
+  const reviewable = selected.filter(unreviewedPacket).length;
   const untailored = queue.filter(needsWork);
   const allOn = queue.every(j => S.tailorChecked.has(j.id));
   const allToggle = `<input type="checkbox" data-act="tailor-select" data-which="${allOn ? 'none' : 'all'}" ${allOn ? 'checked' : ''} aria-label="Select all jobs">`;
@@ -1169,6 +1173,7 @@ function renderBulkTailor(queue) {
     const retailor = j.status === 'needs_retailor';
     const status = task ? taskPill(task)
       : retailor ? `<span title="${attr((j.review_reasons || []).join(' · ') || 'Review sent this packet back to be tailored again')}">${pill('re-tailor', 'warn')}</span>`
+      : unreviewedPacket(j) ? `<span title="The packet was saved but its review never ran or failed: send it to review">${pill('not reviewed', 'warn')}</span>`
       : j.has_resume ? pill(j.status === 'pending_approval' ? 'sent back' : 'has packet', 'muted')
       : j.fit == null ? `<span title="Tailoring works from the ranking: rank this job first, or skip tailoring">${pill('rank first', 'warn')}</span>`
       : pill('not tailored', 'warn');
@@ -1187,6 +1192,7 @@ function renderBulkTailor(queue) {
         <div class="card-sub">${selected.length} of ${queue.length} selected · ${untailored.length} not tailored yet</div></div>
       ${btn(`Select not tailored (${untailored.length})`, 'tailor-select', { which: 'untailored' }, 'sm', !untailored.length)}
       ${btn(allOn ? 'Clear' : 'Select all', 'tailor-select', { which: allOn ? 'none' : 'all' }, 'sm')}
+      ${reviewable ? `<span title="Review the saved packets of the selected jobs whose review never ran or failed, without tailoring them again">${btn(`Review ${reviewable}`, 'bulk-tailor', { mode: 'review' }, 'sm', queueing)}</span>` : ''}
       ${btn(`Skip tailoring${eligible ? ` ${eligible}` : ''}`, 'bulk-tailor', { mode: 'skip' }, 'sm', !eligible || queueing)}
       ${tailorPagesPicker()}
       <span title="${attr(eligible > tailorable ? `${eligible - tailorable} selected job${eligible - tailorable === 1 ? ' is' : 's are'} not ranked yet: rank first, or skip tailoring` : 'Tailor the selected jobs')}">${btn(queueing ? 'Queueing…' : `Tailor${tailorable ? ` ${tailorable}` : ''}`, 'bulk-tailor', { mode: 'tailor' }, 'sm primary', !tailorable || queueing)}</span>
@@ -1216,7 +1222,8 @@ function renderTailorSingle(queue) {
     : `<option value="${job.id}" selected>${esc(job.company)} — ${esc(job.title)} (${esc(statusText(job.status))})</option>`;
   const picker = `<select class="select" style="margin:0;width:auto;max-width:320px" id="tailor-pick" data-act-change="pick-tailor">${extra}${queue.map(j => `<option value="${j.id}" ${j.id === S.tailorJob ? 'selected' : ''}>${esc(j.company)} — ${esc(j.title)}${j.status === 'needs_retailor' ? ' (re-tailor)' : j.has_resume ? '' : ' (not tailored)'}</option>`).join('')}</select>`;
   const task = activeTask(job.id), working = !!task || isBusy('queue' + job.id);
-  const generating = working && task?.mode !== 'skip', skipping = task?.mode === 'skip';
+  const generating = working && !['skip', 'review'].includes(task?.mode), skipping = task?.mode === 'skip';
+  const reviewing = task?.mode === 'review';
   const stack = renderTaskLink() + renderPacketFilters('tailor', D.tailorFacets) + (locked ? `<section class="banner ${job.status === 'applied' ? '' : 'warn'} row wrap gap10" style="margin:0">
       <span class="grow" style="min-width:220px">${job.status === 'applied'
         ? '<b>Already applied.</b> Edits here no longer change what you submitted.'
@@ -1227,7 +1234,10 @@ function renderTailorSingle(queue) {
       <section class="card">${empty(generating ? 'Drafting your packet…' : skipping ? 'Reviewing your master resume…' : 'No packet yet', generating ? `${task ? `${STAGE_LABEL[task.stage]} · ${task.progress}%. ` : ''}Tailoring and an independent review run on the server. You can leave this page.` : skipping ? `${STAGE_LABEL[task.stage]}. Your master resume is used unchanged; the reviewer is scoring it against this posting.` : 'Generate a tailored resume, cover letter and reviewer score. Tailoring may only cite your master resume and verified evidence. If this posting needs no tailoring, skip it and send your master resume as-is.', tailorPagesPicker() + btn(generating ? 'Generating…' : 'Generate tailored packet', 'generate', { id: job.id }, 'primary lg', working) + btn(skipping ? 'Skipping…' : 'Skip tailoring', 'skip-tailor', { id: job.id }, 'lg', working) + btn('Read the posting', 'open-job', { id: job.id }))}</section></div>`;
   }
   const accepted = r.edits.filter(e => e.status === 'accepted').length;
-  const threshold = p.application_mode === 'automatic'
+  const unreviewed = r.reviewer_score == null;
+  const reviewButton = locked || !unreviewed ? '' : btn(reviewing ? 'Reviewing…' : 'Send to review', 'send-review', { id: job.id }, 'primary', working);
+  const threshold = unreviewed ? 'Approval needs a reviewed packet: send this one to review first.'
+    : p.application_mode === 'automatic'
     ? `Auto-approval threshold is ${p.min_review_score}. ${r.reviewer_score >= p.min_review_score ? 'This packet cleared it.' : 'This packet needs your sign-off.'}`
     : `Manual approval mode · minimum review score ${p.min_review_score}.`;
   let body = '';
@@ -1261,7 +1271,7 @@ function renderTailorSingle(queue) {
       ${locked ? '' : tailorPagesPicker()}${btn(generating ? (r.untailored ? 'Tailoring…' : 'Regenerating…') : (r.untailored ? 'Tailor instead' : 'Regenerate'), 'generate', { id: job.id }, '', working || locked)}
       ${r.untailored ? '' : btn(skipping ? 'Skipping…' : 'Skip tailoring', 'skip-tailor', { id: job.id }, '', working || locked)}
       ${btn('Job description', 'open-job', { id: job.id })}
-      ${locked ? '' : btn('Send to approval', 'go', { screen: 'approvals', approval: job.id }, 'primary')}</div>
+      ${locked ? '' : unreviewed ? reviewButton : btn('Send to approval', 'go', { screen: 'approvals', approval: job.id }, 'primary')}</div>
   </section>
   <div class="split gap16">
     <section class="card flush c-main"><div class="row between wrap gap10" style="padding:14px 18px;border-bottom:1px solid var(--line2)">
@@ -1269,7 +1279,7 @@ function renderTailorSingle(queue) {
       <span class="small muted">${r.edits.length} edits · ${accepted} accepted</span></div>${body}</section>
     <div class="c-side col gap14">
       <section class="card pad18"><div class="row gap8 mb12">${pill('AI', 'brand')}<span class="card-title sm">Reviewer notes</span><span class="mono bb base" style="margin-left:auto;color:var(--good)">${fitTxt(r.reviewer_score)} / 100</span></div>
-        <div class="col gap10">${r.review.length ? r.review.map(n => `<div class="row top-align gap10"><span class="note-dot" style="background:${{ good: '#0f9c86', warn: '#e0a136', bad: '#c22f4e' }[n.tone]}"></span><div class="small ink2 pretty" style="line-height:1.55">${esc(n.text)}</div></div>`).join('') : '<div class="small muted">The reviewer left no notes.</div>'}</div>
+        <div class="col gap10">${unreviewed ? `<div class="small muted">${reviewing ? 'The reviewer is checking this packet on the server. You can leave this page.' : 'This packet has not been reviewed: its review never ran or failed. Send it to review to score it without tailoring it again.'}</div>${reviewButton ? `<div>${reviewButton}</div>` : ''}` : r.review.length ? r.review.map(n => `<div class="row top-align gap10"><span class="note-dot" style="background:${{ good: '#0f9c86', warn: '#e0a136', bad: '#c22f4e' }[n.tone]}"></span><div class="small ink2 pretty" style="line-height:1.55">${esc(n.text)}</div></div>`).join('') : '<div class="small muted">The reviewer left no notes.</div>'}</div>
         <div class="xs faint mt12" style="padding-top:12px;border-top:1px solid var(--line2)">${esc(threshold)}</div></section>
       <section class="card pad18"><div class="card-title sm mb12">Keyword coverage</div><div class="row wrap gap6">${r.keywords.length ? r.keywords.map(k => `<span class="kw ${k.status}" title="${k.status}">${esc(k.word)}</span>`).join('') : '<span class="small muted">No keywords yet: they come from the parsed job description (Job description → Structured).</span>'}</div>${r.missing_supported?.length ? `<div class="small muted mt8">Your verified facts support these, but the resume doesn't use them yet: ${esc(r.missing_supported.join(', '))}</div>` : ''}</section>
       <section class="card pad18"><div class="card-title sm mb10">Exports</div><div class="col gap8">
@@ -1986,7 +1996,7 @@ function queueTailoring(ids, mode, regenerate, busyKey, onQueued) {
     await refreshTasks();
     return out;
   }, out => {
-    const n = out.queued.length, verb = mode === 'skip' ? 'Skipping tailoring for' : 'Tailoring';
+    const n = out.queued.length, verb = mode === 'skip' ? 'Skipping tailoring for' : mode === 'review' ? 'Reviewing' : 'Tailoring';
     if (!n) return `Nothing queued: ${out.skipped[0]?.reason || 'no eligible jobs'}`;
     return `${verb} ${n} job${n === 1 ? '' : 's'} in the background${out.skipped.length ? ` · ${out.skipped.length} skipped` : ''}`;
   });
@@ -2731,11 +2741,16 @@ const A = {
   'tailor-pages': el => { S.tailorPages = el.value; render(); },
   'tailor-regenerate': (el, e) => { e.stopPropagation(); S.tailorRegenerate = !S.tailorRegenerate; render(); },
   'bulk-tailor': el => {
+    if (el.dataset.mode === 'review') {
+      const picked = (D.tailorQueue || []).filter(j => S.tailorChecked.has(j.id) && unreviewedPacket(j)).map(j => j.id);
+      return queueTailoring(picked, 'review', false, 'bulkTailor', () => picked.forEach(id => S.tailorChecked.delete(id)));
+    }
     const ids = (D.tailorQueue || []).filter(j => S.tailorChecked.has(j.id) && !activeTask(j.id) && (S.tailorRegenerate || !j.has_resume || j.status === 'needs_retailor')
       && (el.dataset.mode === 'skip' || j.fit != null)).map(j => j.id);
     return queueTailoring(ids, el.dataset.mode, S.tailorRegenerate, 'bulkTailor', () => ids.forEach(id => S.tailorChecked.delete(id)));
   },
   'skip-tailor': el => queueTailoring([Number(el.dataset.id)], 'skip', true, 'queue' + el.dataset.id),
+  'send-review': el => queueTailoring([Number(el.dataset.id)], 'review', false, 'queue' + el.dataset.id),
   'edit-start': el => { S.editing = Number(el.dataset.index); render(); document.getElementById(`edit-text-${el.dataset.index}`)?.focus(); },
   'edit-cancel': () => { S.editing = null; render(); },
   // Read typed values before busy() re-renders and replaces the inputs.

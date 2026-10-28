@@ -99,6 +99,52 @@ def test_a_retailor_gets_one_more_pass_with_the_review_to_fix(sessions, monkeypa
     assert task.waiting_for == "APPROVAL" and task.revision == 1
 
 
+def test_a_failed_review_gets_one_review_only_pass_not_a_second_tailoring(sessions, monkeypatch):
+    user = ps.owner(sessions)
+    job_id = ps.qualified_job(sessions, user)
+    ps.script_reviews(monkeypatch, ["PASS"])
+    scripted, calls = workflow.review_resume, []
+
+    def flaky(db, resume):
+        calls.append(resume.version)
+        if len(calls) == 1:
+            raise RuntimeError("reviewer timed out")
+        return scripted(db, resume)
+
+    monkeypatch.setattr(workflow, "review_resume", flaky)
+    ps.dispatch(sessions, user, job_id)
+    ps.drive(sessions)
+
+    assert calls == [1, 1]  # the same version, reviewed again
+    with sessions() as db:
+        tasks = db.scalars(select(TailorTask).where(TailorTask.job_id == job_id).order_by(TailorTask.id)).all()
+        assert [(t.mode, t.status) for t in tasks] == [("tailor", "failed"), ("review", "succeeded")]
+        assert tasks[1].options.get("conducted")
+    (variant,) = ps.variants(sessions, job_id)
+    assert variant.reviewer_notes["decision"] == "PASS"
+    task = ps.task_of(sessions, job_id)
+    assert (task.status, task.waiting_for, task.step) == ("PENDING", "APPROVAL", graph.AWAIT_APPROVAL)
+
+
+def test_a_review_that_fails_again_ends_the_run_without_a_third_pass(sessions, monkeypatch):
+    user = ps.owner(sessions)
+    job_id = ps.qualified_job(sessions, user)
+    ps.clean_letters(monkeypatch)
+
+    def down(db, resume):
+        raise RuntimeError("reviewer timed out")
+
+    monkeypatch.setattr(workflow, "review_resume", down)
+    ps.dispatch(sessions, user, job_id)
+    ps.drive(sessions)
+
+    with sessions() as db:
+        modes = db.scalars(select(TailorTask.mode).where(TailorTask.job_id == job_id).order_by(TailorTask.id)).all()
+        assert modes == ["tailor", "review"]
+    task = ps.task_of(sessions, job_id)
+    assert task.outcome == graph.FAILED and ps.thread_of(sessions, task).result["code"] == "REVIEW_FAILED"
+
+
 def test_the_revision_loop_stops_at_its_limit_and_waits_for_a_person(sessions, monkeypatch):
     user = ps.owner(sessions)
     job_id = ps.qualified_job(sessions, user)

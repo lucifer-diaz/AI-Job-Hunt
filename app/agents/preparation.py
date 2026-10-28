@@ -5,6 +5,9 @@ existing services, with a bounded revision loop.
       → REVIEW → DECIDE_PASS_OR_REVISION ─┬→ AWAIT_APPROVAL (a person decides)
                                           └→ TAILOR (revision + 1, at most `max_revisions` times)
 
+A pass that saved its version but whose review failed is not tailored again: REVIEW queues one review-only pass of
+that version (`tailor_tasks.enqueue(mode="review")`) and waits for it.
+
 The graph is a conductor, not a second implementation. `resume_verification.for_job` selects the resume,
 `context_builder.completed_fit_analysis` reads the Ranker's analysis (the graph never ranks: without one, or with one
 made from another resume, the run ends), `rag_retrieval.scope` gives the job's evidence scope,
@@ -448,11 +451,16 @@ def _after_tailor_task(state: PreparationState, runtime: Runtime[PreparationCont
         if task.status == "cancelled":
             stopped = task.error in (None, STOPPED_BY_USER) or "stopped" in (task.error or "").lower()
             return _end(TAILOR, STOPPED if stopped else SKIPPED, "TAILOR_CANCELLED")
+        previous = _variant(db, state.get("previous_variant_id"))
         if task.status == "failed":
-            return _end(TAILOR, FAILED, "TAILOR_FAILED")
+            # The pass saved its version and only the review failed: keep the version, REVIEW asks for the review.
+            saved = _latest_variant(db, state["job_id"]) if task.stage == "reviewing" else None
+            if saved is None or saved.reviewer_score is not None or saved.created_at < task.created_at or (
+                    previous is not None and saved.version <= previous.version):
+                return _end(TAILOR, FAILED, "TAILOR_FAILED")
+            return {"variant_id": saved.id, "variant_version": saved.version}
         variant_id = (task.result or {}).get("resume_id")
         variant = _variant(db, variant_id)
-        previous = _variant(db, state.get("previous_variant_id"))
         if variant is None or variant.job_id != state["job_id"] or (
                 previous is not None and variant.version <= previous.version):
             return _end(TAILOR, FAILED, "NO_NEW_VERSION")
@@ -489,18 +497,59 @@ def validate_facts(state: PreparationState, runtime: Runtime[PreparationContext]
 # ───────────── REVIEW ─────────────
 
 def review(state: PreparationState, runtime: Runtime[PreparationContext]) -> dict[str, Any]:
-    """The Reviewer's stored review of this version (the tailor worker ran it). Without one the run ends: a packet is
-    never decided without a review."""
+    """The Reviewer's stored review of this version (the tailor worker ran it). A version saved without one (its
+    review failed) gets one review-only pass, and the run waits for it; a packet is never decided without a review."""
     ctx = runtime.context
     with _session(ctx, True) as db:
         variant = _variant(db, state.get("variant_id"))
         if variant is None:
             return _end(REVIEW, FAILED, "VERSION_MISSING")
-        if variant.reviewer_score is None:
+        if variant.reviewer_score is not None:
+            notes = variant.reviewer_notes or {}
+            return {"step": REVIEW, "review_score": float(variant.reviewer_score),
+                    "recommendation": str(notes.get("recommendation") or "")[:12] or None, "waiting_for": None,
+                    "resume_at": None}
+        version = variant.version
+    if _shadow(state):
+        return _end(REVIEW, FAILED, "REVIEW_MISSING")
+    return _review_pass(state, runtime, version)
+
+
+def _review_pass(state: PreparationState, runtime: Runtime[PreparationContext], version: int) -> dict[str, Any]:
+    """Queue one review-only pass of this version (once, whatever replays) and wait for it. Back here after it ended
+    with the version still unreviewed, the run ends: the pass is never queued twice."""
+    ctx = runtime.context
+    from app.models import TailorTask
+    from app.services import tailor_tasks
+    from app.services.lifecycle import STOPPED_BY_USER
+
+    with _session(ctx, False) as db:
+        job = _job(db, state)
+        done = _terminal(db, job, REVIEW)
+        if done:
+            return done
+        record, created = effects.within(db, ctx.run, f"review.enqueue:{job.id}:v{version}")
+        if created:
+            queued = tailor_tasks.enqueue(db, [job.id], mode="review", options={"conducted": True}, commit=False)
+            task = (queued["queued"] or [None])[0]
+            reason = (queued["skipped"] or [{}])[0].get("reason")
+            record.summary = {"task": task["id"] if task else None, "skipped": (reason or "")[:80] or None}
+        db.commit()
+        summary = record.summary or {}
+        task = db.get(TailorTask, summary["task"]) if summary.get("task") else None
+        if task is None:  # a pass already queued (a person's Send to review) is the one to wait for
+            task = db.scalar(select(TailorTask).where(TailorTask.job_id == job.id,
+                                                      TailorTask.status.in_(ACTIVE_TAILOR)).limit(1))
+        if task is None:
             return _end(REVIEW, FAILED, "REVIEW_MISSING")
-        notes = variant.reviewer_notes or {}
-        return {"step": REVIEW, "review_score": float(variant.reviewer_score),
-                "recommendation": str(notes.get("recommendation") or "")[:12] or None}
+        status, error = task.status, task.error
+    _hold(ctx, "review:after_enqueue")
+    if status in ACTIVE_TAILOR:
+        return _wait(REVIEW, "review", "REVIEWING")
+    if status == "cancelled":
+        stopped = error in (None, STOPPED_BY_USER) or "stopped" in (error or "").lower()
+        return _end(REVIEW, STOPPED if stopped else SKIPPED, "REVIEW_CANCELLED")
+    return _end(REVIEW, FAILED, "REVIEW_FAILED" if status == "failed" else "REVIEW_MISSING")
 
 
 # ───────────── DECIDE_PASS_OR_REVISION ─────────────
@@ -702,10 +751,10 @@ def build(checkpointer: Any) -> Any:
     graph.add_conditional_edges("build_context", _next("tailor"), ["tailor", END])
     graph.add_conditional_edges("tailor", _next("validate_facts"), ["validate_facts", "wait", END])
     graph.add_conditional_edges("validate_facts", _next("review"), ["review", END])
-    graph.add_conditional_edges("review", _next("decide"), ["decide", END])
+    graph.add_conditional_edges("review", _next("decide"), ["decide", "wait", END])
     graph.add_conditional_edges("decide", _after_decide, ["tailor", "await_approval", END])
     graph.add_conditional_edges("await_approval", _after_await, ["tailor", "wait", END])
-    graph.add_conditional_edges("wait", _after_wait, ["tailor", "await_approval"])
+    graph.add_conditional_edges("wait", _after_wait, ["tailor", "review", "await_approval"])
     return graph.compile(checkpointer=checkpointer, name=GRAPH)
 
 

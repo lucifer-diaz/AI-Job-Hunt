@@ -239,6 +239,18 @@ def skip_tailoring(db: Session, job: Job, progress: Progress = _no_progress) -> 
     return resume
 
 
+def review_packet(db: Session, job: Job, progress: Progress = _no_progress) -> ResumeVariant:
+    """Review the latest saved packet of a job, without tailoring it again: for a packet whose review never ran or
+    failed (tailoring saves the version before the Reviewer runs). No new version is made."""
+    resume = db.scalar(select(ResumeVariant).where(ResumeVariant.job_id == job.id)
+                       .order_by(desc(ResumeVariant.version)).limit(1))
+    if resume is None:
+        raise ValueError("This job has no packet to review")
+    progress("reviewing")
+    review_resume(db, resume)
+    return resume
+
+
 def _tokens(text: str) -> set[str]:
     return {w for w in re.findall(r"[a-z0-9+#.]{3,}", (text or "").lower())}
 
