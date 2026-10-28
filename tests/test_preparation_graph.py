@@ -126,6 +126,40 @@ def test_a_failed_review_gets_one_review_only_pass_not_a_second_tailoring(sessio
     assert (task.status, task.waiting_for, task.step) == ("PENDING", "APPROVAL", graph.AWAIT_APPROVAL)
 
 
+def test_a_version_a_person_reviewed_while_the_run_waited_is_decided_not_failed(sessions, monkeypatch):
+    import asyncio
+
+    from app.services import scheduled_jobs, tailor_tasks
+
+    user = ps.owner(sessions)
+    job_id = ps.qualified_job(sessions, user)
+    ps.script_reviews(monkeypatch, ["PASS"])
+    scripted, calls = workflow.review_resume, []
+
+    def flaky(db, resume):
+        calls.append(resume.version)
+        if len(calls) == 1:
+            raise RuntimeError("reviewer timed out")
+        return scripted(db, resume)
+
+    monkeypatch.setattr(workflow, "review_resume", flaky)
+    ps.dispatch(sessions, user, job_id)
+    asyncio.run(scheduled_jobs.preparation_job(ps.ctx(sessions)))  # the run queues its pass and waits
+    tailor_tasks.run_pending(sessions, worker_id="test-tailor")  # the pass saves version 1; its review fails
+    with sessions() as db:  # before the run resumes, the person sends the packet to review (Tailor screen)
+        db.info["user_id"] = user
+        assert tailor_tasks.enqueue(db, [job_id], mode="review")["queued"]
+    tailor_tasks.run_pending(sessions, worker_id="test-tailor")
+    ps.drive(sessions)
+
+    assert calls == [1, 1]  # the person's review is used: the graph queues no review of its own
+    with sessions() as db:
+        modes = db.scalars(select(TailorTask.mode).where(TailorTask.job_id == job_id).order_by(TailorTask.id)).all()
+        assert modes == ["tailor", "review"]
+    task = ps.task_of(sessions, job_id)
+    assert (task.status, task.waiting_for, task.step) == ("PENDING", "APPROVAL", graph.AWAIT_APPROVAL)
+
+
 def test_a_review_that_fails_again_ends_the_run_without_a_third_pass(sessions, monkeypatch):
     user = ps.owner(sessions)
     job_id = ps.qualified_job(sessions, user)

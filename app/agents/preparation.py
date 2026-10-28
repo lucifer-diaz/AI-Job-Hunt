@@ -453,9 +453,10 @@ def _after_tailor_task(state: PreparationState, runtime: Runtime[PreparationCont
             return _end(TAILOR, STOPPED if stopped else SKIPPED, "TAILOR_CANCELLED")
         previous = _variant(db, state.get("previous_variant_id"))
         if task.status == "failed":
-            # The pass saved its version and only the review failed: keep the version, REVIEW asks for the review.
+            # The pass saved its version and only the review failed: keep the version, REVIEW asks for the review
+            # (or reads it, when a person's Send to review already reviewed it while this run waited).
             saved = _latest_variant(db, state["job_id"]) if task.stage == "reviewing" else None
-            if saved is None or saved.reviewer_score is not None or saved.created_at < task.created_at or (
+            if saved is None or saved.created_at < task.created_at or (
                     previous is not None and saved.version <= previous.version):
                 return _end(TAILOR, FAILED, "TAILOR_FAILED")
             return {"variant_id": saved.id, "variant_version": saved.version}
