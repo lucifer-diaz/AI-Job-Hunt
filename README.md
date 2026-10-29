@@ -2258,6 +2258,13 @@ recruiter outcomes, kept apart.
 (`NEEDS_REVIEW` mail), and draws planned stages (ATS answer memory, Evaluation feedback) dashed and labelled planned,
 with no status or metric.
 
+**The LangGraph view** (AI Orchestration → LangGraph, `GET /api/orchestration/langgraph`) draws every registered graph
+(`app/agents/runtime.GRAPHS`) from its compiled structure: its steps in order, which edges are conditional, which go
+back (a retry, a revision, a resume), the steps that pause (`interrupt`) and those that may stop the run, with each
+step's own docstring as its description. It also shows the runtime every graph shares (scheduler, lease, checkpoint,
+services, workers, interrupt, business state), each graph's mode and the account's runs per status. A run's current
+step lives only in its checkpoint, so runs are counted, never placed on a step.
+
 **Offline evaluation** (`python scripts/agent_eval.py`, `app/services/agent_eval/`): eight suites over hand-labelled,
 versioned datasets (`tests/fixtures/agent_eval/*.json`, plus the RAG and preparation benchmarks), each running the
 production code, each with review gates; the run exits non-zero when any gate is BLOCKED. `--report` writes the

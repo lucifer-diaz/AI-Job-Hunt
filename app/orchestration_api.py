@@ -18,14 +18,14 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.auth import CurrentUser, current_user, get_user_db
-from app.services import journey, monitoring, orchestration
+from app.services import graph_topology, journey, monitoring, orchestration
 from app.services import orchestration_topology as topo
 
 router = APIRouter(prefix="/api/orchestration")
 
 
 def orchestration_scope(user: CurrentUser = Depends(current_user),
-                        range: str = Query("7d", pattern="^(today|7d|30d|90d)$"),  # noqa: A002  query parameter name
+                        range: str = Query("7d", pattern="^(today|7d|30d|90d)$"),
                         start: datetime | None = None, end: datetime | None = None,
                         all_accounts: bool = False) -> orchestration.Scope:
     if all_accounts and not user.is_admin:
@@ -118,6 +118,13 @@ def job_trace(job_id: int, user: CurrentUser = Depends(current_user),
     if found is None:
         raise HTTPException(404, "Job not found")
     return found
+
+
+@router.get("/langgraph")
+def langgraph(user: CurrentUser = Depends(current_user), db: Session = Depends(get_user_db)) -> dict[str, Any]:
+    """Every LangGraph graph as the code defines it (nodes, edges, pauses, each step's own description), its mode and
+    the signed-in account's runs per status."""
+    return graph_topology.view(db, user.id)
 
 
 @router.get("/jobs/{job_id}/journey")

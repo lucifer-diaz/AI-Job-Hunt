@@ -937,6 +937,9 @@ Allowed status: NOT_STARTED, PLANNING, IN_PROGRESS, IN_REVIEW, MERGED, BLOCKED, 
   - **Monitoring:** retrieval latency (`llm_request_logs.retrieval_ms`), failover rate, off-configuration rate,
     p50/p99 beside p95 per stage and worker, cost per successful task on AI nodes, unknown cost no longer shown as $0.
   - **Graph:** Submission confirmation and Email review nodes with measured edges; planned stages drawn as planned.
+  - **LangGraph view:** AI Orchestration → LangGraph draws every registered graph from its compiled structure and its
+    nodes' docstrings (`app/services/graph_topology.py`, `GET /api/orchestration/langgraph`), with the shared runtime
+    flow, each graph's mode and the account's runs per status.
   - **Offline evaluation** (`scripts/agent_eval.py`, ADR-036): eight suites, versioned datasets, review gates; and
     `GET /api/monitoring/feedback` (human correction rate, recruiter outcomes apart).
   - **Export hardening:** OTP/opaque-token/cookie shapes refused at the projection and the wire, URL and header check,

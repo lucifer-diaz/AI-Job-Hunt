@@ -172,6 +172,8 @@ def _packet_problem(db: Session, task: Any, job: Any) -> tuple[str, str] | None:
 
 
 def verify_packet(state: ApplicationState, runtime: Runtime[ApplicationContext]) -> dict[str, Any]:
+    """Check the approved packet's digest before anything external starts (approval.verify); a changed packet blocks
+    the run and needs a new approval."""
     ctx = runtime.context
     with _session(ctx) as db:
         task, job = _load(db, state)
@@ -419,6 +421,8 @@ def _takeover(db: Session, ctx: ApplicationContext, state: ApplicationState, tas
 
 
 def analyze_form(state: ApplicationState, runtime: Runtime[ApplicationContext]) -> dict[str, Any]:
+    """Read the application form in a fresh browser context (ATS adapter or the browser-use runner) into its fields
+    and fingerprint; a login wall or challenge waits for the person."""
     from app.services import apply_queue, ats_forms, ats_map
 
     ctx = runtime.context
@@ -502,6 +506,8 @@ def analyze_form(state: ApplicationState, runtime: Runtime[ApplicationContext]) 
 # ───────────── RESOLVE_ANSWERS ─────────────
 
 def resolve_answers(state: ApplicationState, runtime: Runtime[ApplicationContext]) -> dict[str, Any]:
+    """Find a verified source for every field (answer_resolver.plan): profile, packet files, the same saved
+    question; a sensitive answer needs the person's confirmation, a missing required one waits."""
     from app.services import answer_resolver, ats_forms
 
     ctx = runtime.context
@@ -579,6 +585,8 @@ async def _fill_form(browser: Any, user_id: int, job_id: int, url: str, form: An
 
 
 def fill(state: ApplicationState, runtime: Runtime[ApplicationContext]) -> dict[str, Any]:
+    """Re-check the packet digest, then fill the form from the resolved sources in a page that cannot submit
+    (assist)."""
     from app.services import answer_resolver, apply_queue, approval, ats_forms
 
     ctx = runtime.context

@@ -813,6 +813,10 @@ live feedback), `scripts/agent_eval.py` (README §9e). The rules a change has to
 * **Every suite runs production code over a versioned dataset**, and every suite has gates (`gates.GATES`). Bump a
   dataset's `version` when a case is added, removed or relabelled. A skipped suite is BLOCKED. Ground truth is
   written by a person; cases are synthetic. Add a gate before relaxing one.
+* **The LangGraph view draws the code** (`app/services/graph_topology.py`): structure from each compiled graph,
+  descriptions from each node function's docstring, pauses from `interrupt(`, the stage it conducts from
+  `GraphSpec.orchestration_node`. A new graph appears there once it is in `runtime.GRAPHS`; give every node function a
+  docstring (a test fails without one) and never draw or name a step in `app/static/`.
 * **Nothing is uploaded.** `--jsonl` is for a manual LangSmith import; the only export path stays
   `app/agents/tracing_boundary.py`, which also refuses OTP- and token-shaped strings, cookie text and credentials in
   URLs or headers (`export_policy.request_check`). `tests/test_external_api_guard.py` checks `job_hunt_agent/`,

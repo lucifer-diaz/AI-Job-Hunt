@@ -35,6 +35,11 @@ async function loadOrchestration() {
     await Promise.all([aimLoadQuiet(), D.settings ? null : api('/api/settings').then(x => { D.settings = x; }).catch(() => null)]);
     return;
   }
+  if (o.workspace === 'langgraph') {  // the graphs as the code defines them: one read, no polling
+    stopOrchPoll();
+    try { D.orchLanggraph = await api('/api/orchestration/langgraph'); D.orchError = null; } catch (e) { D.orchError = e.message; }
+    return;
+  }
   try {
     const [graph, live] = await Promise.all([api('/api/orchestration/graph?' + orchQuery()), api('/api/orchestration/live?' + orchQuery())]);
     Object.assign(D, { orchGraph: graph, orchLive: live, orchError: null, orchGraphAt: Date.now() });
@@ -266,16 +271,88 @@ function orchPlannedNode(r, p) {
   </div>`;
 }
 
+/* ───────────── LangGraph: each graph as the code defines it ───────────── */
+// Every box, edge and description comes from /api/orchestration/langgraph (the compiled graphs and their nodes'
+// docstrings); nothing here names a step.
+const LG = { dx: 134, dy: 74, w: 118, h: 42, pad: 16 };
+const LG_RUN_TONE = { QUEUED: 'info', RUNNING: 'info', INTERRUPTED: 'warn', COMPLETED: 'good', FAILED: 'bad', STOPPED: 'muted' };
+const lgName = id => id === '__start__' ? 'start' : id === '__end__' ? 'end' : id.replace(/_/g, ' ');
+function lgLayout(g) {
+  // Steps on the top row, a second step in the same column below it, and the steps that pause on a row of their own.
+  const rows = {}, pos = {};
+  const pausing = g.nodes.filter(n => n.interrupt);
+  for (const n of g.nodes.filter(x => !x.interrupt)) {
+    const row = rows[n.depth] = (rows[n.depth] ?? -1) + 1;
+    pos[n.id] = { col: n.depth, row };
+  }
+  const bottom = Math.max(0, ...Object.values(pos).map(p => p.row)) + 1;
+  for (const n of pausing) pos[n.id] = { col: n.depth, row: bottom };
+  const height = (pausing.length ? bottom : bottom - 1) + 1;
+  for (const p of Object.values(pos)) Object.assign(p, { x: LG.pad + p.col * LG.dx, y: LG.pad + p.row * LG.dy });
+  return { pos, width: LG.pad * 2 + (g.columns - 1) * LG.dx + LG.w, height: LG.pad * 2 + (height - 1) * LG.dy + LG.h + 24 };
+}
+function lgEdge(e, a, b) {
+  const { w, h } = LG;
+  if (e.loop && b.row < a.row) return `M${a.x + w / 2},${a.y} C${a.x + w / 2},${a.y - 30} ${b.x + w / 2 + 14},${b.y + h + 30} ${b.x + w / 2 + 14},${b.y + h}`;
+  if (e.loop) return `M${a.x + w / 2},${a.y + h} C${a.x + w / 2},${a.y + h + 34} ${b.x + w / 2},${b.y + h + 34} ${b.x + w / 2},${b.y + h}`;
+  const x1 = a.x + w, y1 = a.y + h / 2, x2 = b.x, y2 = b.y + h / 2;
+  return a.row === b.row ? `M${x1},${y1} L${x2},${y2}` : `M${x1},${y1} C${x1 + 40},${y1} ${x2 - 40},${y2} ${x2},${y2}`;
+}
+function lgDiagram(g) {
+  const L = lgLayout(g), sel = orchState().lgNode;
+  const edges = g.edges.map(e => {
+    const a = L.pos[e.source], b = L.pos[e.target]; if (!a || !b) return '';
+    return `<path class="lg-edge ${e.conditional ? 'cond' : ''} ${e.loop ? 'loop' : ''}" d="${lgEdge(e, a, b)}" marker-end="url(#lg-arrow${e.loop ? '-loop' : ''})"><title>${esc(`${lgName(e.source)} → ${lgName(e.target)}${e.conditional ? ' (when its condition holds)' : ''}${e.loop ? ' (goes back)' : ''}`)}</title></path>`;
+  }).join('');
+  const nodes = g.nodes.map(n => {
+    const p = L.pos[n.id];
+    if (n.kind !== 'step') return `<g class="lg-terminal"><rect x="${p.x + LG.w / 2 - 30}" y="${p.y + 8}" width="60" height="${LG.h - 16}" rx="14"/><text x="${p.x + LG.w / 2}" y="${p.y + LG.h / 2 + 4}" text-anchor="middle">${lgName(n.id)}</text></g>`;
+    const key = `${g.name}:${n.id}`;
+    return `<g class="lg-node ${n.interrupt ? 'pause' : ''} ${sel === key ? 'on' : ''}" data-act="orch-lg-node" data-id="${attr(key)}" tabindex="0" role="button" aria-label="${attr(`${lgName(n.id)}${n.interrupt ? ', pauses' : ''}${n.may_stop ? ', may stop here' : ''}`)}">
+      <title>${esc(n.doc || lgName(n.id))}</title><rect x="${p.x}" y="${p.y}" width="${LG.w}" height="${LG.h}" rx="8"/>
+      <text x="${p.x + 10}" y="${p.y + 19}">${esc(lgName(n.id))}</text>
+      <text class="lg-sub" x="${p.x + 10}" y="${p.y + 35}">${[n.interrupt ? '⏸ pauses' : '', n.may_stop ? '⏹ may stop' : ''].filter(Boolean).join(' · ') || 'step'}</text></g>`;
+  }).join('');
+  return `<div class="lg-scroll"><svg class="lg-svg" viewBox="0 0 ${L.width} ${L.height}" style="width:100%;max-width:${L.width}px;min-width:${Math.round(L.width * 0.85)}px;height:auto" role="img" aria-label="${attr(`${g.label}: ${g.nodes.filter(n => n.kind === 'step').length} steps`)}">
+    <defs><marker id="lg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="lg-arrow"/></marker>
+    <marker id="lg-arrow-loop" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="lg-arrow loop"/></marker></defs>
+    ${edges}${nodes}</svg></div>`;
+}
+function lgGraphCard(g) {
+  const sel = orchState().lgNode, node = sel?.startsWith(g.name + ':') ? g.nodes.find(n => `${g.name}:${n.id}` === sel) : null;
+  const m = g.mode, runs = Object.entries(g.runs).filter(([, n]) => n);
+  return `<section class="card mt16 lg-card"><div class="row between wrap gap10 mb10">
+      <div><div class="card-title">${esc(g.label)} <span class="xs muted mono">${esc(g.name)} · ${esc(g.version)}</span></div>
+        <div class="card-sub">${g.worker_owned ? 'Worker-owned: only its worker resumes it' : 'Resumable from the API'}${g.orchestration_label ? ` · conducts <a href="#orchestration" data-act="orch-lg-stage" data-id="${attr(g.orchestration_node)}">${esc(g.orchestration_label)}</a>` : ''}</div></div>
+      <div class="row gap6 wrap">${pill(m.running ? `${m.effective}` : 'off', m.running ? 'good' : 'muted')}<span class="xs muted mono" title="${attr(m.note || '')}">${esc(m.setting)}=${esc(m.configured)}</span>
+        ${runs.length ? runs.map(([s, n]) => pill(`${n} ${s.toLowerCase()}`, LG_RUN_TONE[s] || 'muted')).join('') : '<span class="xs muted">no runs yet</span>'}</div></div>
+    ${lgDiagram(g)}
+    ${node ? `<div class="box soft mt10"><div class="small b">${esc(lgName(node.id))}${node.interrupt ? ' · pauses (interrupt)' : ''}${node.may_stop ? ' · may stop the run' : ''}</div><div class="small mt4">${esc(node.doc || 'No description in the code.')}</div></div>`
+      : '<div class="xs muted mt6">Select a step for its description (taken from the code).</div>'}
+    <div class="xs muted mt6">Exported to traces (when export is on): ${esc(g.export_fields.join(', '))}</div></section>`;
+}
+function renderOrchLanggraph() {
+  const v = D.orchLanggraph;
+  if (!v) return D.orchError ? `<div class="card">${empty('LangGraph view could not load', D.orchError, btn('Try again', 'orch-retry', {}, 'primary'))}</div>` : loading();
+  const flow = v.runtime.map((s, i) => `<div class="lg-step"><div class="small b">${esc(s.label)}</div><div class="xs muted">${esc(s.detail)}</div></div>${i < v.runtime.length - 1 ? '<span class="lg-then" aria-hidden="true">→</span>' : ''}`).join('');
+  return `<section class="card mt16"><div class="card-title">How a graph runs</div><div class="card-sub mb10">The same runtime for every graph (app/agents/runtime.py)</div>
+      <div class="lg-flow">${flow}</div>
+      <div class="row gap14 wrap xs muted mt10"><span><i class="lg-key"></i> always</span><span><i class="lg-key cond"></i> when its condition holds</span><span><i class="lg-key loop"></i> goes back (retry, revision, resume)</span><span>⏸ pauses for a worker or a person</span><span>⏹ may stop the run early</span></div>
+      <div class="xs muted mt6">${esc(v.note)}</div></section>
+    ${v.graphs.map(lgGraphCard).join('')}`;
+}
+
 /* ───────────── screen ───────────── */
 // Pipeline (the live graph) or Models (which model each worker uses, and how requests are routed).
 function orchWorkspaceSwitch() {
   const o = orchState();
-  return `<div class="seg orch-workspace" role="tablist" aria-label="AI Orchestration">${[['pipeline', 'Pipeline', '◇'], ['models', 'Models & routing', '⇢']].map(([id, t, sym]) =>
+  return `<div class="seg orch-workspace" role="tablist" aria-label="AI Orchestration">${[['pipeline', 'Pipeline', '◇'], ['langgraph', 'LangGraph', '⎔'], ['models', 'Models & routing', '⇢']].map(([id, t, sym]) =>
     `<button role="tab" aria-selected="${o.workspace === id}" class="${o.workspace === id ? 'on' : ''}" data-act="orch-workspace" data-id="${id}"><span aria-hidden="true">${sym}</span> ${t}</button>`).join('')}</div>`;
 }
 function renderOrchestration() {
   const o = orchState(), g = D.orchGraph;
   if (o.workspace === 'models') return `<div class="orch"><section class="card pad12 orch-toolbar">${orchWorkspaceSwitch()}</section>${renderAIModels()}</div>`;
+  if (o.workspace === 'langgraph') return `<div class="orch"><section class="card pad12 orch-toolbar">${orchWorkspaceSwitch()}</section>${renderOrchLanggraph()}</div>`;
   if (!g) return D.orchError ? `<div class="card">${empty('AI Orchestration could not load', D.orchError, btn('Try again', 'orch-retry', {}, 'primary'))}</div>` : loading();
   if (!o.view) setTimeout(orchAutoFit, 0);
   return `<div class="orch">${orchToolbar(g)}
@@ -665,6 +742,8 @@ const ORCHESTRATION_ACTIONS = {
     go('orchestration');
   },
   'orch-workspace': el => { orchState().workspace = el.dataset.id; go('orchestration'); },
+  'orch-lg-node': el => { const o = orchState(); o.lgNode = o.lgNode === el.dataset.id ? null : el.dataset.id; render(); },
+  'orch-lg-stage': (el, e) => { e?.preventDefault?.(); Object.assign(orchState(), { workspace: 'pipeline', node: el.dataset.id, edge: null }); go('orchestration'); },
   'orch-monitoring': el => {
     const m = monState();
     Object.assign(m, { tab: el.dataset.tab || 'overview', stage: el.dataset.stage || '', page: 1, all: orchState().all });

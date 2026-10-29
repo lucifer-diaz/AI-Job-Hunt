@@ -1279,3 +1279,25 @@ form#settings-editor.wk-settings{background:none;border:0;box-shadow:none;border
 .orch-journey{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:4px}
 .orch-journey li{padding:4px 0;border-bottom:1px solid var(--line2)}
 .orch-journey li>.ellipsis{flex:1;min-width:0;text-align:right}
+.lg-flow{display:flex;flex-wrap:wrap;align-items:stretch;gap:6px}
+.lg-step{flex:1 1 130px;min-width:120px;border:1px solid var(--line);border-radius:8px;padding:8px 10px;background:var(--softer)}
+.lg-then{align-self:center;color:var(--muted)}
+.lg-scroll{overflow-x:auto;max-width:100%}
+.lg-svg{display:block}
+.lg-svg text{font-size:12px;fill:var(--ink)}
+.lg-svg .lg-sub{font-size:10px;fill:var(--muted)}
+.lg-node rect{fill:var(--softer);stroke:var(--btnline);stroke-width:1.2}
+.lg-node{cursor:pointer}
+.lg-node:hover rect,.lg-node:focus rect{stroke:var(--brand)}
+.lg-node.on rect{stroke:var(--brand);stroke-width:2.2}
+.lg-node.pause rect{fill:var(--warn-soft);stroke:var(--amber)}
+.lg-terminal rect{fill:var(--soft);stroke:var(--btnline)}
+.lg-terminal text{font-size:11px;fill:var(--muted)}
+.lg-edge{fill:none;stroke:var(--faint);stroke-width:1.4}
+.lg-edge.cond{stroke-dasharray:5 4}
+.lg-edge.loop{stroke:var(--amber)}
+.lg-arrow{fill:var(--faint)}
+.lg-arrow.loop{fill:var(--amber)}
+.lg-key{display:inline-block;width:22px;height:0;border-top:2px solid var(--faint);vertical-align:middle;margin-right:4px}
+.lg-key.cond{border-top-style:dashed}
+.lg-key.loop{border-top-color:var(--amber)}
