@@ -243,3 +243,90 @@ def test_a_langsmith_outage_changes_nothing(wire, export_on, mode):
     rows = export_rows(before)
     assert rows and all(r.status == "FAILED" for r in rows)
     assert {r.error_type for r in rows} <= {"CONNECTION", "TIMEOUT", "SERVER_ERROR", "OTHER", "SDK_ERROR"}
+
+
+# ───────────── Phase 7: shapes a projection alone used to let through ─────────────
+
+# Credentials with no tell-tale name: a one-time code, an opaque session token, a LangSmith key, a cookie line.
+UNNAMED = {"otp": "482915", "opaque": "Qx7Lm2Np9Rs4Tv6Wy8Za1Bc3De5", "langsmith": "lsv2_sk_SYNTHETICabcdefghijklmnop0123",
+           "cookie_line": "Set-Cookie: csrftoken=SYNTHETICcsrf0123456789; Path=/"}
+
+
+def unnamed_graph():
+    """Plain-looking values in fields the graph allowlisted: only the value's shape gives them away."""
+    def node(state: LeakyState) -> dict:
+        return {"kind": UNNAMED["opaque"], "note": UNNAMED["otp"], "items": 1}
+    graph = StateGraph(LeakyState)
+    graph.add_node("leak", node)
+    graph.add_edge(START, "leak")
+    graph.add_edge("leak", END)
+    return graph.compile()
+
+
+def test_unnamed_credentials_in_allowlisted_fields_never_reach_langsmith(wire, export_on, monkeypatch):
+    # Every debug and capture switch is on (export_on), plus an account's own capture: none widens the export.
+    monkeypatch.setattr(get_settings(), "external_api_debug_payloads", True)
+    config = {"configurable": {"thread_id": "pilot:u1:" + "b" * 32 + ":v1"},
+              "metadata": {"graph": "unnamed", "worker": UNNAMED["langsmith"], "prompt_name": UNNAMED["otp"],
+                           "trace_id": UNNAMED["cookie_line"]}, "tags": ["safe-tag"]}
+    with tracing_boundary.export(("kind", "note", "items")) as callbacks:
+        config["callbacks"] = callbacks
+        unnamed_graph().invoke({"kind": "auto", "note": UNNAMED["otp"], "items": 0}, config=config)
+    tracing_boundary.flush()
+    text = wire.text()
+    assert wire.bodies and '"graph":"unnamed"' in text
+    for name, value in UNNAMED.items():
+        assert value not in text, name
+    assert "SYNTHETICcsrf" not in text and "482915" not in text
+    assert all(set(h) & {"Cookie", "cookie", "Authorization"} == set() for h in wire.headers)
+
+
+def test_the_request_check_refuses_credentials_in_urls_and_headers():
+    ok = "https://api.smith.langchain.com/runs/multipart"
+    assert export_policy.request_check(ok, {"x-api-key": "lsv2_pt_x", "Content-Type": "application/json"}) is None
+    assert export_policy.request_check(ok, {"Cookie": "sid=1"}) == "credential header"
+    assert export_policy.request_check(ok, {"Authorization": "Bearer x"}) == "credential header"
+    assert export_policy.request_check(ok + "?api_key=abc", {}) == "credential field in the URL"
+    assert export_policy.request_check(ok + "?code=482915", {}) == "secret-shaped value in the URL"
+    assert export_policy.request_check("https://user:pw@api.example.test/runs", {}) == "credential in the URL"
+    assert export_policy.request_check(ok + "?session=" + UNNAMED["opaque"], {}) is not None
+    assert export_policy.wire_check(UNNAMED["cookie_line"].encode()) is not None
+    assert export_policy.wire_check(b'{"note": "sessionid=SYNTHETICcookie12345; Path=/"}') == \
+        "cookie or session material"
+    assert export_policy.wire_check(json.dumps({"note": UNNAMED["langsmith"]}).encode()) == "secret-shaped text"
+
+
+def test_a_request_refused_for_its_url_is_never_sent(wire, monkeypatch):
+    from app.services.external_api import requests_session
+
+    session = requests_session("LANGSMITH", operation="trace_export", pre_send=export_policy.wire_check,
+                               pre_send_request=export_policy.request_check)
+    response = session.get("https://api.example.test/runs?token=" + UNNAMED["opaque"])
+    assert response.status_code == 400 and wire.bodies == []
+
+
+def test_projection_keeps_ids_and_models_but_not_codes_or_tokens():
+    keep = export_policy._plain
+    assert keep("ranker-main") == "ranker-main" and keep("anthropic/claude-sonnet-4-5") is not None
+    assert keep("3f2c" * 8) is not None  # a lower-case hex id (trace ids, digests) is an id, not a token
+    assert keep("v3") == "v3" and keep(482915) == 482915  # a count is a number
+    assert keep("482915") is None and keep(UNNAMED["opaque"]) is None and keep(UNNAMED["langsmith"]) is None
+
+
+CONTENT_WORDS = ("resume", "description", "answer", "body", "text", "prompt", "response", "email", "subject",
+                 "sender", "html", "page", "value", "letter", "summary", "cookie", "password", "token", "url", "name")
+ID_SUFFIXES = ("id", "ids", "count", "version", "hash", "status", "score", "choice", "fingerprint")
+
+
+@pytest.mark.parametrize("graph", sorted(runtime.GRAPHS))
+def test_every_graph_exports_only_ids_enums_and_counts(graph):
+    """A graph's EXPORT_FIELDS are the only state keys a trace may show: never a credential or a content field."""
+    from app.agents import safety
+
+    fields = runtime.GRAPHS[graph].export_fields
+    assert fields and len(fields) == len(set(fields))
+    for name in fields:
+        assert not safety.denied_key(name), name
+        parts = name.lower().split("_")
+        # "resume_id", "resume_version", "resume_hash" name a row, not its text.
+        assert not set(parts) & set(CONTENT_WORDS) or parts[-1] in ID_SUFFIXES, f"{graph}.{name} names content"

@@ -91,6 +91,7 @@ beforeEach(() => {
     return response(url.includes('/workspace/summary') ? ui.D.summary
       : url.includes('/orchestration/graph') ? routes.graph
       : url.includes('/orchestration/live') ? routes.live
+      : /\/orchestration\/jobs\/\d+\/journey/.test(url) ? (routes.journey || {})
       : /\/orchestration\/jobs\/\d+\/trace/.test(url) ? routes.trace
       : /\/orchestration\/jobs\/\d+/.test(url) ? routes.job
       : url.includes('/orchestration/jobs?') ? { items: [{ job_id: 1842, title: 'Senior Backend Engineer', company: 'Stripe' }] }
@@ -260,6 +261,38 @@ describe('AI Orchestration workspace', () => {
     expect(ui.S.screen).toBe('monitoring');
     expect(ui.S.mon.tab).toBe('logs');
     expect(ui.S.mon.logs.trace_id).toBe('abcdef0123456789');
+  });
+
+  it('shows the application journey in the trace drawer, unknown stages as unknown and Gmail review as review', async () => {
+    const unknown = stage => ({ stage, status: 'UNKNOWN', source: [], detail: `No ${stage} recorded` });
+    routes.journey = { job_id: 1842, stages: [
+      { stage: 'discovery', status: 'DONE', source: ['jobs'], board: 'greenhouse' }, unknown('description'),
+      { stage: 'retrieval', status: 'DONE', source: ['llm_request_logs'], retrieval_ms_max: 42, modes: { on: 1 } },
+      { stage: 'model', status: 'DONE', source: ['llm_request_logs'], calls: [{ id: 1 }], actual_models: ['ollama/gpt-oss:20b'], configured_models: ['ranker-main'] },
+      unknown('packet'), unknown('execution'),
+      { stage: 'confirmation', status: 'UNCERTAIN', source: ['submission_intents'], intent_status: 'UNCERTAIN', evidence: null },
+      { stage: 'gmail_outcome', status: 'NEEDS_REVIEW', source: [], events: [{ event_type: 'REJECTION', decided_by: 'person' }], review_message_ids: [7] }],
+      cost: { cost: null, unpriced: 2 }, recruiter_outcome: { stage: 'rejected', attributed_to_model: false } };
+    await open();
+    await ui.A['orch-pick-job']({ dataset: { id: '1842' } });
+    await ui.A['orch-trace']();
+    const modal = document.querySelector('[aria-label="Job trace"]').textContent;
+    expect(modal).toContain('Application journey');
+    expect(modal).toContain('No description recorded');
+    expect(modal).toContain('needs review');
+    expect(modal).toContain('rejection (you)');
+    expect(modal).toContain('Cost unknown');
+    expect(modal).toContain('never attributed to a model');
+    expect(modal).not.toContain('$0');
+  });
+
+  it('draws planned stages as planned, without a status or metric', async () => {
+    routes.graph = { ...graph(), topology: { ...graph().topology, reserved: [{ id: 'eval_feedback', label: 'Evaluation feedback', description: 'Planned', position: [9, 0], planned: true }] } };
+    await open();
+    const planned = view().querySelector('.orch-planned');
+    expect(planned.textContent).toContain('Evaluation feedback');
+    expect(planned.textContent).toContain('Planned');
+    expect(planned.getAttribute('data-act')).toBe(null);
   });
 
   it('renders History mode with throughput on edges and a per-stage table', async () => {

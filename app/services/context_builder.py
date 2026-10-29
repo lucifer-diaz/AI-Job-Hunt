@@ -35,6 +35,7 @@ import json
 import logging
 import re
 from dataclasses import asdict, dataclass, field
+from types import MappingProxyType
 from typing import Any
 
 from sqlalchemy import desc, select
@@ -189,6 +190,9 @@ class TaskContext:
     excluded_evidence: list[dict[str, Any]] = field(default_factory=list)
     resume_text: str = ""  # a readable rendering of the selected facts (or the raw text when nothing is structured)
     stats: ContextStats = field(default_factory=ContextStats)
+    # Not a field, so never part of the prompt payload (to_dict): {retrieval_ms, retrieval_mode} for call_stats, set
+    # by _base when retrieval ran for this context.
+    retrieval = MappingProxyType({})
     job_stats: jc.JobContextStats = field(default_factory=jc.JobContextStats)
 
     @property
@@ -209,8 +213,9 @@ class TaskContext:
         return asdict(self)
 
     def call_stats(self) -> dict[str, Any]:
-        """Both sides of context selection, for the LLM request log."""
-        return {**self.stats.as_dict(), **self.job_stats.as_dict(), "context_builder_version": CONTEXT_BUILDER_VERSION}
+        """Both sides of context selection, and the evidence retrieval behind it, for the LLM request log."""
+        return {**self.stats.as_dict(), **self.job_stats.as_dict(), **self.retrieval,
+                "context_builder_version": CONTEXT_BUILDER_VERSION}
 
     def selected_payload(self) -> dict[str, Any]:
         """Everything the prompt receives from this context except the job description, which is measured apart."""
@@ -379,7 +384,7 @@ def select_evidence(db: Session, user_id: int, terms: JobTerms, limit: int,
 
 def retrieved_evidence(db: Session, profile: Any, job: Job, task: str, terms: JobTerms, limit: int,
                        deterministic: list[dict[str, Any]], held_back: set[int], resume_items: set[str],
-                       query: str | None = None) -> list[dict[str, Any]]:
+                       query: str | None = None, timing: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """The evidence a job context carries, by RAG_RETRIEVAL_MODE:
 
         off      `deterministic` (select_evidence), exactly as before — the default and the rollback
@@ -388,7 +393,10 @@ def retrieved_evidence(db: Session, profile: Any, job: Job, task: str, terms: Jo
                  relevance-ranked, within the token budget; on any retrieval error, `deterministic`
 
     Retrieval honours the same exclusions: evidence held back for a provenance conflict, and evidence created from a
-    bullet the context already carries as that bullet."""
+    bullet the context already carries as that bullet.
+
+    `timing`, when given, receives what the call's telemetry records (llm_request_logs.retrieval_ms / retrieval_mode):
+    the retrieval's own measured latency, and "on" or "fallback". Left empty when no retrieval was used."""
     from app.settings import get_settings
 
     mode = get_settings().rag_mode
@@ -407,6 +415,8 @@ def retrieved_evidence(db: Session, profile: Any, job: Job, task: str, terms: Jo
                              category="WORKFLOW", level="WARNING", operation="rag_retrieval", user_id=profile.user_id,
                              entity_type="job", entity_id=job.id, status="FALLBACK",
                              details={"task": task, "error": type(exc).__name__})
+        if timing is not None:
+            timing["retrieval_mode"] = "fallback"
         return deterministic
     if mode == "shadow":
         old, new = {e["id"] for e in deterministic}, set(pack.evidence_ids)
@@ -417,6 +427,8 @@ def retrieved_evidence(db: Session, profile: Any, job: Job, task: str, terms: Jo
             details={"task": task, "only_deterministic": sorted(old - new), "only_retrieval": sorted(new - old),
                      "outside_resume_scope": sorted(old - pack_scope(db, profile, job)), **pack.metadata()})
         return deterministic
+    if timing is not None:
+        timing.update(retrieval_ms=pack.latency_ms, retrieval_mode="on")
     return pack.projected()
 
 
@@ -542,8 +554,9 @@ def _base(db: Session, profile: CandidateProfile, job: Job, task: str, allowed: 
     resume_items = {unit.item_id for unit in sr.iter_units(data or {})}
     relevant, every = select_evidence(db, profile.user_id, terms, evidence_limit,
                                       exclude=set(held_back) | set(out_of_scope), resume_items=resume_items)
+    retrieval: dict[str, Any] = {}
     relevant = retrieved_evidence(db, profile, job, task, terms, evidence_limit, relevant,
-                                  set(held_back) | set(out_of_scope), resume_items)
+                                  set(held_back) | set(out_of_scope), resume_items, timing=retrieval)
     every = scoped_evidence(db, profile, job, every)
     projects = _select_projects(data or {}, terms, allowed)
     education_fields = ("degree", "field_of_study", "institution", "university", "grade", "end_date",
@@ -564,6 +577,8 @@ def _base(db: Session, profile: CandidateProfile, job: Job, task: str, allowed: 
                                             context.relevant_evidence, set(held_back), resume_texts)
     if allowed == VERIFIED_ONLY:
         context.unverified_facts = []  # includes verified bullets of unverified roles: not trusted either
+    if retrieval:
+        context.retrieval = retrieval
     return context, data or {}, every, resume
 
 

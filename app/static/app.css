@@ -943,6 +943,7 @@ html.gq-has-tracker .view{padding-bottom:84px}
 .orch-node:hover,.orch-node:focus-visible{box-shadow:0 6px 18px #1018281f;outline:none;border-color:var(--brand-line)}
 .orch-node.selected{box-shadow:0 0 0 3px var(--brand-soft),0 6px 18px #1018281f;border-color:var(--brand)}
 .orch-node.type-AI{border-left-color:var(--brand)}
+.orch-node.orch-planned{border:1px dashed var(--line);border-left:4px dashed var(--grey);background:transparent;opacity:.75;cursor:default;box-shadow:none}
 .orch-node.type-EXTERNAL{border-left-color:#3b82c4}
 .orch-node.type-HUMAN_GATE{border-left-color:var(--amber);border-style:dashed solid dashed solid}
 .orch-node.type-ASYNC_WORKER{border-left-color:var(--brand-lilac)}
@@ -1275,3 +1276,6 @@ form#settings-editor.wk-settings{background:none;border:0;box-shadow:none;border
 @media(max-width:700px){.am-row{grid-template-columns:1fr}.am-summary{margin:18px 18px 4px;padding:16px}
   .am-footer{flex-direction:column-reverse;align-items:stretch;gap:10px}.am-footer .row>.btn{flex:1}}
 @media(prefers-reduced-motion:reduce){.am-preset{transition:none}}
+.orch-journey{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:4px}
+.orch-journey li{padding:4px 0;border-bottom:1px solid var(--line2)}
+.orch-journey li>.ellipsis{flex:1;min-width:0;text-align:right}

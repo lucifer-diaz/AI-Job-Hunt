@@ -180,6 +180,12 @@ Record accepted changes to these decisions with an appended rationale, date, PR,
 | ADR-034 | Takeover: a headful sidecar session is parked for `APPLICATION_TAKEOVER_TTL_MINUTES`; the task waits PENDING at NEEDS_HUMAN (not claimable) until the person continues; the run then re-observes from the apply URL and re-validates; it never replays. Headless or remote deployments end NEEDS_HUMAN as in Phase 5. | Keeps a person's login or code entry useful without storing anything until they ask. Consequence: takeover needs a local, headful install. | A remote takeover channel (VNC/CDP) with its own security review |
 | ADR-035 | Saved ATS logins: `ats_credentials` (encrypted password, write-only API, used only on a domain in `APPLICATION_LOGIN_DOMAINS`, once per run, inside `redaction.holding`) and `ats_sessions` (the person's window storage, scoped to its own domain, `APPLICATION_AUTH_SESSIONS_ENABLED`, `ATS_SESSION_MAX_DAYS`). Signup is always the person's; a generated password is shown once. Used only by the browser-use runner, never by the ephemeral or JD-recovery browsers. | The owner chose session reuse plus a vault (2026-10-26). Supersedes ADR-029's "no session material" for the runner only; `AuthenticatedApplicationBrowser` in-process stays unimplemented. | A credential leak path, or an ATS whose login needs a second factor every time |
 
+**Proposed in Phase 7 (2026-10-29, branch `feat/agent-evaluation-feedback`; accepted only when the Phase 7 PR is approved)**
+
+| ID | Decision | Reason / consequences | Revisit if |
+| --- | --- | --- | --- |
+| ADR-036 | Evaluation and correlation add no telemetry table. The journey and correction rates are read models over the domain's rows; the one new fact (retrieval latency) is a nullable column on `llm_request_logs`. Offline suites are versioned LangSmith-shaped datasets run by `scripts/agent_eval.py` against production code, each with review gates (zero-tolerance for false confirmations, unsafe browser actions, unsupported claims, unconfirmed sensitive answers, cross-resume leaks, fabricated employer quotes, false hides and rejections read as model errors). Nothing is uploaded; `--jsonl` is for a manual import. | §9 metric sourcing: deterministic and from stored facts, so a dashboard and a journey can never disagree with the tables. Consequence: model quality is measured offline on recorded or synthetic cases, and per-model quality in production stays `UNSUPPORTED` until outcomes are stored per model. | A metric no stored fact can answer, or a hosted evaluation run with its own privacy review |
+
 ## 5. Core data and durability contracts
 
 ### Authority boundaries
@@ -538,7 +544,7 @@ This section is intended to change after *each approved phase merge*. Initial en
 | 4. Preparation / insights graphs | MERGED | [#84](https://github.com/triump0870/AI-Job-Hunt/pull/84) | `4317292` | 2026-10-19 note below | OFF (`PREPARATION_GRAPH_MODE=off`, `JOB_INSIGHTS_GRAPH_MODE=off`); approval digest and state sync always on |
 | 5. Application execution | IN_REVIEW | (this branch) | — | 2026-10-19 Phase 5 note below | OFF (`APPLICATION_EXECUTION_MODE=off`); pre-submit claims always on; no submit path |
 | 6. Guarded agentic submission | NOT_STARTED | — | — | — | OFF |
-| 7. Evaluation and feedback | NOT_STARTED | — | — | — | OFF |
+| 7. Evaluation and feedback | IN_REVIEW | (this branch) | — | 2026-10-29 Phase 7 note below; `docs/evals/phase7-report.md` | Read models always on; offline evals manual; LangSmith export still OFF (`AGENT_LANGSMITH_EXPORT_ENABLED=false`) |
 | 8. Production hardening | NOT_STARTED | — | — | — | OFF |
 
 Allowed status: NOT_STARTED, PLANNING, IN_PROGRESS, IN_REVIEW, MERGED, BLOCKED, ROLLED_BACK. Update only with evidence. Prefer a new dated progress note below to explain scope, deferrals and decisions rather than overwriting history.
@@ -918,6 +924,38 @@ Allowed status: NOT_STARTED, PLANNING, IN_PROGRESS, IN_REVIEW, MERGED, BLOCKED, 
     refused while GUARDED_AUTO rows exist.
 - Next dependency: the owner's explicit go-ahead for one real guarded submission on a chosen job before any allowlist
   entry is used in production.
+
+### 2026-10-29 — Phase 7: evaluation, feedback and the correlated journey
+- Branch / PR: `feat/agent-evaluation-feedback` (PR linked in the ledger once opened).
+- Base / merge SHA: base `267554f` (main with #105).
+- What shipped:
+  - **The application journey** (`app/services/journey.py`, `GET /api/orchestration/jobs/{id}/journey`): discovery →
+    description → retrieval → model → packet → execution → confirmation → Gmail outcome, from stored facts, safe ids
+    only, cost counted once, unknown as UNKNOWN; the per-job trace adds execution, claim, intent and match events.
+  - **Correlation at the gateway:** `LLMClient.generate_prompt` narrows the open trace to the call's job or
+    application, so gateway external rows made inside a sweep carry the job.
+  - **Monitoring:** retrieval latency (`llm_request_logs.retrieval_ms`), failover rate, off-configuration rate,
+    p50/p99 beside p95 per stage and worker, cost per successful task on AI nodes, unknown cost no longer shown as $0.
+  - **Graph:** Submission confirmation and Email review nodes with measured edges; planned stages drawn as planned.
+  - **Offline evaluation** (`scripts/agent_eval.py`, ADR-036): eight suites, versioned datasets, review gates; and
+    `GET /api/monitoring/feedback` (human correction rate, recruiter outcomes apart).
+  - **Export hardening:** OTP/opaque-token/cookie shapes refused at the projection and the wire, URL and header check,
+    LangSmith key pattern, exporter guard over `job_hunt_agent/`, `scripts/`, `sidecars/`.
+- New migrations, flags, APIs: migration `0061` (`llm_request_logs.retrieval_ms`, `retrieval_mode`); no flags;
+  `/api/orchestration/jobs/{id}/journey`, `/api/monitoring/feedback`.
+- Architectural decisions and deviations: ADR-036. Deviation: the JD parser suite scores recorded outputs (a model is
+  compared by recording its outputs as a new dataset version), not a live call. Fix found by the evaluation:
+  `answer_resolver.plan` no longer raises when a verified saved answer fits none of a select's options (the field is
+  left for the person).
+- Test/evaluation evidence: `tests/test_phase7_journey.py`, `tests/test_agent_eval.py`, Phase 7 additions to
+  `tests/test_agents_tracing.py` and `tests/test_external_api_guard.py`; `docs/evals/phase7-report.md` (all gates PASS).
+- Known gaps: no live-model evaluation run in CI; LangSmith dataset upload is manual; question memory (user-approved
+  ATS corrections) is drawn as planned, not built; correction rates are per account, not per model.
+- Reviewer / approval: pending.
+- Production activation and rollback: the read models and Monitoring figures are on with the merge; offline evaluation
+  runs only when invoked. Rollback is a revert; migration `0061` downgrades cleanly (two nullable columns), and
+  business logs are untouched.
+- Next dependency: Phase 8 (production hardening) — not started.
 
 ### Phase update template
 

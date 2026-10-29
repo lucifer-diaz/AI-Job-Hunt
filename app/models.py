@@ -1658,6 +1658,10 @@ class LLMRequestLog(Base):
     full_available_context_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     selected_context_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     context_reduction_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Evidence retrieval for that context (RAG_RETRIEVAL_MODE=on, app.services.rag_retrieval): how long it took and
+    # whether its result was used ("on") or the deterministic builder's ("fallback"). NULL: no retrieval ran.
+    retrieval_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    retrieval_mode: Mapped[str | None] = mapped_column(String(20), nullable=True)
     debug_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
     debug_response: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Model routing (app.services.model_resolution): which worker asked, what it was configured to use, and what

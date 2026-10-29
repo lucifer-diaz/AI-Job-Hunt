@@ -38,7 +38,7 @@ from app.models import (
     LLMRequestLog,
     ResumeVariant,
 )
-from app.services.monitoring import percentile
+from app.services.monitoring import off_configuration, percentile
 
 L = LLMRequestLog
 # Every column the aggregates read. Metadata and numbers only: never prompt or response text.
@@ -50,7 +50,7 @@ COLUMNS = (L.id, L.created_at, L.user_id, L.stage, L.provider, L.model, L.reques
            L.estimated_cost, L.cost_source, L.structured_output_valid, L.structured_output_retry_count,
            L.validation_failure_reason, L.workflow_type, L.workflow_entity_id, L.worker_type, L.configured_model,
            L.config_version, L.routing_tier, L.service_tier, L.fallback_used, L.escalated, L.escalation_reason,
-           L.confidence)
+           L.confidence, L.model_group, L.routing_cause, L.retrieval_ms)
 
 GROUPINGS: dict[str, Callable[[Any], str]] = {
     "model": lambda r: r.model or r.requested_model or "unknown",
@@ -169,6 +169,8 @@ def block(items: list[Any], seconds: float) -> dict[str, Any]:
     contexts = [r.estimated_context_tokens for r in items if r.estimated_context_tokens is not None]
     selection = [r for r in items if r.selected_context_tokens is not None and r.full_available_context_tokens]
     confidences = [r.confidence for r in items if r.confidence is not None]
+    compared = [x for x in (off_configuration(r) for r in items) if x is not None]
+    retrievals = [r.retrieval_ms for r in items if getattr(r, "retrieval_ms", None) is not None]
     per_minute = Counter(r.created_at.replace(second=0, microsecond=0) for r in items)
 
     priced = [r for r in items if r.estimated_cost is not None]
@@ -201,6 +203,13 @@ def block(items: list[Any], seconds: float) -> dict[str, Any]:
             "fallback_requests": sum(r.fallback_used is True for r in routed),
             "fallback_rate": _rate(sum(r.fallback_used is True for r in routed), len(routed)),
             "fallback_unknown": total - len(routed),
+            # Failover (app.services.failover) moved the request off a resting model before it was sent; the
+            # gateway's own fallback is fallback_rate above. Configuration mismatch: answered by another model than
+            # configured, over the requests where both are known (model_mismatch_samples).
+            "failover_requests": sum(r.routing_cause == "FAILOVER" for r in items),
+            "failover_rate": _rate(sum(r.routing_cause == "FAILOVER" for r in items), total),
+            "model_mismatch_requests": sum(compared), "model_mismatch_samples": len(compared),
+            "model_mismatch_rate": _rate(sum(compared), len(compared)),
             "escalated_requests": sum(bool(r.escalated) for r in items),
             "escalation_rate": _rate(sum(bool(r.escalated) for r in items), len(first_try)),
             "schema_checked": len(checked),
@@ -214,6 +223,9 @@ def block(items: list[Any], seconds: float) -> dict[str, Any]:
             "ttft_p50_ms": percentile(ttfts, 50), "ttft_p95_ms": percentile(ttfts, 95), "ttft_samples": len(ttfts),
             "generation_avg_ms": _avg(generations, 0), "generation_samples": len(generations),
             "queue_wait_p95_ms": percentile(waits, 95), "queue_wait_samples": len(waits),
+            # Evidence retrieval before the call (llm_request_logs.retrieval_ms); unknown when none ran.
+            "retrieval_p50_ms": percentile(retrievals, 50), "retrieval_p95_ms": percentile(retrievals, 95),
+            "retrieval_samples": len(retrievals),
             "tokens_per_sec": _rounded(percentile(rates, 50), 1), "tokens_per_sec_samples": len(rates),
             # Wall-clock milliseconds per generated token, over successful requests that reported both.
             "ms_per_output_token": _rounded(sum(r.latency_ms for r in with_tokens)

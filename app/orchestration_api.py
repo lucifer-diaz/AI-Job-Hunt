@@ -18,7 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.auth import CurrentUser, current_user, get_user_db
-from app.services import monitoring, orchestration
+from app.services import journey, monitoring, orchestration
 from app.services import orchestration_topology as topo
 
 router = APIRouter(prefix="/api/orchestration")
@@ -115,6 +115,16 @@ def job_trace(job_id: int, user: CurrentUser = Depends(current_user),
               db: Session = Depends(get_user_db)) -> dict[str, Any]:
     """Workflow, task, LLM, external-call and log events for one job, in timestamp order. Metadata only."""
     found = orchestration.job_trace(db, job_id, user.id)
+    if found is None:
+        raise HTTPException(404, "Job not found")
+    return found
+
+
+@router.get("/jobs/{job_id}/journey")
+def job_journey(job_id: int, user: CurrentUser = Depends(current_user),
+                db: Session = Depends(get_user_db)) -> dict[str, Any]:
+    """One application journey, discovery to Gmail outcome, from the facts each stage stores. Safe ids only."""
+    found = journey.journey(db, job_id, user.id)
     if found is None:
         raise HTTPException(404, "Job not found")
     return found

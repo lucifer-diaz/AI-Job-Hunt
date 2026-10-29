@@ -47,10 +47,11 @@ async function loadOrchestration() {
 async function orchLoadJob(withTrace = true) {
   const o = orchState(); if (!o.jobId) return;
   try {
-    const [job, trace] = await Promise.all([api(`/api/orchestration/jobs/${o.jobId}`),
-      withTrace ? api(`/api/orchestration/jobs/${o.jobId}/trace`) : Promise.resolve(D.orchTrace)]);
-    Object.assign(D, { orchJob: job, orchTrace: trace });
-  } catch (e) { toast(e.message, true); o.jobId = null; D.orchJob = D.orchTrace = null; }
+    const [job, trace, journey] = await Promise.all([api(`/api/orchestration/jobs/${o.jobId}`),
+      withTrace ? api(`/api/orchestration/jobs/${o.jobId}/trace`) : Promise.resolve(D.orchTrace),
+      withTrace ? api(`/api/orchestration/jobs/${o.jobId}/journey`).catch(() => null) : Promise.resolve(D.orchJourney)]);
+    Object.assign(D, { orchJob: job, orchTrace: trace, orchJourney: journey });
+  } catch (e) { toast(e.message, true); o.jobId = null; D.orchJob = D.orchTrace = D.orchJourney = null; }
 }
 /* Per model that actually answered, per configuration version and over time: the Monitoring comparison, for this stage. */
 function orchModelPerformance(d) {
@@ -166,7 +167,9 @@ function orchMetricLine(g, n, rt) {
 
 /* ───────────── layout ───────────── */
 function orchLayout(g) {
-  const nodes = g.topology.nodes, G = ORCH_GRID;
+  // Planned stages take a grid place too, so they are drawn where they will sit (and never overlap a running one).
+  const nodes = [...g.topology.nodes, ...(g.topology.reserved || []).filter(r => r.position)
+    .map(r => ({ ...r, position: { col: r.position[0], row: r.position[1] } }))], G = ORCH_GRID;
   const cols = nodes.map(n => n.position.col), rows = nodes.map(n => n.position.row);
   const c0 = Math.min(...cols), r0 = Math.min(...rows);
   const pos = Object.fromEntries(nodes.map(n => [n.id, { x: G.pad + (n.position.col - c0) * G.dx, y: G.pad + (n.position.row - r0) * G.dy }]));
@@ -214,7 +217,8 @@ function orchCanvas(g) {
       <path class="orch-edge-hit" d="${geo.d}"/><path class="orch-edge-line" d="${geo.d}" style="stroke-width:${width.toFixed(2)}px" marker-end="url(#orch-arrow${walked ? '-on' : ''})"/>
       ${text ? `<text class="orch-edge-label" x="${geo.lx.toFixed(1)}" y="${geo.ly.toFixed(1)}" text-anchor="middle">${esc(text)}</text>` : ''}</g>`;
   }).join('');
-  const nodes = g.topology.nodes.map(n => orchNode(g, n, L.pos[n.id], path)).join('');
+  const nodes = g.topology.nodes.map(n => orchNode(g, n, L.pos[n.id], path)).join('')
+    + (g.topology.reserved || []).filter(r => L.pos[r.id]).map(r => orchPlannedNode(r, L.pos[r.id])).join('');
   const v = o.view || { x: 0, y: 0, k: 0.7 };
   return `<div class="orch-canvas" data-orch-canvas tabindex="0" aria-label="Pipeline graph. Drag to pan, scroll or press + and − to zoom, 0 to fit.">
     <div class="orch-world" data-orch-world style="width:${L.width}px;height:${L.height}px;transform:translate(${v.x}px,${v.y}px) scale(${v.k})">
@@ -251,6 +255,15 @@ function orchNode(g, n, p, path) {
     ${rt.recommendations ? `<span class="orch-rec" title="${rt.recommendations} AI Optimization recommendation${rt.recommendations === 1 ? '' : 's'}">${rt.recommendations}</span>` : ''}
     ${rt.llm?.fallbacks ? `<span class="orch-flag" title="Fallback models answered ${rt.llm.fallbacks} request${rt.llm.fallbacks === 1 ? '' : 's'} in this range">↪ fallback</span>` : ''}
   </button>`;
+}
+
+// A planned stage: drawn so the map is honest about what is missing, with no status, metric or model.
+function orchPlannedNode(r, p) {
+  return `<div class="orch-node orch-planned" style="left:${p.x}px;top:${p.y}px;width:${ORCH_GRID.w}px;height:${ORCH_GRID.h}px" role="note" aria-label="${attr(`${r.label}, planned, not running`)}" title="${attr(r.description)}">
+    <span class="orch-node-head"><span class="orch-node-title">${esc(r.label)}</span></span>
+    <span class="orch-node-sub">Planned · not built yet</span>
+    <span class="orch-node-foot"><span class="orch-chip muted">Planned</span></span>
+  </div>`;
 }
 
 /* ───────────── screen ───────────── */
@@ -401,7 +414,11 @@ function orchNodePerformance(g, n, d) {
       ${orchTile('Cost', l.estimated_cost == null ? 'Unknown' : monUSD(l.estimated_cost), l.unpriced_requests ? `${l.unpriced_requests} unpriced` : l.free ? 'free' : '')}
       ${orchTile('Retry rate', monPct(l.retry_rate))}${orchTile('Timeouts', monPct(l.timeout_rate))}
       ${orchTile('Schema pass', monPct(l.schema_pass_rate), l.schema_checked ? `${l.schema_failures} of ${l.schema_checked} failed` : 'not checked')}
-      ${orchTile('Fallback', monPct(l.fallback_rate), `${l.fallbacks} answered by fallback`)}${orchTile('Escalation', monPct(l.escalation_rate), `${l.escalations} escalated`)}</div>`
+      ${orchTile('Fallback', monPct(l.fallback_rate), `${l.fallbacks} answered by fallback`)}${orchTile('Escalation', monPct(l.escalation_rate), `${l.escalations} escalated`)}
+      ${orchTile('Failover', monPct(l.failover_rate), `${l.failovers ?? 0} moved off a resting model`)}
+      ${orchTile('Off configuration', l.model_mismatch_samples ? monPct(l.model_mismatch_rate) : '—', l.model_mismatch_samples ? `of ${l.model_mismatch_samples} with both known` : 'unknown')}
+      ${orchTile('Cost / done task', l.cost_per_successful_task == null ? 'Unknown' : monUSD(l.cost_per_successful_task), 'failed attempts included')}
+      ${l.retrieval_samples ? orchTile('Retrieval p50 / p95', `${monMs(l.retrieval_p50_ms)} / ${monMs(l.retrieval_p95_ms)}`, `${l.retrieval_samples} retrievals`) : ''}</div>`
     : '<div class="small muted mb12">No model calls in this range.</div>') : '';
   const tasks = t ? `<div class="caps-sm mt14 mb8">Tasks · ${t.tasks}${t.truncated ? '+' : ''}</div><div class="orch-tiles">${orchTile('Completed', t.completed)}${orchTile('Failed', t.failed, monPct(t.failure_rate))}
       ${t.blocked != null ? orchTile('Blocked', t.blocked) : ''}${orchTile('Retried', t.retried, monPct(t.retry_rate))}${orchTile('Median run', orchSecs(t.median_run_seconds), `p95 ${orchSecs(t.p95_run_seconds)}`)}</div>` : '';
@@ -469,10 +486,28 @@ function orchEdgeDrawer() {
     <h2 class="orch-drawer-title">${esc(from?.label || o.edge.source)} → ${esc(to?.label || o.edge.target)}</h2><div class="small muted">${esc(e?.label || '')}</div></div>
     <button class="btn sm" data-act="orch-close" aria-label="Close details">✕</button></div></div><div class="orch-drawer-body" data-scroll-key="orch-edge-${esc(o.edge.source)}-${esc(o.edge.target)}">${body}</div></aside>`;
 }
+const ORCH_JOURNEY = { discovery: 'Discovery', description: 'Description', retrieval: 'Retrieval', model: 'Model calls', packet: 'Packet',
+  execution: 'Execution', confirmation: 'Confirmation', gmail_outcome: 'Gmail outcome' };
+const ORCH_JOURNEY_TONE = { DONE: 'good', IN_PROGRESS: 'info', WAITING: 'muted', FAILED: 'bad', BLOCKED: 'bad', NEEDS_REVIEW: 'warn', UNCERTAIN: 'warn', NOT_REACHED: 'muted', UNKNOWN: 'muted' };
+// The application journey: one line per stage, from the stored fact that backs it. Unknown stays unknown.
+function orchJourney(j) {
+  if (!j?.stages) return '';
+  const fact = s => s.stage === 'model' ? `${s.calls.length} call${s.calls.length === 1 ? '' : 's'} · actual ${s.actual_models.join(', ') || 'unknown'}${s.configured_models.length ? ` · configured ${s.configured_models.join(', ')}` : ''}`
+    : s.stage === 'retrieval' ? `max ${monMs(s.retrieval_ms_max)} · ${Object.entries(s.modes).map(([k, v]) => `${k} ${v}`).join(', ')}`
+    : s.stage === 'confirmation' ? [s.evidence === 'verified_browser' ? 'site confirmed' : s.evidence, s.intent_status, s.confirmation_id].filter(Boolean).join(' · ')
+    : s.stage === 'gmail_outcome' ? `${s.events.map(e => `${e.event_type.replace(/_/g, ' ').toLowerCase()}${e.decided_by === 'person' ? ' (you)' : ''}`).join(', ') || 'no classification'}${s.review_message_ids.length ? ` · ${s.review_message_ids.length} to review` : ''}`
+    : s.stage === 'execution' ? [s.mode, s.backend, s.execution_stage, s.result_code].filter(Boolean).join(' · ')
+    : s.stage === 'packet' ? [s.variant_version && `v${s.variant_version}`, s.digest_prefix && `approved ${s.digest_prefix}`, s.approval_override && 'override'].filter(Boolean).join(' · ')
+    : s.stage === 'description' ? [s.parse_status, s.fetch_result, s.quality].filter(Boolean).join(' · ') : (s.board || '');
+  const c = j.cost;
+  return `<div class="caps-sm mb6">Application journey</div><ol class="orch-journey mb12">${j.stages.map(s => `<li class="row between gap8 small"><span class="b">${esc(ORCH_JOURNEY[s.stage] || s.stage)}</span>
+      <span class="ellipsis muted">${esc(s.status === 'UNKNOWN' ? s.detail : fact(s))}</span>${pill(s.status.replace(/_/g, ' ').toLowerCase(), ORCH_JOURNEY_TONE[s.status] || 'muted')}</li>`).join('')}</ol>
+    <div class="xs muted mb12">Cost ${c.cost == null ? 'unknown' : monUSD(c.cost)}${c.unpriced ? ` · ${c.unpriced} unpriced` : ''} · each call counted once · recruiter outcome: ${esc(j.recruiter_outcome.stage || '—')} (never attributed to a model)</div>`;
+}
 function orchTraceDrawer() {
   const o = orchState(); if (!o.traceOpen) return '';
   const t = D.orchTrace;
-  const body = !t ? loading() : `<div class="xs muted mb10">${esc(t.note)} Sources: ${esc(Object.entries(t.sources).map(([k, v]) => `${k} ${v}`).join(' · '))}</div>
+  const body = !t ? loading() : `${orchJourney(D.orchJourney)}<div class="xs muted mb10">${esc(t.note)} Sources: ${esc(Object.entries(t.sources).map(([k, v]) => `${k} ${v}`).join(' · '))}</div>
     ${t.trace_ids.length ? `<div class="row gap6 wrap mb12">${t.trace_ids.slice(0, 8).map(id => btn(`Trace ${id.slice(0, 8)} in Logs`, 'orch-mon-trace', { id }, 'sm')).join('')}</div>` : ''}
     <ol class="orch-trace">${t.events.map(e => `<li class="src-${e.source}"><div class="row between gap8"><span class="small b">${esc(e.title)}</span><span class="mono xs muted none">${esc(fmtDateTime(e.at))} ${esc(orchTime(e.at))}</span></div>
       <div class="xs muted">${esc([e.source, e.node_id ? orchNodeDef(e.node_id)?.label : null, e.status, e.actor, e.detail, e.error, e.level].filter(Boolean).join(' · '))}</div>
@@ -568,7 +603,7 @@ function orchZoomAt(factor, px, py) {
 async function orchSelectJob(id) {
   const o = orchState();
   Object.assign(o, { jobId: Number(id), mode: 'live', jobQuery: '', node: null, edge: null });
-  D.orchJobResults = null; D.orchJob = D.orchTrace = null;
+  D.orchJobResults = null; D.orchJob = D.orchTrace = D.orchJourney = null;
   render();
   await orchLoadJob();
   render(); scheduleOrchPoll();
@@ -612,8 +647,8 @@ const ORCHESTRATION_ACTIONS = {
   'orch-packet': el => orchSelectJob(el.dataset.id),
   'orch-pick-job': el => orchSelectJob(el.dataset.id),
   // From Monitoring (an LLM request or a log line about a job) straight to that job's path.
-  'orch-view-job': el => { const o = orchState(); Object.assign(o, { jobId: Number(el.dataset.id), mode: 'live', node: null, edge: null }); D.orchJob = D.orchTrace = null; if (S.mon) Object.assign(S.mon, { request: null }); go('orchestration'); },
-  'orch-clear-job': () => { orchState().jobId = null; D.orchJob = D.orchTrace = null; render(); scheduleOrchPoll(); },
+  'orch-view-job': el => { const o = orchState(); Object.assign(o, { jobId: Number(el.dataset.id), mode: 'live', node: null, edge: null }); D.orchJob = D.orchTrace = D.orchJourney = null; if (S.mon) Object.assign(S.mon, { request: null }); go('orchestration'); },
+  'orch-clear-job': () => { orchState().jobId = null; D.orchJob = D.orchTrace = D.orchJourney = null; render(); scheduleOrchPoll(); },
   'orch-trace': async () => {
     const o = orchState(); o.traceOpen = true; render();
     if (!D.orchTrace && o.jobId) { await orchLoadJob(); render(); }

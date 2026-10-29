@@ -1,0 +1,252 @@
+{
+ "name": "jd_parser",
+ "version": 1,
+ "description": "Recorded JD parser outputs (synthetic postings) against hand-written reference requirements. Scores the contract, level normalisation and grounding (job_description.validated / ground). Record a new model's outputs as a new version to compare models.",
+ "examples": [
+  {
+   "key": "levels-and-quotes",
+   "inputs": {
+    "posting": "Backend Engineer at Acme. Requirements: 5+ years of Python experience is required. Experience with Kubernetes is a plus. You must be able to work in Singapore.",
+    "recorded_output": {
+     "structured_description": {},
+     "requirements": [
+      {
+       "type": "SKILL",
+       "normalized_value": "Python",
+       "requirement_level": "REQUIRED",
+       "source_text": "5+ years of Python experience is required",
+       "is_explicit": true,
+       "is_derived": false,
+       "confidence": 0.8
+      },
+      {
+       "type": "SKILL",
+       "normalized_value": "Kubernetes",
+       "requirement_level": "PREFERRED",
+       "source_text": "Experience with Kubernetes is a plus",
+       "is_explicit": true,
+       "is_derived": false,
+       "confidence": 0.8
+      },
+      {
+       "type": "WORK_AUTHORIZATION",
+       "normalized_value": "Work authorization in Singapore",
+       "requirement_level": "REQUIRED",
+       "source_text": "You must be able to work in Singapore",
+       "is_explicit": true,
+       "is_derived": false,
+       "confidence": 0.8
+      }
+     ]
+    }
+   },
+   "outputs": {
+    "requirements": [
+     {
+      "value": "Python",
+      "level": "REQUIRED",
+      "explicit": true
+     },
+     {
+      "value": "Kubernetes",
+      "level": "PREFERRED",
+      "explicit": true
+     },
+     {
+      "value": "Work authorization in Singapore",
+      "level": "REQUIRED",
+      "explicit": true
+     }
+    ]
+   }
+  },
+  {
+   "key": "invented-quote-is-demoted",
+   "inputs": {
+    "posting": "Engineering Manager. You will lead a team of six engineers. A degree in computer science is preferred.",
+    "recorded_output": {
+     "structured_description": {},
+     "requirements": [
+      {
+       "type": "LEADERSHIP",
+       "normalized_value": "Team leadership",
+       "requirement_level": "REQUIRED",
+       "source_text": "You will lead a team of six engineers",
+       "is_explicit": true,
+       "is_derived": false,
+       "confidence": 0.8
+      },
+      {
+       "type": "EDUCATION",
+       "normalized_value": "Computer science degree",
+       "requirement_level": "PREFERRED",
+       "source_text": "A degree in computer science is preferred",
+       "is_explicit": true,
+       "is_derived": false,
+       "confidence": 0.8
+      },
+      {
+       "type": "EDUCATION",
+       "normalized_value": "PhD",
+       "requirement_level": "REQUIRED",
+       "source_text": "A PhD in machine learning is mandatory",
+       "is_explicit": true,
+       "is_derived": false,
+       "confidence": 0.8
+      }
+     ]
+    }
+   },
+   "outputs": {
+    "requirements": [
+     {
+      "value": "Team leadership",
+      "level": "REQUIRED",
+      "explicit": true
+     },
+     {
+      "value": "Computer science degree",
+      "level": "PREFERRED",
+      "explicit": true
+     },
+     {
+      "value": "PhD",
+      "level": "REQUIRED",
+      "explicit": false
+     }
+    ]
+   }
+  },
+  {
+   "key": "derived-stays-derived",
+   "inputs": {
+    "posting": "Data Engineer. Strong experience with SQL and Airflow. Familiarity with dbt would be great.",
+    "recorded_output": {
+     "structured_description": {},
+     "requirements": [
+      {
+       "type": "SKILL",
+       "normalized_value": "SQL",
+       "requirement_level": "REQUIRED",
+       "source_text": "Strong experience with SQL and Airflow",
+       "is_explicit": true,
+       "is_derived": false,
+       "confidence": 0.8
+      },
+      {
+       "type": "SKILL",
+       "normalized_value": "Airflow",
+       "requirement_level": "REQUIRED",
+       "source_text": "Strong experience with SQL and Airflow",
+       "is_explicit": true,
+       "is_derived": false,
+       "confidence": 0.8
+      },
+      {
+       "type": "SKILL",
+       "normalized_value": "dbt",
+       "requirement_level": "PREFERRED",
+       "source_text": "Familiarity with dbt would be great",
+       "is_explicit": true,
+       "is_derived": false,
+       "confidence": 0.8
+      },
+      {
+       "type": "SKILL",
+       "normalized_value": "Data modelling",
+       "requirement_level": "UNKNOWN",
+       "source_text": "",
+       "is_explicit": false,
+       "is_derived": true,
+       "confidence": 0.8
+      }
+     ]
+    }
+   },
+   "outputs": {
+    "requirements": [
+     {
+      "value": "SQL",
+      "level": "REQUIRED",
+      "explicit": true
+     },
+     {
+      "value": "Airflow",
+      "level": "REQUIRED",
+      "explicit": true
+     },
+     {
+      "value": "dbt",
+      "level": "PREFERRED",
+      "explicit": true
+     },
+     {
+      "value": "Data modelling",
+      "level": "UNKNOWN",
+      "explicit": false
+     }
+    ]
+   }
+  },
+  {
+   "key": "unknown-level-vocabulary-is-unknown",
+   "inputs": {
+    "posting": "Data Engineer. Strong experience with SQL and Airflow. Familiarity with dbt would be great.",
+    "recorded_output": {
+     "structured_description": {},
+     "requirements": [
+      {
+       "type": "SKILL",
+       "normalized_value": "SQL",
+       "requirement_level": "MUST",
+       "source_text": "Strong experience with SQL and Airflow",
+       "is_explicit": true,
+       "is_derived": false,
+       "confidence": 0.8
+      }
+     ]
+    }
+   },
+   "outputs": {
+    "requirements": [
+     {
+      "value": "SQL",
+      "level": "UNKNOWN",
+      "explicit": true
+     }
+    ]
+   }
+  },
+  {
+   "key": "another-workers-shape-is-refused",
+   "inputs": {
+    "posting": "Backend Engineer at Acme. Requirements: 5+ years of Python experience is required. Experience with Kubernetes is a plus. You must be able to work in Singapore.",
+    "recorded_output": {
+     "structured_description": {},
+     "requirements": [
+      {
+       "skill": "Python",
+       "years": 5
+      }
+     ]
+    }
+   },
+   "outputs": {
+    "schema_valid": false
+   }
+  },
+  {
+   "key": "ranking-output-is-refused",
+   "inputs": {
+    "posting": "Backend Engineer at Acme. Requirements: 5+ years of Python experience is required. Experience with Kubernetes is a plus. You must be able to work in Singapore.",
+    "recorded_output": {
+     "fit_score": 0.8,
+     "decision": "QUALIFY"
+    }
+   },
+   "outputs": {
+    "schema_valid": false
+   }
+  }
+ ]
+}

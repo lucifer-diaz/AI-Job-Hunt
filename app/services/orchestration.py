@@ -41,7 +41,9 @@ from app.models import (
     AIModel,
     AIOptimizationReport,
     Application,
+    ApplicationClaim,
     ApplicationCommunicationEvent,
+    ApplicationEmailMessage,
     ApplicationEvent,
     ApplicationExecutionTask,
     ExternalAPIRequestLog,
@@ -59,6 +61,7 @@ from app.models import (
     RagIndexVersion,
     ResumeVariant,
     SearchRun,
+    SubmissionIntent,
     SystemLogEntry,
     TailorTask,
     WorkflowTransition,
@@ -337,6 +340,7 @@ def llm_metrics(items: list[Any]) -> dict[str, Any]:
     inputs = [r.input_tokens for r in items if r.input_tokens is not None]
     outputs = [r.output_tokens for r in items if r.output_tokens is not None]
     utilization = [r.context_utilization_percent for r in items if r.context_utilization_percent is not None]
+    perf = model_performance.block(items, 3600)
     return {
         "requests": total, "succeeded": total - failed, "failed": failed,
         "success_rate": _rate(total - failed, total), "failure_rate": _rate(failed, total),
@@ -361,6 +365,13 @@ def llm_metrics(items: list[Any]) -> dict[str, Any]:
         "fallback_rate": _rate(sum(r.fallback_used is True for r in routed), len(routed)),
         "escalations": sum(bool(r.escalated) for r in items),
         "escalation_rate": _rate(sum(bool(r.escalated) for r in items), len(first)),
+        "failovers": perf["reliability"]["failover_requests"], "failover_rate": perf["reliability"]["failover_rate"],
+        "model_mismatch_rate": perf["reliability"]["model_mismatch_rate"],
+        "model_mismatch_samples": perf["reliability"]["model_mismatch_samples"],
+        "retrieval_p50_ms": perf["latency"]["retrieval_p50_ms"], "retrieval_p95_ms": perf["latency"]["retrieval_p95_ms"],
+        "retrieval_samples": perf["latency"]["retrieval_samples"],
+        # Failed attempts included, per task that got done; None when no task's request was priced.
+        "cost_per_successful_task": perf["cost"]["per_successful_task"],
         "low_sample": total < LOW_SAMPLE,
     }
 
@@ -750,6 +761,23 @@ def _fact_rows(db: Session, scope: Scope, edge: topo.Edge) -> list[tuple[int | N
         q = select(t.job_id, t.completed_at).where(t.completed_at >= s, t.completed_at <= e,
                                                     t.outcome == "READY_TO_SUBMIT")
         return [(r[0], r[1], None, None) for r in db.execute(_owned(q, t.user_id, u).limit(lim)).all()]
+    if key == "application_execution__submission_confirmation":
+        t = SubmissionIntent
+        q = select(t.job_id, t.clicking_at, t.clicking_at, t.resolved_at).where(t.clicking_at >= s,
+                                                                                 t.clicking_at <= e)
+        return [tuple(r) for r in db.execute(_owned(q, t.user_id, u).limit(lim)).all()]
+    if key == "submission_confirmation__application":
+        t = SubmissionIntent
+        q = select(t.job_id, t.resolved_at).where(t.resolved_at >= s, t.resolved_at <= e, t.status == "CONFIRMED")
+        return [(r[0], r[1], None, None) for r in db.execute(_owned(q, t.user_id, u).limit(lim)).all()]
+    if key == "application_inbox__inbox_review":
+        m, c = ApplicationEmailMessage, ApplicationCommunicationEvent
+        q = select(m.application_id, m.received_at).where(m.match_status == "NEEDS_REVIEW", m.received_at >= s,
+                                                           m.received_at <= e)
+        rows = [(None, r[1], None, None) for r in db.execute(_owned(q, m.user_id, u).limit(lim)).all()]
+        q = select(Application.job_id, c.received_at).join(Application, Application.id == c.application_id).where(
+            c.needs_review.is_(True), c.received_at >= s, c.received_at <= e)
+        return rows + [(r[0], r[1], None, None) for r in db.execute(_owned(q, c.user_id, u).limit(lim)).all()]
     if key == "company_insights__interview_insights":
         t = JobInsightTask
         q = select(t.job_id, t.completed_at).where(t.completed_at >= s, t.completed_at <= e,
@@ -1597,6 +1625,43 @@ def job_trace(db: Session, job_id: int, user_id: int) -> dict[str, Any] | None:
                             .order_by(ApplicationCommunicationEvent.received_at.desc()).limit(50)).all():
             add(r[0], "inbox", r[1], f"Email classified: {r[1].replace('_', ' ').lower()}", node="application_inbox",
                 detail=f"stage decision {r[2]}")
+        # Matching: the status and score only. A message the matcher was unsure of stays NEEDS_REVIEW.
+        for r in db.execute(select(ApplicationEmailMessage.id, ApplicationEmailMessage.received_at,
+                                   ApplicationEmailMessage.match_status, ApplicationEmailMessage.match_score)
+                            .where(ApplicationEmailMessage.application_id == app.id,
+                                   ApplicationEmailMessage.user_id == user_id)
+                            .order_by(ApplicationEmailMessage.received_at.desc()).limit(50)).all():
+            add(r[1], "inbox", f"EMAIL_{r[2]}", f"Email {r[2].replace('_', ' ').lower()}",
+                node="inbox_review" if r[2] == "NEEDS_REVIEW" else "application_inbox", status=r[2],
+                message_id=r[0], match_score=r[3])
+        from app.services.journey import review_messages
+
+        for r in review_messages(db, app.id, user_id):
+            add(r.received_at, "inbox", "EMAIL_NEEDS_REVIEW", "Email waiting for review (not matched)",
+                node="inbox_review", status="NEEDS_REVIEW", message_id=r.id, match_score=r.match_score)
+    for t in db.scalars(select(ApplicationExecutionTask).where(ApplicationExecutionTask.job_id == job.id,
+                                                               ApplicationExecutionTask.user_id == user_id)
+                        .order_by(ApplicationExecutionTask.id.desc()).limit(10)).all():
+        add(t.created_at, "task", "QUEUED", f"Application run queued ({t.mode.lower()})", node="application_execution",
+            task_id=t.id)
+        add(t.started_at, "task", "STARTED", "Application run started", node="application_execution", task_id=t.id,
+            attempt=t.attempt_count)
+        add(t.completed_at, "task", t.stage, f"Application run {t.stage.replace('_', ' ').lower()}",
+            node="application_execution", status=t.status, task_id=t.id, detail=t.result_code)
+    for c in db.scalars(select(ApplicationClaim).where(ApplicationClaim.job_id == job.id,
+                                                       ApplicationClaim.user_id == user_id)
+                        .order_by(ApplicationClaim.id.desc()).limit(10)).all():
+        add(c.claimed_at, "packet", "CLAIMED", f"Posting claimed ({c.client})", node="application", claim_id=c.id)
+        add(c.resolved_at, "packet", c.status, f"Claim {c.status.lower()}", node="application", status=c.status,
+            claim_id=c.id)
+    for i in db.scalars(select(SubmissionIntent).where(SubmissionIntent.job_id == job.id,
+                                                       SubmissionIntent.user_id == user_id)
+                        .order_by(SubmissionIntent.id.desc()).limit(10)).all():
+        add(i.clicking_at, "packet", "CLICKING", "Final submit clicked", node="submission_confirmation",
+            intent_id=i.id)
+        add(i.resolved_at, "packet", i.status, f"Submission {i.status.replace('_', ' ').lower()}",
+            node="submission_confirmation", status=i.status, intent_id=i.id,
+            form_gone=(i.evidence or {}).get("form_gone"))
     trace_ids = set()
     for r in f.llm:
         node = topo.node_for_llm_stage(r.stage)
