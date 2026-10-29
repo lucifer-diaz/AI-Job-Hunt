@@ -112,16 +112,20 @@ def task_dict(task: TailorTask) -> dict[str, Any]:
 # ───────────── per-user operations (the session belongs to the signed-in user) ─────────────
 
 def enqueue(db: Session, ids: list[int], mode: str = "tailor", regenerate: bool = False,
-            pages: int | None = None, options: dict[str, Any] | None = None, commit: bool = True) -> dict[str, Any]:
+            pages: int | None = None, options: dict[str, Any] | None = None, commit: bool = True,
+            revise: bool = False) -> dict[str, Any]:
     """Queue tailoring for jobs in the Tailor queue. Jobs already queued or running, or with a packet
     (unless `regenerate`), are skipped with a reason. `pages` is their page target (None = the default in Settings,
     read when the task runs).
 
     Mode `review` only reviews each job's latest saved packet: it needs one, and skips a packet already reviewed
-    unless `regenerate`."""
+    unless `regenerate`. `revise` (mode `tailor`) makes each run a revision pass that fixes what the job's latest
+    version's review found."""
     wanted = list(dict.fromkeys(ids))
     jobs = {j.id: j for j in db.scalars(select(Job).where(Job.id.in_(wanted))).all()}
-    has_packet = set(db.scalars(select(ResumeVariant.job_id).where(ResumeVariant.job_id.in_(wanted))).all())
+    latest = dict(db.execute(select(ResumeVariant.job_id, func.max(ResumeVariant.id))
+                             .where(ResumeVariant.job_id.in_(wanted)).group_by(ResumeVariant.job_id)).all())
+    has_packet = set(latest)
     reviewed = _latest_reviewed(db, wanted) if mode == "review" else set()
     active = set(db.scalars(select(TailorTask.job_id).where(TailorTask.job_id.in_(wanted),
                                                             TailorTask.status.in_(ACTIVE))).all())
@@ -145,7 +149,9 @@ def enqueue(db: Session, ids: list[int], mode: str = "tailor", regenerate: bool 
         if reason:
             skipped.append({"id": job_id, "reason": reason})
             continue
-        extra = {**({"pages": pages} if pages and mode == "tailor" else {}), **(options or {})}
+        extra = {**({"pages": pages} if pages and mode == "tailor" else {}),
+                 **({"revise_from": latest[job_id]} if revise and mode == "tailor" and job_id in latest else {}),
+                 **(options or {})}
         task = TailorTask(job_id=job.id, mode=mode, regenerate=regenerate, status="queued", stage="queued", attempts=0,
                           options=extra or None)
         try:

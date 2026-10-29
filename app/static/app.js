@@ -1343,7 +1343,7 @@ function renderApprovalsBody(list) {
   const allOn = list.every(q => S.approvalPicked.has(q.id));
   const queue = `<section class="card flush c-narrow"><div class="card-head row gap10"><input type="checkbox" data-act="approval-check-all" ${allOn ? 'checked' : ''} aria-label="Select every job in the queue"><span class="card-title sm grow">Queue · ${waiting} waiting</span></div>
     ${renderApprovalBulkBar(list)}
-    ${list.map(q => `<div class="lrow click ${q.id === S.approvalJob ? 'sel' : ''}" data-act="select-approval" data-id="${q.id}"><input type="checkbox" data-act="approval-check" data-id="${q.id}" ${S.approvalPicked.has(q.id) ? 'checked' : ''} aria-label="Select ${attr(q.title)}">${starButton(q)}<div class="grow"><div class="base b ellipsis">${esc(q.title)}</div><div class="xs muted">${esc(q.company)} · ${esc(q.age)}</div></div>${q.easy_apply ? pill('Easy Apply', 'brand') : ''}${q.approval_override ? pill('waived', 'warn') : ''}${postingClosedPill(q)}<span class="mono bb base" style="color:${q.status === 'approved' ? 'var(--faint)' : (q.reviewer_score || 0) >= 75 ? 'var(--good)' : (q.reviewer_score || 0) >= 65 ? 'var(--warn)' : 'var(--bad)'}">${fitTxt(q.reviewer_score)}</span></div>`).join('')}</section>`;
+    ${list.map(q => `<div class="lrow click ${q.id === S.approvalJob ? 'sel' : ''}" data-act="select-approval" data-id="${q.id}"><input type="checkbox" data-act="approval-check" data-id="${q.id}" ${S.approvalPicked.has(q.id) ? 'checked' : ''} aria-label="Select ${attr(q.title)}">${starButton(q)}<div class="grow"><div class="base b ellipsis">${esc(q.title)}</div><div class="xs muted">${esc(q.company)} · ${esc(q.age)}</div></div>${q.easy_apply ? pill('Easy Apply', 'brand') : ''}${q.approval_override ? pill('waived', 'warn') : ''}${approvalTaskPill(q)}${postingClosedPill(q)}<span class="mono bb base" style="color:${q.status === 'approved' ? 'var(--faint)' : (q.reviewer_score || 0) >= 75 ? 'var(--good)' : (q.reviewer_score || 0) >= 65 ? 'var(--warn)' : 'var(--bad)'}">${fitTxt(q.reviewer_score)}</span></div>`).join('')}</section>`;
   if (!a) return `<div class="split">${queue}<section class="card c-main">${loading()}</section></div>`;
   const r = a.resume, job = a.job;
   const approved = job.status === 'approved';
@@ -1368,6 +1368,9 @@ function renderApprovalsBody(list) {
         <textarea class="textarea mt12" id="approval-notes" data-act-blur="save-notes" data-id="${job.id}" placeholder="Notes for yourself — saved when you click away">${esc(fv('approvalNotes', job.id, a.notes))}</textarea></div></div>` : empty('No packet', 'This job has no tailored resume.')}
   </section></div>`;
 }
+// Packets that can be made again (Retailor) or reviewed again (Re-review): not decided yet, and not already being
+// worked on. The server checks the same and skips the rest with a reason (app.services.tailor_tasks.enqueue).
+const approvalRedoable = picked => picked.filter(q => ['tailored', 'pending_approval'].includes(q.status) && !activeTask(q.id));
 // Acting on several queued jobs at once. Each button counts only the picked jobs it applies to; the server
 // decides each job on its own and reports the ones it skipped. Bulk approval never waives the reviewer minimum.
 function approvalBulkCounts(picked) {
@@ -1376,7 +1379,14 @@ function approvalBulkCounts(picked) {
     reject: picked.length,
     revise: picked.filter(q => q.status !== 'pending_approval').length,
     approve: picked.filter(q => q.status !== 'approved' && q.reviewer_score != null && (min == null || q.reviewer_score >= min)).length,
+    retailor: approvalRedoable(picked).filter(q => q.fit != null).length,
+    review: approvalRedoable(picked).length,
   };
+}
+// A retailoring or re-review running in the background for this packet.
+function approvalTaskPill(q) {
+  const task = activeTask(q.id);
+  return task ? pill(task.mode === 'review' ? 're-reviewing' : 'retailoring', 'brand') : '';
 }
 // The daily posting check found this posting closed; the job stays because you approved it.
 const postingClosedPill = job => job.posting_closed ? `<span title="${attr(`The posting was found closed ${job.posting_closed.ago || ''}. Kept because you approved it.`)}">${pill('posting closed', 'bad')}</span>` : '';
@@ -1395,6 +1405,14 @@ function openPostings(urls) {
   }
   return opened;
 }
+function queueApprovalRedo(mode, busyKey, extra) {
+  const picked = (D.approvals || []).filter(q => S.approvalPicked.has(q.id));
+  const ids = approvalRedoable(picked).filter(q => mode !== 'tailor' || q.fit != null).map(q => q.id);
+  return queueTailoring(ids, mode, true, busyKey, async out => {
+    out.queued.forEach(t => S.approvalPicked.delete(t.job_id));
+    await load();
+  }, extra);
+}
 const BULK_APPROVAL_DONE = { reject: 'Rejected', revise: 'Sent back for revision', approve: 'Approved' };
 function bulkApprovalMsg(out) {
   const n = out.done.length, skipped = out.skipped.length;
@@ -1411,6 +1429,8 @@ function renderApprovalBulkBar(list) {
     <span title="${attr(links < picked.length ? `${picked.length - links} selected job${picked.length - links === 1 ? ' has' : 's have'} no posting link` : 'Open each selected posting in a new tab')}">${btn(`Open postings${links ? ` ${links}` : ''} ↗`, 'bulk-open-postings', {}, 'sm', !links)}</span>
     ${btn('Reject…', 'bulk-reject-open', {}, 'sm ghost danger', working || S.bulkRejecting)}
     ${btn(label('bulkApproval', `Needs revision${n.revise ? ` ${n.revise}` : ''}`, 'Working…'), 'bulk-approval', { action: 'revise' }, 'sm', working || !n.revise)}
+    <span title="Tailor again from each packet's last review, then review the new version. In the background: you can leave this page.">${btn(label('bulkRetailor', `Retailor${n.retailor ? ` ${n.retailor}` : ''}`, 'Queueing…'), 'bulk-retailor', {}, 'sm', working || isBusy('bulkRetailor') || !n.retailor)}</span>
+    <span title="Run the Reviewer again on each packet's current version. Nothing is rewritten.">${btn(label('bulkRereview', `Re-review${n.review ? ` ${n.review}` : ''}`, 'Queueing…'), 'bulk-rereview', {}, 'sm', working || isBusy('bulkRereview') || !n.review)}</span>
     <span title="Approves packets that cleared your reviewer minimum. To waive the minimum, approve that packet on its own.">${btn(label('bulkApproval', `Approve${n.approve ? ` ${n.approve}` : ''}`, 'Working…'), 'bulk-approval', { action: 'approve' }, 'sm good', working || !n.approve)}</span>
     <a href="#" class="small" data-act="approval-check-none">Clear</a></div>`;
   if (!S.bulkRejecting) return head;
@@ -2002,7 +2022,7 @@ async function refreshTasks() {
   if (finished.length) {
     const ok = finished.filter(t => t.status === 'succeeded'), bad = finished.filter(t => t.status === 'failed');
     const one = finished.length === 1 ? finished[0] : null;
-    toast(one ? (one.status === 'succeeded' ? `${one.company}: packet ready · reviewer ${fitTxt(one.result?.reviewer_score)}${one.result?.auto_approved ? ' · auto-approved' : ''}` : one.status === 'failed' ? `${one.company}: ${one.error}` : `${one.company}: cancelled`)
+    toast(one ? (one.status === 'succeeded' ? `${one.company}: ${one.mode === 'review' ? 'reviewed' : 'packet ready'} · reviewer ${fitTxt(one.result?.reviewer_score)}${one.result?.auto_approved ? ' · auto-approved' : ''}` : one.status === 'failed' ? `${one.company}: ${one.error}` : `${one.company}: cancelled`)
       : `${ok.length} packet${ok.length === 1 ? '' : 's'} ready${bad.length ? ` · ${bad.length} failed` : ''}`, !ok.length && !!bad.length);
   }
   if (finished.some(t => t.result?.auto_approved)) refreshApprovals();
@@ -2015,7 +2035,7 @@ function scheduleTaskPoll() {
   if (!(D.tasks || []).some(t => t.status === 'queued' || t.status === 'running')) return;
   taskTimer = setTimeout(async () => {
     const { finished } = await refreshTasks();
-    if (S.screen !== 'tailor') return;
+    if (S.screen !== 'tailor' && S.screen !== 'approvals') return;
     if (finished.length) await load(); else render();
   }, 2500);
 }
@@ -2030,16 +2050,18 @@ function packetLength(r) {
   const over = l.target_pages && l.estimated_pages > l.target_pages + 0.15;
   return ` · ${l.target_pages ? `target ${l.target_pages} page${l.target_pages === 1 ? '' : 's'} · ` : ''}<span data-packet-length${over ? ' style="color:var(--warn)"' : ''}>≈${l.estimated_pages} page${l.estimated_pages === 1 ? '' : 's'}</span>${over ? ' · over target: accept fewer bullets or regenerate' : ''}`;
 }
-function queueTailoring(ids, mode, regenerate, busyKey, onQueued) {
+// `extra` adds to the request: { revise: true } makes each run a revision pass that fixes the packet's last review.
+function queueTailoring(ids, mode, regenerate, busyKey, onQueued, extra = {}) {
   if (!ids.length) return;
   const pages = mode === 'tailor' && S.tailorPages ? { pages: Number(S.tailorPages) } : {};
   return busy(busyKey, async () => {
-    const out = await api('/api/tailor-tasks', { method: 'POST', body: { ids, mode, regenerate, ...pages } });
-    onQueued?.(out);
+    const out = await api('/api/tailor-tasks', { method: 'POST', body: { ids, mode, regenerate, ...pages, ...extra } });
+    await onQueued?.(out);
     await refreshTasks();
     return out;
   }, out => {
-    const n = out.queued.length, verb = mode === 'skip' ? 'Skipping tailoring for' : mode === 'review' ? 'Reviewing' : 'Tailoring';
+    const n = out.queued.length;
+    const verb = mode === 'skip' ? 'Skipping tailoring for' : mode === 'review' ? 'Reviewing' : extra.revise ? 'Retailoring' : 'Tailoring';
     if (!n) return `Nothing queued: ${out.skipped[0]?.reason || 'no eligible jobs'}`;
     return `${verb} ${n} job${n === 1 ? '' : 's'} in the background${out.skipped.length ? ` · ${out.skipped.length} skipped` : ''}`;
   });
@@ -2867,6 +2889,9 @@ const A = {
     if (opened < urls.length) toast(`Opened ${opened} of ${urls.length} postings — your browser blocked the rest. Allow pop-ups for this site and try again.`, true);
     else toast(`Opened ${opened} posting${opened === 1 ? '' : 's'} in new tabs`);
   },
+  // Retailor and Re-review queue background tailor tasks. Queued jobs leave the selection; skipped ones stay picked.
+  'bulk-retailor': () => queueApprovalRedo('tailor', 'bulkRetailor', { revise: true }),
+  'bulk-rereview': () => queueApprovalRedo('review', 'bulkRereview'),
   'bulk-reject-open': () => { S.bulkRejecting = true; delete S.forms.bulkReject; render(); },
   'bulk-reject-close': (el, e) => { e?.preventDefault?.(); S.bulkRejecting = false; delete S.forms.bulkReject; render(); },
   'bulk-reject-reason': el => { setF('bulkReject', 'reason', fv('bulkReject', 'reason', '') === el.dataset.id ? '' : el.dataset.id); render(); },
