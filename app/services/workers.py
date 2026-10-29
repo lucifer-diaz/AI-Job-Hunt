@@ -988,7 +988,10 @@ def _requeue_finished(db: Session, spec: WorkerKind, task: Any, user_id: int) ->
         from app.services import tailor_tasks
 
         # Regenerate: a run that failed in review may already have saved its packet, which a plain enqueue refuses.
-        out = tailor_tasks.enqueue(db, [job.id], task.mode, True)
+        # A retried revision pass still fixes the same review, at the same page target (never `conducted`: a person
+        # asked for this run, not the preparation graph).
+        kept = {k: v for k, v in (task.options or {}).items() if k in ("revise_from", "pages")}
+        out = tailor_tasks.enqueue(db, [job.id], task.mode, True, options=kept or None)
         if out["skipped"]:
             raise WorkerError(f"Cannot tailor again: {out['skipped'][0]['reason']}")
     fresh = db.scalar(select(spec.model).where(spec.model.job_id == job.id, spec.model.user_id == user_id,

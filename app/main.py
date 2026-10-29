@@ -732,7 +732,8 @@ def _packet_response(db: Session, job: Job, resume: ResumeVariant) -> dict:
 @app.post("/api/tailor-tasks")
 def queue_tailor_tasks(payload: TailorTasksIn, db: Session = Depends(get_user_db)):
     """Queue tailoring (or skip tailoring) for jobs; a background worker runs them, so the page can be left."""
-    return tailor_tasks.enqueue(db, payload.ids, payload.mode, payload.regenerate, pages=payload.pages)
+    return tailor_tasks.enqueue(db, payload.ids, payload.mode, payload.regenerate, pages=payload.pages,
+                               revise=payload.revise)
 
 
 @app.get("/api/tailor-tasks")

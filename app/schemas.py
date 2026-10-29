@@ -80,6 +80,7 @@ class TailorTasksIn(BaseModel):
     # skip = send the master resume unchanged; review = only review the latest packet (its review never ran or failed)
     mode: Literal["tailor", "skip", "review"] = "tailor"
     regenerate: bool = False  # also redo jobs that already have a packet
+    revise: bool = False  # tailor mode: a revision pass that fixes what each job's last review found
     # The page target for these jobs (1, 2 or 3; app.services.resume_length). None = the default in Settings.
     pages: Literal[1, 2, 3] | None = None
 
