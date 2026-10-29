@@ -274,9 +274,20 @@ describe('AI Orchestration → Models & routing', () => {
     expect(text()).toContain('36 requests refused as too large');
     expect(text()).toContain('8K prompt + answer tokens/min (TPM)');
     expect(text()).toContain('they are not cut short');
-    expect(text()).toContain('The prompt alone is over');  // the Reviewer: no cap is offered
+    expect(text()).toContain("The prompt alone (~6.2K) is over local-reasoning's limit");  // the Reviewer: no cap is offered
     expect(text()).toContain('No model in your catalog is known to have room');
+    expect(text()).toContain('Last 7 days · 2 workers · 72 requests refused');
     const view = document.getElementById('view');
+    const [rankerCard, reviewerCard] = view.querySelectorAll('.aim-size');
+    // The meter draws the limit these requests overrun most: 6.3K + 800 against the 8K prompt + answer limit.
+    expect(rankerCard.querySelector('.aim-size-meter').getAttribute('aria-label')).toContain('against a limit of 7.8K prompt + answer');
+    expect(rankerCard.querySelector('.aim-size-verdict.brand [data-act="aim-size-cap"]')).not.toBeNull();
+    expect(reviewerCard.querySelector('.aim-size-verdict.warn').textContent).toContain('Switch to a model with more room');
+    expect(reviewerCard.querySelector('[data-act="aim-tab"][data-tab="models"]')).not.toBeNull();
+    const switchBtn = rankerCard.querySelector('[data-act="aim-size-use"]');
+    expect(switchBtn.getAttribute('aria-label')).toBe('Use local-deep instead of local-reasoning for Ranker');
+    expect(switchBtn.classList.contains('primary')).toBe(false);  // the cap is this card's primary action
+    expect(rankerCard.textContent).toContain('Recommended');
     await ui.A['aim-size-cap'](view.querySelector('[data-act="aim-size-cap"]'));
     expect(body('PUT', '/api/settings/ai/workers/RANKER')).toEqual({ revision: 7, max_output_tokens: 1000 });
     await ui.A['aim-size-backup'](view.querySelector('[data-act="aim-size-backup"]'));
@@ -292,6 +303,25 @@ describe('AI Orchestration → Models & routing', () => {
     ui.AIM.data.workers = ui.AIM.data.workers.map(w => w.worker_type === 'RANKER' ? { ...ranker, config: { ...ranker.config, escalation: { model: 'mystery', tier: null, conditions: ['LOW_CONFIDENCE'], confidence_threshold: 0.8 } } } : w);
     await ui.A['aim-size-use'](use('escalation', 'mystery'));
     expect(body('PUT', '/api/settings/ai/workers/RANKER')).toEqual({ revision: 7, escalation: { model: 'local-deep', tier: null, conditions: ['LOW_CONFIDENCE'], confidence_threshold: 0.8 } });
+  });
+  it('makes switching the primary fix when no cap helps, folds extra models away and marks existing backups', async () => {
+    const m = (name, extra = {}) => ({ name, context_window: 131072, proven: false, in_chain: false, ...extra });
+    routes['GET /api/settings/ai'] = () => ({ ...overview(), request_size: [{ worker_type: 'RANKER', label: 'Ranker', model: 'local-reasoning', role: 'primary', count: 1, last_at: '2026-10-25T22:37:42',
+      limits: [{ deployment: 'openai/gpt-oss-120b', kind: 'ITPM', counts: 'input', limit: 6000, requested: 7000 }], typical_input: 7000, typical_output: null, input_over: true, output_cap: null,
+      models: [m('local-deep', { proven: true, in_chain: true }), m('local-fast'), m('mystery', { context_window: null })], has_backup: true }] });
+    await open('workers');
+    const card = document.querySelector('#view .aim-size');
+    expect(card.textContent).toContain('1 request refused as too large');
+    const [first, second] = card.querySelectorAll('.aim-size-model');
+    expect(first.querySelector('[data-act="aim-size-use"]').classList.contains('primary')).toBe(true);
+    expect(first.querySelector('[data-act="aim-size-backup"]')).toBeNull();
+    expect(first.textContent).toContain('Backup');
+    expect(first.textContent).toContain('Proven for this worker');
+    expect(second.querySelector('[data-act="aim-size-backup"]')).not.toBeNull();
+    const more = card.querySelector('details[data-settings-details="aim-size-more:RANKER:local-reasoning"]');
+    expect(more.textContent).toContain('1 more model');
+    expect(more.textContent).toContain('context unknown');
+    expect(card.querySelector('details[data-settings-details="aim-size-limits:RANKER:local-reasoning"]').textContent).toContain('prompt tokens/min (ITPM)');
   });
   it('saves backups in order as the fallback and secondary models, growing the list as it fills', async () => {
     routes['PUT /api/settings/ai/workers/RANKER'] = () => ({ worker: {}, draft_revision: 8 });
