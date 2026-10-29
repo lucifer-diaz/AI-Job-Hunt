@@ -153,3 +153,38 @@ def test_queueing_a_task_wakes_the_tailor_worker_instead_of_waiting_for_the_poll
 
     started = asyncio.run(scenario())
     assert claimed_at and claimed_at[0] - started < 5
+
+
+def test_a_packet_whose_review_failed_is_reviewed_without_tailoring_again(monkeypatch):
+    from app.services import workflow
+
+    use_resume_text(client, "Built Python FastAPI services at 10k rps", name="Test Candidate", headline="Engineer")
+    job_id, fresh = shortlisted_job(), shortlisted_job()
+    assert client.post("/api/tailor-tasks", json={"ids": [job_id], "mode": "skip"}).json()["queued"]
+    real_review = workflow.review_resume
+
+    def down(db, resume):
+        raise RuntimeError("reviewer timed out")
+
+    monkeypatch.setattr(workflow, "review_resume", down)
+    assert tailor_tasks.run_pending(SessionLocal) == 1
+    task = tasks_by_job()[job_id]
+    assert task["status"] == "failed" and task["error"] == "reviewer timed out"
+    saved = client.get(f"/api/tailor/{job_id}").json()["resume"]
+    assert saved["version"] == 1 and saved["reviewer_score"] is None  # the packet was saved before the review
+
+    out = client.post("/api/tailor-tasks", json={"ids": [job_id, fresh], "mode": "review"}).json()
+    assert [t["job_id"] for t in out["queued"]] == [job_id] and out["queued"][0]["mode"] == "review"
+    assert out["skipped"] == [{"id": fresh, "reason": "no packet to review"}]
+    monkeypatch.setattr(workflow, "review_resume", real_review)
+    assert tailor_tasks.run_pending(SessionLocal) == 1
+    task = next(t for t in client.get("/api/tailor-tasks").json() if t["id"] == out["queued"][0]["id"])
+    assert task["status"] == "succeeded", task["error"]
+    assert task["result"]["version"] == 1
+    reviewed = client.get(f"/api/tailor/{job_id}").json()["resume"]
+    assert reviewed["version"] == 1 and reviewed["reviewer_score"] is not None  # the same version, now reviewed
+
+    again = client.post("/api/tailor-tasks", json={"ids": [job_id], "mode": "review"}).json()
+    assert again["skipped"] == [{"id": job_id, "reason": "already reviewed"}]
+    redo = client.post("/api/tailor-tasks", json={"ids": [job_id], "mode": "review", "regenerate": True}).json()
+    assert [t["mode"] for t in redo["queued"]] == ["review"]  # Redo reviews a reviewed packet again

@@ -717,6 +717,28 @@ def test_nudge_approves_a_reviewed_packet_only_where_the_accounts_policy_would(u
         assert db.get(Job, high_id).application.status == "approved"
 
 
+def test_nudge_sends_a_saved_but_unreviewed_packet_to_review(user_id, signed_in):
+    with SessionLocal() as db:
+        unreviewed, reviewed, busy = (add_job(db, user_id, status="tailored") for _ in range(3))
+        db.add_all([ResumeVariant(user_id=user_id, job_id=unreviewed.id, version=1, reviewer_score=80, markdown="x"),
+                    ResumeVariant(user_id=user_id, job_id=unreviewed.id, version=2, markdown="x"),
+                    ResumeVariant(user_id=user_id, job_id=reviewed.id, version=1, reviewer_score=80, markdown="x"),
+                    ResumeVariant(user_id=user_id, job_id=busy.id, version=1, markdown="x"),
+                    TailorTask(user_id=user_id, job_id=busy.id, mode="tailor", status="queued", stage="queued")])
+        db.commit()
+        unreviewed_id, busy_id = unreviewed.id, busy.id
+    client = signed_in(user_id)
+    assert _next(client, "tailoring") == {"to": "Reviewing", "waiting": 1, "job_ids": [unreviewed_id]}
+    out = client.post("/api/workers/tailoring/nudge").json()
+    assert (out["to"], out["moved"], out["skipped"]) == ("Reviewing", [unreviewed_id], [])
+    with SessionLocal() as db:
+        task = db.scalar(select(TailorTask).where(TailorTask.job_id == unreviewed_id))
+        assert (task.mode, task.status, task.run_now_at) == ("review", "queued", None)
+        assert db.scalar(select(func.count()).select_from(TailorTask).where(TailorTask.job_id == busy_id)) == 1
+    assert client.post("/api/workers/tailoring/nudge").json()["moved"] == []  # already queued
+    assert unreviewed_id in [r["job_id"] for r in client.get("/api/workers/reviewing").json()["rows"]]
+
+
 def test_nudge_can_be_limited_to_chosen_jobs_and_says_why_one_was_not_moved(user_id, signed_in, monkeypatch):
     monkeypatch.setattr(get_settings(), "jd_parse_enabled", True)
     with SessionLocal() as db:

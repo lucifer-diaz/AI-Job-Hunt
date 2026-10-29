@@ -133,9 +133,10 @@ def _tailor_max() -> int:
 
 
 def _reviewing(m: Any) -> Any:
-    """The tailor tasks at the review step: reviewing now, a review-only run waiting, or finished while reviewing
-    (tailor_tasks keeps a finished run's last stage)."""
-    return or_(and_(m.status == "running", m.stage == "reviewing"), and_(m.status == "queued", m.mode == "skip"),
+    """The tailor tasks at the review step: reviewing now, a review-only run waiting (skip tailoring, or a review of a
+    saved packet), or finished while reviewing (tailor_tasks keeps a finished run's last stage)."""
+    return or_(and_(m.status == "running", m.stage == "reviewing"),
+               and_(m.status == "queued", m.mode.in_(("skip", "review"))),
                and_(m.status.in_(("succeeded", "failed", "cancelled")), m.stage == "reviewing"))
 
 

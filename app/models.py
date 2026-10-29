@@ -1124,7 +1124,7 @@ class TailorTask(Base):
 
     __tablename__ = "tailor_tasks"
     __table_args__ = (
-        CheckConstraint("mode IN ('tailor', 'skip')", name="ck_tailor_tasks_mode"),
+        CheckConstraint("mode IN ('tailor', 'skip', 'review')", name="ck_tailor_tasks_mode"),
         CheckConstraint("status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')", name="ck_tailor_tasks_status"),
         Index("ix_tailor_tasks_status", "status", "id"),
         # At most one queued or running task per job, so two paths queueing the same job at once cannot both win.
@@ -1136,6 +1136,7 @@ class TailorTask(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"), index=True)
     user_id: Mapped[int] = _owner("tailor_tasks")
+    # tailor | skip (the master resume unchanged, then reviewed) | review (only review the latest saved packet)
     mode: Mapped[str] = mapped_column(String(10), default="tailor")
     regenerate: Mapped[bool] = mapped_column(Boolean, default=False)
     # How to tailor this job: {"pages": 1 | 2 | 3} (app.services.resume_length). None = the account's default.
