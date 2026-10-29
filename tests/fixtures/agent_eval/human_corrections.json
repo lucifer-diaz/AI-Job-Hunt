@@ -1,6 +1,6 @@
 {
  "name": "human_corrections",
- "version": 1,
+ "version": 2,
  "description": "Correction rates from stored facts; the recruiter's outcome reported apart and never counted as a model error. Hand-labelled.",
  "examples": [
   {
@@ -41,14 +41,18 @@
       {
        "method": "USER",
        "user_corrected": true
+      },
+      {
+       "method": "USER",
+       "user_corrected": false
       }
      ]
     }
    },
    "outputs": {
-    "human_correction_rate": 0.25,
+    "human_correction_rate": 0.4,
     "by_signal": {
-     "inbox": 0.25
+     "inbox": 0.4
     }
    }
   },
@@ -152,6 +156,25 @@
     "recruiter_outcome": {
      "rejected": 0,
      "submitted": 0
+    }
+   }
+  },
+  {
+   "key": "only-event-was-corrected",
+   "inputs": {
+    "facts": {
+     "inbox_events": [
+      {
+       "method": "USER",
+       "user_corrected": true
+      }
+     ]
+    }
+   },
+   "outputs": {
+    "human_correction_rate": 1.0,
+    "by_signal": {
+     "inbox": 1.0
     }
    }
   }

@@ -48,6 +48,7 @@ from app.models import (
     ResumeVariant,
     SubmissionIntent,
 )
+from app.services.monitoring import off_configuration
 
 STAGES = ("discovery", "description", "retrieval", "model", "packet", "execution", "confirmation", "gmail_outcome")
 # Every status a stage can show. UNKNOWN: no stored fact.
@@ -114,7 +115,7 @@ def _llm_rows(db: Session, job: Job, application: Application | None, user_id: i
                                 LLMRequestLog.workflow_entity_id == application.id))
     return db.execute(select(LLMRequestLog.id, LLMRequestLog.created_at, LLMRequestLog.stage,
                              LLMRequestLog.worker_type, LLMRequestLog.status, LLMRequestLog.model,
-                             LLMRequestLog.requested_model, LLMRequestLog.configured_model,
+                             LLMRequestLog.requested_model, LLMRequestLog.configured_model, LLMRequestLog.model_group,
                              LLMRequestLog.fallback_used, LLMRequestLog.routing_cause,
                              LLMRequestLog.failed_over_from, LLMRequestLog.estimated_cost,
                              LLMRequestLog.cost_source, LLMRequestLog.retrieval_ms, LLMRequestLog.retrieval_mode,
@@ -142,10 +143,10 @@ def _model(rows: list[Any]) -> dict[str, Any]:
     for r in rows:
         calls.append({"id": r.id, "at": _iso(r.created_at), "stage": r.stage, "worker": r.worker_type,
                       "status": r.status, "actual_model": r.model, "requested_model": r.requested_model,
-                      "configured_model": r.configured_model,
-                      # Unknown stays unknown: a row that never recorded which model answered is not "matched".
-                      "matches_configuration": (r.model == r.configured_model) if r.model and r.configured_model
-                      else None,
+                      "configured_model": r.configured_model, "model_group": r.model_group,
+                      # Monitoring's own comparison (the answering model group against the configured deployment);
+                      # None when either side is unknown, for the auto router and for a failed call.
+                      "matches_configuration": None if (off := off_configuration(r)) is None else not off,
                       "fallback_used": r.fallback_used, "failover": r.routing_cause == "FAILOVER",
                       "failed_over_from": r.failed_over_from, "retry_count": r.retry_count,
                       "cost": r.estimated_cost, "cost_source": r.cost_source, "trace_id": r.trace_id})
@@ -195,7 +196,10 @@ def _confirmation(db: Session, job: Job, application: Application | None, user_i
     intent = db.scalar(select(SubmissionIntent).where(SubmissionIntent.job_id == job.id,
                                                       SubmissionIntent.user_id == user_id)
                        .order_by(SubmissionIntent.id.desc()).limit(1))
-    if intent is not None:
+    # An intent that never submitted (aborted before the click, or resolved as not submitted) does not hide a
+    # submission recorded afterwards: the application's own record wins.
+    unsubmitted = intent is not None and intent.status in ("ABORTED", "RESOLVED_NOT_SUBMITTED")
+    if intent is not None and not (unsubmitted and application is not None and application.applied_at is not None):
         ev = intent.evidence or {}
         return _stage("confirmation", _INTENT_STATUS.get(intent.status, "UNKNOWN"),
                       source=["submission_intents", "applications"], at=intent.resolved_at or intent.clicking_at,

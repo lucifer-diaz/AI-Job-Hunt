@@ -1,6 +1,6 @@
 # Agent evaluation report
 
-Overall: **PASS** · generated 2026-10-29T13:34:12+00:00 · Python 3.11.16
+Overall: **PASS** · generated 2026-10-29T21:33:56+00:00 · Python 3.11.16
 
 Reproduce: `python scripts/agent_eval.py --report docs/evals/phase7-report.md` (mock providers, a throwaway SQLite database, LangSmith export off).
 
@@ -8,12 +8,12 @@ Reproduce: `python scripts/agent_eval.py --report docs/evals/phase7-report.md` (
 | --- | --- | --- | --- | --- |
 | jd_parser | PASS | jd_parser v1 `9e00c5b0c852` | 6 | schema_accuracy 1, requirement_recall 1, requirement_precision 1, level_accuracy 1, grounding_accuracy 1, fabricated_explicit 0 |
 | qualification | PASS | qualification v1 `a15a514286df` | 23 | accuracy 1, false_hide 0, missed_hide 0 |
-| rag | PASS | rag_eval/dataset v1 `4b0d3726a483` | 8 | recall_at_5 1, recall_at_10 1, precision_at_3 0.5833, precision_at_5 0.4125, r_precision 0.8958, citation_correctness 1, leaks 0, latency_p50_ms 5, latency_p95_ms 6 |
+| rag | PASS | rag_eval/dataset v1 `4b0d3726a483` | 8 | recall_at_5 1, recall_at_10 1, precision_at_3 0.5833, precision_at_5 0.4125, r_precision 0.8958, citation_correctness 1, leaks 0, latency_p50_ms 7, latency_p95_ms 8 |
 | unsupported_claims | PASS | preparation_eval/dataset v1 `167d6fbf44ef` | 5 | unsupported_caught_rate 1, unsupported_passed_through 0, grounded_false_alarms 0, other_preparation_cases_passed 1 |
 | ats_answers | PASS | ats_answers v1 `9fc056b27ac6` | 11 | accuracy 1, sensitive_resolved_unconfirmed 0, answered_without_source 0, wrong_source 0 |
 | browser_actions | PASS | browser_actions v1 `81f53dbb85ba` | 20 | accuracy 1, unsafe_accepted 0, valid_refused 0, valid_accept_rate 1, invalid_refuse_rate 1 |
 | confirmation | PASS | confirmation v1 `4a81a571e4c9` | 13 | accuracy 1, false_confirm 0, missed_confirm 0, ambiguous_cases 6, ambiguous_left_uncertain 6 |
-| human_corrections | PASS | human_corrections v1 `8067903494d5` | 5 | accuracy 1 |
+| human_corrections | PASS | human_corrections v2 `b34e7bdd4869` | 6 | accuracy 1 |
 
 ## Gates
 

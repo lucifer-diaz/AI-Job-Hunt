@@ -36,7 +36,9 @@ def _rate(part: int, whole: int) -> float | None:
 
 def rates(facts: dict[str, Any]) -> dict[str, Any]:
     """Correction rates from plain facts (see `collect`). Unknown (no samples) is None, never 0."""
-    inbox = [e for e in facts.get("inbox_events") or [] if e.get("method") != "USER"]
+    # A correction also sets classification_method USER, so a corrected event is the automated result a person
+    # changed: kept. Only a classification a person made from the start (USER, never corrected) is left out.
+    inbox = [e for e in facts.get("inbox_events") or [] if e.get("method") != "USER" or e.get("user_corrected")]
     approvals = facts.get("approvals") or []
     parsed = int(facts.get("jd_parsed_jobs") or 0)
     edited = len(set(facts.get("jd_corrected_jobs") or []))

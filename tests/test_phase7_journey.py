@@ -262,6 +262,13 @@ def test_a_persons_correction_overrides_the_classifier():
     e = gmail["events"][0]
     assert (e["event_type"], e["decided_by"], e["classifier_event_type"]) == ("INTERVIEW_INVITATION", "person", "APPLICATION_REJECTION")
     assert rates["by_signal"]["inbox"] == {"corrected": 1, "samples": 1, "rate": 1.0}
+    # The correction sets classification_method USER as the service does; the corrected result still counts.
+    with SessionLocal() as db:
+        db.info["user_id"] = uid
+        db.query(ApplicationCommunicationEvent).filter_by(application_id=ids["application"]).update(
+            {"classification_method": "USER"})
+        db.commit()
+        assert feedback.report(db, uid)["by_signal"]["inbox"]["rate"] == 1.0
     assert rates["recruiter_outcome"]["rejected"] == 1 and rates["recruiter_outcome"]["attributed_to_model"] is False
 
 
@@ -317,3 +324,39 @@ def test_retrieval_timing_reaches_the_call_but_never_the_prompt():
     ctx.retrieval = {"retrieval_ms": 12, "retrieval_mode": "on"}
     assert ctx.call_stats()["retrieval_ms"] == 12 and "retrieval" not in ctx.to_dict()
     assert "retrieval" not in json.dumps(ctx.selected_payload(), default=str)
+
+
+def test_the_journey_compares_configuration_as_monitoring_does():
+    """The answering model group is what a configured deployment alias is compared with; the auto router's choice
+    and an unknown side are not a mismatch (review: codex P1)."""
+    uid = make_user(SessionLocal)
+    t = utcnow() - timedelta(minutes=10)
+    with SessionLocal() as db:
+        db.info["user_id"] = uid
+        job = Job(user_id=uid, source="test", source_ref=uuid.uuid4().hex, title="Backend Engineer", company="Acme")
+        db.add(job)
+        db.flush()
+        db.add_all([llm_row(uid, job.id, t),  # ranker-main answered through ollama/gpt-oss:20b: as configured
+                    llm_row(uid, job.id, t + timedelta(seconds=1), stage="TAILOR", configured_model="AUTO_ROUTER",
+                            model_group="tier-1"),
+                    llm_row(uid, job.id, t + timedelta(seconds=2), stage="REVIEWER", model_group="ranker-backup")])
+        db.commit()
+        calls = {c["stage"]: c for c in
+                 {s["stage"]: s for s in journey.journey(db, job.id, uid)["stages"]}["model"]["calls"]}
+    assert calls["RANKER"]["matches_configuration"] is True
+    assert calls["TAILOR"]["matches_configuration"] is None
+    assert calls["REVIEWER"]["matches_configuration"] is False
+
+
+def test_a_submission_recorded_after_an_aborted_intent_is_the_confirmation():
+    """An intent aborted before the click never hides the submission the person recorded afterwards (codex P1)."""
+    uid = make_user(SessionLocal)
+    ids = seed_journey(uid)
+    with SessionLocal() as db:
+        db.info["user_id"] = uid
+        db.query(SubmissionIntent).filter_by(job_id=ids["job"]).update({"status": "ABORTED", "evidence": None})
+        db.query(Application).filter_by(id=ids["application"]).update({"submitted_via": "apply_kit"})
+        db.commit()
+        stage = {s["stage"]: s for s in journey.journey(db, ids["job"], uid)["stages"]}["confirmation"]
+    assert (stage["status"], stage["evidence"], stage["submitted_via"]) == ("DONE", "reported", "apply_kit")
+    assert stage["confirmation_id"] == "AC-12345"
