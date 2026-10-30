@@ -151,7 +151,7 @@ def settings_resume(resume_id: int | None = Query(None), db: Session = Depends(g
             "current": detail(current) if current else None,
             "versions": [_card(v, files, setups.get(v.id, []) + (setups.get(None, []) if v.is_active else []))
                          for v in all_versions],
-            "policy": candidate_policy(db)}
+            "policy": candidate_policy(db), "ai_only": resume_parsing.ai_only(db, profile.user_id)}
 
 
 @router.put("/api/settings/resume/policy")

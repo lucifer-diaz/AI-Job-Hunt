@@ -655,6 +655,19 @@ describe('resume data', () => {
     ui.A['rd-jump']({ dataset: { section: 'skills' } }, { preventDefault() {} });
     expect(ui.RD.tab).toBe('structured');
   });
+  it('structures uploads with AI only: the toggle saves the worker setting, a waiting version shows no regex data', async () => {
+    let saved;
+    const waiting = detail({ parser: 'deterministic', ai_parse: { active: true, status: 'PROCESSING', note: 'Structuring with AI…' } });
+    await open(waiting, { 'GET /api/settings/resume': { active: waiting, versions: [waiting], policy: {}, ai_only: true },
+      'PUT /api/workers/settings': body => { saved = body; return { account: {} }; } });
+    const view = document.getElementById('view');
+    expect(view.textContent).toContain('the Resume Parser model is reading this resume');
+    expect(view.innerHTML).not.toContain('Builds &lt;platforms&gt;');
+    expect(document.getElementById('rd-ai-only').checked).toBe(true);
+    await ui.A['rd-ai-only']({ checked: false }); await settle();
+    expect(saved).toEqual({ workers: { resume_parsing: { ai_only: false } } });
+    expect(view.innerHTML).toContain('Builds &lt;platforms&gt;');
+  });
   it('renders every section type and edits single-object sections', async () => {
     const v = verification('UNVERIFIED');
     const base = detail();

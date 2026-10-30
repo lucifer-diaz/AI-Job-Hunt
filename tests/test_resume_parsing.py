@@ -298,6 +298,27 @@ def test_running_workers_shows_the_model_a_resume_parse_used(user):
     assert done["model"]["source"] == "used" and done["model"]["model"] == "parser-model"
 
 
+def test_ai_only_runs_an_upload_now_even_while_paused_and_keeps_the_regex_parse_as_fallback(user):
+    from app.services import worker_settings
+
+    with sessions_for(user)() as db:
+        worker_settings.update(db, user, {"resume_parsing": {"ai_only": True, "auto": False}})
+    assert client.get("/api/settings/resume").json()["ai_only"] is True
+    detail = upload()
+    assert task_row(user, detail["id"]).run_now_at is not None, "ahead of the queue"
+    assert resume_row(user, detail["id"]).parser == "deterministic", "the fallback is there at once"
+    claim = claim_one(user)  # claimed although the account paused the worker
+    assert claim.run_now
+    assert rp.process(sessions_for(user), claim, lambda prompt, call: ai_answer()) == rp.FILLED
+    assert resume_row(user, detail["id"]).parser == "llm"
+
+
+def test_without_ai_only_an_upload_waits_its_turn(user):
+    detail = upload()
+    assert task_row(user, detail["id"]).run_now_at is None
+    assert client.get("/api/settings/resume").json()["ai_only"] is False
+
+
 # ───────────── the graph ─────────────
 
 def test_the_graph_fills_the_resume_and_records_each_step_once(user):
