@@ -813,7 +813,8 @@ def _prepare_application_execution(ctx: JobContext, mode: str) -> dict[str, Any]
                                    "expired_leases": application_execution.recover_expired(db, ctx.now),
                                    "claims_now_uncertain": apply_queue.expire_claims(db, now=ctx.now),
                                    "takeovers_ended": application_execution.end_expired_takeovers(db, ctx.now),
-                                   "submitted_in_window": application_execution.watch_windows(db)}
+                                   "submitted_in_window": application_execution.watch_windows(db),
+                                   "captchas_answered": application_execution.watch_challenges(db)}
         if mode == "off":
             details["released"] = application_execution.release(db, ctx.now)
     return details

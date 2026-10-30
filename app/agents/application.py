@@ -37,7 +37,7 @@ from sqlalchemy.orm import Session
 from app.agents import effects
 
 GRAPH = "application"
-GRAPH_VERSION = "v2"
+GRAPH_VERSION = "v3"
 EXPORT_FIELDS = ("job_id", "task_id", "mode", "step", "outcome", "code", "waiting_for", "route", "backend",
                  "field_count", "required_count", "resolved_count", "needs_input_count", "needs_confirmation_count",
                  "filled_count", "missing_required_count", "blocked_requests", "form_fingerprint", "actions",
@@ -318,22 +318,39 @@ def _bu_load(ctx: ApplicationContext, session: Any, user_id: int, match: Any, ur
 
     ctx.run_async(session.call("goto", url=url))
     observation = ctx.run_async(session.call("observe", html=True))
-    problem = ats_forms.page_problem(observation.get("html") or "", title=observation.get("title"))
+    problem = ats_forms.page_problem(observation.get("html") or "", title=observation.get("title"),
+                                     captcha=observation.get("captcha"))
     if problem == ats_forms.LOGIN_REQUIRED:
         problem, observation = application_backends.try_login(ctx.sessions, session, ctx.run_async, user_id, match,
                                                               observation)
     return problem, observation
 
 
+def _bu_resume(ctx: ApplicationContext, session: Any) -> tuple[str | None, dict]:
+    """The window as the person left it: the marks removed and the page observed where it is, never reloaded."""
+    from app.services import ats_forms
+
+    ctx.run_async(session.call("unpoint"))
+    observation = ctx.run_async(session.call("observe", html=True))
+    return ats_forms.page_problem(observation.get("html") or "", title=observation.get("title"),
+                                  captcha=observation.get("captcha")), observation
+
+
 def _park_or_close(ctx: ApplicationContext, session: Any, problem: str | None) -> bool:
     """A problem a person can fix in the window: hand a headful session to them (takeover; the window then works like
-    a normal browser). Anything else, or a headless session: close it."""
+    a normal browser). Anything else, or a headless session: close it.
+
+    A window handed over is picked up where the person left it (`resume_in_place`): what they did there — a solved
+    CAPTCHA, a sign-in, fields they typed — is never thrown away by reloading the apply URL. The run still observes the
+    page afresh and checks everything again; it falls back to the apply URL only when the form is no longer there."""
     from app.infrastructure.application_browser.browser_use_sidecar import get_sidecars
     from app.settings import get_settings
 
     manager = get_sidecars()
     if _takeover_problem(problem):
-        return bool(ctx.run_async(manager.park(session, get_settings().application_takeover_ttl_minutes)))
+        kept = bool(ctx.run_async(manager.park(session, get_settings().application_takeover_ttl_minutes)))
+        session.resume_in_place = kept
+        return kept
     ctx.run_async(manager.close(session.user_id, session.task_id))
     return False
 
@@ -352,8 +369,13 @@ def _analyze_browser_use(ctx: ApplicationContext, task_id: int, job: Any, url: s
     except SidecarUnavailable as exc:
         return {"problem": "BACKEND_UNAVAILABLE", "detail": str(exc)[:200]}
     problem, keep, steps = None, False, 0
+    in_place = bool(getattr(session, "resume_in_place", False))
+    session.resume_in_place = False
     try:
-        problem, observation = _bu_load(ctx, session, job.user_id, match, url)
+        problem, observation = _bu_resume(ctx, session) if in_place else (None, None)
+        if not in_place or (not problem and generic.analyze(observation.get("url") or url,
+                                                            observation.get("elements") or []) is None):
+            problem, observation = _bu_load(ctx, session, job.user_id, match, url)  # nothing to pick up: load it
         if not problem:
             form = generic.analyze(observation.get("url") or url, observation.get("elements") or [])
             if form is None:  # the form may need revealing (an Apply button, a first section)
@@ -377,6 +399,7 @@ def _analyze_browser_use(ctx: ApplicationContext, task_id: int, job: Any, url: s
         from app.settings import get_settings
 
         ctx.run_async(get_sidecars().hold(session, get_settings().application_takeover_ttl_minutes))
+        session.resume_in_place = True  # FILL picks this page up as it is (a solved CAPTCHA, the revealed form)
         return {"form": form.model_dump(), "route": generic.NAME, "final_url": observation.get("url"),
                 "model_steps": steps}
     except application_backends.NavigatorUnavailable:
@@ -396,7 +419,8 @@ def _browser_use_on() -> bool:
 
 def _takeover(db: Session, ctx: ApplicationContext, state: ApplicationState, task: Any, job: Any, problem: str,
               resume_at: str, **extra: Any) -> dict[str, Any]:
-    """Wait for the person in the kept window; the run resumes at `resume_at` and re-observes everything."""
+    """Wait for the person in the kept window; the run resumes at `resume_at` in that same page (see `_park_or_close`)
+    and checks everything again before any action."""
     from datetime import UTC, datetime, timedelta
 
     from app.services import ats_map
@@ -414,7 +438,12 @@ def _takeover(db: Session, ctx: ApplicationContext, state: ApplicationState, tas
                        **({"question_ids": extra["question_ids"]} if extra.get("question_ids") else {})})
     login = problem in TAKEOVER_PROBLEMS and problem != "CAPTCHA_OR_ANTI_BOT"
     ats_map.observe(db, job, needs_login=login or None, last_outcome=problem, checked=True)
+    user_id, task_id = task.user_id, task.id
     db.commit()
+    from app.services import application_execution as service
+
+    if problem in service.CHALLENGE_REASONS:  # once the person answers it, the run continues by itself
+        service.watch_challenge(ctx.sessions, user_id, task_id)
     return {"step": resume_at.upper(), "waiting_for": HUMAN, "resume_at": resume_at}
 
 
@@ -527,9 +556,29 @@ def resolve_answers(state: ApplicationState, runtime: Runtime[ApplicationContext
             _record(db, ctx, _key(state, RESOLVE_ANSWERS, attempt), task, "NEEDS_INPUT", plan=plan,
                     interrupt={"kind": "NEEDS_INPUT", "question_ids": plan["needs_input"],
                                "confirm_question_ids": plan["needs_confirmation"]})
+            if state.get("mode") in ("ASSIST", "GUARDED_AUTO") and task.backend == "browser_use_webui":
+                _keep_for_input(ctx, task.user_id, task.id)
             return {"step": RESOLVE_ANSWERS, "waiting_for": INPUT, "resume_at": "resolve_answers", **counts}
         _record(db, ctx, _key(state, RESOLVE_ANSWERS, attempt), task, "ANSWERING", plan=plan, interrupt=None)
     return {"step": RESOLVE_ANSWERS, "waiting_for": None, "resume_at": None, **counts}
+
+
+def _keep_for_input(ctx: ApplicationContext, user_id: int, task_id: int) -> None:
+    """While the run waits for an answer in the Knowledge bank, keep the browser-use page it read (signed in, the form
+    revealed) for APPLICATION_INPUT_HOLD_MINUTES, so FILL picks it up in place. Nothing can act in it meanwhile; when
+    it is gone by then (the hold ran out, a restart), FILL loads the apply URL as before. Never fails the step."""
+    from app.infrastructure.application_browser.browser_use_sidecar import get_sidecars
+    from app.settings import get_settings
+
+    try:
+        manager = get_sidecars()
+        session = manager.get(user_id, task_id)
+        if session is None:
+            return
+        ctx.run_async(manager.hold(session, max(1, get_settings().application_input_hold_minutes), extend=True))
+        session.resume_in_place = True
+    except Exception:  # noqa: BLE001  the page is read again after the answer
+        return
 
 
 def _in_window(state: ApplicationState, task: Any) -> bool:
@@ -665,7 +714,7 @@ def _fill_browser_use(ctx: ApplicationContext, task_id: int, job: Any, url: str,
         SidecarUnavailable,
         get_sidecars,
     )
-    from app.services import application_backends, ats_forms, ats_map, browser_actions
+    from app.services import application_backends, ats_map, browser_actions
     from app.services.ats_forms import generic
     from app.settings import get_settings
 
@@ -678,11 +727,12 @@ def _fill_browser_use(ctx: ApplicationContext, task_id: int, job: Any, url: str,
     session.resume_in_place = False
     keep = False
     try:
-        if in_place:  # the person filled fields in this very page: never reload it
-            ctx.run_async(session.call("unpoint"))
-            observation = ctx.run_async(session.call("observe", html=True))
-            problem = ats_forms.page_problem(observation.get("html") or "", title=observation.get("title"))
-        else:
+        if in_place:  # the person worked in this very page (fields, a CAPTCHA, a sign-in): pick it up where it is
+            problem, observation = _bu_resume(ctx, session)
+            here = None if problem else generic.analyze(observation.get("url") or url, observation.get("elements") or [])
+            if not problem and (here is None or not {f.id for f in form.fields} <= {f.id for f in here.fields}):
+                in_place = False  # the form is no longer on this page (a sign-in moved it): the apply URL again
+        if not in_place:
             problem, observation = _bu_load(ctx, session, job.user_id, match, url)
         if problem:
             keep = _park_or_close(ctx, session, problem)
@@ -732,7 +782,6 @@ def _fill_browser_use(ctx: ApplicationContext, task_id: int, job: Any, url: str,
                            f"Job Hunt OS needs you on this page. When you are done, {then}.")
                 ctx.run_async(session.call("point", keys=keys, message=message, note="Job Hunt OS needs you here"))
                 keep = _park_or_close(ctx, session, code)
-                session.resume_in_place = keep
             return {"problem": code, "takeover": keep, "fields": fields, "person_filled": person,
                     "question_ids": list(plan.get("needs_input") or [])}
         if for_submit:  # auto submit: the SUBMIT node validates this very page and clicks
@@ -995,7 +1044,8 @@ def _bu_facts(ctx: ApplicationContext, session: Any, planned: Any, values: dict[
     url = observation.get("url") or ""
     facts: dict[str, Any] = {"host": (urlparse(url).hostname or "").lower(), "url": url,
                              "problem": ats_forms.page_problem(observation.get("html") or "",
-                                                               title=observation.get("title"))}
+                                                               title=observation.get("title"),
+                                                               captcha=observation.get("captcha"))}
     current = generic.analyze(url, observation.get("elements") or []) if not facts["problem"] else None
     if current is None:
         return {**facts, "fingerprint": None, "missing": [], "uploaded": {}, "submit_key": None}
@@ -1089,7 +1139,6 @@ def _submit_browser_use(ctx: ApplicationContext, state: ApplicationState, job: A
                     "or submit here yourself.")[:300]))
                 keep = _park_or_close(ctx, session, FIELDS_NEED_YOU)
                 if keep:
-                    session.resume_in_place = True
                     return _takeover(db, ctx, state, task, job_row, checked.code or FIELDS_NEED_YOU,
                                      "resolve_answers")
             if not checked.ok:
@@ -1227,10 +1276,12 @@ def build(checkpointer: Any) -> Any:
     graph.add_conditional_edges("route", _next("analyze_form"), ["analyze_form", END])
     graph.add_conditional_edges("analyze_form", _next("resolve_answers"), ["resolve_answers", "wait", END])
     graph.add_conditional_edges("resolve_answers", _after_resolve, ["wait", "fill", "validate", "submit", END])
-    graph.add_conditional_edges("wait", _after_wait, ["resolve_answers", "analyze_form", "fill"])
+    graph.add_conditional_edges("wait", _after_wait, ["resolve_answers", "analyze_form", "fill", "submit", "validate"])
     graph.add_conditional_edges("fill", _next("validate"), ["validate", "wait", END])
     graph.add_edge("validate", END)
-    graph.add_edge("submit", END)
+    # SUBMIT can hand the window to the person (a CAPTCHA, a field nothing verified fills): it waits like any other
+    # step, on the same thread, and resumes where `resume_at` says, never from the start.
+    graph.add_conditional_edges("submit", _next(END), ["wait", END])
     return graph.compile(checkpointer=checkpointer, name=GRAPH)
 
 

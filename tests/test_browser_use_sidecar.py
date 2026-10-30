@@ -601,3 +601,49 @@ def test_a_submission_the_person_makes_in_the_window_is_recorded_from_the_sites_
     assert task.result_code == application_execution.SUBMITTED_IN_WINDOW
     with sessions() as db:
         assert db.get(Job, job_id).status == "applied"
+
+
+# A challenge widget shaped like reCAPTCHA v2 (its iframe path and response field), served locally. The "solve" button
+# stands in for the person ticking the box; the runner reports booleans only and never the response token.
+CAPTCHA_PAGE = b"""<!doctype html><html><head><title>Apply</title></head><body>
+<form id="apply"><label for="n">Full name *</label><input id="n" name="n" required>
+<iframe src="/recaptcha/api2/anchor?k=test&size=normal" style="width:304px;height:78px"></iframe>
+<textarea id="g-recaptcha-response" name="g-recaptcha-response" style="display:none"></textarea>
+<button type="submit">Submit application</button></form>
+<button type="button" id="solve" onclick="document.getElementById('g-recaptcha-response').value='SYNTHETIC-TOKEN-1'">
+Solve</button></body></html>"""
+INVISIBLE_PAGE = b"""<!doctype html><html><body><form><input name="n">
+<iframe src="/recaptcha/api2/anchor?k=test&size=invisible" style="width:256px;height:60px"></iframe></form></body></html>"""
+EMBEDDED_PAGE = b"""<!doctype html><html><body><h1>Careers</h1>
+<iframe src="/captcha.html" style="width:800px;height:600px"></iframe></body></html>"""
+
+
+def test_the_runner_reads_a_captcha_in_any_frame_and_only_whether_it_is_answered(runner, tmp_path):
+    from app.services import application_execution, ats_forms
+
+    manager = bus.get_sidecars()
+    pages = {"captcha.html": CAPTCHA_PAGE, "invisible.html": INVISIBLE_PAGE, "embedded.html": EMBEDDED_PAGE}
+    with gs.FakeATS("confirm", pages=pages) as ats, application_execution.background_loop() as loop:
+        run = application_execution.loop_runner(loop, timeout=90)
+        session = run(manager.start(user_id=1, task_id=20, job_id=5, allowed_hosts=["127.0.0.1"],
+                                    upload_dir=str(tmp_path), allow_private=True))
+        try:
+            run(session.call("goto", url=ats.url("captcha")))
+            before = run(session.call("observe", html=True))
+            solve = next(e for e in before["elements"] if e.get("label", "").strip() == "Solve")
+            run(session.call("click", key=solve["key"]))
+            after = run(session.call("challenge"))
+            evidence = run(session.call("evidence"))
+            run(session.call("goto", url=ats.url("invisible")))
+            invisible = run(session.call("challenge"))
+            run(session.call("goto", url=ats.url("embedded")))
+            embedded = run(session.call("challenge"))
+        finally:
+            run(manager.close(1, 20))
+    assert before["captcha"] == {"present": True, "solved": False, "kind": "recaptcha"}
+    assert ats_forms.page_problem(before["html"], title=before["title"], captcha=before["captcha"]) == "CAPTCHA_OR_ANTI_BOT"
+    assert after == {"present": True, "solved": True, "kind": "recaptcha"}
+    assert ats_forms.page_problem(before["html"], title=before["title"], captcha=after) is None
+    assert evidence["captcha"]["solved"] and "SYNTHETIC-TOKEN-1" not in str([after, evidence])
+    assert invisible["present"] is False  # reCAPTCHA v3: the site runs it itself; nobody is asked to solve it
+    assert embedded == {"present": True, "solved": False, "kind": "recaptcha"}  # inside an embedded board's frame

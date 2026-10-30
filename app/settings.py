@@ -415,6 +415,12 @@ class Settings(BaseSettings):
     # for the person only when something needs them (an unknown outcome included). `autonomous` is refused.
     application_max_actions: int = 60  # browser actions per run (fills, clicks, uploads), whatever proposes them
     application_takeover_ttl_minutes: int = 15  # how long a paused headful session waits for the person
+    # A window handed over for a CAPTCHA is asked this often whether the person solved it; the run then continues by
+    # itself (a reCAPTCHA answer lasts about two minutes, so this stays short).
+    application_challenge_poll_seconds: int = 5
+    # A form read in a browser-use session is kept this long while the run waits for an answer in the Knowledge bank,
+    # so it is filled in place afterwards (the session's own time is extended to match; after it, it is read again).
+    application_input_hold_minutes: int = 60
     # Saved ATS logins (app.services.ats_auth): a session a person logged in to, and an encrypted password vault.
     # A password is filled only on a domain listed in APPLICATION_LOGIN_DOMAINS, never anywhere else.
     application_auth_sessions_enabled: bool = False

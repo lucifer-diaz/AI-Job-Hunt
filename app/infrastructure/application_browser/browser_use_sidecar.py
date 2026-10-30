@@ -96,7 +96,8 @@ class SidecarSession:
     headless: bool = True
     parked_until: float | None = None
     domain_for_login: str | None = None
-    # Parked for the person to fill fields in this page: the next FILL re-observes it instead of reloading it.
+    # Kept with the person's work in it (a takeover) or the form read for the next step (waiting for an answer): the
+    # run's next step observes this page where it is instead of reloading the apply URL.
     resume_in_place: bool = False
     _next: int = 0
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -261,11 +262,14 @@ class SidecarManager:
         await session.call("set_takeover", on=True, writes=True, seconds=minutes * 60)
         return True
 
-    async def hold(self, session: SidecarSession, minutes: int) -> None:
+    async def hold(self, session: SidecarSession, minutes: int, *, extend: bool = False) -> None:
         """Keep a session (signed in, the form revealed) for the same execution's next step, for at most `minutes`;
-        nobody can act in it meanwhile (no takeover), and the reaper closes it after."""
+        nobody can act in it meanwhile (no takeover), and the reaper closes it after. `extend` also lengthens the
+        runner's own session time to match (a run waiting for an answer in the Knowledge bank)."""
         if session.alive:
             session.parked_until = time.monotonic() + minutes * 60
+            if extend:
+                await session.call("set_takeover", on=False, seconds=minutes * 60)
 
     async def unpark(self, session: SidecarSession) -> None:
         session.parked_until = None

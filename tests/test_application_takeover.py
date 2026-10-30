@@ -42,7 +42,8 @@ FORM = [{"key": "n", "tag": "input", "type": "text", "label": "Full name *", "re
         {"key": "q", "tag": "input", "type": "text", "label": aps.PYTHON_QUESTION + " *", "required": True,
          "in_form": True},
         {"key": "go", "tag": "button", "type": "submit", "label": "Submit", "submit_like": True, "in_form": True}]
-HTML = {"login": '<form><input type="email"><input type="password"><button>Sign In</button></form><p>Sign in</p>',
+HTML = {"landing": "<p>Welcome back, Asha</p>", "done": "<p>Thank you for applying</p>",
+        "login": '<form><input type="email"><input type="password"><button>Sign In</button></form><p>Sign in</p>',
         "signup": '<form><input type="password"><input type="password"></form><p>Create an account</p>',
         "form": "<form><input name=n><input type=file></form><p>Apply</p>"}
 
@@ -66,14 +67,32 @@ class FakeSession:
 
         self.commands.append((cmd, {k: v for k, v in args.items() if k != "secret"}))
         if cmd == "goto":
+            if self.manager.page == "landing":  # signed in, then the site's home: the apply URL shows the form
+                self.manager.page = "form"
             return {"final_url": URL, "status": 200, "title": "Acme careers"}
         if cmd == "observe":
-            elements = {"login": LOGIN, "signup": SIGNUP, "form": FORM}[self.page]
+            elements = {"landing": [], "done": [], "login": LOGIN, "signup": SIGNUP, "form": FORM}[self.page]
             return {"url": URL, "title": "Acme", "elements": [dict(e) for e in elements], "html": HTML[self.page],
-                    "text": "Acme careers", "blocked_requests": 0}
+                    "text": "Acme careers", "blocked_requests": 0, "captcha": dict(self.manager.captcha)}
+        if cmd == "challenge":
+            return dict(self.manager.captcha)
         if cmd in ("fill", "select"):
             self.values[args["key"]] = args.get("text", args.get("value"))
+            if self.manager.captcha_after_fill:  # the site shows its CAPTCHA once the form is filled
+                self.manager.captcha = {"present": True, "solved": False, "kind": "recaptcha"}
+                self.manager.captcha_after_fill = False
             return {"filled": True}
+        if cmd == "submit":
+            self.manager.submitted.append(args["key"])
+            self.manager.page = "done"
+            return {"clicked": True}
+        if cmd == "evidence":  # the site's confirmation only after a submission; before it, the form is there
+            if self.page != "done":
+                return {"url": URL, "title": "Acme", "form_inputs": 4, "responses": [], "text": "Apply",
+                        "captcha": dict(self.manager.captcha)}
+            return {"url": URL + "/confirmation", "title": "Thanks", "form_inputs": 0,
+                    "responses": [{"method": "POST", "status": 200, "host": DOMAIN}],
+                    "text": "Thank you for applying", "captcha": {"present": False, "solved": False, "kind": None}}
         if cmd == "upload":
             self.values[args["key"]] = [args["path"].rsplit("/", 1)[-1]]
             return {"uploaded": True}
@@ -123,6 +142,11 @@ class FakeManager:
         self.secrets: list[tuple] = []
         self.pointed: list[tuple] = []
         self.parked: list[bool] = []  # whether each kept window may send forms (writes)
+        self.held: list[tuple[int, bool]] = []  # (minutes, runner time extended)
+        self.captcha = {"present": False, "solved": False, "kind": None}
+        self.captcha_after_fill = False
+        self.submitted: list[str] = []
+        self.windows: list[FakeSession] = []  # every window started, closed ones included
         self.loop = None
 
     def available(self) -> bool:
@@ -134,19 +158,29 @@ class FakeManager:
         self.started.append({"user": user_id, "task": task_id, "hosts": allowed_hosts, "storage": storage_state})
         session = FakeSession(self, user_id, task_id, storage_state)
         self.sessions[(user_id, task_id)] = session
+        self.windows.append(session)
         return session
 
     def get(self, user_id, task_id):
         session = self.sessions.get((user_id, task_id))
-        return session if session is not None and session.alive else None
+        if session is None or not session.alive:
+            return None
+        if session.parked_until is not None and session.parked_until < time.monotonic():
+            return None  # kept past its time, as the real manager: the reaper closes it
+        return session
 
     async def park(self, session, minutes):
         session.parked_until = time.monotonic() + minutes * 60
         self.parked.append(True)  # handed to the person: the window works like a normal browser
         return True
 
-    async def hold(self, session, minutes):
+    async def hold(self, session, minutes, *, extend=False):
         session.parked_until = time.monotonic() + minutes * 60
+        self.held.append((minutes, extend))
+
+    def handed_over(self):
+        now = time.monotonic()
+        return [key for key, s in self.sessions.items() if s.alive and s.parked_until and s.parked_until >= now]
 
     async def unpark(self, session):
         session.parked_until = None
@@ -207,7 +241,7 @@ def client_as(user_id: int, monkeypatch, sessions) -> TestClient:
     return TestClient(app)
 
 
-def test_a_login_wall_waits_in_the_window_and_the_run_resumes_from_a_fresh_look(sessions, monkeypatch):
+def test_a_login_wall_waits_in_the_window_and_the_run_resumes_in_the_same_page(sessions, monkeypatch):
     fake = FakeManager("login")
     bus.set_sidecars(fake)
     user, job_id = account(sessions)
@@ -228,8 +262,9 @@ def test_a_login_wall_waits_in_the_window_and_the_run_resumes_from_a_fresh_look(
     drive(sessions)
     task = aps.task_of(sessions, job_id)
     assert (task.status, task.stage, task.outcome) == ("COMPLETED", "READY_TO_SUBMIT", "READY_TO_SUBMIT")
-    resumed = [c for c, _ in fake.sessions[(user, task.id)].commands][before:]
-    assert resumed[:2] == ["goto", "observe"]  # re-observed from the start of the page, nothing replayed
+    resumed = [c for c, _ in fake.sessions[(user, task.id)].commands[before:] if c not in WATCHER_READS]
+    # Picked up where the person left it (signed in, the form showing): observed afresh, never reloaded or replayed.
+    assert resumed[:2] == ["unpoint", "observe"] and "goto" not in resumed
     assert "login_fill" not in resumed and "login_submit" not in resumed
     assert len(fake.started) == 1  # the same window, not a new browser
 
@@ -391,3 +426,187 @@ def test_without_a_visible_window_the_questions_go_to_the_apply_kit(sessions, mo
     drive(sessions)
     task = aps.task_of(sessions, job_id)
     assert (task.status, task.stage) == ("PENDING", "NEEDS_INPUT") and fake.pointed == []
+
+
+# ───────────── picking the page up where the person left it ─────────────
+
+WATCHER_READS = ("evidence", "challenge")  # what the scheduler pass reads from a kept window (never an action)
+
+
+def _commands_since(session: FakeSession, before: int) -> list[str]:
+    """The window's commands after `before`, without the scheduler pass's reads. The session object itself: a run
+    that ends closes its window."""
+    return [c for c, _ in session.commands[before:] if c not in WATCHER_READS]
+
+
+def _answer_saved(sessions, user: int, question: str, text: str) -> None:
+    """The person answers, in the Knowledge bank, the question the run saved for them."""
+    from app.models import KnowledgeAnswer
+    from app.services import application_execution as ae
+    from app.services.knowledge import question_key
+
+    with sessions() as db:
+        db.info["user_id"] = user
+        row = db.scalar(select(KnowledgeAnswer).where(KnowledgeAnswer.question_key == question_key(question)))
+        row.answer, row.verified = text, True
+        ae.wake_waiting(db, user)
+        db.commit()
+
+
+def _solve(fake: FakeManager) -> None:
+    fake.captcha = {"present": True, "solved": True, "kind": "recaptcha"}
+
+
+def _watch(sessions) -> int:
+    from app.services import application_execution as ae
+
+    with sessions() as db:
+        return ae.watch_challenges(db)
+
+
+def test_a_captcha_solved_in_the_window_continues_by_itself_in_the_same_page(sessions):
+    fake = FakeManager("form")
+    fake.captcha = {"present": True, "solved": False, "kind": "recaptcha"}  # a reCAPTCHA iframe, however long the page
+    bus.set_sidecars(fake)
+    user, job_id = account(sessions)
+    drive(sessions)
+    task = aps.task_of(sessions, job_id)
+    assert (task.status, task.stage, task.interrupt["reason"]) == ("PENDING", "NEEDS_HUMAN", "CAPTCHA_OR_ANTI_BOT")
+    assert _watch(sessions) == 0  # not solved yet: nothing continues
+    drive(sessions)
+    assert aps.task_of(sessions, job_id).stage == "NEEDS_HUMAN"
+
+    window = fake.sessions[(user, task.id)]
+    before = len(window.commands)
+    _solve(fake)  # the person ticks "I'm not a robot" in the window
+    assert _watch(sessions) == 1  # no Continue needed
+    assert aps.task_of(sessions, job_id).interrupt["continued_by"] == "window"
+    drive(sessions)
+    done = aps.task_of(sessions, job_id)
+    assert (done.status, done.outcome) == ("COMPLETED", "READY_TO_SUBMIT"), (done.result_code, done.last_error)
+    resumed = _commands_since(window, before)
+    assert "goto" not in resumed and resumed[:2] == ["unpoint", "observe"]  # the solved page, never reloaded
+    assert len(fake.started) == 1 and done.agent_thread_id == task.agent_thread_id
+
+
+def test_auto_submit_waits_at_a_captcha_and_submits_once_in_the_same_page_when_it_is_solved(sessions, monkeypatch):
+    from app.models import SubmissionIntent
+    from tests import guarded_support as gs
+
+    monkeypatch.setattr(aps.get_settings(), "application_execution_mode", "guarded_auto")
+    fake = FakeManager("form")
+    fake.captcha_after_fill = True  # the site shows its CAPTCHA once the form is filled, above Submit
+    bus.set_sidecars(fake)
+    user = aps.owner(sessions)
+    aps.answer(sessions, user, aps.PYTHON_QUESTION, "8")
+    gs.consent(sessions, user)
+    job_id = aps.approved_job(sessions, user, URL)
+    aps.enqueue(sessions, user, job_id, mode="GUARDED_AUTO")
+    drive(sessions)
+    task = aps.task_of(sessions, job_id)
+    # The SUBMIT step waits for the person like any other (it used to end the run instead).
+    assert (task.status, task.stage, task.interrupt["reason"]) == ("PENDING", "NEEDS_HUMAN", "CAPTCHA_OR_ANTI_BOT")
+    assert fake.submitted == []
+
+    window = fake.sessions[(user, task.id)]
+    before = len(window.commands)
+    _solve(fake)
+    assert _watch(sessions) == 1
+    drive(sessions)
+    done = aps.task_of(sessions, job_id)
+    assert (done.status, done.outcome) == ("COMPLETED", "CONFIRMED"), (done.result_code, done.last_error)
+    assert fake.submitted == ["go"]  # one signed click, after every check ran again
+    assert "goto" not in _commands_since(window, before)
+    assert done.agent_thread_id == task.agent_thread_id  # the same run, resumed: never started over
+    with sessions() as db:
+        db.info["user_id"] = user
+        intents = db.scalars(select(SubmissionIntent).where(SubmissionIntent.execution_task_id == task.id)).all()
+        assert [i.status for i in intents] == ["CONFIRMED"]
+
+
+def test_the_graph_can_pause_at_submit_and_resume_there():
+    from app.agents import application
+
+    edges = {(e.source, e.target) for e in application.build(None).get_graph().edges}
+    assert ("submit", "wait") in edges and ("wait", "submit") in edges
+
+
+def test_a_sign_in_that_leaves_the_form_behind_loads_the_apply_url_again(sessions, monkeypatch):
+    fake = FakeManager("login")
+    bus.set_sidecars(fake)
+    user, job_id = account(sessions)
+    drive(sessions)
+    task = aps.task_of(sessions, job_id)
+    assert task.interrupt["reason"] == "LOGIN_REQUIRED"
+    fake.page = "landing"  # signed in; the site shows its home page, not the form
+    window = fake.sessions[(user, task.id)]
+    before = len(window.commands)
+    assert client_as(user, monkeypatch, sessions).post(
+        f"/api/application-executions/{task.id}/continue").status_code == 200
+    drive(sessions)
+    done = aps.task_of(sessions, job_id)
+    assert (done.status, done.outcome) == ("COMPLETED", "READY_TO_SUBMIT")
+    resumed = _commands_since(window, before)
+    assert resumed[:3] == ["unpoint", "observe", "goto"]  # looked where the person left it first, then the apply URL
+
+
+def test_a_captcha_window_of_another_account_is_never_continued(sessions):
+    from app.services import application_execution as ae
+
+    fake = FakeManager("form")
+    fake.captcha = {"present": True, "solved": False, "kind": "recaptcha"}
+    bus.set_sidecars(fake)
+    _user, job_id = account(sessions)
+    drive(sessions)
+    task = aps.task_of(sessions, job_id)
+    _solve(fake)
+    other = aps.owner(sessions)
+    with sessions() as db:
+        db.info["user_id"] = other
+        assert ae.watch_challenges(db) == 0  # an account's session only looks at its own windows
+        assert ae.challenge_solved(db, other, task.id) is False
+    assert aps.task_of(sessions, job_id).stage == "NEEDS_HUMAN"
+
+
+def test_waiting_for_an_answer_keeps_the_read_form_and_fills_it_in_place(sessions, monkeypatch):
+
+    monkeypatch.setattr(aps.get_settings(), "browser_use_headless", True)  # no window: the Apply kit asks instead
+    fake = FakeManager("form")
+    bus.set_sidecars(fake)
+    user = aps.owner(sessions)
+    job_id = aps.approved_job(sessions, user, URL)
+    aps.enqueue(sessions, user, job_id)
+    drive(sessions)
+    task = aps.task_of(sessions, job_id)
+    assert task.stage == "NEEDS_INPUT"
+    kept = fake.sessions[(user, task.id)]
+    assert kept.resume_in_place and fake.held[-1] == (aps.get_settings().application_input_hold_minutes, True)
+
+    before = len(kept.commands)
+    _answer_saved(sessions, user, aps.PYTHON_QUESTION, "8")
+    assert aps.task_of(sessions, job_id).stage == "ANSWERING"  # woken by the answer
+    drive(sessions)
+    done = aps.task_of(sessions, job_id)
+    assert (done.status, done.outcome) == ("COMPLETED", "READY_TO_SUBMIT"), (done.result_code, done.last_error)
+    assert "goto" not in _commands_since(kept, before) and len(fake.started) == 1
+
+
+def test_an_answer_after_the_hold_ran_out_reads_the_form_again(sessions, monkeypatch):
+
+    monkeypatch.setattr(aps.get_settings(), "browser_use_headless", True)
+    fake = FakeManager("form")
+    bus.set_sidecars(fake)
+    user = aps.owner(sessions)
+    job_id = aps.approved_job(sessions, user, URL)
+    aps.enqueue(sessions, user, job_id)
+    drive(sessions)
+    task = aps.task_of(sessions, job_id)
+    held = fake.sessions[(user, task.id)]
+    held.parked_until = time.monotonic() - 1  # the hold ran out
+    before = len(held.commands)
+    _answer_saved(sessions, user, aps.PYTHON_QUESTION, "8")
+    drive(sessions)
+    done = aps.task_of(sessions, job_id)
+    assert done.outcome == "READY_TO_SUBMIT" and len(fake.started) == 2  # a new window, the apply URL loaded again
+    assert _commands_since(held, before) == []  # the expired window was not reused
+    assert "goto" in [c for c, _ in fake.windows[-1].commands]
