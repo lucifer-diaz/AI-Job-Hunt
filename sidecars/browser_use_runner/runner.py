@@ -152,12 +152,25 @@ CAPTCHA_JS = r"""() => {
     ["hcaptcha", /hcaptcha\.com\/.*frame=checkbox/, 'textarea[name="h-captcha-response"], textarea[name="g-recaptcha-response"]'],
     ["turnstile", /challenges\.cloudflare\.com\//, 'input[name="cf-turnstile-response"]'],
   ];
+  // Each widget is judged on its own response field: the one in its nearest container. A container holding several
+  // widgets' fields is ambiguous and counts as unanswered; with one widget and one field on the page, that field.
+  const fieldOf = (widget, response, widgets, all) => {
+    for (let node = widget.parentElement, depth = 0; node && depth < 6; node = node.parentElement, depth++) {
+      const inside = node.querySelectorAll(response);
+      if (inside.length === 1) return inside[0];
+      if (inside.length > 1) return null;
+    }
+    return widgets.length === 1 && all.length === 1 ? all[0] : null;
+  };
   const found = [];
   for (const [kind, source, response] of kinds) {
     const widgets = Array.from(document.querySelectorAll('iframe'))
       .filter(f => source.test(f.src || '') && !/size=invisible/.test(f.src || '') && shown(f));
-    if (!widgets.length) continue;
-    found.push({kind, solved: Array.from(document.querySelectorAll(response)).some(r => (r.value || '').length > 0)});
+    const all = Array.from(document.querySelectorAll(response));
+    for (const widget of widgets) {
+      const field = fieldOf(widget, response, widgets, all);
+      found.push({kind, solved: !!field && (field.value || '').length > 0});
+    }
   }
   return found;
 }"""
@@ -425,7 +438,7 @@ class Runner:
 
     async def _captcha(self, page: Any) -> dict[str, Any]:
         """{present, solved, kind}: whether a challenge a person must answer is on the page (in any frame: an embedded
-        board puts it in its own iframe), and whether every one of them has been answered."""
+        board puts it in its own iframe), and whether every one of them has been answered, each on its own field."""
         found: list[dict[str, Any]] = []
         for frame in page.frames:
             try:

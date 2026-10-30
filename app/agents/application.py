@@ -326,6 +326,17 @@ def _bu_load(ctx: ApplicationContext, session: Any, user_id: int, match: Any, ur
     return problem, observation
 
 
+def _planned_on_page(planned: Any, current: Any, observation: dict[str, Any]) -> bool:
+    """Every planned field is on this page: in the form as read now (it may have grown a conditional question), or a
+    file input the board replaced with the uploaded file's name once it took it (the runner's `attached`)."""
+    from app.services.ats_forms import generic
+
+    if current is None:
+        return False
+    here, attached = {f.id for f in current.fields}, observation.get("attached") or {}
+    return all(f.id in here or (f.kind == "file" and generic.key_of(f.locator) in attached) for f in planned.fields)
+
+
 def _bu_resume(ctx: ApplicationContext, session: Any) -> tuple[str | None, dict]:
     """The window as the person left it: the marks removed and the page observed where it is, never reloaded."""
     from app.services import ats_forms
@@ -730,7 +741,7 @@ def _fill_browser_use(ctx: ApplicationContext, task_id: int, job: Any, url: str,
         if in_place:  # the person worked in this very page (fields, a CAPTCHA, a sign-in): pick it up where it is
             problem, observation = _bu_resume(ctx, session)
             here = None if problem else generic.analyze(observation.get("url") or url, observation.get("elements") or [])
-            if not problem and (here is None or not {f.id for f in form.fields} <= {f.id for f in here.fields}):
+            if not problem and not _planned_on_page(form, here, observation):
                 in_place = False  # the form is no longer on this page (a sign-in moved it): the apply URL again
         if not in_place:
             problem, observation = _bu_load(ctx, session, job.user_id, match, url)
@@ -740,9 +751,8 @@ def _fill_browser_use(ctx: ApplicationContext, task_id: int, job: Any, url: str,
         current = generic.analyze(observation.get("url") or url, observation.get("elements") or [])
         result = browser_actions.FillResult()
         limit = get_settings().application_max_actions
-        planned = {f.id for f in form.fields}
         if in_place and current is not None and current.fingerprint != expected and \
-                planned <= {f.id for f in current.fields}:
+                _planned_on_page(form, current, observation):
             pass  # the page grew (a conditional question appeared): the planned fields are all still there
         elif current is None or current.fingerprint != expected:  # a fresh page: reveal the form again first
             propose, builder = _navigator(ctx, job, attempt)
@@ -1049,7 +1059,7 @@ def _bu_facts(ctx: ApplicationContext, session: Any, planned: Any, values: dict[
     current = generic.analyze(url, observation.get("elements") or []) if not facts["problem"] else None
     if current is None:
         return {**facts, "fingerprint": None, "missing": [], "uploaded": {}, "submit_key": None}
-    grown = {f.id for f in planned.fields} <= {f.id for f in current.fields}
+    grown = _planned_on_page(planned, current, observation)
     facts["fingerprint"] = planned.fingerprint if grown else current.fingerprint
     facts["missing"], facts["person"] = browser_actions.read_required(session, ctx.run_async, current, values,
                                                                       observation)

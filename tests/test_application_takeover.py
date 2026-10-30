@@ -56,6 +56,7 @@ class FakeSession:
         self.alive = True
         self.values: dict[str, Any] = {}
         self.commands: list[tuple[str, dict]] = []
+        self.replaced: dict[str, str] = {}
         self.storage = storage
 
     @property
@@ -72,8 +73,10 @@ class FakeSession:
             return {"final_url": URL, "status": 200, "title": "Acme careers"}
         if cmd == "observe":
             elements = {"landing": [], "done": [], "login": LOGIN, "signup": SIGNUP, "form": FORM}[self.page]
-            return {"url": URL, "title": "Acme", "elements": [dict(e) for e in elements], "html": HTML[self.page],
-                    "text": "Acme careers", "blocked_requests": 0, "captcha": dict(self.manager.captcha)}
+            gone = self.replaced if self.page == "form" else {}  # file inputs the board replaced with their file's name
+            return {"url": URL, "title": "Acme", "elements": [dict(e) for e in elements if e["key"] not in gone],
+                    "html": HTML[self.page], "text": "Acme careers", "blocked_requests": 0,
+                    "captcha": dict(self.manager.captcha), "attached": dict(gone)}
         if cmd == "challenge":
             return dict(self.manager.captcha)
         if cmd in ("fill", "select"):
@@ -95,6 +98,8 @@ class FakeSession:
                     "text": "Thank you for applying", "captcha": {"present": False, "solved": False, "kind": None}}
         if cmd == "upload":
             self.values[args["key"]] = [args["path"].rsplit("/", 1)[-1]]
+            if self.manager.replace_uploads:
+                self.replaced[args["key"]] = self.values[args["key"]][0]
             return {"uploaded": True}
         if cmd == "read":
             value = self.values.get(args["key"])
@@ -145,6 +150,7 @@ class FakeManager:
         self.held: list[tuple[int, bool]] = []  # (minutes, runner time extended)
         self.captcha = {"present": False, "solved": False, "kind": None}
         self.captcha_after_fill = False
+        self.replace_uploads = False
         self.submitted: list[str] = []
         self.windows: list[FakeSession] = []  # every window started, closed ones included
         self.loop = None
@@ -489,13 +495,16 @@ def test_a_captcha_solved_in_the_window_continues_by_itself_in_the_same_page(ses
     assert len(fake.started) == 1 and done.agent_thread_id == task.agent_thread_id
 
 
-def test_auto_submit_waits_at_a_captcha_and_submits_once_in_the_same_page_when_it_is_solved(sessions, monkeypatch):
+@pytest.mark.parametrize("replaces_uploads", [False, True], ids=["file-input-kept", "file-input-replaced"])
+def test_auto_submit_waits_at_a_captcha_and_submits_once_in_the_same_page_when_it_is_solved(sessions, monkeypatch,
+                                                                                          replaces_uploads):
     from app.models import SubmissionIntent
     from tests import guarded_support as gs
 
     monkeypatch.setattr(aps.get_settings(), "application_execution_mode", "guarded_auto")
     fake = FakeManager("form")
     fake.captcha_after_fill = True  # the site shows its CAPTCHA once the form is filled, above Submit
+    fake.replace_uploads = replaces_uploads  # some boards swap the file input for the uploaded file's name
     bus.set_sidecars(fake)
     user = aps.owner(sessions)
     aps.answer(sessions, user, aps.PYTHON_QUESTION, "8")
@@ -610,3 +619,32 @@ def test_an_answer_after_the_hold_ran_out_reads_the_form_again(sessions, monkeyp
     assert done.outcome == "READY_TO_SUBMIT" and len(fake.started) == 2  # a new window, the apply URL loaded again
     assert _commands_since(held, before) == []  # the expired window was not reused
     assert "goto" in [c for c, _ in fake.windows[-1].commands]
+
+
+def test_a_solved_challenge_that_removes_its_widget_still_continues(sessions):
+    fake = FakeManager("form")
+    fake.captcha = {"present": True, "solved": False, "kind": "recaptcha"}
+    bus.set_sidecars(fake)
+    _user, job_id = account(sessions)
+    drive(sessions)
+    assert _watch(sessions) == 0  # the widget is there, unanswered
+    fake.captcha = {"present": False, "solved": False, "kind": None}  # solving it took the widget away
+    assert _watch(sessions) == 1
+    drive(sessions)
+    assert aps.task_of(sessions, job_id).outcome == "READY_TO_SUBMIT"
+
+
+def test_a_captcha_only_the_page_text_named_waits_for_continue(sessions):
+    fake = FakeManager("form")
+    bus.set_sidecars(fake)
+    HTML_WITH_TEXT = "<form><input name=n></form><p>Please complete the captcha to continue</p>"
+    _user, job_id = account(sessions)
+    original, HTML["form"] = HTML["form"], HTML_WITH_TEXT
+    try:
+        drive(sessions)
+        task = aps.task_of(sessions, job_id)
+        assert task.interrupt["reason"] == "CAPTCHA_OR_ANTI_BOT"
+        assert _watch(sessions) == 0 and _watch(sessions) == 0  # no widget was ever seen: nothing to read as solved
+        assert aps.task_of(sessions, job_id).stage == "NEEDS_HUMAN"
+    finally:
+        HTML["form"] = original

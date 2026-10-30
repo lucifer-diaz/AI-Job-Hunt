@@ -647,3 +647,37 @@ def test_the_runner_reads_a_captcha_in_any_frame_and_only_whether_it_is_answered
     assert evidence["captcha"]["solved"] and "SYNTHETIC-TOKEN-1" not in str([after, evidence])
     assert invisible["present"] is False  # reCAPTCHA v3: the site runs it itself; nobody is asked to solve it
     assert embedded == {"present": True, "solved": False, "kind": "recaptcha"}  # inside an embedded board's frame
+
+
+TWO_WIDGETS_PAGE = b"""<!doctype html><html><body><form>
+<div><iframe src="/recaptcha/api2/anchor?k=a" style="width:304px;height:78px"></iframe>
+<textarea id="g-recaptcha-response" name="g-recaptcha-response" style="display:none"></textarea></div>
+<div><iframe src="/recaptcha/api2/anchor?k=b" style="width:304px;height:78px"></iframe>
+<textarea id="g-recaptcha-response-1" name="g-recaptcha-response" style="display:none"></textarea></div></form>
+<button type="button" onclick="document.getElementById('g-recaptcha-response').value='A'">First</button>
+<button type="button" onclick="document.getElementById('g-recaptcha-response-1').value='B'">Second</button>
+</body></html>"""
+
+
+def test_two_captchas_on_a_page_are_answered_only_when_both_are(runner, tmp_path):
+    from app.services import application_execution
+
+    manager = bus.get_sidecars()
+    with gs.FakeATS("confirm", pages={"two.html": TWO_WIDGETS_PAGE}) as ats, \
+            application_execution.background_loop() as loop:
+        run = application_execution.loop_runner(loop, timeout=90)
+        session = run(manager.start(user_id=1, task_id=21, job_id=5, allowed_hosts=["127.0.0.1"],
+                                    upload_dir=str(tmp_path), allow_private=True))
+        try:
+            run(session.call("goto", url=ats.url("two")))
+            page = run(session.call("observe"))
+            button = {e.get("label", "").strip(): e["key"] for e in page["elements"]}
+            run(session.call("click", key=button["First"]))
+            one = run(session.call("challenge"))
+            run(session.call("click", key=button["Second"]))
+            both = run(session.call("challenge"))
+        finally:
+            run(manager.close(1, 21))
+    assert page["captcha"] == {"present": True, "solved": False, "kind": "recaptcha"}
+    assert one["solved"] is False  # one of two answered: still a CAPTCHA
+    assert both == {"present": True, "solved": True, "kind": "recaptcha"}

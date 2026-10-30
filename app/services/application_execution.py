@@ -321,6 +321,19 @@ def continue_after_takeover(db: Session, task_id: int) -> ApplicationExecutionTa
 # Takeovers a person settles in the window by answering a CAPTCHA: the run continues by itself once it is answered.
 CHALLENGE_REASONS = ("CAPTCHA_OR_ANTI_BOT", "NAVIGATOR_CAPTCHA")
 _watching: dict[tuple[int, int], Any] = {}
+_widget_seen: set[tuple[int, int]] = set()  # windows where a challenge widget was seen while it waited
+
+
+def _answered(key: tuple[int, int], reading: Any) -> bool:
+    """Whether the window's challenge is behind the person: its widget reads solved, or a widget seen earlier is gone
+    (solving it removed it, or moved on to the form). The run re-observes and re-validates the page either way; a
+    CAPTCHA only the page text named (no widget ever seen) still waits for Continue."""
+    if not isinstance(reading, dict):
+        return False
+    if reading.get("present"):
+        _widget_seen.add(key)
+        return bool(reading.get("solved"))
+    return key in _widget_seen
 
 
 def _watched(user_id: int, task_id: int) -> bool:
@@ -377,16 +390,17 @@ def watch_challenge(sessions: Callable[[], Session], user_id: int, task_id: int)
                         return
                     try:
                         reading = await session.call("challenge", timeout=15, record=False)
-                    except Exception:  # noqa: BLE001  a busy or navigating page: ask again
+                    except Exception:  # a busy or navigating page: ask again
                         log.debug("CAPTCHA window of execution %s did not answer", task_id, exc_info=True)
                         continue
-                    if not (reading.get("present") and reading.get("solved")):
+                    if not _answered((user_id, task_id), reading):
                         continue
                     done = await threads.run_io(settle)
                     if done is not None:
                         return
             finally:
                 _watching.pop((user_id, task_id), None)
+                _widget_seen.discard((user_id, task_id))
 
         _watching[(user_id, task_id)] = asyncio.run_coroutine_threadsafe(poll(), loop)
     except Exception:  # the Continue button and the scheduler pass still work
@@ -416,8 +430,9 @@ def watch_challenges(db: Session, limit: int = 20) -> int:
             session = manager.get(user_id, task_id)
             reading = manager.run_threadsafe(session.call("challenge", timeout=15, record=False), timeout=20) \
                 if session is not None else None
-            if isinstance(reading, dict) and reading.get("present") and reading.get("solved"):
-                woken += bool(challenge_solved(db, user_id, task_id))
+            if _answered((user_id, task_id), reading) and challenge_solved(db, user_id, task_id):
+                woken += 1
+                _widget_seen.discard((user_id, task_id))
         except Exception:  # one window never stops the others, nor the pass
             db.rollback()
             log.warning("could not check the CAPTCHA window of execution %s", task_id, exc_info=True)
