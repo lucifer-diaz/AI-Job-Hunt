@@ -8,8 +8,8 @@ grounded in this text) then keeps the misspelling. A font maps a glyph the same 
                  "mulY-tenant", "real-Yme")
     one mapping  per odd character: the ligature that turns the most of its suspects into known English words, and
                  clearly more than any other ligature does
-    replace      a suspect when the mapping makes it a known word; a symbol inside a word ("pla[orms") is never
-                 meant, so its suspects all follow the mapping
+    replace      a suspect only when the mapping makes it a known word, symbols included: "pla[orms" becomes
+                 "platforms", while "arr[index]" in the same text stays as written
 
 A word that is already a known word, and an odd character no ligature explains ("eBay", "JavaScript", "k8s"), are
 left exactly as they are. Clean text comes back byte-identical. A glyph that came out as an ordinary lower-case
@@ -145,8 +145,6 @@ def repair_glyphs(text: str) -> str:
         repaired = token
         for i in reversed(positions):
             repaired = repaired[:i] + found[token[i]] + repaired[i + 1:]
-        if all(not token[i].isalpha() for i in positions) or known(repaired):
-            return repaired
-        return token
+        return repaired if known(repaired) else token
 
     return _TOKEN.sub(fix, text)

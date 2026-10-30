@@ -35,6 +35,14 @@ def test_clean_text_comes_back_byte_identical(text):
     assert repair_glyphs(text) == text
 
 
+def test_a_mapped_symbol_never_rewrites_a_word_it_does_not_make_known():
+    assert repair_glyphs("pla[orms arr[index]") == "platforms arr[index]"
+    text = "Built pla[orms and the pla[orms team's data[key] lookups"
+    assert repair_glyphs(text) == "Built platforms and the platforms team's data[key] lookups"
+    # Mostly real brackets: no mapping at all, the text is left as written.
+    assert repair_glyphs("the pla[orms; see x[i] and data[key]") == "the pla[orms; see x[i] and data[key]"
+
+
 def test_one_odd_letter_is_not_a_mapping():
     text = "Shipped the iPhone app and the YouTube channel."
     assert mappings(text) == {} and repair_glyphs(text) == text
@@ -59,4 +67,4 @@ def test_a_pdf_upload_is_repaired_before_it_is_parsed(monkeypatch):
     monkeypatch.setattr(pypdf, "PdfReader", Reader)
     text = document_text.extract(document_text.PDF, b"%PDF-1.4")
     assert "architecting" in text and "architecYng" not in text
-    assert document_text.extract(document_text.TXT, "architecYng".encode()) == "architecYng", "only PDF text"
+    assert document_text.extract(document_text.TXT, b"architecYng") == "architecYng", "only PDF text"
