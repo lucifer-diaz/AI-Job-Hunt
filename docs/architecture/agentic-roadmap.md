@@ -944,7 +944,7 @@ Allowed status: NOT_STARTED, PLANNING, IN_PROGRESS, IN_REVIEW, MERGED, BLOCKED, 
     `GET /api/monitoring/feedback` (human correction rate, recruiter outcomes apart).
   - **Export hardening:** OTP/opaque-token/cookie shapes refused at the projection and the wire, URL and header check,
     LangSmith key pattern, exporter guard over `job_hunt_agent/`, `scripts/`, `sidecars/`.
-- New migrations, flags, APIs: migration `0061` (`llm_request_logs.retrieval_ms`, `retrieval_mode`); no flags;
+- New migrations, flags, APIs: migration `0062` (`llm_request_logs.retrieval_ms`, `retrieval_mode`); no flags;
   `/api/orchestration/jobs/{id}/journey`, `/api/monitoring/feedback`.
 - Architectural decisions and deviations: ADR-036. Deviation: the JD parser suite scores recorded outputs (a model is
   compared by recording its outputs as a new dataset version), not a live call. Fix found by the evaluation:
@@ -956,7 +956,7 @@ Allowed status: NOT_STARTED, PLANNING, IN_PROGRESS, IN_REVIEW, MERGED, BLOCKED, 
   ATS corrections) is drawn as planned, not built; correction rates are per account, not per model.
 - Reviewer / approval: pending.
 - Production activation and rollback: the read models and Monitoring figures are on with the merge; offline evaluation
-  runs only when invoked. Rollback is a revert; migration `0061` downgrades cleanly (two nullable columns), and
+  runs only when invoked. Rollback is a revert; migration `0062` downgrades cleanly (two nullable columns), and
   business logs are untouched.
 - Next dependency: Phase 8 (production hardening) — not started.
 

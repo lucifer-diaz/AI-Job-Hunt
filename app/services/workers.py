@@ -7,6 +7,7 @@
     Tailoring    tailor_tasks (tailor → review)  the in-process tailor worker
     Reviewing    tailor_tasks at the review step  a view of Tailoring: the same rows, settings and controls
     Indexing     rag_index_entries              scheduler job rag_index (no job: an Evidence or saved-answer row)
+    Resume parsing resume_parse_tasks           scheduler job resume_parse (no job: a resume version)
 
 Most queues hold one task per job. The retrieval indexer's entries belong to an account and a source row instead, so a
 kind may describe tasks without a job (`WorkerKind.subject`): how a row is labelled, what a search matches and how a
@@ -47,6 +48,8 @@ from app.models import (
     JobRankingTask,
     RagIndexEntry,
     RagIndexVersion,
+    Resume,
+    ResumeParseTask,
     TailorTask,
 )
 from app.services import backoff, redaction, server_settings, worker_settings
@@ -190,6 +193,34 @@ def _index_requeue(db: Session, task: Any, user_id: int) -> Any:
     return task
 
 
+def _resume_subjects(db: Session, user_id: int, tasks: list[Any]) -> dict[int, dict[str, Any]]:
+    """"Resume name · v3": the version's own label. Never its text."""
+    ids = {t.resume_id for t in tasks}
+    resumes = {r.id: r for r in db.scalars(select(Resume).where(Resume.user_id == user_id, Resume.id.in_(ids))).all()} \
+        if ids else {}
+    out = {}
+    for t in tasks:
+        r = resumes.get(t.resume_id)
+        out[t.id] = {"title": (r.name or "Resume") if r else "Deleted resume",
+                     "company": f"v{r.version}" if r else "", "step": t.step, "outcome": t.outcome,
+                     "subject": {"type": "resume", "id": t.resume_id}}
+    return out
+
+
+def _resume_search(m: Any, text: str) -> Any:
+    """`#12` is the resume's id; words match the resume's name."""
+    if text.lstrip("#").isdigit():
+        return m.resume_id == int(text.lstrip("#"))
+    like = f"%{text.lower()[:100]}%"
+    return m.resume_id.in_(select(Resume.id).where(func.lower(Resume.name).like(like)))
+
+
+def _resume_requeue(db: Session, task: Any, user_id: int) -> Any:
+    from app.services import resume_parsing
+
+    return resume_parsing.requeue(db, task, user_id)
+
+
 KINDS: dict[str, WorkerKind] = {k.kind: k for k in (
     WorkerKind("parsing", "JD parsing", "Parses each posting into structured requirements (JD parser model).",
                JobDescriptionParseTask, "jd_parsing", "PENDING", "PROCESSING", ("COMPLETED", "FAILED", "SKIPPED"),
@@ -234,6 +265,12 @@ KINDS: dict[str, WorkerKind] = {k.kind: k for k in (
                ("ACTIVE", "FAILED", "DEACTIVATED"), lambda: get_settings().rag_index_max_attempts, "retrieval_index",
                scope=_index_scope, subject=_index_subjects, search=_index_search, requeue=_index_requeue,
                shown=(("ACTIVE", "COMPLETED"), ("DEACTIVATED", "SKIPPED")), stopped_status="FAILED"),
+    WorkerKind("resume_parsing", "Resume parsing", "Structures each uploaded resume with the Resume Parser model "
+               "(LangGraph), keeps only what the resume's own text states, and fills the structured data while you "
+               "have not reviewed it (a comparison otherwise).", ResumeParseTask, "resume_parse", "PENDING",
+               "PROCESSING", ("COMPLETED", "FAILED"), lambda: get_settings().resume_parse_max_attempts,
+               "resume_parser", subject=_resume_subjects, search=_resume_search, requeue=_resume_requeue,
+               stopped_status="FAILED"),
 )}
 
 
@@ -566,7 +603,7 @@ def performance(db: Session, user_id: int, kind: str, start: datetime, end: date
         errors[key] = errors.get(key, 0) + 1
         if not spec.tailor:
             code = getattr(t, "error_category", None)
-            category = code.value if code else "UNKNOWN"
+            category = getattr(code, "value", code) if code else "UNKNOWN"  # an enum, or a plain string column
             categories[category] = categories.get(category, 0) + 1
     out: dict[str, Any] = {
         "kind": spec.kind, "start": _iso(start), "end": _iso(end),
@@ -888,6 +925,10 @@ def _stop(db: Session, spec: WorkerKind, task: Any, user_id: int, now: datetime)
         from app.services import application_execution
 
         application_execution.on_stopped(db, task, now)  # its graph thread stops too, and its stage is CANCELLED
+    if spec.kind == "resume_parsing":
+        from app.services import resume_parsing
+
+        resume_parsing.on_stopped(db, task, now)  # its graph thread stops too, and its staged output is dropped
     if spec.kind == "insights" and getattr(task, "agent_thread_id", None):
         from app.services import qualification
 

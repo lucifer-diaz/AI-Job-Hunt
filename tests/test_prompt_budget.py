@@ -119,7 +119,9 @@ def test_without_a_budget_the_prompt_and_context_are_the_builders_own(ranked, ta
     for budget in (None, 0):
         context, prompt = build_and_render(user_id, job_id, task, budget)
         assert (prompt.system, prompt.user) == (expected.system, expected.user)
-        assert context.to_dict() == plain.to_dict() and context.call_stats() == plain.call_stats()
+        # The same context, the same figures; retrieval's own measured latency (RAG on) is a timing, not context.
+        timing = lambda stats: {k: v for k, v in stats.items() if k != "retrieval_ms"}
+        assert context.to_dict() == plain.to_dict() and timing(context.call_stats()) == timing(plain.call_stats())
         assert "trimmed" not in context.stats.as_dict() and "prompt_token_budget" not in context.call_stats()
 
 

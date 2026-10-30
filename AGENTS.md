@@ -264,6 +264,27 @@ The rules a change has to keep:
   NULL or `AUTO` may ever be re-matched; `SETUP`, `USER` and `ACTIVE` are the person's decisions. Changing tags never
   re-ranks by itself — re-matching is an explicit action, because it can queue model calls.
 
+## Resume structuring (AI parse of uploads)
+
+`app/services/resume_parsing.py` (queue and steps), `app/agents/resume_parsing.py` (the graph) and
+`app/services/resume_parsing_graph.py` (graph or plain path) structure each uploaded resume with the Resume Parser
+model (README §11). The rules a change has to keep:
+
+* **No model in a request.** `record_version` and "Re-parse with AI" only write a `ResumeParseTask`; the
+  `resume_parse` scheduler job runs it. The regex parse (`structured_resume.parse_deterministic`) is written at once
+  and stays when the model is unavailable.
+* **Grounding drops, never rewrites** (`resume_parsing.ground`, deterministic): a value is kept only when the resume's
+  own text contains it; dates are recomputed from their raw text with `normalize_date`. Never loosen it to make a
+  model's paraphrase pass; improve the prompt instead.
+* **A person's work wins.** The result replaces `structured_data` only while `untouched` holds (no reviewed unit, no
+  USER change, the revision the task was queued against); otherwise it is `resume_verification.compare`, the same
+  comparison a re-parse makes. Everything it writes is UNVERIFIED. It never activates a resume.
+* **The graph conducts the service's steps.** Its one model call goes through `GatewayChatModel` bound to the
+  `resume_parser` prompt; every write is `effects.within` plus the task's lease (`held`). The model output lives on
+  `resume_parse_tasks.staged` (cleared when the task ends), never in a checkpoint; graph state is ids and counts.
+* **Kill stops; an upload never revives it.** A stopped task's text is not queued again by an upload; Retry, Run now
+  or Re-parse with AI do.
+
 ## Job Insights (company, compensation and interview research)
 
 `app/services/job_insights/` builds a source-backed research package for an approved job (README §14a). The rules a

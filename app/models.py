@@ -95,6 +95,7 @@ class User(Base):
     resume_versions: Mapped[list[ResumeVersion]] = relationship(back_populates="user", passive_deletes=True)
     job_requirements: Mapped[list[JobRequirementEvidence]] = relationship(back_populates="user", passive_deletes=True)
     job_parse_tasks: Mapped[list[JobDescriptionParseTask]] = relationship(back_populates="user", passive_deletes=True)
+    resume_parse_tasks: Mapped[list[ResumeParseTask]] = relationship(back_populates="user", passive_deletes=True)
     job_fetch_tasks: Mapped[list[JobDescriptionFetchTask]] = relationship(back_populates="user", passive_deletes=True)
     job_insight_tasks: Mapped[list[JobInsightTask]] = relationship(back_populates="user", passive_deletes=True)
     job_insights: Mapped[list[JobInsight]] = relationship(back_populates="user", passive_deletes=True)
@@ -289,6 +290,60 @@ class ResumeDataChange(Base):
     change_type: Mapped[str] = mapped_column(String(20))
     source: Mapped[str] = mapped_column(String(10), default="USER")
     changed_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+
+RESUME_PARSE_STATUSES = ("PENDING", "PROCESSING", "COMPLETED", "FAILED")
+ACTIVE_RESUME_PARSE_STATUSES = ("PENDING", "PROCESSING")
+
+
+class ResumeParseTask(Base):
+    """One AI structuring of a resume version (app.services.resume_parsing), claimed by the scheduler.
+
+    A resume has at most one PENDING or PROCESSING task (uq_resume_parse_tasks_active_resume). The task carries the
+    text hash and the structured-data revision it was queued against: the result fills the data only while nobody
+    has reviewed or edited it since, and is offered as a comparison otherwise. `staged` holds the grounded model
+    output between steps (never a graph checkpoint); it is cleared once applied.
+    """
+
+    __tablename__ = "resume_parse_tasks"
+    __table_args__ = (
+        CheckConstraint(f"status IN ({_values(RESUME_PARSE_STATUSES)})", name="ck_resume_parse_tasks_status"),
+        CheckConstraint("attempt_count >= 0", name="ck_resume_parse_tasks_attempt_count"),
+        Index("uq_resume_parse_tasks_active_resume", "resume_id", unique=True,
+              postgresql_where=text(f"status IN ({_values(ACTIVE_RESUME_PARSE_STATUSES)})"),
+              sqlite_where=text(f"status IN ({_values(ACTIVE_RESUME_PARSE_STATUSES)})")),
+        Index("ix_resume_parse_tasks_claim", "status", "next_attempt_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("resume_parse_tasks")
+    user: Mapped[User] = relationship(back_populates="resume_parse_tasks")
+    resume_id: Mapped[int] = mapped_column(
+        ForeignKey("resumes.id", ondelete="CASCADE", name="fk_resume_parse_tasks_resume_id"), index=True)
+    raw_text_hash: Mapped[str] = mapped_column(String(64))
+    base_revision: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(20), default="PENDING")
+    reason: Mapped[str] = mapped_column(String(40), default="upload")  # upload | user_request
+    step: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    # filled | compare | kept | not_configured | gone (app.services.resume_parsing.RESULTS)
+    outcome: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_category: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    run_now_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    locked_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    lock_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lock_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    agent_thread_id: Mapped[int | None] = mapped_column(
+        ForeignKey("agent_threads.id", ondelete="SET NULL", name="fk_resume_parse_tasks_agent_thread_id"),
+        nullable=True)
+    staged: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # What grounding dropped and kept, counts only: {"roles": 1, "bullets": 3, "skills": 2, "kept_roles": 5, ...}
+    counts: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class KnowledgeAnswer(Base):

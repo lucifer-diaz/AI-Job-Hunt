@@ -165,9 +165,10 @@ NODES: tuple[Node, ...] = (
     Node("outcome", "Offer / rejected", (OUTCOME,), "Where an application ended: offer, rejection or closed.",
          "outcome", (2, 2), states=("OFFER", "REJECTED"), screen="tracker"),
     # ── supporting workers ──
-    Node("resume_parser", "Resume parser", (AI,), "Parses uploaded resumes into facts and extracts verifiable "
-         "evidence the Ranker and Tailor may cite.", "support", (5, -1), workers=("RESUME_PARSER", "EVIDENCE_EXTRACTION"),
-         llm_stages=("RESUME_PARSER",), monitoring_tab="llm", screen="settings"),
+    Node("resume_parser", "Resume parser", (AI, ASYNC), "Structures each uploaded resume with the Resume Parser model "
+         "(LangGraph), keeps only what the resume's own text states, and extracts verifiable evidence the Ranker and "
+         "Tailor may cite.", "support", (5, -1), workers=("RESUME_PARSER", "EVIDENCE_EXTRACTION"),
+         llm_stages=("RESUME_PARSER",), monitoring_tab="llm", screen="settings", workers_tab="resume_parsing"),
     Node("compensation", "Compensation", (DET,), "Reads salary from structured posting fields only; the "
          "description is never mined.", "support", (0, -1), screen="discovery"),
     Node("ai_advisor", "AI Optimization Advisor", (AI, ASYNC), "Analyses LLM telemetry and recommends; it never "

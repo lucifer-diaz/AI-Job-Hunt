@@ -33,7 +33,8 @@ from app.models import (AgentEffect, ApplicationClaim, ApplicationClaimKey, Appl
                         JobDescriptionParseTask, JobFeedbackEvent, JobInsight, JobInsightTask, JobQualificationTask, JobPreparationTask, ApprovedPacket, JobRanking,
                         JobRankingTask, RemovedPosting,
                         JobRequirementEvidence, JobStructuredDataChange, KnowledgeAnswer, McpToken, Resume,
-                        ProviderCooldown, ProviderRateWindow, ResumeDataChange, ResumeDocument, ResumeVariant, ResumeVersion, SavedSearch,
+                        ProviderCooldown, ProviderRateWindow, ResumeDataChange, ResumeDocument, ResumeParseTask, ResumeVariant,
+                        ResumeVersion, SavedSearch,
                         SearchProfile,
                         SearchRun, TailorTask, WorkflowTransition)
 
@@ -47,7 +48,7 @@ OWNED_MODELS = (CandidateProfile, AppSetting, ResumeDocument, KnowledgeAnswer, E
                 ApplicationInboxDigest, JobInsightTask, JobInsight, InsightObservation, ModelRouteState, FailoverEvent,
                 AgentThread, AgentEffect, EvidenceResumeLink, RagIndexVersion, RagIndexEntry, JobQualificationTask,
                 JobPreparationTask, ApprovedPacket, ApplicationClaim, ApplicationClaimKey, ApplicationExecutionTask,
-                ApplicationExecutionAttempt, SubmissionIntent, AtsRoute, AtsCredential, AtsSession)
+                ApplicationExecutionAttempt, SubmissionIntent, AtsRoute, AtsCredential, AtsSession, ResumeParseTask)
 # Rows that inherit their owner from a parent row: model -> (relationship, foreign key, parent model).
 INHERITED_OWNER = {
     Application: ("job", "job_id", Job),
