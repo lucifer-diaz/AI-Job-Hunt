@@ -4,7 +4,6 @@ import hashlib
 import secrets
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from io import BytesIO
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
@@ -88,6 +87,7 @@ from app.services import approval as approval_service
 from app.services import (
     backoff,
     context_builder,
+    document_text,
     evidence_tags,
     feedback_learning,
     mcp_tokens,
@@ -975,14 +975,7 @@ async def resume_upload(file: UploadFile = File(...), db: Session = Depends(get_
     if not data:
         raise HTTPException(400, "Resume is empty")
     try:
-        if file.content_type == "text/plain":
-            extracted = data.decode("utf-8")
-        elif file.content_type == "application/pdf":
-            from pypdf import PdfReader
-            extracted = "\n".join(page.extract_text() or "" for page in PdfReader(BytesIO(data)).pages)
-        else:
-            from docx import Document
-            extracted = "\n".join(p.text for p in Document(BytesIO(data)).paragraphs)
+        extracted = document_text.extract(file.content_type, data)
     except Exception as exc:
         raise HTTPException(422, f"Could not read resume: {exc}") from exc
     extracted = clean_raw_text(extracted)

@@ -1197,8 +1197,7 @@ _JD_LABELS = {
 
 def read_job_file(filename: str, content_type: str, data: bytes) -> str:
     """The text of an uploaded job description (PDF, DOCX or TXT). Raises HTTPException for an unusable file."""
-    from io import BytesIO
-
+    from app.services import document_text
     from app.services.structured_resume import clean_raw_text
 
     suffix = Path(filename or "").suffix.lower()
@@ -1208,14 +1207,7 @@ def read_job_file(filename: str, content_type: str, data: bytes) -> str:
     if not data:
         raise HTTPException(400, "The file is empty")
     try:
-        if kind == "application/pdf":
-            from pypdf import PdfReader
-            text = "\n".join(page.extract_text() or "" for page in PdfReader(BytesIO(data)).pages)
-        elif kind == "text/plain":
-            text = data.decode("utf-8", errors="replace")
-        else:
-            from docx import Document
-            text = "\n".join(p.text for p in Document(BytesIO(data)).paragraphs)
+        text = document_text.extract(kind, data, errors="replace")
     except Exception as exc:
         raise HTTPException(422, f"Could not read the file ({exc.__class__.__name__})") from exc
     text = clean_raw_text(text)
