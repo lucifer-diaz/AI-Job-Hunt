@@ -14,10 +14,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, object_session
 
 from app.auth import get_user_db
 from app.models import Resume, ResumeDocument, SavedSearch
+from app.services import resume_parsing
 from app.services import resume_verification as rv
 from app.services.structured_resume import SECTION_LABELS, StructuredResumeIn
 from app.services.user_settings import (
@@ -89,8 +90,11 @@ def summary(resume: Resume) -> dict:
 
 
 def detail(resume: Resume) -> dict:
+    db = object_session(resume)
     return {**summary(resume), "structured": resume.structured_data, "progress": rv.progress(resume.structured_data),
-            "pending_reparse": resume.pending_reparse, "sections": SECTION_LABELS}
+            "pending_reparse": resume.pending_reparse, "sections": SECTION_LABELS,
+            # The latest AI structuring of this version (app.services.resume_parsing): status and counts only.
+            "ai_parse": resume_parsing.status_of(db, resume.id) if db is not None else None}
 
 
 def _commit(db: Session, resume: Resume) -> dict:
@@ -245,8 +249,8 @@ def original(resume_id: int, db: Session = Depends(get_user_db)):
 def reparse(resume_id: int, payload: ReparseIn, db: Session = Depends(get_user_db)):
     resume = _resume(db, resume_id)
     try:
-        rv.reparse(db, resume, use_ai=payload.use_ai)
-    except Exception as exc:  # e.g. no AI key or the parser answered with invalid data
+        rv.reparse(db, resume, use_ai=payload.use_ai)  # use_ai only queues the AI parse: no model in the request
+    except Exception as exc:  # e.g. AI structuring is off
         db.rollback()
         raise HTTPException(400, f"Could not re-parse the resume: {exc}") from exc
     return _commit(db, resume)

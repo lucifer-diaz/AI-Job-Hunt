@@ -480,7 +480,7 @@ prompt versions, and `scripts/audit_sensitive_logs.py` checks stored logs for cr
 | `review.py` | `build_review_prompt` | `ReviewResult` | `review_resume` |
 | `followup.py` | `build_followup_prompt` | `FollowUpResult` | `draft_followup` |
 | `job_description_parser.py` | `build_job_description_parser_prompt` | `JobDescriptionParserOutput` | the `jd_parsing` scheduler job |
-| `resume_parser.py` | `build_resume_parser_prompt`, `build_evidence_extraction_prompt` | `ResumeParserOutput`, `EvidenceExtractionResult` | AI re-parse (a comparison, never applied automatically); evidence parsing |
+| `resume_parser.py` | `build_resume_parser_prompt`, `build_evidence_extraction_prompt` | `ResumeParserOutput`, `EvidenceExtractionResult` | AI structuring of every upload, grounded in the resume's text (fills untouched data, a comparison otherwise); evidence parsing |
 | `application.py` | `build_application_question_prompt` | `ApplicationAnswerResult` | not wired in yet |
 | `application_inbox.py` | `build_application_inbox_prompt`, `build_application_email_match_prompt` | `ApplicationEmailAnalysis`, `ApplicationEmailMatchResult` | the Application Inbox Agent (`app.services.application_inbox`) |
 | `inbox.py` | `build_inbox_classification_prompt` | `InboxClassificationResult` | superseded by `application_inbox.py`; kept for its golden fixture |
@@ -2630,7 +2630,7 @@ it is what AI workflows read; only the facts you verify are trusted when generat
         │  extract text, clean extraction noise (wording untouched)
         ▼
  Resume vN ── original file + raw text (read-only, never edited)
-        │  deterministic parser (or optional AI re-parse → comparison)
+        │  deterministic parser at once, then the AI structuring in the background (LangGraph)
         ▼
  Structured resume ── stable ids, every item UNVERIFIED
         │  you review, edit and verify in Settings → Resumes
@@ -2701,11 +2701,31 @@ verified in a later resume version reuses the same evidence row. Unverified or r
 Every change — parse, edit, add, remove, reorder, verify, reject, re-parse choice — is written to
 `resume_data_changes` with the field path, old and new value, and its source (`PARSER`, `USER`, `SYSTEM`).
 
+### AI structuring of uploads
+
+The regex parser structures an upload at once, but it guesses at layouts (a header that names the employer before the
+title, two-column PDFs). So every new version is also queued for the **Resume Parser** model
+(`app/services/resume_parsing.py`, scheduler job `resume_parse`, Running workers → Resume parsing). It runs as a
+LangGraph graph (`app/agents/resume_parsing.py`) when `AGENT_GRAPHS_ENABLED` is on with PostgreSQL, and as the same
+steps in sequence otherwise (`RESUME_PARSE_GRAPH_MODE=off`):
+
+```text
+LOAD_RESUME → EXTRACT_STRUCTURE (the model, through the gateway) → GROUND_IN_TEXT → CHECK_QUALITY → APPLY_RESULT
+```
+
+* **Grounding is code, not the model**: a name, title, date, skill or bullet is kept only when the resume's own text
+  contains it (bullets word for word, give or take PDF line breaks). Anything else is dropped and counted; the screen
+  says how many values were left out.
+* **Check**: a result with fewer roles and far fewer bullets than the regex parse of the same text is not used.
+* **Apply**: while nobody has reviewed or edited the data, the AI result replaces it (every item unverified). Once you
+  have, it arrives as the comparison below instead. The model never runs inside a request; without an AI model the
+  regex parse simply stays.
+
 ### Re-parsing
 
-**Re-parse resume** (deterministic) or **Re-parse with AI** (uses `app/prompts/resume_parser.py`) never replaces
-data. It produces a comparison — *current value* vs *new parser result* — and you choose **Keep current** or
-**Use new** for each difference. Values taken from the parser start unverified.
+**Re-parse resume** (deterministic) produces a comparison — *current value* vs *new parser result* — and you choose
+**Keep current** or **Use new** for each difference. **Re-parse with AI** queues the AI structuring above and shows
+its progress; it fills untouched data or produces the same comparison. Values taken from a parser start unverified.
 
 ### Multiple resume versions
 

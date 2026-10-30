@@ -11,6 +11,7 @@ from app.auth import CurrentUser
 from app.db import SessionLocal
 from app.main import app
 from app.models import Evidence, Resume, ResumeDataChange
+from app.services import resume_parsing
 from app.services import resume_verification as rv
 from app.services import structured_resume as sr
 from app.services.user_settings import profile_for
@@ -269,7 +270,12 @@ def test_reparse_is_a_comparison_and_never_overwrites_verified_values(user):
     kept = client.post(f"/api/resumes/{detail['id']}/reparse/resolve", json={"decisions": {}}).json()
     assert kept["structured"]["experience"][0]["job_title"] == "Principal Engineer" and kept["pending_reparse"] is None
 
-    client.post(f"/api/resumes/{detail['id']}/reparse", json={"use_ai": True})  # the mock AI parser
+    # Re-parse with AI only queues the AI structuring; the worker runs it (the mock parser) and, since the resume
+    # was reviewed, it arrives as the same comparison.
+    assert client.post(f"/api/resumes/{detail['id']}/reparse", json={"use_ai": True}).json()["ai_parse"]["active"]
+    with session(user) as db:
+        claim, = [c for c in resume_parsing.claim(db, worker_id="test", limit=50) if c.user_id == user]
+    assert resume_parsing.process(lambda: session(user), claim) == resume_parsing.COMPARE
     pending = active(user)["pending_reparse"]
     change = next(c for c in pending["changes"] if c["path"].endswith(".job_title"))
     used = client.post(f"/api/resumes/{detail['id']}/reparse/resolve", json={"decisions": {change["id"]: "use_new"}}).json()
