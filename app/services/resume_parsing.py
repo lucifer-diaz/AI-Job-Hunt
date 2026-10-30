@@ -128,11 +128,17 @@ def enqueue(db: Session, resume: Resume, *, reason: str = UPLOAD, run_now: bool 
     return task
 
 
+def ai_only(db: Session, user_id: int) -> bool:
+    """The account structures uploads with AI only: an upload runs now, and the regex parse is only a fallback."""
+    return bool(worker_settings.get(db, user_id, KIND, "ai_only"))
+
+
 def queue_after_upload(db: Session, resume: Resume) -> None:
-    """The upload hook: queue the new version, and wake the worker. Never fails the upload."""
+    """The upload hook: queue the new version (run now when the account structures uploads with AI only), and wake
+    the worker. Never fails the upload."""
     try:
         with db.begin_nested():
-            queued = enqueue(db, resume)
+            queued = enqueue(db, resume, run_now=ai_only(db, resume.user_id))
     except Exception:  # a queue problem never loses an upload
         log.warning("could not queue AI structuring for resume %s", resume.id, exc_info=True)
         return

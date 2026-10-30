@@ -56,6 +56,40 @@ def test_a_close_call_is_left_to_the_person():
     assert picked("Senior Backend Engineer", (other, domain_only)) == 6, "a role beats a domain"
 
 
+def grouped(id_: int, groups: list[dict]) -> Resume:
+    resume = Resume(id=id_, name=f"r{id_}", version=id_, raw_text="", raw_text_hash="x")
+    rm.set_tags(resume, groups)
+    return resume
+
+
+def test_a_resume_can_target_several_domains_each_with_its_roles():
+    both = grouped(20, [{"domain": "AI / ML", "roles": ["AI Engineer"]},
+                        {"domain": "Data", "roles": ["Data Engineer", "Analytics Engineer"]}])
+    assert (both.domain, both.roles) == ("AI / ML", ["AI Engineer", "Data Engineer", "Analytics Engineer"])
+    assert [g["domain"] for g in rm.groups(both)] == ["AI / ML", "Data"]
+    assert picked("Senior Data Engineer", (both, BACKEND)) == 20, "a role of the second domain"
+    assert picked("ETL Developer", (both, BACKEND)) == 20, "the second domain's keyword in the title"
+    assert rm.score(both, Job(title="AI Engineer")).reason == "role 'AI Engineer'"
+
+
+def test_several_domains_never_add_up():
+    text = "machine learning llm nlp genai data etl analytics warehouse"
+    one = grouped(21, [{"domain": "AI / ML", "roles": []}])
+    two = grouped(22, [{"domain": "AI / ML", "roles": []}, {"domain": "Data", "roles": []}])
+    assert rm.score(two, Job(title="Engineer", description=text)).score == \
+        rm.score(one, Job(title="Engineer", description=text)).score == 3
+
+
+def test_groups_are_cleaned_and_older_tags_read_as_one_group():
+    resume = grouped(23, [{"domain": " Data ", "roles": ["Data Engineer", " "]}, {"domain": "data", "roles": ["ETL"]},
+                          {"domain": "", "roles": []}])
+    assert rm.groups(resume) == [{"domain": "Data", "roles": ["Data Engineer", "ETL"]}]
+    assert rm.groups(BACKEND) == [{"domain": "Backend", "roles": ["Lead Engineer", "Engineering Manager"]}]
+    assert rm.groups(UNTAGGED) == [] and not rm.tagged(UNTAGGED)
+    rm.set_tags(resume, [])
+    assert (resume.domains, resume.domain, resume.roles) == (None, None, None)
+
+
 def test_the_description_only_breaks_ties():
     ml, data = tagged(9, "AI / ML", []), tagged(10, "Data", [])
     text = "We train machine learning models and ship LLM features. ML ops too."
@@ -131,6 +165,14 @@ def test_tags_are_edited_on_versions_and_files_and_shown_everywhere(user, tagged
     assert versions[product]["roles"] == ["Product Manager"] and versions[backend]["domain"] == "Backend"
     choices = client.get("/api/resumes/choices").json()
     assert {c["id"]: c["domain"] for c in choices["items"]}[backend] == "Backend" and choices["catalog"]
+    grouped_out = client.put(f"/api/resumes/{backend}/tags", json={"domains": [
+        {"domain": "Backend", "roles": ["Lead Engineer"]}, {"domain": "DevOps / SRE", "roles": ["Cloud Engineer"]}]})
+    assert grouped_out.json()["domains"] == [{"domain": "Backend", "roles": ["Lead Engineer"]},
+                                             {"domain": "DevOps / SRE", "roles": ["Cloud Engineer"]}]
+    assert grouped_out.json()["domain"] == "Backend"
+    assert grouped_out.json()["roles"] == ["Lead Engineer", "Cloud Engineer"]
+    versions = {v["id"]: v for v in client.get("/api/settings/resume").json()["versions"]}
+    assert [g["domain"] for g in versions[backend]["domains"]] == ["Backend", "DevOps / SRE"]
     with SessionLocal() as db:
         db.info["user_id"] = user
         document = ResumeDocument(user_id=user, original_filename="Founder.pdf", storage_path="/tmp/none.pdf",
@@ -143,6 +185,7 @@ def test_tags_are_edited_on_versions_and_files_and_shown_everywhere(user, tagged
                              json={"domain": "Engineering Leadership", "roles": ["CTO"]}).json()
     library = {d["id"]: d for d in client.get("/api/profile/resumes").json()}
     assert library[document_id]["domain"] == "Engineering Leadership" and library[document_id]["roles"] == ["CTO"]
+    assert library[document_id]["domains"] == [{"domain": "Engineering Leadership", "roles": ["CTO"]}]
     assert library[document_id]["version_id"] == tagged_file["id"], "the file and its version share one set of tags"
     with SessionLocal() as db:
         assert not db.get(Resume, tagged_file["id"]).is_active, "tagging a file never makes it active"

@@ -49,6 +49,7 @@ from app.services import (
     feedback_learning,
     ranker,
     resume_length,
+    resume_matching,
     resume_verification,
 )
 from app.services.approval import ApprovalRefused
@@ -1196,8 +1197,7 @@ _JD_LABELS = {
 
 def read_job_file(filename: str, content_type: str, data: bytes) -> str:
     """The text of an uploaded job description (PDF, DOCX or TXT). Raises HTTPException for an unusable file."""
-    from io import BytesIO
-
+    from app.services import document_text
     from app.services.structured_resume import clean_raw_text
 
     suffix = Path(filename or "").suffix.lower()
@@ -1207,14 +1207,7 @@ def read_job_file(filename: str, content_type: str, data: bytes) -> str:
     if not data:
         raise HTTPException(400, "The file is empty")
     try:
-        if kind == "application/pdf":
-            from pypdf import PdfReader
-            text = "\n".join(page.extract_text() or "" for page in PdfReader(BytesIO(data)).pages)
-        elif kind == "text/plain":
-            text = data.decode("utf-8", errors="replace")
-        else:
-            from docx import Document
-            text = "\n".join(p.text for p in Document(BytesIO(data)).paragraphs)
+        text = document_text.extract(kind, data, errors="replace")
     except Exception as exc:
         raise HTTPException(422, f"Could not read the file ({exc.__class__.__name__})") from exc
     text = clean_raw_text(text)
@@ -2657,7 +2650,8 @@ def resume_list(db: Session = Depends(get_user_db)):
              "in_use": bool(active is not None and active.resume_document_id == d.id),
              "version_id": versions[d.id].id if d.id in versions else None,
              "domain": versions[d.id].domain if d.id in versions else None,
-             "roles": (versions[d.id].roles or []) if d.id in versions else []} for d in docs]
+             "roles": (versions[d.id].roles or []) if d.id in versions else [],
+             "domains": resume_matching.groups(versions[d.id]) if d.id in versions else []} for d in docs]
 
 
 @router.post("/api/profile/resumes/{document_id}/primary")
