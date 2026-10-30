@@ -305,3 +305,59 @@ def test_a_recorded_step_is_not_written_twice(user):
     replayed = rp.apply(sessions_for(user), claim, within=lambda db, step: False)
     assert replayed == {"step": rp.APPLY}
     assert resume_row(user, detail["id"]).parser == "deterministic"
+
+
+# ───────────── review fixes ─────────────
+
+def test_a_changed_number_never_passes_as_a_broken_word():
+    text = "Reduced production incidents by 45% across Kafka pipelines through improved monitoring and automated recovery"
+    src = rp.Source(text)
+    assert not src.has_passage(text.replace("45%", "95%"))
+    assert not src.has_passage(text.replace("45%", "45% and $2M"))
+    # PDF extraction broke an ordinary word: the clean bullet still grounds, with its number exact.
+    assert rp.Source(text.replace("pipelines", "pipe-\nlines")).has_passage(text)
+
+
+def test_the_current_role_flag_follows_the_grounded_end_date():
+    text = "Acme | Engineer | Jan 2020 - Dec 2021\nInitech | Lead | Jan 2022 - Present"
+    data, _ = rp.ground({"experience": [
+        {"company": "Acme", "job_title": "Engineer", "raw_end_date": "Dec 2021", "end_date": "2021-12", "is_current": True},
+        {"company": "Acme", "job_title": "Engineer", "raw_end_date": "Mar 2023", "is_current": True},  # not in the text
+        {"company": "Initech", "job_title": "Lead", "raw_end_date": "Present", "is_current": False}]}, text)
+    assert [r["is_current"] for r in data["experience"]] == [False, False, True]
+    assert data["experience"][1].get("end_date") is None and data["experience"][2].get("end_date") is None
+
+
+def test_performance_reads_a_failed_resume_parse(user):
+    from datetime import UTC, datetime, timedelta
+
+    upload()
+    claim = claim_one(user)
+    with sessions_for(user)() as db:
+        db.execute(ResumeParseTask.__table__.update().where(ResumeParseTask.id == claim.task_id)
+                   .values(attempt_count=get_settings().resume_parse_max_attempts))
+        db.commit()
+    assert rp.fail(sessions_for(user), claim, "RuntimeError: provider down") == "failed"
+    now = datetime.now(UTC).replace(tzinfo=None)
+    with sessions_for(user)() as db:
+        out = workers.performance(db, user, "resume_parsing", now - timedelta(days=1), now + timedelta(minutes=1))
+    assert out["failed"] == 1 and out["failures_by_category"] == {"EXTERNAL_SERVICE": 1}
+
+
+def test_held_locks_the_task_row_on_postgresql():
+    from sqlalchemy.dialects import postgresql
+
+    class Bind:
+        dialect = postgresql.dialect()
+
+    seen = []
+
+    class Db:
+        def get_bind(self):
+            return Bind()
+
+        def scalar(self, query):
+            seen.append(str(query.compile(dialect=postgresql.dialect())))
+
+    rp.held(Db(), rp.ParseClaim(1, "token", "w", 1, 1))
+    assert seen[0].rstrip().endswith("FOR UPDATE")

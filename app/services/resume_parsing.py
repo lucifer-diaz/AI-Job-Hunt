@@ -187,10 +187,15 @@ def claim(db: Session, *, worker_id: str, limit: int, now: datetime | None = Non
 
 
 def held(db: Session, c: ParseClaim) -> ResumeParseTask | None:
-    """The task, only while this run still holds its lease."""
-    return db.scalar(select(ResumeParseTask).where(
+    """The task, only while this run still holds its lease. On PostgreSQL the row stays locked until the caller
+    commits or rolls back, so a Kill or a lease recovery (which lock the same row) cannot land between this check and
+    the write it guards."""
+    query = select(ResumeParseTask).where(
         ResumeParseTask.id == c.task_id, ResumeParseTask.status == PROCESSING,
-        ResumeParseTask.lock_token == c.lock_token).execution_options(populate_existing=True))
+        ResumeParseTask.lock_token == c.lock_token).execution_options(populate_existing=True)
+    if db.get_bind().dialect.name == "postgresql":
+        query = query.with_for_update()
+    return db.scalar(query)
 
 
 def recover_expired(db: Session, now: datetime | None = None) -> int:
@@ -287,6 +292,7 @@ class Source:
     def __init__(self, raw_text: str):
         self.text = f" {_norm(raw_text)} "
         words = self.text.split()
+        self.words = set(words)
         self.pairs = set(pairwise(words))
         self.digits = re.sub(r"\D", "", raw_text or "")
 
@@ -303,13 +309,14 @@ class Source:
         return len(digits) >= 6 and digits in self.digits
 
     def has_passage(self, value: Any) -> bool:
-        """A bullet or a sentence: the text has it, word for word give or take a few broken words."""
+        """A bullet or a sentence: the text has it, word for word give or take a few broken words. A number is a fact,
+        never a broken word: every one in the passage must be in the text exactly (45% never passes as 95%)."""
         words = _norm(value).split()
         if not words:
             return False
         if f" {' '.join(words)} " in self.text:
             return True
-        if len(words) < 4:
+        if len(words) < 4 or any(re.search(r"\d", word) and word not in self.words for word in words):
             return False
         pairs = list(pairwise(words))
         return sum(pair in self.pairs for pair in pairs) / len(pairs) >= BULLET_MATCH
@@ -354,9 +361,12 @@ def _fields(item: dict[str, Any], names: tuple[str, ...], src: Source, count: _C
 
 
 def _dates(item: dict[str, Any], src: Source, count: _Counter, start: str = "start_date",
-           end: str = "end_date") -> None:
+           end: str = "end_date", current_flag: bool = False) -> None:
     """A date is the text's own: its raw form must be in the text, and the normalized month is computed from it
-    (sr.normalize_date: a year alone never gets a month)."""
+    (sr.normalize_date: a year alone never gets a month). With `current_flag` (a role), is_current comes from the
+    grounded end date only, in both directions: "Present" sets it, anything else, or no end date, clears it."""
+    if current_flag:
+        item["is_current"] = False
     for field, raw_field in ((start, f"raw_{start}"), (end, f"raw_{end}")):
         raw = item.get(raw_field)
         if raw and not src.has(raw):
@@ -368,7 +378,7 @@ def _dates(item: dict[str, Any], src: Source, count: _Counter, start: str = "sta
                 count.drop("dates")
             continue
         normalized, current = sr.normalize_date(raw)
-        if field == end and current:
+        if field == end and current and current_flag:
             item["is_current"] = True
         item[field] = normalized
 
@@ -411,7 +421,7 @@ def ground(data: dict[str, Any], raw_text: str) -> tuple[dict[str, Any], dict[st
     for role in out.get("experience") or []:
         role = dict(role)
         _fields(role, ("company", "job_title", "location", "employment_type"), src, count, "role_fields")
-        _dates(role, src, count)
+        _dates(role, src, count, current_flag=True)
         role["achievements"] = _passages(role.get("achievements"), src, count, "bullets")
         role["responsibilities"] = _passages(role.get("responsibilities"), src, count, "bullets")
         role["technologies"] = _names(role.get("technologies"), src, count, "skills")

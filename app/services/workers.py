@@ -603,7 +603,7 @@ def performance(db: Session, user_id: int, kind: str, start: datetime, end: date
         errors[key] = errors.get(key, 0) + 1
         if not spec.tailor:
             code = getattr(t, "error_category", None)
-            category = code.value if code else "UNKNOWN"
+            category = getattr(code, "value", code) if code else "UNKNOWN"  # an enum, or a plain string column
             categories[category] = categories.get(category, 0) + 1
     out: dict[str, Any] = {
         "kind": spec.kind, "start": _iso(start), "end": _iso(end),
