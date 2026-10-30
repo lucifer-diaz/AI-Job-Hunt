@@ -352,6 +352,25 @@ describe('focused settings UI', () => {
     confirm.mockReturnValueOnce(true); await ui.settingsSave('resumes');
     expect(ui.RD.draft).toBeNull(); expect(ui.RD.editing).toBeNull(); expect(ui.RD.viewId).toBe(9);
   });
+  it('shows the AI structuring while it runs and how it ended, and queues it from Re-parse with AI', async () => {
+    const progress = { blocking: [], sections: [], entries: [], percent: 0, counts: { VERIFIED: 0, EDITED: 0, REJECTED: 0 }, needs_review: 0 };
+    const current = { ...resumeCard(), revision: 0, structured: {}, progress, ai_parse: { active: true, status: 'PENDING', note: 'Structuring with AI…', dropped: 0 } };
+    resumesLoaded([resumeCard()]); ui.D.resumeData.current = current; section('resumes');
+    expect(document.querySelector('[data-rd-ai-parse]').dataset.rdAiParse).toBe('active');
+    expect(document.querySelector('[data-act="rd-reparse"][data-ai="1"]').disabled).toBe(true);
+    ui.D.resumeData.current = { ...current, ai_parse: { active: false, status: 'COMPLETED', outcome: 'filled', note: 'Filled from the AI parse', dropped: 2 } };
+    ui.render();
+    const line = document.querySelector('[data-rd-ai-parse]');
+    expect(line.dataset.rdAiParse).toBe('filled');
+    expect(line.textContent).toContain('2 values the resume text does not contain were left out');
+    const reparse = document.querySelector('[data-act="rd-reparse"][data-ai="1"]');
+    expect(reparse.disabled).toBe(false);
+    fetchMock.mockResolvedValueOnce(response({ ...current, ai_parse: { active: true, status: 'PENDING', note: 'Structuring with AI…' } }));
+    await ui.A['rd-reparse'](reparse);
+    const post = fetchMock.mock.calls.find(([url]) => url === '/api/resumes/1/reparse');
+    expect(JSON.parse(post[1].body)).toEqual({ use_ai: true });
+    expect(document.querySelector('[data-rd-ai-parse]').dataset.rdAiParse).toBe('active');
+  });
   it('deleting a resume asks once, keeps text drafts, and the active one cannot be deleted', async () => {
     resumesLoaded([resumeCard(), resumeCard({ id: 2, name: 'older.pdf', version: 2, is_active: false })]); section('resumes');
     expect([...document.querySelectorAll('[data-act="rd-delete-version"]')].map(b => b.dataset.id)).toEqual(['2']);

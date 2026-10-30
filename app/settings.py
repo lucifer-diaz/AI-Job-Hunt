@@ -218,6 +218,18 @@ class Settings(BaseSettings):
     jd_parse_lease_seconds: int = 600
     jd_parse_max_attempts: int = 3
     jd_parse_retry_seconds: int = 120
+    # AI structuring of uploaded resumes (app.services.resume_parsing): the Resume Parser model reads each new version,
+    # the result is grounded in the resume's own text, and fills the structured data while nobody has reviewed it.
+    resume_parse_enabled: bool = True
+    resume_parse_interval_minutes: int = 1
+    resume_parse_batch_size: int = 5
+    resume_parse_concurrency: int = 2
+    resume_parse_lease_seconds: int = 600
+    resume_parse_max_attempts: int = 3
+    resume_parse_retry_seconds: int = 120
+    # RESUME_PARSE_GRAPH_MODE: on (default; each task runs as a LangGraph thread, app.agents.resume_parsing, when
+    # AGENT_GRAPHS_ENABLED and PostgreSQL allow it) or off (the same steps run in sequence without a graph).
+    resume_parse_graph_mode: str = "on"
     # Re-rank qualified jobs once their description has been parsed. Off by default: parsing a backlog would
     # otherwise start a round of ranking calls.
     jd_rerank_after_parse: bool = False
@@ -502,6 +514,12 @@ class Settings(BaseSettings):
         """The scheduler interval of the application execution job: 0 (off) unless agent graphs are on. In off mode
         it still runs to end tasks left over (application_execution.release)."""
         return max(0, self.application_execution_minutes) if self.agent_graphs_enabled else 0
+
+    @property
+    def resume_parse_graph_mode_value(self) -> str:
+        """on or off for resume structuring; anything else, or agent graphs being off, is off."""
+        mode = (self.resume_parse_graph_mode or "on").strip().lower()
+        return "on" if self.agent_graphs_enabled and mode == "on" else "off"
 
     @property
     def job_insights_graph_mode_value(self) -> str:

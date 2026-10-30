@@ -12,7 +12,9 @@ Rules this module enforces:
   the form the candidate policy's resume source names (structured data, or the raw text as written).
 * Only the user verifies. Every unit starts UNVERIFIED; editing a VERIFIED or REJECTED unit makes it EDITED and
   a VERIFIED resume NEEDS_REVIEW until it is verified again.
-* A parser never overwrites data: re-parsing produces a comparison that the user resolves value by value.
+* A parser never overwrites data a person reviewed or edited: re-parsing produces a comparison that the user
+  resolves value by value. The AI structuring of a new upload (app.services.resume_parsing) fills the data only while
+  nobody has reviewed or edited it.
 * Evidence is created only from VERIFIED bullets under a VERIFIED role or project. Anything else that had
   evidence has it marked unverified (never deleted, so rankings that cited it stay explainable).
 * Every change is written to ResumeDataChange with its source (PARSER, USER, SYSTEM).
@@ -161,6 +163,10 @@ def record_version(db: Session, profile: CandidateProfile, raw_text: str, *, doc
         db.add(resume)
         db.flush()
         ensure_structured(db, resume)
+        # The regex parse is there at once; the AI structuring of the new version is queued (never run here).
+        from app.services import resume_parsing
+
+        resume_parsing.queue_after_upload(db, resume)
     if activate or not has_active(db, profile):
         return set_active(db, resume)
     if resume.is_active:
@@ -630,26 +636,33 @@ def _auto_linked(db: Session, resume: Resume) -> set[int]:
 
 # ───────────── re-parse: a comparison, never an overwrite ─────────────
 
-def parse_llm(db: Session, resume: Resume) -> dict[str, Any]:
-    from app.prompts.resume_parser import build_resume_parser_prompt
-    from app.services.llm import LLMCall, LLMClient
-
-    result = LLMClient.for_user(db).generate_prompt_json(build_resume_parser_prompt(resume.raw_text or ""),
-                                                         LLMCall(workflow_type="profile", entity_id=resume.id))
-    structured = result.get("structured_resume") if isinstance(result, dict) else None
-    if not isinstance(structured, dict):
-        raise ValueError("The AI parser did not return structured resume data")  # noqa: TRY004  bad model output
-    return sr.from_parser_output(structured)
-
-
 def _parent_path(path: str) -> str:
     return path.rsplit(".", 1)[0] if "." in path else ""
 
 
 def reparse(db: Session, resume: Resume, use_ai: bool = False) -> dict[str, Any]:
-    """Parse the raw text again and store the differences for the user to resolve. Current data is untouched."""
+    """Parse the raw text again and store the differences for the user to resolve. Current data is untouched.
+
+    The AI parse is never run here, in the request: `use_ai` queues it (app.services.resume_parsing), and its result
+    fills the data while nobody has reviewed it, or arrives as this same comparison."""
+    if use_ai:
+        from app.services import resume_parsing
+
+        task = resume_parsing.enqueue(db, resume, reason=resume_parsing.USER_REQUEST, run_now=True)
+        if task is None:
+            raise UnknownItem("AI structuring is off, or this resume has no text")
+        db.flush()
+        resume_parsing.nudge()
+        return {"queued": True, "task_id": task.id}
+    ensure_structured(db, resume)
+    return compare(db, resume, sr.parse_deterministic(resume.raw_text or ""), parser="deterministic",
+                   parser_version=sr.PARSER_VERSION)
+
+
+def compare(db: Session, resume: Resume, source: dict[str, Any], *, parser: str, parser_version: str) -> dict[str, Any]:
+    """Store the differences between the current structured data and `source` (a parser's output, input shape) as the
+    pending comparison the user resolves value by value. Current data is untouched."""
     current = ensure_structured(db, resume)
-    source = parse_llm(db, resume) if use_ai else sr.parse_deterministic(resume.raw_text or "")
     proposed = materialize(source)
     old_units = {u.item_id: u for u in iter_units(current)}
     new_units = {u.item_id: u for u in iter_units(proposed)}
@@ -680,20 +693,11 @@ def reparse(db: Session, resume: Resume, use_ai: bool = False) -> dict[str, Any]
                             "current": unit.content(), "proposed": None, "current_status": unit.status})
     for index, change in enumerate(changes):
         change["id"] = f"chg_{index + 1}"
-    resume.pending_reparse = {"parser": "llm" if use_ai else "deterministic",
-                              "parser_version": _parser_version(use_ai), "created_at": _iso(),
+    resume.pending_reparse = {"parser": parser, "parser_version": parser_version, "created_at": _iso(),
                               "base_revision": resume.revision or 0, "changes": changes}
     resume.updated_at = utcnow()
     db.flush()
     return resume.pending_reparse
-
-
-def _parser_version(use_ai: bool) -> str:
-    if not use_ai:
-        return sr.PARSER_VERSION
-    from app.prompts.resume_parser import RESUME_PARSER_PROMPT_VERSION
-
-    return RESUME_PARSER_PROMPT_VERSION
 
 
 def resolve_reparse(db: Session, resume: Resume, decisions: dict[str, str]) -> dict[str, Any]:

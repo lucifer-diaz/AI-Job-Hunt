@@ -207,6 +207,34 @@ function rdPolicy() {
     `<fieldset class="settings-options" style="border:0;padding:0;margin:0 0 14px"><legend class="settings-help" style="margin-bottom:8px">Resume source for AI</legend>${RD_POLICY_SOURCES.map(([value, title, help]) => `<label class="settings-check" style="align-items:flex-start"><input type="radio" name="rd-resume-source" data-act-change="rd-policy-source" value="${value}" ${(policy.resume_source || 'structured') === value ? 'checked' : ''}><span><b>${title}</b><br><span class="settings-help">${help}</span></span></label>`).join('')}</fieldset>
     <div class="settings-checks"><label class="settings-check" for="rd-policy-allow"><input type="checkbox" id="rd-policy-allow" data-act-change="rd-policy" data-key="allow_unverified_resume_facts" ${policy.allow_unverified_resume_facts ? 'checked' : ''}> Allow unverified facts in tailored resumes and follow-ups</label><label class="settings-check" for="rd-policy-rank"><input type="checkbox" id="rd-policy-rank" data-act-change="rd-policy" data-key="ranking_uses_unverified" ${policy.ranking_uses_unverified ? 'checked' : ''}> Let ranking read unverified facts as lower-confidence context</label></div>`);
 }
+// The AI structuring of this version (resume_parsing on the server): running, or how it ended. While it runs the
+// screen re-reads the resume every few seconds, so the filled data or the comparison shows up without a reload.
+const RD_AI_TONE = { filled: 'good', compare: 'brand', kept: 'muted', not_configured: 'warn', gone: 'muted' };
+let rdAiTimer = null;
+function rdAiParse(ai) {
+  if (!ai) return '';
+  const tone = ai.active ? 'brand' : ai.status === 'FAILED' ? 'bad' : RD_AI_TONE[ai.outcome] || 'muted';
+  const dropped = !ai.active && ai.dropped ? ` ${ai.dropped} value${ai.dropped === 1 ? '' : 's'} the resume text does not contain ${ai.dropped === 1 ? 'was' : 'were'} left out.` : '';
+  const detail = !ai.active && ai.detail && ai.outcome !== 'filled' && ai.outcome !== 'compare' ? ` ${esc(ai.detail)}` : '';
+  rdAiPoll(ai);
+  return `<p class="settings-help mt8" data-rd-ai-parse="${ai.active ? 'active' : esc(ai.outcome || ai.status.toLowerCase())}">${pill(ai.note || 'AI parse', tone)}${dropped}${detail}</p>`;
+}
+function rdAiPoll(ai) {
+  if (rdAiTimer || !ai?.active) return;
+  rdAiTimer = setTimeout(async () => {
+    rdAiTimer = null;
+    if (!document.querySelector('[data-rd-ai-parse="active"]')) return; // the screen moved on
+    if (RD.editing) return rdAiPoll(ai); // never replace data under an open edit
+    try {
+      const fresh = await api(rdResumeUrl());
+      if (RD.editing) return rdAiPoll(ai);
+      D.resumeData = fresh; RD.changes = null;
+      const now = rdActive()?.ai_parse;
+      if (now && !now.active && now.note) toast(now.note);
+      render();
+    } catch { rdAiPoll(ai); }
+  }, 4000);
+}
 // The data of the resume being reviewed: verification, then its sections.
 function rdHeader(data) {
   const active = rdActive(), p = active.progress, [statusLabel, tone] = RD_RESUME[active.verification_status] || RD_RESUME.UNVERIFIED;
@@ -220,7 +248,7 @@ function rdHeader(data) {
       `<div class="rd-counts row gap16 wrap"><span><strong>${p.counts.VERIFIED}</strong> verified</span><span><strong>${p.needs_review}</strong> require review</span><span><strong>${p.counts.EDITED}</strong> edited</span><span><strong>${p.counts.REJECTED}</strong> rejected</span></div>
       <div class="rd-overview">${p.sections.filter(s => s.state !== 'EMPTY').map(s => `<a href="#settings/resumes" data-act="rd-jump" data-section="${s.section}" class="rd-overview-row"><span>${esc(s.label)}</span><span class="pill ${RD_STATE[s.state][1]}">${RD_STATE[s.state][0]}</span></a>`).join('')}${p.entries.filter(e => e.section === 'experience').map(e => `<div class="rd-overview-row rd-overview-entry"><span>${esc(e.label)}</span><span class="pill ${RD_STATE[e.state][1]}">${RD_STATE[e.state][0]}</span></div>`).join('')}</div>
       ${blocking.length ? `<div class="settings-notice"><strong>${blocking.length} required item${blocking.length === 1 ? '' : 's'} still need review</strong><p>${blocking.slice(0, 5).map(b => esc(b.label)).join(' · ')}${blocking.length > 5 ? ' …' : ''}</p></div>` : ''}
-      <div class="row gap8 wrap mt12">${verified ? btn('✓ Resume verified', 'rd-verify-resume', {}, 'primary', true) : btn('Verify Resume', 'rd-verify-resume', {}, 'primary', locked || blocking.length > 0)}${btn('Re-parse resume', 'rd-reparse', { ai: 0 }, '', locked)}${btn('Re-parse with AI', 'rd-reparse', { ai: 1 }, '', locked)}</div>`) +
+      <div class="row gap8 wrap mt12">${verified ? btn('✓ Resume verified', 'rd-verify-resume', {}, 'primary', true) : btn('Verify Resume', 'rd-verify-resume', {}, 'primary', locked || blocking.length > 0)}${btn('Re-parse resume', 'rd-reparse', { ai: 0 }, '', locked)}${btn('Re-parse with AI', 'rd-reparse', { ai: 1 }, '', locked || !!active.ai_parse?.active)}</div>${rdAiParse(active.ai_parse)}`) +
     rdComparison(active.pending_reparse);
 }
 function rdTabs() {
@@ -292,7 +320,8 @@ const RESUME_DATA_ACTIONS = {
     try { rdApply(await api(`/api/resumes/${rdActive().id}/verify`, { method: 'POST' })); RD.blocking = null; }
     catch (err) { if (err.detail?.blocking) RD.blocking = err.detail.blocking; throw err; }
   }, 'Resume verified'),
-  'rd-reparse': el => { RD.decisions = {}; return rdPost('reparse', { use_ai: el.dataset.ai === '1' }, 'Re-parse ready to compare'); },
+  // The AI parse runs in the background: it fills the data while nothing is reviewed, else it arrives as a comparison.
+  'rd-reparse': el => { RD.decisions = {}; const ai = el.dataset.ai === '1'; return rdPost('reparse', { use_ai: ai }, ai ? 'Structuring with AI…' : 'Re-parse ready to compare'); },
   'rd-decide': el => { RD.decisions[el.dataset.change] = el.dataset.choice; render(); },
   'rd-resolve': el => {
     const decisions = el.dataset.all ? {} : { ...RD.decisions };
