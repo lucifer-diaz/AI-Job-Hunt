@@ -49,6 +49,7 @@ from app.services import (
     feedback_learning,
     ranker,
     resume_length,
+    resume_matching,
     resume_verification,
 )
 from app.services.approval import ApprovalRefused
@@ -2657,7 +2658,8 @@ def resume_list(db: Session = Depends(get_user_db)):
              "in_use": bool(active is not None and active.resume_document_id == d.id),
              "version_id": versions[d.id].id if d.id in versions else None,
              "domain": versions[d.id].domain if d.id in versions else None,
-             "roles": (versions[d.id].roles or []) if d.id in versions else []} for d in docs]
+             "roles": (versions[d.id].roles or []) if d.id in versions else [],
+             "domains": resume_matching.groups(versions[d.id]) if d.id in versions else []} for d in docs]
 
 
 @router.post("/api/profile/resumes/{document_id}/primary")

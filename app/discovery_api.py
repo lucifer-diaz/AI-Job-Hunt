@@ -179,9 +179,14 @@ class BulkResumeIn(ResumeChoiceIn):
     ids: list[int] = Field(min_length=1, max_length=5000)
 
 
-class TagsIn(BaseModel):
+class DomainTagsIn(BaseModel):
     domain: str | None = Field(default=None, max_length=80)
     roles: list[str] = Field(default_factory=list, max_length=30)
+
+
+class TagsIn(DomainTagsIn):
+    """`domains` (one entry per domain, each with its roles); a body with only `domain` / `roles` is one domain."""
+    domains: list[DomainTagsIn] | None = Field(default=None, max_length=8)
 
 
 def _resume(db: Session, resume_id: int | None) -> Resume | None:
@@ -261,6 +266,7 @@ def rematch(request: Request, background: BackgroundTasks, dry_run: bool = False
 def _choice(r: Resume) -> dict:
     return {"id": r.id, "name": r.name or f"Version {r.version}", "version": r.version, "is_active": r.is_active,
             "verification_status": r.verification_status, "domain": r.domain, "roles": r.roles or [],
+            "domains": resume_matching.groups(r),
             "created_at": r.created_at.isoformat() if r.created_at else None}
 
 
@@ -284,18 +290,18 @@ def rename_resume(resume_id: int, payload: RenameIn, db: Session = Depends(get_u
     return {"id": resume.id, "name": resume.name}
 
 
-def _clean_tags(payload: TagsIn) -> tuple[str | None, list[str]]:
-    domain = (payload.domain or "").strip()[:80] or None
-    roles = list(dict.fromkeys(r.strip()[:120] for r in payload.roles if r and r.strip()))[:30]
-    return domain, roles
+def _groups(payload: TagsIn) -> list[dict]:
+    if payload.domains is not None:
+        return [g.model_dump() for g in payload.domains]
+    return [{"domain": payload.domain, "roles": payload.roles}]
 
 
 @router.put("/api/resumes/{resume_id}/tags")
 def tag_resume(resume_id: int, payload: TagsIn, db: Session = Depends(get_user_db)):
-    """Tag a resume version with its domain and target roles. New jobs are matched to the best-tagged resume;
+    """Tag a resume version with its domains, each with its target roles. New jobs are matched to the best-tagged resume;
     existing jobs change only when re-matched (POST /api/jobs/resume/rematch)."""
     resume = _resume(db, resume_id)
-    resume.domain, resume.roles = _clean_tags(payload)
+    resume_matching.set_tags(resume, _groups(payload))
     db.commit()
     return _choice(resume)
 
@@ -311,6 +317,6 @@ def tag_resume_file(document_id: int, payload: TagsIn, db: Session = Depends(get
     if document is None:
         raise HTTPException(404, "Resume not found")
     resume = rv.version_of_document(db, profile_for(db), document)
-    resume.domain, resume.roles = _clean_tags(payload)
+    resume_matching.set_tags(resume, _groups(payload))
     db.commit()
     return {"document_id": document.id, **_choice(resume)}

@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session, object_session
 
 from app.auth import get_user_db
 from app.models import Resume, ResumeDocument, SavedSearch
-from app.services import resume_parsing
+from app.services import resume_matching, resume_parsing
 from app.services import resume_verification as rv
 from app.services.structured_resume import SECTION_LABELS, StructuredResumeIn
 from app.services.user_settings import (
@@ -86,7 +86,7 @@ def summary(resume: Resume) -> dict:
             "created_at": _iso(resume.created_at), "updated_at": _iso(resume.updated_at),
             "has_pending_reparse": bool(resume.pending_reparse),
             # What it is for (app.services.resume_matching): new jobs are matched to the best-tagged resume.
-            "domain": resume.domain, "roles": resume.roles or []}
+            "domain": resume.domain, "roles": resume.roles or [], "domains": resume_matching.groups(resume)}
 
 
 def detail(resume: Resume) -> dict:

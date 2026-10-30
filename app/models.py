@@ -258,11 +258,14 @@ class Resume(Base):
     verified_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # A re-parse waiting for the user to keep or replace each differing value.
     pending_reparse: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
-    # What this resume is for (app.services.resume_matching): a domain ("Backend", "Product") and the roles it targets
-    # ("Lead Engineer", "Engineering Manager"). New jobs are matched to the best-tagged resume. A library file shares
-    # the tags of its version.
+    # What this resume is for (app.services.resume_matching): one or more domains ("AI / ML", "Data"), each with the
+    # roles it targets ([{"domain": "AI / ML", "roles": ["AI Engineer"]}, ...]). New jobs are matched to the
+    # best-tagged resume. A library file shares the tags of its version. `domain` (the first group's) and `roles` (every
+    # group's) are mirrors kept for older readers; only resume_matching.set_tags writes the three. `domains` NULL means
+    # a resume tagged before groups existed: its one group is domain + roles.
     domain: Mapped[str | None] = mapped_column(String(80), nullable=True)
     roles: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    domains: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
 

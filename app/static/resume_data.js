@@ -185,7 +185,7 @@ function rdResumeCard(v, current) {
     <div class="settings-file-icon" aria-hidden="true">${kind}</div>
     <div class="grow">${RD.renaming === v.id ? rdRenameEditor(v) : `<div class="row gap8 wrap" style="align-items:center"><strong>${esc(v.name || 'Resume')} · v${v.version}</strong>${v.is_active ? pill('Active', 'good') : ''}${viewing ? pill('Reviewing below', 'brand') : ''}${btn('Rename', 'rd-rename', { id: v.id, name: v.name || '' }, 'sm ghost', locked)}</div>`}
       <p>${source} · ${esc(status)} · ${v.reviewed_percent ?? 0}% reviewed${v.setups?.length ? ` · Used by ${esc(v.setups.map(x => x.name).join(', '))}` : ''}</p>
-      <div class="rd-roles"><span class="xs muted">Target roles</span> <span class="xs faint">· jobs whose title names one are ranked and tailored with this resume</span>${resumeTags('version', v.id, v.domain, v.roles || [])}</div>
+      <div class="rd-roles"><span class="xs muted">Target roles</span> <span class="xs faint">· jobs whose title names one are ranked and tailored with this resume</span>${resumeTags('version', v.id, v.domain, v.roles || [], v.domains)}</div>
       <div class="row gap8 wrap mt10">${viewing ? '' : btn('Review data', 'rd-view', { id: v.id }, 'sm', locked)}${v.is_active ? '' : btn('Make active', 'rd-activate', { id: v.id }, 'sm', locked)}${v.has_original ? `<a class="btn sm" href="/api/resumes/${v.id}/original">Download</a>` : ''}${v.is_active ? '' : btn('Delete', 'rd-delete-version', { id: v.id, name: `${v.name || 'Resume'} · v${v.version}` }, 'sm danger', locked)}</div>
     </div>
   </article>`;
