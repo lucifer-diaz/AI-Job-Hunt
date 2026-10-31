@@ -69,12 +69,16 @@ def collect(db: Session, user_id: int) -> dict[str, Any]:
     apps = db.execute(select(Application.approved_at, Application.approval_override, Application.stage,
                              Application.applied_at)
                       .where(Application.user_id == user_id).order_by(Application.id.desc()).limit(LIMIT)).all()
+    parsed_jobs = select(JobDescriptionParseTask.job_id).where(JobDescriptionParseTask.user_id == user_id,
+                                                               JobDescriptionParseTask.status == "COMPLETED")
     parsed = db.scalar(select(func.count(func.distinct(JobDescriptionParseTask.job_id)))
                        .where(JobDescriptionParseTask.user_id == user_id,
                               JobDescriptionParseTask.status == "COMPLETED")) or 0
+    # Only an edit of a posting the parser structured is a correction of the parser's output.
     corrected = db.scalars(select(func.distinct(JobStructuredDataChange.job_id))
                            .where(JobStructuredDataChange.user_id == user_id,
-                                  JobStructuredDataChange.change_source == "USER").limit(LIMIT)).all()
+                                  JobStructuredDataChange.change_source == "USER",
+                                  JobStructuredDataChange.job_id.in_(parsed_jobs)).limit(LIMIT)).all()
     return {"inbox_events": [{"method": r[0], "user_corrected": bool(r[1])} for r in inbox],
             "approvals": [{"override": bool(r[1])} for r in apps if r[0] is not None],
             "jd_parsed_jobs": parsed, "jd_corrected_jobs": list(corrected),

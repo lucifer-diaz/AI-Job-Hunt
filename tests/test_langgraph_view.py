@@ -75,3 +75,16 @@ def test_the_view_counts_only_the_accounts_own_runs_and_reports_modes(signed_in,
     monkeypatch.setattr(get_settings(), "qualification_graph_mode", "shadow")
     graphs = {g["name"]: g for g in signed_in(other).get("/api/orchestration/langgraph").json()["graphs"]}
     assert graphs["qualification"]["mode"]["effective"] == "shadow" and graphs["pilot"]["runs"]["FAILED"] == 1
+    # Every graph reads its own switch: resume parsing runs by default (RESUME_PARSE_GRAPH_MODE=on).
+    assert graphs["resume_parsing"]["mode"]["setting"] == "RESUME_PARSE_GRAPH_MODE"
+    assert graphs["resume_parsing"]["mode"]["effective"] == "on"
+    monkeypatch.setattr(get_settings(), "resume_parse_graph_mode", "off")
+    graphs = {g["name"]: g for g in signed_in(other).get("/api/orchestration/langgraph").json()["graphs"]}
+    assert graphs["resume_parsing"]["mode"]["running"] is False
+
+
+def test_every_registered_graph_names_its_mode_setting():
+    from app.agents import runtime
+    from app.services import graph_topology
+
+    assert set(runtime.GRAPHS) - {"pilot"} <= set(graph_topology.MODE_SETTINGS)

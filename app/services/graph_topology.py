@@ -32,9 +32,11 @@ _structure: list[dict[str, Any]] | None = None
 
 # How each graph is switched on (README §9c). The pilot runs whenever agent graphs are on.
 MODE_SETTINGS = {"qualification": "qualification_graph_mode", "preparation": "preparation_graph_mode",
-                 "job_insights": "job_insights_graph_mode", "application": "application_execution_mode"}
+                 "job_insights": "job_insights_graph_mode", "application": "application_execution_mode",
+                 "resume_parsing": "resume_parse_graph_mode"}
 LABELS = {"pilot": "Pilot (no side effects)", "qualification": "Qualification graph",
-          "preparation": "Preparation graph", "application": "Application graph", "job_insights": "Job Insights graph"}
+          "preparation": "Preparation graph", "application": "Application graph", "job_insights": "Job Insights graph",
+          "resume_parsing": "Resume parsing graph"}
 
 
 def _function(node: Any) -> Any:

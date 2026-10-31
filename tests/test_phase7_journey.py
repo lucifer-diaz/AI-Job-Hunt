@@ -360,3 +360,26 @@ def test_a_submission_recorded_after_an_aborted_intent_is_the_confirmation():
         stage = {s["stage"]: s for s in journey.journey(db, ids["job"], uid)["stages"]}["confirmation"]
     assert (stage["status"], stage["evidence"], stage["submitted_via"]) == ("DONE", "reported", "apply_kit")
     assert stage["confirmation_id"] == "AC-12345"
+
+
+def test_only_an_edit_of_a_parsed_posting_counts_as_a_parser_correction():
+    """A person structuring a posting the parser never parsed corrected nothing of the parser's."""
+    from app.models import JobStructuredDataChange
+    from app.services.agent_eval import feedback
+
+    uid = make_user(SessionLocal)
+    ids = seed_journey(uid)  # one job, its parse COMPLETED
+    with SessionLocal() as db:
+        db.info["user_id"] = uid
+        unparsed = Job(user_id=uid, source="manual", source_ref=uuid.uuid4().hex, title="Data Engineer",
+                       company="Initech", description="SQL.")
+        db.add(unparsed)
+        db.flush()
+        db.add(JobStructuredDataChange(user_id=uid, job_id=unparsed.id, field_path="requirements",
+                                       change_source="USER"))
+        db.commit()
+        assert feedback.report(db, uid)["by_signal"]["jd_parser"] == {"corrected": 0, "samples": 1, "rate": 0.0}
+        db.add(JobStructuredDataChange(user_id=uid, job_id=ids["job"], field_path="requirements",
+                                       change_source="USER"))
+        db.commit()
+        assert feedback.report(db, uid)["by_signal"]["jd_parser"] == {"corrected": 1, "samples": 1, "rate": 1.0}
