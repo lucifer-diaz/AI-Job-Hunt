@@ -27,12 +27,16 @@ def owner():
 
 @pytest.fixture(autouse=True)
 def clean(owner):
-    from app.models import WorkflowTransition
+    from app.models import Application, ApplicationEvent, WorkflowTransition
 
     with SessionLocal() as db:
         ids = select(Job.id).where(Job.user_id == owner, Job.source.in_(("apify:naukri", "apify:bayt", "manual")))
-        # SQLite does not enforce the cascade: without this a reused job id inherits another job's history.
+        # SQLite does not enforce the cascade: without this a reused job id inherits another job's history, and an
+        # application left without its job breaks the tracker for every later test.
         db.execute(delete(WorkflowTransition).where(WorkflowTransition.job_id.in_(ids)))
+        apps = select(Application.id).where(Application.job_id.in_(ids))
+        db.execute(delete(ApplicationEvent).where(ApplicationEvent.application_id.in_(apps)))
+        db.execute(delete(Application).where(Application.job_id.in_(ids)))
         db.execute(delete(Job).where(Job.id.in_(ids)))
         db.commit()
     yield

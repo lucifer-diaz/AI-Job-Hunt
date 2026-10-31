@@ -113,7 +113,10 @@ from app.services.tracker import (
     INACTIVE_STAGES,
     INTERVIEW_STAGES,
     REPLY_STAGES,
+    archive_older_than,
+    older_than,
     set_stage,
+    unarchive,
 )
 from app.services.url_safety import UnsafeURL, check_public_url
 from app.services.user_settings import apify_token, lock_settings_row, settings_for
@@ -2477,6 +2480,7 @@ def app_payload(db: Session, app: Application) -> dict:
     return {
         "id": app.id, "job_id": job.id, "title": job.title, "company": job.company, "location": job.location,
         "url": job.url, "fit": None if job.fit_score is None else round(job.fit_score), "stage": stage,
+        "archived": app.archived_at is not None,
         "age": ago(app.applied_at), "tag": tag, "tone": tone,
         "meta": f"applied {day_label(app.applied_at)}" + (f" · follow-up {day_label(app.followup_due_at)}" if app.followup_due_at and stage == "applied" else ""),
         "recruiter_name": app.recruiter_name, "recruiter_email": app.recruiter_email, "notes": app.notes,
@@ -2528,6 +2532,31 @@ def tracker_stages(payload: StagesIn, db: Session = Depends(get_user_db)):
     row.preferences = current
     db.commit()
     return tracker(db)
+
+
+class TrackerArchiveIn(BaseModel):
+    days: int = Field(ge=0, le=3650)  # 0: any age
+    scope: Literal["no_reply", "live", "finished", "all"] = "no_reply"
+    dry_run: bool = False
+
+
+@router.post("/api/tracker/archive")
+def tracker_archive(payload: TrackerArchiveIn, db: Session = Depends(get_user_db)):
+    """Archive the applications submitted more than `days` ago that are in the scope's stages (app.services.tracker).
+    `dry_run` only counts them, for the preview the screen shows before anything moves."""
+    if payload.dry_run:
+        return older_than(db, payload.days, payload.scope).summary()
+    summary = archive_older_than(db, payload.days, payload.scope)
+    db.commit()
+    return {**summary, "tracker": tracker(db)}
+
+
+@router.post("/api/applications/{application_id}/unarchive")
+def unarchive_application(application_id: int, db: Session = Depends(get_user_db)):
+    app = get_app(db, application_id)
+    if unarchive(db, app):
+        db.commit()
+    return app_payload(db, app)
 
 
 class StageIn(BaseModel):

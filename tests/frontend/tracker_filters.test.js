@@ -35,7 +35,7 @@ beforeEach(() => {
     ui.ctx = context;
   }
   ui.D.tracker = tracker(); ui.S.selApp = null; ui.S.trackerView = 'board'; ui.S.busy = {};
-  ui.S.tf = { q: '', location: 'all', min_fit: 0 };
+  ui.S.tf = { q: '', location: 'all', min_fit: 0 }; ui.S.trackerArchive = null; ui.S.showArchived = false; runInContext('openStages.clear()', ui.ctx);
 });
 
 describe('Tracker · filters', () => {
@@ -61,6 +61,102 @@ describe('Tracker · filters', () => {
     const root = view();
     expect(cards(root)).toEqual([]);
     expect(root.textContent).toContain('No applications match');
+  });
+});
+
+describe('Tracker · archive old applications', () => {
+  const withClosed = () => {
+    const t = tracker();
+    t.stages.push({ id: 'rejected', label: 'Rejected', dot: '#c22f4e' }, { id: 'closed', label: 'Closed', dot: '#c6cad8' });
+    t.applications.push(app(5, 'Old role', 'Initech', 'Remote', 60, 'closed'), app(6, 'Older role', 'Hooli', 'Remote', 50, 'closed'),
+      app(7, 'Turned down', 'Umbrella', 'Remote', 70, 'rejected'));
+    return t;
+  };
+  const openStagesOpen = () => { runInContext("openStages.add('closed')", ui.ctx); };
+  const folded = root => [...root.querySelectorAll('.kcol.folded')].map(c => [c.dataset.id, c.querySelector('.mono').textContent, c.querySelector('.kfold-label').textContent]);
+
+  it('folds Rejected and Closed to a strip with their counts, and never selects a folded card by default', () => {
+    ui.D.tracker = withClosed();
+    const root = view();
+    expect(cards(root)).toEqual([1, 2, 4, 3]);
+    expect(folded(root)).toEqual([['rejected', '1', 'Rejected'], ['closed', '2', 'Closed']]);
+    expect(root.querySelector('.kcard.sel').dataset.id).toBe('1');
+    expect(root.querySelector('.kcol.folded[data-id="closed"]').dataset.dropStage).toBe('closed');  // still a drop target
+  });
+
+  it('opens a folded column on a click, remembers it, and folds it again', () => {
+    ui.D.tracker = withClosed();
+    const toggle = id => runInContext(`toggleStage(${JSON.stringify(id)})`, ui.ctx);  // what the tracker-fold action does
+    expect(view().querySelector('.kcol.folded[data-id="closed"]').dataset.act).toBe('tracker-fold');
+    toggle('closed');
+    let root = view();
+    expect(cards(root)).toEqual([1, 2, 4, 3, 5, 6]);
+    expect(folded(root).map(([id]) => id)).toEqual(['rejected']);
+    expect(runInContext('[...openStages]', ui.ctx)).toEqual(['closed']);  // saved to localStorage where it is allowed
+    expect(root.querySelector('button[data-act="tracker-fold"][data-id="closed"]')).not.toBeNull();
+    toggle('closed');
+    root = view();
+    expect(folded(root).map(([id]) => id)).toEqual(['rejected', 'closed']);
+  });
+
+  it('still shows the details of a folded card opened from elsewhere', () => {
+    ui.D.tracker = withClosed(); ui.S.selApp = 5;
+    const root = view();
+    expect(cards(root)).not.toContain(5);
+    expect(root.querySelector('.tr-detail .card-title').textContent).toBe('Old role');
+    expect(root.querySelector('.tr-detail').textContent).toContain('Initech');
+  });
+
+  it('offers the periods, and names how many move and from where before anything moves', () => {
+    ui.S.trackerArchive = { days: 45, scope: 'no_reply', loading: false,
+      preview: { count: 3, by_stage: [{ stage: 'applied', label: 'Applied', count: 2 }, { stage: 'acknowledged', label: 'Acknowledged', count: 1 }] } };
+    const root = view();
+    const presets = [...root.querySelectorAll('[data-act="tracker-archive-days"]')];
+    expect(presets.map(b => b.textContent)).toEqual(['15 days', '30 days', '45 days', '60 days', '90 days', 'Any age']);
+    expect(presets[2].classList.contains('primary')).toBe(true);
+    expect(root.querySelector('#archive-days').value).toBe('45');
+    expect(root.querySelector('[data-act="tracker-archive-days"][data-days="0"]').textContent).toBe('Any age');
+    expect([...root.querySelectorAll('#archive-scope option')].map(o => o.value)).toEqual(['no_reply', 'live', 'finished', 'all']);
+    const run = root.querySelector('[data-act="tracker-archive-run"]');
+    expect(run.textContent).toBe('Archive 3 applications');
+    expect(run.disabled).toBe(false);
+    expect([...root.querySelectorAll('.tr-tally')].map(x => x.textContent)).toEqual(['2 Applied', '1 Acknowledged']);
+  });
+
+  it('hides archived cards until asked, and offers Unarchive on one', () => {
+    const t = withClosed();
+    t.applications[0] = { ...t.applications[0], archived: true, stage: 'closed' };
+    ui.D.tracker = t; openStagesOpen();
+    let root = view();
+    expect(cards(root)).not.toContain(1);
+    const toggle = root.querySelector('[data-act="tracker-show-archived"]');
+    expect(toggle.textContent).toBe('Show archived (1)');
+    ui.S.showArchived = true; ui.S.selApp = 1;
+    root = view();
+    expect(cards(root)).toContain(1);
+    expect(root.querySelector('[data-act="tracker-show-archived"]').textContent).toBe('Hide archived');
+    expect(root.querySelector('.kcard[data-id="1"]').textContent).toContain('archived');
+    expect(root.querySelector('[data-act="tracker-unarchive"]').dataset.app).toBe('1');
+  });
+
+  it('says so when everything is archived instead of showing an empty board', () => {
+    const t = tracker();
+    t.applications = t.applications.map(a => ({ ...a, archived: true }));
+    ui.D.tracker = t;
+    const root = view();
+    expect(root.textContent).toContain('Every application is archived');
+    expect(root.querySelector('[data-act="tracker-show-archived"]').textContent).toBe('Show archived (4)');
+  });
+
+  it('will not archive while counting or when nothing is that old', () => {
+    ui.S.trackerArchive = { days: 90, scope: 'live', loading: false, preview: { count: 0, by_stage: [] } };
+    let run = view().querySelector('[data-act="tracker-archive-run"]');
+    expect(run.textContent).toBe('Nothing to archive');
+    expect(run.disabled).toBe(true);
+    ui.S.trackerArchive = { days: 90, scope: 'live', loading: true, preview: null };
+    run = view().querySelector('[data-act="tracker-archive-run"]');
+    expect(run.textContent).toBe('Counting…');
+    expect(run.disabled).toBe(true);
   });
 });
 
