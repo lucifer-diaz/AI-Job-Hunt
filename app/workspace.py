@@ -274,6 +274,55 @@ def job_card(job: Job) -> dict:
     }
 
 
+# How a job's resume was chosen (Job.resume_choice), in the words the job and Tailor screens show.
+RESUME_CHOICE_LABELS = {
+    "AUTO": "Matched by resume tags",
+    "SETUP": "Pinned by the search setup",
+    "USER": "Chosen by you",
+    "ACTIVE": "Pinned to the active resume",
+}
+
+
+def resume_ref(resume: Resume | None) -> dict | None:
+    """A resume version as the screens name it: never its text."""
+    if resume is None:
+        return None
+    return {"id": resume.id, "name": resume.name or f"Version {resume.version}", "version": resume.version,
+            "is_active": bool(resume.is_active), "domains": resume_matching.groups(resume)}
+
+
+def resume_in_use(db: Session, job: Job) -> dict | None:
+    """The resume ranking and tailoring read for this job now, resolved the way resume_verification.for_job resolves
+    it (the job's own resume, else the active one), and why. Read-only: never activates or re-matches anything."""
+    profile = get_profile(db)
+    chosen = resume_verification.chosen_resume(db, profile, job)
+    resume = chosen or resume_verification.active_resume(db, profile, create=False)
+    if resume is None:
+        return None
+    choice = job.resume_choice if chosen is not None or job.resume_choice == "ACTIVE" else None
+    if choice in RESUME_CHOICE_LABELS:
+        how = RESUME_CHOICE_LABELS[choice]
+        if choice == "AUTO" and (reason := resume_matching.score(resume, job).reason):
+            how = f"{how} ({reason})"
+    elif job.resume_id is not None:
+        how = "The chosen resume is gone: the active resume is used"
+    else:
+        how = "No resume matched by tags clearly: the active resume is used"
+    return {**resume_ref(resume), "choice": choice, "how": how}
+
+
+def packet_source_resume(db: Session, job: Job, variant: ResumeVariant, now: dict | None = None) -> dict:
+    """The resume version a saved packet was tailored from, as its own content records it (the tailoring context's
+    resume id, or an untailored packet's source), and whether that is still the resume the job would use now."""
+    content = variant.content or {}
+    source_id = (content.get("context") or {}).get("id") or content.get("source_resume_id")
+    resume = db.scalar(select(Resume).where(Resume.id == source_id)) if source_id else None
+    now = now if now is not None else resume_in_use(db, job)
+    return {"recorded": source_id is not None, "resume": resume_ref(resume),
+            "deleted": source_id is not None and resume is None,
+            "differs": bool(source_id and now and now["id"] != source_id)}
+
+
 def get_job(db: Session, job_id: int) -> Job:
     job = db.get(Job, job_id)
     if not job:
@@ -1066,7 +1115,10 @@ def job_detail(job_id: int, db: Session = Depends(get_user_db)):
             "description_recovery": jd_recovery.status_of(db, job),
             "rank_pct": rank, "wizard": [{"label": l, "done": d, "meta": m} for l, d, m in steps],
             "gap_notes": gap_notes, "notes": app.notes if app else "",
-            "resume_id": resume.id if resume else None, "pipeline": ranker.pipeline_status(db, job)}
+            "resume_id": resume.id if resume else None, "pipeline": ranker.pipeline_status(db, job),
+            # Which resume ranking and tailoring read for this job now, and the one its latest packet was made from.
+            "resume_in_use": (in_use := resume_in_use(db, job)),
+            "packet_source": packet_source_resume(db, job, resume, in_use) if resume else None}
 
 
 class JobUrlIn(BaseModel):
@@ -1963,6 +2015,8 @@ def packet(db: Session, job: Job) -> dict:
         "id": resume.id, "version": resume.version, "created_at": resume.created_at.isoformat(),
         "generated": ago(resume.created_at), "reviewer_score": resume.reviewer_score, "markdown": resume.markdown,
         "untailored": bool((resume.content or {}).get("untailored")),
+        # The resume version this packet was tailored from, and the one the job resolves to now.
+        "source": packet_source_resume(db, job, resume, in_use := resume_in_use(db, job)), "resume_in_use": in_use,
         "cover_letter": strip_citations(resume.cover_letter), "cover_words": len(resume.cover_letter.split()),
         "edits": edits, "review": review, "keywords": coverage,
         "ats_pct": ats_keywords.score(coverage),

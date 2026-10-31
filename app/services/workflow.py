@@ -203,9 +203,15 @@ def persist_tailored_resume(db: Session, job: Job, content: dict, *, markdown: s
     content = {**content, "cover_letter": strip_citations(content.get("cover_letter", "") or "").strip()}
     version = (db.scalar(select(ResumeVariant.version).where(ResumeVariant.job_id == job.id)
                          .order_by(desc(ResumeVariant.version)).limit(1)) or 0) + 1
+    profile = rv.for_job(db, get_profile(db), job)
+    # Which resume version the packet was made from, so the Tailor screen can name it. The backend Tailor records it
+    # in its context; every other path (Claude Desktop over MCP, skip tailoring) records the job's resolved resume.
+    if not (content.get("context") or {}).get("id") and not content.get("source_resume_id"):
+        source = rv.resume_for(db, profile, create=False) if profile is not None else None
+        if source is not None:
+            content["source_resume_id"] = source.id
     resume = ResumeVariant(job_id=job.id, version=version, content=content,
-                           markdown=build_resume_markdown(rv.for_job(db, get_profile(db), job), content)
-                           if markdown is None else markdown,
+                           markdown=build_resume_markdown(profile, content) if markdown is None else markdown,
                            cover_letter=content.get("cover_letter", "") or "")
     db.add(resume)
     job.status = "tailored"
