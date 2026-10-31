@@ -698,3 +698,37 @@ def test_a_compound_primary_skill_protects_the_skill_it_names(user):
         db.commit()
     assert job_of(add(user, "Java Backend Engineer")).domain_match == "MATCH"
     assert job_of(add(user, "Senior PHP Developer")).domain_match == "NOT_MATCHING", "other exclusions still apply"
+
+
+def test_the_job_and_its_packet_name_the_resume_they_use(user, resumes, client):
+    from app.services import resume_matching
+    from app.services.workflow import persist_tailored_resume
+
+    active, ml = resumes
+    job_id = add(user, "Backend Engineer")
+    # No resume matched by tags: the screens say the active resume is used, and why.
+    detail = client.get(f"/api/jobs/{job_id}").json()
+    assert detail["resume_in_use"]["id"] == active and detail["resume_in_use"]["choice"] is None
+    assert "active resume is used" in detail["resume_in_use"]["how"]
+    assert detail["packet_source"] is None
+
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        resume_matching.set_tags(db.get(Resume, ml), [{"domain": "ML", "roles": ["Backend Engineer"]}])
+        job = db.get(Job, job_id)
+        assert resume_matching.auto_assign(db, job) is not None and job.resume_id == ml
+        db.commit()
+        # A packet saved without a tailoring context (MCP, skip tailoring) records the resume it was made from.
+        persist_tailored_resume(db, job, {"summary": "", "skills": [], "experience": []}, markdown="# Asha")
+    detail = client.get(f"/api/jobs/{job_id}").json()
+    assert detail["resume_in_use"]["id"] == ml and detail["resume_in_use"]["choice"] == "AUTO"
+    assert "role 'backend engineer'" in detail["resume_in_use"]["how"].lower()
+    packet = client.get(f"/api/tailor/{job_id}").json()["resume"]
+    assert packet["source"]["resume"]["name"] == "ML resume" and not packet["source"]["differs"]
+    assert packet["resume_in_use"]["id"] == ml
+
+    # The person moves the job to the active resume: the packet still names its own source, and says it differs.
+    client.put(f"/api/jobs/{job_id}/resume", json={"mode": "active"})
+    packet = client.get(f"/api/tailor/{job_id}").json()["resume"]
+    assert packet["source"]["resume"]["id"] == ml and packet["source"]["differs"]
+    assert packet["resume_in_use"]["id"] == active and packet["resume_in_use"]["choice"] == "ACTIVE"

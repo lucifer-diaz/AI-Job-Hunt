@@ -3329,6 +3329,14 @@ again and a tailored packet is marked for re-tailoring. After changing tags, **R
 re-matches jobs that were matched automatically or never chosen — it first says how many would change and how many
 would be ranked again.
 
+The screens always name the resume a job really uses, whatever the picker says: under **Resume used** the job shows
+"Uses *name · vN* — Matched by resume tags (role '…')", "Chosen by you", "Pinned by the search setup", or "No resume
+matched by tags clearly: the active resume is used" (`resume_in_use` on `GET /api/jobs/{id}` and `/api/tailor/{id}`,
+resolved like `resume_verification.for_job`, read-only). Each tailored packet records the version it was made from
+(the Tailor's context, or `source_resume_id` for packets saved by Claude Desktop or Skip tailoring), and Tailor &
+review shows "Tailored from …" with a warning to regenerate when the job now uses another resume
+(`resume.source` on `/api/tailor/{id}`). Packets made before this was recorded say so instead of guessing.
+
 `GET /api/resumes/choices` (with tags and the role catalog), `PUT /api/resumes/{id}/tags`,
 `PUT /api/profile/resumes/{document_id}/tags`, `PUT /api/resumes/{id}` (rename),
 `PUT /api/jobs/{id}/resume` and `POST /api/jobs/bulk-resume` (`mode`: auto | active | fixed + `resume_id`),

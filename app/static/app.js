@@ -1305,7 +1305,7 @@ function renderTailorSingle(queue) {
   }
   return `<div class="stack">${stack}
   <section class="card row gap16 wrap" id="tailor-packet" style="padding:16px 20px">
-    <div class="grow" style="min-width:220px"><div class="card-title" style="font-size:16px">Tailoring for ${esc(job.title)} · ${esc(job.company)}</div><div class="card-sub">v${r.version} · generated ${esc(r.generated)}${packetLength(r)} · ${r.untailored ? 'master resume, not tailored' : 'edits must trace to verified evidence'}</div></div>
+    <div class="grow" style="min-width:220px"><div class="card-title" style="font-size:16px">Tailoring for ${esc(job.title)} · ${esc(job.company)}</div><div class="card-sub">v${r.version} · generated ${esc(r.generated)}${packetLength(r)} · ${r.untailored ? 'master resume, not tailored' : 'edits must trace to verified evidence'}</div>${packetSourceNote(r.source, r.resume_in_use)}</div>
     ${picker}
     <div class="row gap14"><div class="metric"><div class="n" style="color:${r.reviewer_score >= p.min_review_score ? 'var(--good)' : 'var(--warn)'}">${fitTxt(r.reviewer_score)}</div><div class="l">REVIEWER</div></div>
       <div class="metric"><div class="n">${r.ats_pct == null ? '—' : r.ats_pct + '%'}</div><div class="l">ATS KEYWORDS</div></div>
@@ -1772,6 +1772,20 @@ const pipelineBanner = (j, margin = '0 24px') => {
 // (app.services.resume_matching), active = always the active resume, or one specific version.
 const resumeLabel = r => `${r.name}${r.roles?.length ? ` — ${r.roles.slice(0, 2).join(', ')}${r.roles.length > 2 ? '…' : ''}` : ''}${r.is_active ? ' (active)' : ''}`;
 const resumeValue = (id, choice) => choice === 'ACTIVE' || (choice === 'SETUP' && id == null) ? 'active' : id == null ? 'auto' : String(id);
+// The resume a job actually resolves to (workspace.resume_in_use) and why, so "Auto — best match by tags" is never a
+// mystery: the select shows the choice, this line names the resume ranking and tailoring read.
+const resumeName = r => `${r.name}${r.name === `Version ${r.version}` ? '' : ` · v${r.version}`}${r.is_active ? ' (active)' : ''}`;
+const resumeInUseNote = (u, extra = '') => !u ? ''
+  : `<div class="xs faint mt4" data-resume-in-use="${attr(u.id)}">Uses <b class="ink2">${esc(resumeName(u))}</b> — ${esc(u.how)}${extra}</div>`;
+// The resume a packet was tailored from (workspace.packet_source_resume), and a warning when the job now uses another.
+function packetSourceNote(src, now) {
+  if (!src) return '';
+  if (!src.recorded) return '<div class="xs faint mt4" data-packet-source="">Tailored from: not recorded for this version</div>';
+  const name = src.resume ? `<b class="ink2">${esc(resumeName(src.resume))}</b>` : '<b class="ink2">a resume that was deleted</b>';
+  const why = !src.differs && now ? ` — ${esc(now.how)}` : '';
+  const warn = src.differs && now ? `<div class="xs mt4" style="color:var(--warn)">This job now uses ${esc(resumeName(now))} (${esc(now.how)}). Regenerate to tailor from it.</div>` : '';
+  return `<div class="xs muted mt4" data-packet-source="${attr(src.resume?.id ?? '')}">Tailored from ${name}${why}</div>${warn}`;
+}
 function resumeOptions(choices) {
   const groups = {};
   for (const r of choices) (groups[tagGroups(r.domains, r.domain, r.roles).map(g => g.domain).filter(Boolean).join(', ') || 'Untagged'] ||= []).push(r);
@@ -1921,7 +1935,7 @@ function renderJobModal() {
       <section class="card flush" style="flex:1 1 420px;min-width:0"><div class="tabs under">${[['description', 'Description'], ['structured', 'Structured JD'], ['requirements', 'Requirements map'], ['insights', 'Insights'], ['notes', 'Notes']].map(([id, t]) => `<button class="${S.jobTab === id ? 'on' : ''}" data-act="job-tab" data-id="${id}">${t}</button>`).join('')}</div>${tab}</section>
       <div class="col gap14" style="flex:1 1 280px;min-width:0">
         <section class="card pad18"><div class="row gap8 mb14">${pill('AI', 'brand')}<span class="card-title sm">Fit breakdown</span></div>
-          ${D.resumeChoices?.length ? `<div class="mb12"><div class="row gap8" style="align-items:center;min-width:0"><span class="xs muted" style="white-space:nowrap">Resume used</span>${resumeSelect('job-resume', j.resume_choice_id, { id: j.id, choice: j.resume_choice })}</div>${j.resume_choice === 'AUTO' ? '<div class="xs faint mt4">Matched by resume tags</div>' : ''}</div>` : ''}
+          ${D.resumeChoices?.length ? `<div class="mb12"><div class="row gap8" style="align-items:center;min-width:0"><span class="xs muted" style="white-space:nowrap">Resume used</span>${resumeSelect('job-resume', j.resume_choice_id, { id: j.id, choice: j.resume_choice })}</div>${j.resume_in_use ? resumeInUseNote(j.resume_in_use) : j.resume_choice === 'AUTO' ? '<div class="xs faint mt4">Matched by resume tags</div>' : ''}${j.packet_source?.differs || (j.packet_source && !j.resume_in_use) ? packetSourceNote(j.packet_source, j.resume_in_use) : ''}</div>` : ''}
           ${j.fit == null && j.needs_description ? '<div class="small muted">Not ranked: add the job description first — a score from a title alone would mean nothing.</div>'
           : j.fit == null && needsParse(j) ? `<div class="small muted mb12">Not ranked yet: ranking waits for the description to be parsed.</div>${parseBtn(j, 'soft')}`
           : j.fit == null ? `<div class="small muted mb12">Not ranked yet.</div>${btn(label('rank' + j.id, 'Rank this job', 'Queueing…'), 'rank-job', { id: j.id }, 'soft', isBusy('rank' + j.id))}` : `
