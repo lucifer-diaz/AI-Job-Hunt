@@ -56,6 +56,41 @@ describe('Tracker · filters', () => {
     expect(cards(view())).toEqual([2]);
   });
 
+  it('never keeps a card the filters hide in the detail panel', () => {
+    ui.S.selApp = 4; ui.S.tf = { q: '', location: 'Bengaluru', min_fit: 0 };
+    const root = view();
+    expect(cards(root)).toEqual([1, 2]);
+    expect(root.querySelector('.tr-detail .card-title').textContent).toBe('Lead AI/ML Engineer');
+    expect(root.querySelector('[data-act="move-stage"]').dataset.app).toBe('1');
+  });
+
+  it('never shows a hidden archived card in the detail panel', () => {
+    const t = tracker(); t.applications[0] = { ...t.applications[0], archived: true };
+    ui.D.tracker = t; ui.S.selApp = 1;
+    const root = view();
+    expect(cards(root)).not.toContain(1);
+    expect(root.querySelector('.tr-detail .card-title').textContent).toBe('Senior AI platform Engineer');
+  });
+
+  it('reveals an application opened from elsewhere: archived cards shown, hiding filters cleared', () => {
+    const t = tracker(); t.applications[3] = { ...t.applications[3], archived: true };
+    ui.D.tracker = t; ui.S.selApp = 4; ui.S.tf = { q: 'optum', location: 'all', min_fit: 0 };
+    runInContext('S.trackerReveal = 4; revealTrackerApp()', ui.ctx);
+    expect(ui.S.showArchived).toBe(true);
+    expect(ui.S.tf).toEqual({ q: '', location: 'all', min_fit: 0 });
+    const root = view();
+    expect(cards(root)).toContain(4);
+    expect(root.querySelector('.tr-detail .card-title').textContent).toBe('AI Forward Deployed Engineer');
+    expect(ui.S.trackerReveal).toBeNull();
+  });
+
+  it('leaves the filters alone when the opened application already matches', () => {
+    ui.S.tf = { q: 'optum', location: 'all', min_fit: 0 };
+    runInContext('S.trackerReveal = 1; revealTrackerApp()', ui.ctx);
+    expect(ui.S.tf.q).toBe('optum');
+    expect(ui.S.showArchived).toBe(false);
+  });
+
   it('says so when nothing matches instead of showing an empty board', () => {
     ui.S.tf = { q: 'nothing like this', location: 'all', min_fit: 0 };
     const root = view();

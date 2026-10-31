@@ -205,6 +205,8 @@ function go(screen, extra = {}) {
   // Opening one job's packet lands on that packet, not on the task list and filters above it (focusPacket).
   const tailorFocus = screen === 'tailor' && !!extra.tailorJob;
   Object.assign(S, { screen, editing: null, scheduling: false, editingRecruiter: false, tailorFocus }, extra);
+  // Opening one application from elsewhere shows it, even when it is archived or the board's filters hide it.
+  S.trackerReveal = screen === 'tracker' && extra.selApp ? Number(extra.selApp) : null;
   setHash(); window.scrollTo(0, 0); render(); load();
 }
 // Scroll the requested job's packet ("Tailoring for …") into view once it has loaded, then forget the request so
@@ -249,6 +251,7 @@ const LOADERS = {
     D.tracker = await api('/api/tracker');
     const apps = D.tracker.applications;
     if (!apps.some(a => a.id === S.selApp)) S.selApp = (apps[0] || {}).id || null;
+    revealTrackerApp();
   },
   knowledge: loadKnowledge,
   async monitoring() { await loadMonitoring(); },
@@ -1625,6 +1628,15 @@ function filterTracker(apps, f) {
     && (!f.min_fit || (a.fit ?? -1) >= f.min_fit)
     && (!q || `${a.title} ${a.company} ${a.location || ''}`.toLowerCase().includes(q)));
 }
+// A link to one application (go('tracker', { selApp })) brings it onto the board: archived cards are shown and
+// filters that hide it are cleared, once, so the detail panel and the board always agree.
+function revealTrackerApp() {
+  const id = S.trackerReveal; S.trackerReveal = null;
+  const app = id && D.tracker?.applications.find(a => a.id === id);
+  if (!app) return;
+  if (app.archived) S.showArchived = true;
+  if (!filterTracker([app], S.tf).length) S.tf = { q: '', location: 'all', min_fit: 0 };
+}
 function renderTrackerFilters(all, shown, archived) {
   const f = S.tf, active = f.q || f.location !== 'all' || f.min_fit;
   const opts = (list, cur) => list.map(([v, t]) => `<option value="${attr(v)}" ${String(v) === String(cur) ? 'selected' : ''}>${esc(t)}</option>`).join('');
@@ -1719,8 +1731,9 @@ function renderTracker() {
     const events = apps.flatMap(a => a.timeline.map(e => ({ ...e, app: a }))).sort((x, y) => y.at.localeCompare(x.at));
     return `<div class="stack">${head}${toolbar}<section class="card">${events.map(e => `<div class="tl"><div class="tl-rail"><span class="d" style="background:${KIND_DOT[e.kind] || '#c6cad8'}"></span><span class="l"></span></div><div style="padding-bottom:16px" class="grow row top-align gap10">${companyAvatar(e.app.company, 'sm')}<div class="grow"><div class="small b">${esc(e.app.company)} · ${esc(e.title)}</div><div class="xs muted mt4">${fmtDateTime(e.at)}${e.detail && e.kind !== 'stage' ? ' · ' + esc(e.detail) : ''}</div></div></div>${btn('Open', 'select-app', { id: e.app.id, board: 1 }, 'sm none')}</div>`).join('')}</section></div>`;
   }
-  const sel = apps.find(a => a.id === S.selApp) || t.applications.find(a => a.id === S.selApp)
-    || apps.find(a => !stageFolded(a.stage) && !a.archived) || apps[0];
+  // The panel only ever shows a card the board shows (folded columns included), so its actions never act on an
+  // application the filters hid. A link to one hidden application reveals it first (revealTrackerApp).
+  const sel = apps.find(a => a.id === S.selApp) || apps.find(a => !stageFolded(a.stage) && !a.archived) || apps[0];
   const selStage = t.stages.find(s => s.id === sel.stage) || { label: sel.stage, dot: '#c6cad8' };
   const column = st => {
     const cards = apps.filter(a => a.stage === st.id);
@@ -1797,7 +1810,7 @@ function eventContact(e) {
 function renderRecruiters(sel) {
   const list = sel.recruiters || [];
   if (!S.editingRecruiter) {
-    return `<div class="box" style="padding:13px"><div class="row between mb8"><span class="caps">RECRUITERS${list.length > 1 ? ` · ${list.length}` : ''}</span><a href="#" class="xs" data-act="edit-recruiter">${list.length ? 'Edit' : 'Add'}</a></div>
+    return `<div class="box" style="padding:13px"><div class="row between mb8"><span class="caps">RECRUITERS${list.length > 1 ? ` · ${list.length}` : ''}</span><a href="#" class="xs" data-act="edit-recruiter" data-app="${sel.id}">${list.length ? 'Edit' : 'Add'}</a></div>
       ${list.length ? `<div class="col gap10">${list.map((r, i) => `<div${i ? ' style="padding-top:10px;border-top:1px solid var(--line3)"' : ''}>
         <div class="base b">${esc(r.name || r.email || r.phone)}${i === 0 && list.length > 1 ? ' <span class="xs muted" style="font-weight:400">· primary</span>' : ''}</div>
         ${r.email && r.name ? `<div class="small mt4"><a href="mailto:${attr(r.email)}">${esc(r.email)}</a></div>` : ''}
@@ -3160,7 +3173,7 @@ const A = {
   },
   'edit-recruiter': (el, e) => {
     e.preventDefault();
-    const sel = D.tracker.applications.find(a => a.id === S.selApp);
+    const sel = D.tracker.applications.find(a => a.id === Number(el.dataset.app));
     S.recruiterDraft = (sel?.recruiters || []).map(r => ({ ...r }));
     if (!S.recruiterDraft.length) S.recruiterDraft.push({ name: '', email: '', phone: '' });
     S.editingRecruiter = true; render();
