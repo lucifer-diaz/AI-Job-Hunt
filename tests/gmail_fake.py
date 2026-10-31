@@ -136,8 +136,14 @@ class FakeGoogle:
             options = [o.strip().lower() for o in (senders.group(1) or senders.group(2)).split(" OR ")]
             if not any(o and o in sender for o in options):
                 return False
+        found = lambda p: p.lower() in message.text() or p.lower() in sender
+        # ("a" OR "b"): any one of the phrases; every other quoted phrase must be there.
+        for group in re.findall(r'\(("[^)]*")\)', query):
+            if not any(found(p) for p in re.findall(r'"([^"]+)"', group)):
+                return False
+            query = query.replace(f"({group})", "")
         phrases = re.findall(r'"([^"]+)"', query)
-        return all(p.lower() in message.text() or p.lower() in sender for p in phrases)
+        return all(found(p) for p in phrases)
 
     # ───────────── what the tests look at ─────────────
 

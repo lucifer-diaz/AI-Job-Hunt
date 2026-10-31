@@ -167,8 +167,8 @@ function wkHistoryLogs(d) {
 }
 function wkWaitingText(r) {
   const w = r.waiting_detail || {};
-  if (w.kind === 'NEEDS_HUMAN' && w.fields) return `Waiting for you in the browser window: fill ${w.fields} highlighted field${w.fields === 1 ? '' : 's'}, then Continue in the Apply kit${w.expires_at ? ` · until ${fmtDateTime(w.expires_at)}` : ''}`;
-  if (w.kind === 'NEEDS_HUMAN') return `Waiting for you to finish in the browser window${w.reason ? ` (${wkHumanize(w.reason).toLowerCase()})` : ''}, then Continue in the Apply kit${w.expires_at ? ` · until ${fmtDateTime(w.expires_at)}` : ''}`;
+  if (w.kind === 'NEEDS_HUMAN' && w.fields) return `Waiting for you in the browser window: fill ${w.fields} highlighted field${w.fields === 1 ? '' : 's'}${w.reason === 'FIELDS_NEED_YOU' ? ': it carries on by itself when you finish, or press Continue' : ', then press Continue'}${w.expires_at ? ` · until ${fmtDateTime(w.expires_at)}` : ''}`;
+  if (w.kind === 'NEEDS_HUMAN') return `Waiting for you to finish in the browser window${w.reason ? ` (${wkHumanize(w.reason).toLowerCase()})` : ''}, then press Continue${w.expires_at ? ` · until ${fmtDateTime(w.expires_at)}` : ''}`;
   const parts = [w.questions ? `answer ${w.questions} question${w.questions === 1 ? '' : 's'} in the Knowledge bank (and verify them)` : '', w.confirmations ? `confirm ${w.confirmations} saved answer${w.confirmations === 1 ? '' : 's'} in the Apply kit` : ''].filter(Boolean);
   return `Waiting for you: ${parts.join(', then ') || 'see the Apply kit'}. It continues by itself`;
 }
@@ -283,7 +283,7 @@ function wkTable(kind, data) {
       <div style="min-width:0"><div class="small b ellipsis"><button type="button" class="linklike" style="all:unset;cursor:pointer" data-act="wk-history" data-kind="${attr(kind)}" data-id="${r.task_id}" title="Show what happened to this task">${wkTaskName(r)}</button></div>
         <div class="wk-detail xs ${['FAILED', 'BLOCKED'].includes(r.status) ? 'orch-bad' : 'muted'}"><span class="ellipsis" title="${attr(wkDetail(r))}">${wkTries(r)}${esc(wkDetail(r))}</span>${wkRowWhy(r)}</div></div>
       ${wkLastRun(r)}${wkModel(r)}${wkModelChange(r)}
-      <div class="wk-row-actions">${r.retried_by ? `<span class="orch-chip muted" title="${attr(`A newer task (#${r.retried_by.task_id}) is handling this job`)}">↻ Run again</span>` : ''}${wkButtons(kind, r.task_id, { kill: r.can_kill, runNow: r.can_run_now })}${wkRowNudge(kind, r.job_id, r.status)}${r.waiting_for === 'YOU' && r.job_id != null ? btn(r.waiting_detail?.kind === 'NEEDS_HUMAN' ? 'Open Apply kit' : 'Answer questions', 'open-kit', { id: r.job_id }, 'sm primary') : ''}${r.job_id != null ? btn('Job', 'open-job', { id: r.job_id }, 'sm') : ''}</div></div>`).join('')}</div></section>`;
+      <div class="wk-row-actions">${r.retried_by ? `<span class="orch-chip muted" title="${attr(`A newer task (#${r.retried_by.task_id}) is handling this job`)}">↻ Run again</span>` : ''}${wkButtons(kind, r.task_id, { kill: r.can_kill, runNow: r.can_run_now })}${wkRowNudge(kind, r.job_id, r.status)}${wkTakeoverContinue(kind, r)}${r.waiting_for === 'YOU' && r.job_id != null ? btn(r.waiting_detail?.kind === 'NEEDS_HUMAN' ? 'Open Apply kit' : 'Answer questions', 'open-kit', { id: r.job_id }, wkTakeoverContinue(kind, r) ? 'sm' : 'sm primary') : ''}${r.job_id != null ? btn('Job', 'open-job', { id: r.job_id }, 'sm') : ''}</div></div>`).join('')}</div></section>`;
 }
 
 /* ───────────── overview: hero, queue and the last 24 hours ───────────── */
@@ -299,6 +299,13 @@ function wkRunQueuedButton(tab, spec) {
   const c = spec.counts || {}, n = (c.queued || 0) + (c.retrying || 0), key = 'wkRunQueued' + tab;
   const verb = tab === 'ranking' ? 'Rank' : 'Run';
   return `<span title="${attr(n ? `${verb} the ${n} queued or waiting task${n === 1 ? '' : 's'} now: no retry wait${tab === 'ranking' ? ', no cadence' : ''}. A provider cooldown still applies.` : 'Nothing is queued')}">${btn(label(key, `${verb} ${n || ''} queued now`.replace('  ', ' '), 'Starting…'), 'wk-run-queued', { kind: tab, n }, 'sm', !n || isBusy(key))}</span>`;
+}
+// An application run waiting for you in its browser window: say you are done from here, without opening the Apply kit
+// (the same Continue; the run reads the page again and checks everything before it acts).
+function wkTakeoverContinue(kind, r) {
+  const w = r.waiting_detail;
+  if ((r.kind || kind) !== 'application' || r.waiting_for !== 'YOU' || !w || !w.takeover || w.continued) return '';
+  return btn(label(`wkCont${r.task_id}`, 'I’m done — continue', 'Continuing…'), 'wk-continue', { id: r.task_id }, 'sm primary', isBusy(`wkCont${r.task_id}`));
 }
 // A finished task's own Nudge: enabled while its job is waiting for the next stage, otherwise it says why it is not.
 const WK_OK = ['COMPLETED', 'SUCCEEDED', 'PARTIAL'];
@@ -853,6 +860,10 @@ const WORKERS_ACTIONS = {
     await wkReload();
     return out;
   }, out => `${out.title || 'The task'} runs next`),
+  'wk-continue': el => busy(`wkCont${el.dataset.id}`, async () => {
+    await api(`/api/application-executions/${el.dataset.id}/continue`, { method: 'POST' });
+    await wkReload();
+  }, 'Continuing in the same page: it checks everything again first'),
   'wk-kill': el => busy(`wkKill${el.dataset.kind}${el.dataset.id}`, async () => {
     const out = await api(`/api/workers/${el.dataset.kind}/tasks/${el.dataset.id}/kill`, { method: 'POST' });
     await wkReload();

@@ -71,12 +71,19 @@ def _kind(element: dict[str, Any]) -> str | None:
     return kind if kind in (*TEXT_KINDS, "checkbox", "radio", "file") else "text"
 
 
-def _role(kind: str, label: str) -> str:
+# A file input labelled only by its button: the question is the group's heading ("Resume/CV *" over "Attach").
+CONTROL_WORDS = re.compile(r"^(attach|upload|browse|choose|select|add)( (a |your )?(file|files|document))?$|^choose file$",
+                           re.IGNORECASE)
+
+
+def _role(kind: str, label: str, hints: str = "") -> str:
     lowered = label.lower()
     if kind == "file":
-        if "cover" in lowered:
+        # The element's own name and id count too (as in the Greenhouse adapter): new boards use id="resume".
+        named = f"{lowered} {hints.lower()}"
+        if re.search(r"cover", named):
             return "cover_letter"
-        return "resume" if re.search(r"resume|cv|curriculum", lowered) else "question"
+        return "resume" if re.search(r"resume|\bcv\b|curriculum", named) else "question"
     if kind == "email":
         return "email"
     if kind == "tel":
@@ -108,11 +115,19 @@ def analyze(url: str, elements: list[dict[str, Any]]) -> ApplicationForm | None:
             radios.setdefault(element.get("name") or element["key"], []).append(element)
             continue
         label = _clean(element.get("label")) or _clean(element.get("name")) or element["key"]
+        group = _clean(element.get("group_label"))
+        required = bool(element.get("required"))
+        hints = ""
+        if kind == "file":
+            hints = " ".join([group, _clean(element.get("name"), 120), _clean(element.get("id"), 120)])
+            if group and CONTROL_WORDS.match(label):
+                label = group
+            required = required or str(element.get("group_label") or "").rstrip().endswith("*")
         options = [FormOption(label=_clean(o.get("label"), 300) or _clean(o.get("value"), 300),
                               value=_clean(o.get("value"), 300))
                    for o in element.get("options") or [] if _clean(o.get("value"), 300)] if kind == "select" else []
-        fields.append(FormField(id=f"bu_{element['key']}"[:200], label=label, kind=kind, role=_role(kind, label),
-                                required=bool(element.get("required")), options=options,
+        fields.append(FormField(id=f"bu_{element['key']}"[:200], label=label, kind=kind, role=_role(kind, label, hints),
+                                required=required, options=options,
                                 locator=locator(element["key"]), eeo=_eeo(label),
                                 legal=kind == "checkbox" and is_legal(label)))
     for name, group in radios.items():

@@ -169,7 +169,10 @@ class PreSubmitValidator:
                 return _refuse("PACKET_FILE_CHANGED", f"The {fmt} file is not the one this run prepared")
         plan = (task.plan or {}).get("fields") or {}
         approved = set(consent(db, task.user_id)["attestations"])
-        for f in form.fields:
+        # Questions the page grew after the form was read (application._plan_grown) are checked like planned ones.
+        fields = [*form.fields, *(ats_forms.FormField.model_validate(f)
+                                  for f in (task.plan or {}).get("extra_fields") or [])]
+        for f in fields:
             entry = plan.get(f.id) or {}
             person = entry.get("status") == "PERSON"  # the person filled it in the window, then pressed Continue
             if f.required and entry.get("status") != "RESOLVED" and not person:
@@ -185,7 +188,7 @@ class PreSubmitValidator:
         if page.get("missing"):
             return _refuse("REQUIRED_FIELDS_MISSING", "A required field does not hold its answer on the page")
         uploaded = page.get("uploaded") or {}
-        for f in form.fields:
+        for f in fields:
             if f.kind == "file" and f.required:
                 wanted = Path(files.get("cover_letter" if f.role == "cover_letter" else "pdf") or "").name
                 if not wanted or not str(uploaded.get(f.id) or "").endswith(wanted):

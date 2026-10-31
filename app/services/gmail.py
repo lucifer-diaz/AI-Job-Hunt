@@ -33,7 +33,7 @@ from sqlalchemy.orm import Session
 
 from app.models import GmailConnection
 from app.security import decrypt_secret, encrypt_secret
-from app.services.external_api import RateLimitedCooldown, external_client
+from app.services.external_api import NO_CAPTURE, RateLimitedCooldown, external_client
 from app.services.redaction import redact_text
 from app.settings import get_settings
 
@@ -242,13 +242,16 @@ class GmailClient:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
-    def _get(self, path: str, params: dict[str, Any] | list[tuple[str, Any]] | None, operation: str) -> dict[str, Any]:
+    def _get(self, path: str, params: dict[str, Any] | list[tuple[str, Any]] | None, operation: str, *,
+             no_capture: bool = False) -> dict[str, Any]:
         retries = max(0, get_settings().gmail_max_retries)
         for attempt in range(retries + 1):
             self.requests += 1
+            extensions: dict[str, Any] = {"operation": operation, "attempt": attempt + 1}
+            if no_capture:  # bodies that must never be kept (a verification code), whatever capture says
+                extensions[NO_CAPTURE] = True
             try:
-                response = self._http.get(f"{GMAIL_API}{path}", params=params,
-                                          extensions={"operation": operation, "attempt": attempt + 1})
+                response = self._http.get(f"{GMAIL_API}{path}", params=params, extensions=extensions)
             except RateLimitedCooldown as exc:
                 raise GmailRateLimited(str(exc)) from exc
             except httpx.HTTPError as exc:
@@ -308,8 +311,8 @@ class GmailClient:
         params = [("format", "metadata"), *(("metadataHeaders", h) for h in METADATA_HEADERS)]
         return self._get(f"/messages/{message_id}", params, "message_metadata")
 
-    def get_full(self, message_id: str) -> dict[str, Any]:
-        return self._get(f"/messages/{message_id}", {"format": "full"}, "message_full")
+    def get_full(self, message_id: str, *, no_capture: bool = False) -> dict[str, Any]:
+        return self._get(f"/messages/{message_id}", {"format": "full"}, "message_full", no_capture=no_capture)
 
 
 # ───────────── reading a message ─────────────

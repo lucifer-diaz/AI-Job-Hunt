@@ -1552,8 +1552,8 @@ function renderKitTakeover(k) {
     SUBMIT_NOT_FOUND: 'Job Hunt OS could not tell which button submits this form', REQUIRED_FIELDS_MISSING: 'A required field is still empty' }[t.reason]
     || (String(t.reason || '').startsWith('NAVIGATOR_') ? 'The page needs you' : 'The page needs you');
   const list = fields.length ? `<ul class="small mt6" style="margin:6px 0 0 18px">${fields.map(f => `<li class="pretty">${esc(f.label || f.id)}</li>`).join('')}</ul>` : '';
-  return `<div class="banner warn mt8"><div class="b">${esc(why)}</div>
-    <div class="small mt4 pretty">${fields.length ? 'The browser window is open with these fields highlighted. Fill them there' + ((k.execution_questions || []).length ? ', or answer the questions below' : '') + ', then press Continue.'
+  return `<div class="banner warn stack mt8"><div class="b">${esc(why)}</div>
+    <div class="small mt4 pretty">${fields.length ? 'The browser window is open with these fields highlighted. Fill them there' + ((k.execution_questions || []).length ? ', or answer the questions below' : '') + (t.reason === 'FIELDS_NEED_YOU' ? '. It carries on by itself a few seconds after you finish, or press Continue.' : ', then press Continue.')
       : captcha ? 'Solve it in the browser window Job Hunt OS opened: the application continues by itself as soon as it is solved (or press Continue).'
       : 'Finish it in the browser window Job Hunt OS opened, then press Continue.'} The run picks up that same page: the page is not reloaded. Kept until ${fmtDateTime(t.expires_at)}. ${x.mode === 'GUARDED_AUTO' ? 'Job Hunt OS checks everything again before it submits.' : 'Job Hunt OS never submits from this window; you do.'}</div>${list}
     <div class="row gap8 mt10 wrap">${btn(label('kit-continue', 'I’m done — continue', 'Continuing…'), 'kit-continue', { exec: x.id }, 'sm', isBusy('kit-continue'))}
@@ -1572,7 +1572,19 @@ function renderKitIntent(k) {
   const i = k.execution_intent;
   if (!i) return '';
   const tone = i.status === 'CONFIRMED' ? 'good' : ['UNCERTAIN', 'CLICKING'].includes(i.status) ? 'warn' : 'muted';
-  return `<div class="row gap8 mt8">${pill(`Submit ${i.status.replaceAll('_', ' ').toLowerCase()}`, tone)}${i.reason ? `<span class="xs muted pretty">${esc(i.reason)}</span>` : ''}</div>`;
+  return `<div class="row gap8 mt8">${pill(`Submit ${i.status.replaceAll('_', ' ').toLowerCase()}`, tone)}${i.reason ? `<span class="xs muted pretty">${esc(i.reason)}</span>` : ''}</div>${renderKitEmailCode(k)}`;
+}
+// After the final click the site emailed a code to finish: look it up in Gmail when you ask, and paste it into the
+// browser window yourself. The code lives only in this page while the kit is open; Job Hunt OS never enters it.
+function renderKitEmailCode(k) {
+  const i = k.execution_intent, x = k.execution;
+  if (!i || !x || i.status !== 'UNCERTAIN' || !(i.evidence && i.evidence.email_code)) return '';
+  const got = S.kitEmailCode && S.kitEmailCode.exec === x.id ? S.kitEmailCode : null;
+  return `<div class="banner warn stack mt8"><div class="b">The site emailed you a code to finish the application</div>
+    <div class="small pretty">Enter it in the browser window Job Hunt OS left open. It records the application once the site confirms it.</div>
+    ${got && got.code ? `<div class="row gap8 wrap"><span class="mono b" style="font-size:18px;letter-spacing:2px">${esc(got.code)}</span>${btn('Copy', 'kit-copy-email-code', {}, 'sm')}</div>` : ''}
+    ${got && got.message ? `<div class="xs pretty">${esc(got.message)}</div>` : ''}
+    <div class="row gap8 wrap">${btn(label('kit-email-code', got && got.code ? 'Look again' : 'Get code from Gmail', 'Looking…'), 'kit-email-code', { exec: x.id }, 'sm', isBusy('kit-email-code'))}</div></div>`;
 }
 // The questions the application worker could not answer from a verified source: answer them here (saved to the
 // Knowledge bank as verified, your own words), or open just these in the Knowledge bank. The run continues by itself
@@ -3064,7 +3076,7 @@ const A = {
     await load();
   }, 'Sent back for revision'),
   'open-kit': el => openKit(el.dataset.id),
-  'close-kit': () => { S.kitJob = null; render(); },
+  'close-kit': () => { S.kitJob = null; S.kitEmailCode = null; render(); },
   'copy-answer': el => { copyText(el.dataset.text); api(`/api/knowledge/${el.dataset.id}/used`, { method: 'POST' }).catch(() => {}); },
   'kit-release': el => busy('kit-release', async () => {
     await api(`/api/jobs/${el.dataset.id}/submission/release`, { method: 'POST', body: { claim_token: el.dataset.token, reason: 'Not submitted (Apply kit)' } });
@@ -3120,6 +3132,12 @@ const A = {
     S.kitSignup = { exec: Number(el.dataset.exec), domain: out.domain, username: out.username, password: out.password };
   }, 'Use these on the signup form, then Save this login'),
   'kit-copy-password': () => { if (S.kitSignup) copyText(S.kitSignup.password); },
+  'kit-email-code': el => busy('kit-email-code', async () => {
+    const out = await api(`/api/application-executions/${el.dataset.exec}/email-code`);
+    S.kitEmailCode = { exec: Number(el.dataset.exec), code: out.status === 'FOUND' ? out.code : null, message: out.status === 'FOUND' ? '' : out.message };
+    return out;
+  }, out => (out.status === 'FOUND' ? 'Code found: copy it into the browser window' : out.message)),
+  'kit-copy-email-code': () => { if (S.kitEmailCode && S.kitEmailCode.code) copyText(S.kitEmailCode.code); },
   'kit-save-login': el => busy('kit-save-login', async () => {
     const typed = S.kitSignup && S.kitSignup.exec === Number(el.dataset.exec) ? null : window.prompt('The password you used on the site (stored encrypted, never shown again). Leave empty to keep only the session.');
     const out = await api(`/api/application-executions/${el.dataset.exec}/save-login`, { method: 'POST', body: typed ? { password: typed } : {} });

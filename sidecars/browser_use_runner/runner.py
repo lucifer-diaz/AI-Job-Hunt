@@ -72,7 +72,16 @@ DESCRIBE_JS = """(el) => {
     if (box) { const l = box.querySelector('label, legend, .label, [class*="label"]'); if (l) label = text(l); }
   }
   const fieldset = el.closest('fieldset');
-  const legend = fieldset ? text(fieldset.querySelector('legend')) : '';
+  let legend = fieldset ? text(fieldset.querySelector('legend')) : '';
+  if (!legend) {
+    // A group heading outside the control's own label (new Greenhouse boards: "Resume/CV *" over an "Attach" button).
+    const group = el.closest('[role="group"]');
+    if (group) {
+      const by = group.getAttribute('aria-labelledby');
+      legend = by ? by.split(/\\s+/).map(id => text(document.getElementById(id))).join(' ').trim()
+                  : (group.getAttribute('aria-label') || '');
+    }
+  }
   const form = owner;
   const required = el.required || el.getAttribute('aria-required') === 'true' || /\\*\\s*$/.test(label);
   const options = tag === 'select' ? Array.from(el.options).slice(0, 200).map(o => ({label: text(o), value: o.value})) : [];
