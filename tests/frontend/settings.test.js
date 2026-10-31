@@ -890,6 +890,31 @@ describe('AI agents & automation', () => {
     expect(row.querySelector('.am-warn').textContent).toContain('Turn on LangGraph');
   });
 
+  it('takes a LangSmith key as a password, sends only a typed one and removes a saved one', async () => {
+    const withKey = extra => { const a = automation(); a.settings.push({ name: 'agent_langsmith_api_key', env: 'AGENT_LANGSMITH_API_KEY', group: 'retention', label: 'LangSmith API key', help: '', kind: 'secret', needs: null, min: 0, max: 0, choices: [], value: '', default: '', overridden: false, set: false, env_set: false, ...extra }); return a; };
+    ui.D.automation = withKey();
+    ui.S.forms.automation = { agent_langsmith_export_enabled: 'true' };
+    section('automation');
+    const input = view().querySelector('#automation-agent_langsmith_api_key');
+    expect(input.type).toBe('password');
+    expect(input.getAttribute('autocomplete')).toBe('new-password');
+    expect(view().querySelector('[data-automation="agent_langsmith_export_enabled"] .am-warn').textContent).toContain('Enter a LangSmith API key below');
+    ui.S.forms.automation = { agent_langsmith_export_enabled: 'true', agent_langsmith_api_key: '  lsv2_pt_typed  ' };
+    section('automation');
+    expect(view().querySelector('[data-automation="agent_langsmith_export_enabled"] .am-warn')).toBeNull();
+    fetchMock.mockImplementation(async () => response(withKey({ overridden: true, set: true })));
+    await ui.A['automation-save']();
+    const put = () => fetchMock.mock.calls.filter(([url, o]) => url === '/api/settings/automation' && o?.method === 'PUT').map(([, o]) => JSON.parse(o.body));
+    expect(put()[0]).toEqual({ values: { agent_langsmith_export_enabled: 'true', agent_langsmith_api_key: 'lsv2_pt_typed' } });
+    section('automation');
+    expect(view().querySelector('#automation-agent_langsmith_api_key').value).toBe('');  // never shown again
+    expect(view().querySelector('#automation-agent_langsmith_api_key').placeholder).toContain('Saved');
+    expect(view().querySelector('.am-footer.is-dirty')).toBeNull();  // an empty key field is not a change
+    fetchMock.mockImplementation(async () => response(withKey()));
+    await ui.A['automation-clear-secret']({ dataset: { name: 'agent_langsmith_api_key' } });
+    expect(put()[1]).toEqual({ values: { agent_langsmith_api_key: '' } });
+  });
+
   it('is read-only for someone who is not an admin', () => {
     ui.D.automation = automation(false);
     section('automation');

@@ -67,7 +67,9 @@ def test_everyone_reads_the_choices_and_only_an_admin_changes_them(signed_in):
     assert {g["id"] for g in view["groups"]} == {s["group"] for s in view["settings"]}
     assert [p["id"] for p in view["presets"]] == ["manual", "read", "fill", "auto"]
     assert view["environment"]["langsmith_api_key"] is True and "lsv2-secret" not in str(view)
-    assert "agent_langsmith_api_key" not in {s["name"] for s in view["settings"]}  # secrets stay in .env
+    key = setting(view, "agent_langsmith_api_key")  # whether a key is set and where, never the key
+    assert key["kind"] == "secret" and key["value"] == "" and key["default"] == ""
+    assert key["set"] is True and key["env_set"] is True and key["overridden"] is False
     assert person.put(URL, json={"values": {"application_execution_mode": "assist"}}).status_code == 403
 
 
@@ -122,3 +124,55 @@ def test_text_values_are_cleaned(signed_in):
     assert setting(view, "application_login_domains")["value"] == "acme.wd5.myworkdayjobs.com,careers.example.com"
     assert get_settings().login_domains == frozenset({"acme.wd5.myworkdayjobs.com", "careers.example.com"})
     assert get_settings().application_takeover_ttl_minutes == 30
+
+
+def test_a_langsmith_key_saved_here_is_encrypted_used_and_never_returned(signed_in, monkeypatch):
+    monkeypatch.setattr(get_settings(), "secret_key", "test-secret-key-for-encryption")
+    admin = signed_in(admin=True)
+    view = admin.put(URL, json={"values": {"agent_langsmith_api_key": "  lsv2_pt_saved-in-the-app-1234  "}}).json()
+    assert "saved-in-the-app" not in str(view)
+    key = setting(view, "agent_langsmith_api_key")
+    assert key["overridden"] is True and key["set"] is True and key["value"] == ""
+    with SessionLocal() as db:
+        stored = db.get(ServerSetting, "agent_langsmith_api_key").value
+    assert "saved-in-the-app" not in stored  # encrypted at rest
+    assert get_settings().agent_langsmith_api_key == "lsv2_pt_saved-in-the-app-1234"  # in force at once, trimmed
+    assert "saved-in-the-app" not in admin.get(URL).text
+    # Other settings saved later leave the key alone; an empty value removes it and the environment's applies.
+    admin.put(URL, json={"values": {"agent_langsmith_project": "elsewhere"}}).raise_for_status()
+    assert get_settings().agent_langsmith_api_key == "lsv2_pt_saved-in-the-app-1234"
+    view = admin.put(URL, json={"values": {"agent_langsmith_api_key": ""}}).json()
+    with SessionLocal() as db:
+        assert db.get(ServerSetting, "agent_langsmith_api_key") is None
+    assert setting(view, "agent_langsmith_api_key")["overridden"] is False
+    assert get_settings().agent_langsmith_api_key == "lsv2-secret-not-shown-000000"
+
+
+def test_a_saved_key_that_no_longer_decrypts_falls_back_to_the_environment(signed_in, monkeypatch):
+    monkeypatch.setattr(get_settings(), "secret_key", "the-first-secret-key")
+    signed_in(admin=True).put(URL, json={"values": {"agent_langsmith_api_key": "lsv2_pt_old-key-0000"}})
+    monkeypatch.setattr(get_settings(), "secret_key", "a-rotated-secret-key")
+    server_settings.apply()
+    assert get_settings().agent_langsmith_api_key == "lsv2-secret-not-shown-000000"
+
+
+@pytest.mark.parametrize("key", ["short", "has a space in it", "x" * 201])
+def test_a_key_that_is_not_one_token_is_refused(signed_in, monkeypatch, key):
+    monkeypatch.setattr(get_settings(), "secret_key", "test-secret-key-for-encryption")
+    out = signed_in(admin=True).put(URL, json={"values": {"agent_langsmith_api_key": key}})
+    assert out.status_code == 422 and key not in out.text
+    with SessionLocal() as db:
+        assert db.scalars(select(ServerSetting)).all() == []
+
+
+def test_without_a_secret_key_the_server_refuses_to_store_a_key(signed_in, monkeypatch):
+    monkeypatch.setattr(get_settings(), "secret_key", "")
+    out = signed_in(admin=True).put(URL, json={"values": {"agent_langsmith_api_key": "lsv2_pt_cannot-store-0000"}})
+    assert out.status_code == 422 and "SECRET_KEY" in out.json()["detail"] and "cannot-store" not in out.text
+
+
+def test_only_an_admin_saves_a_key(signed_in, monkeypatch):
+    monkeypatch.setattr(get_settings(), "secret_key", "test-secret-key-for-encryption")
+    out = signed_in().put(URL, json={"values": {"agent_langsmith_api_key": "lsv2_pt_not-an-admin-0000"}})
+    assert out.status_code == 403
+    assert get_settings().agent_langsmith_api_key == "lsv2-secret-not-shown-000000"

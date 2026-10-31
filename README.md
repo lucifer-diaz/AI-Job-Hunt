@@ -1822,7 +1822,7 @@ default). Applications do not use graphs.
 | `AGENT_LEASE_SECONDS` / `AGENT_MAX_ATTEMPTS` | `300` / `3` | A run's lease (renewed while it runs), and how many times recovery retries it. |
 | `AGENT_CHECKPOINT_MAX_BYTES` | `65536` | A larger checkpoint is refused, and so is one with a credential field or a secret-shaped string. |
 | `AGENT_CHECKPOINT_RETENTION_DAYS` / `AGENT_INTERRUPT_EXPIRY_DAYS` | `14` / `30` | Checkpoints of finished runs are deleted, and a run left waiting for a person expires. |
-| `AGENT_LANGSMITH_EXPORT_ENABLED` + `AGENT_LANGSMITH_API_KEY` | off | Optional LangSmith traces, metadata only (below). `AGENT_LANGSMITH_ENDPOINT` and `AGENT_LANGSMITH_PROJECT` choose where they go. |
+| `AGENT_LANGSMITH_EXPORT_ENABLED` + `AGENT_LANGSMITH_API_KEY` | off | Optional LangSmith traces, metadata only (below). `AGENT_LANGSMITH_ENDPOINT` and `AGENT_LANGSMITH_PROJECT` choose where they go. An admin can also set all four in Settings → AI agents & automation (Advanced); a key saved there is encrypted with `SECRET_KEY`, never shown again, and overrides the `.env` key until removed. |
 
 ```text
 POST /api/agents/pilot/runs        {"kind": "auto" | "review", "items": 1-20, "idempotency_key": "…"}
