@@ -98,6 +98,56 @@ def remove_question(insight: JobInsight, qid: str) -> bool:
     return True
 
 
+MAX_ANSWER_CHARS = 8000
+
+
+def save_reviewed(db: Session, insight: JobInsight, job: Job, qid: str, answer: str,
+                  sensitive: bool = False) -> KnowledgeAnswer:
+    """The person read this question's answer (a draft they may have edited, or one they typed) and saves it to their
+    Answer library as verified, from the Insights tab. The item then shows as their saved answer.
+
+    The answer is the person's own words: nothing here calls a model or keeps an unreviewed draft. A personal
+    question (or one they mark sensitive) is saved sensitive: it is confirmed on each form, so its text is not shown
+    on the item. An existing saved row for the same question is updated (their earlier request is answered), never
+    duplicated."""
+    from app.services import knowledge
+
+    answer = (answer or "").strip()
+    if not answer:
+        raise ValueError("Write the answer before saving it")
+    if len(answer) > MAX_ANSWER_CHARS:
+        raise ValueError(f"An answer is at most {MAX_ANSWER_CHARS} characters")
+    items = list(insight.application_questions or [])
+    index = next((i for i, q in enumerate(items) if q.get("id") == qid), None)
+    if index is None or items[index].get("status") not in (DRAFTED, NEEDS_INPUT):
+        raise LookupError("Question not found")
+    item = items[index]
+    question = item["question"]
+    sensitive = bool(sensitive) or item.get("category") == "PERSONAL" or personal(question)
+    row = knowledge.find_same(db, question)
+    if row is None:
+        row = KnowledgeAnswer(user_id=job.user_id, question=question,
+                              question_key=knowledge.question_key(question), category="general",
+                              answer_type="text", source_job_id=job.id)
+        db.add(row)
+    row.answer, row.verified, row.sensitive = answer, True, bool(row.sensitive) or sensitive
+    if row.source_job_id is None:
+        row.source_job_id = job.id
+    db.flush()
+    if row.sensitive:
+        saved = _item(qid, question, item.get("origin") or FORM, NEEDS_INPUT, category="PERSONAL",
+                      knowledge_answer_id=row.id,
+                      reason="Saved in your Answer library as sensitive; confirm it on the form each time")
+    else:
+        saved = _item(qid, question, item.get("origin") or FORM, LIBRARY, answer=row.answer,
+                      answer_source=f"knowledge_answer:{row.id}", knowledge_answer_id=row.id,
+                      category=item.get("category"), requirement_ids=item.get("requirement_ids"),
+                      requirements=item.get("requirements"))
+    items[index] = saved
+    insight.application_questions = items
+    return row
+
+
 def personal(question: str, category: str | None = None) -> bool:
     return bool(PERSONAL_RE.search(question or "")) or (category or "") in PERSONAL_CATEGORIES
 

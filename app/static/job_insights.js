@@ -219,20 +219,34 @@ function insInterview(x, jobId) {
 function insFormQuestion(q, jobId) {
   const [word, tone] = INS_FORM_STATUS[q.status] || INS_FORM_STATUS.NEEDS_INPUT;
   const key = `${jobId}:${q.id}`;
-  const actions = [
+  const savable = q.status === 'DRAFTED' || q.status === 'NEEDS_INPUT', editing = savable && !!insState().editing?.[key];
+  const actions = editing ? '' : [
     q.answer ? btn('Copy', 'ins-form-copy', { id: jobId, q: q.id }, 'sm ghost') : '',
-    q.status !== 'LIBRARY' && q.status !== 'PENDING' ? btn(q.status === 'DRAFTED' ? 'Save to library' : 'Answer in library', 'ins-form-save', { id: jobId, q: q.id }, 'sm ghost') : '',
+    savable ? btn(q.status === 'DRAFTED' ? 'Review &amp; save' : 'Answer here', 'ins-form-edit', { id: jobId, q: q.id }, 'sm ghost') : '',
+    savable ? btn('Open in library', 'ins-form-save', { id: jobId, q: q.id }, 'sm ghost') : '',
     q.origin === 'FORM' ? btn(label('insformrm' + key, 'Remove', 'Removing…'), 'ins-form-remove', { id: jobId, q: q.id }, 'sm ghost danger', isBusy('insformrm' + key)) : '',
   ].filter(Boolean).join('');
   return `<div class="ins-q"><div class="row top-align gap8"><div class="grow"><div class="small b pretty">${esc(q.question)}</div>
       ${q.rationale ? `<div class="xs mt4"><span class="faint">Why likely:</span> ${esc(q.rationale)}</div>` : ''}
-      ${q.answer ? `<div class="box soft mt8 small pretty" style="white-space:pre-wrap">${esc(q.answer)}</div>` : ''}
+      ${editing ? insAnswerEditor(q, jobId) : q.answer ? `<div class="box soft mt8 small pretty" style="white-space:pre-wrap">${esc(q.answer)}</div>` : ''}
       ${q.evidence?.filter(Boolean).length ? `<div class="xs muted mt6">From your evidence: ${q.evidence.filter(Boolean).map(esc).join(' · ')}</div>` : ''}
       ${q.resume_facts?.filter(Boolean).length ? `<div class="xs muted mt4">From your resume: ${q.resume_facts.filter(Boolean).map(esc).join(' · ')}</div>` : ''}
       ${q.requirements?.length ? `<div class="xs muted mt4">Relates to: ${esc(q.requirements.join(', '))}</div>` : ''}
       ${q.reason ? `<div class="xs mt6" style="color:var(--warn-deep)">${esc(q.reason)}</div>` : ''}</div>
       <div class="col gap6 none">${pill(word, tone)}${q.kind ? insKind(q.kind) : ''}</div></div>
     ${actions ? `<div class="row wrap gap6 mt8">${actions}</div>` : ''}</div>`;
+}
+
+// Edit the draft (or write the answer) in place and save it to the Answer library as verified, without leaving the
+// job. "I reviewed this" starts unticked: a draft is saved as the person's answer only once they say they read it.
+const insAnswerForm = (jobId, qid) => `insans${jobId}_${qid}`;
+function insAnswerEditor(q, jobId) {
+  const form = insAnswerForm(jobId, q.id), key = `${jobId}:${q.id}`, personal = q.category === 'PERSONAL';
+  return `<div class="box soft mt8 col gap8">
+    ${textareaF(form, 'answer', q.answer || '', `style="min-height:110px" aria-label="Your answer to: ${attr(q.question)}" placeholder="Write your answer"`)}
+    ${checkF(form, 'reviewed', false, q.status === 'DRAFTED' ? 'I reviewed this answer and it is accurate' : 'This is my answer and it is accurate')}
+    ${checkF(form, 'sensitive', personal, 'Sensitive (confirm it on each form; it is never shown to a model)', personal ? 'disabled' : '')}
+    <div class="row wrap gap6">${btn(label('insans' + key, 'Save to library as verified', 'Saving…'), 'ins-form-verify', { id: jobId, q: q.id }, 'primary sm', isBusy('insans' + key))}${btn('Cancel', 'ins-form-cancel', { id: jobId, q: q.id }, 'sm ghost')}</div></div>`;
 }
 
 function insForm(x, jobId) {
@@ -392,6 +406,35 @@ const INSIGHTS_ACTIONS = {
     const f = D.insights?.[Number(el.dataset.id)]?.application_form || {};
     const q = [...(f.from_form || []), ...(f.likely || [])].find(item => item.id === el.dataset.q);
     if (q?.answer) copyText(q.answer);
+  },
+  'ins-form-edit': el => {
+    const st = insState();
+    st.editing = { ...(st.editing || {}), [`${el.dataset.id}:${el.dataset.q}`]: true };
+    render();
+    document.getElementById(`${insAnswerForm(el.dataset.id, el.dataset.q)}-answer`)?.focus();
+  },
+  'ins-form-cancel': el => {
+    delete insState().editing?.[`${el.dataset.id}:${el.dataset.q}`];
+    delete S.forms[insAnswerForm(el.dataset.id, el.dataset.q)];
+    render();
+  },
+  'ins-form-verify': el => {
+    const id = Number(el.dataset.id), q = el.dataset.q, form = insAnswerForm(id, q), key = `${id}:${q}`;
+    const f = D.insights?.[id]?.application_form || {};
+    const item = [...(f.from_form || []), ...(f.likely || [])].find(x => x.id === q);
+    if (!item) return;
+    const answer = String(fv(form, 'answer', item.answer || '')).trim();
+    if (!answer) { toast('Write the answer first', true); return; }
+    if (!fv(form, 'reviewed', false)) { toast('Tick “I reviewed this answer” to save it as verified', true); return; }
+    const sensitive = item.category === 'PERSONAL' || !!fv(form, 'sensitive', false);
+    return busy('insans' + key, async () => {
+      const out = await api(`/api/jobs/${id}/insights/application-questions/${encodeURIComponent(q)}/save`, { method: 'POST', body: { answer, sensitive, reviewed: true } });
+      D.insights = { ...(D.insights || {}), [id]: out };
+      delete insState().editing?.[key];
+      delete S.forms[form];
+      D.knowledge = null; // the Answer library reloads with it next time
+      return out;
+    }, 'Saved to your Answer library as verified');
   },
   // Opens the Answer library editor with the question (and the draft) filled in. "Human verified" starts unticked:
   // the person reads the draft and confirms it there; nothing is saved from here.
