@@ -353,8 +353,10 @@ function automationOf(a, name) {
   const item = a.settings.find(s => s.name === name);
   return item ? automationValue(a, item) : '';
 }
+// A key field counts as changed only when something was typed in it: its saved value is never sent back.
+function automationChanged(item, v) { return item.kind === 'secret' ? String(v).trim() !== '' : String(v) !== item.value; }
 function automationChanges(a) {
-  return Object.entries(S.forms.automation || {}).filter(([k, v]) => { const item = a.settings.find(s => s.name === k); return item && String(v) !== item.value; });
+  return Object.entries(S.forms.automation || {}).filter(([k, v]) => { const item = a.settings.find(s => s.name === k); return item && automationChanged(item, v); });
 }
 // What happens to an approved job with the choices as they stand (unsaved ones included), in one sentence.
 function automationSummary(a) {
@@ -376,12 +378,16 @@ function automationWarnings(a, item, v) {
   if ((AUTOMATION_GRAPH_MODES.includes(item.name) && v !== 'off' || item.name === 'agent_graphs_enabled' && v === 'true') && !a.environment.postgres) out.push('Needs PostgreSQL: this server uses another database, so it acts as off.');
   if (item.name === 'application_execution_mode' && v === 'guarded_auto') out.push('Each account also turns on Auto submit in Settings → Auto submit.');
   if (item.name === 'browser_use_webui_enabled' && v === 'true' && !a.environment.browser_use_python) out.push('Set BROWSER_USE_PYTHON in .env to the browser-use Web UI’s Python; until then it stays off.');
-  if (item.name === 'agent_langsmith_export_enabled' && v === 'true' && !a.environment.langsmith_api_key) out.push('Set AGENT_LANGSMITH_API_KEY in .env; until then nothing is sent.');
+  if (item.name === 'agent_langsmith_export_enabled' && v === 'true' && !a.environment.langsmith_api_key && !String(automationOf(a, 'agent_langsmith_api_key')).trim()) out.push('Enter a LangSmith API key below (or set AGENT_LANGSMITH_API_KEY in .env); until then nothing is sent.');
   return out;
 }
 function automationControl(a, item, v) {
   const lock = a.editable ? '' : 'disabled';
   const id = `aria-describedby="am-help-${item.name}"`;
+  if (item.kind === 'secret') {
+    const hint = item.overridden ? 'Saved · paste a new key to replace it' : item.env_set ? 'Using the key in .env · paste one to override it' : 'Paste your API key';
+    return inputF('automation', item.name, v, `type="password" autocomplete="new-password" spellcheck="false" placeholder="${attr(hint)}" ${id} ${lock}`);
+  }
   if (item.choices.length) {
     const options = item.choices.map(c => [c.value, c.label]);
     if (!options.some(([value]) => value === v)) options.push([v, `${v} (custom)`]);
@@ -390,13 +396,18 @@ function automationControl(a, item, v) {
   const type = item.kind === 'int' ? `type="number" inputmode="numeric" min="${item.min}" max="${item.max}"` : 'spellcheck="false" autocomplete="off"';
   return inputF('automation', item.name, v, `${type} ${id} ${lock}`);
 }
+function automationSecretOrigin(a, item) {
+  const env = item.env_set ? '.env has a key' : '.env has none';
+  if (!item.overridden) return `<span class="am-origin">${item.env_set ? 'From .env' : 'Not set'}</span>`;
+  return `<span class="am-origin am-origin-set">Saved here, encrypted · ${env}</span>${a.editable ? btn(item.env_set ? 'Use .env key' : 'Remove saved key', 'automation-clear-secret', { name: item.name }, 'am-link') : ''}`;
+}
 function automationRow(a, item) {
   const v = automationValue(a, item);
   const chosen = item.choices.find(c => c.value === v);
   const inactive = AUTOMATION_GRAPH_MODES.includes(item.name) && automationOf(a, 'agent_graphs_enabled') !== 'true';
   const envLabel = (item.choices.find(c => c.value === item.default) || {}).label || item.default || 'empty';
   const changed = v !== item.default;
-  const origin = changed
+  const origin = item.kind === 'secret' ? automationSecretOrigin(a, item) : changed
     ? `<span class="am-origin am-origin-set">Set here · .env says ${esc(envLabel)}</span>${a.editable ? btn('Use .env value', 'automation-reset', { name: item.name }, 'am-link') : ''}`
     : '<span class="am-origin">Same as .env</span>';
   const warnings = automationWarnings(a, item, v);
@@ -410,7 +421,7 @@ function automationRow(a, item) {
 function automationStatus(a) {
   const on = automationOf(a, 'agent_graphs_enabled') === 'true';
   const chip = (ok, yes, no, title) => `<span class="am-chip ${ok ? 'am-ok' : 'am-no'}" title="${attr(title)}"><span aria-hidden="true">${ok ? '●' : '○'}</span>${esc(ok ? yes : no)}</span>`;
-  return `<div class="am-chips">${chip(on, 'LangGraph on', 'LangGraph off', 'AGENT_GRAPHS_ENABLED')}${chip(a.environment.postgres, 'PostgreSQL', 'Not PostgreSQL', 'Agent graphs need PostgreSQL')}${chip(a.environment.browser_use_ready, 'browser-use ready', a.environment.browser_use_python ? 'browser-use off' : 'BROWSER_USE_PYTHON not set', 'The browser-use runner')}${chip(a.environment.langsmith_api_key, 'LangSmith key set', 'No LangSmith key', 'AGENT_LANGSMITH_API_KEY in .env')}</div>`;
+  return `<div class="am-chips">${chip(on, 'LangGraph on', 'LangGraph off', 'AGENT_GRAPHS_ENABLED')}${chip(a.environment.postgres, 'PostgreSQL', 'Not PostgreSQL', 'Agent graphs need PostgreSQL')}${chip(a.environment.browser_use_ready, 'browser-use ready', a.environment.browser_use_python ? 'browser-use off' : 'BROWSER_USE_PYTHON not set', 'The browser-use runner')}${chip(a.environment.langsmith_api_key, 'LangSmith key set', 'No LangSmith key', 'The LangSmith API key: saved below or AGENT_LANGSMITH_API_KEY in .env')}</div>`;
 }
 function renderAutomationSettings() {
   const a = D.automation;
@@ -434,7 +445,7 @@ function renderAutomationSettings() {
   const rows = id => a.settings.filter(s => s.group === id).map(s => automationRow(a, s)).join('');
   const main = a.groups.filter(g => g.id !== 'retention').map(g => settingsGroup(esc(g.label), esc(g.help), `<div class="am-rows">${rows(g.id)}</div>`)).join('');
   const advanced = a.groups.filter(g => g.id === 'retention').map(g => settingsDetails('automation-advanced', `Advanced: ${esc(g.label.toLowerCase())}`, `<p class="settings-help">${esc(g.help)}</p><div class="am-rows">${rows(g.id)}</div>`)).join('');
-  const footer = a.editable ? `<footer class="settings-footer am-footer${changes.length ? ' is-dirty' : ''}"><span role="status">${isBusy('automation') ? 'Saving…' : changes.length ? `${changes.length} unsaved change${changes.length === 1 ? '' : 's'} · they apply as soon as you save, no restart` : 'Saved. These override .env for the whole server; API keys and paths stay in .env.'}</span>
+  const footer = a.editable ? `<footer class="settings-footer am-footer${changes.length ? ' is-dirty' : ''}"><span role="status">${isBusy('automation') ? 'Saving…' : changes.length ? `${changes.length} unsaved change${changes.length === 1 ? '' : 's'} · they apply as soon as you save, no restart` : 'Saved. These override .env for the whole server; a key saved here is encrypted and never shown again.'}</span>
     <div class="row gap8">${btn('Discard', 'automation-discard', {}, '', !changes.length)}${btn(label('automation', 'Save changes', 'Saving…'), 'automation-save', {}, 'primary', !changes.length || isBusy('automation'))}</div></footer>` : '';
   return `<div class="am">${summary}${presets}${main}${advanced}${footer}</div>`;
 }
@@ -547,9 +558,14 @@ const SETTINGS_ACTIONS = {
     const item = (D.automation?.settings || []).find(x => x.name === el.dataset.name);
     if (item) { S.forms.automation = { ...(S.forms.automation || {}), [item.name]: item.default }; render(); }
   },
+  // An empty value removes the saved key at once; the key itself is never in the page.
+  'automation-clear-secret': el => busy('automation', async () => {
+    D.automation = await api('/api/settings/automation', { method: 'PUT', body: { values: { [el.dataset.name]: '' } } });
+    if (S.forms.automation) delete S.forms.automation[el.dataset.name];
+  }, 'Saved key removed'),
   'automation-save': () => busy('automation', async () => {
     const byName = Object.fromEntries((D.automation?.settings || []).map(s => [s.name, s]));
-    const values = Object.fromEntries(Object.entries(S.forms.automation || {}).filter(([k, v]) => byName[k] && String(v) !== byName[k].value));
+    const values = Object.fromEntries(Object.entries(S.forms.automation || {}).filter(([k, v]) => byName[k] && automationChanged(byName[k], v)).map(([k, v]) => [k, byName[k].kind === 'secret' ? String(v).trim() : v]));
     D.automation = await api('/api/settings/automation', { method: 'PUT', body: { values } });
     delete S.forms.automation;
   }, 'Saved: in effect now'),

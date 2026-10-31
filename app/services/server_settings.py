@@ -10,7 +10,9 @@ again removes the override:
     Each is a choice with a description of every option (or a checked number or text). These are laid over the settings
     object itself (`apply`), so every reader — its derived properties included (`qualification_mode`,
     `application_execution_mode_value`, the scheduler intervals that follow AGENT_GRAPHS_ENABLED) — sees the admin's
-    choice. Secrets and machine paths (API keys, BROWSER_USE_PYTHON) are never here: they stay in the environment.
+    choice. Machine paths (BROWSER_USE_PYTHON) and the server's own secrets stay in the environment. The one key that
+    may be saved here is the LangSmith API key (kind "secret"): encrypted with SECRET_KEY (app.security), never
+    returned by any API (only whether one is set), and replaced or removed, never read back.
 
 Reads are cached for a few seconds and never raise: if the table cannot be read, the environment value applies.
 """
@@ -28,6 +30,7 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
 
 from app.models import SchedulerJob, ServerSetting
+from app.security import SecretsUnavailable, decrypt_secret, encrypt_secret
 from app.settings import get_settings
 
 log = logging.getLogger(__name__)
@@ -128,7 +131,7 @@ class Config:
     group: str
     label: str
     help: str
-    kind: str  # "choice" (a word), "bool", "int" or "text"
+    kind: str  # "choice" (a word), "bool", "int", "text" or "secret" (stored encrypted, never returned)
     choices: tuple[Choice, ...] = ()
     low: int = 0
     high: int = 0
@@ -226,7 +229,9 @@ CONFIG: dict[str, Config] = {c.name: c for c in (
            "Run metadata only (ids, enums, counts, error class names); never a prompt, document or credential.", "bool",
            (Choice("false", "Off", "Nothing leaves this server."),
             Choice("true", "On", "Graph runs are traced to the LangSmith project below.")),
-           needs="AGENT_LANGSMITH_API_KEY set in the environment"),
+           needs="a LangSmith API key, below or in .env"),
+    Config("agent_langsmith_api_key", "retention", "LangSmith API key",
+           "Saved encrypted on this server and never shown again. Leave it empty to keep the saved key.", "secret"),
     Config("agent_langsmith_project", "retention", "LangSmith project", "The project traces go to.", "text"),
     Config("agent_langsmith_endpoint", "retention", "LangSmith endpoint",
            "The LangSmith API address (https), e.g. https://eu.api.smith.langchain.com for the EU region.", "text"),
@@ -258,6 +263,8 @@ def _typed(spec: Config, text: str) -> Any:
         return str(text).strip().lower() == "true"
     if spec.kind == "int":
         return _whole(text)
+    if spec.kind == "secret":
+        return decrypt_secret(text)  # None (the environment applies) when SECRET_KEY changed or is missing
     return str(text)
 
 
@@ -416,6 +423,12 @@ def describe_config() -> dict[str, Any]:
         saved = dict(_config)
     items = []
     for name, spec in CONFIG.items():
+        if spec.kind == "secret":  # whether a key is set, and where; never the key
+            items.append({"name": name, "env": name.upper(), "group": spec.group, "label": spec.label,
+                          "help": spec.help, "kind": spec.kind, "needs": None, "min": 0, "max": 0, "choices": [],
+                          "value": "", "default": "", "overridden": name in saved,
+                          "set": bool(getattr(settings, name)), "env_set": bool(environment(name))})
+            continue
         items.append({"name": name, "env": name.upper(), "group": spec.group, "label": spec.label, "help": spec.help,
                       "kind": spec.kind, "needs": spec.needs or None, "min": spec.low, "max": spec.high,
                       "choices": [{"value": c.value, "label": c.label, "help": c.help} for c in spec.choices],
@@ -428,8 +441,21 @@ def describe_config() -> dict[str, Any]:
                             "langsmith_api_key": bool(settings.agent_langsmith_api_key)}}
 
 
+SECRET = re.compile(r"^[\x21-\x7e]{8,200}$")  # one printable token, no spaces
+
+
 def _clean(spec: Config, raw: Any) -> str:
     text = _text(raw).strip()
+    if spec.kind == "secret":
+        if not text:
+            return ""  # removes the saved key: the environment's applies
+        if not SECRET.match(text):
+            raise ServerSettingError(f"{spec.label}: paste the key as it is (8 to 200 characters, no spaces)")
+        try:
+            return encrypt_secret(text)
+        except SecretsUnavailable:
+            raise ServerSettingError(f"{spec.label}: the server has no SECRET_KEY, so a key cannot be stored; "
+                                     f"set {spec.name.upper()} in .env instead") from None
     if spec.kind in ("choice", "bool"):
         if text.lower() not in {c.value for c in spec.choices}:
             raise ServerSettingError(f"{spec.label}: choose one of {', '.join(c.label for c in spec.choices)}")
@@ -455,8 +481,9 @@ def _clean(spec: Config, raw: Any) -> str:
 
 
 def update_config(db: Session, changes: dict[str, Any], actor: str) -> dict[str, Any]:
-    """Save an admin's configuration changes, all or none. A value equal to the environment's removes the override.
-    Takes effect at once in this process (`apply`); other processes pick it up within CACHE_SECONDS. Commits."""
+    """Save an admin's configuration changes, all or none. A value equal to the environment's removes the override;
+    for a secret, an empty value removes the saved key. Takes effect at once in this process (`apply`); other
+    processes pick it up within CACHE_SECONDS. Commits."""
     clean: dict[str, str] = {}
     for name, raw in changes.items():
         spec = CONFIG.get(name)
@@ -466,7 +493,8 @@ def update_config(db: Session, changes: dict[str, Any], actor: str) -> dict[str,
     now = datetime.now(UTC).replace(tzinfo=None)
     for name, text in clean.items():
         db.execute(delete(ServerSetting).where(ServerSetting.name == name))
-        if text != _text(environment(name)):
+        secret = CONFIG[name].kind == "secret"
+        if text if secret else text != _text(environment(name)):
             db.add(ServerSetting(name=name, value=text, updated_by=actor[:200], updated_at=now))
     db.commit()
     apply()
