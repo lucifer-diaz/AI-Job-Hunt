@@ -720,7 +720,7 @@ def fill(state: ApplicationState, runtime: Runtime[ApplicationContext]) -> dict[
 
 
 def _plan_grown(ctx: ApplicationContext, task_id: int, job_id: int, planned: Any, current: Any, plan: dict[str, Any],
-                values: dict[str, Any], files: dict[str, str] | None) -> None:
+                values: dict[str, Any], files: dict[str, str] | None, attached: dict[str, str] | None = None) -> None:
     """Questions the page shows now that the form read at ANALYZE_FORM did not have (the page grew in the person's
     window, or the next section appeared): resolved exactly as RESOLVE_ANSWERS resolves the planned ones — a verified
     saved answer is used, an unanswered required question is saved to the Knowledge bank for the person. Their entries
@@ -728,10 +728,16 @@ def _plan_grown(ctx: ApplicationContext, task_id: int, job_id: int, planned: Any
     `task.form` and its fingerprint stay as planned, so a fresh load still matches; this runs on every in-place pass."""
     from app.models import ApplicationExecutionTask, Job
     from app.services import answer_resolver
-    from app.services.ats_forms import ApplicationForm
+    from app.services.ats_forms import ApplicationForm, FormField, generic
 
     known = {f.id for f in planned.fields}
     extra = [f for f in current.fields if f.id not in known]
+    # A grown file input the board replaced with the uploaded file's name is no longer in the form as read now: keep
+    # its stored entry while the runner still reports the upload, so the pre-submit checks see it attached.
+    here = {f.id for f in extra}
+    extra += [f for f in (FormField.model_validate(d) for d in plan.get("extra_fields") or [])
+              if f.kind == "file" and f.id not in here and f.id not in known
+              and generic.key_of(f.locator) in (attached or {})]
     if not extra:
         if plan.pop("extra_fields", None) is not None:  # an earlier pass's questions are no longer on the page
             with _session(ctx) as db:
@@ -817,7 +823,7 @@ def _fill_browser_use(ctx: ApplicationContext, task_id: int, job: Any, url: str,
                 keep = _park_or_close(ctx, session, result.code if result.outcome == "NEEDS_HUMAN" else None)
                 return {"problem": result.code if result.outcome != "FILLED" else "FORM_CHANGED", "takeover": keep}
         if current is not None:
-            _plan_grown(ctx, task_id, job.id, form, current, plan, values, files)
+            _plan_grown(ctx, task_id, job.id, form, current, plan, values, files, observation.get("attached"))
         browser_actions.fill_deterministic(session, ctx.run_async, current, plan, values, observation, result, limit)
         observation = ctx.run_async(session.call("observe", html=True))
         missing, person = browser_actions.read_required(session, ctx.run_async, current, values, observation)
@@ -1097,7 +1103,8 @@ def submit(state: ApplicationState, runtime: Runtime[ApplicationContext]) -> dic
         ctx.run_async(page.close())
 
 
-def _bu_facts(ctx: ApplicationContext, session: Any, planned: Any, values: dict[str, Any]) -> dict[str, Any]:
+def _bu_facts(ctx: ApplicationContext, session: Any, planned: Any, values: dict[str, Any],
+              extra: list[Any] | None = None) -> dict[str, Any]:
     """What the browser-use page shows now, for the PreSubmitValidator: its host and address, any problem, the form's
     fingerprint (the planned one while every planned field is still there: a conditional question may have grown it),
     the required fields that do not hold their answer (or a person's), the file attached to each file field, and the
@@ -1121,7 +1128,9 @@ def _bu_facts(ctx: ApplicationContext, session: Any, planned: Any, values: dict[
     facts["missing"], facts["person"] = browser_actions.read_required(session, ctx.run_async, current, values,
                                                                       observation)
     uploaded = {}
-    for field_ in {f.id: f for f in [*planned.fields, *current.fields]}.values():  # a grown page's file inputs too
+    # A grown page's file inputs too: those on the page now, and the stored ones (`extra`, application._plan_grown)
+    # whose input the board replaced with the uploaded file's name (element_for finds them through `attached`).
+    for field_ in {f.id: f for f in [*planned.fields, *(extra or []), *current.fields]}.values():
         element = browser_actions.element_for(field_, observation) if field_.kind == "file" else None
         if element is not None:
             read = ctx.run_async(session.call("read", key=element["key"]))
@@ -1191,7 +1200,8 @@ def _submit_browser_use(ctx: ApplicationContext, state: ApplicationState, job: A
                     entries[fid] = {**(entries.get(fid) or {}), "status": "PERSON", "source": "person_in_window"}
                 _record(db, ctx, _key(state, SUBMIT, f":a{attempt}:person"), task, "FILLING",
                         plan={**(task.plan or {}), "fields": entries})
-        facts = _bu_facts(ctx, session, form, values)
+        extra = [ats_forms.FormField.model_validate(f) for f in plan.get("extra_fields") or []]
+        facts = _bu_facts(ctx, session, form, values, extra)
         with _session(ctx) as db:
             task, job_row = _load(db, state)
             checked = PreSubmitValidator.check(db, task, job_row, form=form, page=facts, files=files,
@@ -1221,7 +1231,7 @@ def _submit_browser_use(ctx: ApplicationContext, state: ApplicationState, job: A
                 return _end_guarded(db, ctx, state, task, "BLOCKED", armed.status, BLOCKED)
             intent_id, claim_id = armed.intent.id, armed.claim.id
         _hold(ctx, "armed")
-        again = _bu_facts(ctx, session, form, values)  # the page, again, immediately before the click
+        again = _bu_facts(ctx, session, form, values, extra)  # the page, again, immediately before the click
         with _session(ctx) as db:
             task, job_row = _load(db, state)
             intent = db.get(submission.SubmissionIntent, intent_id)

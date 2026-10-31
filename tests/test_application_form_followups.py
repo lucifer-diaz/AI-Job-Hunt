@@ -173,3 +173,61 @@ def test_a_filled_window_counts_only_once_its_fields_stopped_changing(monkeypatc
     assert application_execution.settled(key, ("a", "bc"), now=36)
     assert not application_execution.settled(key, None, now=40)  # emptied again: forgotten
     application_execution._fields_seen.pop(key, None)
+
+
+# ───────────── review follow-ups ─────────────
+
+def test_the_code_search_is_never_widened_beyond_the_applications_own_sender(google, monkeypatch):
+    """An employer's own site (generic route) is searched by its domain; with no domain to name, nothing is read."""
+    user = make_user(SessionLocal)
+    _connect(user)
+    clicked = utcnow() - timedelta(minutes=1)
+    task = _waiting_run(monkeypatch, user, clicked)
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        job = db.get(Job, task.job_id)
+        job.url = "https://careers.acme.co.uk/jobs/7/apply"
+        db.commit()
+    google.add("bank", sender="Bank <alerts@bank.example>", subject="Your security code",
+               body="Your security code is 55554444", received_at=clicked + timedelta(seconds=10))
+    google.add("acme", sender="Acme Careers <no-reply@acme.co.uk>", subject="Verify",
+               body="Your verification code is 12345678", received_at=clicked + timedelta(seconds=20))
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        assert codes.sender(db.get(Job, task.job_id)) == "acme.co.uk"
+        assert codes.find_code(db, task) == {"status": codes.FOUND, "code": "12345678"}
+        assert google.fetched("bank") == 0
+        job = db.get(Job, task.job_id)
+        job.url = "http://10.0.0.7/apply"
+        db.commit()
+        before = len(google.gmail_requests())
+        assert codes.find_code(db, task)["status"] == codes.NO_SENDER
+        assert len(google.gmail_requests()) == before  # declined: Gmail is not read at all
+
+
+def test_a_grown_file_input_the_board_replaced_is_still_read_as_uploaded():
+    """A required file input that appeared after the form was read, and that the board replaced with the uploaded
+    file's name, is in neither form as read: its stored entry still reports the upload to the pre-submit checks."""
+    import asyncio
+
+    from app.agents import application
+    from app.services.ats_forms import ApplicationForm, FormField, SubmitControl
+
+    name = FormField(id="bu_n", label="Name", kind="text", role="full_name", required=True, locator="key:n")
+    grown = FormField(id="bu_f", label="Portfolio", kind="file", role="resume", required=True, locator="key:f")
+    planned = ApplicationForm(adapter="browser_use", host="x", fields=[name], submit=SubmitControl(present=True))
+
+    class Session:
+        async def call(self, cmd, **args):
+            if cmd == "observe":
+                return {"url": "https://x.example/apply", "html": "<form></form>", "title": "Apply",
+                        "elements": [{"tag": "input", "type": "text", "key": "n", "label": "Name", "required": True}],
+                        "attached": {"f": "resume.pdf"}}
+            if cmd == "read":
+                return {"files": ["resume.pdf"], "filled": True} if args["key"] == "f" else {"value": "Asha"}
+            return {}
+
+    ctx = SimpleNamespace(run_async=asyncio.run)
+    facts = application._bu_facts(ctx, Session(), planned, {"bu_n": "Asha"}, [grown])
+    assert facts["uploaded"] == {"bu_f": "resume.pdf"}
+    assert application._bu_facts(ctx, Session(), planned, {"bu_n": "Asha"})["uploaded"] == {}
