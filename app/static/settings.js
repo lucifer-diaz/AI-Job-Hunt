@@ -353,6 +353,9 @@ function automationOf(a, name) {
   const item = a.settings.find(s => s.name === name);
   return item ? automationValue(a, item) : '';
 }
+// A text setting shows its address field when its value is none of its choices, or once Custom address is picked.
+const AUTOMATION_CUSTOM = '__custom__';
+function automationCustom(item, v) { return !!S.automationCustom?.[item.name] || !item.choices.some(c => c.value === v); }
 // A key field counts as changed only when something was typed in it: its saved value is never sent back.
 function automationChanged(item, v) { return item.kind === 'secret' ? String(v).trim() !== '' : String(v) !== item.value; }
 function automationChanges(a) {
@@ -388,6 +391,13 @@ function automationControl(a, item, v) {
     const hint = item.overridden ? 'Saved · paste a new key to replace it' : item.env_set ? 'Using the key in .env · paste one to override it' : 'Paste your API key';
     return inputF('automation', item.name, v, `type="password" autocomplete="new-password" spellcheck="false" placeholder="${attr(hint)}" ${id} ${lock}`);
   }
+  // A text setting with choices (the LangSmith region): pick one, or type any other address under Custom.
+  if (item.kind === 'text' && item.choices.length) {
+    const custom = automationCustom(item, v);
+    const options = [...item.choices.map(c => [c.value, c.label]), [AUTOMATION_CUSTOM, 'Custom address']];
+    const select = `<select class="select" id="automation-${item.name}-choice" data-act-change="automation-choice" data-name="${attr(item.name)}" ${id} ${lock}>${options.map(([value, text]) => `<option value="${attr(value)}" ${value === (custom ? AUTOMATION_CUSTOM : v) ? 'selected' : ''}>${esc(text)}</option>`).join('')}</select>`;
+    return custom ? `${select}<div class="mt6">${inputF('automation', item.name, v, `spellcheck="false" autocomplete="off" placeholder="https://" aria-label="${attr(`${item.label}: custom address`)}" ${lock}`)}</div>` : select;
+  }
   if (item.choices.length) {
     const options = item.choices.map(c => [c.value, c.label]);
     if (!options.some(([value]) => value === v)) options.push([v, `${v} (custom)`]);
@@ -405,6 +415,7 @@ function automationRow(a, item) {
   const v = automationValue(a, item);
   const chosen = item.choices.find(c => c.value === v);
   const inactive = AUTOMATION_GRAPH_MODES.includes(item.name) && automationOf(a, 'agent_graphs_enabled') !== 'true';
+  const control = item.kind === 'text' && item.choices.length ? `automation-${item.name}-choice` : `automation-${item.name}`;
   const envLabel = (item.choices.find(c => c.value === item.default) || {}).label || item.default || 'empty';
   const changed = v !== item.default;
   const origin = item.kind === 'secret' ? automationSecretOrigin(a, item) : changed
@@ -412,7 +423,7 @@ function automationRow(a, item) {
     : '<span class="am-origin">Same as .env</span>';
   const warnings = automationWarnings(a, item, v);
   return `<div class="am-row${inactive ? ' am-row-inactive' : ''}" data-automation="${item.name}">
-    <div class="am-row-text"><label class="am-label" for="automation-${item.name}">${esc(item.label)}</label>
+    <div class="am-row-text"><label class="am-label" for="${control}">${esc(item.label)}</label>
       <p class="am-help" id="am-help-${item.name}">${esc(item.help)}</p>
       <div class="am-meta"><code>${esc(item.env)}</code>${origin}</div></div>
     <div class="am-row-control">${automationControl(a, item, v)}${chosen && chosen.help ? `<p class="am-choice">${esc(chosen.help)}</p>` : ''}
@@ -553,10 +564,17 @@ const SETTINGS_ACTIONS = {
     S.forms.automation = { ...(S.forms.automation || {}), ...preset.values };
     render();
   },
-  'automation-discard': () => { delete S.forms.automation; render(); },
+  'automation-discard': () => { delete S.forms.automation; delete S.automationCustom; render(); },
   'automation-reset': el => {
     const item = (D.automation?.settings || []).find(x => x.name === el.dataset.name);
-    if (item) { S.forms.automation = { ...(S.forms.automation || {}), [item.name]: item.default }; render(); }
+    if (item) { S.forms.automation = { ...(S.forms.automation || {}), [item.name]: item.default }; if (S.automationCustom) delete S.automationCustom[item.name]; render(); }
+  },
+  // A region sets the address; Custom address keeps the current one in a field to edit.
+  'automation-choice': el => {
+    const name = el.dataset.name, custom = el.value === AUTOMATION_CUSTOM;
+    S.automationCustom = { ...(S.automationCustom || {}), [name]: custom };
+    if (!custom) S.forms.automation = { ...(S.forms.automation || {}), [name]: el.value };
+    render();
   },
   // An empty value removes the saved key at once; the key itself is never in the page.
   'automation-clear-secret': el => busy('automation', async () => {
@@ -567,7 +585,7 @@ const SETTINGS_ACTIONS = {
     const byName = Object.fromEntries((D.automation?.settings || []).map(s => [s.name, s]));
     const values = Object.fromEntries(Object.entries(S.forms.automation || {}).filter(([k, v]) => byName[k] && automationChanged(byName[k], v)).map(([k, v]) => [k, byName[k].kind === 'secret' ? String(v).trim() : v]));
     D.automation = await api('/api/settings/automation', { method: 'PUT', body: { values } });
-    delete S.forms.automation;
+    delete S.forms.automation; delete S.automationCustom;
   }, 'Saved: in effect now'),
   'applying-consent': el => busy('applying', async () => {
     const text = document.getElementById('applying-attest')?.value || '';

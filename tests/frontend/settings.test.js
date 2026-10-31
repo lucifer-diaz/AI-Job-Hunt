@@ -915,6 +915,30 @@ describe('AI agents & automation', () => {
     expect(put()[1]).toEqual({ values: { agent_langsmith_api_key: '' } });
   });
 
+  it('picks a LangSmith region from a list, or types another address under Custom address', async () => {
+    const regions = [choice('https://api.smith.langchain.com', 'US'), choice('https://eu.api.smith.langchain.com', 'EU'), choice('https://apac.api.smith.langchain.com', 'APAC')];
+    const withRegion = (value = 'https://api.smith.langchain.com') => { const a = automation(); a.settings.push({ name: 'agent_langsmith_endpoint', env: 'AGENT_LANGSMITH_ENDPOINT', group: 'retention', label: 'LangSmith region', help: '', kind: 'text', needs: null, min: 0, max: 0, choices: regions, value, default: 'https://api.smith.langchain.com', overridden: false }); return a; };
+    ui.D.automation = withRegion();
+    section('automation');
+    const row = () => view().querySelector('[data-automation="agent_langsmith_endpoint"]');
+    expect(row().querySelector('label').getAttribute('for')).toBe('automation-agent_langsmith_endpoint-choice');
+    expect(row().querySelector('select').value).toBe('https://api.smith.langchain.com');
+    expect(row().querySelector('input')).toBeNull();
+    await ui.A['automation-choice']({ dataset: { name: 'agent_langsmith_endpoint' }, value: 'https://apac.api.smith.langchain.com' });
+    expect(row().querySelector('select').value).toBe('https://apac.api.smith.langchain.com');
+    expect(row().querySelector('.am-choice').textContent).toBe('APAC means this');
+    await ui.A['automation-choice']({ dataset: { name: 'agent_langsmith_endpoint' }, value: '__custom__' });
+    expect(row().querySelector('#automation-agent_langsmith_endpoint').value).toBe('https://apac.api.smith.langchain.com');
+    ui.S.forms.automation.agent_langsmith_endpoint = 'https://langsmith.example.com';
+    fetchMock.mockImplementation(async () => response(withRegion('https://langsmith.example.com')));
+    await ui.A['automation-save']();
+    const [, options] = fetchMock.mock.calls.find(([url, o]) => url === '/api/settings/automation' && o?.method === 'PUT');
+    expect(JSON.parse(options.body)).toEqual({ values: { agent_langsmith_endpoint: 'https://langsmith.example.com' } });
+    section('automation');
+    expect(row().querySelector('select').value).toBe('__custom__');  // a saved address that is no region
+    expect(row().querySelector('#automation-agent_langsmith_endpoint').value).toBe('https://langsmith.example.com');
+  });
+
   it('is read-only for someone who is not an admin', () => {
     ui.D.automation = automation(false);
     section('automation');
