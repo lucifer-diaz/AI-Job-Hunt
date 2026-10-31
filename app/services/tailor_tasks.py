@@ -57,7 +57,8 @@ STAGE_PROGRESS = {
     "review": {"queued": 0, "ranking": 0, "tailoring": 0, "reviewing": 10, "done": 100},
 }
 # jobs.auto_tailor_status (app.services.auto_tailor): automatic tailoring queued the job, or the person cancelled it.
-AUTO_QUEUED, DECLINED = "QUEUED", "DECLINED"
+# RESUME_CHANGED: the person moved a tailored job to another resume, so its packet is re-tailored once it is ranked again.
+AUTO_QUEUED, DECLINED, RESUME_CHANGED = "QUEUED", "DECLINED", "RESUME"
 DESKTOP_MODE_REASON ="Claude Desktop mode: tailor and review this job from Claude Desktop"
 # Finished tasks stay on the Tailor screen this long unless cleared.
 RECENT = timedelta(hours=24)

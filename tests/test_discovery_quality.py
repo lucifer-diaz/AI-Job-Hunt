@@ -767,3 +767,39 @@ def test_a_job_matched_before_its_resume_was_tagged_is_offered_a_rematch(user, r
         db.commit()
     detail = client.get(f"/api/jobs/{job_id}").json()["resume_in_use"]
     assert detail["id"] == ml and detail["rematch"] == {"resume": None, "reason": "no resume matches clearly now"}
+
+
+def test_rematch_takes_only_the_jobs_the_filters_select(user, resumes, client):
+    from datetime import timedelta
+
+    from app.models import now
+    from app.services import resume_matching
+
+    _, ml = resumes
+    fresh, old, archived, other_board = (add(user, "Staff Software Engineer") for _ in range(4))
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        db.execute(update(Job).where(Job.id.in_([fresh, old, archived, other_board]))
+                   .values(source_board="greenhouse", status="shortlisted"))
+        db.execute(update(Job).where(Job.id == old).values(discovered_at=now() - timedelta(days=60)))
+        db.execute(update(Job).where(Job.id == archived).values(status="archived"))
+        db.execute(update(Job).where(Job.id == other_board).values(source_board="lever"))
+        resume_matching.set_tags(db.get(Resume, ml), [{"domain": "Backend", "roles": ["Staff Software Engineer"]}])
+        db.commit()
+
+    def plan(**filters):
+        return client.post("/api/jobs/resume/rematch?dry_run=true", json=filters).json()
+
+    everything = plan()
+    assert everything["changing"] == 3, "archived jobs are left out unless asked for"
+    assert everything["into"] == [{"resume": "ML resume · v2", "jobs": 3}]
+    assert {"name": "greenhouse", "jobs": 3} in everything["options"]["boards"]
+    assert plan(stages=["ranked", "archived"])["changing"] == 4
+    assert plan(stages=["tailored"])["changing"] == 0
+    assert plan(found_within_days=30)["changing"] == 2
+    assert plan(board="lever")["changing"] == 1
+    assert client.post("/api/jobs/resume/rematch?dry_run=true").json()["changing"] == 3, "no body: the defaults"
+
+    out = client.post("/api/jobs/resume/rematch", json={"found_within_days": 30, "board": "greenhouse"}).json()
+    assert out["changed"] == [fresh]
+    assert job_of(fresh).resume_id == ml and job_of(old).resume_id is None and job_of(archived).resume_id is None

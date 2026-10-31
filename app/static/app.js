@@ -2446,16 +2446,10 @@ const A = {
     D.resumeData = await api(rdResumeUrl()).catch(() => D.resumeData);  // the resume being reviewed stays open
     const plan = await api('/api/jobs/resume/rematch?dry_run=true', { method: 'POST' }).catch(() => null);
     return { ...out, changing: plan?.changing || 0 };
-  }, out => out.changing ? `Tags saved — ${out.changing} existing job${out.changing === 1 ? '' : 's'} would now use another resume: use Re-match existing jobs` : 'Tags saved — new jobs are matched with them'),
-  'resume-rematch': () => busy('resumeRematch', async () => {
-    const plan = await api('/api/jobs/resume/rematch?dry_run=true', { method: 'POST' });
-    if (!plan.changing) return { ...plan, skipped: true };
-    if (!confirm(`${plan.changing} of ${plan.jobs} job${plan.jobs === 1 ? '' : 's'} would switch resume${plan.reranked ? `, and ${plan.reranked} ranked job${plan.reranked === 1 ? '' : 's'} would be ranked again (model calls)` : ''}. Pinned choices are not touched. Continue?`)) return { cancelled: true };
-    return api('/api/jobs/resume/rematch', { method: 'POST' });
-  }, out => out.cancelled ? '' : out.skipped ? 'Every job already has its best-matching resume' : `${out.changing} job${out.changing === 1 ? '' : 's'} re-matched · ${out.reranked} queued for ranking`),
+  }, out => out.changing ? `Tags saved — ${out.changing} existing job${out.changing === 1 ? '' : 's'} would now use another resume: use Re-match jobs to resume tags` : 'Tags saved — new jobs are matched with them'),
   'job-rematch': el => busy('rematch' + el.dataset.id, async () => {
     const ranked = D.jobModal?.id === Number(el.dataset.id) && D.jobModal.fit != null;
-    if (ranked && !confirm('This job will be ranked again with the resume its tags match now (model calls), and a tailored packet will need regenerating. Continue?')) return { cancelled: true };
+    if (ranked && !confirm('This job will be ranked again with the resume its tags match now (model calls). A tailored packet is tailored again from it when automatic tailoring is on, otherwise it waits for you to regenerate it. Continue?')) return { cancelled: true };
     const out = await api(`/api/jobs/${el.dataset.id}/resume`, { method: 'PUT', body: { mode: 'auto' } });
     if (S.jobOpen) D.jobModal = await api(`/api/jobs/${S.jobOpen}`).catch(() => D.jobModal);
     await load();

@@ -98,8 +98,10 @@ def setup_jobs(db: Session, setup: SavedSearch) -> list[Job]:
 
 def repoint_jobs(db: Session, jobs: list[Job], assign: Callable[[Job], None], actor: str) -> dict[str, Any]:
     """Apply a resume choice to jobs (`assign` sets resume_id / resume_choice). A job whose resume changed is ranked
-    again with it, and a tailored packet needs re-tailoring. Does not commit."""
+    again with it, and a tailored packet needs re-tailoring: automatic tailoring re-tailors it once the new ranking
+    qualifies it (`tailor_tasks.RESUME_CHANGED`), when the account has it on. Does not commit."""
     from app.services import ranker
+    from app.services.tailor_tasks import RESUME_CHANGED
     from app.services.workflow import NEEDS_RETAILOR
 
     changed, requeued, skipped = [], [], []
@@ -110,12 +112,17 @@ def repoint_jobs(db: Session, jobs: list[Job], assign: Callable[[Job], None], ac
         if job.resume_id == before:
             continue
         changed.append(job.id)
-        if job.status in ("tailored", "pending_approval"):
+        had_packet = job.status in ("tailored", "pending_approval")
+        if had_packet:
             job.status = NEEDS_RETAILOR
         if job.fit_score is not None or job.state in (ranker.S.RANKED, ranker.S.QUALIFIED, ranker.S.RANK_PENDING):
             policy = policy or ranker.policy_for(db, job.user_id)
             why = ranker.queue_job(db, job, policy=policy, actor=actor, reason="resume_changed", force=True)
             (skipped.append({"id": job.id, "reason": why}) if why else requeued.append(job.id))
+            if had_packet and not why:
+                # The person changed the resume: a new request, even if they once cancelled this job's tailoring. Only
+                # with a ranking queued, so the packet is never re-tailored from the old resume's analysis.
+                job.auto_tailor_status = RESUME_CHANGED
     return {"changed": changed, "ranking_queued": requeued, "ranking_skipped": skipped}
 
 

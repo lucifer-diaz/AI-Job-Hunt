@@ -227,3 +227,97 @@ def test_auto_tailor_for_tolerates_bad_saved_values(monkeypatch):
                                                            "enabled_at": "2026-09-28T10:00:00"}}})()
     monkeypatch.setattr(us, "settings_for", lambda db, user_id=None: row)
     assert auto_tailor_for(None) == {"enabled": True, "min_fit_score": None, "enabled_at": "2026-09-28T10:00:00"}
+
+
+# ───────────── a packet whose resume the person changed ─────────────
+
+def _another_resume(sessions, user_id):
+    from app.models import CandidateProfile, Resume
+
+    with sessions() as db:
+        profile = db.scalar(select(CandidateProfile).where(CandidateProfile.user_id == user_id))
+        resume = Resume(user_id=user_id, candidate_profile_id=profile.id, name="AI Engineer", version=9,
+                        raw_text=f"AI Engineer. {profile.master_resume}", raw_text_hash="h9", roles=[], is_active=False)
+        db.add(resume)
+        db.commit()
+        return resume.id
+
+
+def _tailored_then_moved(sessions, owner, *, cancelled=False):
+    """A job auto-tailored once (or whose tailoring the person cancelled), then pointed at another resume."""
+    from app.services import discovery
+
+    job_id, = add_jobs(sessions, 1, owner)
+    rank(sessions)
+    with as_owner(sessions, owner) as db:
+        if cancelled:
+            tailor_tasks.cancel_queued(db)
+        else:
+            db.execute(update(TailorTask).where(TailorTask.job_id == job_id).values(status="succeeded", stage="done"))
+        db.execute(update(Job).where(Job.id == job_id).values(status="tailored"))
+        db.commit()
+    other = _another_resume(sessions, owner)
+    with as_owner(sessions, owner) as db:
+        job = db.get(Job, job_id)
+        out = discovery.repoint_jobs(db, [job], lambda j: setattr(j, "resume_id", other), actor="user:test")
+        db.commit()
+        assert out["ranking_queued"] == [job_id]
+        assert (job.status, job.auto_tailor_status) == ("needs_retailor", tailor_tasks.RESUME_CHANGED)
+    return job_id
+
+
+def active_tailor_tasks(sessions, job_id):
+    return [t for t in tailor_tasks_of(sessions, job_id) if t.status in tailor_tasks.ACTIVE]
+
+
+def test_a_packet_moved_to_another_resume_is_tailored_again_once_it_is_ranked(pg_sessions, owner, model):
+    turn_on(pg_sessions, owner)
+    job_id = _tailored_then_moved(pg_sessions, owner)
+    assert sweep_count(pg_sessions, owner) == 0, "never from the old resume's analysis: it waits for the new ranking"
+    assert active_tailor_tasks(pg_sessions, job_id) == []
+    assert rank(pg_sessions)["qualified"] == 1
+    task, = active_tailor_tasks(pg_sessions, job_id)
+    assert (task.status, task.mode) == ("queued", "tailor")
+    with as_owner(pg_sessions, owner) as db:
+        assert db.get(Job, job_id).auto_tailor_status == tailor_tasks.AUTO_QUEUED
+    assert sweep_count(pg_sessions, owner) == 0, "queued once"
+
+
+def test_changing_the_resume_is_a_new_request_even_after_a_cancelled_tailoring(pg_sessions, owner, model):
+    turn_on(pg_sessions, owner)
+    job_id = _tailored_then_moved(pg_sessions, owner, cancelled=True)
+    rank(pg_sessions)
+    assert len(active_tailor_tasks(pg_sessions, job_id)) == 1
+
+
+def test_a_moved_packet_waits_for_the_person_when_automatic_tailoring_is_off(pg_sessions, owner, model):
+    turn_on(pg_sessions, owner)
+    job_id = _tailored_then_moved(pg_sessions, owner)
+    with as_owner(pg_sessions, owner) as db:
+        row = settings_for(db, owner)
+        row.preferences = {**row.preferences, "auto_tailor": {**row.preferences["auto_tailor"], "enabled": False}}
+        db.commit()
+    rank(pg_sessions)
+    assert active_tailor_tasks(pg_sessions, job_id) == []
+    with as_owner(pg_sessions, owner) as db:
+        assert db.get(Job, job_id).status == "needs_retailor"
+
+
+def test_a_moved_packet_that_ranks_below_the_automatic_fit_score_waits(pg_sessions, owner, model):
+    turn_on(pg_sessions, owner, min_fit_score=80)
+    job_id, = add_jobs(pg_sessions, 1, owner)
+    model.answer(job_id, {"overall_fit_score": 85})
+    rank(pg_sessions)
+    from app.services import discovery
+
+    with as_owner(pg_sessions, owner) as db:
+        db.execute(update(TailorTask).where(TailorTask.job_id == job_id).values(status="succeeded", stage="done"))
+        db.execute(update(Job).where(Job.id == job_id).values(status="tailored"))
+        db.commit()
+    other = _another_resume(pg_sessions, owner)
+    with as_owner(pg_sessions, owner) as db:
+        discovery.repoint_jobs(db, [db.get(Job, job_id)], lambda j: setattr(j, "resume_id", other), actor="user:test")
+        db.commit()
+    model.answer(job_id, {"overall_fit_score": 75})
+    rank(pg_sessions)
+    assert active_tailor_tasks(pg_sessions, job_id) == []

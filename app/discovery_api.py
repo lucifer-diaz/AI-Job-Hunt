@@ -5,15 +5,17 @@ Nothing here calls a model. Hidden jobs are listed by GET /api/jobs/search?domai
 from __future__ import annotations
 
 import copy
+from datetime import timedelta
 from typing import Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.auth import get_user_db
-from app.models import Job, Resume
+from app.models import Job, Resume, SavedSearch, SearchRun
+from app.models import now as utcnow
 from app.scheduler_hooks import run_soon
 from app.services import discovery, domain_match, feedback_learning, resume_matching
 from app.services.user_settings import lock_settings_row, settings_for
@@ -39,6 +41,19 @@ class LearnedIn(BaseModel):
 
 class IdsIn(BaseModel):
     ids: list[int] = Field(min_length=1, max_length=5000)
+
+
+# Re-match filters: the stages a person picks from, each the job statuses it covers (approved and applied never move).
+REMATCH_STAGES = {"new": ("discovered",), "ranked": ("shortlisted", "maybe"),
+                  "tailored": ("tailored", "needs_retailor", "pending_approval"), "archived": ("archived", "dismissed")}
+REMATCH_DEFAULT_STAGES = ("new", "ranked", "tailored")
+
+
+class RematchIn(BaseModel):
+    stages: list[Literal["new", "ranked", "tailored", "archived"]] | None = None  # None: every stage but archived
+    found_within_days: int | None = Field(default=None, ge=1, le=3650)
+    saved_search_id: int | None = None
+    board: str | None = Field(default=None, max_length=50)
 
 
 class RenameIn(BaseModel):
@@ -243,21 +258,56 @@ def bulk_resume(payload: BulkResumeIn, request: Request, background: BackgroundT
     return out
 
 
+def _rematch_jobs(db: Session, payload: RematchIn) -> list[Job]:
+    """Jobs re-matching may move: matched automatically or never chosen, not approved or applied, not hidden, and
+    within the person's filters."""
+    stages = payload.stages if payload.stages is not None else REMATCH_DEFAULT_STAGES
+    statuses = [status for stage in stages for status in REMATCH_STAGES[stage]]
+    query = select(Job).where(Job.resume_choice.is_(None) | (Job.resume_choice == resume_matching.AUTO),
+                              Job.status.in_(statuses),
+                              Job.domain_match.is_distinct_from(domain_match.NOT_MATCHING))
+    if payload.found_within_days is not None:
+        query = query.where(Job.discovered_at >= utcnow() - timedelta(days=payload.found_within_days))
+    if payload.saved_search_id is not None:
+        query = query.where(Job.search_run_id.in_(select(SearchRun.id)
+                                                  .where(SearchRun.saved_search_id == payload.saved_search_id)))
+    if payload.board:
+        query = query.where(Job.source_board == payload.board)
+    return list(db.scalars(query).all())
+
+
+def _rematch_options(db: Session) -> dict:
+    """What the filters offer: the account's setups and the boards its jobs came from, with how many jobs each has."""
+    setups = db.execute(select(SavedSearch.id, SavedSearch.name).order_by(SavedSearch.name)).all()
+    boards = db.execute(select(Job.source_board, func.count()).where(Job.source_board.is_not(None))
+                        .group_by(Job.source_board).order_by(func.count().desc())).all()
+    return {"stages": [{"id": stage, "default": stage in REMATCH_DEFAULT_STAGES} for stage in REMATCH_STAGES],
+            "setups": [{"id": i, "name": name} for i, name in setups],
+            "boards": [{"name": name, "jobs": n} for name, n in boards]}
+
+
 @router.post("/api/jobs/resume/rematch")
-def rematch(request: Request, background: BackgroundTasks, dry_run: bool = False,
+def rematch(request: Request, background: BackgroundTasks, dry_run: bool = False, payload: RematchIn | None = None,
             db: Session = Depends(get_user_db)):
-    """Match every job that has no pinned resume to the best-tagged resume again (after tagging resumes). Jobs whose
-    resume changes and were ranked are ranked again, so `dry_run` first says how many that is."""
-    jobs = list(db.scalars(select(Job).where(Job.resume_choice.is_(None) | (Job.resume_choice == resume_matching.AUTO),
-                                             Job.status.not_in(("approved", "applied")),
-                                             Job.domain_match.is_distinct_from(domain_match.NOT_MATCHING))).all())
+    """Match the jobs that have no pinned resume to the best-tagged resume again (after tagging resumes), within the
+    optional filters (stage, found within N days, search setup, board). Jobs whose resume changes and were ranked are
+    ranked again, so `dry_run` first says how many that is, and which resume they would move to."""
+    jobs = _rematch_jobs(db, payload or RematchIn())
     resumes = resume_matching.tagged_resumes(db, _user(db))
     moves = [(job, (match.resume_id if (match := resume_matching.pick(resumes, job)) else None)) for job in jobs]
     moving = [job for job, target in moves if target != job.resume_id]
     reranked = sum(1 for job in moving if job.fit_score is not None)
     if dry_run:
+        names = {r.id: f"{r.name or 'Version'} · v{r.version}" for r in resumes}
+        into: dict[str, int] = {}
+        for job, target in moves:
+            if target != job.resume_id:
+                key = names.get(target, "the active resume")
+                into[key] = into.get(key, 0) + 1
         db.rollback()
-        return {"jobs": len(jobs), "changing": len(moving), "reranked": reranked}
+        return {"jobs": len(jobs), "changing": len(moving), "reranked": reranked,
+                "into": [{"resume": k, "jobs": n} for k, n in sorted(into.items(), key=lambda kv: -kv[1])],
+                "options": _rematch_options(db)}
     out = _set_resume(db, moving, "auto", None)
     run_soon(background, request.app, "ranking")
     return {"jobs": len(jobs), "changing": len(moving), "reranked": len(out["ranking_queued"]), **out}

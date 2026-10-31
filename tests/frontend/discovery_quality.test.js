@@ -122,6 +122,57 @@ describe('a job matched before its resume was tagged', () => {
   });
 });
 
+describe('Settings → Resumes: re-matching jobs to the tags', () => {
+  const tagged = [{ id: 1, domains: [{ domain: 'Backend', roles: ['Staff Software Engineer'] }] }];
+  const plan = { jobs: 40, changing: 3, reranked: 2, into: [{ resume: 'Rohan_Roy_AI_Engineer.pdf · v9', jobs: 3 }],
+    options: { stages: [], setups: [{ id: 4, name: 'AI Engineer Europe' }], boards: [{ name: 'greenhouse', jobs: 12 }] } };
+  const posts = () => fetchMock.mock.calls.filter(([url]) => url.startsWith('/api/jobs/resume/rematch'));
+  beforeEach(() => {
+    runInContext('RD.rematch = null', context);
+    fetchMock.mockImplementation(async url => response(url.startsWith('/api/jobs/resume/rematch') ? plan : {}));
+  });
+
+  it('offers the button above the list once a resume is tagged', () => {
+    expect(context.rdRematchBar([{ id: 1, roles: [] }])).toBe('');
+    expect(context.rdRematchBar(tagged)).toContain('data-act="resume-rematch"');
+  });
+
+  it('opens the filters, counts the selected jobs and narrows them by stage, date, search and board', async () => {
+    await ui.A['resume-rematch']();
+    let [url, opts] = posts().at(-1);
+    expect(url).toBe('/api/jobs/resume/rematch?dry_run=true');
+    expect(JSON.parse(opts.body)).toEqual({ stages: ['new', 'ranked', 'tailored'], found_within_days: null, saved_search_id: null, board: null });
+    const html = context.rdRematchBar(tagged);
+    expect(html).toContain('<b>40</b> jobs selected');
+    expect(html).toContain('3 → Rohan_Roy_AI_Engineer.pdf · v9');
+    expect(html).toContain('Re-match 3 jobs');
+    expect(html).toContain('AI Engineer Europe');
+    expect(html).toContain('greenhouse (12)');
+
+    await ui.A['rm-stage']({ value: 'archived', checked: true });
+    await ui.A['rm-stage']({ value: 'new', checked: false });
+    await ui.A['rm-filter']({ dataset: { key: 'found' }, value: '30' });
+    await ui.A['rm-filter']({ dataset: { key: 'setup' }, value: '4' });
+    await ui.A['rm-filter']({ dataset: { key: 'board' }, value: 'greenhouse' });
+    [, opts] = posts().at(-1);
+    expect(JSON.parse(opts.body)).toEqual({ stages: ['ranked', 'tailored', 'archived'], found_within_days: 30, saved_search_id: 4, board: 'greenhouse' });
+  });
+
+  it('re-matches only the selected jobs, after asking', async () => {
+    await ui.A['resume-rematch']();
+    await ui.A['rm-filter']({ dataset: { key: 'found' }, value: '7' });
+    vi.stubGlobal('confirm', vi.fn(() => false)); context.confirm = confirm;
+    await ui.A['rm-run']();
+    expect(posts().some(([url]) => url === '/api/jobs/resume/rematch')).toBe(false);
+    vi.stubGlobal('confirm', vi.fn(() => true)); context.confirm = confirm;
+    await ui.A['rm-run']();
+    const run = posts().find(([url]) => url === '/api/jobs/resume/rematch');
+    expect(JSON.parse(run[1].body).found_within_days).toBe(7);
+    ui.A['rm-close']();
+    expect(runInContext('RD.rematch', context)).toBe(null);
+  });
+});
+
 describe('hidden jobs', () => {
   it('keeps one job or the selection', async () => {
     await ui.A['domain-keep']({ dataset: { id: '7' } });

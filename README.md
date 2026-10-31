@@ -1188,6 +1188,11 @@ Claude Desktop mode nothing is queued. A job has at most one queued or running t
 happens right after the ranking is saved and never changes it; the `auto_tailor` scheduler job
 (`AUTO_TAILOR_INTERVAL_MINUTES=5`) queues any qualified job that step missed.
 
+One more job is queued: a tailored packet you moved to another resume (Re-match, **Resume used**, a setup's resume).
+Moving it is a new request, even if you once cancelled its tailoring: it is ranked again with the new resume, and once
+that ranking qualifies it (at the fit score above) it is tailored and reviewed again from that resume, then goes on to
+approval like any packet. With automatic tailoring off it waits in the Tailor queue for **Regenerate**.
+
 The Discovery → Ranking tracker shows the effect: every waiting job has a progress bar, its place in the queue
 and, once the account has finished some rankings, an estimate of when it will start. The estimate comes from the
 median duration of that account's recent rankings; before anything has been measured it is left blank rather
