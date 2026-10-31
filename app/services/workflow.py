@@ -471,8 +471,10 @@ def store_review(db: Session, resume: ResumeVariant, notes: dict, *, commit: boo
         db.commit()
 
 
-def approve_job(db: Session, job: Job, *, override: bool = False, note: str = "") -> Application:
-    """Approve the latest reviewed packet. `override` records that the reviewer minimum was waived for it."""
+def approve_job(db: Session, job: Job, *, override: bool = False, note: str = "", by_person: bool = False) -> Application:
+    """Approve the latest reviewed packet. `override` records that the reviewer minimum was waived for it.
+    `by_person`: the candidate approved it on a screen, which may overrule the ranking policy's archive
+    (approval.path_to_ready); automatic approvals never pass it."""
     from app.services import approval
 
     latest = db.scalar(select(ResumeVariant).where(ResumeVariant.job_id == job.id)
@@ -481,7 +483,7 @@ def approve_job(db: Session, job: Job, *, override: bool = False, note: str = ""
         raise ValueError("The latest resume must be reviewed before approval")
     # The canonical state goes to READY_TO_APPLY through validated transitions, or the approval is refused before
     # anything is written (approval.ApprovalRefused).
-    approval.reconcile_to_ready(db, job, latest)
+    approval.reconcile_to_ready(db, job, latest, by_person=by_person)
     application = job.application
     if not application:
         application = Application(job_id=job.id)

@@ -12,7 +12,10 @@ Rules:
     "approved" again.
   * The job's canonical state moves only through `work_queue.transition`, and only through stages a stored fact
     backs: a saved tailored version is TAILORING → TAILORED, a stored review of it is REVIEWED. A job whose state has
-    no such path (a re-rank in progress, archived, skipped, failed) is refused, and nothing is written.
+    no such path (a re-rank in progress, archived, skipped, failed) is refused, and nothing is written. The one
+    exception is the candidate's own approval of a job the ranking policy archived: their decision is the fact, and
+    the job is reopened to QUALIFIED by them (lifecycle.PERSON_ONLY) before the stages above. The same goes for a job
+    whose ranking they stopped (ranker.removed_by_user). No worker does that.
   * A revoked approval keeps its row (`revoked_at`, `revoked_reason`): the history of what was approved stays.
 """
 from __future__ import annotations
@@ -27,8 +30,8 @@ from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from app.models import Application, ApprovedPacket, Job, ResumeVariant, WorkflowTransition
+from app.services.lifecycle import PERSON, REOPENABLE_ARCHIVE_SOURCES, can_transition, parse_state
 from app.services.lifecycle import WorkflowState as S
-from app.services.lifecycle import can_transition, parse_state
 
 SERIALIZER_VERSION = 1
 ACTOR = "approval"
@@ -78,10 +81,14 @@ def _last_entered(db: Session, job: Job, state: S) -> datetime | None:
                      .order_by(desc(WorkflowTransition.id)).limit(1))
 
 
-def path_to_ready(db: Session, job: Job, variant: ResumeVariant) -> list[tuple[S, str]] | None:
+def path_to_ready(db: Session, job: Job, variant: ResumeVariant, *, by_person: bool = False) -> list[tuple[S, str]] | None:
     """The transitions that take the job to READY_TO_APPLY, each with the stored fact it stands for; [] when it is
-    already there; None when no such path exists."""
+    already there; None when no such path exists. `by_person`: the candidate is approving it themselves, which also
+    reopens a job the ranking policy archived, or whose ranking they stopped."""
+    from app.services.ranker import removed_by_user
+
     state = parse_state(job.state)
+    previous = parse_state(job.previous_state) if job.previous_state else None
     tailored = f"tailored version {variant.version} (resume_variants.id {variant.id}) saved " \
                f"{variant.created_at:%Y-%m-%d %H:%M}" if variant.created_at else f"tailored version {variant.version}"
     reviewed = f"review of version {variant.version} stored (score {variant.reviewer_score:g})"
@@ -99,10 +106,14 @@ def path_to_ready(db: Session, job: Job, variant: ResumeVariant) -> list[tuple[S
         steps = stages[1:]
     elif state is S.TAILORED:
         steps = stages[2:]
+    elif state is S.ARCHIVED and previous in REOPENABLE_ARCHIVE_SOURCES and by_person:
+        steps = [(S.QUALIFIED, "approved by you over the ranking policy's archive"), *stages]
+    elif state is S.SKIPPED and by_person and removed_by_user(db, job):
+        steps = [(S.QUALIFIED, "approved by you after you stopped its ranking"), *stages]
     else:
         return None
     steps = [*steps, (S.READY_TO_APPLY, f"approved: version {variant.version}")]
-    current, previous = state, parse_state(job.previous_state) if job.previous_state else None
+    current = state
     for target, _ in steps:
         if not can_transition(current, target, previous_state=previous):
             return None
@@ -110,9 +121,9 @@ def path_to_ready(db: Session, job: Job, variant: ResumeVariant) -> list[tuple[S
     return steps
 
 
-def refusal_reason(job: Job) -> str:
+def refusal_reason(db: Session, job: Job) -> str:
     """Why approval is refused, and what puts the job back (the action ranker.pipeline_status offers on its screens)."""
-    from app.services.lifecycle import REOPENABLE_ARCHIVE_SOURCES
+    from app.services.ranker import removed_by_user
 
     state = parse_state(job.state)
     previous = parse_state(job.previous_state) if job.previous_state else None
@@ -122,28 +133,34 @@ def refusal_reason(job: Job) -> str:
         return ("This job's last ranking failed, so it cannot be approved yet. Use \"Put back in ranking\" on the "
                 "job and approve it once it qualifies again")
     if state is S.ARCHIVED and previous in REOPENABLE_ARCHIVE_SOURCES:
-        return ("The ranking policy archived this job, so it cannot be approved. Use \"Rank again\" on the job "
-                "first")
+        return ("The ranking policy archived this job, so only you can approve it, on its own. Or use \"Rank again\" "
+                "on the job first")
+    if state is S.SKIPPED and removed_by_user(db, job):
+        return ("You stopped this job's ranking, so only you can approve it, on its own. Or use \"Put back in "
+                "ranking\" on the job first")
     return (f"This job's workflow state is {state.value}, which cannot move to ready-to-apply. "
             "Re-rank or restore the job first")
 
 
 def reconcile_to_ready(db: Session, job: Job, variant: ResumeVariant, *, actor: str = ACTOR,
-                       now: datetime | None = None) -> list[WorkflowTransition]:
+                       by_person: bool = False, now: datetime | None = None) -> list[WorkflowTransition]:
     """Move the job to READY_TO_APPLY through validated transitions, or raise ApprovalRefused. Does not commit.
 
     Stages the job's state has not caught up with are recorded by RECONCILE_ACTOR with the fact they stand for (the
     version and when it was saved); the last step is the approval itself."""
     from app.services.work_queue import transition
 
-    steps = path_to_ready(db, job, variant)
+    steps = path_to_ready(db, job, variant, by_person=by_person)
     if steps is None:
-        raise ApprovalRefused(refusal_reason(job))
+        raise ApprovalRefused(refusal_reason(db, job))
     now = now or utcnow()
     made = []
     for target, fact in steps:
-        who = actor if target is S.READY_TO_APPLY else RECONCILE_ACTOR
-        why = fact if target is S.READY_TO_APPLY else f"Reconciled at approval: {fact}"
+        if target is S.QUALIFIED and parse_state(job.state) in (S.ARCHIVED, S.SKIPPED):
+            who, why = PERSON, f"Reopened at approval: {fact}"
+        else:
+            who = actor if target is S.READY_TO_APPLY else RECONCILE_ACTOR
+            why = fact if target is S.READY_TO_APPLY else f"Reconciled at approval: {fact}"
         made.append(transition(db, job, target, actor=who, reason=why, now=now))
     return made
 

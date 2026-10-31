@@ -325,7 +325,10 @@ def _held(db: Session, job: Job) -> dict[str, Any] | None:
                      .order_by(desc(WorkflowTransition.id)).limit(1))
     since = last.created_at.isoformat() if last is not None and last.created_at else None
     why = redact_text(last.reason, 300) if last is not None and last.reason else None
-    blocked = state not in approval.PREPARATION_STATES
+    # A ranking archive, or a ranking the candidate stopped, does not block their own approval
+    # (approval.path_to_ready reopens it for them).
+    blocked = state not in approval.PREPARATION_STATES and not (
+        (state is S.ARCHIVED and previous in REOPENABLE_ARCHIVE_SOURCES) or removed_by_user(db, job))
     base = {"state": state.value, "previous_state": previous.value if previous else None, "since": since,
             "reason": why, "approval_blocked": blocked}
     if state is S.FAILED and previous in (S.RANK_PENDING, S.RANKING):
@@ -343,7 +346,8 @@ def _held(db: Session, job: Job) -> dict[str, Any] | None:
     if state is S.ARCHIVED and previous in REOPENABLE_ARCHIVE_SOURCES:
         return {**base, "stage": "ranking", "title": "Archived by ranking", "action": "rank",
                 "action_label": "Rank again",
-                "message": "The ranking policy archived it. Ranking it again uses your current profile and policy."}
+                "message": "The ranking policy archived it. Ranking it again uses your current profile and policy; "
+                           "approving its reviewed packet yourself overrules the archive."}
     if state is S.ARCHIVED:
         return {**base, "stage": "archived", "title": "Archived", "action": None, "action_label": None,
                 "message": "It was archived outside ranking. Restore it from Discovery to bring it back."}
@@ -351,7 +355,8 @@ def _held(db: Session, job: Job) -> dict[str, Any] | None:
         return {**base, "stage": "ranking", "title": "Taken out of ranking", "action": "rank",
                 "action_label": "Put back in ranking",
                 "message": "You (or Kill in Running workers) took it out of ranking. Putting it back runs it through "
-                           "the filters and the ranker like a new job."}
+                           "the filters and the ranker like a new job; approving its reviewed packet yourself also "
+                           "brings it back."}
     if state is S.SKIPPED:
         return {**base, "stage": "skipped", "title": "Skipped", "action": None, "action_label": None,
                 "message": "It was skipped and cannot be put back from here."}
