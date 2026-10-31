@@ -461,7 +461,11 @@ def test_provenance_drops_a_draft_that_claims_a_research_source():
     assert [q["id"] for q in out["application_questions"]] == ["f2"]
 
 
-def test_a_reviewed_answer_is_saved_to_the_library_from_the_insights_tab(owner, signed_in):
+def test_a_reviewed_answer_is_saved_to_the_library_from_the_insights_tab(owner, signed_in, monkeypatch):
+    from app.services import application_execution
+
+    woken = []
+    monkeypatch.setattr(application_execution, "wake_waiting", lambda db, uid: woken.append(uid) or 0)
     job_id = new_job(owner)
     run_insights()
     client = signed_in(owner)
@@ -479,6 +483,7 @@ def test_a_reviewed_answer_is_saved_to_the_library_from_the_insights_tab(owner, 
         item = next(q for q in out["application_form"]["from_form"] if q["id"] == qid)
         assert item["status"] == "LIBRARY" and item["kind"] == "FACT" and item["answer"] == "My own words."
         assert item["answer_source"] == f"knowledge_answer:{out['knowledge_answer_id']}"
+        assert woken == [owner], "an application run waiting for this answer is woken, as from the library"
         with SessionLocal() as db:
             row = db.get(KnowledgeAnswer, out["knowledge_answer_id"])
             assert (row.user_id, row.answer, row.verified, row.sensitive, row.source_job_id) == \

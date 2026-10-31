@@ -109,7 +109,7 @@ def save_reviewed(db: Session, insight: JobInsight, job: Job, qid: str, answer: 
     The answer is the person's own words: nothing here calls a model or keeps an unreviewed draft. A personal
     question (or one they mark sensitive) is saved sensitive: it is confirmed on each form, so its text is not shown
     on the item. An existing saved row for the same question is updated (their earlier request is answered), never
-    duplicated."""
+    duplicated. Application runs waiting for an answer are woken, as when it is answered in the library."""
     from app.services import knowledge
 
     answer = (answer or "").strip()
@@ -134,6 +134,9 @@ def save_reviewed(db: Session, insight: JobInsight, job: Job, qid: str, answer: 
     if row.source_job_id is None:
         row.source_job_id = job.id
     db.flush()
+    from app.services import application_execution
+
+    application_execution.wake_waiting(db, row.user_id)  # as in the library: a run waiting for this answer goes on
     if row.sensitive:
         saved = _item(qid, question, item.get("origin") or FORM, NEEDS_INPUT, category="PERSONAL",
                       knowledge_answer_id=row.id,
