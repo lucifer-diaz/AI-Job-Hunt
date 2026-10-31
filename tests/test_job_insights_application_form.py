@@ -459,3 +459,48 @@ def test_provenance_drops_a_draft_that_claims_a_research_source():
         {"id": "f3", "status": "NEEDS_INPUT", "kind": "UNKNOWN", "answer": "z"}]}
     out, report = provenance.enforce(sections, [])
     assert [q["id"] for q in out["application_questions"]] == ["f2"]
+
+
+def test_a_reviewed_answer_is_saved_to_the_library_from_the_insights_tab(owner, signed_in, monkeypatch):
+    from app.services import application_execution
+
+    woken = []
+    monkeypatch.setattr(application_execution, "wake_waiting", lambda db, uid: woken.append(uid) or 0)
+    job_id = new_job(owner)
+    run_insights()
+    client = signed_in(owner)
+    why, visa = "Tell us why you want to join the payments team here.", "Do you require visa sponsorship to work here?"
+    client.post(f"/api/jobs/{job_id}/insights/application-questions", json={"questions": [why, visa]})
+    run_insights()
+    try:
+        got = by_question(job_id)
+        qid = got[why]["id"]
+        url = f"/api/jobs/{job_id}/insights/application-questions/{qid}/save"
+        assert client.post(url, json={"answer": "My own words."}).status_code == 422, "reviewed must be confirmed"
+        assert client.post(url, json={"answer": "   ", "reviewed": True}).status_code == 422
+
+        out = client.post(url, json={"answer": "My own words.", "reviewed": True}).json()
+        item = next(q for q in out["application_form"]["from_form"] if q["id"] == qid)
+        assert item["status"] == "LIBRARY" and item["kind"] == "FACT" and item["answer"] == "My own words."
+        assert item["answer_source"] == f"knowledge_answer:{out['knowledge_answer_id']}"
+        assert woken == [owner], "an application run waiting for this answer is woken, as from the library"
+        with SessionLocal() as db:
+            row = db.get(KnowledgeAnswer, out["knowledge_answer_id"])
+            assert (row.user_id, row.answer, row.verified, row.sensitive, row.source_job_id) == \
+                (owner, "My own words.", True, False, job_id)
+        assert client.post(url, json={"answer": "Again", "reviewed": True}).status_code == 404, \
+            "a library answer is edited in the library"
+
+        vid = by_question(job_id)[visa]["id"]
+        out = client.post(f"/api/jobs/{job_id}/insights/application-questions/{vid}/save",
+                          json={"answer": "No", "reviewed": True}).json()
+        item = next(q for q in out["application_form"]["from_form"] if q["id"] == vid)
+        assert out["sensitive"] and item["status"] == "NEEDS_INPUT" and item["answer"] is None, \
+            "a personal answer is saved sensitive and never shown on the item"
+        other = make_user(SessionLocal)
+        assert signed_in(other).post(f"/api/jobs/{job_id}/insights/application-questions/{qid}/save",
+                                     json={"answer": "x", "reviewed": True}).status_code == 404
+    finally:
+        with SessionLocal() as db:
+            db.execute(delete(KnowledgeAnswer).where(KnowledgeAnswer.question.in_([why, visa])))
+            db.commit()

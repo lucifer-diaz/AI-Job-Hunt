@@ -52,6 +52,12 @@ class FormQuestionsIn(BaseModel):
     questions: list[str] = Field(min_length=1, max_length=application_form.MAX_FORM_QUESTIONS)
 
 
+class ReviewedAnswerIn(BaseModel):
+    answer: str = Field(min_length=1, max_length=application_form.MAX_ANSWER_CHARS)
+    sensitive: bool = False
+    reviewed: bool = False
+
+
 class InputsIn(BaseModel):
     # None leaves it as it is; "" clears the website the person entered (the posting's own is used again).
     company_website: str | None = Field(default=None, max_length=500)
@@ -185,6 +191,31 @@ def remove_form_question(job_id: int, question_id: str, db: Session = Depends(ge
         raise HTTPException(404, "Question not found")
     db.commit()
     return views.insight_view(db, job)
+
+
+@router.post("/api/jobs/{job_id}/insights/application-questions/{question_id}/save")
+def save_form_answer(job_id: int, question_id: str, payload: ReviewedAnswerIn,
+                     db: Session = Depends(get_user_db)) -> dict[str, Any]:
+    """Save a form question's answer to the Answer library as verified, straight from the Insights tab. The person
+    must say they reviewed it (`reviewed`): a draft is never saved as an answer without that."""
+    if not payload.reviewed:
+        raise HTTPException(422, "Confirm you reviewed the answer before saving it as verified")
+    job = _job(db, job_id)
+    insight = db.scalar(select(JobInsight).where(JobInsight.job_id == job.id))
+    if insight is None:
+        raise HTTPException(404, "Question not found")
+    try:
+        row = application_form.save_reviewed(db, insight, job, question_id, payload.answer, payload.sensitive)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    try:
+        db.commit()
+    except IntegrityError as exc:  # the same question saved at the same moment elsewhere
+        db.rollback()
+        raise HTTPException(409, "This question was just saved elsewhere; try again") from exc
+    return {"knowledge_answer_id": row.id, "sensitive": row.sensitive, **views.insight_view(db, job)}
 
 
 @router.get("/api/applications/{application_id}/insights")

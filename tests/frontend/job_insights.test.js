@@ -160,7 +160,34 @@ describe('job insights', () => {
     // Only pasted questions can be removed; a library answer is not offered for saving again.
     expect(div.querySelectorAll('[data-act="ins-form-remove"]').length).toBe(3);
     expect([...div.querySelectorAll('[data-act="ins-form-save"]')].map(b => b.dataset.q)).toEqual(['f2', 'f4']);
-    expect(div.querySelector('[data-act="ins-form-save"][data-q="f4"]').textContent).toBe('Save to library');
+    expect([...div.querySelectorAll('[data-act="ins-form-edit"]')].map(b => b.textContent)).toEqual(['Answer here', 'Review & save']);
+  });
+
+  it('saves a reviewed draft to the library as verified without leaving the job', async () => {
+    const draft = { id: 'f4', question: 'Describe a reliable system you built.', origin: 'PREDICTED', status: 'DRAFTED', kind: 'GENERATED', answer: 'I built reliable payment services.' };
+    const saved = insights({ application_form: { from_form: [], likely: [{ ...draft, status: 'LIBRARY', kind: 'FACT', answer: 'I built and ran reliable payment services.' }] } });
+    fetchMock.mockImplementation(async () => response(saved));
+    ui.D.knowledge = [];
+    let div = panel('form', insights({ application_form: { from_form: [], likely: [draft] } }));
+    ui.A['ins-form-edit']({ dataset: { id: '7', q: 'f4' } });
+    div.innerHTML = ui.renderJobInsights(7);
+    expect(div.querySelector('#insans7_f4-answer').value).toBe('I built reliable payment services.');
+    expect(div.querySelector('[data-act="ins-form-verify"]')).not.toBeNull();
+
+    ui.S.forms.insans7_f4 = { answer: 'I built and ran reliable payment services.' };
+    await ui.A['ins-form-verify']({ dataset: { id: '7', q: 'f4' } });
+    expect(fetchMock.mock.calls.some(([url]) => url.includes('/save')), 'not saved until the person ticks reviewed').toBe(false);
+
+    ui.S.forms.insans7_f4.reviewed = true;
+    await ui.A['ins-form-verify']({ dataset: { id: '7', q: 'f4' } });
+    const [url, opt] = fetchMock.mock.calls.find(([u]) => u.includes('/save'));
+    expect(url).toBe('/api/jobs/7/insights/application-questions/f4/save');
+    expect(JSON.parse(opt.body)).toEqual({ answer: 'I built and ran reliable payment services.', sensitive: false, reviewed: true });
+    expect(ui.S.forms.insans7_f4).toBeUndefined();
+    expect(ui.D.knowledge).toBeNull();
+    div = panel('form', ui.D.insights[7]);
+    expect(div.textContent).toContain('From your library');
+    expect(div.querySelector('[data-act="ins-form-verify"]')).toBeNull();
   });
 
   it('posts pasted form questions and opens the library editor unverified', async () => {
