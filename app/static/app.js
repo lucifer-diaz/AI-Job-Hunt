@@ -1025,7 +1025,7 @@ function renderSetup() {
         <div class="mt12" role="group" aria-labelledby="seniority-label" aria-describedby="use-seniority"><div class="xs muted mb4" id="seniority-label">Seniority</div><div class="row gap6 wrap">${(D.actors?.seniority || []).map(s => `<button type="button" class="btn sm ${seniority.includes(s) ? 'soft' : ''}" data-act="toggle-list" data-key="seniority" data-value="${s}" aria-pressed="${seniority.includes(s) ? 'true' : 'false'}">${seniority.includes(s) ? '✓ ' : ''}${s}</button>`).join('')}</div>${filterNote(catalogList, on, 'seniority')}</div>
         <div class="mt12"><label class="xs muted mb4" for="sp-exclude_keywords" style="display:block">Exclude titles or keywords</label>${tagBox(F, 'exclude_keywords', p.exclude_keywords || [], 'e.g. intern, then Enter', 20)}${filterNote(catalogList, on, 'exclude_keywords')}</div>
         <div class="row gap16 wrap mt12">${usedCheck(catalogList, on, 'remote', 'is_remote', p.is_remote, 'Remote only')}${usedCheck(catalogList, on, 'easy_apply', 'easy_apply', p.easy_apply, 'Easy Apply only')}${usedCheck(catalogList, on, 'salary_only', 'salary_only', p.salary_only, 'Salary listed only')}${usedCheck(catalogList, on, 'visa_sponsorship', 'visa_sponsorship', p.visa_sponsorship, 'Offers visa sponsorship')}${usedCheck(catalogList, on, 'skip_agencies', 'skip_agencies', p.skip_agencies, 'Skip agencies &amp; reposts')}${checkF(F, 'auto_rank', p.auto_rank, 'Auto-rank on import')}</div>
-        <label class="field strong mt12">Resume for these jobs<span class="xs muted" style="font-weight:400"> — ranking, tailoring and review of jobs this search finds use it</span>${selectF(F, 'resume_select', setupResumeValue(p), [['auto', 'Auto — best match by resume tags (default)'], ['active', 'Active resume'], ...(D.resumeChoices || []).map(r => [r.id, `${r.domain ? `${r.domain}: ` : ''}${resumeLabel(r)}`])])}</label>
+        <label class="field strong mt12">Resume for these jobs<span class="xs muted" style="font-weight:400"> — ranking, tailoring and review of jobs this search finds use it</span>${selectF(F, 'resume_select', setupResumeValue(p), [['auto', 'Auto — best match by resume tags (default)'], ['active', 'Active resume'], ...(D.resumeChoices || []).map(r => { const d = tagGroups(r.domains, r.domain, r.roles).map(g => g.domain).filter(Boolean).join(', '); return [r.id, `${d ? `${d}: ` : ''}${resumeLabel(r)}`]; })])}</label>
         <div class="helper">“Not used” means none of the actors you picked reads that setting.</div></section>
       <div class="box soft" style="padding:14px"><div class="row between wrap gap8 mb8"><span class="small b">Schedule <span class="faint" style="font-weight:400">· this setup only</span></span>
         ${kind === 'manual' ? '' : checkF(F, 'enabled', setup ? setup.enabled : true, 'Scheduled')}</div>
@@ -1771,7 +1771,7 @@ const resumeLabel = r => `${r.name}${r.roles?.length ? ` — ${r.roles.slice(0, 
 const resumeValue = (id, choice) => choice === 'ACTIVE' || (choice === 'SETUP' && id == null) ? 'active' : id == null ? 'auto' : String(id);
 function resumeOptions(choices) {
   const groups = {};
-  for (const r of choices) (groups[r.domain || 'Untagged'] ||= []).push(r);
+  for (const r of choices) (groups[tagGroups(r.domains, r.domain, r.roles).map(g => g.domain).filter(Boolean).join(', ') || 'Untagged'] ||= []).push(r);
   return Object.entries(groups).sort(([a], [b]) => (a === 'Untagged') - (b === 'Untagged') || a.localeCompare(b))
     .map(([domain, list]) => ({ domain, list }));
 }
@@ -1786,22 +1786,39 @@ function resumeSelect(kind, current, { id = '', placeholder = '', disabled = fal
   return `<select class="select" style="margin:0;${size};min-width:0;max-width:100%;padding:6px 8px;text-overflow:ellipsis" data-resume-choice="${kind}" data-id="${attr(id)}" aria-label="Resume" ${disabled ? 'disabled' : ''}>${placeholder ? opt('', placeholder) : ''}${opt('auto', 'Auto — best match by tags')}${opt('active', 'Active resume')}${groups}</select>`;
 }
 
-// Tagging a resume with its domain and the roles it targets. A library file and its version share one set of tags.
-function resumeTags(kind, id, domain, roles = []) {
+// Tagging a resume with its domains, each with the roles it targets. A library file and its version share one set of
+// tags. The editor keeps group i in S.forms.rtag as domain_i / roles_i; `groups` lists the indexes still shown.
+const tagGroups = (domains, domain, roles = []) => domains?.length ? domains : (domain || roles.length ? [{ domain, roles }] : []);
+function resumeTags(kind, id, domain, roles = [], domains = null) {
   if (S.tagEdit === `${kind}:${id}`) return resumeTagEditor(kind, id);
-  const has = domain || roles.length;
-  return `<div class="row wrap gap6 mt6" style="align-items:center">${domain ? pill(domain, 'brand') : ''}${roles.map(r => pill(r, 'plain')).join('')}${btn(has ? 'Edit tags' : 'Tag domain &amp; roles', 'rtag-edit', { kind, id, domain: domain || '', roles: JSON.stringify(roles) }, 'sm ghost')}</div>`;
+  const groups = tagGroups(domains, domain, roles);
+  const shown = groups.map(g => `${g.domain ? pill(g.domain, 'brand') : ''}${(g.roles || []).map(r => pill(r, 'plain')).join('')}`)
+    .join('<span class="faint" aria-hidden="true">·</span>');
+  return `<div class="row wrap gap6 mt6" style="align-items:center">${shown}${btn(groups.length ? 'Edit tags' : 'Tag domains &amp; roles', 'rtag-edit', { kind, id, groups: JSON.stringify(groups) }, 'sm ghost')}</div>`;
 }
-function resumeTagEditor(kind, id) {
-  const catalog = D.resumeCatalog || [], domain = String(fv('rtag', 'domain', '') || ''), roles = fv('rtag', 'roles', []);
+function resumeTagGroup(index, catalog, removable) {
+  const domain = String(fv('rtag', `domain_${index}`, '') || ''), roles = fv('rtag', `roles_${index}`, []);
   const known = catalog.find(c => c.domain.toLowerCase() === domain.trim().toLowerCase());
   const suggestions = (known ? known.roles : []).filter(r => !roles.includes(r));
+  return `<div class="col gap8" data-rtag-group="${index}">
+    <div class="row gap8" style="align-items:flex-end"><label class="field" style="flex:1;margin:0"><span class="xs muted">Domain</span>${inputF('rtag', `domain_${index}`, domain, 'list="resume-domain-list" placeholder="e.g. Backend, Product" maxlength="80"')}</label>${removable ? btn('Remove domain', 'rtag-remove-group', { index }, 'sm ghost') : ''}</div>
+    <div><div class="xs muted mb4">Roles for this domain</div>${tagBox('rtag', `roles_${index}`, roles, 'Add a role, e.g. Lead Engineer…', 30)}</div>
+    ${suggestions.length ? `<div class="row wrap gap6">${suggestions.map(r => btn(`+ ${esc(r)}`, 'rtag-add', { role: r, index }, 'sm ghost')).join('')}</div>` : domain ? '' : `<div class="xs muted">Pick a domain to see suggested roles: ${catalog.map(c => esc(c.domain)).join(' · ')}</div>`}</div>`;
+}
+function resumeTagEditor(kind, id) {
+  const catalog = D.resumeCatalog || [], groups = S.forms.rtag?.groups || [0];
   return `<div class="box mt8 col gap10" data-rtag-editor style="max-width:620px">
-    <label class="field"><span class="xs muted">Domain</span>${inputF('rtag', 'domain', domain, 'list="resume-domain-list" placeholder="e.g. Backend, Product" maxlength="80"')}<datalist id="resume-domain-list">${catalog.map(c => `<option value="${attr(c.domain)}"></option>`).join('')}</datalist></label>
-    <div><div class="xs muted mb4">Roles this resume targets</div>${tagBox('rtag', 'roles', roles, 'Add a role, e.g. Lead Engineer…', 30)}</div>
-    ${suggestions.length ? `<div class="row wrap gap6">${suggestions.map(r => btn(`+ ${esc(r)}`, 'rtag-add', { role: r }, 'sm ghost')).join('')}</div>` : domain ? '' : `<div class="xs muted">Pick a domain to see suggested roles: ${catalog.map(c => esc(c.domain)).join(' · ')}</div>`}
-    <div class="xs faint">New jobs are matched to the resume whose roles their title names (then the domain). Pinned choices are never changed.</div>
+    <datalist id="resume-domain-list">${catalog.map(c => `<option value="${attr(c.domain)}"></option>`).join('')}</datalist>
+    ${groups.map(i => resumeTagGroup(i, catalog, groups.length > 1)).join('<div class="hr" style="margin:4px 0"></div>')}
+    ${groups.length < 8 ? `<div>${btn('+ Add domain', 'rtag-add-group', {}, 'sm ghost')}</div>` : ''}
+    <div class="xs faint">New jobs are matched to the resume whose roles their title names (then its domains), scored by the domain that fits best. Pinned choices are never changed.</div>
     <div class="row gap8">${btn(label('rtagSave', 'Save tags', 'Saving…'), 'rtag-save', { kind, id }, 'sm primary', isBusy('rtagSave'))}${btn('Cancel', 'rtag-cancel', {}, 'sm')}</div></div>`;
+}
+// The editor's groups, in order, as the API takes them.
+function resumeTagBody() {
+  const form = S.forms.rtag || {};
+  return { domains: (form.groups || []).map(i => ({ domain: String(form[`domain_${i}`] || '').trim() || null, roles: form[`roles_${i}`] || [] }))
+    .filter(g => g.domain || g.roles.length) };
 }
 
 // Changing a job's resume ranks it again with that resume (and a tailored packet is marked for re-tailoring).
@@ -2390,14 +2407,18 @@ const A = {
   'show-not-matching': (el, e) => { e.preventDefault(); S.filters = { ...S.filters, domain: 'not_matching', page: 1 }; go('discovery', { discMode: 'table' }); },
   'rtag-edit': el => {
     S.tagEdit = `${el.dataset.kind}:${el.dataset.id}`;
-    S.forms.rtag = { domain: el.dataset.domain || '', roles: JSON.parse(el.dataset.roles || '[]') };
+    const groups = JSON.parse(el.dataset.groups || '[]');
+    S.forms.rtag = { groups: groups.length ? groups.map((_, i) => i) : [0] };
+    groups.forEach((g, i) => { S.forms.rtag[`domain_${i}`] = g.domain || ''; S.forms.rtag[`roles_${i}`] = [...(g.roles || [])]; });
     loadResumeChoices().then(render); render();
   },
-  'rtag-add': el => { const roles = fv('rtag', 'roles', []); if (!roles.includes(el.dataset.role)) setF('rtag', 'roles', [...roles, el.dataset.role]); render(); },
+  'rtag-add': el => { const key = `roles_${el.dataset.index}`, roles = fv('rtag', key, []); if (!roles.includes(el.dataset.role)) setF('rtag', key, [...roles, el.dataset.role]); render(); },
+  'rtag-add-group': () => { const groups = S.forms.rtag?.groups || [0]; setF('rtag', 'groups', [...groups, Math.max(-1, ...groups) + 1]); render(); },
+  'rtag-remove-group': el => { const i = Number(el.dataset.index); setF('rtag', 'groups', (S.forms.rtag?.groups || []).filter(g => g !== i)); render(); },
   'rtag-cancel': () => { S.tagEdit = null; delete S.forms.rtag; render(); },
   'rtag-save': el => busy('rtagSave', async () => {
     document.querySelectorAll('input[data-tag][data-form="rtag"]').forEach(input => { if (input.value.trim()) commitTag(input, false); });
-    const body = { domain: String(fv('rtag', 'domain', '') || '').trim() || null, roles: fv('rtag', 'roles', []) };
+    const body = resumeTagBody();
     const url = el.dataset.kind === 'file' ? `/api/profile/resumes/${el.dataset.id}/tags` : `/api/resumes/${el.dataset.id}/tags`;
     const out = await api(url, { method: 'PUT', body });
     S.tagEdit = null; delete S.forms.rtag; D.resumeChoices = null;
@@ -3095,7 +3116,7 @@ document.addEventListener('input', e => {
   if (el.dataset.rdPath) { resumeDataInput(el); return; }
   if (el.dataset.jdPath) { jobDataInput(el); return; }
   if (el.dataset.resumeChoice) { chooseResume(el); return; }
-  if (el.dataset.form === 'rtag' && el.dataset.field === 'domain') { setF('rtag', 'domain', el.value); render(); return; }
+  if (el.dataset.form === 'rtag' && el.dataset.field.startsWith('domain_')) { setF('rtag', el.dataset.field, el.value); render(); return; }
   if (el.dataset.form && el.dataset.field) {
     setF(el.dataset.form, el.dataset.field, el.type === 'checkbox' ? el.checked : el.value);
     if (el.dataset.live || el.type === 'radio') render();

@@ -6,7 +6,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 // Discovery quality in the UI: hidden (not matching) jobs can be listed and kept, each job and each search setup can
 // choose its resume, and Settings → Domain filter shows the lists and what was learned.
 const appSource = readFileSync('app/static/app.js', 'utf8').split('/* ───────────── boot ───────────── */')[0];
-const names = ['S', 'D', 'A', 'render', 'resumeSelect', 'chooseResume', 'renderDomainSettings', 'searchPayload'];
+const names = ['S', 'D', 'A', 'render', 'resumeSelect', 'chooseResume', 'renderDomainSettings', 'searchPayload', 'resumeTags', 'resumeTagBody'];
 let ui, context, fetchMock;
 
 const response = (data, status = 200) => ({ ok: status < 400, status, text: async () => JSON.stringify(data) });
@@ -133,5 +133,23 @@ describe('deleting a resume version', () => {
     expect(call[0]).toBe('/api/resumes/9');
     expect(ui.D.resumeChoices).toBe(null);
     expect(fetchMock.mock.calls.some(([url]) => url === '/api/settings/resume')).toBe(true);
+  });
+
+  it('tags a resume with several domains, each with its own roles', () => {
+    ui.S.tagEdit = null;
+    const shown = ui.resumeTags('version', 9, 'AI / ML', ['AI Engineer', 'Data Engineer'],
+      [{ domain: 'AI / ML', roles: ['AI Engineer'] }, { domain: 'Data', roles: ['Data Engineer'] }]);
+    expect(shown).toContain('AI / ML'); expect(shown).toContain('Data Engineer'); expect(shown).toContain('Edit tags');
+    ui.A['rtag-edit']({ dataset: { kind: 'version', id: '9', groups: JSON.stringify([{ domain: 'AI / ML', roles: ['AI Engineer'] }]) } });
+    expect(ui.S.forms.rtag.groups).toEqual([0]);
+    ui.A['rtag-add-group']();
+    ui.S.forms.rtag.domain_1 = 'Data';
+    ui.A['rtag-add']({ dataset: { role: 'Data Engineer', index: '1' } });
+    ui.D.resumeCatalog = [{ domain: 'Data', roles: ['Data Engineer', 'Analytics Engineer'] }];
+    const editor = ui.resumeTags('version', 9);
+    expect(editor).toContain('Remove domain'); expect(editor).toContain('+ Analytics Engineer');
+    expect(ui.resumeTagBody()).toEqual({ domains: [{ domain: 'AI / ML', roles: ['AI Engineer'] }, { domain: 'Data', roles: ['Data Engineer'] }] });
+    ui.A['rtag-remove-group']({ dataset: { index: '0' } });
+    expect(ui.resumeTagBody()).toEqual({ domains: [{ domain: 'Data', roles: ['Data Engineer'] }] });
   });
 });

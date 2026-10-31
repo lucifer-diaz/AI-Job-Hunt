@@ -260,7 +260,8 @@ The rules a change has to keep:
 * **Setups pin resumes, and their jobs follow.** Changing a setup's resume re-applies it to the jobs it found
   (`discovery.follow_setup`) — never to jobs the person pinned (`USER`, `ACTIVE`) or approved/applied ones.
 * **Resume choice is deterministic and pins win** (`app/services/resume_matching.py`): tags live on `Resume`
-  (`domain`, `roles`); `discovery.choose_resume` applies the setup's pin, else `auto_assign`. Only `resume_choice`
+  (`domains`: one or more domains, each with its roles; a resume scores as its best-fitting domain). `domain` /
+  `roles` are mirrors; only `resume_matching.set_tags` writes the three, and `groups(resume)` reads them; `discovery.choose_resume` applies the setup's pin, else `auto_assign`. Only `resume_choice`
   NULL or `AUTO` may ever be re-matched; `SETUP`, `USER` and `ACTIVE` are the person's decisions. Changing tags never
   re-ranks by itself — re-matching is an explicit action, because it can queue model calls.
 
@@ -282,6 +283,12 @@ model (README §11). The rules a change has to keep:
 * **The graph conducts the service's steps.** Its one model call goes through `GatewayChatModel` bound to the
   `resume_parser` prompt; every write is `effects.within` plus the task's lease (`held`). The model output lives on
   `resume_parse_tasks.staged` (cleared when the task ends), never in a checkpoint; graph state is ids and counts.
+* **Extracted text is repaired, never rewritten.** Uploads are read by `document_text.extract`; PDF text goes through
+  `text_repair.repair_glyphs` (deterministic: a broken ligature glyph is replaced only where the inferred ligature makes
+  a known word) before any parser sees it, so grounding checks the repaired text. Never add a model to that step.
+* **AI only is a queue order, not a missing fallback.** With the account's `resume_parsing.ai_only` worker setting an
+  upload is queued run-now and the screen hides the regex data while the model reads; the regex parse is still written
+  and stays when the model cannot answer.
 * **Kill stops; an upload never revives it.** A stopped task's text is not queued again by an upload; Retry, Run now
   or Re-parse with AI do.
 
@@ -427,7 +434,8 @@ other static files.
   `asyncio.to_thread` pool, which a few slow model calls can fill and stall every scheduled job.
 * **Bulk retry is many single retries** (`workers.retry`): each task goes through `_requeue_finished`, is skipped with a
   reason rather than failing the batch, and never gets `run_now_at` — a bulk retry never bypasses a provider cooldown.
-* **A task row's model is read, never decided.** `workers.attach_models` adds `model` (route, model, how it was chosen;
+* **A task row's model is read, never decided.** `workers.attach_models` (matched through the kind's `llm_link`: the
+  job, or the resume for resume parsing) adds `model` (route, model, how it was chosen;
   `source` is `used` from the task's own `llm_request_logs` rows, or `next` from `LLMClient.route_for`) and
   `model_change` (FAILOVER, RESTING, FALLBACK, ESCALATED, CONFIG) to active rows. One bounded query, metadata only, and
   it never raises. Finished rows keep the model their own last request used (`source` `used`, or `none` when the task

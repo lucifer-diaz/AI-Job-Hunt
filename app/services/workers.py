@@ -104,6 +104,8 @@ class WorkerKind:
     requeue: Callable[[Session, Any, int], Any] | None = None
     shown: tuple[tuple[str, str], ...] = ()  # a raw finished status → the word every worker uses for it
     stopped_status: str = "SKIPPED"  # what Kill leaves (with lifecycle.STOPPED_BY_USER as the error)
+    # Where its model calls are recorded: the llm_request_logs workflow_type, and the row key holding the entity id.
+    llm_link: tuple[str, str] = ("job", "job_id")
 
     @property
     def active(self) -> tuple[str, str]:
@@ -203,7 +205,7 @@ def _resume_subjects(db: Session, user_id: int, tasks: list[Any]) -> dict[int, d
         r = resumes.get(t.resume_id)
         out[t.id] = {"title": (r.name or "Resume") if r else "Deleted resume",
                      "company": f"v{r.version}" if r else "", "step": t.step, "outcome": t.outcome,
-                     "subject": {"type": "resume", "id": t.resume_id}}
+                     "subject": {"type": "resume", "id": t.resume_id}, "resume_id": t.resume_id}
     return out
 
 
@@ -270,7 +272,7 @@ KINDS: dict[str, WorkerKind] = {k.kind: k for k in (
                "have not reviewed it (a comparison otherwise).", ResumeParseTask, "resume_parse", "PENDING",
                "PROCESSING", ("COMPLETED", "FAILED"), lambda: get_settings().resume_parse_max_attempts,
                "resume_parser", subject=_resume_subjects, search=_resume_search, requeue=_resume_requeue,
-               stopped_status="FAILED"),
+               stopped_status="FAILED", llm_link=("profile", "resume_id")),
 )}
 
 
@@ -730,7 +732,8 @@ def attach_models(db: Session, user_id: int, spec: WorkerKind | str, rows_: list
     tracker, the tailoring task list); anything else is finished."""
     spec = kind_of(spec) if isinstance(spec, str) else spec
     status_of = status_of or (lambda r: r.get("status"))
-    rows_ = [r for r in rows_ if r.get("job_id")]
+    workflow_type, key = spec.llm_link
+    rows_ = [r for r in rows_ if r.get(key)]
     if not rows_:
         return
     try:
@@ -746,13 +749,13 @@ def attach_models(db: Session, user_id: int, spec: WorkerKind | str, rows_: list
         if since is None:
             return
         logs = db.execute(select(LLMRequestLog).where(
-            LLMRequestLog.user_id == user_id, LLMRequestLog.workflow_type == "job",
-            LLMRequestLog.workflow_entity_id.in_({r["job_id"] for r in rows_}),
+            LLMRequestLog.user_id == user_id, LLMRequestLog.workflow_type == workflow_type,
+            LLMRequestLog.workflow_entity_id.in_({r[key] for r in rows_}),
             LLMRequestLog.worker_type.in_(workers), LLMRequestLog.created_at >= datetime.fromisoformat(since))
             .order_by(LLMRequestLog.id.desc()).limit(1000)).scalars().all()
-        by_job: dict[int, list[Any]] = {}
+        by_entity: dict[int, list[Any]] = {}
         for log in logs:  # newest first
-            by_job.setdefault(log.workflow_entity_id, []).append(log)
+            by_entity.setdefault(log.workflow_entity_id, []).append(log)
         browser_use = spec.kind == "application" and _browser_use_configured()
         for r in rows_:
             active = status_of(r) in STATUS_FILTERS["active"]
@@ -766,7 +769,7 @@ def attach_models(db: Session, user_id: int, spec: WorkerKind | str, rows_: list
             start = datetime.fromisoformat(r["created_at"]) if r.get("created_at") else None
             finished = r.get("finished_at") or r.get("completed_at")
             end = datetime.fromisoformat(finished) + timedelta(seconds=5) if finished and not active else None
-            last = next((log for log in by_job.get(r["job_id"], [])
+            last = next((log for log in by_entity.get(r[key], [])
                          if (start is None or log.created_at >= start) and (end is None or log.created_at <= end)),
                         None)
             if not active:

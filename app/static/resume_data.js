@@ -185,7 +185,7 @@ function rdResumeCard(v, current) {
     <div class="settings-file-icon" aria-hidden="true">${kind}</div>
     <div class="grow">${RD.renaming === v.id ? rdRenameEditor(v) : `<div class="row gap8 wrap" style="align-items:center"><strong>${esc(v.name || 'Resume')} · v${v.version}</strong>${v.is_active ? pill('Active', 'good') : ''}${viewing ? pill('Reviewing below', 'brand') : ''}${btn('Rename', 'rd-rename', { id: v.id, name: v.name || '' }, 'sm ghost', locked)}</div>`}
       <p>${source} · ${esc(status)} · ${v.reviewed_percent ?? 0}% reviewed${v.setups?.length ? ` · Used by ${esc(v.setups.map(x => x.name).join(', '))}` : ''}</p>
-      <div class="rd-roles"><span class="xs muted">Target roles</span> <span class="xs faint">· jobs whose title names one are ranked and tailored with this resume</span>${resumeTags('version', v.id, v.domain, v.roles || [])}</div>
+      <div class="rd-roles"><span class="xs muted">Target roles</span> <span class="xs faint">· jobs whose title names one are ranked and tailored with this resume</span>${resumeTags('version', v.id, v.domain, v.roles || [], v.domains)}</div>
       <div class="row gap8 wrap mt10">${viewing ? '' : btn('Review data', 'rd-view', { id: v.id }, 'sm', locked)}${v.is_active ? '' : btn('Make active', 'rd-activate', { id: v.id }, 'sm', locked)}${v.has_original ? `<a class="btn sm" href="/api/resumes/${v.id}/original">Download</a>` : ''}${v.is_active ? '' : btn('Delete', 'rd-delete-version', { id: v.id, name: `${v.name || 'Resume'} · v${v.version}` }, 'sm danger', locked)}</div>
     </div>
   </article>`;
@@ -199,6 +199,7 @@ function rdResumeList(current) {
   return settingsGroup('Your resumes', 'Each resume has its own data and the roles it is for. The active resume is used for ranking, tailoring and review, unless a job’s title matches another resume’s target roles, or its search setup or you chose one. Uploading or editing never changes which resume is active.',
     `<div class="settings-resume-list">${versions.map(v => rdResumeCard(v, current)).join('') || '<div class="settings-empty"><strong>Your experience starts here</strong><p>Upload a resume to make your applications more personal. It is parsed into data you can review and verify here.</p></div>'}</div>
     <label class="settings-upload" for="resume-file"><strong>＋ Upload ${versions.length ? 'another resume' : 'your resume'}</strong><span>PDF, DOCX or TXT · up to ${BOOT.max_upload_mb} MB</span><input type="file" id="resume-file" accept=".txt,.pdf,.docx" aria-label="Upload resume"></label>
+    <label class="settings-check mt8" for="rd-ai-only"><input type="checkbox" id="rd-ai-only" data-act-change="rd-ai-only" ${D.resumeData.ai_only ? 'checked' : ''}> Structure uploads with AI only<span class="settings-help"> · the Resume Parser model reads a new upload right away and its data is shown when it is done; the quick parse is kept only as a fallback</span></label>
     ${versions.some(v => v.domain || v.roles?.length) ? `<div class="row gap8 mt12" style="align-items:center">${btn(label('resumeRematch', 'Re-match existing jobs', 'Checking…'), 'resume-rematch', {}, 'sm soft', isBusy('resumeRematch'))}<span class="settings-help">New jobs use the target roles right away; this re-matches jobs found earlier (not ones you or a search pinned).</span></div>` : ''}`);
 }
 function rdPolicy() {
@@ -274,8 +275,11 @@ function rdTabBody(data) {
       ? `<div class="rd-history">${RD.changes.items.map(c => `<div class="rd-history-row" data-rd-change-type="${c.change_type}"><div class="row between gap8"><span class="small b">${esc(c.change_type.replace(/_/g, ' '))} · ${esc(c.source)}</span><span class="xs muted">${esc(rdDate(c.changed_at))}</span></div><div class="xs mono ellipsis">${esc(c.field_path)}</div><div class="xs muted">${esc(show(c.old_value))} → ${esc(show(c.new_value))}</div></div>`).join('')}</div>`
       : '<p class="settings-help">No changes yet.</p>');
   }
+  if (rdAwaitingAi(active)) return settingsGroup('Structuring with AI', 'You structure uploads with AI only: the Resume Parser model is reading this resume, and its data shows here when it is done. If the model cannot answer, the quick parse is shown instead.', rdAiParse(active.ai_parse));
   return RD_SECTIONS.map(([section, label]) => rdSectionCard(section, label, data, active.progress)).join('');
 }
+// AI only (Running workers → Resume parsing): a version the model has not structured yet shows no regex data to review.
+const rdAwaitingAi = active => !!(D.resumeData?.ai_only && active?.parser !== 'llm' && active?.ai_parse?.active);
 async function rdFetch(kind) {
   const active = rdActive();
   if (RD.loading || !active) return;
@@ -361,5 +365,9 @@ const RESUME_DATA_ACTIONS = {
     });
   },
   'rd-policy-source': el => rdRun(async () => { D.resumeData = { ...D.resumeData, policy: await api('/api/settings/resume/policy', { method: 'PUT', body: { resume_source: el.value } }) }; }, el.value === 'master_text' ? 'AI now works from the resume text as written' : 'AI now works from your structured resume data'),
+  'rd-ai-only': el => rdRun(async () => {
+    await api('/api/workers/settings', { method: 'PUT', body: { workers: { resume_parsing: { ai_only: el.checked } } } });
+    D.resumeData = { ...D.resumeData, ai_only: el.checked };
+  }, el.checked ? 'New uploads are structured with AI only' : 'New uploads show the quick parse first, then the AI refines it'),
   'rd-policy': el => rdRun(async () => { D.resumeData = { ...D.resumeData, policy: await api('/api/settings/resume/policy', { method: 'PUT', body: { [el.dataset.key]: el.checked } }) }; }, 'Candidate policy saved'),
 };

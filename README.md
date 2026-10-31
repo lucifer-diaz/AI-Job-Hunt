@@ -2766,6 +2766,16 @@ verified in a later resume version reuses the same evidence row. Unverified or r
 Every change — parse, edit, add, remove, reorder, verify, reject, re-parse choice — is written to
 `resume_data_changes` with the field path, old and new value, and its source (`PARSER`, `USER`, `SYSTEM`).
 
+### Reading the file
+
+PDF, DOCX and TXT uploads (resumes and job descriptions) are read by `app/services/document_text.py`. Some PDF
+exports draw "ti", "tf", "fi" … as one glyph with a broken Unicode mapping, so the text read "architecYng" or
+"pla[orms" and every parser kept the misspelling. `app/services/text_repair.py` restores them deterministically: for
+each odd character inside lower-case words it picks the one ligature that turns the most of those words into known
+English words (a bundled word list, `app/services/data/`), and replaces only words it makes known. Clean text comes
+back unchanged; a glyph that came out as an ordinary letter cannot be detected. Upload a file again to get a repaired
+version of a resume read before this existed.
+
 ### AI structuring of uploads
 
 The regex parser structures an upload at once, but it guesses at layouts (a header that names the employer before the
@@ -2785,6 +2795,10 @@ LOAD_RESUME → EXTRACT_STRUCTURE (the model, through the gateway) → GROUND_IN
 * **Apply**: while nobody has reviewed or edited the data, the AI result replaces it (every item unverified). Once you
   have, it arrives as the comparison below instead. The model never runs inside a request; without an AI model the
   regex parse simply stays.
+* **Structure uploads with AI only** (the checkbox under Upload, or Running workers → Settings → Resume parsing): a new
+  upload is queued to run now (ahead of the queue, even while the worker is paused), and the resume screen shows
+  *Structuring with AI* instead of the regex data until the model is done. The regex parse is still saved, as the
+  fallback when the model cannot answer or its result fails the check.
 
 ### Re-parsing
 
@@ -3287,10 +3301,12 @@ LEARN_MIN_DISMISSALS=3
 
 ### Resume per search and per job, matched by tags
 
-Tag each resume with a **domain** and the **roles** it targets — "Backend: Lead Engineer, Engineering Manager",
-"Product: Associate Product Manager, Product Manager" — in Settings → Resumes, on each
-resume (its file and its data share one set of tags). The editor suggests roles per domain (Backend,
-Product, AI / ML, Data, Frontend, Full Stack, DevOps / SRE, Engineering Leadership); anything can be typed.
+Tag each resume with one or more **domains**, each with the **roles** it targets — "Backend: Lead Engineer,
+Engineering Manager", "Product: Associate Product Manager, Product Manager", or one resume for "AI / ML: AI Engineer"
+and "Data: Data Engineer" — in Settings → Resumes, on each resume (its file and its data share one set of tags;
+**+ Add domain** adds another). The editor suggests roles per domain (Backend, Product, AI / ML, Data, Frontend, Full
+Stack, DevOps / SRE, Engineering Leadership); anything can be typed. A resume scores as its best-fitting domain, so
+tagging more domains never adds up to a stronger match (`resumes.domains`; `domain` / `roles` are mirrors).
 
 Every new job gets its resume (`jobs.resume_id`, `jobs.resume_choice`), deterministically and without a model
 (`app/services/resume_matching.py`):

@@ -1,8 +1,8 @@
 """Which of the candidate's resumes fits a job, from the resume tags. Deterministic, no model.
 
-A resume version is tagged with a domain ("Backend", "Product") and the roles it targets ("Lead Engineer",
-"Engineering Manager"; "Associate Product Manager", "Product Manager"). A new job is matched to the best-tagged
-resume:
+A resume version is tagged with one or more domains ("Backend", "Product"), each with the roles it targets ("Lead
+Engineer", "Engineering Manager"; "Associate Product Manager", "Product Manager"). A new job is matched to the
+best-tagged resume, a resume scoring as its best-fitting domain (several domains never add up):
 
     a tagged role named in the job title          → strong match (a longer role name beats a shorter one, so
                                                      "Associate Product Manager" wins over "Product Manager")
@@ -56,6 +56,7 @@ DOMAIN_CATALOG: dict[str, dict[str, list[str]]] = {
 ROLE_SCORE, ROLE_WORD_SCORE, DOMAIN_TITLE_SCORE, DOMAIN_TEXT_SCORE = 10, 3, 4, 1
 MIN_SCORE, MIN_MARGIN = 4, 2
 TEXT_WINDOW = 2000
+MAX_DOMAINS, MAX_ROLES = 8, 30
 
 
 def _norm(text: str | None) -> str:
@@ -75,8 +76,36 @@ def keywords_of(domain: str | None) -> list[str]:
     return list(dict.fromkeys(w for w in words if w and w not in ("/",)))
 
 
+def groups(resume: Resume) -> list[dict[str, Any]]:
+    """The resume's domains, each with its roles. A resume tagged before groups existed has one: domain + roles."""
+    if resume.domains is not None:
+        return [{"domain": g.get("domain"), "roles": list(g.get("roles") or [])} for g in resume.domains]
+    return [{"domain": resume.domain, "roles": list(resume.roles or [])}] if resume.domain or resume.roles else []
+
+
+def clean_groups(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Trimmed, de-duplicated groups: a domain named twice is merged, an empty group dropped, the limits applied."""
+    out: dict[str, dict[str, Any]] = {}
+    for group in raw:
+        domain = (group.get("domain") or "").strip()[:80] or None
+        roles = [r.strip()[:120] for r in group.get("roles") or [] if r and r.strip()]
+        if not domain and not roles:
+            continue
+        into = out.setdefault(_norm(domain), {"domain": domain, "roles": []})
+        into["roles"] = list(dict.fromkeys(into["roles"] + roles))[:MAX_ROLES]
+    return list(out.values())[:MAX_DOMAINS]
+
+
+def set_tags(resume: Resume, raw: list[dict[str, Any]]) -> None:
+    """The one writer of a resume's tags: its groups, and the `domain` / `roles` mirrors older readers use."""
+    cleaned = clean_groups(raw)
+    resume.domains = cleaned or None
+    resume.domain = next((g["domain"] for g in cleaned if g["domain"]), None)
+    resume.roles = list(dict.fromkeys(r for g in cleaned for r in g["roles"]))[:MAX_ROLES] or None
+
+
 def tagged(resume: Resume) -> bool:
-    return bool(resume.domain or resume.roles)
+    return bool(groups(resume))
 
 
 @dataclass(frozen=True)
@@ -89,19 +118,25 @@ class Match:
 def score(resume: Resume, job: Any) -> Match:
     title = _norm(getattr(job, "title", ""))
     text = _norm((getattr(job, "description", "") or "")[:TEXT_WINDOW])
-    best_role = max((role for role in resume.roles or [] if _has(title, role)), key=lambda r: len(r.split()),
+    best = max((_group_score(group, title, text) for group in groups(resume)), key=lambda m: m[0], default=(0, ""))
+    return Match(resume.id, *best)
+
+
+def _group_score(group: dict[str, Any], title: str, text: str) -> tuple[int, str]:
+    domain = group.get("domain")
+    best_role = max((role for role in group.get("roles") or [] if _has(title, role)), key=lambda r: len(r.split()),
                     default=None)
     points, reason = 0, ""
     if best_role:
         points += ROLE_SCORE + ROLE_WORD_SCORE * len(best_role.split())  # a longer, more specific role wins
         reason = f"role '{best_role}'"
-    domain_hit = next((word for word in keywords_of(resume.domain) if _has(title, word)), None)
+    domain_hit = next((word for word in keywords_of(domain) if _has(title, word)), None)
     if domain_hit:
         points += DOMAIN_TITLE_SCORE
-        reason = reason or f"domain '{resume.domain}'"
+        reason = reason or f"domain '{domain}'"
     # At most 3, below MIN_SCORE: the description breaks ties but never picks a resume on its own.
-    points += min(3, sum(DOMAIN_TEXT_SCORE for word in keywords_of(resume.domain) if _has(text, word)))
-    return Match(resume.id, points, reason)
+    points += min(3, sum(DOMAIN_TEXT_SCORE for word in keywords_of(domain) if _has(text, word)))
+    return points, reason
 
 
 def pick(resumes: list[Resume], job: Any) -> Match | None:
