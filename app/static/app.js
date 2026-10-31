@@ -2459,6 +2459,7 @@ const A = {
     const out = await api(`/api/jobs/${el.dataset.id}/resume`, { method: 'PUT', body: { mode: 'auto' } });
     if (S.jobOpen) D.jobModal = await api(`/api/jobs/${S.jobOpen}`).catch(() => D.jobModal);
     await load();
+    if (out.ranking_queued?.length) watchRanking(out.ranking_queued);  // the open job shows the new fit once ranked
     return out;
   }, out => out.cancelled ? '' : `Re-matched${out.ranking_queued?.length ? ' · queued for ranking' : ''}`),
   'domain-keep': el => busy('keep' + el.dataset.id, async () => {

@@ -107,6 +107,19 @@ describe('a job matched before its resume was tagged', () => {
     expect(call[1].method).toBe('PUT');
     expect(JSON.parse(call[1].body)).toEqual({ mode: 'auto' });
   });
+
+  it('watches the ranking it queued, so the open job shows the new fit when it is done', async () => {
+    const watched = [], original = context.watchRanking;
+    context.watchRanking = ids => { watched.push(ids); return Promise.resolve(); };
+    ui.D.jobModal = { id: 7, fit: null };
+    fetchMock.mockImplementation(async () => response({ changed: [7], ranking_queued: [7], ranking_skipped: [] }));
+    await ui.A['job-rematch']({ dataset: { id: '7' } });
+    expect(watched).toEqual([[7]]);
+    fetchMock.mockImplementation(async () => response({ changed: [], ranking_queued: [], ranking_skipped: [] }));
+    await ui.A['job-rematch']({ dataset: { id: '7' } });
+    expect(watched).toEqual([[7]]);
+    context.watchRanking = original;
+  });
 });
 
 describe('hidden jobs', () => {
