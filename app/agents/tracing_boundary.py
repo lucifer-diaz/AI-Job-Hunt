@@ -65,7 +65,8 @@ def client(fields: tuple[str, ...]) -> Any:
             _clients[key] = _client_class()(
                 api_url=settings.agent_langsmith_endpoint, api_key=settings.agent_langsmith_api_key,
                 session=requests_session("LANGSMITH", service="runs", operation="trace_export",
-                                         pre_send=export_policy.wire_check),
+                                         pre_send=export_policy.wire_check,
+                                         pre_send_request=export_policy.request_check),
                 timeout_ms=settings.agent_langsmith_timeout_ms, hide_inputs=hook, hide_outputs=hook,
                 hide_metadata=export_policy.project_metadata, omit_traced_runtime_info=True,
                 info={"instance_flags": {}})  # known up front: no /info call, and never zstd compression

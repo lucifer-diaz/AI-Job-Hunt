@@ -101,10 +101,14 @@ def _generate(ctx: ResumeParsingContext) -> rp.Generate:
 
 
 def load(state: ResumeParsingState, runtime: Runtime[ResumeParsingContext]) -> dict[str, Any]:
+    """The version still exists with the text the task was queued for, and the account can call its model
+    (resume_parsing.load)."""
     return rp.load(runtime.context.sessions, runtime.context.claim)
 
 
 def extract(state: ResumeParsingState, runtime: Runtime[ResumeParsingContext]) -> dict[str, Any]:
+    """The Resume Parser model reads the text through the LLM gateway; its validated output is staged on the task,
+    never in the checkpoint."""
     ctx = runtime.context
     out = rp.extract(ctx.sessions, ctx.claim, _generate(ctx), _within(ctx, state))
     _hold(ctx, "extract:after_effect")
@@ -112,16 +116,21 @@ def extract(state: ResumeParsingState, runtime: Runtime[ResumeParsingContext]) -
 
 
 def ground(state: ResumeParsingState, runtime: Runtime[ResumeParsingContext]) -> dict[str, Any]:
+    """Hold the staged output to the resume's own text (resume_parsing.ground): a value it does not state is
+    dropped, never rewritten."""
     ctx = runtime.context
     return rp.ground_step(ctx.sessions, ctx.claim, _within(ctx, state))
 
 
 def check(state: ResumeParsingState, runtime: Runtime[ResumeParsingContext]) -> dict[str, Any]:
+    """Compare the grounded result with the regex parse of the same text; a clearly poorer result is not used."""
     ctx = runtime.context
     return rp.check(ctx.sessions, ctx.claim, _within(ctx, state))
 
 
 def apply(state: ResumeParsingState, runtime: Runtime[ResumeParsingContext]) -> dict[str, Any]:
+    """Fill the structured data while it is untouched, or offer it as a comparison when a person reviewed or edited
+    it (resume_parsing.apply). Everything written is UNVERIFIED; never activates a resume."""
     ctx = runtime.context
     out = rp.apply(ctx.sessions, ctx.claim, _within(ctx, state))
     _hold(ctx, "apply:after_effect")

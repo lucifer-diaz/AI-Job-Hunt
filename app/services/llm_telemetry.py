@@ -310,7 +310,8 @@ def _context_selection(stats: dict[str, Any] | None) -> dict[str, Any]:
     stats = stats or {}
     return {key: stats.get(key) for key in ("full_available_context_tokens", "selected_context_tokens",
                                             "context_reduction_percent", "raw_job_tokens",
-                                            "selected_job_context_tokens", "job_context_reduction_percent")}
+                                            "selected_job_context_tokens", "job_context_reduction_percent",
+                                            "retrieval_ms", "retrieval_mode")}
 
 
 def _routing(attempt: Attempt) -> dict[str, Any]:

@@ -82,6 +82,22 @@ const history = { node_id: 'ranker', note: 'Observed metrics; not proof that one
   by_actual_model: [{ model: 'gpt-oss-20b', requests: 182, success_rate: 0.991, p95_latency_ms: 7900, avg_input_tokens: 4800, first_seen: '2026-09-28T00:00:00', last_seen: '2026-10-04T00:00:00', low_sample: false },
     { model: 'qwen-14b', requests: 11, success_rate: 0.9, p95_latency_ms: 14200, avg_input_tokens: 5100, first_seen: '2026-09-14T00:00:00', last_seen: '2026-09-28T00:00:00', low_sample: true }] }] };
 
+const langgraph = { note: 'Drawn from the compiled graphs.', runtime: [{ id: 'lease', label: 'Lease', detail: 'one runner per thread' },
+  { id: 'interrupt', label: 'Interrupt', detail: 'resumed from the checkpoint' }], graphs: [{
+  name: 'flowtest', label: 'Flow test graph', version: 'v9', worker_owned: true, orchestration_node: 'ranker', orchestration_label: 'Ranker',
+  export_fields: ['job_id', 'step'], columns: 5, mode: { configured: 'shadow', effective: 'shadow', running: true, setting: 'FLOWTEST_MODE', note: null },
+  runs: { QUEUED: 0, RUNNING: 1, INTERRUPTED: 2, COMPLETED: 0, FAILED: 0, STOPPED: 0 },
+  nodes: [{ id: '__start__', kind: 'start', depth: 0, doc: '', interrupt: false, may_stop: false },
+    { id: 'first_step', kind: 'step', depth: 1, doc: 'Queues the work, once per key.', interrupt: false, may_stop: true },
+    { id: 'second_step', kind: 'step', depth: 2, doc: 'Decides in Python.', interrupt: false, may_stop: false },
+    { id: 'hold_on', kind: 'step', depth: 2, doc: 'Waits for the worker.', interrupt: true, may_stop: false },
+    { id: '__end__', kind: 'end', depth: 3, doc: '', interrupt: false, may_stop: false }],
+  edges: [{ source: '__start__', target: 'first_step', conditional: false, loop: false },
+    { source: 'first_step', target: 'second_step', conditional: true, loop: false },
+    { source: 'first_step', target: 'hold_on', conditional: true, loop: false },
+    { source: 'hold_on', target: 'first_step', conditional: true, loop: true },
+    { source: 'second_step', target: '__end__', conditional: false, loop: false }] }] };
+
 beforeEach(() => {
   document.body.innerHTML = '<script id="boot" type="application/json">{"user":{"email":"a@b.c","is_admin":true}}</script><div id="nav"></div><div id="side-foot"></div><div id="side-meta"></div><div id="brand-sub"></div><div id="top"></div><div id="view"></div><div id="overlays"></div><div id="toast"></div>';
   vi.stubGlobal('scrollTo', vi.fn());
@@ -91,6 +107,8 @@ beforeEach(() => {
     return response(url.includes('/workspace/summary') ? ui.D.summary
       : url.includes('/orchestration/graph') ? routes.graph
       : url.includes('/orchestration/live') ? routes.live
+      : url.includes('/orchestration/langgraph') ? langgraph
+      : /\/orchestration\/jobs\/\d+\/journey/.test(url) ? (routes.journey || {})
       : /\/orchestration\/jobs\/\d+\/trace/.test(url) ? routes.trace
       : /\/orchestration\/jobs\/\d+/.test(url) ? routes.job
       : url.includes('/orchestration/jobs?') ? { items: [{ job_id: 1842, title: 'Senior Backend Engineer', company: 'Stripe' }] }
@@ -260,6 +278,57 @@ describe('AI Orchestration workspace', () => {
     expect(ui.S.screen).toBe('monitoring');
     expect(ui.S.mon.tab).toBe('logs');
     expect(ui.S.mon.logs.trace_id).toBe('abcdef0123456789');
+  });
+
+  it('shows the application journey in the trace drawer, unknown stages as unknown and Gmail review as review', async () => {
+    const unknown = stage => ({ stage, status: 'UNKNOWN', source: [], detail: `No ${stage} recorded` });
+    routes.journey = { job_id: 1842, stages: [
+      { stage: 'discovery', status: 'DONE', source: ['jobs'], board: 'greenhouse' }, unknown('description'),
+      { stage: 'retrieval', status: 'DONE', source: ['llm_request_logs'], retrieval_ms_max: 42, modes: { on: 1 } },
+      { stage: 'model', status: 'DONE', source: ['llm_request_logs'], calls: [{ id: 1 }], actual_models: ['ollama/gpt-oss:20b'], configured_models: ['ranker-main'] },
+      unknown('packet'), unknown('execution'),
+      { stage: 'confirmation', status: 'UNCERTAIN', source: ['submission_intents'], intent_status: 'UNCERTAIN', evidence: null },
+      { stage: 'gmail_outcome', status: 'NEEDS_REVIEW', source: [], events: [{ event_type: 'REJECTION', decided_by: 'person' }], review_message_ids: [7] }],
+      cost: { cost: null, unpriced: 2 }, recruiter_outcome: { stage: 'rejected', attributed_to_model: false } };
+    await open();
+    await ui.A['orch-pick-job']({ dataset: { id: '1842' } });
+    await ui.A['orch-trace']();
+    const modal = document.querySelector('[aria-label="Job trace"]').textContent;
+    expect(modal).toContain('Application journey');
+    expect(modal).toContain('No description recorded');
+    expect(modal).toContain('needs review');
+    expect(modal).toContain('rejection (you)');
+    expect(modal).toContain('Cost unknown');
+    expect(modal).toContain('never attributed to a model');
+    expect(modal).not.toContain('$0');
+  });
+
+  it('draws planned stages as planned, without a status or metric', async () => {
+    routes.graph = { ...graph(), topology: { ...graph().topology, reserved: [{ id: 'eval_feedback', label: 'Evaluation feedback', description: 'Planned', position: [9, 0], planned: true }] } };
+    await open();
+    const planned = view().querySelector('.orch-planned');
+    expect(planned.textContent).toContain('Evaluation feedback');
+    expect(planned.textContent).toContain('Planned');
+    expect(planned.getAttribute('data-act')).toBe(null);
+  });
+
+  it('draws each LangGraph graph from the API: steps, conditional and looping edges, pauses, mode and runs', async () => {
+    ui.orchState().workspace = 'langgraph';
+    await open();
+    const card = view().querySelector('.lg-card');
+    expect(view().textContent).toContain('How a graph runs');
+    expect(card.textContent).toContain('Flow test graph');
+    expect(card.textContent).toContain('shadow');
+    expect(card.textContent).toContain('2 interrupted');
+    expect(card.querySelectorAll('.lg-node').length).toBe(3);
+    expect(card.querySelectorAll('.lg-edge.cond').length).toBe(3);
+    expect(card.querySelectorAll('.lg-edge.loop').length).toBe(1);
+    expect(card.querySelector('.lg-node.pause').textContent).toContain('pauses');
+    await ui.A['orch-lg-node']({ dataset: { id: 'flowtest:first_step' } });
+    expect(view().querySelector('.lg-card').textContent).toContain('Queues the work, once per key.');
+    ui.A['orch-lg-stage']({ dataset: { id: 'ranker' } }, { preventDefault() {} });
+    expect(ui.orchState().workspace).toBe('pipeline');
+    expect(ui.orchState().node).toBe('ranker');
   });
 
   it('renders History mode with throughput on edges and a per-stage table', async () => {

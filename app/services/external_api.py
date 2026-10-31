@@ -732,12 +732,14 @@ class ExportBlocked(Exception):
 
 
 def requests_session(provider: str, *, service: str = "", operation: str = "",
-                     pre_send: Callable[[bytes | None], str | None] | None = None) -> Any:
+                     pre_send: Callable[[bytes | None], str | None] | None = None,
+                     pre_send_request: Callable[[str, Any], str | None] | None = None) -> Any:
     """A `requests.Session` for a vendor SDK that only accepts one (LangSmith), measured like `external_client`.
 
     `Session.send` is the funnel for every request the SDK makes, whatever adapters it mounts, so nothing gets past:
     `pre_send(body)` may refuse a request by returning a reason (the request is not sent; the SDK gets a 400 and
-    the refusal is recorded as a CLIENT_ERROR with `blocked_by`); a transport failure is recorded and answered with a 503 instead of raising,
+    the refusal is recorded as a CLIENT_ERROR with `blocked_by`); `pre_send_request(url, headers)` may refuse it the same
+    way for its URL or headers; a transport failure is recorded and answered with a 503 instead of raising,
     so an outage of the provider never reaches the code that called the SDK. Bodies are never stored.
     """
     import requests
@@ -755,6 +757,8 @@ def requests_session(provider: str, *, service: str = "", operation: str = "",
                     # A streamed body (a file, a generator, a multipart encoder) cannot be checked: refuse it.
                     readable = body is None or isinstance(body, (bytes, bytearray))
                     reason = pre_send(bytes(body) if body is not None else None) if readable else "unreadable body"
+                if not reason and pre_send_request is not None:
+                    reason = pre_send_request(request.url or "", request.headers)
                 if reason:
                     call.note(blocked_by="pre_send_policy")
                     record(call, started_at=started, completed_at=_finished(started, clock),

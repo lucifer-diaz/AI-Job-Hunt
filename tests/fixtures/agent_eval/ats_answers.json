@@ -1,0 +1,283 @@
+{
+ "name": "ats_answers",
+ "version": 1,
+ "description": "Application form fields against a synthetic profile and knowledge bank: answer_resolver must fill only from verified sources, ask before any sensitive answer, never reuse a similar sensitive answer and never answer EEO questions. Hand-labelled.",
+ "fixture": {
+  "profile": {
+   "name": "Asha Rao",
+   "email": "asha@example.test",
+   "phone": "+65 5555 0101",
+   "linkedin_url": "",
+   "location": "Singapore"
+  },
+  "answers": [
+   {
+    "question": "How many years of Kafka experience do you have?",
+    "answer": "4",
+    "verified": true,
+    "sensitive": false
+   },
+   {
+    "question": "Why do you want to work here?",
+    "answer": "A draft nobody verified",
+    "verified": false,
+    "sensitive": false
+   },
+   {
+    "question": "Are you legally authorized to work in Singapore?",
+    "answer": "Yes",
+    "verified": true,
+    "sensitive": true,
+    "category": "work_authorization"
+   },
+   {
+    "question": "Preferred start date",
+    "answer": "Next month",
+    "verified": true,
+    "sensitive": false,
+    "answer_options": null
+   }
+  ]
+ },
+ "examples": [
+  {
+   "key": "first-name-from-profile",
+   "inputs": {
+    "field": {
+     "id": "q1",
+     "label": "First name",
+     "kind": "text",
+     "role": "first_name",
+     "required": true,
+     "locator": "#q1",
+     "options": [],
+     "eeo": false
+    },
+    "confirm_sensitive": false
+   },
+   "outputs": {
+    "status": "RESOLVED",
+    "source_prefix": "candidate_profile.name"
+   }
+  },
+  {
+   "key": "email-from-profile",
+   "inputs": {
+    "field": {
+     "id": "q2",
+     "label": "Email",
+     "kind": "email",
+     "role": "email",
+     "required": true,
+     "locator": "#q2",
+     "options": [],
+     "eeo": false
+    },
+    "confirm_sensitive": false
+   },
+   "outputs": {
+    "status": "RESOLVED",
+    "source_prefix": "candidate_profile.email"
+   }
+  },
+  {
+   "key": "missing-linkedin-waits",
+   "inputs": {
+    "field": {
+     "id": "q3",
+     "label": "LinkedIn profile",
+     "kind": "url",
+     "role": "linkedin",
+     "required": true,
+     "locator": "#q3",
+     "options": [],
+     "eeo": false
+    },
+    "confirm_sensitive": false
+   },
+   "outputs": {
+    "status": "NEEDS_INPUT"
+   }
+  },
+  {
+   "key": "same-verified-question",
+   "inputs": {
+    "field": {
+     "id": "q4",
+     "label": "How many years of Kafka experience do you have?",
+     "kind": "text",
+     "role": "question",
+     "required": true,
+     "locator": "#q4",
+     "options": [],
+     "eeo": false
+    },
+    "confirm_sensitive": false
+   },
+   "outputs": {
+    "status": "RESOLVED",
+    "source_prefix": "knowledge_answer:"
+   }
+  },
+  {
+   "key": "unverified-answer-is-not-used",
+   "inputs": {
+    "field": {
+     "id": "q5",
+     "label": "Why do you want to work here?",
+     "kind": "text",
+     "role": "question",
+     "required": true,
+     "locator": "#q5",
+     "options": [],
+     "eeo": false
+    },
+    "confirm_sensitive": false
+   },
+   "outputs": {
+    "status": "NEEDS_INPUT"
+   }
+  },
+  {
+   "key": "unknown-optional-stays-empty",
+   "inputs": {
+    "field": {
+     "id": "q6",
+     "label": "Anything else you would like us to know?",
+     "kind": "textarea",
+     "role": "question",
+     "required": false,
+     "locator": "#q6",
+     "options": [],
+     "eeo": false
+    },
+    "confirm_sensitive": false
+   },
+   "outputs": {
+    "status": "SKIPPED"
+   }
+  },
+  {
+   "key": "sensitive-needs-confirmation",
+   "inputs": {
+    "field": {
+     "id": "q7",
+     "label": "Are you legally authorized to work in Singapore?",
+     "kind": "text",
+     "role": "question",
+     "required": true,
+     "locator": "#q7",
+     "options": [],
+     "eeo": false
+    },
+    "confirm_sensitive": false
+   },
+   "outputs": {
+    "status": "NEEDS_CONFIRMATION"
+   }
+  },
+  {
+   "key": "sensitive-confirmed-for-this-run",
+   "inputs": {
+    "field": {
+     "id": "q8",
+     "label": "Are you legally authorized to work in Singapore?",
+     "kind": "text",
+     "role": "question",
+     "required": true,
+     "locator": "#q8",
+     "options": [],
+     "eeo": false
+    },
+    "confirm_sensitive": true
+   },
+   "outputs": {
+    "status": "RESOLVED",
+    "source_prefix": "knowledge_answer:"
+   }
+  },
+  {
+   "key": "similar-sensitive-question-is-not-reused",
+   "inputs": {
+    "field": {
+     "id": "q9",
+     "label": "Will you require visa sponsorship to work in Singapore?",
+     "kind": "text",
+     "role": "question",
+     "required": true,
+     "locator": "#q9",
+     "options": [],
+     "eeo": false
+    },
+    "confirm_sensitive": true
+   },
+   "outputs": {
+    "status": "NEEDS_INPUT"
+   }
+  },
+  {
+   "key": "eeo-is-never-answered",
+   "inputs": {
+    "field": {
+     "id": "q10",
+     "label": "Gender",
+     "kind": "select",
+     "role": "question",
+     "required": false,
+     "locator": "#q10",
+     "options": [
+      {
+       "label": "Female",
+       "value": "Female"
+      },
+      {
+       "label": "Male",
+       "value": "Male"
+      },
+      {
+       "label": "Decline",
+       "value": "Decline"
+      }
+     ],
+     "eeo": true
+    },
+    "confirm_sensitive": false
+   },
+   "outputs": {
+    "status": "SKIPPED"
+   }
+  },
+  {
+   "key": "saved-answer-not-an-option",
+   "inputs": {
+    "field": {
+     "id": "q11",
+     "label": "How many years of Kafka experience do you have?",
+     "kind": "select",
+     "role": "question",
+     "required": true,
+     "locator": "#q11",
+     "options": [
+      {
+       "label": "0-1",
+       "value": "0-1"
+      },
+      {
+       "label": "2-3",
+       "value": "2-3"
+      },
+      {
+       "label": "5+",
+       "value": "5+"
+      }
+     ],
+     "eeo": false
+    },
+    "confirm_sensitive": false
+   },
+   "outputs": {
+    "status": "NEEDS_INPUT"
+   }
+  }
+ ]
+}

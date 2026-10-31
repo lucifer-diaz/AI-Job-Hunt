@@ -33,6 +33,7 @@ enforces), json_mode (JSON only, the contract checked here), prompt_only, or non
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import re
@@ -298,6 +299,16 @@ def _gateway_error(model: str, exc: Exception) -> LLMError:
     return LLMError(detail)
 
 
+def _workflow_trace(call: LLMCall) -> Any:
+    """The current trace narrowed to the call's job or application. Telemetry only: never changes the call."""
+    entity = call.entity_id
+    if call.workflow_type == "job" and entity is not None:
+        return tracing.trace(job_id=entity)
+    if call.workflow_type == "application" and entity is not None:
+        return tracing.trace(application_id=entity)
+    return contextlib.nullcontext()
+
+
 class LLMClient:
     """Calls the AI provider chosen in a user's settings, with that user's own API key."""
 
@@ -341,8 +352,16 @@ class LLMClient:
         """Run a prompt built in app.prompts. The stage comes from the prompt's marker, never from its data.
 
         The answer is checked against the prompt's output contract before the call's own validator sees it. A
-        contract failure gets one retry with a schema correction; the retry is never escalated a second time."""
+        contract failure gets one retry with a schema correction; the retry is never escalated a second time.
+
+        The call runs under the trace already open, narrowed to the job or application it is for (same trace id), so
+        the gateway's external-call row carries that job too and the job's journey finds it (orchestration.journey).
+        """
         call = call or LLMCall()
+        with _workflow_trace(call):
+            return self._generate_prompt(prompt, call)
+
+    def _generate_prompt(self, prompt: Prompt, call: LLMCall) -> LLMResult:
         task = MARKER_TASKS.get(prompt.marker, "default")
         call.contract = prompt.output_schema
         try:
@@ -461,9 +480,10 @@ class LLMClient:
                 attempt.validation_failure_reason = attempt.validation_failure_reason or exc.reason
             raise
         finally:
-            # Tokens and cost the provider reported travel to the generic row too, so a cost total can be taken
-            # from either table. `not_sent` requests (missing key, refused before the network) are marked as
-            # configuration failures rather than counted as provider calls.
+            # Tokens travel to the generic row too; cost does not. An LLM call's cost lives only on its
+            # llm_request_logs row, so a total that adds external rows skips those an LLM row points at
+            # (external_request_id) and nothing is counted twice. `not_sent` requests (missing key, refused before
+            # the network) are marked as configuration failures rather than counted as provider calls.
             external.note(answered_model=attempt.model, sent=attempt.sent,
                           input_tokens=attempt.usage.input_tokens if attempt.usage else None,
                           output_tokens=attempt.usage.output_tokens if attempt.usage else None)

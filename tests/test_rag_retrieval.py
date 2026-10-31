@@ -213,7 +213,7 @@ def test_off_is_the_deterministic_builder_exactly(monkeypatch, data):
     off = _ranking_context(data, "backend_kafka")
     assert not called
     # The pre-RAG builder: retrieval's hook taken out entirely.
-    monkeypatch.setattr(cb, "retrieved_evidence", lambda db, profile, job, task, terms, limit, deterministic, *_: deterministic)
+    monkeypatch.setattr(cb, "retrieved_evidence", lambda db, profile, job, task, terms, limit, deterministic, *_, **__: deterministic)
     before = _ranking_context(data, "backend_kafka")
     assert off.to_dict() == before.to_dict()
 

@@ -117,3 +117,29 @@ def test_only_the_tracing_boundary_builds_a_langsmith_exporter():
         "from langchain_core.tracers import LangChainTracer"]
     assert trace_exporters("import langsmith") == ["import langsmith"]
     assert trace_exporters("from langchain_core.messages import AIMessage") == []
+
+
+# Phase 7: the other Python trees that run beside the app. A script, the ADK agent or a sidecar that built its own
+# tracer would export outside the policy as surely as one under app/.
+OTHER_TREES = ("job_hunt_agent", "scripts", "sidecars")
+
+
+def test_no_langsmith_exporter_outside_the_app_either():
+    offenders = {}
+    for tree in OTHER_TREES:
+        for path in sorted((ROOT / tree).rglob("*.py")):
+            if hits := trace_exporters(path.read_text()):
+                offenders[str(path.relative_to(ROOT))] = hits
+    assert offenders == {}, f"LangSmith exporters belong in {TRACE_EXPORT_BOUNDARY} only: {offenders}"
+
+
+def test_the_browser_use_runner_loads_no_tracing_and_turns_telemetry_off():
+    """The runner drives a browser with sessions and logins: no LangChain/LangSmith import, no callback, and
+    browser-use's own telemetry off before it is imported."""
+    runner = ROOT / "sidecars" / "browser_use_runner" / "runner.py"
+    tree = ast.parse(runner.read_text())
+    imported = {a.name.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
+    imported |= {(n.module or "").split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
+    assert not imported & {"langsmith", "langchain", "langchain_core", "langchain_openai", "langchain_anthropic"}
+    source = runner.read_text()
+    assert "ANONYMIZED_TELEMETRY" in source and "Agent(" not in source

@@ -180,7 +180,7 @@ function miniMarkdown(md) {
 
 /* ───────────── routing + loading ───────────── */
 function setHash() {
-  const sub = S.screen === 'discovery' ? '/' + S.discMode : S.screen === 'today' ? '/' + S.todayVariant : S.screen === 'settings' ? '/' + S.settingsSection : S.screen === 'knowledge' ? '/' + S.knowledgeSection : S.screen === 'workers' ? '/' + wkState().tab : S.screen === 'orchestration' && orchState().workspace === 'models' ? '/models' : '';
+  const sub = S.screen === 'discovery' ? '/' + S.discMode : S.screen === 'today' ? '/' + S.todayVariant : S.screen === 'settings' ? '/' + S.settingsSection : S.screen === 'knowledge' ? '/' + S.knowledgeSection : S.screen === 'workers' ? '/' + wkState().tab : S.screen === 'orchestration' && orchState().workspace !== 'pipeline' ? '/' + orchState().workspace : '';
   const next = '#' + S.screen + sub;
   if (location.hash !== next) history.replaceState(null, '', next);
 }
@@ -192,7 +192,7 @@ function readHash() {
   if (screen === 'settings' && sub === 'ai') { S.screen = 'orchestration'; orchState().workspace = 'models'; return; }
   // Workflow & cadence moved to Running workers → Settings (approvals, tailoring, cadence); old links land there.
   if (screen === 'settings' && sub === 'workflow') { S.screen = 'workers'; wkState().tab = 'settings'; return; }
-  if (screen === 'orchestration') orchState().workspace = sub === 'models' ? 'models' : 'pipeline';
+  if (screen === 'orchestration') orchState().workspace = ['models', 'langgraph'].includes(sub) ? sub : 'pipeline';
   if (SCREENS.includes(screen)) S.screen = screen;
   if (screen === 'workers' && WK_TABS.some(([id]) => id === sub)) wkState().tab = sub;
   if (screen === 'settings') S.settingsSection = settingsSection(sub);

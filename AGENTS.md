@@ -822,6 +822,35 @@ ADR-035). The rules a change has to keep:
 * **`rag_vectors` is created at runtime, not by Alembic** (`vector_store.setup`). A server without pgvector must still
   start; retrieval then stays full-text. There is no ANN index until a measured account needs one.
 
+## Evaluation, feedback and the journey (Phase 7)
+
+`app/services/journey.py` (the application journey), `app/services/agent_eval/` (datasets, suites, gates, report,
+live feedback), `scripts/agent_eval.py` (README §9e). The rules a change has to keep:
+
+* **No second pipeline.** The journey and the feedback rates read the rows each stage already writes. A new fact goes
+  where its stage owns it (a nullable column written by `llm_telemetry.build_entry`, as `retrieval_ms` is), never a
+  journey, packet-event or graph-state table.
+* **Cost is counted once.** An LLM call's cost lives on its `llm_request_logs` row only; an external row adds its own
+  cost only when no LLM row points at it (`external_request_id`). Unknown cost is None everywhere, never `0.0`.
+* **Unknown is UNKNOWN.** A stage with no stored fact is `UNKNOWN`; nothing is inferred from a neighbour. The actual
+  model is `llm_request_logs.model` / `model_group`; "off configuration" is computed only where both sides are known
+  and never for the auto router.
+* **The recruiter's decision is not a model error.** `recruiter_outcome` is reported beside the journey and the
+  correction rates with `attributed_to_model: False`; no metric reads a rejection as a fault of a stage.
+* **Gmail stays confidence-aware.** An ambiguous message is NEEDS_REVIEW and never an application's outcome
+  (`journey.review_messages` finds it by its candidates); a person's correction wins and is labelled `person`.
+* **Every suite runs production code over a versioned dataset**, and every suite has gates (`gates.GATES`). Bump a
+  dataset's `version` when a case is added, removed or relabelled. A skipped suite is BLOCKED. Ground truth is
+  written by a person; cases are synthetic. Add a gate before relaxing one.
+* **The LangGraph view draws the code** (`app/services/graph_topology.py`): structure from each compiled graph,
+  descriptions from each node function's docstring, pauses from `interrupt(`, the stage it conducts from
+  `GraphSpec.orchestration_node`. A new graph appears there once it is in `runtime.GRAPHS`; give every node function a
+  docstring (a test fails without one) and never draw or name a step in `app/static/`.
+* **Nothing is uploaded.** `--jsonl` is for a manual LangSmith import; the only export path stays
+  `app/agents/tracing_boundary.py`, which also refuses OTP- and token-shaped strings, cookie text and credentials in
+  URLs or headers (`export_policy.request_check`). `tests/test_external_api_guard.py` checks `job_hunt_agent/`,
+  `scripts/` and `sidecars/` for exporters too.
+
 ## Traces
 
 `app/services/tracing.py` holds an ambient correlation ID. Scheduler jobs and HTTP requests open one; nested

@@ -217,6 +217,8 @@ def _state_name(job: Any) -> str:
 # ───────────── VALIDATE_JOB ─────────────
 
 def validate_job(state: QualificationState, runtime: Runtime[QualificationContext]) -> dict[str, Any]:
+    """Make sure the job still exists and still needs deciding: a deleted, triaged or already decided job ends the
+    run; one a person asked for again is put back first (ranker.restore_removed)."""
     ctx = _context(runtime)
     from app.services import ranker
     from app.services.lifecycle import WorkflowState as S
@@ -322,6 +324,8 @@ def _after_admission(state: QualificationState) -> str:
 # ───────────── CHECK_JD ─────────────
 
 def check_jd(state: QualificationState, runtime: Runtime[QualificationContext]) -> dict[str, Any]:
+    """Decide whether the posting's description is usable as it is (parse it) or must be recovered from its URL
+    first (jd_quality); nothing is fetched here."""
     ctx = _context(runtime)
     from app.services import jd_quality, jd_recovery
     from app.services.lifecycle import WorkflowState as S
@@ -359,6 +363,8 @@ def _after_check(state: QualificationState) -> str:
 # ───────────── RECOVER_JD_IF_NEEDED ─────────────
 
 def recover_jd(state: QualificationState, runtime: Runtime[QualificationContext]) -> dict[str, Any]:
+    """Queue one description recovery task (jd_recovery.enqueue), once per job whatever replays, and wait for the
+    recovery worker."""
     ctx = _context(runtime)
     from app.models import JobDescriptionFetchTask
     from app.services import jd_recovery
@@ -392,6 +398,8 @@ def recover_jd(state: QualificationState, runtime: Runtime[QualificationContext]
 # ───────────── PARSE_JD ─────────────
 
 def parse_jd(state: QualificationState, runtime: Runtime[QualificationContext]) -> dict[str, Any]:
+    """Queue the structured parse of the description (job_description.queue_parse), once per description, and wait
+    for the parser worker."""
     ctx = _context(runtime)
     from app.models import JobDescriptionParseTask
     from app.services import job_description, ranker
@@ -438,6 +446,8 @@ def parse_jd(state: QualificationState, runtime: Runtime[QualificationContext]) 
 # ───────────── QUALIFICATION_HARD_FILTER ─────────────
 
 def hard_filter(state: QualificationState, runtime: Runtime[QualificationContext]) -> dict[str, Any]:
+    """Normalize and apply the account's hard filters through the ranker's own rules (ranker.prepare): a job that
+    fails one is skipped with its reason, before any model."""
     ctx = _context(runtime)
     from app.services import ranker
     from app.services.lifecycle import WorkflowState as S
@@ -499,6 +509,8 @@ def retrieve(state: QualificationState, runtime: Runtime[QualificationContext]) 
 # ───────────── RANK ─────────────
 
 def rank(state: QualificationState, runtime: Runtime[QualificationContext]) -> dict[str, Any]:
+    """Queue the job for the Ranker (ranker.queue_job), once, and wait for the ranking worker; the ranker, not the
+    graph, decides QUALIFIED or ARCHIVED."""
     ctx = _context(runtime)
     from app.models import JobRanking, JobRankingTask
     from app.services import ranker

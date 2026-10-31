@@ -37,6 +37,17 @@ RUN_FIELDS = ("id", "trace_id", "dotted_order", "parent_run_id", "name", "run_ty
 UPDATE_FIELDS = ("name", "run_type", "start_time", "end_time", "error", "inputs", "outputs", "events", "extra", "tags",
                  "trace_id", "parent_run_id", "dotted_order", "session_id", "session_name", "reference_example_id")
 _SAFE_TEXT = re.compile(r"^[A-Za-z0-9_.:/\- ]{0,120}$")
+# Shapes a credential takes without a name to give it away, refused in exported strings even though they are plain:
+# a one-time code (4–8 digits) and an opaque random token (24+ characters mixing upper, lower and digits). Hex ids and
+# UUIDs (trace ids) are lower-case and pass; counts are numbers, not strings.
+_OTP = re.compile(r"^\s*\d{4,8}\s*$")
+_OPAQUE = re.compile(r"(?=[A-Za-z0-9_\-]*[A-Z])(?=[A-Za-z0-9_\-]*[a-z])(?=[A-Za-z0-9_\-]*\d)[A-Za-z0-9_\-]{24,}")
+# Cookie and session material in text (a body or a URL): name=value pairs of session-like names, Set-Cookie lines.
+_COOKIE = re.compile(r"(?i)(?:\bset-cookie\s*:|\b[a-z0-9_\-]{0,32}(?:sess(?:ion)?|sid|csrf|xsrf|auth|jwt|token)"
+                     r"[a-z0-9_\-]{0,32}=[^;&\s\"']{8,})")
+# Request headers the export may carry: LangSmith's own key and transport headers. A cookie or any other credential
+# header is refused.
+_EXPORT_HEADER_ALLOW = {"x-api-key"}
 _SAFE_TAG = re.compile(r"^[a-z0-9_:\-]{1,40}$")
 _ERROR_CLASS = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_.]{0,80})")
 _JSON_KEY = re.compile(rb'"([^"\\]{1,80})"\s*:')
@@ -55,7 +66,8 @@ def _plain(value: Any) -> Any:
         return value
     if isinstance(value, (int, float)):
         return value
-    if isinstance(value, str) and _SAFE_TEXT.match(value) and not safety.secret_shaped(value):
+    if isinstance(value, str) and _SAFE_TEXT.match(value) and not safety.secret_shaped(value) \
+            and not _OTP.match(value) and not _OPAQUE.search(value):
         return value
     return None
 
@@ -141,7 +153,34 @@ def wire_check(body: bytes | None) -> str | None:
         return "body is not text"
     if safety.secret_shaped(text):
         return "secret-shaped text"
+    if _COOKIE.search(text):
+        return "cookie or session material"
     for match in _JSON_KEY.finditer(body):
         if safety.denied_key(match.group(1).decode("utf-8", "ignore")):
             return "credential field"
+    return None
+
+
+def request_check(url: str, headers: Any) -> str | None:
+    """Why a request must not be sent for anything other than its body (run by requests_session beside
+    `wire_check`): a credential or secret-shaped value in the URL, or a credential header other than LangSmith's own
+    key (`x-api-key`) — a cookie never goes out with a trace."""
+    from urllib.parse import parse_qsl, urlsplit
+
+    parts = urlsplit(url or "")
+    if parts.password:
+        return "credential in the URL"
+    for name, value in parse_qsl(parts.query, keep_blank_values=True):
+        if safety.denied_key(name):
+            return "credential field in the URL"
+        if safety.secret_shaped(value) or _OTP.match(value) or _OPAQUE.search(value):
+            return "secret-shaped value in the URL"
+    if _COOKIE.search(url or ""):
+        return "cookie or session material in the URL"
+    for name in (headers or {}):
+        key = str(name).lower()
+        if key in _EXPORT_HEADER_ALLOW:
+            continue
+        if key in ("cookie", "set-cookie") or safety.denied_key(key):
+            return "credential header"
     return None

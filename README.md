@@ -2220,6 +2220,71 @@ suppressed. Each sync writes one line to Monitoring → Logs (category `EMAIL`).
 | Model analysis keeps failing | The email is kept and retried `APPLICATION_INBOX_ANALYSIS_MAX_ATTEMPTS` times, then saved from the rules for review |
 | The scheduled job says it is off | Set `APPLICATION_INBOX_ENABLED=true`; Sync now works either way |
 
+## 9e. Evaluation, feedback and the application journey
+
+Phase 7 of the [agentic roadmap](docs/architecture/agentic-roadmap.md). Nothing here adds a telemetry pipeline or a
+graph-state table: it reads the facts each stage already stores.
+
+**One application journey** (`GET /api/orchestration/jobs/{id}/journey`, shown at the top of the job's trace in AI
+Orchestration). Eight stages in order, each from the row that backs it, with its ids and status; a stage with no
+stored fact is `UNKNOWN`, never guessed:
+
+| Stage | Read from |
+| --- | --- |
+| discovery | `jobs` |
+| description | `job_description_fetch_tasks`, `job_description_parse_tasks` |
+| retrieval | `llm_request_logs.retrieval_ms` / `retrieval_mode` (measured by retrieval, recorded with the call) |
+| model | `llm_request_logs`: actual vs configured model, fallback, failover, retries, reported cost |
+| packet | `resume_variants`, `approved_packets` (a 12-character digest prefix) |
+| execution | `application_execution_tasks` |
+| confirmation | `submission_intents` (the verifier's flags) or the reported submission on `applications` |
+| gmail_outcome | `application_email_messages`, `application_communication_events` |
+
+Cost is counted once: an LLM call's cost is on its `llm_request_logs` row only, and an external row adds its own
+(an embedding, an Apify run) only when no LLM row points at it. Unpriced rows leave the total unknown, not $0. An email
+the matcher could not place is `NEEDS_REVIEW` and is never this application's outcome; a person's correction wins
+over the classifier and is labelled `person`. The recruiter's decision (`recruiter_outcome`) sits beside the journey
+and is never attributed to a model, a packet or a stage. Model calls are traced to their job by the LLM gateway, so a
+gateway call made inside a scheduler sweep still carries its job on the external-call row.
+
+**Monitoring** adds, from the same raw rows: p50/p95/p99 per stage and per worker, the failover rate (a request moved
+off a resting model), the share of requests answered by a model other than the configured one (only where both are
+known; the auto router is left out), retrieval latency p50/p95, and cost per successful task on each AI node. Unknown
+cost stays unknown on every tile and day. `GET /api/monitoring/feedback` returns the account's human correction rate
+(inbox classifications corrected, approvals that overrode the reviewer, parsed postings a person edited) beside its
+recruiter outcomes, kept apart.
+
+**The orchestration graph** draws Submission confirmation (measured on `submission_intents`) and Email review
+(`NEEDS_REVIEW` mail), and draws planned stages (ATS answer memory, Evaluation feedback) dashed and labelled planned,
+with no status or metric.
+
+**The LangGraph view** (AI Orchestration → LangGraph, `GET /api/orchestration/langgraph`) draws every registered graph
+(`app/agents/runtime.GRAPHS`) from its compiled structure: its steps in order, which edges are conditional, which go
+back (a retry, a revision, a resume), the steps that pause (`interrupt`) and those that may stop the run, with each
+step's own docstring as its description. It also shows the runtime every graph shares (scheduler, lease, checkpoint,
+services, workers, interrupt, business state), each graph's mode and the account's runs per status. A run's current
+step lives only in its checkpoint, so runs are counted, never placed on a step.
+
+**Offline evaluation** (`python scripts/agent_eval.py`, `app/services/agent_eval/`): eight suites over hand-labelled,
+versioned datasets (`tests/fixtures/agent_eval/*.json`, plus the RAG and preparation benchmarks), each running the
+production code, each with review gates; the run exits non-zero when any gate is BLOCKED. `--report` writes the
+Markdown report (`docs/evals/phase7-report.md`), `--jsonl` LangSmith Examples for a manual import. Nothing is uploaded.
+
+| Suite | Runs | Zero-tolerance gate |
+| --- | --- | --- |
+| jd_parser | recorded parser outputs → contract, `validated`, `ground` | a requirement quoted as the employer's that the posting does not say |
+| qualification | `domain_match`, `search_scope`, `ranker.hard_filter_reason` | a job the person wants is hidden |
+| rag | `scripts/rag_eval.py` (Recall@k, Precision@k) | a fact of another resume reaches a job |
+| unsupported_claims | the tailoring evidence checks | an invented skill or metric passes |
+| ats_answers | `answer_resolver.plan` on a synthetic profile | a sensitive answer filled without the person; a field filled with no verified source |
+| browser_actions | `browser_actions.check` | a submit, off-route, consent, password or unresolved step is allowed |
+| confirmation | `ConfirmationVerifier` | anything less than the site's evidence counts as submitted |
+| human_corrections | `feedback.rates` | a recruiter's rejection counted as a model error |
+
+**LangSmith export** stays behind `app/agents/tracing_boundary.py`. Phase 7 also refuses, before anything is sent,
+one-time codes and opaque tokens in exported strings, cookie and session strings in a body, LangSmith keys, and any
+credential in a request's URL or headers (other than LangSmith's own key). No debug or capture switch widens it.
+
 ## 10. Claude Desktop + MCP
 
 ### What this feature does

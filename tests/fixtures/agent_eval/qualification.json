@@ -1,0 +1,674 @@
+{
+ "name": "qualification",
+ "version": 1,
+ "description": "Deterministic admission and hard filters (domain_match, search_scope, ranker.hard_filter_reason). keep=false means hidden or skipped. Unknown values never filter. Hand-labelled.",
+ "examples": [
+  {
+   "key": "domain-own-role",
+   "inputs": {
+    "check": "domain",
+    "job": {
+     "title": "Senior Backend Engineer"
+    },
+    "rules": {
+     "domain_excludes": [
+      "sales",
+      "nurse"
+     ],
+     "skill_excludes": [
+      "java",
+      "php"
+     ],
+     "includes": [
+      "platform"
+     ],
+     "roles": [
+      "backend engineer"
+     ],
+     "skills": [
+      "python",
+      "go"
+     ]
+    }
+   },
+   "outputs": {
+    "keep": true
+   }
+  },
+  {
+   "key": "domain-other-field",
+   "inputs": {
+    "check": "domain",
+    "job": {
+     "title": "Enterprise Sales Engineer"
+    },
+    "rules": {
+     "domain_excludes": [
+      "sales",
+      "nurse"
+     ],
+     "skill_excludes": [
+      "java",
+      "php"
+     ],
+     "includes": [
+      "platform"
+     ],
+     "roles": [
+      "backend engineer"
+     ],
+     "skills": [
+      "python",
+      "go"
+     ]
+    }
+   },
+   "outputs": {
+    "keep": false,
+    "code": "DOMAIN"
+   }
+  },
+  {
+   "key": "domain-foreign-skill",
+   "inputs": {
+    "check": "domain",
+    "job": {
+     "title": "Java Developer"
+    },
+    "rules": {
+     "domain_excludes": [
+      "sales",
+      "nurse"
+     ],
+     "skill_excludes": [
+      "java",
+      "php"
+     ],
+     "includes": [
+      "platform"
+     ],
+     "roles": [
+      "backend engineer"
+     ],
+     "skills": [
+      "python",
+      "go"
+     ]
+    }
+   },
+   "outputs": {
+    "keep": false,
+    "code": "SKILL"
+   }
+  },
+  {
+   "key": "domain-foreign-and-own-skill",
+   "inputs": {
+    "check": "domain",
+    "job": {
+     "title": "Java / Python Developer"
+    },
+    "rules": {
+     "domain_excludes": [
+      "sales",
+      "nurse"
+     ],
+     "skill_excludes": [
+      "java",
+      "php"
+     ],
+     "includes": [
+      "platform"
+     ],
+     "roles": [
+      "backend engineer"
+     ],
+     "skills": [
+      "python",
+      "go"
+     ]
+    }
+   },
+   "outputs": {
+    "keep": true
+   }
+  },
+  {
+   "key": "domain-include-wins",
+   "inputs": {
+    "check": "domain",
+    "job": {
+     "title": "Platform Sales Lead"
+    },
+    "rules": {
+     "domain_excludes": [
+      "sales",
+      "nurse"
+     ],
+     "skill_excludes": [
+      "java",
+      "php"
+     ],
+     "includes": [
+      "platform"
+     ],
+     "roles": [
+      "backend engineer"
+     ],
+     "skills": [
+      "python",
+      "go"
+     ]
+    }
+   },
+   "outputs": {
+    "keep": true
+   }
+  },
+  {
+   "key": "domain-nurse",
+   "inputs": {
+    "check": "domain",
+    "job": {
+     "title": "Registered Nurse"
+    },
+    "rules": {
+     "domain_excludes": [
+      "sales",
+      "nurse"
+     ],
+     "skill_excludes": [
+      "java",
+      "php"
+     ],
+     "includes": [
+      "platform"
+     ],
+     "roles": [
+      "backend engineer"
+     ],
+     "skills": [
+      "python",
+      "go"
+     ]
+    }
+   },
+   "outputs": {
+    "keep": false,
+    "code": "DOMAIN"
+   }
+  },
+  {
+   "key": "domain-no-title-is-kept",
+   "inputs": {
+    "check": "domain",
+    "job": {
+     "title": ""
+    },
+    "rules": {
+     "domain_excludes": [
+      "sales",
+      "nurse"
+     ],
+     "skill_excludes": [
+      "java",
+      "php"
+     ],
+     "includes": [
+      "platform"
+     ],
+     "roles": [
+      "backend engineer"
+     ],
+     "skills": [
+      "python",
+      "go"
+     ]
+    }
+   },
+   "outputs": {
+    "keep": true
+   }
+  },
+  {
+   "key": "domain-description-foreign",
+   "inputs": {
+    "check": "domain",
+    "job": {
+     "title": "Software Developer",
+     "description": "Daily work in Java and PHP services."
+    },
+    "rules": {
+     "domain_excludes": [
+      "sales",
+      "nurse"
+     ],
+     "skill_excludes": [
+      "java",
+      "php"
+     ],
+     "includes": [
+      "platform"
+     ],
+     "roles": [
+      "backend engineer"
+     ],
+     "skills": [
+      "python",
+      "go"
+     ]
+    }
+   },
+   "outputs": {
+    "keep": false,
+    "code": "DESCRIPTION"
+   }
+  },
+  {
+   "key": "domain-description-own-skill",
+   "inputs": {
+    "check": "domain",
+    "job": {
+     "title": "Software Developer",
+     "description": "Java, PHP and Python services."
+    },
+    "rules": {
+     "domain_excludes": [
+      "sales",
+      "nurse"
+     ],
+     "skill_excludes": [
+      "java",
+      "php"
+     ],
+     "includes": [
+      "platform"
+     ],
+     "roles": [
+      "backend engineer"
+     ],
+     "skills": [
+      "python",
+      "go"
+     ]
+    }
+   },
+   "outputs": {
+    "keep": true
+   }
+  },
+  {
+   "key": "scope-match",
+   "inputs": {
+    "check": "scope",
+    "job": {
+     "title": "Backend Engineer",
+     "location": "Singapore",
+     "description": "Python services"
+    },
+    "search": {
+     "roles": [
+      "backend engineer"
+     ],
+     "skills": [
+      "python"
+     ],
+     "locations": [
+      "Singapore"
+     ],
+     "distance": 50
+    }
+   },
+   "outputs": {
+    "keep": true
+   }
+  },
+  {
+   "key": "scope-other-role",
+   "inputs": {
+    "check": "scope",
+    "job": {
+     "title": "Data Analyst",
+     "location": "Singapore",
+     "description": "Python"
+    },
+    "search": {
+     "roles": [
+      "backend engineer"
+     ],
+     "skills": [
+      "python"
+     ],
+     "locations": [
+      "Singapore"
+     ],
+     "distance": 50
+    }
+   },
+   "outputs": {
+    "keep": false,
+    "code": "SCOPE_ROLE"
+   }
+  },
+  {
+   "key": "scope-other-country",
+   "inputs": {
+    "check": "scope",
+    "job": {
+     "title": "Backend Engineer",
+     "location": "Berlin, Germany",
+     "description": "Python"
+    },
+    "search": {
+     "roles": [
+      "backend engineer"
+     ],
+     "skills": [
+      "python"
+     ],
+     "locations": [
+      "Singapore"
+     ],
+     "distance": 50
+    }
+   },
+   "outputs": {
+    "keep": false,
+    "code": "SCOPE_LOCATION"
+   }
+  },
+  {
+   "key": "scope-unknown-location-kept",
+   "inputs": {
+    "check": "scope",
+    "job": {
+     "title": "Backend Engineer",
+     "location": "",
+     "description": "Python"
+    },
+    "search": {
+     "roles": [
+      "backend engineer"
+     ],
+     "skills": [
+      "python"
+     ],
+     "locations": [
+      "Singapore"
+     ],
+     "distance": 50
+    }
+   },
+   "outputs": {
+    "keep": true
+   }
+  },
+  {
+   "key": "scope-onsite-for-remote-search",
+   "inputs": {
+    "check": "scope",
+    "job": {
+     "title": "Backend Engineer",
+     "location": "Singapore",
+     "remote_type": "On-site",
+     "description": "Python"
+    },
+    "search": {
+     "roles": [
+      "backend engineer"
+     ],
+     "skills": [
+      "python"
+     ],
+     "locations": [
+      "Singapore"
+     ],
+     "distance": 50,
+     "remote_only": true
+    }
+   },
+   "outputs": {
+    "keep": false,
+    "code": "SCOPE_LOCATION"
+   }
+  },
+  {
+   "key": "filter-excluded-company",
+   "inputs": {
+    "check": "hard_filter",
+    "job": {
+     "title": "Backend Engineer",
+     "company": "Initech",
+     "remote_type": "remote"
+    },
+    "policy": {
+     "exclude_companies": [
+      "Initech"
+     ],
+     "exclude_title_keywords": [
+      "intern"
+     ],
+     "remote_only": true,
+     "minimum_salary": 100000,
+     "salary_currency": "SGD"
+    }
+   },
+   "outputs": {
+    "keep": false,
+    "code": "HARD_FILTER"
+   }
+  },
+  {
+   "key": "filter-title-keyword",
+   "inputs": {
+    "check": "hard_filter",
+    "job": {
+     "title": "Software Engineering Intern",
+     "company": "Acme",
+     "remote_type": "remote"
+    },
+    "policy": {
+     "exclude_companies": [
+      "Initech"
+     ],
+     "exclude_title_keywords": [
+      "intern"
+     ],
+     "remote_only": true,
+     "minimum_salary": 100000,
+     "salary_currency": "SGD"
+    }
+   },
+   "outputs": {
+    "keep": false,
+    "code": "HARD_FILTER"
+   }
+  },
+  {
+   "key": "filter-keyword-is-a-word",
+   "inputs": {
+    "check": "hard_filter",
+    "job": {
+     "title": "Internal Tools Engineer",
+     "company": "Acme",
+     "remote_type": "remote"
+    },
+    "policy": {
+     "exclude_companies": [
+      "Initech"
+     ],
+     "exclude_title_keywords": [
+      "intern"
+     ],
+     "remote_only": true,
+     "minimum_salary": 100000,
+     "salary_currency": "SGD"
+    }
+   },
+   "outputs": {
+    "keep": true
+   }
+  },
+  {
+   "key": "filter-onsite",
+   "inputs": {
+    "check": "hard_filter",
+    "job": {
+     "title": "Backend Engineer",
+     "company": "Acme",
+     "remote_type": "onsite"
+    },
+    "policy": {
+     "exclude_companies": [
+      "Initech"
+     ],
+     "exclude_title_keywords": [
+      "intern"
+     ],
+     "remote_only": true,
+     "minimum_salary": 100000,
+     "salary_currency": "SGD"
+    }
+   },
+   "outputs": {
+    "keep": false,
+    "code": "HARD_FILTER"
+   }
+  },
+  {
+   "key": "filter-unknown-work-type-kept",
+   "inputs": {
+    "check": "hard_filter",
+    "job": {
+     "title": "Backend Engineer",
+     "company": "Acme"
+    },
+    "policy": {
+     "exclude_companies": [
+      "Initech"
+     ],
+     "exclude_title_keywords": [
+      "intern"
+     ],
+     "remote_only": true,
+     "minimum_salary": 100000,
+     "salary_currency": "SGD"
+    }
+   },
+   "outputs": {
+    "keep": true
+   }
+  },
+  {
+   "key": "filter-dismissed",
+   "inputs": {
+    "check": "hard_filter",
+    "job": {
+     "title": "Backend Engineer",
+     "company": "Acme",
+     "status": "dismissed"
+    },
+    "policy": {
+     "exclude_companies": [
+      "Initech"
+     ],
+     "exclude_title_keywords": [
+      "intern"
+     ],
+     "remote_only": true,
+     "minimum_salary": 100000,
+     "salary_currency": "SGD"
+    }
+   },
+   "outputs": {
+    "keep": false,
+    "code": "HARD_FILTER"
+   }
+  },
+  {
+   "key": "filter-salary-below",
+   "inputs": {
+    "check": "hard_filter",
+    "job": {
+     "title": "Backend Engineer",
+     "company": "Acme",
+     "remote_type": "remote",
+     "salary_max": 80000,
+     "salary_currency": "SGD",
+     "salary_interval": "yearly"
+    },
+    "policy": {
+     "exclude_companies": [
+      "Initech"
+     ],
+     "exclude_title_keywords": [
+      "intern"
+     ],
+     "remote_only": true,
+     "minimum_salary": 100000,
+     "salary_currency": "SGD"
+    }
+   },
+   "outputs": {
+    "keep": false,
+    "code": "HARD_FILTER"
+   }
+  },
+  {
+   "key": "filter-salary-other-currency-kept",
+   "inputs": {
+    "check": "hard_filter",
+    "job": {
+     "title": "Backend Engineer",
+     "company": "Acme",
+     "remote_type": "remote",
+     "salary_max": 80000,
+     "salary_currency": "USD",
+     "salary_interval": "yearly"
+    },
+    "policy": {
+     "exclude_companies": [
+      "Initech"
+     ],
+     "exclude_title_keywords": [
+      "intern"
+     ],
+     "remote_only": true,
+     "minimum_salary": 100000,
+     "salary_currency": "SGD"
+    }
+   },
+   "outputs": {
+    "keep": true
+   }
+  },
+  {
+   "key": "filter-hourly-salary-kept",
+   "inputs": {
+    "check": "hard_filter",
+    "job": {
+     "title": "Backend Engineer",
+     "company": "Acme",
+     "remote_type": "remote",
+     "salary_max": 60,
+     "salary_currency": "SGD",
+     "salary_interval": "hourly"
+    },
+    "policy": {
+     "exclude_companies": [
+      "Initech"
+     ],
+     "exclude_title_keywords": [
+      "intern"
+     ],
+     "remote_only": true,
+     "minimum_salary": 100000,
+     "salary_currency": "SGD"
+    }
+   },
+   "outputs": {
+    "keep": true
+   }
+  }
+ ]
+}

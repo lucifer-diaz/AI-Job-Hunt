@@ -93,8 +93,10 @@ def plan(db: Session, job: Job, form: ApplicationForm, *, confirmed: list[int] |
                 entry["question_id"] = saved["question_id"]
         if entry["status"] == NEEDS_INPUT and not field.required:
             entry = _entry(field, SKIPPED, None, why="optional and not answered by a verified source")
-        if entry["status"] == NEEDS_INPUT:
+        if entry["status"] == NEEDS_INPUT and entry.get("question_id") is not None:
             needs_input.append(entry["question_id"])
+        # A verified saved answer that fits no option of this form (re-resolved above) has no question to wait on:
+        # the field stays unresolved, so the pre-submit checks hand it to the person instead of filling a guess.
         if entry["status"] == CONFIRM:
             needs_confirmation.append(entry["question_id"])
         fields[field.id] = entry
