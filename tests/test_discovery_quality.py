@@ -732,3 +732,38 @@ def test_the_job_and_its_packet_name_the_resume_they_use(user, resumes, client):
     packet = client.get(f"/api/tailor/{job_id}").json()["resume"]
     assert packet["source"]["resume"]["id"] == ml and packet["source"]["differs"]
     assert packet["resume_in_use"]["id"] == active and packet["resume_in_use"]["choice"] == "ACTIVE"
+    assert packet["resume_in_use"]["rematch"] is None, "a pinned choice is never offered a re-match"
+
+
+def test_a_job_matched_before_its_resume_was_tagged_is_offered_a_rematch(user, resumes, client):
+    from app.services import resume_matching
+
+    active, ml = resumes
+    job_id = add(user, "Staff Software Engineer, Growth")
+    detail = client.get(f"/api/jobs/{job_id}").json()["resume_in_use"]
+    assert detail["id"] == active and detail["rematch"] is None, "no tag matches: nothing to offer"
+
+    # Tagged after the job was found: the job keeps the active resume until the person re-matches it, but says so.
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        resume_matching.set_tags(db.get(Resume, ml), [{"domain": "Backend", "roles": ["Staff Software Engineer"]}])
+        db.commit()
+    detail = client.get(f"/api/jobs/{job_id}").json()["resume_in_use"]
+    assert detail["id"] == active and detail["choice"] is None
+    assert detail["rematch"]["resume"]["id"] == ml and "staff software engineer" in detail["rematch"]["reason"].lower()
+    assert "when this job was found" in detail["how"]
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        assert db.get(Job, job_id).resume_id is None, "showing the offer changes nothing"
+
+    client.put(f"/api/jobs/{job_id}/resume", json={"mode": "auto"})
+    detail = client.get(f"/api/jobs/{job_id}").json()["resume_in_use"]
+    assert detail["id"] == ml and detail["choice"] == "AUTO" and detail["rematch"] is None
+
+    # Its tags removed again: the AUTO job would now fall back to the active resume, and is offered that.
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        resume_matching.set_tags(db.get(Resume, ml), [])
+        db.commit()
+    detail = client.get(f"/api/jobs/{job_id}").json()["resume_in_use"]
+    assert detail["id"] == ml and detail["rematch"] == {"resume": None, "reason": "no resume matches clearly now"}

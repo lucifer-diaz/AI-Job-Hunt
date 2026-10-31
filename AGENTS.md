@@ -263,7 +263,8 @@ The rules a change has to keep:
   (`domains`: one or more domains, each with its roles; a resume scores as its best-fitting domain). `domain` /
   `roles` are mirrors; only `resume_matching.set_tags` writes the three, and `groups(resume)` reads them; `discovery.choose_resume` applies the setup's pin, else `auto_assign`. Only `resume_choice`
   NULL or `AUTO` may ever be re-matched; `SETUP`, `USER` and `ACTIVE` are the person's decisions. Changing tags never
-  re-ranks by itself — re-matching is an explicit action, because it can queue model calls.
+  re-ranks by itself — re-matching is an explicit action, because it can queue model calls. A job whose stored match
+  differs from what today's tags pick shows it (`workspace.stale_match`, read-only) and offers Re-match on a click.
 
 ## Resume structuring (AI parse of uploads)
 

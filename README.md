@@ -3328,6 +3328,8 @@ between *Auto*, *Active resume* or a specific version (`USER` / `ACTIVE`, never 
 again and a tailored packet is marked for re-tailoring. After changing tags, **Re-match existing jobs** (Versions)
 re-matches jobs that were matched automatically or never chosen — it first says how many would change and how many
 would be ranked again.
+Saving tags says how many existing jobs they would move. A job matched before its resume's tags changed says so
+under **Resume used** ("Your resume tags now match *name · vN* (role '…')") with **Re-match this job**.
 
 The screens always name the resume a job really uses, whatever the picker says: under **Resume used** the job shows
 "Uses *name · vN* — Matched by resume tags (role '…')", "Chosen by you", "Pinned by the search setup", or "No resume

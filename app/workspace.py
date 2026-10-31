@@ -300,15 +300,32 @@ def resume_in_use(db: Session, job: Job) -> dict | None:
     if resume is None:
         return None
     choice = job.resume_choice if chosen is not None or job.resume_choice == "ACTIVE" else None
+    rematch = stale_match(db, job)
     if choice in RESUME_CHOICE_LABELS:
         how = RESUME_CHOICE_LABELS[choice]
         if choice == "AUTO" and (reason := resume_matching.score(resume, job).reason):
             how = f"{how} ({reason})"
     elif job.resume_id is not None:
         how = "The chosen resume is gone: the active resume is used"
+    elif rematch is not None:
+        how = "No resume matched by tags when this job was found: the active resume is used"
     else:
         how = "No resume matched by tags clearly: the active resume is used"
-    return {**resume_ref(resume), "choice": choice, "how": how}
+    return {**resume_ref(resume), "choice": choice, "how": how, "rematch": rematch}
+
+
+def stale_match(db: Session, job: Job) -> dict | None:
+    """What re-matching would change for a job matched automatically (or never), now that tags may have changed since
+    it was matched: the resume today's tags pick (None: the active one) and why. None when nothing would change or the
+    choice is pinned. Read-only: re-matching stays the person's action, since a ranked job is ranked again."""
+    if job.resume_choice not in resume_matching.REMATCHABLE:
+        return None
+    match = resume_matching.pick(resume_matching.tagged_resumes(db, job.user_id), job)
+    target = match.resume_id if match else None
+    if target == job.resume_id:
+        return None
+    resume = db.get(Resume, target) if target is not None else None
+    return {"resume": resume_ref(resume), "reason": match.reason if match else "no resume matches clearly now"}
 
 
 def packet_source_resume(db: Session, job: Job, variant: ResumeVariant, now: dict | None = None) -> dict:

@@ -6,7 +6,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 // Discovery quality in the UI: hidden (not matching) jobs can be listed and kept, each job and each search setup can
 // choose its resume, and Settings → Domain filter shows the lists and what was learned.
 const appSource = readFileSync('app/static/app.js', 'utf8').split('/* ───────────── boot ───────────── */')[0];
-const names = ['S', 'D', 'A', 'render', 'resumeSelect', 'chooseResume', 'renderDomainSettings', 'searchPayload', 'resumeTags', 'resumeTagBody'];
+const names = ['S', 'D', 'A', 'render', 'resumeSelect', 'chooseResume', 'renderDomainSettings', 'searchPayload', 'resumeTags', 'resumeTagBody', 'resumeInUseNote'];
 let ui, context, fetchMock;
 
 const response = (data, status = 200) => ({ ok: status < 400, status, text: async () => JSON.stringify(data) });
@@ -80,6 +80,32 @@ describe('resume per job', () => {
     ui.S.forms.sp = {};
     ui.D.searchProfile = { profile: { resume_id: 3 } };  // saved before modes existed: a pinned resume
     expect(ui.searchPayload()).toMatchObject({ resume_mode: 'fixed', resume_id: 3 });
+  });
+});
+
+describe('a job matched before its resume was tagged', () => {
+  const inUse = rematch => ({ id: 3, name: 'Backend resume', version: 2, is_active: true, how: 'the active resume is used', rematch });
+
+  it('names the resume its tags match now, with a button, only when re-matching would change it', () => {
+    expect(ui.resumeInUseNote(inUse(null), '', 7)).not.toContain('job-rematch');
+    const html = ui.resumeInUseNote(inUse({ resume: { id: 5, name: 'ML resume', version: 3, is_active: false }, reason: "role 'Staff Software Engineer'" }), '', 7);
+    expect(html).toContain('ML resume · v3');
+    expect(html).toContain("role &#39;Staff Software Engineer&#39;");
+    expect(html).toContain('data-act="job-rematch"');
+    expect(ui.resumeInUseNote(inUse({ resume: null, reason: 'x' }), '', 7)).toContain('no resume clearly');
+    expect(ui.resumeInUseNote(inUse({ resume: null, reason: 'x' }))).not.toContain('job-rematch');
+  });
+
+  it('re-matches the job as auto, asking first when it was ranked', async () => {
+    ui.D.jobModal = { id: 7, fit: 82 };
+    vi.stubGlobal('confirm', vi.fn(() => false)); context.confirm = confirm;
+    await ui.A['job-rematch']({ dataset: { id: '7' } });
+    expect(fetchMock.mock.calls.some(([url]) => url === '/api/jobs/7/resume')).toBe(false);
+    vi.stubGlobal('confirm', vi.fn(() => true)); context.confirm = confirm;
+    await ui.A['job-rematch']({ dataset: { id: '7' } });
+    const call = fetchMock.mock.calls.find(([url]) => url === '/api/jobs/7/resume');
+    expect(call[1].method).toBe('PUT');
+    expect(JSON.parse(call[1].body)).toEqual({ mode: 'auto' });
   });
 });
 
