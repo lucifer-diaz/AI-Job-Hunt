@@ -241,8 +241,14 @@ CONFIG: dict[str, Config] = {c.name: c for c in (
     Config("agent_langsmith_api_key", "retention", "LangSmith API key",
            "Saved encrypted on this server and never shown again. Leave it empty to keep the saved key.", "secret"),
     Config("agent_langsmith_project", "retention", "LangSmith project", "The project traces go to.", "text"),
-    Config("agent_langsmith_endpoint", "retention", "LangSmith endpoint",
-           "The LangSmith API address (https), e.g. https://eu.api.smith.langchain.com for the EU region.", "text"),
+    # A text setting with choices: the regions are offered, and any other https address (self-hosted) is still allowed.
+    Config("agent_langsmith_endpoint", "retention", "LangSmith region",
+           "Where your LangSmith organization lives. A key works only in its own region (another region answers "
+           "403 Forbidden).", "text",
+           (Choice("https://api.smith.langchain.com", "US", "smith.langchain.com · api.smith.langchain.com"),
+            Choice("https://eu.api.smith.langchain.com", "EU", "eu.smith.langchain.com · eu.api.smith.langchain.com"),
+            Choice("https://apac.api.smith.langchain.com", "APAC",
+                   "apac.smith.langchain.com · apac.api.smith.langchain.com"))),
 )}
 
 _lock = threading.Lock()

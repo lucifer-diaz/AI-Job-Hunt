@@ -126,6 +126,17 @@ def test_text_values_are_cleaned(signed_in):
     assert get_settings().application_takeover_ttl_minutes == 30
 
 
+def test_the_langsmith_region_is_offered_and_any_https_address_still_works(signed_in):
+    admin = signed_in(admin=True)
+    region = setting(admin.get(URL).json(), "agent_langsmith_endpoint")
+    assert [c["label"] for c in region["choices"]] == ["US", "EU", "APAC"]
+    view = admin.put(URL, json={"values": {"agent_langsmith_endpoint": "https://apac.api.smith.langchain.com"}}).json()
+    assert setting(view, "agent_langsmith_endpoint")["value"] == "https://apac.api.smith.langchain.com"
+    assert get_settings().agent_langsmith_endpoint == "https://apac.api.smith.langchain.com"
+    admin.put(URL, json={"values": {"agent_langsmith_endpoint": "https://langsmith.example.com/api/"}}).raise_for_status()
+    assert get_settings().agent_langsmith_endpoint == "https://langsmith.example.com/api"  # self-hosted
+
+
 def test_a_langsmith_key_saved_here_is_encrypted_used_and_never_returned(signed_in, monkeypatch):
     monkeypatch.setattr(get_settings(), "secret_key", "test-secret-key-for-encryption")
     admin = signed_in(admin=True)
