@@ -2546,7 +2546,9 @@ Everything below is off unless you turn it on.
   - the page shows no CAPTCHA, code or login, and the form's shape is the one planned for.
 - **When it needs you:** a question with no saved answer, an attestation, a login, a code or CAPTCHA, or a form whose
   Submit button it cannot tell apart. The window opens with the reason on the page; fill it there and press Continue
-  (it checks everything again and submits), or submit it yourself there.
+  (it checks everything again and submits), or submit it yourself there. A CAPTCHA needs no Continue: solve it in the
+  window and the run carries on by itself within a few seconds (`APPLICATION_CHALLENGE_POLL_SECONDS`). Either way the
+  run picks the page up where you left it; it is not reloaded.
 - **Claim and intent:** the run takes the same pre-submit claim Claude Desktop and the Apply kit use, then writes a
   SubmissionIntent. It commits CLICKING just before the click.
 
@@ -2570,8 +2572,10 @@ no per-user sessions and no way to veto an action (docs/architecture/agentic-roa
 
 **Logins.** A login wall, a code or a signup stops the run and, on a local install with
 `BROWSER_USE_HEADLESS=false`, keeps the browser window open for `APPLICATION_TAKEOVER_TTL_MINUTES` (15).
-- **Finishing in the window:** you finish there and press **I'm done — continue** in the Apply kit; the run looks at
-  the page afresh.
+- **Finishing in the window:** you finish there and press **I'm done — continue** in the Apply kit (for a CAPTCHA,
+  solving it is enough); the run looks at the same page afresh, and loads the apply URL again only if the form is no
+  longer there. While a run waits for an answer you give in the Knowledge bank, its browser-use window keeps the form
+  for `APPLICATION_INPUT_HOLD_MINUTES` and fills it in place afterwards.
 - **Signup:** a signup gets a generated password, shown once, so you sign up with exactly that.
 - **Save this login:** stores the password (encrypted, never shown again) and the window's session, for that site
   only.

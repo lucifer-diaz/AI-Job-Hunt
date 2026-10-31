@@ -1542,6 +1542,7 @@ function renderKitTakeover(k) {
   const t = k.execution_takeover, x = k.execution;
   if (!t || !x) return '';
   const fields = t.fields || [], login = ['LOGIN_REQUIRED', 'LOGIN_FAILED', 'OTP_REQUIRED', 'ACCOUNT_REQUIRED'].includes(t.reason);
+  const captcha = ['CAPTCHA_OR_ANTI_BOT', 'NAVIGATOR_CAPTCHA'].includes(t.reason);
   const why = { LOGIN_REQUIRED: 'The site wants you to sign in', LOGIN_FAILED: 'The saved login did not work', OTP_REQUIRED: 'The site sent a one-time code', ACCOUNT_REQUIRED: 'The site wants a new account', CAPTCHA_OR_ANTI_BOT: 'The site shows a CAPTCHA',
     FIELDS_NEED_YOU: `${fields.length} field${fields.length === 1 ? '' : 's'} need${fields.length === 1 ? 's' : ''} you`, NAVIGATOR_UNEXPECTED_PAGE: 'The page needs a look', NAVIGATOR_LEGAL: 'The form asks you to agree to something',
     LEGAL_ATTESTATION: 'The form asks you to agree to something: tick it in the window', SENSITIVE_NOT_CONFIRMED: 'A sensitive answer needs your OK',
@@ -1549,7 +1550,9 @@ function renderKitTakeover(k) {
     || (String(t.reason || '').startsWith('NAVIGATOR_') ? 'The page needs you' : 'The page needs you');
   const list = fields.length ? `<ul class="small mt6" style="margin:6px 0 0 18px">${fields.map(f => `<li class="pretty">${esc(f.label || f.id)}</li>`).join('')}</ul>` : '';
   return `<div class="banner warn mt8"><div class="b">${esc(why)}</div>
-    <div class="small mt4 pretty">${fields.length ? 'The browser window is open with these fields highlighted. Fill them there' + ((k.execution_questions || []).length ? ', or answer the questions below' : '') + ', then press Continue: the page is not reloaded.' : 'Finish it in the browser window Job Hunt OS opened, then continue.'} Kept until ${fmtDateTime(t.expires_at)}. Nothing is submitted from that window unless you do it, and the form can only be sent after you press Start submission (which reserves the posting for you).</div>${list}
+    <div class="small mt4 pretty">${fields.length ? 'The browser window is open with these fields highlighted. Fill them there' + ((k.execution_questions || []).length ? ', or answer the questions below' : '') + ', then press Continue.'
+      : captcha ? 'Solve it in the browser window Job Hunt OS opened: the application continues by itself as soon as it is solved (or press Continue).'
+      : 'Finish it in the browser window Job Hunt OS opened, then press Continue.'} The run picks up that same page: the page is not reloaded. Kept until ${fmtDateTime(t.expires_at)}. ${x.mode === 'GUARDED_AUTO' ? 'Job Hunt OS checks everything again before it submits.' : 'Job Hunt OS never submits from this window; you do.'}</div>${list}
     <div class="row gap8 mt10 wrap">${btn(label('kit-continue', 'I’m done — continue', 'Continuing…'), 'kit-continue', { exec: x.id }, 'sm', isBusy('kit-continue'))}
     ${t.reason === 'ACCOUNT_REQUIRED' ? btn('Sign up with a generated password', 'kit-signup', { exec: x.id }, 'sm') : ''}
     ${login ? btn('Save this login', 'kit-save-login', { exec: x.id }, 'sm ghost') : ''}</div>
@@ -2995,7 +2998,7 @@ const A = {
     await api(`/api/application-executions/${el.dataset.exec}/continue`, { method: 'POST' });
     S.kitSignup = null;
     D.kit = await api(`/api/jobs/${S.kitJob}/apply-kit`);
-  }, 'Continuing: it checks the page again first'),
+  }, 'Continuing in the same page: it checks everything again first'),
   'kit-signup': el => busy('kit-signup', async () => {
     const out = await api(`/api/application-executions/${el.dataset.exec}/signup`, { method: 'POST' });
     S.kitSignup = { exec: Number(el.dataset.exec), domain: out.domain, username: out.username, password: out.password };

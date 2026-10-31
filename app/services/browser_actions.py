@@ -216,7 +216,8 @@ def navigate(session: Any, run: Run, propose: Callable[[Any], BrowserActionPropo
     steps = REVEAL_STEPS if reveal_only else max_actions
     empty = ApplicationForm(adapter=generic.NAME, host="", fields=[], submit=ats_forms.SubmitControl(present=False))
     for number in range(1, steps + 1):
-        problem = ats_forms.page_problem(observation.get("html") or "", title=observation.get("title"))
+        problem = ats_forms.page_problem(observation.get("html") or "", title=observation.get("title"),
+                                     captcha=observation.get("captcha"))
         if problem:
             result.outcome, result.code = ("NEEDS_HUMAN" if problem in ats_forms.HUMAN_BLOCKERS else "BLOCKED"), \
                 problem

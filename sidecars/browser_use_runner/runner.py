@@ -141,6 +141,39 @@ RESTORE_STORAGE_JS = """(items) => {
 }"""
 FILE_NAMES_JS = "(el) => Array.from(el.files || []).map(f => f.name)"
 FILE_SIZES_JS = "(el) => Array.from(el.files || []).map(f => f.size)"
+# A challenge widget a person must answer, per frame: a visible checkbox iframe of reCAPTCHA (v2 / Enterprise), hCaptcha
+# or Turnstile, and whether its response field is filled. Invisible widgets (reCAPTCHA v3, `size=invisible`) are left
+# out: the site runs them itself when the form is sent, and no person can answer them. Returns kinds and booleans only;
+# the response token never leaves the page.
+CAPTCHA_JS = r"""() => {
+  const shown = el => { const r = el.getBoundingClientRect(); return r.width > 20 && r.height > 20; };
+  const kinds = [
+    ["recaptcha", /\/recaptcha\/(api2|enterprise)\/anchor/, 'textarea[name="g-recaptcha-response"], textarea[id^="g-recaptcha-response"]'],
+    ["hcaptcha", /hcaptcha\.com\/.*frame=checkbox/, 'textarea[name="h-captcha-response"], textarea[name="g-recaptcha-response"]'],
+    ["turnstile", /challenges\.cloudflare\.com\//, 'input[name="cf-turnstile-response"]'],
+  ];
+  // Each widget is judged on its own response field: the one in its nearest container. A container holding several
+  // widgets' fields is ambiguous and counts as unanswered; with one widget and one field on the page, that field.
+  const fieldOf = (widget, response, widgets, all) => {
+    for (let node = widget.parentElement, depth = 0; node && depth < 6; node = node.parentElement, depth++) {
+      const inside = node.querySelectorAll(response);
+      if (inside.length === 1) return inside[0];
+      if (inside.length > 1) return null;
+    }
+    return widgets.length === 1 && all.length === 1 ? all[0] : null;
+  };
+  const found = [];
+  for (const [kind, source, response] of kinds) {
+    const widgets = Array.from(document.querySelectorAll('iframe'))
+      .filter(f => source.test(f.src || '') && !/size=invisible/.test(f.src || '') && shown(f));
+    const all = Array.from(document.querySelectorAll(response));
+    for (const widget of widgets) {
+      const field = fieldOf(widget, response, widgets, all);
+      found.push({kind, solved: !!field && (field.value || '').length > 0});
+    }
+  }
+  return found;
+}"""
 FORM_INPUTS_JS = """() => Array.from(document.querySelectorAll('form input, form select, form textarea'))
   .filter(e => !['hidden', 'search', 'submit', 'button'].includes((e.getAttribute('type') || '').toLowerCase()))
   .length"""
@@ -399,8 +432,22 @@ class Runner:
             pass
         html = (await page.content())[:MAX_HTML] if args.get("html") else ""
         return {"url": page.url, "title": await page.title(), "elements": elements, "text": text, "html": html,
+                "captcha": await self._captcha(page),
                 "attached": {k: n for k, n in self.attached.items() if k not in mapped},
                 "blocked_requests": self.blocked, "blocked_navigations": self.navigation_blocked}
+
+    async def _captcha(self, page: Any) -> dict[str, Any]:
+        """{present, solved, kind}: whether a challenge a person must answer is on the page (in any frame: an embedded
+        board puts it in its own iframe), and whether every one of them has been answered, each on its own field."""
+        found: list[dict[str, Any]] = []
+        for frame in page.frames:
+            try:
+                found += await frame.evaluate(CAPTCHA_JS)
+            except Exception:  # noqa: BLE001, S112  a frame navigating or gone
+                continue
+        if not found:
+            return {"present": False, "solved": False, "kind": None}
+        return {"present": True, "solved": all(bool(f.get("solved")) for f in found), "kind": str(found[0]["kind"])}
 
     def _element(self, key: str) -> dict[str, Any]:
         element = self.elements.get(str(key))
@@ -658,6 +705,11 @@ class Runner:
     async def login_submit(self, args: dict[str, Any]) -> dict[str, Any]:
         return await self._signed_click(args, "LOGIN")
 
+    async def challenge(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Only whether a CAPTCHA is on the page and answered (booleans): cheap enough to ask every few seconds while
+        a person has the window, and it leaves the element map alone."""
+        return await self._captcha(await self._page())
+
     async def evidence(self, args: dict[str, Any]) -> dict[str, Any]:
         page = await self._page()
         inputs = 0
@@ -671,7 +723,7 @@ class Runner:
         except Exception:  # noqa: BLE001
             pass
         return {"url": page.url, "title": await page.title(), "responses": list(self.responses),
-                "form_inputs": inputs, "text": text}
+                "form_inputs": inputs, "text": text, "captcha": await self._captcha(page)}
 
     async def set_takeover(self, args: dict[str, Any]) -> dict[str, Any]:
         self.takeover = bool(args.get("on"))
@@ -679,6 +731,8 @@ class Runner:
         self.takeover_writes = self.takeover and bool(args.get("writes"))
         if self.takeover:
             self.deadline = time.monotonic() + float(args.get("seconds") or 900)
+        elif args.get("seconds"):  # kept for the same run's next step (no takeover): only its lifetime grows
+            self.deadline = max(self.deadline, time.monotonic() + float(args["seconds"]))
         return {"takeover": self.takeover, "writes": self.takeover_writes}
 
     async def storage_state(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -715,7 +769,7 @@ class Runner:
 
 COMMANDS = ("health", "open", "goto", "observe", "read", "fill", "select", "check", "upload", "click", "choose",
             "point", "unpoint", "scroll",
-            "login_fill", "login_submit", "submit", "evidence", "set_takeover", "storage_state", "close")
+            "login_fill", "login_submit", "submit", "evidence", "challenge", "set_takeover", "storage_state", "close")
 
 
 def _reply_channel() -> Any:

@@ -106,15 +106,23 @@ def with_fingerprint(form: ApplicationForm) -> ApplicationForm:
     return form.model_copy(update={"fingerprint": fingerprint(form.fields)})
 
 
-def page_problem(html: str, *, status: int | None = None, title: str | None = None) -> str | None:
+def page_problem(html: str, *, status: int | None = None, title: str | None = None,
+                 captcha: dict[str, Any] | None = None) -> str | None:
     """Why this page cannot be filled: a login wall, an OTP prompt, an anti-bot challenge or a closed posting.
-    Uses the same markers JD recovery uses (jd_quality); never retried, never worked around."""
+    Uses the same markers JD recovery uses (jd_quality); never retried, never worked around.
+
+    `captcha` is the browser-use runner's reading of a challenge widget ({present, solved}, booleans only). An unsolved
+    widget is a CAPTCHA wherever it sits (an embedded board's iframe, a long page); one a person solved is not, whatever
+    challenge text stays on the page. Without it (the Playwright pages, JD recovery) the text markers decide."""
     soup = BeautifulSoup(html or "", "html.parser")
     text = soup.get_text(" ", strip=True)
     has_password = soup.find("input", attrs={"type": "password"}) is not None
     lowered = text.lower()
     kind = jd_quality.classify_page(status=status, text=text, title=title, has_password_field=has_password)
-    if kind == jd_quality.CAPTCHA_OR_ANTI_BOT:
+    widget = captcha or {}
+    if widget.get("present") and not widget.get("solved"):
+        return CAPTCHA
+    if kind == jd_quality.CAPTCHA_OR_ANTI_BOT and not (widget.get("present") and widget.get("solved")):
         return CAPTCHA
     if soup.find("input", attrs={"autocomplete": "one-time-code"}) is not None or (
             len(lowered) < 4000 and any(marker in lowered for marker in OTP_MARKERS)):

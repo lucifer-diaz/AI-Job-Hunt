@@ -303,8 +303,8 @@ def wake_waiting(db: Session, user_id: int) -> int:
 
 
 def continue_after_takeover(db: Session, task_id: int) -> ApplicationExecutionTask:
-    """The person finished in the kept window (logged in, entered the code, signed up): the run resumes and re-observes
-    the page, revalidating everything before it acts. Commits."""
+    """The person finished in the kept window (logged in, entered the code, solved a CAPTCHA, filled fields): the run
+    resumes in that same page while it is open, revalidating everything before it acts. Commits."""
     task = db.get(ApplicationExecutionTask, task_id)
     if task is None:
         raise ExecutionRefused("Execution not found", "NOT_FOUND")
@@ -316,6 +316,129 @@ def continue_after_takeover(db: Session, task_id: int) -> ApplicationExecutionTa
     wake(db, task)
     db.commit()
     return task
+
+
+# Takeovers a person settles in the window by answering a CAPTCHA: the run continues by itself once it is answered.
+CHALLENGE_REASONS = ("CAPTCHA_OR_ANTI_BOT", "NAVIGATOR_CAPTCHA")
+_watching: dict[tuple[int, int], Any] = {}
+_widget_seen: set[tuple[int, int]] = set()  # windows where a challenge widget was seen while it waited
+
+
+def _answered(key: tuple[int, int], reading: Any) -> bool:
+    """Whether the window's challenge is behind the person: its widget reads solved, or a widget seen earlier is gone
+    (solving it removed it, or moved on to the form). The run re-observes and re-validates the page either way; a
+    CAPTCHA only the page text named (no widget ever seen) still waits for Continue."""
+    if not isinstance(reading, dict):
+        return False
+    if reading.get("present"):
+        _widget_seen.add(key)
+        return bool(reading.get("solved"))
+    return key in _widget_seen
+
+
+def _watched(user_id: int, task_id: int) -> bool:
+    """A watcher is running for this window (one whose loop closed before it ran does not count)."""
+    running = _watching.get((user_id, task_id))
+    return running is not None and not running.done()
+
+
+def challenge_solved(db: Session, user_id: int, task_id: int) -> bool | None:
+    """The window of this task reports its CAPTCHA answered: continue the run as the Continue button would (marked
+    `continued_by: window`). True: woken. None: not settled yet (the run is still handing the window over), ask again.
+    False: nothing to continue (another reason, already continued, ended). Commits when it wakes."""
+    task = db.get(ApplicationExecutionTask, task_id)
+    if task is None or task.user_id != user_id:
+        return False
+    if task.status == PROCESSING:
+        return None
+    waiting = dict(task.interrupt or {})
+    if task.status != PENDING or task.stage != "NEEDS_HUMAN" or not waiting.get("takeover") \
+            or waiting.get("reason") not in CHALLENGE_REASONS or waiting.get("continued"):
+        return False
+    waiting.update(continued=True, continued_by="window")
+    task.interrupt = waiting
+    woken = wake(db, task)
+    db.commit()
+    return woken
+
+
+def watch_challenge(sessions: Callable[[], Session], user_id: int, task_id: int) -> None:
+    """Ask the window handed over for a CAPTCHA, every APPLICATION_CHALLENGE_POLL_SECONDS, whether the person answered
+    it (the runner's booleans; never the answer), and continue the run as soon as they have: a solved reCAPTCHA lasts
+    about two minutes, longer than a scheduler pass. Runs on the loop the session lives on, until the window is no
+    longer handed over. Never raises; one watcher per window."""
+    try:
+        from app.infrastructure.application_browser.browser_use_sidecar import get_sidecars
+        from app.services import threads
+
+        manager = get_sidecars()
+        loop = getattr(manager, "loop", None)
+        if loop is None or loop.is_closed() or _watched(user_id, task_id):
+            return
+
+        def settle() -> bool | None:
+            with sessions() as db:
+                db.info["user_id"] = user_id
+                return challenge_solved(db, user_id, task_id)
+
+        async def poll() -> None:
+            try:
+                while True:
+                    await asyncio.sleep(max(1, get_settings().application_challenge_poll_seconds))
+                    session = manager.get(user_id, task_id)
+                    if session is None or session.parked_until is None:
+                        return
+                    try:
+                        reading = await session.call("challenge", timeout=15, record=False)
+                    except Exception:  # a busy or navigating page: ask again
+                        log.debug("CAPTCHA window of execution %s did not answer", task_id, exc_info=True)
+                        continue
+                    if not _answered((user_id, task_id), reading):
+                        continue
+                    done = await threads.run_io(settle)
+                    if done is not None:
+                        return
+            finally:
+                _watching.pop((user_id, task_id), None)
+                _widget_seen.discard((user_id, task_id))
+
+        _watching[(user_id, task_id)] = asyncio.run_coroutine_threadsafe(poll(), loop)
+    except Exception:  # the Continue button and the scheduler pass still work
+        log.warning("could not watch the CAPTCHA window of execution %s", task_id, exc_info=True)
+
+
+def watch_challenges(db: Session, limit: int = 20) -> int:
+    """Each scheduler pass, for windows still waiting at a CAPTCHA: continue the ones the person answered (the same
+    as `watch_challenge`, when no watcher is running). Never raises."""
+    try:
+        from app.infrastructure.application_browser.browser_use_sidecar import get_sidecars
+
+        manager = get_sidecars()
+        windows = manager.handed_over()[:limit]
+    except Exception:  # noqa: BLE001
+        return 0
+    woken, account = 0, db.info.get("user_id")
+    for user_id, task_id in windows:
+        if account not in (None, user_id) or _watched(user_id, task_id):
+            continue
+        db.info["user_id"] = user_id
+        try:
+            task = db.get(ApplicationExecutionTask, task_id)
+            if task is None or task.user_id != user_id or task.status != PENDING \
+                    or (task.interrupt or {}).get("reason") not in CHALLENGE_REASONS:
+                continue
+            session = manager.get(user_id, task_id)
+            reading = manager.run_threadsafe(session.call("challenge", timeout=15, record=False), timeout=20) \
+                if session is not None else None
+            if _answered((user_id, task_id), reading) and challenge_solved(db, user_id, task_id):
+                woken += 1
+                _widget_seen.discard((user_id, task_id))
+        except Exception:  # one window never stops the others, nor the pass
+            db.rollback()
+            log.warning("could not check the CAPTCHA window of execution %s", task_id, exc_info=True)
+        finally:
+            db.info["user_id"] = account
+    return woken
 
 
 def end_expired_takeovers(db: Session, now: datetime | None = None, limit: int = 200) -> int:

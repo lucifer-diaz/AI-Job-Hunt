@@ -199,6 +199,14 @@ CONFIG: dict[str, Config] = {c.name: c for c in (
            "When a run needs you, the browser window stays open this long; then the run ends and waits for a retry.",
            "int", (Choice("5", "5 minutes", ""), Choice("15", "15 minutes", ""), Choice("30", "30 minutes", ""),
                    Choice("60", "1 hour", ""), Choice("120", "2 hours", "")), low=1, high=240),
+    Config("application_challenge_poll_seconds", "applications", "How often a CAPTCHA window is checked",
+           "After you solve a CAPTCHA in the window, the application continues by itself; the window is checked this "
+           "often (a solved CAPTCHA lasts about two minutes).", "int",
+           (Choice("3", "3 seconds", ""), Choice("5", "5 seconds", ""), Choice("10", "10 seconds", "")), low=2, high=30),
+    Config("application_input_hold_minutes", "applications", "How long a read form waits for your answer",
+           "While a run waits for an answer you give in the Knowledge bank, its browser-use window keeps the form so "
+           "it is filled in place afterwards. Past this, the form is read again.", "int",
+           (Choice("15", "15 minutes", ""), Choice("60", "1 hour", ""), Choice("120", "2 hours", "")), low=1, high=240),
     Config("application_max_actions", "applications", "Most browser actions per run",
            "Fills, uploads and clicks one run may make, whoever proposes them. A run that needs more stops.", "int",
            low=10, high=300),

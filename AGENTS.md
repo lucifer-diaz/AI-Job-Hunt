@@ -751,8 +751,21 @@ ADR-035). The rules a change has to keep:
     confirmed (`ConfirmationVerifier`): the run's own open claim is resolved as submitted, anything else is a
     `reported` submission; the run ends `SUBMITTED_IN_WINDOW`. It works as the window's own account.
   * The task waits PENDING at NEEDS_HUMAN, not claimable, until the person continues
-    (`continue_after_takeover`).
-  * Then the run re-observes the page from its apply URL and re-validates everything. It never replays an old action.
+    (`continue_after_takeover`), on the same thread: every step, SUBMIT included, pauses through `wait` and resumes at
+    its `resume_at`. A run that hands over a window never ends and starts again.
+  * Then the run picks the page up where the person left it (`resume_in_place`, set by `_park_or_close`; no reload, so
+    a solved CAPTCHA, a sign-in and typed fields survive), observes it afresh and re-validates everything. It loads
+    the apply URL again only when the planned form is no longer on that page or the window is gone. It never replays
+    an old action.
+  * **A CAPTCHA is the person's, and the run continues once it is answered.** The runner reports a challenge widget as
+    booleans only (`captcha: {present, solved, kind}`, every frame, constant JavaScript; never the token; invisible
+    v3 widgets are not a challenge), and `ats_forms.page_problem(captcha=…)` lets it decide over page text. While a
+    window waits at a CAPTCHA, `watch_challenge` asks it every `APPLICATION_CHALLENGE_POLL_SECONDS` (a scheduler pass
+    does the same as a fallback, `watch_challenges`) and continues the run when it is answered (`continued_by:
+    window`). Nothing ever solves, clicks or retries a challenge.
+  * A run waiting for an answer in the Knowledge bank (NEEDS_INPUT, browser-use) keeps the form it read for
+    `APPLICATION_INPUT_HOLD_MINUTES` (`_keep_for_input`: a hold, never a takeover; non-GET stays blocked) and fills it
+    in place after the answer. The ephemeral Playwright page is still read again.
   * An unclaimed takeover ends TAKEOVER_EXPIRED with the shared blocker. Kill closes the window.
 * **Fields the run could not fill are pointed out, not guessed** (`FIELDS_NEED_YOU`, headful browser-use).
   * The runner outlines them with a banner (`point`, constant JavaScript, no click). The interrupt holds field ids and

@@ -407,3 +407,15 @@ def test_autonomous_mode_does_not_exist_and_auto_submit_is_off_by_default():
     assert fresh.login_domains == frozenset()
     assert Settings(_env_file=None, agent_graphs_enabled=True,
                     application_execution_mode="guarded_auto").application_execution_mode_value == "guarded_auto"
+
+
+def test_a_captcha_widget_decides_over_leftover_text():
+    """The runner's reading of a challenge widget (booleans) decides: an unsolved widget is a CAPTCHA however long the
+    page; a solved one is not, whatever challenge text stays. Without a reading, the text markers decide as before."""
+    long_page = "<form><input name=n></form><p>" + "Apply to Acme. " * 600 + "</p>"
+    leftover = "<form><input name=n></form><p>This site is protected by reCAPTCHA</p>"
+    assert page_problem(long_page, captcha={"present": True, "solved": False}) == "CAPTCHA_OR_ANTI_BOT"
+    assert page_problem(long_page) is None  # the text alone never saw the widget
+    assert page_problem(leftover, captcha={"present": True, "solved": True}) is None
+    assert page_problem(leftover) == "CAPTCHA_OR_ANTI_BOT"
+    assert page_problem(leftover, captcha={"present": False, "solved": False}) == "CAPTCHA_OR_ANTI_BOT"
