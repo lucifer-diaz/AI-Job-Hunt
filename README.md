@@ -79,10 +79,13 @@ flowchart LR
     API["FastAPI<br/>backend"]
     MCP["MCP server<br/>(stdio)"]
     Sched["Scheduler<br/>& workers"]
+    Graphs["LangGraph agent graphs<br/>qualification · preparation<br/>application · insights · resume parsing"]
+    LLM["LLM gateway<br/>(LLMClient)"]
     PG[("PostgreSQL<br/>+ pgvector")]
     Files[("Resumes<br/>& packets")]
     LiteLLM["LiteLLM proxy"]
     Models["OpenAI · Anthropic · Gemini<br/>OpenRouter · Ollama"]
+    LangSmith["LangSmith<br/>(optional, metadata only)"]
     Apify["Apify actors"]
     Gmail["Gmail API<br/>(read-only)"]
     Chromium["Headless Chromium<br/>(Playwright)"]
@@ -96,8 +99,14 @@ flowchart LR
     MCP --> PG
     API -- "starts" --> Sched
     Sched -- "tasks · state · telemetry" --> PG
-    Sched -- "prompts" --> LiteLLM
+    Sched -- "runs threads" --> Graphs
+    Graphs -- "checkpoints" --> PG
+    Graphs -- "GatewayChatModel" --> LLM
+    Graphs -. "traces" .-> LangSmith
+    Sched -- "prompts" --> LLM
+    LLM --> LiteLLM
     LiteLLM --> Models
+    LLM -. "direct mode" .-> Models
     Sched -- "job search · research" --> Apify
     Sched -- "application replies" --> Gmail
     Sched -- "JD recovery" --> Chromium
@@ -111,13 +120,24 @@ separate worker service). Every model call goes through the LLM gateway (`LLMCli
 from its configuration and sends it to LiteLLM or straight to the provider. Every third-party call (models, Apify,
 Gmail, job sites) goes through the instrumented client (`external_api`), so it shows up in Monitoring.
 
+**Agent graphs (LangGraph).** Multi-step stages can run as LangGraph graphs (`app/agents/`): qualification (admit,
+recover, parse and rank a job), resume preparation (tailor, check the facts, review, wait for approval), application
+execution, Job Insights research and resume parsing. A graph conducts the existing services; it never writes job
+state itself, and its model calls go through the same LLM gateway (`GatewayChatModel`). The scheduler's workers run
+each graph thread under their task's lease, its checkpoints are kept in PostgreSQL so a run continues after a restart
+or a pause for a person, and traces can be exported to LangSmith (metadata only, off by default). Graphs need
+`AGENT_GRAPHS_ENABLED=true` and PostgreSQL; each one has its own mode (`QUALIFICATION_GRAPH_MODE`,
+`PREPARATION_GRAPH_MODE`, …), and with a graph off its stage runs the same steps without one. See
+[9c. Agent graphs](#9c-agent-graphs-experimental-off-by-default).
+
 | Layer | Stack |
 | --- | --- |
 | Frontend | Server-rendered Jinja pages with a single-page workspace in plain JavaScript (`app/static`), no build step |
 | Backend | Python 3.11+, FastAPI, SQLAlchemy 2, Pydantic v2, Alembic |
 | Data | PostgreSQL (SQLite for local development), pgvector for optional retrieval, local files for resumes and packets |
 | Background work | Built-in asyncio scheduler (`app/scheduler.py`) with PostgreSQL task tables (`FOR UPDATE SKIP LOCKED` leases) |
-| AI | LiteLLM gateway or a direct provider (OpenAI, Anthropic, Gemini, OpenRouter, Ollama), per-worker models with failover; LangGraph for agent graphs |
+| AI | LiteLLM gateway or a direct provider (OpenAI, Anthropic, Gemini, OpenRouter, Ollama), per-worker models with failover |
+| Agent graphs | LangGraph with the PostgreSQL checkpointer, LangChain core (gateway-bound chat model), optional LangSmith export |
 | Discovery & research | Apify actors, Lever and Greenhouse imports |
 | Browser | Playwright with headless Chromium; optional browser-use runner for application forms |
 | Integrations | Gmail (read-only, OAuth), MCP server for Claude Desktop, Google ADK agent (`job_hunt_agent`) |
