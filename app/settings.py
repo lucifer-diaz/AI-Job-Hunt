@@ -230,6 +230,10 @@ class Settings(BaseSettings):
     # RESUME_PARSE_GRAPH_MODE: on (default; each task runs as a LangGraph thread, app.agents.resume_parsing, when
     # AGENT_GRAPHS_ENABLED and PostgreSQL allow it) or off (the same steps run in sequence without a graph).
     resume_parse_graph_mode: str = "on"
+    # RESUME_EXTRACTION_V2: read uploaded PDFs with app.services.resume_extraction (PDFium, which honours the
+    # /ActualText some producers write for ligature glyphs, line-break hyphen joining and a quality report) instead
+    # of pypdf. Off by default; off, extraction is exactly as before. Job description files are read the same way.
+    resume_extraction_v2: bool = False
     # Re-rank qualified jobs once their description has been parsed. Off by default: parsing a backlog would
     # otherwise start a round of ranking calls.
     jd_rerank_after_parse: bool = False

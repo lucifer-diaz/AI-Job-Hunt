@@ -135,3 +135,14 @@ def test_the_cli_scores_the_suite_and_reports_it_blocked_until_the_targets_are_m
     proc = subprocess.run([sys.executable, "scripts/agent_eval.py", "--suite", "resume_extraction", *flag],
                           capture_output=True, text=True, cwd=ROOT, timeout=300, check=False)
     assert "resume_extraction" in proc.stdout and proc.returncode in (0, 1), proc.stderr[-2000:]
+
+
+def test_v2_reads_the_actualtext_pdfs_without_errors_and_keeps_the_hard_gates():
+    ds = dataset_for("resume_extraction")
+    current = SUITES["resume_extraction"](ds, {}).metrics
+    v2 = SUITES["resume_extraction"](ds, {"resume_pipeline": "v2"}).metrics
+    assert v2["cer_actualtext"] == 0.0 < current["cer_actualtext"]
+    assert v2["cer"] < current["cer"] and v2["bullets_intact"] > current["bullets_intact"]
+    assert v2["field_recall"] >= current["field_recall"] and v2["field_precision"] >= current["field_precision"]
+    assert v2["valid_words_altered"] == 0 and v2["hallucinated_values"] == 0
+    assert v2["quality_routing"] == 1.0 and current["quality_routing"] is None

@@ -7,8 +7,9 @@
                 (`--with-real-resumes`); never committed
 
 A pipeline is three functions (`Pipeline`): read a document (its raw text layer and its final text), repair a text
-layer, and structure a text. `current` is exactly what an upload does today: pypdf + text_repair.repair_glyphs +
-clean_raw_text, then structured_resume.parse_deterministic (the AI parser needs a model and is scored separately).
+layer, and structure a text; optionally a fourth that routes it (the quality report). `current` is exactly what an
+upload does today: pypdf + text_repair.repair_glyphs + clean_raw_text, then structured_resume.parse_deterministic
+(the AI parser needs a model and is scored separately). `v2` is RESUME_EXTRACTION_V2 (app.services.resume_extraction).
 
 Metrics, all computed against the hand-written ground truth, never against another extractor:
 
@@ -50,6 +51,7 @@ class Pipeline:
     read: Callable[[str, bytes], tuple[str, str]]  # (kind, bytes) → (raw text layer, final text)
     repair: Callable[[str], str]  # raw text layer → final text
     structure: Callable[[str], dict[str, Any]]  # final text → StructuredResumeIn-shaped data
+    route: Callable[[str, bytes], str] | None = None  # (kind, bytes) → quality route (clean / suspicious / poor)
 
 
 def _current_read(kind: str, data: bytes) -> tuple[str, str]:
@@ -80,7 +82,34 @@ def _current_structure(text: str) -> dict[str, Any]:
     return parse_deterministic(text)
 
 
-PIPELINES: dict[str, Pipeline] = {"current": Pipeline(_current_read, _current_repair, _current_structure)}
+def _v2_read(kind: str, data: bytes) -> tuple[str, str]:
+    from app.services.resume_extraction import pipeline
+    from app.services.structured_resume import clean_raw_text
+
+    out = pipeline.extract(kind, data)
+    return out.text_layer, clean_raw_text(out.text)
+
+
+def _v2_repair(text: str) -> str:
+    from app.services.resume_extraction.normalize import normalize
+    from app.services.structured_resume import clean_raw_text
+    from app.services.text_repair import repair_glyphs
+
+    return clean_raw_text(repair_glyphs(normalize(text)))
+
+
+def _v2_route(kind: str, data: bytes) -> str:
+    from app.services.resume_extraction import pipeline
+
+    return pipeline.extract(kind, data).quality.route
+
+
+PIPELINES: dict[str, Pipeline] = {
+    "current": Pipeline(_current_read, _current_repair, _current_structure),
+    "v2": Pipeline(_v2_read, _v2_repair, _current_structure, _v2_route),
+}
+# The quality route each fixture variant should get: the file's mapping is broken, or it is not.
+EXPECTED_ROUTE = {"clean": ("clean",), "actualtext": ("clean",), "broken": ("suspicious", "poor")}
 
 
 # ───────────── ground truth ─────────────
@@ -330,7 +359,8 @@ def run(ds: Dataset, ctx: dict[str, Any]) -> SuiteResult:
                 "bad_corrections": wrong[:5]}
 
     for key, path, kind, resume, variant in docs:
-        layer, final = pipeline.read(kind, path.read_bytes())
+        data = path.read_bytes()
+        layer, final = pipeline.read(kind, data)
         expected = tokens("\n".join(document_lines(resume)))
         out = add_text(variant, expected, tokens(layer), tokens(final))
         s = score_structure(resume, pipeline.structure(final), final)
@@ -340,6 +370,9 @@ def run(ds: Dataset, ctx: dict[str, Any]) -> SuiteResult:
         out.update({"recall": _rate(s["facts_correct"], s["facts_expected"]), "missing": s["missing"][:6],
                     "misfiled": s["misfiled"][:6], "hallucinated": s["hallucinated"][:6],
                     "unrecognized_dropped": s["unrecognized_dropped"]})
+        if pipeline.route is not None and kind == "application/pdf" and variant in EXPECTED_ROUTE:
+            out["route"] = pipeline.route(kind, data)
+            totals.update({"routed": 1, "routed_right": out["route"] in EXPECTED_ROUTE[variant]})
         ok = (not out["wrong_words"] and not out["altered"] and s["facts_correct"] == s["facts_expected"]
               and s["facts_produced"] == s["facts_expected"] and not s["hallucinated"])
         cases.append({"key": key, "ok": ok, "outputs": out})
@@ -364,5 +397,6 @@ def run(ds: Dataset, ctx: dict[str, Any]) -> SuiteResult:
         "hallucinated_values": totals["hallucinated"],
         "unrecognized_dropped": totals["unrecognized_dropped"],
         "bullets_intact": _rate(totals["bullets_intact"], totals["bullets"]),
+        "quality_routing": _rate(totals["routed_right"], totals["routed"]),  # None: the pipeline routes nothing
     }
     return SuiteResult("resume_extraction", ds.identity(), metrics, cases)

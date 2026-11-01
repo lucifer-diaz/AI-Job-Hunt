@@ -1,6 +1,6 @@
 {
  "name": "resume_extraction",
- "version": 1,
+ "version": 2,
  "description": "Resume extraction: synthetic resumes (resumes.json, hand-written) rendered by scripts/build_resume_fixtures.py to PDF in four layouts (clean, ligature ToUnicode broken, broken with /ActualText), DOCX and TXT; plus hand-written text-layer corruption cases. Scores the text a pipeline extracts and the structure it parses against the hand-written ground truth.",
  "fixture": {
   "resumes_sha256": "d55140874c2d3cdc3b94eb94ac051d9018a2dd8586a20bcb3360fcca35a4da2b"
@@ -364,6 +364,19 @@
    },
    "outputs": {
     "text": "Ran production systems for real-time analytics and optimization."
+   }
+  },
+  {
+   "key": "text-digit-glyph",
+   "metadata": {
+    "format": "text",
+    "what": "a ligature read as a digit or a capital that varies by export: ti -> 5, tf -> G (seen in a real Pages/Calibri export)"
+   },
+   "inputs": {
+    "text_layer": "Delivered Solu5ons for opera5ons teams, cut crea5on 5me in half and launched a Marke5ng PlaGorm."
+   },
+   "outputs": {
+    "text": "Delivered Solutions for operations teams, cut creation time in half and launched a Marketing Platform."
    }
   }
  ]

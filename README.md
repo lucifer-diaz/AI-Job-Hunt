@@ -2785,6 +2785,17 @@ English words (a bundled word list, `app/services/data/`), and replaces only wor
 back unchanged; a glyph that came out as an ordinary letter cannot be detected. Upload a file again to get a repaired
 version of a resume read before this existed.
 
+With `RESUME_EXTRACTION_V2=true` (off by default) a PDF is read by `app/services/resume_extraction/` instead: PDFium
+(`pypdfium2`) rather than pypdf, because PDFium honours the `/ActualText` that producers such as Apple Pages write
+beside a ligature glyph whose mapping is broken, so "Kafka" no longer reads "Kaga". Lines are rebuilt from the
+characters' positions (each word keeps its page, box and font for later stages), a word a line break split is joined
+only when the joined word is known and its halves are not ("optimiza-" / "tion"; "real-" / "time" keeps its hyphen),
+and only artefact characters are normalised (ligature and full-width forms, odd spaces; never NFKC, which would turn
+"m²" into "m2"). A quality report routes each file `clean`, `suspicious`, `poor` or `no_text` from counts alone
+(unknown lower-case words, broken-glyph suspects, unmapped characters). The glyph repair above still runs after it.
+Measure any change with `python scripts/agent_eval.py --suite resume_extraction --resume-pipeline v2`
+(`docs/resume-extraction-plan.md`, `docs/evals/`).
+
 ### AI structuring of uploads
 
 The regex parser structures an upload at once, but it guesses at layouts (a header that names the employer before the

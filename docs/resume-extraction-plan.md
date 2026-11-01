@@ -1,6 +1,6 @@
 # Resume extraction V2: Phase 0 findings and plan
 
-Status: **Phase 1 done (eval harness + baseline); Phase 2 next.** Agreed decisions are in section 10; where they differ from the
+Status: **Phases 1 – 2 done; Phase 3 (sections + persistence) next.** Agreed decisions are in section 10; where they differ from the
 recommendations in sections 5 – 9, section 10 wins.
 
 ## 1. Summary
@@ -274,3 +274,19 @@ position is found, not claimed) and cheaper. Keep a `source_quote` only for summ
   bug it found that content before the first recognised heading is discarded (a whole sidebar), that bullets without
   a "•" character are lost (every DOCX upload on the regex path), and that DOCX tables are not read.
 * `scripts/agent_eval.py` with no `--suite` now reports BLOCKED overall until V2 meets these targets.
+
+### Phase 2: text layer + quality (done)
+
+* `app/services/resume_extraction/`: `text_layer` (PDFium words with page, box, font, bold and glyph height; lines
+  rebuilt from positions; PDFium's line-break hyphen marker kept as a soft hyphen; pypdf fallback), `normalize`
+  (artefact characters only, never NFKC; line-break words joined on evidence), `quality` (route from unknown lower-case
+  words, broken-glyph suspects and unmapped characters; product names such as "BigQuery" are not suspects), `pipeline`.
+  `document_text.extract` uses it for PDFs when `RESUME_EXTRACTION_V2` is on.
+* Glyph-name repair (fontTools) dropped as planned: ActualText supersedes it, and the real file's glyph names are stripped.
+* Eval (`docs/evals/resume-extraction-phase2.md`): `cer_actualtext` 0.0194 → 0.0, CER 0.0191 → 0.0113 (dataset v2), bullets intact
+  0.83 → 0.93, field precision 0.70 → 0.77, recall 0.36 → 0.40, quality routing 1.0; hard gates stay at 0. Both real
+  PDFs in this install, and the two in `data/real/`, read with no broken word and route `clean`.
+* A real export maps `ti` to the digit 5 and `tf` to G: the confusion table is per export, not per font, and the
+  correction engine (Phase 6) must handle digit glyphs (`text-digit-glyph`, dataset v2).
+* Found on the way: pypdfium2 5 returns char boxes as (left, bottom, right, top); boxes are ink bounds, so letter gaps
+  are no evidence of a space; a comma hangs below the baseline, so a line is a band, not the previous glyph's height.

@@ -269,6 +269,24 @@ The rules a change has to keep:
   tailoring (when on) re-tailors it once the new ranking qualifies it — never from the old resume's analysis, and only
   when its ranking was queued.
 
+## Resume extraction V2 (reading uploaded files)
+
+`app/services/resume_extraction/` (README §11 "Reading the file", `docs/resume-extraction-plan.md`) reads an uploaded
+PDF when `RESUME_EXTRACTION_V2` is on. The rules a change has to keep:
+
+* **Off is the old path, byte for byte.** `document_text.extract` calls the pipeline only for a PDF with the flag on;
+  DOCX and TXT read through `document_text.read_plain` either way (`tests/test_resume_extraction_text_layer.py`).
+* **The text the file states comes first.** PDFium (`text_layer.read_pdfium`) honours `/ActualText`; pypdf is only the
+  fallback for a file PDFium cannot open. Every word keeps its page, box and font: never drop provenance.
+* **Normalise artefacts, never meaning.** `normalize.TABLE` lists the characters that change; no NFKC. A line-break
+  hyphen is removed only when the joined word is known and its halves are not; otherwise the hyphen stays.
+* **Deterministic, local, cheap.** No model, no network and no OCR in this step: it may run in the upload request.
+  The quality report and the log line hold counts, routes and flags, never resume words.
+* **Measured, not assumed.** Run `python scripts/agent_eval.py --suite resume_extraction --resume-pipeline v2`; its
+  hard gates (`valid_words_altered`, `hallucinated_values`) stay at 0. Fixtures are synthetic
+  (`tests/fixtures/resume_extraction/`, rebuilt by `scripts/build_resume_fixtures.py`); a real resume goes only in the
+  gitignored `real/` folder. Bump the dataset's `version` when a case changes.
+
 ## Resume structuring (AI parse of uploads)
 
 `app/services/resume_parsing.py` (queue and steps), `app/agents/resume_parsing.py` (the graph) and

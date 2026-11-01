@@ -3,12 +3,16 @@
 PDF text has its broken ligature glyphs restored (app.services.text_repair) before anything parses it, so the regex
 parser, the AI parser and grounding all read "architecting", not "architecYng". Raises whatever the reader raises for
 an unreadable file; callers turn that into their own message.
+
+With RESUME_EXTRACTION_V2 on, a PDF is read by app.services.resume_extraction instead (PDFium, which honours the
+/ActualText some producers write for ligatures, plus line-break hyphen joining); off, the path below is unchanged.
 """
 from __future__ import annotations
 
 from io import BytesIO
 
 from app.services.text_repair import repair_glyphs
+from app.settings import get_settings
 
 PDF, DOCX, TXT = ("application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                   "text/plain")
@@ -17,9 +21,18 @@ PDF, DOCX, TXT = ("application/pdf", "application/vnd.openxmlformats-officedocum
 def extract(kind: str, data: bytes, *, errors: str = "strict") -> str:
     """Raw text (not cleaned: callers run clean_raw_text) of a file of media type `kind`."""
     if kind == PDF:
+        if get_settings().resume_extraction_v2:
+            from app.services.resume_extraction import pipeline
+
+            return pipeline.extract(kind, data, errors=errors).text
         from pypdf import PdfReader
 
         return repair_glyphs("\n".join(page.extract_text() or "" for page in PdfReader(BytesIO(data)).pages))
+    return read_plain(kind, data, errors=errors)
+
+
+def read_plain(kind: str, data: bytes, *, errors: str = "strict") -> str:
+    """A TXT or DOCX file's text, as written."""
     if kind == TXT:
         return data.decode("utf-8", errors=errors)
     from docx import Document
