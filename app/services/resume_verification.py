@@ -95,10 +95,17 @@ def parse_text(db: Session, resume: Resume) -> str:
     return store.parse_text(db, resume)
 
 
+def parse_structured(db: Session, resume: Resume) -> dict[str, Any]:
+    """The regex parse of a version: from its parse view when it was read with V2, else from its raw text."""
+    from app.services.resume_extraction import store
+
+    return store.parse(db, resume)
+
+
 def ensure_structured(db: Session, resume: Resume) -> dict[str, Any]:
     """Structured data for a version, parsing it deterministically the first time (e.g. migrated versions)."""
     if resume.structured_data is None:
-        resume.structured_data = materialize(sr.parse_deterministic(parse_text(db, resume)))
+        resume.structured_data = materialize(parse_structured(db, resume))
         resume.parser, resume.parser_version = "deterministic", sr.PARSER_VERSION
         db.flush()
         record(db, resume, "*", "PARSE", "PARSER", new={"parser": resume.parser, "version": resume.parser_version,
@@ -520,8 +527,12 @@ def verify_section(db: Session, resume: Resume, section: str, source: str = "USE
 
 def verify_resume(db: Session, resume: Resume, user_id: int | None) -> Resume:
     """Mark the whole resume VERIFIED. Every unit in the required sections must be VERIFIED or REJECTED."""
+    from app.services.resume_extraction import store
+
     data = ensure_structured(db, resume)
-    blocking = blocking_items(data)
+    # A heading no table could place must be assigned first: its lines may belong to any section.
+    blocking = [{"item_id": f"section:{s['line']}", "label": f"Heading \u201c{s['text']}\u201d: choose its section"}
+                for s in store.unplaced(db, resume.id)] + blocking_items(data)
     if blocking:
         raise VerificationBlocked(blocking)
     old = resume.verification_status
@@ -678,7 +689,7 @@ def reparse(db: Session, resume: Resume, use_ai: bool = False) -> dict[str, Any]
         resume_parsing.nudge()
         return {"queued": True, "task_id": task.id}
     ensure_structured(db, resume)
-    return compare(db, resume, sr.parse_deterministic(parse_text(db, resume)), parser="deterministic",
+    return compare(db, resume, parse_structured(db, resume), parser="deterministic",
                    parser_version=sr.PARSER_VERSION)
 
 

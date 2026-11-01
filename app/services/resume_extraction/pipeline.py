@@ -15,7 +15,14 @@ from __future__ import annotations
 
 import logging
 
-from app.services.resume_extraction import docx_reader, normalize, quality, sections, structure, text_layer
+from app.services.resume_extraction import (
+    docx_reader,
+    normalize,
+    quality,
+    sections,
+    structure,
+    text_layer,
+)
 from app.services.resume_extraction.models import Extraction, LineInfo, TextLayer
 from app.services.text_repair import repair_glyphs
 
@@ -24,14 +31,15 @@ log = logging.getLogger("jobhunt.resume_extraction")
 PDF = "application/pdf"
 
 
-def extract(kind: str, data: bytes, *, errors: str = "strict") -> Extraction:
-    """`Extraction.text` is raw text in document_text's sense: callers still run clean_raw_text."""
+def extract(kind: str, data: bytes, *, errors: str = "strict", learned: dict[str, str] | None = None) -> Extraction:
+    """`Extraction.text` is raw text in document_text's sense: callers still run clean_raw_text. `learned` is the
+    account's own heading choices (store.learned), applied before the synonym table."""
     if kind == PDF:
         layer = text_layer.read(data)
         raw = layer.text
         text = repair_glyphs(normalize.normalize(raw))
         report = quality.assess(raw, layer.flags, layer)
-        out = _structured(Extraction(text=text, text_layer=raw, quality=report, layer=layer))
+        out = _structured(Extraction(text=text, text_layer=raw, quality=report, layer=layer), learned=learned)
         log.info("resume text read: source=%s pages=%d words=%d route=%s flags=%s sections=%s", layer.source,
                  len(layer.pages), report.words, report.route, report.flags,
                  [f"{s['kind']}:{s['method']}" for s in out.sections])
@@ -42,18 +50,21 @@ def extract(kind: str, data: bytes, *, errors: str = "strict") -> Extraction:
         lines = docx_reader.read(data)
         raw = docx_reader.text(lines)
         report = quality.assess(raw, text_layer.flags_of(raw))
-        return _structured(Extraction(text=raw, text_layer=raw, quality=report), sources=lines)
+        return _structured(Extraction(text=raw, text_layer=raw, quality=report), sources=lines, learned=learned)
     raw = document_text.read_plain(kind, data, errors=errors)
-    return _structured(Extraction(text=raw, text_layer=raw, quality=quality.assess(raw, text_layer.flags_of(raw))))
+    return _structured(Extraction(text=raw, text_layer=raw, quality=quality.assess(raw, text_layer.flags_of(raw))),
+                       learned=learned)
 
 
-def _structured(out: Extraction, sources: list[LineInfo] | None = None) -> Extraction:
+def _structured(out: Extraction, sources: list[LineInfo] | None = None,
+                learned: dict[str, str] | None = None) -> Extraction:
     """Sections and the parse view, from the text as it will be stored (after clean_raw_text) so that their line
     numbers are the stored text's."""
     from app.services.structured_resume import clean_raw_text
 
     infos = structure.line_infos(clean_raw_text(out.text), out.layer, sources)
-    headings = sections.detect(infos)
+    headings = sections.detect(infos, learned)
+    out.lines = infos
     out.sections = [h.as_dict() for h in headings]
     out.view = structure.view(infos, headings)
     return out

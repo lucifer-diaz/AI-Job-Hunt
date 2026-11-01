@@ -980,7 +980,10 @@ async def resume_upload(file: UploadFile = File(...), db: Session = Depends(get_
         if resume_parsing.extraction_v2(db, require_user_id(db)):
             from app.services.resume_extraction import pipeline
 
-            extraction = pipeline.extract(file.content_type, data)
+            from app.services.resume_extraction import store as extraction_store
+
+            extraction = pipeline.extract(file.content_type, data,
+                                          learned=extraction_store.learned(db, require_user_id(db)))
             extracted = extraction.text
         else:
             extracted = document_text.extract(file.content_type, data, v2=False)

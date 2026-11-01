@@ -7,6 +7,10 @@ A heading is a short line on its own, without a date, a bar or an e-mail address
     contains a section keyword       "Technical Expertise & Tools", "Relevant Work Experience"   method keyword
     looks like a heading             larger than the body, in capitals, or a Word heading style  method unknown
 
+A person's choices win over all of it: on this resume (`overrides`, line → section, method "person") and, learnt
+from their earlier choices on other resumes, for a heading written the same way (`learned`, method "learned", treated
+like a synonym). "none" means a line is not a heading.
+
 A heading the table cannot place is still a heading: it starts its own section (kind "other") so its lines never run
 on into the section before it, and the person can assign it on review. Without layout (a text file) only the first
 two methods count, since a short line alone is no evidence of a heading.
@@ -24,6 +28,12 @@ from app.services.resume_extraction.models import LineInfo
 KINDS = ("summary", "skills", "experience", "projects", "education", "certifications", "awards", "languages",
          "additional_information")
 OTHER = "other"
+NONE = "none"  # a person's answer for a line taken for a heading: it is not one
+CHOICES = (*KINDS, OTHER, NONE)
+CHOICE_LABELS = {"summary": "Summary", "skills": "Skills", "experience": "Work experience", "projects": "Projects",
+                 "education": "Education", "certifications": "Certifications", "awards": "Awards",
+                 "languages": "Languages", "additional_information": "Additional information",
+                 OTHER: "Other (kept as additional information)", NONE: "Not a section"}
 # What each kind is rendered as for the parser (structured_resume understands these headings).
 LABELS = {"summary": "Summary", "skills": "Skills", "experience": "Experience", "projects": "Projects",
           "education": "Education", "certifications": "Certifications", "awards": "Awards", "languages": "Languages",
@@ -91,9 +101,11 @@ def phrase(text: str) -> str:
     return " ".join(re.sub(r"[^a-z0-9 /]", " ", out).split())
 
 
-def classify(text: str) -> tuple[str, str]:
-    """(kind, method) for a heading's text."""
+def classify(text: str, learned: dict[str, str] | None = None) -> tuple[str, str]:
+    """(kind, method) for a heading's text: the person's earlier choice for it first, then the table."""
     p = phrase(text)
+    if learned and p in learned:
+        return learned[p], "learned"
     if p in _EXACT:
         return _EXACT[p], "synonym"
     for kind, words in KEYWORDS:
@@ -140,7 +152,7 @@ def _caps(text: str) -> bool:
 def _house_style(lines: list[LineInfo], candidates: list[tuple[int, str, str]]) -> tuple[bool | None, float | None]:
     """How this document writes its section headings, learnt from the ones the synonym table knows: in capitals or
     not, and how tall. (None, None) when no such heading has a look to learn from."""
-    known = [lines[i] for i, _, method in candidates if method == "synonym" and (lines[i].size or lines[i].style)]
+    known = [lines[i] for i, _, method in candidates if method in ("synonym", "learned") and (lines[i].size or lines[i].style)]
     if not known:
         return None, None
     caps = sum(_caps(line.text) for line in known) * 2 > len(known)
@@ -156,7 +168,8 @@ def _in_style(line: LineInfo, caps: bool | None, size: float | None) -> bool:
     return not (size and line.size) or abs(line.size - size) <= 0.08 * size
 
 
-def detect(lines: list[LineInfo]) -> list[Heading]:
+def detect(lines: list[LineInfo], learned: dict[str, str] | None = None,
+           overrides: dict[int, str] | None = None) -> list[Heading]:
     """Every section heading, in order.
 
     A synonym is a heading wherever it stands. A keyword or an unknown heading also needs to look like this
@@ -164,11 +177,17 @@ def detect(lines: list[LineInfo]) -> list[Heading]:
     taken for one, and nothing above the first synonym heading is one (the header: "Full Stack Developer")."""
     layout = any(line.size or line.style for line in lines)
     body = _body_size(lines)
-    candidates = [(i, *classify(line.text)) for i, line in enumerate(lines) if _shape(line)]
+    overrides = overrides or {}
+    candidates = [(i, *classify(line.text, learned)) for i, line in enumerate(lines) if _shape(line)]
     caps, size = _house_style(lines, candidates) if layout else (None, None)
     out: list[Heading] = []
     for i, kind, method in candidates:
         line = lines[i]
+        if i in overrides or kind == NONE:
+            continue  # the person decided this line (below), or said a heading written like it is none
+        if method == "learned":
+            out.append(Heading(line=i, text=line.text.strip(), kind=kind, method=method, signal="person"))
+            continue
         styled = _looks_like_heading(line, body) if layout else False
         if method != "synonym":
             if not out:
@@ -179,7 +198,10 @@ def detect(lines: list[LineInfo]) -> list[Heading]:
                 continue  # without layout only a heading written like one counts
         signal = "style" if line.style else "layout" if styled else "text"
         out.append(Heading(line=i, text=line.text.strip(), kind=kind, method=method, signal=signal))
-    return out
+    for i, kind in overrides.items():
+        if kind != NONE and 0 <= i < len(lines) and lines[i].text.strip():
+            out.append(Heading(line=i, text=lines[i].text.strip(), kind=kind, method="person", signal="person"))
+    return sorted(out, key=lambda h: h.line)
 
 
 def section_of(headings: list[Heading], index: int) -> str | None:

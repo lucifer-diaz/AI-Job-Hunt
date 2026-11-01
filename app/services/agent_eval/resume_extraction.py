@@ -94,7 +94,7 @@ def _v2_structure(text: str, context: Any = None) -> dict[str, Any]:
     from app.services.resume_extraction import pipeline
     from app.services.structured_resume import parse_deterministic
 
-    return parse_deterministic(context.view if context is not None else pipeline.parse_view(text))
+    return parse_deterministic(context.view if context is not None else pipeline.parse_view(text), marked=True)
 
 
 def _v2_repair(text: str) -> str:

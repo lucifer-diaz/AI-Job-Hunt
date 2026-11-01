@@ -2800,7 +2800,11 @@ Core Skills, Areas of Expertise, Tech Stack, Career History… —, keywords, an
 bold role title is never a section; an unknown heading starts its own section instead of running on into the one
 before), and roles are assembled from common layouts (employer line then title line, several roles under one
 employer). The result is a *parse view* the regex parser reads, kept with the version in `resume_extractions` with the
-quality report and the section map; the stored text stays what the file says.
+quality report and the section map; the stored text stays what the file says. In Settings → Resumes → Review, "How
+it was read" lists each heading as the file writes it with the section it was put in (Known, Guess, Choose, Yours);
+picking another section reads the resume again with it (filled while nothing is reviewed, else a comparison), a
+heading no table could place must be assigned before the resume can be verified, and each choice is remembered for
+the account's next uploads.
 Measure any change with `python scripts/agent_eval.py --suite resume_extraction --resume-pipeline v2`
 (`docs/resume-extraction-plan.md`, `docs/evals/`).
 

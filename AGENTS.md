@@ -292,6 +292,13 @@ PDF when `RESUME_EXTRACTION_V2` is on. The rules a change has to keep:
   "### Title | Company | …", "- "). An unknown heading starts its own section: lines never run on into a neighbour
   and are never dropped. Only `resume_extraction.store` writes `resume_extractions`; a person's decisions go to
   `resume_extraction_feedback`.
+* **A person's section choice wins, and is learnt by counting.** `store.assign` records the choice (feedback and the
+  record's `overrides`), rebuilds the view from the stored text and its recorded look (never from the file again) and
+  re-parses: the data is filled only while nothing is reviewed or edited (`resume_parsing.untouched`), otherwise the
+  new parse is the usual comparison the person resolves. `store.learned` is the account's own choices, counted per
+  heading as written, applied before the synonym table on its next uploads; never another account's. A view is parsed
+  with `parse_deterministic(..., marked=True)` so headings are not guessed again. A heading no table could place
+  (`unknown`) blocks `verify_resume` until it is assigned.
 * **Measured, not assumed.** Run `python scripts/agent_eval.py --suite resume_extraction --resume-pipeline v2`; its
   hard gates (`valid_words_altered`, `hallucinated_values`) stay at 0. Fixtures are synthetic
   (`tests/fixtures/resume_extraction/`, rebuilt by `scripts/build_resume_fixtures.py`); a real resume goes only in the

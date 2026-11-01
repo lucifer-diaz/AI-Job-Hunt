@@ -409,9 +409,12 @@ def _personal(parsed_name: str, header_lines: list[str]) -> dict[str, Any]:
     return info
 
 
-def parse_deterministic(raw_text: str) -> dict[str, Any]:
-    """Parse resume text into StructuredResumeIn-shaped data without an LLM. Nothing is inferred."""
-    parsed = parse_resume(to_dialect(raw_text))
+def parse_deterministic(raw_text: str, *, marked: bool = False) -> dict[str, Any]:
+    """Parse resume text into StructuredResumeIn-shaped data without an LLM. Nothing is inferred.
+
+    `marked`: the text is a parse view (app.services.resume_extraction.structure) whose sections and roles are already
+    marked, so headings are not guessed again — a line a person said is not a heading stays an ordinary line."""
+    parsed = parse_resume(raw_text if marked else to_dialect(raw_text))
     data: dict[str, Any] = {"personal_information": _personal(parsed.name, parsed.header_lines), "summary": "",
                             "skills": [], "experience": [], "projects": [], "education": [], "certifications": [],
                             "awards": [], "languages": [], "additional_information": []}

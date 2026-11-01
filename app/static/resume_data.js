@@ -190,6 +190,26 @@ function rdSectionCard(section, label, data, progress) {
   const count = list && !editing && value.length ? `<span class="faint small">${value.length}</span>` : '';
   return `<section class="settings-group rd-section" id="rd-section-${section}" data-rd-section="${section}"><div class="row between gap10 wrap mb12"><div class="row gap8"><span class="pill ${tone}" aria-label="${attr(state.state)}">${icon}</span><h3>${esc(label)}</h3>${count}${state.required ? '<span class="xs muted">required</span>' : ''}</div><div class="row gap6 wrap">${buttons}</div></div>${body}</section>`;
 }
+// How the file was read (resume extraction V2): the quality route, and each heading as written with the section it was
+// put in and how. Changing a heading's section re-reads the resume with it (filled while nothing is reviewed, else a
+// comparison). Folded away unless a heading needs a decision; versions read before V2 show nothing.
+const RD_METHOD = { synonym: ['Known', 'good'], keyword: ['Guess', 'warn'], unknown: ['Choose', 'bad'], learned: ['Your earlier choice', 'brand'], person: ['Yours', 'brand'] };
+const RD_ROUTE = { clean: ['Read cleanly', 'good'], suspicious: ['A few words may be misread', 'warn'], poor: ['Many words may be misread', 'bad'], no_text: ['No text found (a scan?)', 'bad'] };
+function rdSectionsPanel(active) {
+  const ex = active.extraction;
+  if (!ex) return '';
+  const locked = rdLocked(), [route, tone] = RD_ROUTE[ex.quality?.route] || ['Read', 'muted'];
+  const rows = ex.sections.map(s => {
+    const [method, mtone] = RD_METHOD[s.method] || [s.method, 'muted'];
+    const options = ex.choices.map(c => `<option value="${attr(c.kind)}" ${c.kind === s.kind && s.method !== 'unknown' ? 'selected' : ''}>${esc(c.label)}</option>`).join('');
+    return `<div class="rd-sec-row${s.method === 'unknown' ? ' needs' : ''}" data-rd-heading="${s.line}"><div class="grow"><strong>${esc(s.text)}</strong>${s.preview ? `<div class="faint small ellipsis">${esc(s.preview)}</div>` : ''}</div>${pill(method, mtone)}<select class="select rd-sec-select" data-act-change="rd-section-assign" data-line="${s.line}" aria-label="Section for ${attr(s.text)}" ${locked ? 'disabled' : ''}>${s.method === 'unknown' ? '<option value="" selected disabled>Choose a section…</option>' : ''}${options}</select></div>`;
+  }).join('') || '<p class="settings-help">No section headings were found: everything was read as one block.</p>';
+  const help = ex.unplaced ? `<div class="settings-notice"><strong>${ex.unplaced} heading${ex.unplaced === 1 ? '' : 's'} need${ex.unplaced === 1 ? 's' : ''} a section</strong><p>The reader could not place ${ex.unplaced === 1 ? 'it' : 'them'}. Choose a section to verify this resume; your choice is remembered for your next uploads.</p></div>` : '';
+  const reasons = (ex.quality?.reasons || []).length ? ` · ${esc(ex.quality.reasons.join(' · '))}` : '';
+  // <small>, not <span>: the details summary turns its <span> (the "+") when open.
+  const title = `<small class="rd-sec-sum"><b>How it was read</b>${pill(route, tone)}<em class="faint">${ex.sections.length} section${ex.sections.length === 1 ? '' : 's'}${ex.unplaced ? ` · ${ex.unplaced} to place` : ''}</em></small>`;
+  return `<details class="settings-details rd-sections" data-settings-details="resume-sections" ${ex.unplaced || SETTING_DETAILS.has('resume-sections') ? 'open' : ''}><summary>${title}<span aria-hidden="true">+</span></summary><div class="settings-details-body">${help}<p class="settings-help mb8">Each heading as the file writes it, and the section its lines were put in. Wrong? Pick another: the resume is read again with it${reasons}.</p><div class="rd-sec-list">${rows}</div></div></details>`;
+}
 // The sections at a glance, sticky while reviewing: jump to one, or add one the parser did not find.
 function rdNav(data, progress) {
   const locked = rdLocked();
@@ -346,8 +366,9 @@ function rdHeader() {
   const verified = active.verification_status === 'VERIFIED';
   const left = p.needs_review || 0;
   const next = !verified && left ? btn(`Review next <span class="rd-count">${left} left</span>`, 'rd-next', {}, 'primary', locked) : '';
+  const unplaced = active.extraction?.unplaced || 0;
   const verify = verified ? btn('✓ Resume verified', 'rd-verify-resume', {}, 'good', true)
-    : btn('Verify resume', 'rd-verify-resume', {}, next ? '' : 'primary', locked || blocking.length > 0);
+    : btn('Verify resume', 'rd-verify-resume', {}, next || unplaced ? '' : 'primary', locked || blocking.length > 0 || unplaced > 0);
   const version = (D.resumeData.versions || []).find(v => v.id === active.id) || active;
   const menu = `<details class="rd-menu"><summary class="btn">More ▾</summary><div class="rd-menu-list">${btn('Re-parse (quick)', 'rd-reparse', { ai: 0 }, 'sm', locked)}${btn('Re-parse with AI', 'rd-reparse', { ai: 1 }, 'sm', locked || !!active.ai_parse?.active)}${version.has_original ? `<a class="btn sm" href="/api/resumes/${active.id}/original">Download original</a>` : ''}</div></details>`;
   const counts = [`${p.counts.VERIFIED} verified`, `${left} require review`, p.counts.EDITED ? `${p.counts.EDITED} edited` : '', p.counts.REJECTED ? `${p.counts.REJECTED} rejected` : ''].filter(Boolean).join(' · ');
@@ -378,7 +399,7 @@ function rdTabBody(data) {
       : '<p class="settings-help">No changes yet.</p>');
   }
   if (rdAwaitingAi(active)) return settingsGroup('Structuring with AI', 'You structure uploads with AI only: the Resume Parser model is reading this resume, and its data shows here when it is done. If the model cannot answer, the quick parse is shown instead.', rdAiParse(active.ai_parse));
-  return `<div class="rd-review">${rdNav(data, active.progress)}${RD_SECTIONS.map(([section, label]) => rdSectionCard(section, label, data, active.progress)).join('')}</div>`;
+  return `${rdSectionsPanel(active)}<div class="rd-review">${rdNav(data, active.progress)}${RD_SECTIONS.map(([section, label]) => rdSectionCard(section, label, data, active.progress)).join('')}</div>`;
 }
 // AI only (Running workers → Resume parsing): a version the model has not structured yet shows no regex data to review.
 const rdAwaitingAi = active => !!(D.resumeData?.ai_only && active?.parser !== 'llm' && active?.ai_parse?.active);
@@ -511,6 +532,13 @@ const RESUME_DATA_ACTIONS = {
     });
   },
   'rd-policy-source': el => rdRun(async () => { D.resumeData = { ...D.resumeData, policy: await api('/api/settings/resume/policy', { method: 'PUT', body: { resume_source: el.value } }) }; }, el.value === 'master_text' ? 'AI now works from the resume text as written' : 'AI now works from your structured resume data'),
+  'rd-section-assign': el => {
+    if (!el.value) return;
+    const active = rdActive();
+    return rdRun(async () => {
+      rdApply(await api(`/api/resumes/${active.id}/sections`, { method: 'POST', body: { line: Number(el.dataset.line), kind: el.value } }));
+    }, () => (rdActive()?.pending_reparse ? 'Read again with that section: compare the changes below' : 'Read again with that section'));
+  },
   'rd-ai-only': el => rdRun(async () => {
     await api('/api/workers/settings', { method: 'PUT', body: { workers: { resume_parsing: { ai_only: el.checked } } } });
     D.resumeData = { ...D.resumeData, ai_only: el.checked };

@@ -372,6 +372,10 @@ class ResumeExtraction(Base):
     quality: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)  # QualityReport.summary()
     sections: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)  # sections.Heading.as_dict()
     parse_view: Mapped[str] = mapped_column(Text, default="")
+    # Each line's look (glyph height, weight, left edge, style, list item, columns), compact, so the view can be
+    # rebuilt from Resume.raw_text when a person assigns a heading; {"<line>": kind or "none"} are those choices.
+    layout: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    overrides: Mapped[dict[str, str]] = mapped_column(JSON, default=dict)
     # Corrections made to the text and values held back for review (Phases 5 – 6); empty until then.
     corrections: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     review: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)

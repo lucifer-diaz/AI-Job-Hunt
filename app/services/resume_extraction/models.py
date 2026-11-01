@@ -123,3 +123,4 @@ class Extraction:
     layer: TextLayer | None = None  # None for formats without layout (TXT)
     sections: list[dict[str, object]] = field(default_factory=list)  # sections.Heading.as_dict(), in order
     view: str = ""  # structure.view: the cleaned text with its structure marked, for the parser
+    lines: list[LineInfo] = field(default_factory=list)  # the cleaned text's lines with their look

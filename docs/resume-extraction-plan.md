@@ -1,6 +1,6 @@
 # Resume extraction V2: Phase 0 findings and plan
 
-Status: **Phases 1 – 3 done; Phase 4 (sections review) next.** Agreed decisions are in section 10; where they differ from the
+Status: **Phases 1 – 4 done; Phase 5 (AI parser on the parse view, grounding, review list) next.** Agreed decisions are in section 10; where they differ from the
 recommendations in sections 5 – 9, section 10 wins.
 
 ## 1. Summary
@@ -311,3 +311,17 @@ position is found, not claimed) and cheaper. Keep a `source_quote` only for summ
   0.769 → 0.936, misfiled 120 → 3, cer_clean 0.0; real resumes: all 7 roles right. Hard gates stay at 0.
 * Fixed on the way: `delete_version` left a pending AI-parse task behind on SQLite (no cascade), which could block a
   later resume reusing the id.
+
+### Phase 4: sections review (done)
+
+* `store.assign` (a person's section for a heading, or "Not a section": feedback row, record overrides, view rebuilt
+  from the stored text and its recorded look, re-parse filled while untouched else a comparison), `store.learned`
+  (counted per heading as written, applied before the synonym table on the account's next uploads),
+  `POST /api/resumes/{id}/sections`; migration 0066 (`layout`, `overrides`). An unplaced heading blocks
+  `verify_resume`. The parser reads a view with `marked=True`, so a line a person said is not a heading stays a line.
+* Settings → Resumes → Review: "How it was read" (quality route, each heading with its first line, Known / Guess /
+  Choose / Yours / Your earlier choice, a section picker), open by itself when a heading needs a section.
+* Eval unchanged by design (no person in it); certifications and awards wrapped in narrow columns are joined:
+  precision 0.950 → 0.954 with the real resumes (synthetic 0.936 → 0.943).
+* Not covered: in a text file an unknown heading is not detected at all, so it cannot be picked from the list (its
+  lines stay where they are written); assigning arbitrary lines is a possible follow-up.

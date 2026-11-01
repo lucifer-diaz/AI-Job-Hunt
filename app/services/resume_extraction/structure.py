@@ -314,7 +314,7 @@ def view(infos: list[LineInfo], headings: list[Heading] | None = None) -> str:
             out += _projects(lines)
         elif heading.kind == "skills":
             out += _skills(lines)
-        elif heading.kind == "education":
+        elif heading.kind in ("education", "certifications", "awards"):
             out += _unwrap_headers([i for i in lines if i.text.strip()])[1]
         else:
             out += [("- " + _text(i)) if i.bullet else _text(i) for i in lines if i.text.strip()]

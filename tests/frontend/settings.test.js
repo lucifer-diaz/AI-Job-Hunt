@@ -703,6 +703,30 @@ describe('resume data', () => {
     ui.rdReset(); ui.render();
     expect(document.querySelector('#rd-detail a[href$="/original"]')).toBeNull();  // no stored file: nothing to download
   });
+  it('shows how the file was read and assigns a heading nobody could place', async () => {
+    let sent;
+    const choices = [['summary', 'Summary'], ['skills', 'Skills'], ['none', 'Not a section']].map(([kind, label]) => ({ kind, label }));
+    const extraction = (method, kind) => ({ source: 'pdfium', quality: { route: 'clean', reasons: [] }, choices, unplaced: method === 'unknown' ? 1 : 0,
+      sections: [{ text: 'Summary', kind: 'summary', method: 'synonym', line: 3, preview: 'Builds platforms' },
+        { text: 'SELECTED WORK', kind, method, line: 9, preview: 'Kafka, Go' }] });
+    const before = detail({ extraction: extraction('unknown', 'other'), progress: { ...detail().progress, blocking: [] } });
+    const after = detail({ extraction: extraction('person', 'skills'), progress: { ...detail().progress, blocking: [] } });
+    await open(before, { 'POST /api/resumes/5/sections': body => { sent = body; return after; } });
+    const panel = document.querySelector('.rd-sections');
+    expect(panel.open).toBe(true);
+    expect(panel.textContent).toContain('1 heading needs a section');
+    expect(document.querySelector('[data-rd-heading="9"]').textContent).toContain('Choose');
+    expect(document.querySelector('[data-act="rd-verify-resume"]').disabled).toBe(true);
+    await ui.A['rd-section-assign']({ value: 'skills', dataset: { line: '9' } }); await settle();
+    expect(sent).toEqual({ line: 9, kind: 'skills' });
+    expect(document.querySelector('[data-rd-heading="9"]').textContent).toContain('Yours');
+    expect(document.querySelector('[data-act="rd-verify-resume"]').disabled).toBe(false);
+    expect(document.querySelector('.rd-sections summary').textContent).not.toContain('to place');
+  });
+  it('shows nothing about reading for a version read before the new reader', async () => {
+    await open(detail({ extraction: null }));
+    expect(document.querySelector('.rd-sections')).toBeNull();
+  });
   it('reviews in one place: skill chips, hidden empty sections, Add section and Review next', async () => {
     const base = detail();
     const structured = { ...base.structured, skills: [{ id: 'skill_py', name: 'Python', category: 'Languages', verification: verification('VERIFIED') }, { id: 'skill_k', name: 'Kafka', category: 'Data', verification: verification('UNVERIFIED') }] };

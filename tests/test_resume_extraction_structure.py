@@ -202,7 +202,8 @@ def test_an_upload_read_with_v2_keeps_its_record_and_is_parsed_from_its_view(use
     detail = client.get(f"/api/settings/resume?resume_id={resume_id}").json()["current"]
     assert detail["extraction"]["quality"]["route"] == "clean"
     assert detail["extraction"]["sections"][0] == {"text": "Areas of Expertise", "kind": "skills", "method": "synonym",
-                                                   "signal": "text", "line": 3}
+                                                   "signal": "text", "line": 3, "preview": "Engineering Leadership,"}
+    assert detail["extraction"]["unplaced"] == 0
 
 
 def test_without_v2_an_upload_has_no_record_and_reads_as_before(user, monkeypatch):
