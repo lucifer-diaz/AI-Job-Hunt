@@ -33,6 +33,8 @@ from sqlalchemy.orm import Session
 from app.models import Job, WorkflowTransition
 from app.services.lifecycle import (
     DEFAULT_RETRYABLE,
+    PERSON,
+    PERSON_ONLY,
     TERMINAL_STATES,
     TRANSITIONS,
     ErrorCategory,
@@ -95,6 +97,9 @@ def transition(db: Session, job: Job, target: object, *, actor: str = "system", 
     """Validate and apply one state change and record it in workflow_transitions. Does not commit."""
     current = job.state
     target_state = validate_transition(current, target, previous_state=job.previous_state)
+    if current is not None and (parse_state(current), target_state) in PERSON_ONLY and actor != PERSON:
+        raise InvalidTransition(parse_state(current), target_state,
+                                f"Only the candidate can move a job from {current} to {target_state}")
     job.state = target_state
     job.previous_state = current
     job.updated_at = now or utcnow()

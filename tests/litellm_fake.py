@@ -30,6 +30,31 @@ def deployment(name: str, model: str, *, model_id: str | None = None, info: dict
             "model_info": {"id": model_id or uuid.uuid4().hex, "db_model": False, **(info or {})}}
 
 
+# What LiteLLM 1.102.1 forwards of a provider's rate-limit headers (litellm/litellm_core_utils/core_helpers.py
+# process_response_headers, llm_response_utils/get_headers.py get_response_headers): every raw header prefixed
+# `llm_provider-`; on a success also the six OpenAI-named x-ratelimit-* headers bare, on a refusal only the four
+# limit/remaining counters bare (no reset, no Retry-After).
+OPENAI_RESPONSE_HEADERS = ("x-ratelimit-remaining-requests", "x-ratelimit-remaining-tokens", "x-ratelimit-limit-requests",
+                           "x-ratelimit-limit-tokens", "x-ratelimit-reset-requests", "x-ratelimit-reset-tokens")
+REFUSAL_BARE = ("x-ratelimit-limit-requests", "x-ratelimit-remaining-requests", "x-ratelimit-limit-tokens",
+                "x-ratelimit-remaining-tokens")
+
+
+def groq_raw(tokens_remaining: int, *, tokens_limit: int = 8000, tokens_reset: str = "7.66s",
+             requests_remaining: int = 999, retry_after: str | None = None) -> dict[str, str]:
+    """The headers Groq itself sends (console.groq.com/docs/rate-limits): requests per DAY, tokens per minute."""
+    raw = {"x-ratelimit-limit-requests": "1000", "x-ratelimit-remaining-requests": str(requests_remaining),
+           "x-ratelimit-reset-requests": "2m59.56s", "x-ratelimit-limit-tokens": str(tokens_limit),
+           "x-ratelimit-remaining-tokens": str(tokens_remaining), "x-ratelimit-reset-tokens": tokens_reset,
+           "x-groq-region": "us-west-1"}
+    return {**raw, **({"retry-after": retry_after} if retry_after else {})}
+
+
+def forwarded(raw: dict[str, str], *, refused: bool = False) -> dict[str, str]:
+    bare = REFUSAL_BARE if refused else OPENAI_RESPONSE_HEADERS
+    return {**{f"llm_provider-{k}": v for k, v in raw.items()}, **{k: v for k, v in raw.items() if k in bare}}
+
+
 class FakeLiteLLM:
     def __init__(self):
         self.deployments = [
@@ -50,6 +75,9 @@ class FakeLiteLLM:
         self.down = False
         self.unavailable: set[str] = set()  # model groups that fail (503) unless the request names fallbacks
         self.rate_limited: set[str] = set()
+        self.rate_limit_messages: dict[str, str] = {}  # model → the provider's 429 text (default: a plain one)
+        self.provider_headers: dict[str, list[dict[str, str]]] = {}  # group → raw provider headers, one per answer
+        self.too_large: set[str] = set()  # groups that refuse every request as Groq does past the whole TPM limit
         self.answers: dict[str, list[Any]] = {}  # model → queued answers (dict → JSON content, str → raw content)
         self.route_tier = "SIMPLE"
         self.spend: dict[str, dict[str, Any]] = {}
@@ -172,8 +200,19 @@ class FakeLiteLLM:
         if router and str(router["litellm_params"].get("model", "")).startswith("auto_router/"):
             group = router["litellm_params"]["complexity_router_config"]["tiers"][self.route_tier]
         attempted = 0
+        queued_raw = self.provider_headers.get(group) or []
+        raw = queued_raw.pop(0) if queued_raw else None
+        if group in self.too_large:  # LiteLLM maps Groq's 413 "Request too large" to its RateLimitError: a 429
+            return self._json(429, {"error": {
+                "message": f"litellm.RateLimitError: RateLimitError: GroqException - Request too large for model "
+                           f"`{group}` in organization `org_x` service tier `on_demand` on tokens per minute (TPM): "
+                           "Limit 8000, Requested 9500, please reduce your message size and try again.",
+                "type": "throttling_error", "param": None, "code": "429"}},
+                headers=forwarded(raw, refused=True) if raw else None)
         if group in self.rate_limited:
-            return self._error(429, "Rate limit reached")
+            return self._json(429, {"error": {"message": self.rate_limit_messages.get(group, "Rate limit reached"),
+                                              "type": "error", "code": "429"}},
+                              headers=forwarded(raw, refused=True) if raw else None)
         if group in self.unavailable:
             fallbacks = body.get("fallbacks") or []
             if not fallbacks:
@@ -198,7 +237,8 @@ class FakeLiteLLM:
                                    "x-litellm-attempted-fallbacks": str(attempted),
                                    "x-litellm-attempted-retries": "0",
                                    "x-litellm-response-duration-ms": "900.5",
-                                   "x-litellm-overhead-duration-ms": "40.2"})
+                                   "x-litellm-overhead-duration-ms": "40.2",
+                                   **(forwarded(raw) if raw else {})})
 
 
 # ───────────── fixtures (import them into a test module to use them) ─────────────

@@ -165,9 +165,10 @@ NODES: tuple[Node, ...] = (
     Node("outcome", "Offer / rejected", (OUTCOME,), "Where an application ended: offer, rejection or closed.",
          "outcome", (2, 2), states=("OFFER", "REJECTED"), screen="tracker"),
     # ── supporting workers ──
-    Node("resume_parser", "Resume parser", (AI,), "Parses uploaded resumes into facts and extracts verifiable "
-         "evidence the Ranker and Tailor may cite.", "support", (5, -1), workers=("RESUME_PARSER", "EVIDENCE_EXTRACTION"),
-         llm_stages=("RESUME_PARSER",), monitoring_tab="llm", screen="settings"),
+    Node("resume_parser", "Resume parser", (AI, ASYNC), "Structures each uploaded resume with the Resume Parser model "
+         "(LangGraph), keeps only what the resume's own text states, and extracts verifiable evidence the Ranker and "
+         "Tailor may cite.", "support", (5, -1), workers=("RESUME_PARSER", "EVIDENCE_EXTRACTION"),
+         llm_stages=("RESUME_PARSER",), monitoring_tab="llm", screen="settings", workers_tab="resume_parsing"),
     Node("compensation", "Compensation", (DET,), "Reads salary from structured posting fields only; the "
          "description is never mined.", "support", (0, -1), screen="discovery"),
     Node("ai_advisor", "AI Optimization Advisor", (AI, ASYNC), "Analyses LLM telemetry and recommends; it never "
@@ -208,14 +209,38 @@ NODES: tuple[Node, ...] = (
          "PREPARATION_GRAPH_MODE is on (or shadow, which only compares).", "support", (3, -1),
          workers_tab="preparation", screen="tailor"),
     # The application worker (app.agents.application, APPLICATION_EXECUTION_MODE): reads an approved job's form,
-    # resolves each answer's source in code and, in assist mode, fills it in an ephemeral browser page. It never
-    # submits and never calls a model, so it is not an AI node; it hands a filled, validated form to you.
-    Node("application_execution", "Application worker", (ASYNC, BROWSER, EXT, DET), "Reads an approved job's "
+    # resolves each answer's source in code and, in assist mode, fills it — on Playwright with a form adapter, or on
+    # the browser-use sidecar, where the Browser Navigator proposes steps Python checks (optional AI). In guarded
+    # mode it may click the final Submit once, behind the pre-submit validator, the shared claim and an intent.
+    Node("application_execution", "Application worker", (ASYNC, BROWSER, EXT, DET, AI), "Reads an approved job's "
          "application form, finds a verified source for every answer (unknown required answers wait for you) and, "
-         "in assist mode, fills it in a private browser page that cannot submit, ending at ready to submit. You "
-         "submit from the Apply kit. Off unless APPLICATION_EXECUTION_MODE is observe or assist.", "support", (1, -1),
-         external=(ExternalMatch("WEB", "application_browser"),), monitoring_tab="external",
+         "in assist mode, fills it in a private browser that cannot submit, ending at ready to submit. A form no "
+         "adapter knows goes to the browser-use backend, where the Browser Navigator proposes each step and code "
+         "checks it. In guarded mode (consenting accounts, allowlisted routes) it may submit once, after the "
+         "pre-submit validator and the shared claim, and records it only on the site's confirmation. Off unless "
+         "APPLICATION_EXECUTION_MODE is observe, assist or guarded_auto.", "support", (1, -1),
+         workers=("BROWSER_NAVIGATOR",), llm_stages=("BROWSER_NAVIGATION",), optional_ai=True,
+         external=(ExternalMatch("WEB", "application_browser"), ExternalMatch("BROWSER_USE"),
+                   ExternalMatch("BROWSER_USE_WEBUI")), monitoring_tab="external",
          workers_tab="application", screen="approvals"),
+    # Guarded submission (app.services.submission): the one click is bound to a SubmissionIntent, and only the
+    # ConfirmationVerifier's evidence from the site makes it CONFIRMED; anything less is UNCERTAIN until a person says.
+    Node("submission_confirmation", "Submission confirmation", (DET, OUTCOME), "After the application worker's one "
+         "authorized Submit click, the site's own evidence (a successful request to the site, the form gone, its "
+         "confirmation) decides CONFIRMED; anything less is UNCERTAIN and waits for you. Never retried, never "
+         "guessed.", "support", (1, -2), workers_tab="application", screen="approvals"),
+    # Email the matcher could not place with confidence (application_inbox.matching): linked to no application until
+    # a person decides. A person's correction always wins over the classifier.
+    Node("inbox_review", "Email review", (HUMAN,), "Emails the inbox could not match to one application with "
+         "confidence, and classifications it was unsure of, wait here for you; your correction overrides the "
+         "model's.", "outcome", (0, 2), monitoring_tab="inbox", screen="tracker"),
+    # Planned (docs/architecture/agentic-roadmap.md Phase 7 follow-ups): drawn as planned, never measured.
+    Node("ats_correction_memory", "ATS answer memory", (DET, HUMAN), "Planned: keep the corrections you approve on "
+         "application forms as verified answers, without promoting generated text into facts. Not built yet.",
+         "support", (2, -2), implemented=False),
+    Node("eval_feedback", "Evaluation feedback", (DET,), "Planned: feed offline evaluation results and your "
+         "corrections back to worker configuration as recommendations. Today evaluation runs offline "
+         "(scripts/agent_eval.py) and changes nothing.", "support", (6, 1), implemented=False),
     Node("interview_insights", "Interview preparation", (AI,), "Writes interview preparation from the posting, the "
          "fit analysis and verified evidence, always labelled as generated (never as questions the company asks).",
          "support", (4, 2), workers=("INTERVIEW_INSIGHTS",), llm_stages=("INTERVIEW_INSIGHTS",),
@@ -266,6 +291,12 @@ EDGES: tuple[Edge, ...] = (
          "(application_execution_tasks.created_at)", timed=True),
     Edge("application_execution", "application", "ready to submit", kind="support", measure="application runs that "
          "ended READY_TO_SUBMIT (application_execution_tasks.completed_at)"),
+    Edge("application_execution", "submission_confirmation", "submit clicked", kind="support",
+         measure="intents committed to the click (submission_intents.clicking_at)", timed=True),
+    Edge("submission_confirmation", "application", "confirmed", kind="support", measure="submissions the site "
+         "confirmed (submission_intents CONFIRMED, resolved_at)"),
+    Edge("application_inbox", "inbox_review", "needs review", kind="branch", measure="emails waiting for a person "
+         "(application_email_messages NEEDS_REVIEW, and classifications marked needs_review)"),
     Edge("company_insights", "interview_insights", "researched", kind="support", measure="research runs that saved "
          "insights (job_insight_tasks COMPLETED or PARTIAL)"),
 )
@@ -321,14 +352,15 @@ def validate() -> list[str]:
 def public() -> dict[str, Any]:
     """The whole topology as the API returns it: node types, lanes, nodes and edges. Static, safe to cache.
 
-    Reserved stages are listed separately and never drawn: a stage that does not run must not look as if it does."""
+    Planned stages are listed separately (`reserved`, with their grid position) and are never measured or given a
+    status: the canvas draws them as planned, so a stage that does not run never looks as if it does."""
     nodes = [n for n in NODES if n.implemented]
     ids = {n.id for n in nodes}
     return {"node_types": NODE_TYPES, "lanes": list(LANES),
             "nodes": [n.public() for n in nodes],
             "edges": [e.public() for e in EDGES if e.source in ids and e.target in ids],
-            "reserved": [{"id": n.id, "label": n.label, "description": n.description} for n in NODES
-                         if not n.implemented]}
+            "reserved": [{"id": n.id, "label": n.label, "description": n.description, "lane": n.lane,
+                          "position": list(n.position), "planned": True} for n in NODES if not n.implemented]}
 
 
 __all__ = ["NODES", "EDGES", "NODE_TYPES", "Node", "Edge", "ExternalMatch", "node", "edge", "node_for_worker",

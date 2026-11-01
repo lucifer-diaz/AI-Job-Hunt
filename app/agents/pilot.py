@@ -68,22 +68,26 @@ def _hold(runtime: Runtime[AgentContext], point: str) -> None:
 
 
 def validate(state: PilotState) -> dict[str, Any]:
+    """Check the input against PilotInput; nothing else reaches the graph."""
     clean = PilotInput(kind=state.get("kind", "auto"), items=state.get("items", 3))
     return {"kind": clean.kind, "items": clean.items, "step": 1}
 
 
 def compute(state: PilotState, runtime: Runtime[AgentContext]) -> dict[str, Any]:
+    """Add up the items: pure computation, no side effect."""
     _hold(runtime, "compute")
     return {"total": sum(range(1, state["items"] + 1)), "step": 2}
 
 
 def approval(state: PilotState) -> dict[str, Any]:
+    """Pause for a person (interrupt) when the run asked for review; their decision resumes it."""
     answer = interrupt({"kind": "approval", "items": state["items"], "total": state["total"]})
     decision = PilotDecision.model_validate(answer if isinstance(answer, dict) else {"decision": answer})
     return {"decision": decision.decision, "step": 3}
 
 
 def finalize(state: PilotState, runtime: Runtime[AgentContext]) -> dict[str, Any]:
+    """Record the one side effect of the pilot, exactly once per thread (effects.once)."""
     ctx = runtime.context
     with ctx.sessions() as db:
         effects.once(db, ctx.run, "pilot.completed", {"items": state["items"], "total": state["total"]})
@@ -92,6 +96,7 @@ def finalize(state: PilotState, runtime: Runtime[AgentContext]) -> dict[str, Any
 
 
 def rejected(state: PilotState) -> dict[str, Any]:
+    """End without any side effect: the person declined."""
     return {"outcome": "rejected", "step": 4}
 
 

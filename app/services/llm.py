@@ -33,6 +33,7 @@ enforces), json_mode (JSON only, the contract checked here), prompt_only, or non
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import re
@@ -42,7 +43,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
-from app.services import failover, llm_telemetry, model_resolution, tracing
+from app.services import failover, llm_telemetry, model_resolution, rate_limits, tracing
 from app.services.ai_config import is_free_model
 from app.services.ai_config import resolve as resolve_ai_config
 from app.services.ai_workers import label as worker_label
@@ -76,7 +77,22 @@ class LLMTimeoutError(LLMError):
 
 
 class LLMRateLimitError(LLMError):
-    pass
+    """A 429. `rate_limit` says what kind and, when the provider named it, when it clears (app.services.rate_limits)."""
+
+    def __init__(self, *args: Any, rate_limit: Any = None, held_seconds: int | None = None):
+        super().__init__(*args)
+        if rate_limit is None and args:
+            from app.services import rate_limits
+
+            rate_limit = rate_limits.classify(str(args[0]))
+        self.rate_limit = rate_limit
+        # Set when token pacing held the request (app.services.token_pacing): nothing was sent, and the model's
+        # token window resets in this many seconds. Queued workers wait for it without spending an attempt.
+        self.held_seconds = held_seconds
+
+
+def _rate_limited(waiting: RateLimitedCooldown) -> LLMRateLimitError:
+    return LLMRateLimitError(str(waiting), held_seconds=waiting.retry_after_seconds if waiting.paced else None)
 
 
 class LLMContextOverflowError(LLMError):
@@ -213,7 +229,7 @@ def error_type(exc: BaseException, *, validation: bool = False) -> str:
     if validation or (isinstance(exc, LLMSchemaError) and exc.reason != "INVALID_JSON"):
         return "SCHEMA_VALIDATION"
     return ("CONFIGURATION" if isinstance(exc, LLMConfigError) else "TIMEOUT" if isinstance(exc, (LLMTimeoutError, TimeoutError))
-            else "RATE_LIMIT" if isinstance(exc, LLMRateLimitError)
+            else "RATE_LIMIT" if isinstance(exc, (LLMRateLimitError, RateLimitedCooldown))
             else "CONTEXT_OVERFLOW" if isinstance(exc, LLMContextOverflowError)
             else "INVALID_JSON" if isinstance(exc, LLMResponseError)
             else "PROVIDER_ERROR" if isinstance(exc, LLMError) else "OTHER")
@@ -267,7 +283,12 @@ def _gateway_error(model: str, exc: Exception) -> LLMError:
     if isinstance(exc, LiteLLMAuthError):
         return LLMConfigError(f"LiteLLM refused the API key saved in AI Orchestration → Models: {text}")
     if status == 429:
-        return LLMRateLimitError(detail)
+        limit = getattr(exc, "rate_limit", None)
+        if getattr(limit, "kind", None) == rate_limits.TOO_LARGE:
+            # larger than the model's whole per-minute limit (Groq): no wait makes it fit, so it is never retried
+            detail += (" — waiting cannot help: shorten the prompt (a prompt token budget) or use a model with a "
+                       "higher limit")
+        return LLMRateLimitError(detail, rate_limit=limit)
     if status in (408, 504) or "did not answer in time" in text or "Timeout" in text:
         return LLMTimeoutError(detail)
     if status == 413 or CONTEXT_OVERFLOW.search(text):
@@ -276,6 +297,16 @@ def _gateway_error(model: str, exc: Exception) -> LLMError:
             r"invalid model|model not found|no deployments|not allowed to access model", text, re.IGNORECASE)):
         return LLMConfigError(detail)
     return LLMError(detail)
+
+
+def _workflow_trace(call: LLMCall) -> Any:
+    """The current trace narrowed to the call's job or application. Telemetry only: never changes the call."""
+    entity = call.entity_id
+    if call.workflow_type == "job" and entity is not None:
+        return tracing.trace(job_id=entity)
+    if call.workflow_type == "application" and entity is not None:
+        return tracing.trace(application_id=entity)
+    return contextlib.nullcontext()
 
 
 class LLMClient:
@@ -321,8 +352,16 @@ class LLMClient:
         """Run a prompt built in app.prompts. The stage comes from the prompt's marker, never from its data.
 
         The answer is checked against the prompt's output contract before the call's own validator sees it. A
-        contract failure gets one retry with a schema correction; the retry is never escalated a second time."""
+        contract failure gets one retry with a schema correction; the retry is never escalated a second time.
+
+        The call runs under the trace already open, narrowed to the job or application it is for (same trace id), so
+        the gateway's external-call row carries that job too and the job's journey finds it (orchestration.journey).
+        """
         call = call or LLMCall()
+        with _workflow_trace(call):
+            return self._generate_prompt(prompt, call)
+
+    def _generate_prompt(self, prompt: Prompt, call: LLMCall) -> LLMResult:
         task = MARKER_TASKS.get(prompt.marker, "default")
         call.contract = prompt.output_schema
         try:
@@ -370,7 +409,7 @@ class LLMClient:
             try:
                 return self._gateway(system, user, task, prompt_name, prompt_version, call or LLMCall())
             except RateLimitedCooldown as waiting:
-                raise LLMRateLimitError(str(waiting)) from waiting
+                raise _rate_limited(waiting) from waiting
         model = config["stage_models"].get(task) or config["model"]
         attempt = Attempt(provider=provider, requested_model=model, user_id=self.user_id, call=call or LLMCall(),
                           prompt_name=prompt_name, prompt_version=prompt_version, system=system, user=user)
@@ -380,7 +419,7 @@ class LLMClient:
         try:
             return self._instrumented(system, user, task, model, config, attempt, prompt_name, prompt_version, started)
         except RateLimitedCooldown as waiting:
-            raise LLMRateLimitError(str(waiting)) from waiting
+            raise _rate_limited(waiting) from waiting
 
     def _instrumented(self, system: str, user: str, task: str, model: str, config: dict[str, Any], attempt: Attempt,
                       prompt_name: str | None, prompt_version: str | None, started: float) -> LLMResult:
@@ -441,9 +480,10 @@ class LLMClient:
                 attempt.validation_failure_reason = attempt.validation_failure_reason or exc.reason
             raise
         finally:
-            # Tokens and cost the provider reported travel to the generic row too, so a cost total can be taken
-            # from either table. `not_sent` requests (missing key, refused before the network) are marked as
-            # configuration failures rather than counted as provider calls.
+            # Tokens travel to the generic row too; cost does not. An LLM call's cost lives only on its
+            # llm_request_logs row, so a total that adds external rows skips those an LLM row points at
+            # (external_request_id) and nothing is counted twice. `not_sent` requests (missing key, refused before
+            # the network) are marked as configuration failures rather than counted as provider calls.
             external.note(answered_model=attempt.model, sent=attempt.sent,
                           input_tokens=attempt.usage.input_tokens if attempt.usage else None,
                           output_tokens=attempt.usage.output_tokens if attempt.usage else None)
@@ -482,7 +522,12 @@ class LLMClient:
         """One logical request: the worker's model, then — only when its escalation policy says so — one
         escalated request to a stronger model. Each is recorded as its own telemetry row."""
         worker_type = call.worker_type or worker_for_prompt(prompt_name) or STAGE_WORKERS.get(task)
-        resolved = failover.apply(call.resolved or model_resolution.get(self.user_id, worker_type), self.user_id)
+        resolved = call.resolved or model_resolution.get(self.user_id, worker_type)
+        # What the request will take off a per-minute token window (app.services.token_pacing): a model whose window
+        # cannot take it this minute moves behind its backups, like a resting one.
+        need = (llm_telemetry.estimate_tokens(system) + llm_telemetry.estimate_tokens(user)
+                + (resolved.max_output_tokens or 0))
+        resolved = failover.apply(resolved, self.user_id, tokens_needed=need)
         try:
             first = self._gateway_attempt(system, user, resolved.model, resolved, call, prompt_name, prompt_version)
         except Exception as exc:
@@ -582,7 +627,7 @@ class LLMClient:
         external = {"model": model, "stage": llm_telemetry.STAGE_BY_PROMPT.get(attempt.prompt_name or "", "OTHER"),
                     "worker_type": resolved.worker_type, "prompt_name": attempt.prompt_name,
                     "prompt_version": attempt.prompt_version, "params_withheld": withheld or None,
-                    "escalation": escalation}
+                    "escalation": escalation, "tokens_needed": estimated + int(params.get("max_tokens") or 0)}
         waiting = time.monotonic()
         with model_resolution.concurrency_slot(resolved, self.user_id, timeout) as free:
             if resolved.max_concurrency:  # without a limit there is no queue to measure
@@ -864,7 +909,45 @@ class LLMClient:
             return self._mock_interview_insights(user)
         if "PREPARE_APPLICATION_FORM" in user.split("\n", 1)[0]:
             return self._mock_application_form(user)
+        if "NAVIGATE_APPLICATION_FORM" in user.split("\n", 1)[0]:
+            return self._mock_browser_navigation(user)
         return {"summary": "Mock answer."}
+
+    @staticmethod
+    def _mock_browser_navigation(user: str) -> dict[str, Any]:
+        """No spend, no guesses: the next RESOLVED field that has its own element and is not filled yet, else done."""
+        def part(name: str) -> Any:
+            found = re.search(rf"^{name}:\n(.*)$", user, re.MULTILINE)
+            return json.loads(found.group(1)) if found else []
+
+        def wrapped(tag: str) -> list[dict[str, Any]]:
+            raw = user.split(f"<{tag}>", 1)[-1].split(f"</{tag}>", 1)[0].strip() if f"<{tag}>" in user else ""
+            return json.loads(raw) if raw else []
+
+        elements = {e.get("key"): e for e in part("ELEMENTS")}
+        fields = part("FIELDS")
+        field_labels = {f.get("ref"): (f.get("label") or "").lower() for f in wrapped("untrusted_field_labels")}
+        if not fields:  # nothing to fill yet: open the form with a control that cannot submit
+            labels = {e.get("key"): (e.get("label") or "").lower() for e in wrapped("untrusted_element_labels")}
+            controls = [k for k, e in elements.items() if e.get("tag") in ("a", "button") and not e.get("submit_like")]
+            for wanted in (("decline", "reject", "necessary only"), ("apply", "application")):
+                for key in controls:
+                    if labels.get(key, "").startswith(wanted):
+                        return {"action": "click_control", "element_key": key, "step_note": "Mock: open the form."}
+            return {"action": "done", "step_note": "Mock: nothing to open."}
+        verbs = {"select": "select_option", "combobox": "select_option", "checkbox": "check_box", "radio": "check_box",
+                 "file": "upload_file"}
+        for field in fields:
+            key = str(field.get("ref") or "").removeprefix("bu_")
+            if field.get("status") != "RESOLVED" or field.get("filled") or key not in elements:
+                continue
+            action = verbs.get(field.get("kind"), "fill_field")
+            out = {"action": action, "element_key": key, "answer_ref": field["ref"],
+                   "step_note": "Mock: the next resolved field."}
+            if action == "upload_file":
+                out["file_ref"] = "cover_letter" if "cover" in field_labels.get(field["ref"], "") else "resume"
+            return out
+        return {"action": "done", "step_note": "Mock: every resolved field is filled."}
 
     @staticmethod
     def _mock_application_form(user: str) -> dict[str, Any]:

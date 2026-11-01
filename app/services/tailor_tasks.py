@@ -38,6 +38,7 @@ from app.services.workflow import (
     NEEDS_RETAILOR,
     SKIP_TAILORING_STATUSES,
     approve_job,
+    review_packet,
     skip_tailoring,
     tailor_job,
 )
@@ -53,9 +54,11 @@ MAX_ATTEMPTS = 2
 STAGE_PROGRESS = {
     "tailor": {"queued": 0, "ranking": 5, "tailoring": 25, "reviewing": 70, "done": 100},
     "skip": {"queued": 0, "ranking": 0, "tailoring": 0, "reviewing": 30, "done": 100},
+    "review": {"queued": 0, "ranking": 0, "tailoring": 0, "reviewing": 10, "done": 100},
 }
 # jobs.auto_tailor_status (app.services.auto_tailor): automatic tailoring queued the job, or the person cancelled it.
-AUTO_QUEUED, DECLINED = "QUEUED", "DECLINED"
+# RESUME_CHANGED: the person moved a tailored job to another resume, so its packet is re-tailored once it is ranked again.
+AUTO_QUEUED, DECLINED, RESUME_CHANGED = "QUEUED", "DECLINED", "RESUME"
 DESKTOP_MODE_REASON ="Claude Desktop mode: tailor and review this job from Claude Desktop"
 # Finished tasks stay on the Tailor screen this long unless cleared.
 RECENT = timedelta(hours=24)
@@ -110,13 +113,21 @@ def task_dict(task: TailorTask) -> dict[str, Any]:
 # ───────────── per-user operations (the session belongs to the signed-in user) ─────────────
 
 def enqueue(db: Session, ids: list[int], mode: str = "tailor", regenerate: bool = False,
-            pages: int | None = None, options: dict[str, Any] | None = None, commit: bool = True) -> dict[str, Any]:
+            pages: int | None = None, options: dict[str, Any] | None = None, commit: bool = True,
+            revise: bool = False) -> dict[str, Any]:
     """Queue tailoring for jobs in the Tailor queue. Jobs already queued or running, or with a packet
     (unless `regenerate`), are skipped with a reason. `pages` is their page target (None = the default in Settings,
-    read when the task runs)."""
+    read when the task runs).
+
+    Mode `review` only reviews each job's latest saved packet: it needs one, and skips a packet already reviewed
+    unless `regenerate`. `revise` (mode `tailor`) makes each run a revision pass that fixes what the job's latest
+    version's review found."""
     wanted = list(dict.fromkeys(ids))
     jobs = {j.id: j for j in db.scalars(select(Job).where(Job.id.in_(wanted))).all()}
-    has_packet = set(db.scalars(select(ResumeVariant.job_id).where(ResumeVariant.job_id.in_(wanted))).all())
+    latest = dict(db.execute(select(ResumeVariant.job_id, func.max(ResumeVariant.id))
+                             .where(ResumeVariant.job_id.in_(wanted)).group_by(ResumeVariant.job_id)).all())
+    has_packet = set(latest)
+    reviewed = _latest_reviewed(db, wanted) if mode == "review" else set()
     active = set(db.scalars(select(TailorTask.job_id).where(TailorTask.job_id.in_(wanted),
                                                             TailorTask.status.in_(ACTIVE))).all())
     tasks, skipped = [], []
@@ -128,6 +139,9 @@ def enqueue(db: Session, ids: list[int], mode: str = "tailor", regenerate: bool 
                   else DESKTOP_MODE_REASON if desktop
                   else "already queued" if job_id in active
                   else "not in the Tailor queue" if job.status not in SKIP_TAILORING_STATUSES
+                  else ("no packet to review" if job_id not in has_packet
+                        else "already reviewed" if job_id in reviewed and not regenerate
+                        else None) if mode == "review"
                   else "already has a packet" if job_id in has_packet and not regenerate
                   and job.status != NEEDS_RETAILOR
                   # The Tailor works from the Ranker's analysis; skipping tailoring needs none.
@@ -136,7 +150,9 @@ def enqueue(db: Session, ids: list[int], mode: str = "tailor", regenerate: bool 
         if reason:
             skipped.append({"id": job_id, "reason": reason})
             continue
-        extra = {**({"pages": pages} if pages and mode == "tailor" else {}), **(options or {})}
+        extra = {**({"pages": pages} if pages and mode == "tailor" else {}),
+                 **({"revise_from": latest[job_id]} if revise and mode == "tailor" and job_id in latest else {}),
+                 **(options or {})}
         task = TailorTask(job_id=job.id, mode=mode, regenerate=regenerate, status="queued", stage="queued", attempts=0,
                           options=extra or None)
         try:
@@ -158,6 +174,16 @@ def enqueue(db: Session, ids: list[int], mode: str = "tailor", regenerate: bool 
 
         scheduler_hooks.nudge("tailor")  # start now instead of at the next poll; the task table is the queue
     return {"queued": [task_dict(t) for t in tasks], "skipped": skipped}
+
+
+def _latest_reviewed(db: Session, job_ids: list[int]) -> set[int]:
+    """Of these jobs, the ones whose latest packet version has a review."""
+    latest = (select(ResumeVariant.job_id, func.max(ResumeVariant.version).label("version"))
+              .where(ResumeVariant.job_id.in_(job_ids)).group_by(ResumeVariant.job_id).subquery())
+    return set(db.scalars(select(ResumeVariant.job_id)
+                          .join(latest, (ResumeVariant.job_id == latest.c.job_id)
+                                & (ResumeVariant.version == latest.c.version))
+                          .where(ResumeVariant.reviewer_score.is_not(None))).all())
 
 
 def _nudge_after_commit(db: Session) -> None:
@@ -339,6 +365,7 @@ def run_task(sessions: SessionFactory, task_id: int, worker_id: str, lease_secon
             with backoff.bypass(run_now):
                 feedback = _revision_feedback(db, job, revise_from) if mode == "tailor" else None
                 made = skip_tailoring(db, job, progress=progress) if mode == "skip" \
+                    else review_packet(db, job, progress=progress) if mode == "review" \
                     else tailor_job(db, job, progress=progress, pages=pages, **({"feedback": feedback} if feedback else {}))
                 # The preparation graph decides on a conducted run (review decision, then approval); it is never
                 # approved here.

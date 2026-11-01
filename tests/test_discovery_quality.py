@@ -532,8 +532,18 @@ def test_choosing_a_resume_for_old_jobs_ranks_them_again(user, resumes, client):
 
 
 def test_a_resume_can_be_renamed_for_the_pickers(user, resumes, client):
-    active, _ = resumes
+    active, ml = resumes
+    client.put(f"/api/resumes/{ml}/tags", json={"domain": "ML", "roles": ["ML Engineer"]})
     assert client.put(f"/api/resumes/{active}", json={"name": "Platform resume"}).json()["name"] == "Platform resume"
+    out = client.put(f"/api/resumes/{ml}", json={"name": "  Applied ML  "}).json()
+    assert out == {"id": ml, "name": "Applied ML"}
+    with SessionLocal() as db:
+        renamed = db.get(Resume, ml)
+        # Only the label changed: tags, text and which resume is active stay as they were.
+        assert (renamed.domain, renamed.roles, renamed.is_active) == ("ML", ["ML Engineer"], False)
+        assert renamed.raw_text == RESUME_B and db.get(Resume, active).is_active
+    assert client.put(f"/api/resumes/{ml}", json={"name": "   "}).status_code == 422
+    assert client.put(f"/api/resumes/{ml}", json={"name": ""}).status_code == 422
 
 
 def test_the_mcp_context_carries_the_jobs_own_resume(user, resumes):
@@ -688,3 +698,114 @@ def test_a_compound_primary_skill_protects_the_skill_it_names(user):
         db.commit()
     assert job_of(add(user, "Java Backend Engineer")).domain_match == "MATCH"
     assert job_of(add(user, "Senior PHP Developer")).domain_match == "NOT_MATCHING", "other exclusions still apply"
+
+
+def test_the_job_and_its_packet_name_the_resume_they_use(user, resumes, client):
+    from app.services import resume_matching
+    from app.services.workflow import persist_tailored_resume
+
+    active, ml = resumes
+    job_id = add(user, "Backend Engineer")
+    # No resume matched by tags: the screens say the active resume is used, and why.
+    detail = client.get(f"/api/jobs/{job_id}").json()
+    assert detail["resume_in_use"]["id"] == active and detail["resume_in_use"]["choice"] is None
+    assert "active resume is used" in detail["resume_in_use"]["how"]
+    assert detail["packet_source"] is None
+
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        resume_matching.set_tags(db.get(Resume, ml), [{"domain": "ML", "roles": ["Backend Engineer"]}])
+        job = db.get(Job, job_id)
+        assert resume_matching.auto_assign(db, job) is not None and job.resume_id == ml
+        db.commit()
+        # A packet saved without a tailoring context (MCP, skip tailoring) records the resume it was made from.
+        persist_tailored_resume(db, job, {"summary": "", "skills": [], "experience": []}, markdown="# Asha")
+    detail = client.get(f"/api/jobs/{job_id}").json()
+    assert detail["resume_in_use"]["id"] == ml and detail["resume_in_use"]["choice"] == "AUTO"
+    assert "role 'backend engineer'" in detail["resume_in_use"]["how"].lower()
+    packet = client.get(f"/api/tailor/{job_id}").json()["resume"]
+    assert packet["source"]["resume"]["name"] == "ML resume" and not packet["source"]["differs"]
+    assert packet["resume_in_use"]["id"] == ml
+
+    # The person moves the job to the active resume: the packet still names its own source, and says it differs.
+    client.put(f"/api/jobs/{job_id}/resume", json={"mode": "active"})
+    packet = client.get(f"/api/tailor/{job_id}").json()["resume"]
+    assert packet["source"]["resume"]["id"] == ml and packet["source"]["differs"]
+    assert packet["resume_in_use"]["id"] == active and packet["resume_in_use"]["choice"] == "ACTIVE"
+    # Pinned to the active resume while the tags clearly pick the ML one: the tag match is offered, flagged as
+    # replacing the person's choice. Nothing changes until they take it.
+    assert packet["resume_in_use"]["rematch"]["resume"]["id"] == ml and packet["resume_in_use"]["rematch"]["pinned"]
+    client.put(f"/api/jobs/{job_id}/resume", json={"mode": "fixed", "resume_id": ml})
+    assert client.get(f"/api/jobs/{job_id}").json()["resume_in_use"]["rematch"] is None, "already the tag match"
+
+
+def test_a_job_matched_before_its_resume_was_tagged_is_offered_a_rematch(user, resumes, client):
+    from app.services import resume_matching
+
+    active, ml = resumes
+    job_id = add(user, "Staff Software Engineer, Growth")
+    detail = client.get(f"/api/jobs/{job_id}").json()["resume_in_use"]
+    assert detail["id"] == active and detail["rematch"] is None, "no tag matches: nothing to offer"
+
+    # Tagged after the job was found: the job keeps the active resume until the person re-matches it, but says so.
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        resume_matching.set_tags(db.get(Resume, ml), [{"domain": "Backend", "roles": ["Staff Software Engineer"]}])
+        db.commit()
+    detail = client.get(f"/api/jobs/{job_id}").json()["resume_in_use"]
+    assert detail["id"] == active and detail["choice"] is None
+    assert detail["rematch"]["resume"]["id"] == ml and "staff software engineer" in detail["rematch"]["reason"].lower()
+    assert detail["rematch"]["pinned"] is False
+    assert "when this job was found" in detail["how"]
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        assert db.get(Job, job_id).resume_id is None, "showing the offer changes nothing"
+
+    client.put(f"/api/jobs/{job_id}/resume", json={"mode": "auto"})
+    detail = client.get(f"/api/jobs/{job_id}").json()["resume_in_use"]
+    assert detail["id"] == ml and detail["choice"] == "AUTO" and detail["rematch"] is None
+
+    # Its tags removed again: the AUTO job would now fall back to the active resume, and is offered that.
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        resume_matching.set_tags(db.get(Resume, ml), [])
+        db.commit()
+    detail = client.get(f"/api/jobs/{job_id}").json()["resume_in_use"]
+    assert detail["id"] == ml and detail["rematch"] == {"resume": None, "reason": "no resume matches clearly now",
+                                                            "pinned": False}
+
+
+def test_rematch_takes_only_the_jobs_the_filters_select(user, resumes, client):
+    from datetime import timedelta
+
+    from app.models import now
+    from app.services import resume_matching
+
+    _, ml = resumes
+    fresh, old, archived, other_board = (add(user, "Staff Software Engineer") for _ in range(4))
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        db.execute(update(Job).where(Job.id.in_([fresh, old, archived, other_board]))
+                   .values(source_board="greenhouse", status="shortlisted"))
+        db.execute(update(Job).where(Job.id == old).values(discovered_at=now() - timedelta(days=60)))
+        db.execute(update(Job).where(Job.id == archived).values(status="archived"))
+        db.execute(update(Job).where(Job.id == other_board).values(source_board="lever"))
+        resume_matching.set_tags(db.get(Resume, ml), [{"domain": "Backend", "roles": ["Staff Software Engineer"]}])
+        db.commit()
+
+    def plan(**filters):
+        return client.post("/api/jobs/resume/rematch?dry_run=true", json=filters).json()
+
+    everything = plan()
+    assert everything["changing"] == 3, "archived jobs are left out unless asked for"
+    assert everything["into"] == [{"resume": "ML resume · v2", "jobs": 3}]
+    assert {"name": "greenhouse", "jobs": 3} in everything["options"]["boards"]
+    assert plan(stages=["ranked", "archived"])["changing"] == 4
+    assert plan(stages=["tailored"])["changing"] == 0
+    assert plan(found_within_days=30)["changing"] == 2
+    assert plan(board="lever")["changing"] == 1
+    assert client.post("/api/jobs/resume/rematch?dry_run=true").json()["changing"] == 3, "no body: the defaults"
+
+    out = client.post("/api/jobs/resume/rematch", json={"found_within_days": 30, "board": "greenhouse"}).json()
+    assert out["changed"] == [fresh]
+    assert job_of(fresh).resume_id == ml and job_of(old).resume_id is None and job_of(archived).resume_id is None

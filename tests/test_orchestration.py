@@ -127,8 +127,13 @@ def test_the_topology_registry_is_consistent_and_honest_about_kinds():
     assert nodes["jd_recovery"]["optional_ai"] is True
     assert nodes["approval"]["types"] == ["HUMAN_GATE"]
     assert nodes["discovery"]["primary_type"] == "EXTERNAL"
-    # Job Insights is implemented: research is an async external stage with AI, preparation is AI only.
-    assert t["reserved"] == []
+    # Job Insights is implemented: research is an async external stage with AI, preparation is AI only. Only the
+    # Phase 7 follow-ups are planned, drawn as planned, and never in the measured graph.
+    assert {r["id"] for r in t["reserved"]} == {"ats_correction_memory", "eval_feedback"}
+    assert all(r["planned"] and r["position"] for r in t["reserved"])
+    assert not {r["id"] for r in t["reserved"]} & set(nodes)
+    assert nodes["submission_confirmation"]["types"] == ["DETERMINISTIC", "OUTCOME"]
+    assert nodes["inbox_review"]["types"] == ["HUMAN_GATE"]
     assert set(nodes["company_insights"]["types"]) == {"ASYNC_WORKER", "EXTERNAL", "AI"}
     assert nodes["interview_insights"]["workers"] == ["INTERVIEW_INSIGHTS"]
     assert all(e["source"] in nodes and e["target"] in nodes for e in t["edges"])

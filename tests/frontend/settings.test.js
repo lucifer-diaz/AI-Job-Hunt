@@ -352,6 +352,25 @@ describe('focused settings UI', () => {
     confirm.mockReturnValueOnce(true); await ui.settingsSave('resumes');
     expect(ui.RD.draft).toBeNull(); expect(ui.RD.editing).toBeNull(); expect(ui.RD.viewId).toBe(9);
   });
+  it('shows the AI structuring while it runs and how it ended, and queues it from Re-parse with AI', async () => {
+    const progress = { blocking: [], sections: [], entries: [], percent: 0, counts: { VERIFIED: 0, EDITED: 0, REJECTED: 0 }, needs_review: 0 };
+    const current = { ...resumeCard(), revision: 0, structured: {}, progress, ai_parse: { active: true, status: 'PENDING', note: 'Structuring with AI…', dropped: 0 } };
+    resumesLoaded([resumeCard()]); ui.D.resumeData.current = current; section('resumes');
+    expect(document.querySelector('[data-rd-ai-parse]').dataset.rdAiParse).toBe('active');
+    expect(document.querySelector('[data-act="rd-reparse"][data-ai="1"]').disabled).toBe(true);
+    ui.D.resumeData.current = { ...current, ai_parse: { active: false, status: 'COMPLETED', outcome: 'filled', note: 'Filled from the AI parse', dropped: 2 } };
+    ui.render();
+    const line = document.querySelector('[data-rd-ai-parse]');
+    expect(line.dataset.rdAiParse).toBe('filled');
+    expect(line.textContent).toContain('2 values the resume text does not contain were left out');
+    const reparse = document.querySelector('[data-act="rd-reparse"][data-ai="1"]');
+    expect(reparse.disabled).toBe(false);
+    fetchMock.mockResolvedValueOnce(response({ ...current, ai_parse: { active: true, status: 'PENDING', note: 'Structuring with AI…' } }));
+    await ui.A['rd-reparse'](reparse);
+    const post = fetchMock.mock.calls.find(([url]) => url === '/api/resumes/1/reparse');
+    expect(JSON.parse(post[1].body)).toEqual({ use_ai: true });
+    expect(document.querySelector('[data-rd-ai-parse]').dataset.rdAiParse).toBe('active');
+  });
   it('deleting a resume asks once, keeps text drafts, and the active one cannot be deleted', async () => {
     resumesLoaded([resumeCard(), resumeCard({ id: 2, name: 'older.pdf', version: 2, is_active: false })]); section('resumes');
     expect([...document.querySelectorAll('[data-act="rd-delete-version"]')].map(b => b.dataset.id)).toEqual(['2']);
@@ -363,6 +382,23 @@ describe('focused settings UI', () => {
     expect(confirm).toHaveBeenCalledTimes(2);
     expect(ui.S.forms.resumes.master_resume).toBe('Draft');
     expect(ui.D.resumeData.versions.map(v => v.id)).toEqual([1]);
+  });
+  it('renames a resume in place without touching anything else', async () => {
+    resumesLoaded([resumeCard(), resumeCard({ id: 2, name: 'older.pdf', version: 2, is_active: false, roles: ['Lead'] })]); section('resumes');
+    ui.A['rd-rename']({ dataset: { id: '2', name: 'older.pdf' } });
+    expect(document.getElementById('rdname-name').value).toBe('older.pdf');
+    ui.setF('rdname', 'name', '   ');
+    await ui.A['rd-rename-save']({ dataset: { id: '2' } }); expect(fetchMock).not.toHaveBeenCalled();
+    ui.setF('rdname', 'name', ' Leadership CV ');
+    fetchMock.mockResolvedValueOnce(response({ id: 2, name: 'Leadership CV' }));
+    await ui.A['rd-rename-save']({ dataset: { id: '2' } });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/resumes/2');
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ name: 'Leadership CV' });
+    const renamed = ui.D.resumeData.versions.find(v => v.id === 2);
+    expect(renamed).toMatchObject({ name: 'Leadership CV', is_active: false, roles: ['Lead'], version: 2 });
+    expect(ui.RD.renaming).toBeNull();
+    expect(document.querySelector('[data-rd-resume="2"] strong').textContent).toBe('Leadership CV · v2');
   });
   it('requires saved text for evidence extraction', async () => {
     resumesLoaded(); section('resumes'); ui.setF('resumes', 'master_resume', 'Draft');
@@ -619,6 +655,19 @@ describe('resume data', () => {
     ui.A['rd-jump']({ dataset: { section: 'skills' } }, { preventDefault() {} });
     expect(ui.RD.tab).toBe('structured');
   });
+  it('structures uploads with AI only: the toggle saves the worker setting, a waiting version shows no regex data', async () => {
+    let saved;
+    const waiting = detail({ parser: 'deterministic', ai_parse: { active: true, status: 'PROCESSING', note: 'Structuring with AI…' } });
+    await open(waiting, { 'GET /api/settings/resume': { active: waiting, versions: [waiting], policy: {}, ai_only: true },
+      'PUT /api/workers/settings': body => { saved = body; return { account: {} }; } });
+    const view = document.getElementById('view');
+    expect(view.textContent).toContain('the Resume Parser model is reading this resume');
+    expect(view.innerHTML).not.toContain('Builds &lt;platforms&gt;');
+    expect(document.getElementById('rd-ai-only').checked).toBe(true);
+    await ui.A['rd-ai-only']({ checked: false }); await settle();
+    expect(saved).toEqual({ workers: { resume_parsing: { ai_only: false } } });
+    expect(view.innerHTML).toContain('Builds &lt;platforms&gt;');
+  });
   it('renders every section type and edits single-object sections', async () => {
     const v = verification('UNVERIFIED');
     const base = detail();
@@ -781,5 +830,121 @@ describe('structured job description', () => {
     routes({ 'GET /api/jobs/7/structured-description/history': { items: [{ id: 1, field_path: 'job_identity.seniority', old_value: 'Lead', new_value: 'Staff', change_source: 'USER', created_at: '2026-09-18T11:00:00' }] } });
     await ui.A['jd-history']({ dataset: { id: '7' } });
     expect(document.querySelector('[data-jd-change-source="USER"]').textContent).toContain('job_identity.seniority');
+  });
+});
+
+// Settings → AI agents & automation: what happens now in one sentence, presets that fill the choices, each setting's
+// meaning beside its dropdown, prerequisites spelt out, and only the changed values sent.
+describe('AI agents & automation', () => {
+  const choice = (value, label, help = `${label} means this`) => ({ value, label, help });
+  function automation(editable = true, environment = {}) {
+    const item = (name, group, kind, value, choices = [], extra = {}) => ({ name, env: name.toUpperCase(), group, label: name, help: `${name} help`, kind, needs: null, min: 1, max: 300, choices, value, default: value, overridden: false, ...extra });
+    const bool = [choice('false', 'Off'), choice('true', 'On')];
+    return { editable, groups: [{ id: 'graphs', label: 'Agent graphs', help: '' }, { id: 'applications', label: 'Applications', help: '' }, { id: 'browser', label: 'Browser', help: '' }, { id: 'retention', label: 'Checkpoints and tracing', help: '' }],
+      settings: [item('agent_graphs_enabled', 'graphs', 'bool', 'false', bool),
+        item('qualification_graph_mode', 'graphs', 'choice', 'off', [choice('off', 'Off'), choice('shadow', 'Shadow'), choice('on', 'On')]),
+        item('application_execution_mode', 'applications', 'choice', 'off', [choice('off', 'Off'), choice('observe', 'Read forms'), choice('assist', 'Fill forms, I submit'), choice('guarded_auto', 'Auto submit')]),
+        item('application_max_actions', 'applications', 'int', '60'),
+        item('browser_use_webui_enabled', 'browser', 'bool', 'false', bool),
+        item('browser_use_headless', 'browser', 'bool', 'true', [choice('false', 'Visible'), choice('true', 'Hidden')]),
+        item('agent_langsmith_export_enabled', 'retention', 'bool', 'false', bool)],
+      presets: [{ id: 'manual', label: 'I apply myself', help: '', values: { agent_graphs_enabled: 'false', application_execution_mode: 'off' } },
+        { id: 'fill', label: 'Fill forms; I submit', help: '', values: { agent_graphs_enabled: 'true', application_execution_mode: 'assist', browser_use_webui_enabled: 'true', browser_use_headless: 'false' } }],
+      environment: { postgres: true, browser_use_python: true, browser_use_ready: true, langsmith_api_key: false, ...environment } };
+  }
+  const view = () => document.getElementById('view');
+
+  it('says what happens now, marks the matching preset and explains the chosen option beside each control', () => {
+    ui.D.automation = automation();
+    section('automation');
+    expect(view().querySelector('.am-summary-head').textContent).toBe('You apply yourself');
+    expect(view().querySelector('.am-preset.is-selected').textContent).toContain('I apply myself');
+    expect(view().querySelector('[data-automation="application_execution_mode"] .am-choice').textContent).toBe('Off means this');
+    expect(view().querySelector('[data-automation="application_execution_mode"] code').textContent).toBe('APPLICATION_EXECUTION_MODE');
+    expect(view().querySelector('[data-settings-details="automation-advanced"] [data-automation="agent_langsmith_export_enabled"]')).not.toBeNull();
+    expect(view().querySelector('.am-footer.is-dirty')).toBeNull();  // nothing to save
+  });
+
+  it('fills the choices from a preset, warns about what is missing, and saves only the changes', async () => {
+    ui.D.automation = automation(true, { browser_use_python: false, browser_use_ready: false });
+    section('automation');
+    await ui.A['automation-preset']({ dataset: { id: 'fill' } });
+    expect(view().querySelector('.am-summary .caps').textContent).toBe('With your unsaved changes');
+    expect(view().querySelector('.am-summary-head').textContent).toBe('Forms are filled, you submit');
+    expect(view().querySelector('[data-automation="browser_use_webui_enabled"] .am-warn').textContent).toContain('BROWSER_USE_PYTHON');
+    expect(view().querySelector('.am-footer.is-dirty span').textContent).toContain('4 unsaved changes');
+    await ui.A['automation-reset']({ dataset: { name: 'browser_use_headless' } });
+    expect(view().querySelector('.am-footer span').textContent).toContain('3 unsaved changes');
+    fetchMock.mockImplementation(async () => response(automation()));
+    await ui.A['automation-save']();
+    const [, options] = fetchMock.mock.calls.find(([url, o]) => url === '/api/settings/automation' && o?.method === 'PUT');
+    expect(JSON.parse(options.body)).toEqual({ values: { agent_graphs_enabled: 'true', application_execution_mode: 'assist', browser_use_webui_enabled: 'true' } });
+  });
+
+  it('dims a graph mode while LangGraph is off and says so when it is chosen', () => {
+    ui.D.automation = automation();
+    ui.S.forms.automation = { qualification_graph_mode: 'on' };
+    section('automation');
+    const row = view().querySelector('[data-automation="qualification_graph_mode"]');
+    expect(row.classList.contains('am-row-inactive')).toBe(true);
+    expect(row.querySelector('.am-warn').textContent).toContain('Turn on LangGraph');
+  });
+
+  it('takes a LangSmith key as a password, sends only a typed one and removes a saved one', async () => {
+    const withKey = extra => { const a = automation(); a.settings.push({ name: 'agent_langsmith_api_key', env: 'AGENT_LANGSMITH_API_KEY', group: 'retention', label: 'LangSmith API key', help: '', kind: 'secret', needs: null, min: 0, max: 0, choices: [], value: '', default: '', overridden: false, set: false, env_set: false, ...extra }); return a; };
+    ui.D.automation = withKey();
+    ui.S.forms.automation = { agent_langsmith_export_enabled: 'true' };
+    section('automation');
+    const input = view().querySelector('#automation-agent_langsmith_api_key');
+    expect(input.type).toBe('password');
+    expect(input.getAttribute('autocomplete')).toBe('new-password');
+    expect(view().querySelector('[data-automation="agent_langsmith_export_enabled"] .am-warn').textContent).toContain('Enter a LangSmith API key below');
+    ui.S.forms.automation = { agent_langsmith_export_enabled: 'true', agent_langsmith_api_key: '  lsv2_pt_typed  ' };
+    section('automation');
+    expect(view().querySelector('[data-automation="agent_langsmith_export_enabled"] .am-warn')).toBeNull();
+    fetchMock.mockImplementation(async () => response(withKey({ overridden: true, set: true })));
+    await ui.A['automation-save']();
+    const put = () => fetchMock.mock.calls.filter(([url, o]) => url === '/api/settings/automation' && o?.method === 'PUT').map(([, o]) => JSON.parse(o.body));
+    expect(put()[0]).toEqual({ values: { agent_langsmith_export_enabled: 'true', agent_langsmith_api_key: 'lsv2_pt_typed' } });
+    section('automation');
+    expect(view().querySelector('#automation-agent_langsmith_api_key').value).toBe('');  // never shown again
+    expect(view().querySelector('#automation-agent_langsmith_api_key').placeholder).toContain('Saved');
+    expect(view().querySelector('.am-footer.is-dirty')).toBeNull();  // an empty key field is not a change
+    fetchMock.mockImplementation(async () => response(withKey()));
+    await ui.A['automation-clear-secret']({ dataset: { name: 'agent_langsmith_api_key' } });
+    expect(put()[1]).toEqual({ values: { agent_langsmith_api_key: '' } });
+  });
+
+  it('picks a LangSmith region from a list, or types another address under Custom address', async () => {
+    const regions = [choice('https://api.smith.langchain.com', 'US'), choice('https://eu.api.smith.langchain.com', 'EU'), choice('https://apac.api.smith.langchain.com', 'APAC')];
+    const withRegion = (value = 'https://api.smith.langchain.com') => { const a = automation(); a.settings.push({ name: 'agent_langsmith_endpoint', env: 'AGENT_LANGSMITH_ENDPOINT', group: 'retention', label: 'LangSmith region', help: '', kind: 'text', needs: null, min: 0, max: 0, choices: regions, value, default: 'https://api.smith.langchain.com', overridden: false }); return a; };
+    ui.D.automation = withRegion();
+    section('automation');
+    const row = () => view().querySelector('[data-automation="agent_langsmith_endpoint"]');
+    expect(row().querySelector('label').getAttribute('for')).toBe('automation-agent_langsmith_endpoint-choice');
+    expect(row().querySelector('select').value).toBe('https://api.smith.langchain.com');
+    expect(row().querySelector('input')).toBeNull();
+    await ui.A['automation-choice']({ dataset: { name: 'agent_langsmith_endpoint' }, value: 'https://apac.api.smith.langchain.com' });
+    expect(row().querySelector('select').value).toBe('https://apac.api.smith.langchain.com');
+    expect(row().querySelector('.am-choice').textContent).toBe('APAC means this');
+    await ui.A['automation-choice']({ dataset: { name: 'agent_langsmith_endpoint' }, value: '__custom__' });
+    expect(row().querySelector('#automation-agent_langsmith_endpoint').value).toBe('https://apac.api.smith.langchain.com');
+    ui.S.forms.automation.agent_langsmith_endpoint = 'https://langsmith.example.com';
+    fetchMock.mockImplementation(async () => response(withRegion('https://langsmith.example.com')));
+    await ui.A['automation-save']();
+    const [, options] = fetchMock.mock.calls.find(([url, o]) => url === '/api/settings/automation' && o?.method === 'PUT');
+    expect(JSON.parse(options.body)).toEqual({ values: { agent_langsmith_endpoint: 'https://langsmith.example.com' } });
+    section('automation');
+    expect(row().querySelector('select').value).toBe('__custom__');  // a saved address that is no region
+    expect(row().querySelector('#automation-agent_langsmith_endpoint').value).toBe('https://langsmith.example.com');
+  });
+
+  it('is read-only for someone who is not an admin', () => {
+    ui.D.automation = automation(false);
+    section('automation');
+    expect(view().querySelector('.am-readonly')).not.toBeNull();
+    expect(view().querySelector('#automation-application_execution_mode').disabled).toBe(true);
+    expect(view().querySelector('[data-act="automation-save"]')).toBeNull();
+    expect([...view().querySelectorAll('.am-preset')].every(b => b.disabled)).toBe(true);
   });
 });

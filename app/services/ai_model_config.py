@@ -44,7 +44,7 @@ from app.models import (
     WorkerModelConfig,
 )
 from app.security import decrypt_secret, encrypt_secret
-from app.services import model_resolution
+from app.services import model_capacity, model_resolution
 from app.services.ai_workers import (
     AUTO_ROUTER_TIERS,
     DEFAULT_TIERS,
@@ -54,6 +54,7 @@ from app.services.ai_workers import (
 )
 from app.services.litellm_client import LiteLLMAPI, LiteLLMError, normalize_base_url
 from app.services.litellm_config_manager import LiteLLMConfigManager, literal_secrets, render
+from app.services.prompt_budget import TRIMMED_WORKERS
 from app.services.redaction import redact_text, redact_value
 from app.settings import get_settings
 
@@ -62,15 +63,15 @@ log = logging.getLogger("jobhunt.ai_model_config")
 SNAPSHOT_SCHEMA = 1
 APPLY_LEASE = timedelta(minutes=10)
 TIER_NAME = re.compile(r"^[A-Z][A-Z0-9_]{1,59}$")
-MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+\-]{0,199}$")
+MODEL_NAME = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._:/@+\- ]{0,198}[A-Za-z0-9._:/@+\-])?$")  # LiteLLM aliases may hold spaces
 PLUGIN_PATH = re.compile(r"^[A-Za-z_]\w*(\.[A-Za-z_]\w*)+$")
 LIMITS = {"temperature": (0.0, 2.0), "max_output_tokens": (1, 200_000), "context_window": (512, 2_000_000),
-          "timeout_seconds": (1, 3600), "retry_count": (0, 10), "max_concurrency": (1, 100),
+          "prompt_token_budget": (256, 2_000_000), "timeout_seconds": (1, 3600), "retry_count": (0, 10), "max_concurrency": (1, 100),
           "rest_seconds": (10, 604_800), "embedding_dimensions": (1, 65_536)}
 MAX_MODEL_FALLBACKS = 4
 WORKER_FIELDS = ("model_mode", "primary_model", "tier_name", "fallback_model", "secondary_models", "temperature", "max_output_tokens",
-                 "context_window", "reasoning_effort", "timeout_seconds", "retry_count", "max_concurrency",
-                 "use_structured_output", "enabled", "escalation")
+                 "context_window", "prompt_token_budget", "reasoning_effort", "timeout_seconds", "retry_count",
+                 "max_concurrency", "use_structured_output", "enabled", "escalation")
 ROUTING_FIELDS = ("auto_router_enabled", "auto_router_model_name", "manage_auto_router", "classifier",
                   "classifier_model", "classifier_plugin", "tier_models", "default_model", "send_metadata")
 CAPABILITIES = ("supports_structured_output", "supports_tools", "supports_reasoning", "supports_vision")
@@ -78,7 +79,8 @@ OVERRIDABLE = (*CAPABILITIES, "context_window", "max_output_tokens", "embedding_
 FIELD_LABELS = {"mode": "mode", "primary_model": "model", "tier": "tier", "fallback_model": "fallback model", "secondary_models": "secondary models",
                 "fallback_models": "model fallbacks", "rest_seconds": "rest time",
                 "temperature": "temperature", "max_output_tokens": "max output tokens",
-                "context_window": "context window", "reasoning_effort": "reasoning effort",
+                "context_window": "context window", "prompt_token_budget": "prompt token budget",
+                "reasoning_effort": "reasoning effort",
                 "timeout_seconds": "timeout", "retry_count": "retries", "max_concurrency": "max concurrency",
                 "use_structured_output": "structured output", "enabled": "enabled", "escalation": "escalation",
                 "model": "model", "description": "description", "auto_router_enabled": "Auto Router",
@@ -451,6 +453,7 @@ def worker_snapshot(row: WorkerModelConfig) -> dict[str, Any]:
             "fallback_model": row.fallback_model, "secondary_models": list(row.secondary_models or []),
             "temperature": row.temperature,
             "max_output_tokens": row.max_output_tokens, "context_window": row.context_window,
+            "prompt_token_budget": row.prompt_token_budget,
             "reasoning_effort": row.reasoning_effort, "timeout_seconds": row.timeout_seconds,
             "retry_count": row.retry_count, "max_concurrency": row.max_concurrency,
             "use_structured_output": row.use_structured_output, "enabled": row.enabled,
@@ -571,8 +574,37 @@ def load_live_from(url: str | None, key: str | None, user_id: int) -> LiveState:
         return LiveState(error=str(exc))
 
 
+# A model's issue paths end in one of these; the name before it may itself contain dots ("gpt-4.1").
+MODEL_ISSUE_FIELD = re.compile(r"\.(fallback_models\.\d+|rest_seconds|model_type|deployment_params)$")
+
+
+def _subject(path: str) -> str | None:
+    """What an issue is about, named as the screens name it ("Ranker", "Tier FAST", "Auto Router")."""
+    head, _, rest = path.partition(".")
+    if head == "workers" and rest:
+        return label(rest.split(".", 1)[0])
+    if head == "tiers" and rest:
+        return f"Tier {rest.split('.', 1)[0]}"
+    if head == "models" and rest:
+        return f"Model {MODEL_ISSUE_FIELD.sub('', rest)}"
+    if head == "routing":
+        return "Auto Router"
+    if head in ("connection", "litellm"):
+        return "LiteLLM"
+    return None
+
+
 def _issue(path: str, message: str) -> dict[str, str]:
-    return {"path": path, "message": message}
+    issue = {"path": path, "message": message}
+    if subject := _subject(path):
+        issue["subject"] = subject
+    return issue
+
+
+def issue_text(issue: dict[str, str]) -> str:
+    """An issue as one line, with what it is about in front unless the message already starts with it."""
+    subject, message = issue.get("subject"), issue["message"]
+    return message if not subject or message.startswith(subject) else f"{subject}: {message}"
 
 
 def _in_range(value: Any, name: str) -> bool:
@@ -644,14 +676,16 @@ def validate(snapshot: dict[str, Any], *, live: LiveState | None = None, gateway
         entry = models.get(name)
         if entry is None and name not in managed_names:
             if live.known and name not in live.names:
-                errors.append(_issue(path, f"{what} {name} does not exist in LiteLLM or the model registry"))
+                errors.append(_issue(path, f"{what.capitalize()} {name} does not exist in LiteLLM or the model "
+                                           "registry"))
             elif not live.known:
-                warnings.append(_issue(path, f"{what} {name} is not in the model registry; run model discovery"))
+                warnings.append(_issue(path, f"{what.capitalize()} {name} is not in the model registry; run model "
+                                             "discovery"))
             return None
         if entry is not None and not entry.get("enabled", True):
-            errors.append(_issue(path, f"{what} {name} is disabled"))
+            errors.append(_issue(path, f"{what.capitalize()} {name} is disabled"))
         if live.known and name not in live.names and name not in managed_names:
-            errors.append(_issue(path, f"{what} {name} is not served by LiteLLM"))
+            errors.append(_issue(path, f"{what.capitalize()} {name} is not served by LiteLLM"))
         return entry
 
     def not_for_chat(path: str, entry: dict[str, Any] | None, name: str, worker_type: str) -> None:
@@ -755,7 +789,8 @@ def validate(snapshot: dict[str, Any], *, live: LiveState | None = None, gateway
         fallback = config.get("fallback_model")
         if fallback:
             if fallback == model:
-                errors.append(_issue(f"{base}.fallback_model", "The fallback model cannot be the primary model"))
+                errors.append(_issue(f"{base}.fallback_model", f"The fallback model cannot be the primary model "
+                                                                  f"({model})"))
             else:
                 not_for_chat(f"{base}.fallback_model", check_model(f"{base}.fallback_model", fallback,
                                                                    what="fallback model"), fallback, worker_type)
@@ -770,8 +805,8 @@ def validate(snapshot: dict[str, Any], *, live: LiveState | None = None, gateway
                 continue
             seen.add(extra)
             not_for_chat(path, check_model(path, extra, what="secondary model"), extra, worker_type)
-        for name in ("temperature", "max_output_tokens", "context_window", "timeout_seconds", "retry_count",
-                     "max_concurrency"):
+        for name in ("temperature", "max_output_tokens", "context_window", "prompt_token_budget", "timeout_seconds",
+                     "retry_count", "max_concurrency"):
             value = config.get(name)
             if value is not None and not _in_range(value, name):
                 low, high = LIMITS[name]
@@ -781,6 +816,13 @@ def validate(snapshot: dict[str, Any], *, live: LiveState | None = None, gateway
                 config["context_window"] > caps["context_window"]:
             errors.append(_issue(f"{base}.context_window", f"{config['context_window']} tokens exceeds the "
                                  f"{caps['context_window']}-token context {model} runs with"))
+        if config.get("prompt_token_budget") and worker_type not in TRIMMED_WORKERS:
+            warnings.append(_issue(f"{base}.prompt_token_budget", f"{label(worker_type)} does not trim its prompt "
+                                   "yet, so a prompt token budget has no effect"))
+        window = config.get("context_window") or caps.get("context_window")
+        if config.get("prompt_token_budget") and window and config["prompt_token_budget"] >= window:
+            warnings.append(_issue(f"{base}.prompt_token_budget", f"A {config['prompt_token_budget']}-token prompt "
+                                   f"budget is no smaller than the {window}-token context, so it never trims"))
         if config.get("max_output_tokens") and caps.get("max_output_tokens") and \
                 config["max_output_tokens"] > caps["max_output_tokens"]:
             errors.append(_issue(f"{base}.max_output_tokens", f"{model} produces at most "
@@ -837,7 +879,7 @@ def validate(snapshot: dict[str, Any], *, live: LiveState | None = None, gateway
         if entry.get("managed"):
             params = entry.get("deployment_params") or {}
             if not MODEL_NAME.match(name):
-                errors.append(_issue(f"models.{name}", "Model names are letters, digits and . _ : / @ + -"))
+                errors.append(_issue(f"models.{name}", "Model names are letters, digits, spaces and . _ : / @ + -"))
             if not params.get("model"):
                 errors.append(_issue(f"models.{name}.deployment_params", "A managed model needs a LiteLLM model "
                                      "(e.g. ollama_chat/llama3.2:3b)"))
@@ -951,7 +993,8 @@ def update_worker(db: Session, user_id: int, worker_type: str, changes: dict[str
             value = (str(value).strip().upper() or None) if value not in (None, "") else None
         elif name == "temperature":
             value = _number(value, name, float)
-        elif name in ("max_output_tokens", "context_window", "timeout_seconds", "retry_count", "max_concurrency"):
+        elif name in ("max_output_tokens", "context_window", "prompt_token_budget", "timeout_seconds", "retry_count",
+                      "max_concurrency"):
             value = _number(value, name, int)
         elif name == "reasoning_effort":
             value = (str(value).lower() or None) if value not in (None, "") else None
@@ -1111,10 +1154,15 @@ def update_model(db: Session, user_id: int, name: str, changes: dict[str, Any],
     if row is None:
         raise NotFound(f"Model {name} is not in the registry")
     conn = _bump(db, user_id, expected_revision)
+    dropped: list[str] = []
     for key, value in changes.items():
         if key == "display_name":
             row.display_name = str(value or name)[:200]
         elif key == "enabled":
+            if row.enabled and not value:
+                dropped = drop_backup_uses(db, user_id, name)
+                audit(db, user_id, "DISABLE", actor=_actor(db, user_id),
+                      changes=[{"model": name, "dropped_from": dropped}])
             row.enabled = bool(value)
         elif key == "model_type":
             if value not in AI_MODEL_TYPES:
@@ -1164,7 +1212,32 @@ def update_model(db: Session, user_id: int, name: str, changes: dict[str, Any],
             row.context_window = params["num_ctx"]
     row.updated_at = utcnow()
     db.commit()
-    return {"model": model_snapshot(row), "draft_revision": conn.draft_revision}
+    return {"model": model_snapshot(row), "draft_revision": conn.draft_revision, "dropped": dropped}
+
+
+def drop_backup_uses(db: Session, user_id: int, name: str) -> list[str]:
+    """Stop using a model as a backup: it leaves every worker's backups (the next one moving up, order kept) and
+    every other model's own fallbacks. Edits the draft only (the caller commits; the apply versions it). A main
+    model, a tier, the auto router and escalation are left alone. Returns what changed, worded like
+    `model_references`."""
+    out: list[str] = []
+    workers = db.scalars(select(WorkerModelConfig).where(WorkerModelConfig.user_id == user_id)).all()
+    for row in sorted(workers, key=lambda w: w.worker_type):
+        backups = [b for b in (row.fallback_model, *(row.secondary_models or [])) if b]
+        if name not in backups:
+            continue
+        out += [f"{label(row.worker_type)} (backup {i})" for i, b in enumerate(backups, 1) if b == name]
+        rest = [b for b in backups if b != name]
+        row.fallback_model = rest[0] if rest else None
+        row.secondary_models = rest[1:] or None
+        row.updated_at = utcnow()
+    models = db.scalars(select(AIModel).where(AIModel.user_id == user_id, AIModel.litellm_model_name != name)).all()
+    for row in sorted(models, key=lambda m: m.litellm_model_name):
+        if name in (row.fallback_models or []):
+            row.fallback_models = [m for m in row.fallback_models if m != name] or None
+            row.updated_at = utcnow()
+            out.append(f"{row.litellm_model_name}'s fallbacks")
+    return out
 
 
 def model_references(snapshot: dict[str, Any], name: str) -> list[str]:
@@ -1203,18 +1276,21 @@ def remove_model(db: Session, user_id: int, name: str, expected_revision: int | 
                                           AIModel.removed_at.is_(None)))
     if row is None:
         raise NotFound(f"{name} is not in the model registry")
+    conn = _bump(db, user_id, expected_revision)
+    dropped = drop_backup_uses(db, user_id, name)
+    db.flush()
     references = model_references(draft_snapshot(db, user_id), name)
     if references:
+        db.rollback()  # a refused removal keeps its backups too
         raise ConfigConflict(f"{name} is still used by: {', '.join(references)}. Change those first.",
                              references=references)
-    conn = _bump(db, user_id, expected_revision)
     # `managed` is kept: the snapshot leaves the model out, so the apply deletes an owned deployment anyway, and a
     # Restore redeploys it
     row.removed_at, row.enabled, row.updated_at = utcnow(), False, utcnow()
     db.execute(delete(ModelRouteState).where(ModelRouteState.user_id == user_id, ModelRouteState.model == name))
-    audit(db, user_id, "REMOVE", actor=_actor(db, user_id), changes=[{"model": name}])
+    audit(db, user_id, "REMOVE", actor=_actor(db, user_id), changes=[{"model": name, "dropped_from": dropped}])
     db.commit()
-    return {"removed": name, "draft_revision": conn.draft_revision}
+    return {"removed": name, "draft_revision": conn.draft_revision, "dropped": dropped}
 
 
 def restore_model(db: Session, user_id: int, name: str, expected_revision: int | None = None) -> dict[str, Any]:
@@ -1252,8 +1328,9 @@ def write_snapshot_to_draft(db: Session, user_id: int, snapshot: dict[str, Any])
                                                             created_at=utcnow())
         row.model_mode, row.primary_model, row.tier_name = config.get("mode") or "TIER", config.get("primary_model"), \
             config.get("tier")
-        for name in ("fallback_model", "secondary_models", "temperature", "max_output_tokens", "context_window", "reasoning_effort",
-                     "timeout_seconds", "retry_count", "max_concurrency", "escalation"):
+        for name in ("fallback_model", "secondary_models", "temperature", "max_output_tokens", "context_window",
+                     "prompt_token_budget", "reasoning_effort", "timeout_seconds", "retry_count", "max_concurrency",
+                     "escalation"):
             setattr(row, name, config.get(name))
         row.use_structured_output = config.get("use_structured_output", True)
         row.enabled = config.get("enabled", True)
@@ -1381,7 +1458,7 @@ def apply(db: Session, user_id: int, *, actor: str | None = None, source: str = 
                 "message": "Nothing changed since the active version"}
     if checked.report["errors"]:
         audit(db, user_id, action, result="REJECTED", source=source, actor=actor, changes=checked.changes,
-              error="; ".join(e["message"] for e in checked.report["errors"])[:1000])
+              error="; ".join(issue_text(e) for e in checked.report["errors"])[:1000])
         db.commit()
         raise ValidationFailed("The configuration is not valid", validation=checked.report)
 
@@ -1642,6 +1719,7 @@ def overview(db: Session, user_id: int) -> dict[str, Any]:
                      "structured_output_required": w.structured_output_required,
                      "min_context_tokens": w.min_context_tokens, "has_prompt": bool(w.prompts),
                      "capability": w.capability, "optional": w.optional,
+                     "trims_prompt": w.worker_type in TRIMMED_WORKERS,
                      "config": draft["workers"].get(w.worker_type),
                      "resolved": dict(zip(("model", "assignment", "note"),
                                           model_resolution.resolve_model(draft, w.worker_type), strict=True))}
@@ -1653,6 +1731,7 @@ def overview(db: Session, user_id: int) -> dict[str, Any]:
                     "discovered": {name: getattr(m, name) for name in OVERRIDABLE},
                     "used_by": sorted(used.get(m.litellm_model_name, []))} for m in models],
         "removed_models": removed,
+        "request_size": model_capacity.report(db, user_id, draft),  # requests too big for their model, and fixes
         "tiers": draft["tiers"], "routing": draft["routing"],
         "options": {"model_modes": list(WORKER_MODEL_MODES), "reasoning_efforts": list(REASONING_EFFORTS),
                     "model_types": list(AI_MODEL_TYPES), "classifiers": list(AUTO_ROUTER_CLASSIFIERS),

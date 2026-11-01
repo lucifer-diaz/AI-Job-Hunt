@@ -1,0 +1,58 @@
+<!doctype html>
+<html>
+<head><title>Job Application for Platform Engineer at Examplecorp</title></head>
+<body>
+<!-- A synthetic page shaped like the newer job-boards.greenhouse.io form: no `name` attributes, yes/no questions as
+     dropdown widgets (role="combobox", options rendered only once opened, like React Select), each followed by a
+     hidden required-shim input, and a plain "Submit application" button. Used only by the tests. -->
+<form id="application-form" class="application--form" action="/apply/submit" method="post">
+  <div class="field"><label for="first_name">First Name<span aria-hidden="true">*</span></label>
+    <input id="first_name" type="text" class="input" aria-required="true"></div>
+  <div class="field"><label for="last_name">Last Name<span aria-hidden="true">*</span></label>
+    <input id="last_name" type="text" class="input" aria-required="true"></div>
+  <div class="field"><label for="email">Email<span aria-hidden="true">*</span></label>
+    <input id="email" type="text" class="input" aria-required="true"></div>
+  <div class="field"><label for="resume">Resume/CV<span aria-hidden="true">*</span></label>
+    <input id="resume" type="file" class="visually-hidden" aria-required="true"></div>
+  <div class="field select" data-options="Yes|No">
+    <label for="question_1001" id="question_1001-label">Are you open to relocation for this role?<span aria-hidden="true">*</span></label>
+    <div class="select__control"><div class="select__value-container">
+      <div class="select__single-value" hidden></div>
+      <input id="question_1001" type="text" role="combobox" aria-required="true" aria-expanded="false"
+             aria-labelledby="question_1001-label" class="select__input" autocomplete="off">
+    </div></div>
+    <input aria-hidden="true" tabindex="-1" class="requiredInput" required value="">
+    <div class="select__menu" role="listbox" hidden></div>
+  </div>
+  <div class="field"><label for="question_1002">How many years of Python experience do you have?<span aria-hidden="true">*</span></label>
+    <input id="question_1002" type="text" class="input" aria-required="true"></div>
+  <button type="submit" class="btn btn--rounded">Submit application</button>
+</form>
+<script>
+  document.querySelectorAll('.field.select').forEach(function (box) {
+    var input = box.querySelector('[role="combobox"]'), menu = box.querySelector('[role="listbox"]');
+    var shown = box.querySelector('.select__single-value'), shim = box.querySelector('.requiredInput');
+    var options = box.dataset.options.split('|');
+    function open() {
+      var typed = input.value.trim().toLowerCase();
+      menu.innerHTML = '';
+      options.filter(function (o) { return !typed || o.toLowerCase().indexOf(typed) >= 0; }).forEach(function (o) {
+        var item = document.createElement('div');
+        item.setAttribute('role', 'option'); item.textContent = o;
+        item.addEventListener('click', function () {
+          shown.textContent = o; shown.hidden = false; shim.value = o; input.value = '';
+          menu.hidden = true; input.setAttribute('aria-expanded', 'false');
+        });
+        menu.appendChild(item);
+      });
+      menu.hidden = false; input.setAttribute('aria-expanded', 'true');
+    }
+    input.addEventListener('focus', open);
+    input.addEventListener('click', open);
+    input.addEventListener('input', open);
+    input.addEventListener('keydown', function (e) { if (e.key === 'Escape') { menu.hidden = true; } });
+  });
+  fetch('/beacon', {method: 'POST', body: 'loaded'}).catch(function () {});
+</script>
+</body>
+</html>

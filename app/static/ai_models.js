@@ -54,7 +54,9 @@ function aimTargetOptions(selected, capability = 'CHAT') {
     + (models.length ? `<optgroup label="Models">${models.map(n => aimOpt(`model:${n}`, n, selected)).join('')}</optgroup>` : '')
     + (router || selected === 'auto' ? `<optgroup label="Auto router">${aimOpt('auto', `Auto router${router ? ` · ${d.routing.auto_router_model_name}` : ' (off)'}`, selected)}</optgroup>` : '');
 }
-function aimTargetFields(target, c = {}) {
+// `c` is null for a worker added after the account's configuration was seeded (no row yet; saving creates it).
+function aimTargetFields(target, c) {
+  c = c || {};
   const [kind, name] = String(target || '').split(/:(.*)/s);
   if (kind === 'model') return { model_mode: 'FIXED', primary_model: name || null, tier_name: c.tier || null };
   if (kind === 'auto') return { model_mode: 'AUTO_ROUTER', primary_model: c.primary_model || null, tier_name: c.tier || null };
@@ -90,6 +92,40 @@ async function aimRun(key, fn, ok) {
     catch (err) { if (err.status === 409) await aimLoad(); throw err; }
   }, ok);
 }
+// A validation issue as one line, naming what it is about ("Ranker: …") unless the message already does; repeats once.
+const aimIssueText = i => !i.subject || i.message.startsWith(i.subject) ? i.message : `${i.subject}: ${i.message}`;
+const aimIssues = list => { const seen = new Set(); return (list || []).map(i => ({ ...i, text: aimIssueText(i) })).filter(i => !seen.has(i.text) && seen.add(i.text)); };
+// Where an issue's path is fixed: the tab, the worker drawer or the details to open, and the field to focus.
+// Model paths end in a known field; the name before it may itself contain dots ("gpt-4.1").
+const AIM_WORKER_FIELDS = { fallback_model: 'backup_0', escalation: 'esc_target', primary_model: 'target', tier: 'target', mode: 'target' };
+const aimAttrSel = value => String(value).replace(/["\\]/g, '\\$&');
+function aimFixTarget(path = '') {
+  const [head, name, field, index] = path.split('.');
+  if (head === 'workers' && name) {
+    const id = field === 'secondary_models' ? `backup_${Number(index) + 1}` : AIM_WORKER_FIELDS[field] || field || 'target';
+    const details = field === 'escalation' ? 'aim-escalation' : ['temperature', 'max_output_tokens', 'context_window', 'reasoning_effort', 'timeout_seconds', 'retry_count', 'max_concurrency'].includes(field) ? 'aim-generation' : null;
+    return { tab: 'workers', worker: name, details, focus: `#aiw-${id}` };
+  }
+  if (head === 'models' && name) {
+    const model = path.slice(7).replace(/\.(fallback_models\.\d+|rest_seconds|model_type|deployment_params)$/, '');
+    return { tab: 'models', model, fallbacks: /\.fallback_models\.\d+$/.test(path), focus: `[data-model="${aimAttrSel(model)}"]` };
+  }
+  if (head === 'tiers' && name) return { tab: 'models', focus: `select[data-tier="${aimAttrSel(name)}"]` };
+  if (head === 'routing') {
+    const id = name === 'tier_models' ? `tier_${field}` : { auto_router_model_name: 'auto_router_model_name', default_model: 'default_model', classifier_model: 'classifier_model', classifier_plugin: 'classifier_plugin' }[name] || 'classifier';
+    return { tab: 'models', details: 'aim-router', focus: `#aim-route-${id}` };
+  }
+  if (head === 'connection' || head === 'litellm') return { tab: 'settings', focus: '#aim-conn-base_url' };
+  return null;
+}
+const aimFixLink = (i, text = 'Fix') => aimFixTarget(i.path) ? `<button type="button" class="aim-fix" data-act="aim-fix" data-path="${attr(i.path)}"${text === 'Fix' && i.subject ? ` aria-label="Fix ${attr(i.subject)}"` : ''}>${esc(text)}</button>` : '';
+// Warnings with the same message once, naming each worker it is about, each a link to fix it.
+function aimWarningLines(warnings) {
+  const groups = new Map();
+  for (const w of warnings) { const key = w.subject && !w.message.startsWith(w.subject) ? w.message : w.text; groups.set(key, [...(groups.get(key) || []), w]); }
+  return [...groups].map(([message, list]) => list.length === 1 ? `<p class="settings-help">${esc(list[0].text)} ${aimFixLink(list[0])}</p>`
+    : `<p class="settings-help">${esc(message)} — ${list.map(w => aimFixLink(w, w.subject) || esc(w.subject)).join(', ')}</p>`).join('');
+}
 // Apply whatever the draft holds now, as a new version. A refusal is kept on screen with Undo.
 async function aimApplyNow() {
   await aimLoad();
@@ -99,13 +135,15 @@ async function aimApplyNow() {
     return out;
   } catch (err) {
     if (err.status === 409) { await aimLoad(); throw err; }
-    AIM.failed = { errors: (err.detail?.validation?.errors || []).map(e => e.message), warnings: (err.detail?.validation?.warnings || []).map(w => w.message), message: err.message };
-    if (!AIM.failed.errors.length) AIM.failed.errors = [err.message];
+    AIM.failed = { errors: aimIssues(err.detail?.validation?.errors), warnings: aimIssues(err.detail?.validation?.warnings), message: err.message };
+    if (!AIM.failed.errors.length) AIM.failed.errors = [{ message: err.message, text: err.message }];
     await aimLoad();
-    throw new Error(`Not saved: ${AIM.failed.errors[0]}`);
+    throw new Error(`Not saved: ${AIM.failed.errors[0].text}`);
   }
 }
 const aimSaved = (ok, out) => out?.status === 'PENDING' ? `${ok} · v${out.version} — restart LiteLLM to load it` : out?.status === 'UNCHANGED' ? `${ok} · nothing changed` : `${ok} · v${out?.version}`;
+// What disabling or deleting a model took it out of ("Ranker (backup 1)" → "Ranker"), for the toast.
+const aimDropped = dropped => dropped?.length ? ` · no longer a backup for ${[...new Set(dropped.map(d => d.replace(/ \(backup \d+\)$/, '')))].join(', ')}` : '';
 // A change to the configuration: write it, then apply it at once.
 async function aimSave(key, write, ok = 'Saved') {
   return busy(key, async () => {
@@ -137,7 +175,7 @@ function aimStrip() {
   const d = aimData(), conn = d.connection || {}, [connLabel, connTone] = AIM_CONN[conn.status] || AIM_CONN.UNKNOWN;
   const pending = (d.pending_changes || []).length, resting = typeof FO !== 'undefined' ? FO.routes?.resting || 0 : 0;
   const f = AIM.failed;
-  const notice = f ? `<div class="settings-error aim-failed" role="alert"><strong>Not saved.</strong>${f.errors.slice(0, 3).map(e => `<p>${esc(e)}</p>`).join('')}${f.errors.length > 3 ? `<p class="settings-help">and ${f.errors.length - 3} more</p>` : ''}${(f.warnings || []).map(w => `<p class="settings-help">${esc(w)}</p>`).join('')}<div class="row gap8 mt8">${btn(isBusy('aim-discard') ? 'Undoing…' : 'Undo changes', 'aim-discard', {}, 'sm', isBusy('aim-discard'))}${btn('Try again', 'aim-apply', {}, 'sm', isBusy('aim-apply'))}</div></div>`
+  const notice = f ? `<div class="settings-error aim-failed" role="alert"><strong>Not saved.</strong>${f.errors.map(e => `<p>${esc(e.text)} ${aimFixLink(e)}</p>`).join('')}${aimWarningLines(f.warnings || [])}<div class="row gap8 mt8">${btn(isBusy('aim-discard') ? 'Undoing…' : 'Undo changes', 'aim-discard', {}, 'sm', isBusy('aim-discard'))}${btn('Try again', 'aim-apply', {}, 'sm', isBusy('aim-apply'))}</div></div>`
     : pending ? `<div class="settings-notice aim-failed" role="status">${pending} change${pending === 1 ? ' is' : 's are'} saved but not applied yet.<div class="row gap8 mt8">${btn(isBusy('aim-apply') ? 'Applying…' : 'Apply now', 'aim-apply', {}, 'primary sm', isBusy('aim-apply'))}${btn('Undo', 'aim-discard', {}, 'sm', isBusy('aim-discard'))}</div></div>` : '';
   return `<section class="card aim-hero"><div class="row between wrap gap10">
       <div style="min-width:min(100%,280px);flex:1"><div class="aim-hero-title">Models &amp; routing</div>
@@ -175,7 +213,73 @@ function aimWorkers() {
       <td class="aim-wk-act">${btn('Edit', 'aim-worker', { worker: w.worker_type }, 'sm')}</td></tr>${test ? `<tr class="aim-wk-test"><td colspan="5">${aimTestResult(test)}</td></tr>` : ''}`;
   }).join('');
   const direct = d.gateway_enabled ? '' : `<p class="settings-notice">Workers call ${esc(d.gateway?.direct_label || 'the direct provider')} directly right now (Settings). These assignments apply when the LiteLLM route is on.</p>`;
-  return aimPanel(settingsGroup('Workers', 'Pick the model each worker uses. Backups take over when it is rate limited or failing.', `${direct}<div class="aim-wk-wrap"><table class="aim-workers"><thead><tr><th>Worker</th><th>Model</th><th>Backups</th><th>Health</th><th><span class="sr-only">Actions</span></th></tr></thead><tbody>${rows}</tbody></table></div>`));
+  return aimRequestSize() + aimPanel(settingsGroup('Workers', 'Pick the model each worker uses. Backups take over when it is rate limited or failing.', `${direct}<div class="aim-wk-wrap"><table class="aim-workers"><thead><tr><th>Worker</th><th>Model</th><th>Backups</th><th>Health</th><th><span class="sr-only">Actions</span></th></tr></thead><tbody>${rows}</tbody></table></div>`));
+}
+// Requests a provider refused as larger than its per-minute limit (README: Model failover). Waiting never helps them,
+// so this shows the provider's own limits, this worker's request sizes, and the fixes that fit: a cap on answers when
+// they fit under it, or a model with more room. A person applies a fix; nothing changes on its own.
+const AIM_COUNTS = { total: 'prompt + answer', input: 'prompt', output: 'answer' };
+const AIM_SIZE_SHOWN = 2;  // suggested models shown before "N more models"
+// The limit these requests overrun the most: what it counts (prompt, answer or both) against the limit itself. A limit
+// that counts the prompt comes first, so the bar shows the whole request; an answer-only limit is drawn only alone.
+function aimSizeBinding(g) {
+  const inp = g.typical_input, out = g.typical_output;
+  const counted = l => l.counts === 'input' ? inp : l.counts === 'output' ? out : inp != null ? inp + (out || 0) : null;
+  return g.limits.map(l => ({ ...l, used: counted(l) })).filter(l => l.used != null && l.limit > 0)
+    .sort((a, b) => (a.counts === 'output') - (b.counts === 'output') || b.used / b.limit - a.used / a.limit)[0] || null;
+}
+// A bar of this worker's typical request against the binding limit; unknown sizes draw nothing.
+function aimSizeMeter(g) {
+  const b = aimSizeBinding(g);
+  if (!b) return '';
+  const inp = b.counts === 'output' ? 0 : g.typical_input || 0, out = b.counts === 'input' ? 0 : g.typical_output || 0;
+  const scale = Math.max(b.limit, inp + out) || 1, pct = n => `${Math.round(n / scale * 1000) / 10}%`;
+  const parts = [b.counts !== 'output' ? `Prompt <b>~${esc(aimTokens(g.typical_input))}</b>` : '', b.counts !== 'input' && g.typical_output != null ? `Answer <b>~${esc(aimTokens(g.typical_output))}</b>` : '',
+    `Limit <b>${esc(aimTokens(b.limit))}</b> ${esc(AIM_COUNTS[b.counts] || b.counts)}/min on <span class="mono">${esc(b.deployment)}</span>`].filter(Boolean);
+  return `<div class="aim-size-meter" role="img" aria-label="${attr(`Typical request ${aimTokens(inp + out)} tokens against a limit of ${aimTokens(b.limit)} ${AIM_COUNTS[b.counts] || b.counts} tokens per minute`)}">
+      <div class="aim-size-bar">${inp ? `<span class="in" style="width:${pct(inp)}"></span>` : ''}${out ? `<span class="out" style="width:${pct(out)}"></span>` : ''}<i style="left:${pct(b.limit)}" title="${attr(`Limit ${aimTokens(b.limit)}/min`)}"></i></div>
+      <p class="aim-size-legend">${parts.join('<span aria-hidden="true">·</span>')}<span class="muted">9 in 10 requests are smaller</span></p></div>`;
+}
+function aimSizeLimits(g) {
+  const rows = g.limits.map(l => `<tr><td class="mono">${esc(l.deployment)}</td><td>${esc(aimTokens(l.limit))} ${esc(AIM_COUNTS[l.counts] || l.counts)} tokens/min (${esc(l.kind)})</td></tr>`).join('');
+  return rows ? settingsDetails(`aim-size-limits:${g.worker_type}:${g.model}`, `${esc(g.model)}'s limits (${g.limits.length})`, `<table class="aim-size-limits"><tbody>${rows}</tbody></table>`) : '';
+}
+function aimSizeVerdict(g) {
+  const cap = g.output_cap, box = (tone, head, why, act = '') => `<div class="aim-size-verdict ${tone}"><div><b>${head}</b><p>${why}</p></div>${act}</div>`;
+  if (cap?.applied) return box('good', `✓ Answers are capped at ${esc(aimTokens(cap.current))} tokens`, 'Requests like these now fit.');
+  if (cap) return box('brand', `Cap answers at ${esc(aimTokens(cap.value))} tokens`, `These requests then fit. ${cap.known_safe ? `This worker's answers are about ${esc(aimTokens(cap.typical_output))}, so they are not cut short.` : 'This worker has no answers on record yet, so check that a cap this size does not cut them short.'}`,
+    btn(isBusy('aim-size') ? 'Saving…' : `Cap answers at ${aimTokens(cap.value)}`, 'aim-size-cap', { worker: g.worker_type, value: cap.value }, 'primary sm', isBusy('aim-size')));
+  return box('warn', 'Switch to a model with more room', g.input_over ? `The prompt alone${g.typical_input != null ? ` (~${esc(aimTokens(g.typical_input))})` : ''} is over ${esc(g.model)}'s limit, so capping answers cannot help.`
+    : `Prompt and answer together are more than ${esc(g.model)} accepts in a minute, and a smaller answer cap would cut this worker's answers short.`);
+}
+function aimSizeModels(g, backups) {
+  if (!g.models.length) return `<div class="aim-size-none"><span>No model in your catalog is known to have room for these requests.</span>${btn('Add one in Models', 'aim-tab', { tab: 'models' }, 'ghost sm')}</div>`;
+  const busy = isBusy('aim-size'), primary = g.output_cap && !g.output_cap.applied ? '' : 'primary';
+  const row = (m, i) => {
+    const use = `Use ${m.name} instead of ${g.model} for ${g.label}`;
+    const tags = [i === 0 ? '<span class="pill brand">Recommended</span>' : '', m.proven ? '<span class="pill good">Proven for this worker</span>' : '',
+      `<span class="xs muted">${m.context_window ? `${esc(aimTokens(m.context_window))} context` : 'context unknown'}</span>`].join('');
+    const backup = m.in_chain ? '<span class="pill muted" title="Already in this worker\'s backups">Backup</span>'
+      : backups.length < AIM_BACKUPS ? btn('Add as backup', 'aim-size-backup', { worker: g.worker_type, model: m.name }, 'ghost sm', busy) : '';
+    return `<li class="aim-size-model"><div class="aim-size-model-name"><span class="aim-size-dot" style="--h:${aimHue(m.name)}" aria-hidden="true"></span><span class="mono" title="${attr(m.name)}">${esc(m.name)}</span>${tags}</div>
+      <div class="aim-size-model-act">${backup}<button class="btn sm ${i === 0 ? primary : ''}" data-act="aim-size-use" data-worker="${attr(g.worker_type)}" data-model="${attr(m.name)}" data-replace="${attr(g.model)}" data-role="${attr(g.role || 'primary')}" aria-label="${attr(use)}" title="${attr(use)}" ${busy ? 'disabled' : ''}>Switch</button></div></li>`;
+  };
+  const shown = g.models.slice(0, AIM_SIZE_SHOWN).map(row).join(''), rest = g.models.slice(AIM_SIZE_SHOWN);
+  return `<h4 class="aim-size-h">Models with room for these requests</h4><ul class="aim-size-models">${shown}</ul>${rest.length ? settingsDetails(`aim-size-more:${g.worker_type}:${g.model}`, `${rest.length} more model${rest.length === 1 ? '' : 's'}`, `<ul class="aim-size-models">${rest.map((m, i) => row(m, i + AIM_SIZE_SHOWN)).join('')}</ul>`) : ''}`;
+}
+function aimRequestSize() {
+  const groups = aimData().request_size || [];
+  if (!groups.length) return '';
+  const card = g => {
+    const backups = aimBackups(aimWorkerByType(g.worker_type)?.config || {});
+    const role = g.role && g.role !== 'primary' ? ` <span class="pill muted">its ${esc(g.role === 'backup' ? 'backup' : 'escalation model')}</span>` : '';
+    return `<article class="aim-size" style="--h:${aimHue(g.worker_type)}"><header class="aim-size-head"><span class="aim-wk-mono" aria-hidden="true">${esc(aimMonogram(g.label))}</span>
+        <div class="aim-size-title"><b>${esc(g.label)}</b> <span aria-hidden="true">→</span><span class="sr-only">sends to</span> <span class="mono">${esc(g.model)}</span>${role}</div>
+        <div class="aim-size-when"><span class="pill bad">${g.count} request${g.count === 1 ? '' : 's'} refused as too large</span><span class="xs muted">last ${esc(fmtDateTime(g.last_at))}</span></div></header>
+      ${aimSizeMeter(g)}${aimSizeVerdict(g)}${aimSizeModels(g, backups)}${aimSizeLimits(g)}</article>`;
+  };
+  const total = groups.reduce((n, g) => n + g.count, 0), workers = new Set(groups.map(g => g.worker_type)).size;
+  return aimPanel(settingsGroup('Requests too big for their model', `Last 7 days · ${workers} worker${workers === 1 ? '' : 's'} · ${total} request${total === 1 ? '' : 's'} refused. Each was over the provider's per-minute token limit, so waiting does not help and the model is not rested for them.`, `<div class="aim-size-list">${groups.map(card).join('')}</div>`), 'aim-size-panel');
 }
 function aimTestResult(t) {
   if (t.error && !t.success) return `<div class="settings-error aim-test">${esc(t.error)}</div>`;
@@ -189,7 +293,7 @@ function aimWorkerBaseline(w) {
   const c = w.config || {}, e = c.escalation || {}, backups = aimBackups(c);
   // An embedding worker is on exactly while it has a model: switched off, it shows Off whatever model it last had.
   const target = w.capability === 'EMBEDDING' && c.enabled === false ? '' : aimTarget(c);
-  return { target, ...Object.fromEntries(Array.from({ length: AIM_BACKUPS }, (_, i) => [`backup_${i}`, backups[i] || ''])), temperature: c.temperature ?? '', max_output_tokens: c.max_output_tokens ?? '', context_window: c.context_window ?? '', reasoning_effort: c.reasoning_effort || '', timeout_seconds: c.timeout_seconds ?? '', retry_count: c.retry_count ?? '', max_concurrency: c.max_concurrency ?? '', use_structured_output: c.use_structured_output !== false, enabled: c.enabled !== false, esc_target: e.model ? `model:${e.model}` : e.tier ? `tier:${e.tier}` : '', esc_threshold: e.confidence_threshold ?? '', ...Object.fromEntries(Object.keys(AIM_CONDITIONS).map(k => [`esc_${k}`, (e.conditions || []).includes(k)])) };
+  return { target, ...Object.fromEntries(Array.from({ length: AIM_BACKUPS }, (_, i) => [`backup_${i}`, backups[i] || ''])), temperature: c.temperature ?? '', max_output_tokens: c.max_output_tokens ?? '', context_window: c.context_window ?? '', prompt_token_budget: c.prompt_token_budget ?? '', reasoning_effort: c.reasoning_effort || '', timeout_seconds: c.timeout_seconds ?? '', retry_count: c.retry_count ?? '', max_concurrency: c.max_concurrency ?? '', use_structured_output: c.use_structured_output !== false, enabled: c.enabled !== false, esc_target: e.model ? `model:${e.model}` : e.tier ? `tier:${e.tier}` : '', esc_threshold: e.confidence_threshold ?? '', ...Object.fromEntries(Object.keys(AIM_CONDITIONS).map(k => [`esc_${k}`, (e.conditions || []).includes(k)])) };
 }
 function aimDrawerValues(w) { const base = aimWorkerBaseline(w); return Object.fromEntries(Object.keys(base).map(k => [k, fv('aiw', k, base[k])])); }
 const aimDrawerBackups = v => Array.from({ length: AIM_BACKUPS }, (_, i) => v[`backup_${i}`]).filter(Boolean);
@@ -200,6 +304,8 @@ function aimWarnings(w, v) {
   else if (w.structured_output_required && m.supports_structured_output == null && m.model_type !== 'AUTO_ROUTER') out.push(`Structured Output Required: it is unknown whether ${m.name} returns JSON reliably.`);
   if (m.context_window && m.context_window < w.min_context_tokens) out.push(`This model may not satisfy ${w.label} requirements (${aimTokens(m.context_window)} context; ${aimTokens(w.min_context_tokens)} recommended).`);
   if (v.context_window && m.context_window && Number(v.context_window) > m.context_window) out.push(`Context ${aimTokens(Number(v.context_window))} exceeds the ${aimTokens(m.context_window)} ${m.name} runs with.`);
+  const windowSize = Number(v.context_window) || m.context_window;
+  if (w.trims_prompt && v.prompt_token_budget && windowSize && Number(v.prompt_token_budget) >= windowSize) out.push(`A ${aimTokens(Number(v.prompt_token_budget))} prompt budget is no smaller than the ${aimTokens(windowSize)} context, so it never trims.`);
   if (aimDrawerBackups(v).includes(m.name)) out.push('A backup cannot be the model itself.');
   return out;
 }
@@ -221,7 +327,7 @@ function aimDrawer() {
     <label class="field" for="aiw-target"><span>Model</span><select class="select" id="aiw-target" data-form="aiw" data-field="target" data-live="1">${aimTargetOptions(v.target)}</select></label>${router}
     <div class="settings-grid">${backups}</div><p class="settings-help">Backups are tried in order when the model is rate limited, failing or down. Reliability decides when.</p>
     <div class="settings-checks">${checkF('aiw', 'enabled', v.enabled, 'Worker enabled')}</div>
-    ${settingsDetails('aim-generation', 'Generation settings', `<div class="settings-grid">${f('temperature', 'Temperature', 'type="number" min="0" max="2" step="0.1" placeholder="Model default"')}${f('max_output_tokens', 'Max output tokens', `type="number" min="1" max="${model?.max_output_tokens || 200000}" placeholder="Model default"`)}${f('context_window', 'Context window (tokens)', `type="number" min="512" placeholder="${attr(model?.context_window ? `Model: ${model.context_window}` : 'Model default')}" data-live="1"`)}${reasoning}${f('timeout_seconds', 'Timeout (seconds)', 'type="number" min="1" max="3600" placeholder="Server default"')}${f('retry_count', 'Retries', 'type="number" min="0" max="10" placeholder="Server default"')}${f('max_concurrency', 'Maximum concurrency', 'type="number" min="1" max="100" placeholder="No limit"')}</div><div class="settings-checks">${checkF('aiw', 'use_structured_output', v.use_structured_output, 'Structured output (JSON mode)')}</div>`)}
+    ${settingsDetails('aim-generation', 'Generation settings', `<div class="settings-grid">${f('temperature', 'Temperature', 'type="number" min="0" max="2" step="0.1" placeholder="Model default"')}${f('max_output_tokens', 'Max output tokens', `type="number" min="1" max="${model?.max_output_tokens || 200000}" placeholder="Model default"`)}${f('context_window', 'Context window (tokens)', `type="number" min="512" placeholder="${attr(model?.context_window ? `Model: ${model.context_window}` : 'Model default')}" data-live="1"`)}${w.trims_prompt ? f('prompt_token_budget', 'Prompt token budget', 'type="number" min="256" placeholder="No trimming" data-live="1"') : ''}${reasoning}${f('timeout_seconds', 'Timeout (seconds)', 'type="number" min="1" max="3600" placeholder="Server default"')}${f('retry_count', 'Retries', 'type="number" min="0" max="10" placeholder="Server default"')}${f('max_concurrency', 'Maximum concurrency', 'type="number" min="1" max="100" placeholder="No limit"')}</div><div class="settings-checks">${checkF('aiw', 'use_structured_output', v.use_structured_output, 'Structured output (JSON mode)')}</div>${w.trims_prompt ? '<p class="settings-help">Prompt token budget: over it, the least relevant job details and evidence are left out of the prompt, in a fixed order, until it fits (for providers that refuse large requests, such as a per-minute token limit). Required requirements are never left out. Blank sends the whole prompt.</p>' : ''}`)}
     ${settingsDetails('aim-escalation', 'Quality escalation', `<p class="settings-help">When an answer is not good enough, ask a stronger model once. Separate from backups, which handle outages.</p><div class="settings-grid"><label class="field" for="aiw-esc_target"><span>Escalate to</span><select class="select" id="aiw-esc_target" data-form="aiw" data-field="esc_target">${escTargets}</select></label>${f('esc_threshold', 'Confidence threshold', 'type="number" min="0" max="1" step="0.05" placeholder="e.g. 0.85"')}</div><div class="settings-checks">${conditions}</div>`)}
     <footer class="row gap8 mt14">${btn(isBusy('aim-worker-save') ? 'Saving…' : 'Save', 'aim-worker-save', { worker: w.worker_type }, 'primary', isBusy('aim-worker-save'))}${btn(isBusy(`aim-wtest-${w.worker_type}`) ? 'Testing…' : 'Test', 'aim-worker-test', { worker: w.worker_type }, '', isBusy(`aim-wtest-${w.worker_type}`))}</footer>${AIM.tests[`worker:${w.worker_type}`] ? aimTestResult(AIM.tests[`worker:${w.worker_type}`]) : ''}</aside>`;
 }
@@ -247,7 +353,7 @@ function aimWorkerPayload(w) {
   const [kind, name] = String(v.esc_target || '').split(/:(.*)/s);
   const conditions = Object.keys(AIM_CONDITIONS).filter(k => v[`esc_${k}`]);
   const backups = [...new Set(aimDrawerBackups(v))];
-  return { revision: aimRev(), ...aimTargetFields(v.target, w.config), fallback_model: backups[0] || null, secondary_models: backups.slice(1), temperature: num(v.temperature), max_output_tokens: num(v.max_output_tokens), context_window: num(v.context_window), reasoning_effort: v.reasoning_effort || null, timeout_seconds: num(v.timeout_seconds), retry_count: num(v.retry_count), max_concurrency: num(v.max_concurrency), use_structured_output: !!v.use_structured_output, enabled: !!v.enabled,
+  return { revision: aimRev(), ...aimTargetFields(v.target, w.config), fallback_model: backups[0] || null, secondary_models: backups.slice(1), temperature: num(v.temperature), max_output_tokens: num(v.max_output_tokens), context_window: num(v.context_window), prompt_token_budget: num(v.prompt_token_budget), reasoning_effort: v.reasoning_effort || null, timeout_seconds: num(v.timeout_seconds), retry_count: num(v.retry_count), max_concurrency: num(v.max_concurrency), use_structured_output: !!v.use_structured_output, enabled: !!v.enabled,
     escalation: kind && conditions.length ? { model: kind === 'model' ? name : null, tier: kind === 'tier' ? name : null, conditions, confidence_threshold: num(v.esc_threshold) } : null };
 }
 
@@ -286,7 +392,7 @@ function aimModelCard(m, labels, d) {
   const tags = [m.managed ? pill('Managed', 'brand') : '', m.present_in_litellm ? '' : pill('Not in LiteLLM', 'warn'), m.enabled ? '' : pill('Disabled', 'muted'), m.model_type && m.model_type !== 'CUSTOM' ? pill(m.model_type.replace('_', ' ').toLowerCase(), 'plain') : ''].join('');
   const more = open ? `<div class="aim-mcard-more"><label class="field" for="aim-type-${attr(m.name)}"><span>Type</span><select class="select" id="aim-type-${attr(m.name)}" data-act-change="aim-model-type" data-name="${attr(m.name)}">${(d.options?.model_types || []).map(t => aimOpt(t, t.replace('_', ' ').toLowerCase(), m.model_type)).join('')}</select></label>${m.model_type === 'EMBEDDING' ? `<label class="field" for="aim-dims-${attr(m.name)}"><span>Vector size (dimensions)</span><input class="input" type="number" min="1" max="65536" id="aim-dims-${attr(m.name)}" value="${attr(m.embedding_dimensions ?? '')}" placeholder="${attr(m.discovered?.embedding_dimensions ? `Discovered: ${m.discovered.embedding_dimensions}` : 'Unknown — run Test')}" data-act-change="aim-model-dims" data-name="${attr(m.name)}"></label>` : ''}${m.managed ? btn('Stop managing', 'aim-model-unmanage', { name: m.name }, 'sm') : ''}${btn(isBusy('aim-model-remove') ? 'Deleting…' : 'Delete model', 'aim-model-remove', { name: m.name, managed: m.managed ? '1' : '' }, 'sm danger', isBusy('aim-model-remove'))}</div>` : '';
   const refs = AIM.refs?.[m.name];
-  return `<article class="card aim-mcard ${m.enabled ? '' : 'off'}" style="--h:${aimHue(m.name)}">
+  return `<article class="card aim-mcard ${m.enabled ? '' : 'off'}" style="--h:${aimHue(m.name)}" data-model="${attr(m.name)}" tabindex="-1">
     <header class="aim-mcard-head"><span class="aim-mcard-mono" aria-hidden="true">${esc(aimMonogram(m.name))}</span>
       <div class="aim-mcard-title"><div class="aim-mcard-name mono b" title="${attr(m.name)}">${aimModelName(m.name)}</div><div class="xs muted ellipsis" title="${attr(sub)}">${esc(sub)}</div></div>
       <span class="aim-health ${tone}"><i aria-hidden="true"></i>${healthLabel}</span></header>
@@ -401,6 +507,43 @@ const AI_MODELS_ACTIONS = {
   'aim-reload': () => { AIM.error = ''; AIM.data = undefined; render(); },
   'aim-tab': el => { AIM.tab = el.dataset.tab; AIM.drawer = null; render(); },
   'aim-worker': el => { AIM.drawer = el.dataset.worker; delete S.forms.aiw; AIM.tab = 'workers'; render(); document.getElementById('aiw-target')?.focus(); },
+  'aim-fix': el => {
+    const t = aimFixTarget(el.dataset.path);
+    if (!t) return;
+    AIM.tab = t.tab; AIM.drawer = t.worker || null;
+    if (t.worker) delete S.forms.aiw;
+    if (t.details) SETTING_DETAILS.add(t.details);
+    if (t.fallbacks) { delete S.forms[`fb-${t.model}`]; AIM.fbEdit = t.model; }
+    render();
+    const target = document.querySelector(t.focus) || (t.worker && document.getElementById('aiw-target'));
+    target?.scrollIntoView?.({ block: 'center', behavior: 'smooth' });
+    target?.focus?.({ preventScroll: true });
+  },
+  'aim-size-cap': el => {
+    const w = aimWorkerByType(el.dataset.worker), value = Number(el.dataset.value);
+    return aimSave('aim-size', () => api(`/api/settings/ai/workers/${encodeURIComponent(w.worker_type)}`, { method: 'PUT', body: { revision: aimRev(), max_output_tokens: value } }), `${w.label}: answers capped at ${aimTokens(value)} tokens`);
+  },
+  'aim-size-backup': el => {
+    const w = aimWorkerByType(el.dataset.worker), list = [...new Set([...aimBackups(w.config), el.dataset.model])].slice(0, AIM_BACKUPS);
+    return aimSave('aim-size', () => api(`/api/settings/ai/workers/${encodeURIComponent(w.worker_type)}`, { method: 'PUT', body: { revision: aimRev(), fallback_model: list[0], secondary_models: list.slice(1) } }), `${el.dataset.model} is now a backup for ${w.label}`);
+  },
+  // Replaces the refusing model in the role it has for this worker: its model, one of its backups, or its escalation.
+  'aim-size-use': el => {
+    const w = aimWorkerByType(el.dataset.worker), c = w.config || {}, { model: name, replace: old, role } = el.dataset;
+    let change;
+    if (role === 'backup') {
+      const list = [...new Set(aimBackups(c).map(m => m === old ? name : m))];
+      change = { fallback_model: list[0] || null, secondary_models: list.slice(1) };
+    } else if (role === 'escalation') {
+      change = { escalation: { ...(c.escalation || {}), model: name, tier: null } };
+    } else {
+      // The new primary leaves the backups, where it would only be tried after itself.
+      const list = aimBackups(c).filter(m => m !== name);
+      change = { ...aimTargetFields(`model:${name}`, c), fallback_model: list[0] || null, secondary_models: list.slice(1) };
+    }
+    const where = role === 'backup' ? ' as a backup' : role === 'escalation' ? ' for escalation' : '';
+    return aimSave('aim-size', () => api(`/api/settings/ai/workers/${encodeURIComponent(w.worker_type)}`, { method: 'PUT', body: { revision: aimRev(), ...change } }), `${w.label} now uses ${name}${where} instead of ${old}`);
+  },
   'aim-drawer-close': () => { AIM.drawer = null; delete S.forms.aiw; render(); },
   'aim-worker-save': async el => {
     const w = aimWorkerByType(el.dataset.worker);
@@ -417,7 +560,10 @@ const AI_MODELS_ACTIONS = {
   },
   'aim-worker-test': el => { const w = el.dataset.worker; return busy(`aim-wtest-${w}`, async () => { AIM.tests[`worker:${w}`] = await api(`/api/settings/ai/workers/${encodeURIComponent(w)}/test`, { method: 'POST', body: { configuration: 'draft' } }); }); },
   'aim-model-test': el => { const n = el.dataset.name; return busy(`aim-mtest-${n}`, async () => { AIM.tests[`model:${n}`] = await api(`/api/settings/ai/models/${encodeURIComponent(n)}/test`, { method: 'POST' }); await aimLoad(); }); },
-  'aim-model-toggle': el => aimSave('aim-model', () => api(`/api/settings/ai/models/${encodeURIComponent(el.dataset.name)}`, { method: 'PUT', body: { revision: aimRev(), enabled: !!el.dataset.on } }), `${el.dataset.name} ${el.dataset.on ? 'enabled' : 'disabled'}`),
+  'aim-model-toggle': el => {
+    let dropped = [];
+    return aimSave('aim-model', async () => { dropped = (await api(`/api/settings/ai/models/${encodeURIComponent(el.dataset.name)}`, { method: 'PUT', body: { revision: aimRev(), enabled: !!el.dataset.on } }))?.dropped || []; }, () => `${el.dataset.name} ${el.dataset.on ? 'enabled' : 'disabled'}${aimDropped(dropped)}`);
+  },
   'aim-model-dims': el => {
     const m = aimModel(el.dataset.name) || {}, size = el.value === '' ? null : Number(el.value);
     return aimSave('aim-model', () => api(`/api/settings/ai/models/${encodeURIComponent(el.dataset.name)}`, { method: 'PUT', body: { revision: aimRev(), overrides: { ...(m.overrides || {}), embedding_dimensions: size } } }), 'Vector size saved');
@@ -439,11 +585,12 @@ const AI_MODELS_ACTIONS = {
     const what = el.dataset.managed ? `Its deployment is also removed from LiteLLM.` : `It stays in LiteLLM; Job Hunt OS stops using it.`;
     if (!confirm(`Delete ${n} from Job Hunt OS? ${what} A sync won't bring it back; you can restore it from Removed models.`)) return;
     AIM.refs = { ...(AIM.refs || {}) }; delete AIM.refs[n];
+    let dropped = [];
     return aimSave('aim-model-remove', async () => {
-      try { await api(`/api/settings/ai/models/${encodeURIComponent(n)}/remove`, { method: 'POST', body: { revision: aimRev() } }); }
+      try { dropped = (await api(`/api/settings/ai/models/${encodeURIComponent(n)}/remove`, { method: 'POST', body: { revision: aimRev() } }))?.dropped || []; }
       catch (err) { if (err.status === 409 && err.detail?.references) { AIM.refs[n] = err.detail.references; render(); } throw err; }
       AIM.more = { ...(AIM.more || {}), [n]: false };
-    }, `${n} deleted`);
+    }, () => `${n} deleted${aimDropped(dropped)}`);
   },
   'aim-model-restore': el => aimSave('aim-model-restore', () => api(`/api/settings/ai/models/${encodeURIComponent(el.dataset.name)}/restore`, { method: 'POST', body: { revision: aimRev() } }), `${el.dataset.name} restored`),
   'aim-model-more': el => { AIM.more = { ...(AIM.more || {}), [el.dataset.name]: !AIM.more?.[el.dataset.name] }; render(); },

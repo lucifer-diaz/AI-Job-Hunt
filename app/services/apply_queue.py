@@ -263,8 +263,9 @@ SUBMITTED_VIA = {"mcp": "claude_desktop", "apply_kit": "apply_kit", "worker": "a
 @dataclass
 class ClaimResult:
     """What begin_submission decided. `status`: CLAIMED (token issued), NOT_READY, DUPLICATE (already applied, here
-    or on another posting of the same job), CLAIM_CONFLICT (another client is submitting it now) or UNCERTAIN (an
-    earlier claim's outcome is unknown: a person must say whether it was submitted)."""
+    or on another posting of the same job), CLAIM_CONFLICT (another client is submitting it now), UNCERTAIN (an
+    earlier claim's outcome is unknown: a person must say whether it was submitted) or ROUTE_HELD (a guarded
+    execution owns this posting's submission: no other client may start one beside it)."""
 
     status: str
     claim: ApplicationClaim | None = None
@@ -403,7 +404,32 @@ def _new_claim(db: Session, job: Job, application: Application, *, client: str, 
     return claim
 
 
-def begin_submission(db: Session, job: Job, *, client: str, now: datetime | None = None) -> ClaimResult:
+def guarded_hold(db: Session, job: Job) -> Any | None:
+    """The active GUARDED_AUTO execution that owns this posting (this job or another posting of it), if any. While
+    one does, Claude Desktop and the Apply kit may not start a submission or be issued the packet (route exclusivity,
+    ADR-033): two submitters must never work on the same posting at once, and MCP clicks outside Job Hunt OS."""
+    from app.models import ACTIVE_APPLICATION_EXECUTION_TASK_STATUSES, ApplicationExecutionTask
+
+    q = ApplicationExecutionTask
+    rows = db.scalars(select(q).where(q.user_id == job.user_id, q.mode == "GUARDED_AUTO",
+                                      q.status.in_(ACTIVE_APPLICATION_EXECUTION_TASK_STATUSES)).limit(100)).all()
+    if not rows:
+        return None
+    keys = set(posting_identity(job))
+    for task in rows:
+        other = job if task.job_id == job.id else db.get(Job, task.job_id)
+        if other is not None and (other.id == job.id or keys & set(posting_identity(other))):
+            return task
+    return None
+
+
+ROUTE_HELD = "ROUTE_HELD"
+ROUTE_HELD_REASON = ("The application worker is submitting this posting in guarded mode; wait for it to finish, or "
+                     "stop it in Running workers first")
+
+
+def begin_submission(db: Session, job: Job, *, client: str, now: datetime | None = None,
+                     execution_id: int | None = None) -> ClaimResult:
     """Reserve this posting for one submission before anything external starts. Commits.
 
     Under the account lock: readiness exactly as packet issuance checks it (approved, the approved digest unchanged,
@@ -415,6 +441,9 @@ def begin_submission(db: Session, job: Job, *, client: str, now: datetime | None
     now = now or _now()
     expire_claims(db, now=now, user_id=job.user_id)
     application = lock_application(db, job)
+    if client != "worker" and guarded_hold(db, job) is not None:
+        db.rollback()
+        return ClaimResult(ROUTE_HELD, reason=ROUTE_HELD_REASON)
     reason = not_ready_reason(db, job)
     if reason is not None:
         db.rollback()
@@ -429,6 +458,7 @@ def begin_submission(db: Session, job: Job, *, client: str, now: datetime | None
     try:
         with db.begin_nested():
             claim = _new_claim(db, job, application, client=client, status=CLAIMED, now=now)
+            claim.execution_id = execution_id
             db.flush()
     except IntegrityError:  # another session claimed an alias at the same moment (SQLite has no row locks)
         db.rollback()
@@ -441,9 +471,22 @@ def begin_submission(db: Session, job: Job, *, client: str, now: datetime | None
     return ClaimResult(CLAIMED, claim=claim)
 
 
+def _intent(db: Session, claim: ApplicationClaim) -> Any | None:
+    from app.models import SubmissionIntent
+
+    return db.scalar(select(SubmissionIntent).where(SubmissionIntent.claim_id == claim.id)
+                     .execution_options(populate_existing=True).limit(1))
+
+
+CLICKED = ("A final Submit may have been clicked for this claim, so whether it was submitted is a fact to establish, "
+           "not something to release; say what happened (Apply kit)")
+
+
 def release_claim(db: Session, job: Job, token: str, reason: str) -> ApplicationClaim:
     """The client says nothing was submitted: free the posting. Only an open (CLAIMED) claim; an UNCERTAIN one is a
-    person's to resolve. Commits."""
+    person's to resolve, and so is one whose SubmissionIntent got as far as the click. Commits."""
+    from app.models import CLICKED_INTENT_STATUSES
+
     lock_application(db, job)
     claim = _claim_by_token(db, job, token)
     if claim is None or claim.status != CLAIMED:
@@ -453,9 +496,40 @@ def release_claim(db: Session, job: Job, token: str, reason: str) -> Application
         # The sweep may not have run yet: past its lease the outcome is unknown whatever the status column says.
         db.rollback()
         raise ValueError(LEASE_RAN_OUT)
+    from app.services import submission
+
+    intent = _intent(db, claim)
+    if intent is not None and intent.status in CLICKED_INTENT_STATUSES:
+        db.rollback()
+        raise ValueError(CLICKED)
+    # ARMED → ABORTED in one conditional UPDATE: a worker committing CLICKING at this moment wins or loses cleanly.
+    if intent is not None and intent.status != "ABORTED" and not submission.move(
+            db, intent.id, "ABORTED", only_from=("ARMED",), resolved_at=_now(), reason=f"released: {reason}"[:300]):
+        db.rollback()
+        raise ValueError(CLICKED)
     _finish(claim, RELEASED, f"not submitted: {(reason or 'no reason given').strip()}")
     db.commit()
     return claim
+
+
+def mark_uncertain(db: Session, claim_id: int, reason: str, *, now: datetime | None = None) -> bool:
+    """A client that may have submitted cannot tell whether it did (the confirmation was ambiguous, the browser
+    died after the click): the claim becomes UNCERTAIN at once instead of waiting for its lease, so nobody starts
+    another submission of the posting until a person says what happened. Only from CLAIMED. Does not commit."""
+    now = now or _now()
+    moved = db.execute(update(ApplicationClaim).where(ApplicationClaim.id == claim_id,
+                                                      ApplicationClaim.status == CLAIMED)
+                       .values(status=UNCERTAIN, resolution=reason[:200])
+                       .execution_options(synchronize_session=False)).rowcount
+    if moved:
+        claim = db.get(ApplicationClaim, claim_id, populate_existing=True)
+        application = db.get(Application, claim.application_id) if claim.application_id else None
+        if application is not None:
+            db.add(ApplicationEvent(application=application, kind="note", title="Submission outcome unknown",
+                                    detail=f"{reason} Say whether it was submitted before this posting can be "
+                                           "applied to again."[:1000],
+                                    meta={"claim_id": claim_id, "client": claim.client}))
+    return bool(moved)
 
 
 def resolve_uncertain(db: Session, job: Job, claim_id: int, *, submitted: bool,
@@ -468,8 +542,15 @@ def resolve_uncertain(db: Session, job: Job, claim_id: int, *, submitted: bool,
     if claim is None or claim.status not in (CLAIMED, UNCERTAIN):
         raise ValueError("There is no open submission to resolve for this job")
     if submitted:
-        return record_submission(db, job, claim_token=claim.token, client=claim.client,
-                                 confirmation_id=confirmation_id, resolving=True)
+        result = record_submission(db, job, claim_token=claim.token, client=claim.client,
+                                   confirmation_id=confirmation_id, resolving=True)
+        if result.status == "SUBMITTED":
+            _settle_intent(db, claim_id, "RESOLVED_SUBMITTED", "a person said it was submitted")
+        return result
+    from app.services.lifecycle import PERSON, parse_state
+    from app.services.lifecycle import WorkflowState as S
+    from app.services.work_queue import transition
+
     lock_application(db, job)
     claim = db.get(ApplicationClaim, claim_id, populate_existing=True)
     if claim is None or claim.status not in (CLAIMED, UNCERTAIN):
@@ -477,20 +558,41 @@ def resolve_uncertain(db: Session, job: Job, claim_id: int, *, submitted: bool,
         db.rollback()
         raise ValueError("There is no open submission to resolve for this job")
     _finish(claim, RELEASED, "a person said it was not submitted")
+    _settle_intent(db, claim_id, "RESOLVED_NOT_SUBMITTED", "a person said it was not submitted", commit=False)
+    if job.state and parse_state(job.state) is S.APPLYING:
+        # The one move only a person makes (lifecycle.PERSON_ONLY): back to the approved packet.
+        transition(db, job, S.READY_TO_APPLY, actor=PERSON, reason="The candidate said the submission was not sent")
     db.commit()
     return claim
 
 
+def _settle_intent(db: Session, claim_id: int, status: str, reason: str, *, commit: bool = True) -> None:
+    from app.models import SubmissionIntent
+
+    intent = db.scalar(select(SubmissionIntent).where(SubmissionIntent.claim_id == claim_id).limit(1))
+    if intent is not None and intent.status not in ("CONFIRMED", "RESOLVED_SUBMITTED", "RESOLVED_NOT_SUBMITTED"):
+        intent.status, intent.resolved_at, intent.reason = status, _now(), reason[:300]
+        if commit:
+            db.commit()
+
+
 def record_submission(db: Session, job: Job, *, claim_token: str | None = None, client: str = "mcp",
                       confirmation_id: str | None = None, submitted_by: str | None = None,
-                      submitted_via: str | None = None, resolving: bool = False) -> RecordResult:
+                      submitted_via: str | None = None, resolving: bool = False,
+                      evidence: dict[str, Any] | None = None) -> RecordResult:
     """The one place a submission is recorded (MCP, the Apply kit, `POST /api/jobs/{id}/applied`, a person resolving).
 
     Under `lock_application`: an already applied job is ALREADY_APPLIED (idempotent); otherwise the application must
     be approved and its packet still the approved one, no other posting of the job applied to, and the posting not
     held by another client's claim. With `claim_token` the claim must be this job's open claim for the same approved
     digest. Without one (older MCP clients, a person's own report) the result is recorded as unclaimed. Either way the
-    posting's alias keys stay held (RECORDED) for good. `mark_applied` commits everything at once."""
+    posting's alias keys stay held (RECORDED) for good. `mark_applied` commits everything at once, including the
+    canonical READY_TO_APPLY → APPLYING → APPLIED transitions.
+
+    `evidence` is only ever passed by the guarded worker after its ConfirmationVerifier found the site's proof
+    ({"kind": "verified_browser", "facts": …}), and only with its own claim token; every other report is `reported`."""
+    if evidence is not None and (client != "worker" or not claim_token):
+        raise ValueError("Only the application worker, holding its claim, records a verified submission")
     confirmation_id = (confirmation_id or "").strip()[:200] or None
     now = _now()
     application = lock_application(db, job)
@@ -540,7 +642,8 @@ def record_submission(db: Session, job: Job, *, claim_token: str | None = None, 
                                submitted_via=submitted_via or SUBMITTED_VIA.get(client, client),
                                confirmation_id=confirmation_id,
                                claim={"claim_id": claim.id, "claim": "unclaimed" if tokenless else "claimed",
-                                      "client": client})
+                                      "client": client},
+                               evidence=evidence if not resolving else None)
     return RecordResult("SUBMITTED", application=application, claimed=not tokenless)
 
 

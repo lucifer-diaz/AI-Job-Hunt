@@ -55,6 +55,12 @@ FIELDS: tuple[Field, ...] = (
           "int", 0, 0, 3_600_000),
     Field("degradation_pct", "Slower than its own history (%, 0 = off)",
           "Switch away when p95 latency exceeds the route's own 7-day median by this much.", "int", 0, 0, 10_000),
+    Field("rate_limit_rest_minutes", "Rest after a rate limit (minutes, 0 = cooldown)",
+          "A model that answers 429 is not used for this long, the same every time; 0 rests it for the cooldown below. "
+          "A model's own rest time (its Fallbacks) wins.", "int", 0, 0, 1440),
+    Field("usage_limit_rest_minutes", "Rest after a usage limit (minutes, 0 = as above)",
+          "A model whose provider says its usage allowance is used up (a 5-hour or weekly cap) without saying when it "
+          "resets is not used for this long. A reset time the provider gives always wins.", "int", 300, 0, 10_080),
     Field("cooldown_seconds", "First cooldown (seconds)", "How long a failed model rests; doubles each time.", "int",
           60, 5, 3600),
     Field("max_cooldown_seconds", "Longest cooldown (seconds)", "The doubling stops here.", "int", 900, 5, 86_400),

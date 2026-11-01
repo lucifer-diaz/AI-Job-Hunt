@@ -124,6 +124,50 @@ def test_ranking_can_ignore_unverified_facts_by_policy(user):
     assert context.unverified_facts == [] and context.relevant_experience == []
 
 
+PLAIN_RESUME = """# Sam Roe
+Frontend Developer
+
+## Summary
+Engineering manager who led a team of 12, building AI and machine learning products on AWS.
+
+## Skills
+- Languages: JavaScript, TypeScript
+
+## Experience
+### Frontend Developer | Pixel Co | Pune | Jan 2016 - Dec 2018
+- Built React dashboards for retail analytics
+- Improved page load time by 30%
+"""
+SUMMARY_FLAGS = ("leadership_experience", "ai_experience", "cloud_experience")
+
+
+@pytest.mark.strict_resume_policy
+def test_an_unverified_summary_sets_no_verified_background_flag(monkeypatch):
+    user = make_user(SessionLocal)
+    monkeypatch.setattr(auth, "authenticate", lambda request: CurrentUser(user, f"{user}@jobhunt.test", False))
+    client.post("/api/profile/resume", files={"file": ("sam.txt", io.BytesIO(PLAIN_RESUME.encode()), "text/plain")})
+    rid = resume_id()
+    for section in ("experience", "skills"):
+        client.post(f"/api/resumes/{rid}/verify-section", json={"section": section})
+    job_id = add_job(user, description="Frontend developer for React dashboards and page performance.",
+                     title="Frontend Developer")
+    with session(user) as db:
+        db.get(Job, job_id).fit_analysis = {"resume_gaps": []}
+        db.commit()
+    # The summary's leadership, AI and cloud words are unverified: they are no verified background anywhere.
+    for builder in (cb.build_ranking_context, cb.build_tailoring_context):
+        context = build(user, builder, job_id)
+        assert "summary" not in context.candidate
+        background = context.candidate["verified_background"]
+        assert background["primary_roles"] == ["Frontend Developer"]  # the verified experience still counts
+        assert not any(background.get(flag) for flag in SUMMARY_FLAGS), (builder.__name__, background)
+
+    summary = client.get(f"/api/resumes/{rid}/structured").json()["structured"]["summary"]
+    client.post(f"/api/resumes/{rid}/verify-item", json={"item_id": summary["id"]})
+    context = build(user, cb.build_ranking_context, job_id)
+    assert all(context.candidate["verified_background"].get(flag) for flag in SUMMARY_FLAGS)
+
+
 def profile_for_user(user_id):
     with session(user_id) as db:
         profile = profile_for(db)

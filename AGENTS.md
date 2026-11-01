@@ -98,7 +98,9 @@ These rules keep the model a worker uses a matter of configuration, never of cod
   creates a version). Keep that pairing: a refused save must never leave edits silently waiting in the draft.
 * **Deleting a model is a soft removal** (`ai_model_config.remove_model`, `AIModel.removed_at`): it leaves the draft,
   every picker and the next version, and `ai_registry.discover` never brings it back; Restore (or a rollback to a version
-  that had it) does. It is refused while anything still uses it (`model_references`). Only a deployment Job Hunt OS owns
+  that had it) does. Disabling or removing a model first drops it from worker backups and model fallbacks
+  (`drop_backup_uses`), never from a main model, a tier or the router; it is refused while anything still uses it
+  (`model_references`). Only a deployment Job Hunt OS owns
   leaves LiteLLM (through the normal apply; `managed` is kept, so Restore redeploys it); a discovered model stays in
   LiteLLM. Undo (`discard_draft`) removes again a model restored since the active version.
 * **Prompts remain under `app/prompts/`.** Prompts say *what* a model is asked to do; worker configuration decides
@@ -110,6 +112,14 @@ These rules keep the model a worker uses a matter of configuration, never of cod
 * **Routing policy is central.** Quality escalation (`escalation_reason`), request metadata and parameter filtering
   (`request_params`) live in `app/services/model_resolution.py`. A worker never decides to retry on a bigger model.
   Infrastructure fallback (the worker's `fallback_model`, sent to LiteLLM) and quality escalation stay separate.
+* **A prompt token budget trims; a context window refuses.** `WorkerModelConfig.prompt_token_budget` (versioned, draft →
+  apply) is read through `prompt_budget.budget_for` (LiteLLM gateway mode only). Over it, `context_builder.fit_prompt`
+  (Ranker, Tailor) and `ai_advisor.fit_advisor_prompt` (AI Optimization) render, measure and drop one item at a time in
+  their documented order (`RANKING_TRIM_ORDER`, `TAILORING_TRIM_ORDER`, `ADVISOR_TRIM_ORDER`) — deterministic, no
+  model. Trim before anything is computed from the context (ranking hashes, citable ids), so a validator never accepts
+  an id the prompt no longer shows. Never drop a REQUIRED requirement, the employer's sentences for it, the fit
+  analysis or rule findings. Unset, the builders' prompts stay byte-identical (`tests/test_prompt_budget.py`). A worker
+  joins `prompt_budget.TRIMMED_WORKERS` only with trim steps of its own.
 * **Unsupported parameters are never sent blindly**: a parameter goes out only when the model is not known to lack
   it; reasoning effort needs a model known to reason. Unknown capability stays unknown (NULL), never guessed.
 * **Job Hunt OS never destroys LiteLLM configuration it does not own.** `LiteLLMConfigManager` creates and removes
@@ -139,14 +149,42 @@ rules a change has to keep:
   request's outcome (`record_outcome` and `failover.apply` catch everything).
 * **A chain is the worker's backups, then its model's own fallbacks** (`AIModel.fallback_models`, `ResolvedWorker.chain`).
   Only the primary model's fallbacks join it, never a fallback's fallbacks, so two models may name each other without a
-  loop. A model's `rest_seconds` is exactly how long it rests after a trip, every time; without it the account's cooldown
-  doubles per trip. Both are configuration (versioned, draft → apply).
+  loop. A model's `rest_seconds` is exactly how long it rests after a trip, every time; without it a 429 rests it for the
+  account's `rate_limit_rest_minutes` (also fixed) when set, and otherwise the account's cooldown doubles per trip. The
+  model's fallbacks and rest time are configuration (versioned, draft → apply); the account's are failover settings.
 * **A resting model is a last resort, not removed**, so a request is never left with nothing to call. After its
   cooldown a route is half-open: traffic probes it, `recovery_successes` successes restore it, one failure rests it
   again for twice as long.
+* **A 429 rests the model for as long as the provider said** (`app/services/rate_limits.py`, read from the full 429
+  response before its text is cut): never before a reset it named (a header, `X-RateLimit-Reset` in the body, "try
+  again in 8.4s"); a usage cap with no reset (Ollama's 5-hour / weekly limits) for the account's
+  `usage_limit_rest_minutes`. "Request too large" refused one request, not the model: it never rests it, starts no
+  request cooldown (`external_api` marks the call `oversized_request`) and is not counted in the health window. A reset is a provider fact; never invent one.
+* **Requests too big for a model are shown, not rerouted** (`app/services/model_capacity.py`, Workers tab). From the
+  account's own refusals (the provider's stated limit and request size) and successes, it offers an answer cap only
+  when this worker's answers fit under it, and models with room: no refusal of a request that size, and a known context
+  window large enough or an answer to one (credited to the model that answered: `model_group`, never the requested
+  model of a fallback). A fix replaces the model in the role it has (primary, backup, escalation). It recommends; a
+  person applies a fix through draft → apply.
 * **A 429 rests the model, not the gateway.** The LiteLLM cooldown is kept per model (`external_api.cooldown_provider`,
   `LITELLM:<model>`), so a rate-limited model never blocks the model failover sends the request to. Other providers
   still cool down as a whole.
+* **A spent minute is waited out, not sent into a 429** (`app/services/token_pacing.py`). Each gateway response's
+  token headers (`x-ratelimit-*-tokens`, bare or LiteLLM's `llm_provider-` form; resets are durations such as
+  `2m59.56s`) are kept per `LITELLM:<model>` in `provider_rate_windows`; `external_api.hold_off` reserves the request's
+  `tokens_needed` (estimated prompt + `max_tokens`) with one guarded UPDATE and holds it with `RateLimitedCooldown`
+  until the token reset when the window cannot take it. A reservation stays on the window (`tokens_reserved`) until its
+  request's answer, so a provider figure that has not seen requests in flight never frees their tokens; a failure gives
+  it back. A window belongs to the model that answered (`x-litellm-model-group`), never to the requested one when a
+  fallback answered. Failover moves a waiting model behind its backups (an overlay, never a health trip); a request
+  that was never sent counts against a model's health nowhere (`record_outcome`, `window_stats`); a held ranking gives
+  its attempt back and comes back at the reset (`LLMRateLimitError.held_seconds`). Only what the provider said paces:
+  no row, an expired reset or a request larger than the whole limit is sent. Fails open.
+  Groq's request counter is per DAY: never report it as the figure that runs out first.
+* **A request larger than the whole per-minute limit fails once.** Besides the rules above (no cooldown, no rest), its
+  `LLMRateLimitError` (`rate_limit.kind == TOO_LARGE`) is never retried by the ranker, gives back its token
+  reservation and leaves the window alone. Its row stays a `RATE_LIMIT` with the provider's figures: Model capacity
+  reads it.
 * **Quality escalation and infrastructure failover stay separate.** Failover never decides on answer quality, and an
   escalated request gets no failover.
 * **Notifications are metadata only** (`/api/failover/events`: model names, cause, counts) and use the existing browser
@@ -222,9 +260,41 @@ The rules a change has to keep:
 * **Setups pin resumes, and their jobs follow.** Changing a setup's resume re-applies it to the jobs it found
   (`discovery.follow_setup`) — never to jobs the person pinned (`USER`, `ACTIVE`) or approved/applied ones.
 * **Resume choice is deterministic and pins win** (`app/services/resume_matching.py`): tags live on `Resume`
-  (`domain`, `roles`); `discovery.choose_resume` applies the setup's pin, else `auto_assign`. Only `resume_choice`
+  (`domains`: one or more domains, each with its roles; a resume scores as its best-fitting domain). `domain` /
+  `roles` are mirrors; only `resume_matching.set_tags` writes the three, and `groups(resume)` reads them; `discovery.choose_resume` applies the setup's pin, else `auto_assign`. Only `resume_choice`
   NULL or `AUTO` may ever be re-matched; `SETUP`, `USER` and `ACTIVE` are the person's decisions. Changing tags never
-  re-ranks by itself — re-matching is an explicit action, because it can queue model calls.
+  re-ranks by itself — re-matching is an explicit action, because it can queue model calls. A job whose stored match
+  differs from what today's tags pick shows it (`workspace.stale_match`, read-only) and offers Re-match on a click.
+  A person moving a tailored job to another resume (`discovery.repoint_jobs`) marks it `RESUME_CHANGED`: automatic
+  tailoring (when on) re-tailors it once the new ranking qualifies it — never from the old resume's analysis, and only
+  when its ranking was queued.
+
+## Resume structuring (AI parse of uploads)
+
+`app/services/resume_parsing.py` (queue and steps), `app/agents/resume_parsing.py` (the graph) and
+`app/services/resume_parsing_graph.py` (graph or plain path) structure each uploaded resume with the Resume Parser
+model (README §11). The rules a change has to keep:
+
+* **No model in a request.** `record_version` and "Re-parse with AI" only write a `ResumeParseTask`; the
+  `resume_parse` scheduler job runs it. The regex parse (`structured_resume.parse_deterministic`) is written at once
+  and stays when the model is unavailable.
+* **Grounding drops, never rewrites** (`resume_parsing.ground`, deterministic): a value is kept only when the resume's
+  own text contains it; dates are recomputed from their raw text with `normalize_date`. Never loosen it to make a
+  model's paraphrase pass; improve the prompt instead.
+* **A person's work wins.** The result replaces `structured_data` only while `untouched` holds (no reviewed unit, no
+  USER change, the revision the task was queued against); otherwise it is `resume_verification.compare`, the same
+  comparison a re-parse makes. Everything it writes is UNVERIFIED. It never activates a resume.
+* **The graph conducts the service's steps.** Its one model call goes through `GatewayChatModel` bound to the
+  `resume_parser` prompt; every write is `effects.within` plus the task's lease (`held`). The model output lives on
+  `resume_parse_tasks.staged` (cleared when the task ends), never in a checkpoint; graph state is ids and counts.
+* **Extracted text is repaired, never rewritten.** Uploads are read by `document_text.extract`; PDF text goes through
+  `text_repair.repair_glyphs` (deterministic: a broken ligature glyph is replaced only where the inferred ligature makes
+  a known word) before any parser sees it, so grounding checks the repaired text. Never add a model to that step.
+* **AI only is a queue order, not a missing fallback.** With the account's `resume_parsing.ai_only` worker setting an
+  upload is queued run-now and the screen hides the regex data while the model reads; the regex parse is still written
+  and stays when the model cannot answer.
+* **Kill stops; an upload never revives it.** A stopped task's text is not queued again by an upload; Retry, Run now
+  or Re-parse with AI do.
 
 ## Job Insights (company, compensation and interview research)
 
@@ -368,7 +438,8 @@ other static files.
   `asyncio.to_thread` pool, which a few slow model calls can fill and stall every scheduled job.
 * **Bulk retry is many single retries** (`workers.retry`): each task goes through `_requeue_finished`, is skipped with a
   reason rather than failing the batch, and never gets `run_now_at` — a bulk retry never bypasses a provider cooldown.
-* **A task row's model is read, never decided.** `workers.attach_models` adds `model` (route, model, how it was chosen;
+* **A task row's model is read, never decided.** `workers.attach_models` (matched through the kind's `llm_link`: the
+  job, or the resume for resume parsing) adds `model` (route, model, how it was chosen;
   `source` is `used` from the task's own `llm_request_logs` rows, or `next` from `LLMClient.route_for`) and
   `model_change` (FAILOVER, RESTING, FALLBACK, ESCALATED, CONFIG) to active rows. One bounded query, metadata only, and
   it never raises. Finished rows keep the model their own last request used (`source` `used`, or `none` when the task
@@ -520,12 +591,13 @@ hand-back) qualify a job when `QUALIFICATION_GRAPH_MODE=on` (README §9c). The r
 `app/services/answer_resolver.py`, `app/services/ats_forms/` and `app/infrastructure/application_browser/` (README
 §10a). The rules a change has to keep:
 
-* **Nothing in Job Hunt OS clicks a final Submit.** Phase 5 fills a form at most (ASSIST) and ends at
-  READY_TO_SUBMIT; a person submits. The execution stages SUBMITTING, CONFIRMING and CONFIRMED exist in the vocabulary
-  and are refused by `application_execution.set_stage`. `ApplicationPage` has no click, press, submit, tap or evaluate,
-  and the application browser aborts every non-GET request. `tests/test_no_automated_submit.py` fails the build on a
-  submit-capable call under the application modules. Do not add one before the Phase 6 SubmissionIntent, pre-submit
-  validator and confirmation verifier exist and are reviewed.
+* **Only the guarded path clicks a final Submit (Phase 6, next section).** OBSERVE and ASSIST fill a form at most and
+  end at READY_TO_SUBMIT; a person submits. The execution stages SUBMITTING, CONFIRMING and CONFIRMED are refused by
+  `application_execution.set_stage` (and the column) unless a GUARDED_AUTO execution passes its own SubmissionIntent.
+  `ApplicationPage` has no click, press, submit, tap or evaluate, and while Job Hunt OS drives a page the application
+  browsers abort every non-GET request except a file upload and a SubmitTicket's click. `tests/test_no_automated_submit.py`
+  allows exactly one `click` (GuardedPage.submit), one `.submit(ticket)` and one `signed_submit` (the SUBMIT node);
+  never add another.
 * **`apply_queue` stays the one domain boundary.** Readiness (`not_ready_reason`), duplicates (`applied_duplicate`,
   over `posting_identity`), blockers and recording (`record_submission`, `record_blocker`) are shared by MCP, the Apply
   kit, `POST /api/jobs/{id}/applied` and the execution worker. Never add a second readiness, duplicate or result path.
@@ -555,8 +627,8 @@ hand-back) qualify a job when `QUALIFICATION_GRAPH_MODE=on` (README §9c). The r
   `app.infrastructure.application_browser` (`ApplicationSessionManager`). Its only implementation is ephemeral: a fresh
   context per step, no storage state, cookies, credentials or profile, closed in `finally`. It never passes anything
   to `BrowserService.fetch_rendered_page` or JD recovery, and JD recovery never receives an application context.
-  Persisting an authenticated session needs a reviewed `AuthenticatedApplicationBrowser` implementation, an ADR and an
-  update of this section first. A login wall, OTP or CAPTCHA pauses as NEEDS_HUMAN; it is never solved or retried.
+  It never holds a saved login: saved ATS sessions exist only for the browser-use runner, per account and domain
+  (Phase 6, ADR-035). A login wall, OTP or CAPTCHA pauses as NEEDS_HUMAN; it is never solved or retried.
 * **The execution worker is a normal queued worker.** `application_execution_tasks` (one active per job), WorkerKind
   `application`, scheduler job `application_execution`, orchestration node `application_execution`, worker-owned graph
   `application` (`api_resumable=False`; thread key `application:<job>:<task>:<created>:a<attempt>`). Kill stops the
@@ -566,6 +638,155 @@ hand-back) qualify a job when `QUALIFICATION_GRAPH_MODE=on` (README §9c). The r
   holds ids, enums and counts only — never form values, page HTML or answers. ASSIST fills a page that is closed when
   the step ends: READY_TO_SUBMIT means every required field could be filled from verified sources, not that a filled
   form is waiting anywhere. Never present it as one; a person fills and submits on the site.
+
+## Guarded submission, the browser-use backend and ATS logins (Phase 6)
+
+`app/services/submission.py` (PreSubmitValidator, SubmissionIntent, ConfirmationVerifier, reconcile),
+`app/infrastructure/application_browser/guarded_submit.py` (the one page that clicks),
+`app/services/application_backends.py`, `app/services/browser_actions.py`, `app/prompts/browser_navigation.py`,
+`app/infrastructure/application_browser/browser_use_sidecar.py` + `sidecars/browser_use_runner/runner.py`,
+`app/services/ats_map.py`, `app/services/ats_auth.py`, `app/services/browser_use_webui.py` (README §10b, ADR-031 –
+ADR-035). The rules a change has to keep:
+
+* **Auto submit is per account, and stops only for the person.** `guarded_auto` is auto submit:
+  * it needs the server mode (`APPLICATION_EXECUTION_MODE=guarded_auto`) and the account's switch (Settings → Auto
+    submit, `submission.consent`, re-read at every check). `autonomous` is refused when settings load;
+  * with both on, approving a job queues its run (`application_execution.on_approved`, in a savepoint: approval never
+    fails because of it), and a run named by no one gets GUARDED_AUTO (`default_mode`);
+  * it covers every route a browser can complete (`AtsMatch.auto_submit`): the Greenhouse adapter on Playwright, or the
+    browser-use backend for any other form. LinkedIn, Indeed and Ashby are never automated;
+  * anything only the person can settle (a question with no verified answer, an attestation they have not approved, a
+    sensitive answer, a login, a code, a CAPTCHA, no single Submit control) hands them the window with the reason on
+    the page; Continue checks everything again and submits.
+* **The order is fixed and every step is re-checked.**
+  1. `PreSubmitValidator.check`.
+  2. `apply_queue.begin_submission(client="worker", execution_id=…)` — the shared claim, never a second mechanism.
+  3. A SubmissionIntent ARMED.
+  4. The page read again.
+  5. `PreSubmitValidator.check` again (with the claim).
+  6. `commit_clicking`: CLICKING + SUBMITTING in one commit, under the run's lease.
+  7. The click: `GuardedPage.submit(ticket)` (Playwright), or the runner's `submit` with `submission.signed_submit`
+     (browser-use) after `still_clicking`. Either way the intent is re-read first.
+  8. `after_click`: CONFIRMING, READY_TO_APPLY → APPLYING.
+  9. `ConfirmationVerifier`.
+  10. `confirm` (through `record_submission`) or `uncertain`.
+
+  No transaction is held while the browser works.
+* **After CLICKING, the outcome is a fact to establish, never a retry.** A crash, a timeout, a Kill, a lease running out
+  or an ambiguous page makes the intent and the claim UNCERTAIN (`submission.reconcile`, `recover_expired`,
+  `on_stopped`). A replayed SUBMIT node never clicks again (`submission.clicked`). Only an ARMED intent (nothing
+  clicked) is aborted and its claim released. Only a person resolves an uncertain submission, and only a person moves
+  APPLYING back to READY_TO_APPLY (`lifecycle.PERSON_ONLY`, enforced in `work_queue.transition`).
+* **Confirmation needs the site's evidence.** It needs all three:
+  * a 2xx/3xx non-GET response from the application's own site after the click (`same_site`; uploads never count);
+  * the form gone;
+  * a confirmation path or the site's confirmation wording.
+
+  A click, a navigation or a success-looking page alone is never enough. The evidence stored is metadata (statuses,
+  hosts, flags, a confirmation id), never page text.
+* **One recorder, two provenances.** Every submission is recorded by `apply_queue.record_submission`, which moves
+  READY_TO_APPLY → APPLYING → APPLIED (`workflow.advance_to_applied`, never a forged step) and labels the event
+  `evidence: verified_browser` only when the worker passes its own claim token and the verifier's facts. MCP, the Apply
+  kit and `POST /api/jobs/{id}/applied` are always `reported`.
+* **Route exclusivity.** While a GUARDED_AUTO task is active for a posting (any alias), `begin_submission` refuses every
+  other client (`ROUTE_HELD`) and MCP `get_job_packet` refuses the packet. A guarded enqueue is refused while any claim
+  on the posting is open or uncertain.
+* **The browser-use backend never decides, and submits only with a signed token.**
+  * The runner is a child process per execution, started with `BROWSER_USE_PYTHON`. It speaks JSON lines and has no
+    port.
+  * Its environment holds only PATH and HOME. Telemetry is off. Chromium is launched plainly: no debugging port, no
+    anti-detection flags (browser-use's own launcher is not used).
+  * It reuses browser-use's DOM indexing and element actions only: no browser-use Agent, no LLM.
+  * While Job Hunt OS drives, it aborts every non-GET except:
+    * the upload a file selection starts: an XHR/fetch PUT or multipart POST, for the seconds after `upload`
+      (Greenhouse sends the file to its storage bucket);
+    * during a signed SUBMIT click, whatever the page sends (its CAPTCHA script included);
+    * during a signed LOGIN click, the login domain only.
+
+    It refuses a submit-like click without a token (a `<button>` with no type inside a form is a submit), refuses
+    navigation off the allowed hosts, uploads only from the run's packet folder and fills password fields only through
+    `login_fill`. An upload counts only once the site took it (`UPLOAD_FAILED` otherwise); a board that replaces the
+    input with the file's name is read from `observe`'s `attached`.
+  * Like the shared browser, it never reaches internal services: every request is checked by host name and literal
+    address, and every navigation (a frame's too) by the addresses its host resolves to (`_resolves_private`).
+  * A LOGIN token works only on a control of the form that holds the password field, and `_login_parts` takes the
+    username, password and button from that one form.
+  * A saved session restores its cookies and its origins' local storage.
+  * The only scripts it evaluates are its own constants.
+  * Only `submission` signs SUBMIT (`signed_submit`, called once, by the SUBMIT node after CLICKING), for the form's
+    own submit control (`_submit_control`: one submit-like element of the form that holds the fields). Only
+    `application_backends` signs LOGIN.
+* **Every navigator step is checked by Python** (`browser_actions.check`):
+  * the element is in the latest observation;
+  * an answer goes only into the element it was resolved for (the field's locator is that element's key), and only a
+    RESOLVED answer;
+  * a select value is one of the element's own options;
+  * an upload is a packet file of the matching role;
+  * a click never lands on a submit-like control, a link off the route, or an accept/agree/consent button
+    (declining non-essential cookies is allowed);
+  * three refusals end the run.
+
+  The model's contract (`BrowserActionProposal`) has no field for a value and no submit action. Deterministic filling
+  comes first; the navigator only reaches what it cannot.
+* **Dropdown widgets (`role=combobox`, the newer Greenhouse board) are set only by the runner's `choose`.** It opens
+  the widget, types the verified answer and clicks the option whose text matches it exactly; anything else is
+  refused (`NO_SUCH_OPTION`). The Playwright path never clicks, so a form with a required dropdown goes to browser-use
+  (auto submit included), or waits for the person (`DROPDOWN_FIELDS`) when browser-use is off. A widget's hidden helper
+  inputs (`aria-hidden`, `tabindex=-1`, no id or name) are never fields. Each ephemeral-page field action waits at most
+  `FIELD_TIMEOUT_MS`.
+* **A person may send a run to browser-use** (`enqueue(backend="browser_use_webui")`, the Apply kit and the history
+  panel): fill only (ASSIST) unless a mode is named, refused while another run of the job is active or when the runner is
+  not configured; Retry and Run now keep that choice.
+* **The Web UI's own HTTP interface is not an automation API.** `browser_use_webui.probe` GETs its `/config` for
+  health and compatibility, nothing else. Never drive its Gradio endpoints (positional, auto-named, unauthenticated,
+  one global session, no pre-action veto).
+* **Logins are the person's, scoped to one domain** (`ats_auth`).
+  * Passwords and sessions are encrypted (`encrypt_secret`) in their own owned tables, never in settings or
+    preferences.
+  * No API returns a password, except a signup's generated one, once. A password is decrypted only to fill that very
+    domain's login form, on a domain in `APPLICATION_LOGIN_DOMAINS`, inside `redaction.holding`.
+  * A saved session keeps only its own domain's cookies and origins and is used only by that account's runner for that
+    domain (`APPLICATION_AUTH_SESSIONS_ENABLED`). A login is attempted once per run.
+  * OTP, CAPTCHA, a failed login and every signup wait for the person. No run ever creates an account or accepts terms.
+* **A window handed to the person is a normal browser.**
+  * A headful session is parked for `APPLICATION_TAKEOVER_TTL_MINUTES` and then sends what the person sends (logins,
+    uploads, their own submission); there is nothing to start first, and no Start submission in the Apply kit.
+  * `watch_windows` (every `applications` pass) reads those windows' evidence and records a submission the site
+    confirmed (`ConfirmationVerifier`): the run's own open claim is resolved as submitted, anything else is a
+    `reported` submission; the run ends `SUBMITTED_IN_WINDOW`. It works as the window's own account.
+  * The task waits PENDING at NEEDS_HUMAN, not claimable, until the person continues
+    (`continue_after_takeover`), on the same thread: every step, SUBMIT included, pauses through `wait` and resumes at
+    its `resume_at`. A run that hands over a window never ends and starts again.
+  * Then the run picks the page up where the person left it (`resume_in_place`, set by `_park_or_close`; no reload, so
+    a solved CAPTCHA, a sign-in and typed fields survive), observes it afresh and re-validates everything. It loads
+    the apply URL again only when the planned form is no longer on that page or the window is gone. It never replays
+    an old action.
+  * **A CAPTCHA is the person's, and the run continues once it is answered.** The runner reports a challenge widget as
+    booleans only (`captcha: {present, solved, kind}`, every frame, constant JavaScript; never the token; invisible
+    v3 widgets are not a challenge), and `ats_forms.page_problem(captcha=…)` lets it decide over page text. While a
+    window waits at a CAPTCHA, `watch_challenge` asks it every `APPLICATION_CHALLENGE_POLL_SECONDS` (a scheduler pass
+    does the same as a fallback, `watch_challenges`) and continues the run when it is answered (`continued_by:
+    window`). Nothing ever solves, clicks or retries a challenge.
+  * A run waiting for an answer in the Knowledge bank (NEEDS_INPUT, browser-use) keeps the form it read for
+    `APPLICATION_INPUT_HOLD_MINUTES` (`_keep_for_input`: a hold, never a takeover; non-GET stays blocked) and fills it
+    in place after the answer. The ephemeral Playwright page is still read again.
+  * An unclaimed takeover ends TAKEOVER_EXPIRED with the shared blocker. Kill closes the window.
+* **Fields the run could not fill are pointed out, not guessed** (`FIELDS_NEED_YOU`, headful browser-use).
+  * The runner outlines them with a banner (`point`, constant JavaScript, no click). The interrupt holds field ids and
+    labels only.
+  * Continue resumes in the same page (`session.resume_in_place`, no reload): the run removes the marks, fills what was
+    answered meanwhile, and reads back every required field.
+  * A required field with no verified source passes only when it now holds a value, and becomes `PERSON`. Auto submit
+    accepts a `PERSON` field (and an attestation the person ticked) only after the person pressed Continue.
+  * The person's values are never stored on the task, the checkpoint or a log. They are read from the window only when
+    the person asks to save them to the Knowledge bank (`save-window-answers`, as their verified answers).
+  * Headless runs end NEEDS_HUMAN and list the fields instead.
+* **The ATS map is facts, per account** (`ats_routes`, `ats_map.observe`): from posting URLs and run outcomes, never a
+  model, never a guessed employer site. A login belongs to a route's `login_domain`: per tenant where the ATS has
+  per-employer accounts (Workday, iCIMS, Taleo, SuccessFactors). Where employers share a host (SuccessFactors,
+  `tenant_in_host=False`), a host cannot keep their logins apart: `login_domain` is None, nothing is saved or reused
+  there, and a person signs in each time. Ashby (its form loads through POST), LinkedIn and
+  Indeed are `unsupported`.
 
 ## Candidate knowledge retrieval (RAG)
 
@@ -617,6 +838,35 @@ hand-back) qualify a job when `QUALIFICATION_GRAPH_MODE=on` (README §9c). The r
   byte-identical to the old builders (a test checks this). In `on` mode a retrieval error falls back to them.
 * **`rag_vectors` is created at runtime, not by Alembic** (`vector_store.setup`). A server without pgvector must still
   start; retrieval then stays full-text. There is no ANN index until a measured account needs one.
+
+## Evaluation, feedback and the journey (Phase 7)
+
+`app/services/journey.py` (the application journey), `app/services/agent_eval/` (datasets, suites, gates, report,
+live feedback), `scripts/agent_eval.py` (README §9e). The rules a change has to keep:
+
+* **No second pipeline.** The journey and the feedback rates read the rows each stage already writes. A new fact goes
+  where its stage owns it (a nullable column written by `llm_telemetry.build_entry`, as `retrieval_ms` is), never a
+  journey, packet-event or graph-state table.
+* **Cost is counted once.** An LLM call's cost lives on its `llm_request_logs` row only; an external row adds its own
+  cost only when no LLM row points at it (`external_request_id`). Unknown cost is None everywhere, never `0.0`.
+* **Unknown is UNKNOWN.** A stage with no stored fact is `UNKNOWN`; nothing is inferred from a neighbour. The actual
+  model is `llm_request_logs.model` / `model_group`; "off configuration" is computed only where both sides are known
+  and never for the auto router.
+* **The recruiter's decision is not a model error.** `recruiter_outcome` is reported beside the journey and the
+  correction rates with `attributed_to_model: False`; no metric reads a rejection as a fault of a stage.
+* **Gmail stays confidence-aware.** An ambiguous message is NEEDS_REVIEW and never an application's outcome
+  (`journey.review_messages` finds it by its candidates); a person's correction wins and is labelled `person`.
+* **Every suite runs production code over a versioned dataset**, and every suite has gates (`gates.GATES`). Bump a
+  dataset's `version` when a case is added, removed or relabelled. A skipped suite is BLOCKED. Ground truth is
+  written by a person; cases are synthetic. Add a gate before relaxing one.
+* **The LangGraph view draws the code** (`app/services/graph_topology.py`): structure from each compiled graph,
+  descriptions from each node function's docstring, pauses from `interrupt(`, the stage it conducts from
+  `GraphSpec.orchestration_node`. A new graph appears there once it is in `runtime.GRAPHS`; give every node function a
+  docstring (a test fails without one) and never draw or name a step in `app/static/`.
+* **Nothing is uploaded.** `--jsonl` is for a manual LangSmith import; the only export path stays
+  `app/agents/tracing_boundary.py`, which also refuses OTP- and token-shaped strings, cookie text and credentials in
+  URLs or headers (`export_policy.request_check`). `tests/test_external_api_guard.py` checks `job_hunt_agent/`,
+  `scripts/` and `sidecars/` for exporters too.
 
 ## Traces
 

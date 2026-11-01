@@ -10,9 +10,9 @@
    ranking cadence and any provider cooldown. Every number and row comes from /api/workers/* (app.services.workers). */
 'use strict';
 
-const WK_KINDS = [['parsing', 'JD parsing'], ['recovery', 'JD recovery'], ['ranking', 'Ranking'], ['qualification', 'Qualification'], ['insights', 'Job insights'], ['tailoring', 'Tailoring'], ['reviewing', 'Reviewing'], ['application', 'Application'], ['indexing', 'Indexing']];
+const WK_KINDS = [['parsing', 'JD parsing'], ['recovery', 'JD recovery'], ['ranking', 'Ranking'], ['qualification', 'Qualification'], ['insights', 'Job insights'], ['tailoring', 'Tailoring'], ['reviewing', 'Reviewing'], ['application', 'Application'], ['indexing', 'Indexing'], ['resume_parsing', 'Resume parsing']];
 // Tabs drawn from the generic task list (/api/workers/{kind}); ranking and tailoring keep their own views.
-const WK_GENERIC = ['parsing', 'recovery', 'qualification', 'insights', 'reviewing', 'application', 'indexing'];
+const WK_GENERIC = ['parsing', 'recovery', 'qualification', 'insights', 'reviewing', 'application', 'indexing', 'resume_parsing'];
 // Tabs whose Performance card comes from /api/workers/{kind}/performance (parsing and recovery bring their own metrics).
 const WK_PERF = ['ranking', 'insights', 'tailoring', 'reviewing'];
 // The worker tabs, then the account's worker settings (processing limits and rate-limit backoff).
@@ -73,7 +73,30 @@ async function loadWorkers() {
   if (data) D.wkData = { ...(D.wkData || {}), [tab]: data };
   if (act) D.wkAct = { ...(D.wkAct || {}), [tab]: act };
   if (performance) D.wkPerf = { ...(D.wkPerf || {}), [tab]: performance };
+  const h = w.history;
+  if (h && h.kind === tab) D.wkHistory = await api(`/api/workers/${h.kind}/tasks/${h.id}/history`).catch(e => ({ error: e.message }));
   scheduleWkPoll();
+}
+/* ───────────── a task's history (click its name) ───────────── */
+const WK_SOURCE_ICON = { task: '◆', attempt: '↻', step: '▸', browser: '▣', model: '●', workflow: '→', application: '✎', intent: '⚑' };
+function wkHistoryPanel(tab) {
+  const h = wkState().history;
+  if (!h || h.kind !== tab) return '';
+  const d = D.wkHistory;
+  if (!d) return `<section class="card mb12">${loading()}</section>`;
+  if (d.error) return `<section class="card mb12"><div class="row between"><div class="small">${esc(d.error)}</div>${btn('Close', 'wk-history-close', {}, 'sm')}</div></section>`;
+  const r = d.task, tone = { good: 'var(--good)', warn: 'var(--warn)', bad: 'var(--bad)', brand: 'var(--brand)', muted: 'var(--line)' };
+  const actions = [wkButtons(tab, r.task_id, { kill: r.can_kill, runNow: r.can_run_now }),
+    tab === 'application' && r.job_id != null ? btn('Open Apply kit', 'open-kit', { id: r.job_id }, 'sm') : '',
+    tab === 'application' && r.job_id != null && d.browser_use_ready ? `<span title="${attr('Opens a browser window (browser-use) that fills the form from your verified answers, checked step by step. It never submits: you do.')}">${btn(label('kit-browser-use', 'Run with browser-use', 'Queueing…'), 'kit-browser-use', { id: r.job_id }, 'sm', isBusy('kit-browser-use'))}</span>` : ''].join('');
+  return `<section class="card mb12 wk-history" aria-label="Task history"><div class="row between wrap gap10" style="padding:14px 18px;border-bottom:1px solid var(--line2)">
+      <div><div class="card-title" style="font-size:16px">${wkTaskName(r)}</div><div class="card-sub">Task #${r.task_id} · ${esc(wkDetail(r))}</div></div>
+      <div class="row gap8 wrap">${actions}${btn('Close', 'wk-history-close', {}, 'sm')}</div></div>
+    ${wkHistoryLogs(d)}
+    <ol style="list-style:none;margin:0;padding:10px 18px;max-height:420px;overflow:auto">${(d.events || []).map(e => `<li class="row gap10" style="padding:6px 0;border-bottom:1px solid var(--line2);align-items:flex-start">
+      <span aria-hidden="true" style="color:${tone[e.tone] || tone.muted};width:16px;text-align:center">${WK_SOURCE_ICON[e.source] || '•'}</span>
+      <span class="xs muted mono" style="min-width:150px">${esc(fmtDateTime(e.at))}</span>
+      <span class="grow"><span class="small">${esc(e.title)}</span>${e.detail ? `<span class="xs muted"> · ${esc(e.detail)}</span>` : ''}</span></li>`).join('') || '<li class="small muted">Nothing recorded yet.</li>'}</ol></section>`;
 }
 // Every few seconds while anything runs, slowly when idle, never on another screen or in a hidden tab.
 function wkPollDelay() {
@@ -134,7 +157,23 @@ function wkCooldowns(list) {
   return `<div class="banner warn" role="status"><span class="grow">Rate-limited: ${list.map(c => `<b>${esc(c.provider.toLowerCase())}</b> ${c.seconds_left}s left${c.calls_skipped ? ` (${c.calls_skipped} calls held back)` : ''}`).join(' · ')}. Waiting tasks resume when it ends.</span>
     ${btn(label('wkCooldown', 'Reset backoff', 'Resetting…'), 'wk-reset-cooldowns', {}, 'sm', isBusy('wkCooldown'))}</div>`;
 }
+// An application run waiting for the person (it is not claimable, so it is not "waiting its turn").
+// The Monitoring → Logs lines this task's runs wrote: one button per run's trace, newest first.
+function wkHistoryLogs(d) {
+  const ids = d.trace_ids || [];
+  if (!ids.length) return '<div class="xs muted" style="padding:8px 18px;border-bottom:1px solid var(--line2)">No log lines were written for this task.</div>';
+  return `<div class="row gap6 wrap" style="padding:8px 18px;border-bottom:1px solid var(--line2);align-items:center"><span class="xs muted">${d.log_count ? `${d.log_count} log line${d.log_count === 1 ? '' : 's'} in Monitoring → Logs` : 'Its runs in Monitoring → Logs'}:</span>
+    ${ids.map((id, i) => btn(ids.length === 1 ? 'View logs' : `${i === 0 ? 'Latest run' : `Run ${ids.length - i}`} · ${id.slice(0, 8)}`, 'wk-logs', { id }, 'sm')).join('')}</div>`;
+}
+function wkWaitingText(r) {
+  const w = r.waiting_detail || {};
+  if (w.kind === 'NEEDS_HUMAN' && w.fields) return `Waiting for you in the browser window: fill ${w.fields} highlighted field${w.fields === 1 ? '' : 's'}, then Continue in the Apply kit${w.expires_at ? ` · until ${fmtDateTime(w.expires_at)}` : ''}`;
+  if (w.kind === 'NEEDS_HUMAN') return `Waiting for you to finish in the browser window${w.reason ? ` (${wkHumanize(w.reason).toLowerCase()})` : ''}, then Continue in the Apply kit${w.expires_at ? ` · until ${fmtDateTime(w.expires_at)}` : ''}`;
+  const parts = [w.questions ? `answer ${w.questions} question${w.questions === 1 ? '' : 's'} in the Knowledge bank (and verify them)` : '', w.confirmations ? `confirm ${w.confirmations} saved answer${w.confirmations === 1 ? '' : 's'} in the Apply kit` : ''].filter(Boolean);
+  return `Waiting for you: ${parts.join(', then ') || 'see the Apply kit'}. It continues by itself`;
+}
 function wkDetail(r) {
+  if (r.waiting_for === 'YOU') return wkWaitingText(r);
   const of = r.max_attempts ? ` of ${r.max_attempts}` : '';
   const error = r.last_error ? ` · ${r.last_error}` : '';
   if (r.run_now && ['QUEUED', 'RETRYING'].includes(r.status)) return `First in line: runs on the next pass, without waiting${r.attempt ? ` · attempt ${r.attempt}${of} so far${error}` : ''}`;
@@ -240,11 +279,11 @@ function wkTable(kind, data) {
   return `<section class="card flush"><div class="row between wrap gap10" style="padding:14px 18px;border-bottom:1px solid var(--line2)">
       <div><div class="card-title" style="font-size:16px">Tasks${filtered ? ' matching your filters' : ''}</div><div class="card-sub">${active} waiting, running or retrying · ${rows.length - active} finished in the last day${shown}</div></div>${wkShownNudge(kind, rows)}</div>
     <div style="max-height:560px;overflow:auto" data-scroll-key="wk-${kind}"><div class="wk-head" aria-hidden="true"><div></div><div>Status</div><div>Task</div><div>Last run</div><div>Model &amp; route</div><div>Change</div><div></div></div>${rows.map(r => `<div class="wk-row ${r.status === 'RUNNING' ? 'running' : ''} ${wkSel(kind).has(r.task_id) ? 'picked' : ''}">
-      <div>${['FAILED', 'BLOCKED', 'STOPPED'].includes(r.status) && !r.retried_by ? wkSelectBox(kind, r.task_id, r.title) : ''}</div><div>${wkChip(r.status)}</div>
-      <div style="min-width:0"><div class="small b ellipsis">${wkTaskName(r)}</div>
+      <div>${['FAILED', 'BLOCKED', 'STOPPED'].includes(r.status) && !r.retried_by ? wkSelectBox(kind, r.task_id, r.title) : ''}</div><div>${r.waiting_for === 'YOU' ? wkPill('Waiting for you', 'warn', '◷') : wkChip(r.status)}</div>
+      <div style="min-width:0"><div class="small b ellipsis"><button type="button" class="linklike" style="all:unset;cursor:pointer" data-act="wk-history" data-kind="${attr(kind)}" data-id="${r.task_id}" title="Show what happened to this task">${wkTaskName(r)}</button></div>
         <div class="wk-detail xs ${['FAILED', 'BLOCKED'].includes(r.status) ? 'orch-bad' : 'muted'}"><span class="ellipsis" title="${attr(wkDetail(r))}">${wkTries(r)}${esc(wkDetail(r))}</span>${wkRowWhy(r)}</div></div>
       ${wkLastRun(r)}${wkModel(r)}${wkModelChange(r)}
-      <div class="wk-row-actions">${r.retried_by ? `<span class="orch-chip muted" title="${attr(`A newer task (#${r.retried_by.task_id}) is handling this job`)}">↻ Run again</span>` : ''}${wkButtons(kind, r.task_id, { kill: r.can_kill, runNow: r.can_run_now })}${wkRowNudge(kind, r.job_id, r.status)}${r.job_id != null ? btn('Job', 'open-job', { id: r.job_id }, 'sm') : ''}</div></div>`).join('')}</div></section>`;
+      <div class="wk-row-actions">${r.retried_by ? `<span class="orch-chip muted" title="${attr(`A newer task (#${r.retried_by.task_id}) is handling this job`)}">↻ Run again</span>` : ''}${wkButtons(kind, r.task_id, { kill: r.can_kill, runNow: r.can_run_now })}${wkRowNudge(kind, r.job_id, r.status)}${r.waiting_for === 'YOU' && r.job_id != null ? btn(r.waiting_detail?.kind === 'NEEDS_HUMAN' ? 'Open Apply kit' : 'Answer questions', 'open-kit', { id: r.job_id }, 'sm primary') : ''}${r.job_id != null ? btn('Job', 'open-job', { id: r.job_id }, 'sm') : ''}</div></div>`).join('')}</div></section>`;
 }
 
 /* ───────────── overview: hero, queue and the last 24 hours ───────────── */
@@ -256,7 +295,7 @@ function wkLimits(tab) {
 }
 // Rank / run everything that is waiting, now, in bulk (not for tailoring, which has no wait).
 function wkRunQueuedButton(tab, spec) {
-  if (!['parsing', 'recovery', 'ranking', 'qualification', 'insights', 'indexing'].includes(tab)) return '';
+  if (!['parsing', 'recovery', 'ranking', 'qualification', 'insights', 'indexing', 'resume_parsing'].includes(tab)) return '';
   const c = spec.counts || {}, n = (c.queued || 0) + (c.retrying || 0), key = 'wkRunQueued' + tab;
   const verb = tab === 'ranking' ? 'Rank' : 'Run';
   return `<span title="${attr(n ? `${verb} the ${n} queued or waiting task${n === 1 ? '' : 's'} now: no retry wait${tab === 'ranking' ? ', no cadence' : ''}. A provider cooldown still applies.` : 'Nothing is queued')}">${btn(label(key, `${verb} ${n || ''} queued now`.replace('  ', ' '), 'Starting…'), 'wk-run-queued', { kind: tab, n }, 'sm', !n || isBusy(key))}</span>`;
@@ -564,7 +603,7 @@ function wkSettings() {
       <div class="wk-scol server"><div class="wk-scol-head"><span class="wk-scol-icon" aria-hidden="true">↗</span><div><b>Waits after 429s in a row</b><small>Worked out from the values on the left.</small></div></div><div class="wk-pad">${ladder}<p class="settings-help mt12">A provider's own <code>Retry-After</code> wins when it asks for longer. Model calls and Apify calls back off separately; the first normal answer resets it. Kill all and Reset backoff clear a wait that is running now.</p></div></div></div>`
     : '<div class="wk-paused-note">Off: every queued task calls the provider again straight away, even while it is refusing them.</div>'}</section>`;
   const auto = id => !!fv('workers', wkAKey(id, 'auto'), D.wkSettings.account[id].values.auto);
-  const nav = [['parsing', 'JD parsing'], ['recovery', 'JD recovery'], ['ranking', 'Ranking'], ['qualification', 'Qualification'], ['insights', 'Job insights'], ['tailoring', 'Tailoring'], ['application', 'Application'], ['indexing', 'Indexing'], ['approvals', 'Approvals'], ['backoff', 'Rate limits']]
+  const nav = [['parsing', 'JD parsing'], ['recovery', 'JD recovery'], ['ranking', 'Ranking'], ['qualification', 'Qualification'], ['insights', 'Job insights'], ['tailoring', 'Tailoring'], ['application', 'Application'], ['indexing', 'Indexing'], ['resume_parsing', 'Resume parsing'], ['approvals', 'Approvals'], ['backoff', 'Rate limits']]
     .filter(([id]) => id === 'backoff' || id === 'approvals' || D.wkSettings.account[id])
     .map(([id, t]) => `<a href="#wk-set-${id}" data-act="wk-set-jump" data-id="${id}"><span class="wk-set-icon sm" aria-hidden="true">${WK_SET_ICONS[id]}</span><span class="grow">${t}</span>${id === 'backoff' ? (backoffOn ? '<i class="wk-state on">On</i>' : '<i class="wk-state">Off</i>') : id === 'approvals' ? (fv(form, 'application_mode', b.application_mode) === 'automatic' ? '<i class="wk-state on">Auto</i>' : '<i class="wk-state">Manual</i>') : auto(id) ? '<i class="wk-state on">Auto</i>' : '<i class="wk-state paused">Paused</i>'}</a>`).join('');
   return `<form id="settings-editor" class="wk-settings" data-form="workers" novalidate><fieldset ${isBusy('settings-workers') ? 'disabled' : ''}>
@@ -572,7 +611,7 @@ function wkSettings() {
         <div class="wk-legend-box mt12"><div><span aria-hidden="true">👤</span> <b>Your account</b> only your tasks</div><div><span aria-hidden="true">${D.wkSettings.server_editable ? '⚙' : '🔒'}</span> <b>Server</b> ${D.wkSettings.server_editable ? 'every account (admin)' : 'set by your admin'}</div><div><span class="wk-dot" aria-hidden="true"></span> <b>Custom</b> differs from the default</div></div>
 </nav>
       <div class="stack" style="min-width:0"><div id="settings-error" class="settings-error" role="alert" ${SETTING_ERRORS.workers ? '' : 'hidden'}>${esc(SETTING_ERRORS.workers || '')}</div>
-        ${wkSettingsCard('parsing', 'JD parsing')}${wkSettingsCard('recovery', 'JD recovery')}${wkSettingsCard('ranking', 'Ranking', ranking)}${wkSettingsCard('qualification', 'Qualification')}${wkSettingsCard('insights', 'Job insights')}${wkSettingsCard('tailoring', 'Tailoring', tailoringExtra)}${wkSettingsCard('application', 'Application')}${wkSettingsCard('indexing', 'Indexing')}${wkApprovalsCard(b)}${backoff}
+        ${wkSettingsCard('parsing', 'JD parsing')}${wkSettingsCard('recovery', 'JD recovery')}${wkSettingsCard('ranking', 'Ranking', ranking)}${wkSettingsCard('qualification', 'Qualification')}${wkSettingsCard('insights', 'Job insights')}${wkSettingsCard('tailoring', 'Tailoring', tailoringExtra)}${wkSettingsCard('application', 'Application')}${wkSettingsCard('indexing', 'Indexing')}${wkSettingsCard('resume_parsing', 'Resume parsing')}${wkApprovalsCard(b)}${backoff}
         <div class="wk-set-footer">${settingsFooter('workers')}</div></div></div></fieldset></form>`;
 }
 
@@ -644,7 +683,7 @@ function wkFilterBar(tab, counts) {
   const f = wkFilter(tab), ranking = tab === 'ranking';
   const search = ranking
     ? `<input class="input grow" style="min-width:200px;margin-top:0" id="rf-q" data-rf="q" value="${attr(S.rf.q)}" placeholder="Search title, company or location…" aria-label="Search ranking tasks">`
-    : `<input class="input grow" style="min-width:200px;margin-top:0" id="wk-q-${tab}" data-wk-search="${tab}" value="${attr(f.q)}" placeholder="${tab === 'indexing' ? 'Search evidence, answer or #source id…' : 'Search job title, company or #job id…'}" aria-label="Search tasks">`;
+    : `<input class="input grow" style="min-width:200px;margin-top:0" id="wk-q-${tab}" data-wk-search="${tab}" value="${attr(f.q)}" placeholder="${tab === 'indexing' ? 'Search evidence, answer or #source id…' : tab === 'resume_parsing' ? 'Search resume name or #resume id…' : 'Search job title, company or #job id…'}" aria-label="Search tasks">`;
   const status = `<select class="select" style="width:auto;margin-top:0" id="wk-status-${tab}" data-wk-status="${tab}" aria-label="Status">${WK_FILTERS.map(([id, text]) =>
     `<option value="${id}" ${f.status === id ? 'selected' : ''}>${esc(text)}${counts && counts[id] != null ? ` (${counts[id]})` : ''}</option>`).join('')}</select>`;
   const location = ranking && D.ranking ? `<select class="select" style="width:auto;margin-top:0" id="rf-location" data-rf="location" aria-label="Location">${locationOptions(D.ranking.locations).map(([v, t]) =>
@@ -708,7 +747,7 @@ function renderWorkers() {
     // The filters narrow the task list, not the metrics, so they sit right above the list.
     const insights = { parsing: wkParsingInsights, recovery: wkRecoveryInsights }[w.tab]
       || (WK_PERF.includes(w.tab) ? () => wkPerformanceInsights(w.tab, (D.wkPerf || {})[w.tab]) : null);
-    body = !data ? loading() : `${insights ? insights(data) : ''}${wkFilterBar(w.tab, filterCounts)}${wkBulkBar(w.tab)}${wkTable(w.tab, data)}`;
+    body = !data ? loading() : `${insights ? insights(data) : ''}${wkHistoryPanel(w.tab)}${wkFilterBar(w.tab, filterCounts)}${wkBulkBar(w.tab)}${wkTable(w.tab, data)}`;
   }
   return `<div class="stack">${top}${wkCooldowns(s.cooldowns)}${wkHero(w.tab, spec, act)}${wkActivity(act)}${body}</div>`;
 }
@@ -790,6 +829,25 @@ const WORKERS_ACTIONS = {
     await wkReload();
     return out;
   }, out => out.message || `Moved ${out.moved.length} job${out.moved.length === 1 ? '' : 's'} to ${out.to}${out.skipped.length ? ` · ${out.skipped.length} skipped: ${out.skipped[0].reason}` : ''}`),
+  'wk-history': async el => {
+    wkState().history = { kind: el.dataset.kind, id: Number(el.dataset.id) };
+    D.wkHistory = null; render();
+    D.wkHistory = await api(`/api/workers/${el.dataset.kind}/tasks/${el.dataset.id}/history`).catch(e => ({ error: e.message }));
+    render();
+  },
+  'wk-logs': el => {
+    const m = monState();
+    Object.assign(m.logs, { category: '', level: '', provider: '', workflow: '', search: '', trace_id: el.dataset.id, page: 1, entry: null });
+    m.tab = 'logs'; go('monitoring');
+  },
+  // Running workers with one task's history open (the Apply kit's link to its application run).
+  'wk-open-task': el => {
+    const w = wkState();
+    w.tab = el.dataset.kind; w.history = { kind: el.dataset.kind, id: Number(el.dataset.id) };
+    wkFilter(el.dataset.kind).status = 'all'; D.wkHistory = null;
+    go('workers', { kitJob: null });
+  },
+  'wk-history-close': () => { wkState().history = null; D.wkHistory = null; render(); },
   'wk-run-now': el => busy(`wkRun${el.dataset.kind}${el.dataset.id}`, async () => {
     const out = await api(`/api/workers/${el.dataset.kind}/tasks/${el.dataset.id}/run-now`, { method: 'POST' });
     await wkReload();

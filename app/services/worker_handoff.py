@@ -9,8 +9,9 @@ worker itself uses, so there is no second workflow:
     Recovery  → Parsing    job_description.queue_parse
     Parsing   → Ranking    ranker.request_ranking (the hard filters and the domain filter still apply)
     Ranking   → Tailoring  auto_tailor.queue(manual=True)
-    Tailoring → Approval   workflow.approve_job, only where the account's own policy (automatic mode and the minimum
-    Reviewing → Approval   reviewer score) would have approved the packet already
+    Tailoring → Reviewing  tailor_tasks.enqueue(mode="review"): a saved packet whose review never ran or failed
+    Reviewing → Approval   workflow.approve_job, only where the account's own policy (automatic mode and the minimum
+                           reviewer score) would have approved the packet already
 
 Insights has no next stage. Rules a change has to keep (AGENTS.md → Running workers): only the account's own jobs;
 a job a person stopped (`STOPPED_BY_USER`), removed from ranking, or already approved or applied is left alone; nothing
@@ -140,7 +141,32 @@ def _queue_tailoring(db: Session, user_id: int, ids: list[int]):
     return queued, skipped
 
 
-# ───────────── Tailoring / Reviewing → Approval ─────────────
+# ───────────── Tailoring → Reviewing ─────────────
+
+def _unreviewed_packets(db: Session, user_id: int) -> list[int]:
+    """Jobs still in the Tailor queue whose latest packet was saved but never reviewed (the review failed, or the run
+    was interrupted between saving and reviewing), with no tailoring pass queued or running."""
+    from app.services.workflow import SKIP_TAILORING_STATUSES
+
+    latest = select(func.max(ResumeVariant.version)).where(ResumeVariant.job_id == Job.id).correlate(Job).scalar_subquery()
+    decided = exists().where(Application.job_id == Job.id, Application.status.in_(("approved", "applied")))
+    active = exists().where(TailorTask.job_id == Job.id, TailorTask.status.in_(("queued", "running")))
+    stopped = exists().where(TailorTask.job_id == Job.id, TailorTask.error == STOPPED_BY_USER)
+    return list(db.scalars(
+        select(Job.id).join(ResumeVariant, (ResumeVariant.job_id == Job.id) & (ResumeVariant.version == latest))
+        .where(_owned(user_id), Job.status.in_(SKIP_TAILORING_STATUSES), ResumeVariant.reviewer_score.is_(None),
+               ~decided, ~active, ~stopped)
+        .order_by(Job.id).limit(LIMIT)).all())
+
+
+def _queue_reviews(db: Session, user_id: int, ids: list[int]):
+    from app.services import tailor_tasks
+
+    out = tailor_tasks.enqueue(db, ids, mode="review")
+    return [t["job_id"] for t in out["queued"]], [{"job_id": s["id"], "reason": s["reason"]} for s in out["skipped"]]
+
+
+# ───────────── Reviewing → Approval ─────────────
 
 def _reviewed_unapproved(db: Session, user_id: int) -> list[int]:
     """Reviewed packets the account's own policy would approve (automatic mode, a stored PASS, minimum score met) that were not."""
@@ -183,8 +209,8 @@ STAGES: dict[str, Stage] = {
                      "Every parsed job is already ranked or waiting to be."),
     "ranking": Stage("Tailoring", _qualified_untailored, _queue_tailoring, ("tailor",),
                      "Every qualified job is already tailored or queued, or automatic tailoring is off."),
-    "tailoring": Stage("Approval", _reviewed_unapproved, _approve, (),
-                       "No reviewed packet is waiting for an approval your settings would give."),
+    "tailoring": Stage("Reviewing", _unreviewed_packets, _queue_reviews, ("tailor",),
+                       "Every saved packet has been reviewed or is being tailored."),
     "reviewing": Stage("Approval", _reviewed_unapproved, _approve, (),
                        "No reviewed packet is waiting for an approval your settings would give."),
 }

@@ -35,6 +35,7 @@ import json
 import logging
 import re
 from dataclasses import asdict, dataclass, field
+from types import MappingProxyType
 from typing import Any
 
 from sqlalchemy import desc, select
@@ -60,6 +61,9 @@ from app.services.user_settings import candidate_policy
 
 log = logging.getLogger("jobhunt.context_builder")
 
+# v5: the verified background (leadership, AI, cloud, data flags) is derived from verified units only, the summary
+# included: an unverified or edited summary no longer sets a flag. Only that block changes; the ranking identity
+# (latest_ranking_context_hash) does not cover it, so no job is re-ranked because of it.
 # v4: generation tasks (tailoring, cover letters) pick bullets and evidence by the parsed posting's skills,
 # responsibilities and keywords as well as its words; tailoring and letters also carry a requirement map (the Ranker's
 # matched requirements with the ids that prove them) and keyword targets (app.services.ats_keywords.targets).
@@ -69,7 +73,7 @@ log = logging.getLogger("jobhunt.context_builder")
 # near-identical items collapse to one. Evidence is sent as {id, company, role, claim}.
 # v2: task-specific projections (no search configuration), the Tailor's canonical source resume with evidence ids per
 # bullet, the completed-FitAnalysis gate, provenance exclusion and pre-prompt consistency checks.
-CONTEXT_BUILDER_VERSION = "v4"
+CONTEXT_BUILDER_VERSION = "v5"
 # Two texts state the same fact when this share of their distinctive words overlaps (Jaccard).
 SAME_CLAIM = 0.6
 BULLET_KINDS = {"achievements": "achievement", "responsibilities": "responsibility"}
@@ -125,6 +129,12 @@ class ContextStats:
     full_available_context_tokens: int = 0
     selected_context_tokens: int = 0
     context_reduction_percent: float = 0.0
+    # Set only when the worker has a prompt token budget (fit_prompt): the budget, the prompt's estimated tokens
+    # before and after trimming, and how many items of each kind were dropped to fit it.
+    prompt_token_budget: int | None = None
+    prompt_tokens_before_trim: int | None = None
+    prompt_tokens: int | None = None
+    trimmed: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def measure(cls, full: int, selected: int) -> ContextStats:
@@ -133,7 +143,11 @@ class ContextStats:
         return cls(full, selected, max(0.0, reduction))
 
     def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        out = asdict(self)
+        if self.prompt_token_budget is None:  # no budget: the stats are exactly what they were before budgets
+            for key in ("prompt_token_budget", "prompt_tokens_before_trim", "prompt_tokens", "trimmed"):
+                out.pop(key)
+        return out
 
 
 @dataclass
@@ -176,6 +190,9 @@ class TaskContext:
     excluded_evidence: list[dict[str, Any]] = field(default_factory=list)
     resume_text: str = ""  # a readable rendering of the selected facts (or the raw text when nothing is structured)
     stats: ContextStats = field(default_factory=ContextStats)
+    # Not a field, so never part of the prompt payload (to_dict): {retrieval_ms, retrieval_mode} for call_stats, set
+    # by _base when retrieval ran for this context.
+    retrieval = MappingProxyType({})
     job_stats: jc.JobContextStats = field(default_factory=jc.JobContextStats)
 
     @property
@@ -196,8 +213,9 @@ class TaskContext:
         return asdict(self)
 
     def call_stats(self) -> dict[str, Any]:
-        """Both sides of context selection, for the LLM request log."""
-        return {**self.stats.as_dict(), **self.job_stats.as_dict(), "context_builder_version": CONTEXT_BUILDER_VERSION}
+        """Both sides of context selection, and the evidence retrieval behind it, for the LLM request log."""
+        return {**self.stats.as_dict(), **self.job_stats.as_dict(), **self.retrieval,
+                "context_builder_version": CONTEXT_BUILDER_VERSION}
 
     def selected_payload(self) -> dict[str, Any]:
         """Everything the prompt receives from this context except the job description, which is measured apart."""
@@ -366,7 +384,7 @@ def select_evidence(db: Session, user_id: int, terms: JobTerms, limit: int,
 
 def retrieved_evidence(db: Session, profile: Any, job: Job, task: str, terms: JobTerms, limit: int,
                        deterministic: list[dict[str, Any]], held_back: set[int], resume_items: set[str],
-                       query: str | None = None) -> list[dict[str, Any]]:
+                       query: str | None = None, timing: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """The evidence a job context carries, by RAG_RETRIEVAL_MODE:
 
         off      `deterministic` (select_evidence), exactly as before — the default and the rollback
@@ -375,7 +393,10 @@ def retrieved_evidence(db: Session, profile: Any, job: Job, task: str, terms: Jo
                  relevance-ranked, within the token budget; on any retrieval error, `deterministic`
 
     Retrieval honours the same exclusions: evidence held back for a provenance conflict, and evidence created from a
-    bullet the context already carries as that bullet."""
+    bullet the context already carries as that bullet.
+
+    `timing`, when given, receives what the call's telemetry records (llm_request_logs.retrieval_ms / retrieval_mode):
+    the retrieval's own measured latency, and "on" or "fallback". Left empty when no retrieval was used."""
     from app.settings import get_settings
 
     mode = get_settings().rag_mode
@@ -394,6 +415,8 @@ def retrieved_evidence(db: Session, profile: Any, job: Job, task: str, terms: Jo
                              category="WORKFLOW", level="WARNING", operation="rag_retrieval", user_id=profile.user_id,
                              entity_type="job", entity_id=job.id, status="FALLBACK",
                              details={"task": task, "error": type(exc).__name__})
+        if timing is not None:
+            timing["retrieval_mode"] = "fallback"
         return deterministic
     if mode == "shadow":
         old, new = {e["id"] for e in deterministic}, set(pack.evidence_ids)
@@ -404,6 +427,8 @@ def retrieved_evidence(db: Session, profile: Any, job: Job, task: str, terms: Jo
             details={"task": task, "only_deterministic": sorted(old - new), "only_retrieval": sorted(new - old),
                      "outside_resume_scope": sorted(old - pack_scope(db, profile, job)), **pack.metadata()})
         return deterministic
+    if timing is not None:
+        timing.update(retrieval_ms=pack.latency_ms, retrieval_mode="on")
     return pack.projected()
 
 
@@ -474,8 +499,12 @@ def _reviewed_list(data: dict[str, Any], section: str, allowed: tuple[str, ...],
 
 
 def _filtered(data: dict[str, Any], allowed: tuple[str, ...]) -> dict[str, Any]:
-    """A copy holding only units with an allowed status, for derived facts that must not use other data."""
+    """A copy holding only units with an allowed status, for derived facts that must not use other data. The summary
+    is a unit too: structured_resume.derive reads its text, so an unverified one must not reach it."""
     out = {k: v for k, v in data.items() if k not in sr.LIST_SECTIONS}
+    summary = out.get("summary")
+    if summary and (not isinstance(summary, dict) or _status(summary) not in allowed):
+        out.pop("summary")
     for section in sr.LIST_SECTIONS:
         items = []
         for item in data.get(section) or []:
@@ -525,8 +554,9 @@ def _base(db: Session, profile: CandidateProfile, job: Job, task: str, allowed: 
     resume_items = {unit.item_id for unit in sr.iter_units(data or {})}
     relevant, every = select_evidence(db, profile.user_id, terms, evidence_limit,
                                       exclude=set(held_back) | set(out_of_scope), resume_items=resume_items)
+    retrieval: dict[str, Any] = {}
     relevant = retrieved_evidence(db, profile, job, task, terms, evidence_limit, relevant,
-                                  set(held_back) | set(out_of_scope), resume_items)
+                                  set(held_back) | set(out_of_scope), resume_items, timing=retrieval)
     every = scoped_evidence(db, profile, job, every)
     projects = _select_projects(data or {}, terms, allowed)
     education_fields = ("degree", "field_of_study", "institution", "university", "grade", "end_date",
@@ -547,6 +577,8 @@ def _base(db: Session, profile: CandidateProfile, job: Job, task: str, allowed: 
                                             context.relevant_evidence, set(held_back), resume_texts)
     if allowed == VERIFIED_ONLY:
         context.unverified_facts = []  # includes verified bullets of unverified roles: not trusted either
+    if retrieval:
+        context.retrieval = retrieval
     return context, data or {}, every, resume
 
 
@@ -593,6 +625,255 @@ def _measure(context: TaskContext, raw_text: str, every_evidence: list[dict[str,
 
 def has_verified_facts(data: dict[str, Any] | None, evidence: list[dict[str, Any]]) -> bool:
     return bool(rv.verified_facts(data) or evidence)
+
+
+# ───────────── prompt token budget ─────────────
+
+# What a context loses, in this order, when its prompt is over the worker's prompt token budget
+# (app.services.prompt_budget). Each step drops one item at a time, the least relevant first, until the prompt fits.
+# Never trimmed: REQUIRED requirements (job_context.required, hard_requirements and the employer's sentences for them,
+# REQUIRED rows of the requirement map), the candidate's identity, summary and verified background, role headers,
+# each role's most relevant bullet (ranking) or its budgeted bullets (tailoring), the fit analysis and the length plan.
+RANKING_TRIM_ORDER = (
+    "unverified_facts",        # lower-confidence facts, the last listed first
+    "extra_skills",            # skills the posting does not mention, the last listed first
+    "projects",                # resume projects, the least relevant first
+    "preferred_requirements",  # PREFERRED requirements, the lowest parse confidence first, then the last listed
+    "responsibilities",        # beyond the first TRIM_KEEP_RESPONSIBILITIES, the last listed first
+    "evidence",                # verified evidence, the lowest relevance score first
+    "bullets",                 # each role's last (least relevant) bullet, the lowest-scoring first; a role keeps one
+)
+TAILORING_TRIM_ORDER = (
+    "spare_bullets",              # source bullets beyond a role's budget (its CANDIDATE_SLACK), each role's last first
+    "projects",                   # read-only project context, the least relevant first
+    "preferred_requirement_map",  # PREFERRED rows of the requirement map, the last listed first
+    "preferred_requirements",
+    "responsibilities",
+    "evidence",
+)
+TRIM_KEEP_RESPONSIBILITIES = 3
+
+
+def _drop_preferred(context: TaskContext) -> Any:
+    from app.services.prompt_budget import drop_lowest
+
+    job = context.job_context
+
+    def forget(item: dict[str, Any]) -> None:  # the term overlap names requirement ids: never one no longer shown
+        for key in ("candidate_matches", "candidate_gaps"):
+            job[key] = [m for m in job.get(key) or [] if not (m.get("id") == item.get("id")
+                                                              and m.get("level") != jc.REQUIRED)]
+
+    items = job.get("preferred") if isinstance(job.get("preferred"), list) else []
+    return drop_lowest(items, lambda r: (r.get("confidence") or 0,), removed=forget)
+
+
+def _drop_extra_skill(context: TaskContext, terms: JobTerms) -> Any:
+    def drop() -> bool:
+        matched = set(sr._mentions(terms.text, context.relevant_skills))
+        for index in range(len(context.relevant_skills) - 1, -1, -1):
+            if context.relevant_skills[index] not in matched:
+                del context.relevant_skills[index]
+                return True
+        return False
+    return drop
+
+
+def _drop_ranking_bullet(context: TaskContext, terms: JobTerms) -> Any:
+    def drop() -> bool:
+        # A role's bullets are already most relevant first (_select_experience): each role offers its last one, and
+        # the least relevant of those goes (an older role first on a tie).
+        spare = [(terms.score(role["bullets"][-1]["text"]), -r, r) for r, role in enumerate(context.relevant_experience)
+                 if len(role.get("bullets") or []) > 1]
+        if not spare:
+            return False
+        *_, r = min(spare)
+        context.relevant_experience[r]["bullets"].pop()
+        return True
+    return drop
+
+
+def _drop_spare_bullet(context: TaskContext, terms: JobTerms) -> Any:
+    """A source bullet beyond its role's budget, from context.roles, the source resume and the selection behind it
+    alike, so the citable ids (citable_ids, evidence_ids) are exactly the bullets the prompt still shows."""
+    caps = (context.length_plan or {}).get("role_caps") or {}
+    source = {role["role_index"]: role for role in context.source_resume.get("roles") or []}
+
+    def drop() -> bool:
+        # Each role over its budget offers its last bullet (they are most relevant first), the least relevant goes.
+        spare = [(terms.score(role["bullets"][-1]), -r, r) for r, role in enumerate(context.roles)
+                 if len(role["bullets"]) > caps.get(str(role["role_index"]), len(role["bullets"]))]
+        if not spare:
+            return False
+        *_, r = min(spare)
+        role = context.roles[r]
+        i = len(role["bullets"]) - 1
+        ids = role.get("bullet_ids") or []
+        item_id = ids[i] if i < len(ids) else None
+        for key in ("bullets", "bullet_ids", "bullet_evidence_ids"):
+            if i < len(role.get(key) or []):
+                del role[key][i]
+        shown = source.get(role["role_index"])
+        if shown is not None and i < len(shown.get("bullets") or []):
+            del shown["bullets"][i]
+        if item_id is not None:
+            for unit in context.relevant_experience:
+                unit["bullets"] = [b for b in unit.get("bullets") or [] if b.get("id") != item_id]
+        return True
+    return drop
+
+
+def _drop_project(context: TaskContext) -> Any:
+    def drop() -> bool:
+        if not context.relevant_projects:
+            return False
+        shown = context.source_resume.get("projects")
+        rest = any(v for k, v in context.source_resume.items() if k != "projects")
+        if shown and len(shown) == 1 and not rest and not context.relevant_evidence:
+            return False  # the only thing left to tailor from (validate_tailoring_context): it stays
+        context.relevant_projects.pop()  # ordered most relevant first (_select_projects)
+        if shown:
+            shown.pop()
+            if not shown:
+                del context.source_resume["projects"]
+        return True
+    return drop
+
+
+def _drop_preferred_map_row(context: TaskContext) -> Any:
+    def drop() -> bool:
+        for index in range(len(context.requirement_map) - 1, -1, -1):
+            if context.requirement_map[index].get("level") != jc.REQUIRED:
+                del context.requirement_map[index]
+                return True
+        return False
+    return drop
+
+
+def _drop_tailoring_evidence(context: TaskContext, score: Any) -> Any:
+    """The Tailor needs something to tailor from: with no source resume left (projects may have gone before), the
+    last evidence item stays. Decided at each drop, not when the steps are built."""
+    from app.services.prompt_budget import drop_lowest
+
+    lowest = drop_lowest(context.relevant_evidence, score)
+
+    def drop() -> bool:
+        if not context.source_resume and len(context.relevant_evidence) <= 1:
+            return False
+        return lowest()
+    return drop
+
+
+def _refresh_targets(context: TaskContext, job: Job) -> None:
+    """After a tailoring fact left the prompt: the requirement map cites only ids still shown, and the keyword
+    targets count as supported only what the remaining facts prove."""
+    citable = context.citable_ids
+    for row in context.requirement_map:
+        ids = [i for i in row.get("evidence_ids") or [] if i in citable]
+        if ids:
+            row["evidence_ids"] = ids
+        else:
+            row.pop("evidence_ids", None)
+    context.keyword_targets = keyword_targets(job, _shown_texts(context), _tailoring_sources(context))
+
+
+def _rematching(context: TaskContext) -> Any:
+    """Wraps a ranking drop of a candidate fact: the term overlap (candidate_matches / candidate_gaps) is counted
+    again from the facts still shown, so it never names a term only a dropped fact had. Only when the overlap was
+    counted from these facts in the first place (not with resume_source master_text, whose overlap comes from data
+    the prompt does not show): otherwise it is left as the builder made it."""
+    job = context.job_context or {}
+
+    def requirements() -> list[dict[str, Any]]:
+        return list(job.get("required") or []) + list(job.get("preferred") or [])
+
+    current = bool(job.get("structured")) and (job.get("candidate_matches"), job.get("candidate_gaps")) == tuple(
+        jc.candidate_match(requirements(), context))
+
+    def wrap(drop: Any) -> Any:
+        def run() -> bool:
+            if not drop():
+                return False
+            if current:
+                job["candidate_matches"], job["candidate_gaps"] = jc.candidate_match(requirements(), context)
+            return True
+        return run
+    return wrap
+
+
+def trim_steps(context: TaskContext, job: Job) -> list[Any]:
+    """The trim steps of a ranking or tailoring context, in RANKING_TRIM_ORDER / TAILORING_TRIM_ORDER."""
+    from app.services.prompt_budget import Step, drop_last, drop_lowest
+
+    def evidence_score(e: dict[str, Any]) -> tuple:
+        return (terms.score(" ".join(str(e.get(k) or "") for k in ("company", "role", "claim"))),)
+
+    listed = (context.job_context or {}).get("responsibilities")
+    responsibilities = listed if isinstance(listed, list) else []
+    if context.task == "ranking":
+        terms = job_terms(job)
+        rematched = _rematching(context)  # skills, bullets and evidence are what the term overlap counts
+        steps = {"unverified_facts": drop_last(context.unverified_facts),
+                 "extra_skills": rematched(_drop_extra_skill(context, terms)),
+                 "projects": drop_last(context.relevant_projects),
+                 "preferred_requirements": _drop_preferred(context),
+                 "responsibilities": drop_last(responsibilities, TRIM_KEEP_RESPONSIBILITIES),
+                 "evidence": rematched(drop_lowest(context.relevant_evidence, evidence_score)),
+                 "bullets": rematched(_drop_ranking_bullet(context, terms))}
+        return [Step(kind, steps[kind]) for kind in RANKING_TRIM_ORDER]
+    if context.task != "tailoring":
+        return []
+    terms = generation_terms(job)
+
+    def refreshed(drop: Any) -> Any:
+        def run() -> bool:
+            if not drop():
+                return False
+            _refresh_targets(context, job)
+            return True
+        return run
+
+    steps = {"spare_bullets": refreshed(_drop_spare_bullet(context, terms)),
+             "projects": refreshed(_drop_project(context)),
+             "preferred_requirement_map": _drop_preferred_map_row(context),
+             "preferred_requirements": _drop_preferred(context),
+             "responsibilities": drop_last(responsibilities, TRIM_KEEP_RESPONSIBILITIES),
+             "evidence": refreshed(_drop_tailoring_evidence(context, evidence_score))}
+    return [Step(kind, steps[kind]) for kind in TAILORING_TRIM_ORDER]
+
+
+def fit_prompt(context: TaskContext, job: Job, render: Any, budget: int | None) -> Any:
+    """The context's prompt (`render()` builds it from `context`) within the worker's prompt token budget.
+
+    Without a budget this is `render()` and nothing else: the prompt and the context are exactly what the builder
+    made. With one, the least relevant items are dropped in the task's trim order until the prompt fits; the context
+    is changed in place, so everything computed from it afterwards (the citable ids a validator accepts, ranking
+    hashes) matches the prompt that is sent. What was dropped is recorded on context.stats."""
+    from app.services import prompt_budget
+
+    if not budget:
+        return render()
+    rendered = bool(context.relevant_experience) and context.resume_text == _render(context)
+    prompt, trim = prompt_budget.fit(render, trim_steps(context, job), budget)
+    if trim.trimmed:
+        if rendered:
+            context.resume_text = _render(context)
+            prompt = render()
+        sent_job = 0 if (context.job_context or {}).get("structured") else estimate_tokens(job.description or "")
+        selected = estimate_tokens(json.dumps(context.selected_payload(), default=str)) + sent_job
+        context.stats = ContextStats.measure(max(context.stats.full_available_context_tokens, selected), selected)
+        if context.job_context:
+            job_selected = estimate_tokens(json.dumps(context.job_context, default=str))
+            context.job_stats = jc.JobContextStats.measure(max(context.job_stats.raw_job_tokens, job_selected),
+                                                           job_selected)
+    context.stats.prompt_token_budget = budget
+    context.stats.prompt_tokens_before_trim = trim.tokens_before
+    context.stats.prompt_tokens = prompt_budget.prompt_tokens(prompt)
+    context.stats.trimmed = dict(trim.removed)
+    if not trim.fits:
+        log.info("%s prompt is %s tokens after trimming, over its %s-token budget", context.task,
+                 context.stats.prompt_tokens, budget)
+    return prompt
 
 
 # ───────────── builders ─────────────
@@ -1081,14 +1362,8 @@ def build_application_form_context(db: Session, profile: CandidateProfile, job: 
     if asked:
         terms.focus |= tokens(asked) - jc.FILLER
         terms.text = f"{terms.text} {asked}"
-    context, data, every, _resume = _base(db, profile, job, "application_form", VERIFIED_ONLY, FORM_EVIDENCE,
-                                          terms=terms, out_of_scope=out_of_scope)
-    if _status((data or {}).get("summary") or {}) != "VERIFIED":
-        # sr.derive reads the summary's text whatever its status; an unverified summary must not become a "verified"
-        # background flag (leadership, AI, cloud ...) here.
-        unsummarised = {k: v for k, v in (data or {}).items() if k != "summary"}
-        derived = sr.derive(_filtered(unsummarised, VERIFIED_ONLY))
-        context.candidate["verified_background"] = {k: v for k, v in derived.items() if v not in (None, [], False)}
+    context, _data, every, _resume = _base(db, profile, job, "application_form", VERIFIED_ONLY, FORM_EVIDENCE,
+                                           terms=terms, out_of_scope=out_of_scope)
     context.candidate = {k: v for k, v in context.candidate.items() if k not in FORM_PRIVATE_FIELDS and v}
     context.unverified_facts = []
     context.job = {}

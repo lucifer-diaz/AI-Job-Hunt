@@ -480,7 +480,7 @@ prompt versions, and `scripts/audit_sensitive_logs.py` checks stored logs for cr
 | `review.py` | `build_review_prompt` | `ReviewResult` | `review_resume` |
 | `followup.py` | `build_followup_prompt` | `FollowUpResult` | `draft_followup` |
 | `job_description_parser.py` | `build_job_description_parser_prompt` | `JobDescriptionParserOutput` | the `jd_parsing` scheduler job |
-| `resume_parser.py` | `build_resume_parser_prompt`, `build_evidence_extraction_prompt` | `ResumeParserOutput`, `EvidenceExtractionResult` | AI re-parse (a comparison, never applied automatically); evidence parsing |
+| `resume_parser.py` | `build_resume_parser_prompt`, `build_evidence_extraction_prompt` | `ResumeParserOutput`, `EvidenceExtractionResult` | AI structuring of every upload, grounded in the resume's text (fills untouched data, a comparison otherwise); evidence parsing |
 | `application.py` | `build_application_question_prompt` | `ApplicationAnswerResult` | not wired in yet |
 | `application_inbox.py` | `build_application_inbox_prompt`, `build_application_email_match_prompt` | `ApplicationEmailAnalysis`, `ApplicationEmailMatchResult` | the Application Inbox Agent (`app.services.application_inbox`) |
 | `inbox.py` | `build_inbox_classification_prompt` | `InboxClassificationResult` | superseded by `application_inbox.py`; kept for its golden fixture |
@@ -1188,6 +1188,11 @@ Claude Desktop mode nothing is queued. A job has at most one queued or running t
 happens right after the ranking is saved and never changes it; the `auto_tailor` scheduler job
 (`AUTO_TAILOR_INTERVAL_MINUTES=5`) queues any qualified job that step missed.
 
+One more job is queued: a tailored packet you moved to another resume (Re-match, **Resume used**, a setup's resume).
+Moving it is a new request, even if you once cancelled its tailoring: it is ranked again with the new resume, and once
+that ranking qualifies it (at the fit score above) it is tailored and reviewed again from that resume, then goes on to
+approval like any packet. With automatic tailoring off it waits in the Tailor queue for **Regenerate**.
+
 The Discovery → Ranking tracker shows the effect: every waiting job has a progress bar, its place in the queue
 and, once the account has finished some rankings, an estimate of when it will start. The estimate comes from the
 median duration of that account's recent rankings; before anything has been measured it is left blank rather
@@ -1822,7 +1827,7 @@ default). Applications do not use graphs.
 | `AGENT_LEASE_SECONDS` / `AGENT_MAX_ATTEMPTS` | `300` / `3` | A run's lease (renewed while it runs), and how many times recovery retries it. |
 | `AGENT_CHECKPOINT_MAX_BYTES` | `65536` | A larger checkpoint is refused, and so is one with a credential field or a secret-shaped string. |
 | `AGENT_CHECKPOINT_RETENTION_DAYS` / `AGENT_INTERRUPT_EXPIRY_DAYS` | `14` / `30` | Checkpoints of finished runs are deleted, and a run left waiting for a person expires. |
-| `AGENT_LANGSMITH_EXPORT_ENABLED` + `AGENT_LANGSMITH_API_KEY` | off | Optional LangSmith traces, metadata only (below). `AGENT_LANGSMITH_ENDPOINT` and `AGENT_LANGSMITH_PROJECT` choose where they go. |
+| `AGENT_LANGSMITH_EXPORT_ENABLED` + `AGENT_LANGSMITH_API_KEY` | off | Optional LangSmith traces, metadata only (below). `AGENT_LANGSMITH_ENDPOINT` (the region's API: `https://api.smith.langchain.com` US, `https://eu.api.smith.langchain.com` EU, `https://apac.api.smith.langchain.com` APAC, or a self-hosted address; a key from another region gets 403 Forbidden) and `AGENT_LANGSMITH_PROJECT` choose where they go. An admin can also set all four in Settings → AI agents & automation (Advanced); a key saved there is encrypted with `SECRET_KEY`, never shown again, and overrides the `.env` key until removed. |
 
 ```text
 POST /api/agents/pilot/runs        {"kind": "auto" | "review", "items": 1-20, "idempotency_key": "…"}
@@ -2220,6 +2225,71 @@ suppressed. Each sync writes one line to Monitoring → Logs (category `EMAIL`).
 | Model analysis keeps failing | The email is kept and retried `APPLICATION_INBOX_ANALYSIS_MAX_ATTEMPTS` times, then saved from the rules for review |
 | The scheduled job says it is off | Set `APPLICATION_INBOX_ENABLED=true`; Sync now works either way |
 
+## 9e. Evaluation, feedback and the application journey
+
+Phase 7 of the [agentic roadmap](docs/architecture/agentic-roadmap.md). Nothing here adds a telemetry pipeline or a
+graph-state table: it reads the facts each stage already stores.
+
+**One application journey** (`GET /api/orchestration/jobs/{id}/journey`, shown at the top of the job's trace in AI
+Orchestration). Eight stages in order, each from the row that backs it, with its ids and status; a stage with no
+stored fact is `UNKNOWN`, never guessed:
+
+| Stage | Read from |
+| --- | --- |
+| discovery | `jobs` |
+| description | `job_description_fetch_tasks`, `job_description_parse_tasks` |
+| retrieval | `llm_request_logs.retrieval_ms` / `retrieval_mode` (measured by retrieval, recorded with the call) |
+| model | `llm_request_logs`: actual vs configured model, fallback, failover, retries, reported cost |
+| packet | `resume_variants`, `approved_packets` (a 12-character digest prefix) |
+| execution | `application_execution_tasks` |
+| confirmation | `submission_intents` (the verifier's flags) or the reported submission on `applications` |
+| gmail_outcome | `application_email_messages`, `application_communication_events` |
+
+Cost is counted once: an LLM call's cost is on its `llm_request_logs` row only, and an external row adds its own
+(an embedding, an Apify run) only when no LLM row points at it. Unpriced rows leave the total unknown, not $0. An email
+the matcher could not place is `NEEDS_REVIEW` and is never this application's outcome; a person's correction wins
+over the classifier and is labelled `person`. The recruiter's decision (`recruiter_outcome`) sits beside the journey
+and is never attributed to a model, a packet or a stage. Model calls are traced to their job by the LLM gateway, so a
+gateway call made inside a scheduler sweep still carries its job on the external-call row.
+
+**Monitoring** adds, from the same raw rows: p50/p95/p99 per stage and per worker, the failover rate (a request moved
+off a resting model), the share of requests answered by a model other than the configured one (only where both are
+known; the auto router is left out), retrieval latency p50/p95, and cost per successful task on each AI node. Unknown
+cost stays unknown on every tile and day. `GET /api/monitoring/feedback` returns the account's human correction rate
+(inbox classifications corrected, approvals that overrode the reviewer, parsed postings a person edited) beside its
+recruiter outcomes, kept apart.
+
+**The orchestration graph** draws Submission confirmation (measured on `submission_intents`) and Email review
+(`NEEDS_REVIEW` mail), and draws planned stages (ATS answer memory, Evaluation feedback) dashed and labelled planned,
+with no status or metric.
+
+**The LangGraph view** (AI Orchestration → LangGraph, `GET /api/orchestration/langgraph`) draws every registered graph
+(`app/agents/runtime.GRAPHS`) from its compiled structure: its steps in order, which edges are conditional, which go
+back (a retry, a revision, a resume), the steps that pause (`interrupt`) and those that may stop the run, with each
+step's own docstring as its description. It also shows the runtime every graph shares (scheduler, lease, checkpoint,
+services, workers, interrupt, business state), each graph's mode and the account's runs per status. A run's current
+step lives only in its checkpoint, so runs are counted, never placed on a step.
+
+**Offline evaluation** (`python scripts/agent_eval.py`, `app/services/agent_eval/`): eight suites over hand-labelled,
+versioned datasets (`tests/fixtures/agent_eval/*.json`, plus the RAG and preparation benchmarks), each running the
+production code, each with review gates; the run exits non-zero when any gate is BLOCKED. `--report` writes the
+Markdown report (`docs/evals/phase7-report.md`), `--jsonl` LangSmith Examples for a manual import. Nothing is uploaded.
+
+| Suite | Runs | Zero-tolerance gate |
+| --- | --- | --- |
+| jd_parser | recorded parser outputs → contract, `validated`, `ground` | a requirement quoted as the employer's that the posting does not say |
+| qualification | `domain_match`, `search_scope`, `ranker.hard_filter_reason` | a job the person wants is hidden |
+| rag | `scripts/rag_eval.py` (Recall@k, Precision@k) | a fact of another resume reaches a job |
+| unsupported_claims | the tailoring evidence checks | an invented skill or metric passes |
+| ats_answers | `answer_resolver.plan` on a synthetic profile | a sensitive answer filled without the person; a field filled with no verified source |
+| browser_actions | `browser_actions.check` | a submit, off-route, consent, password or unresolved step is allowed |
+| confirmation | `ConfirmationVerifier` | anything less than the site's evidence counts as submitted |
+| human_corrections | `feedback.rates` | a recruiter's rejection counted as a model error |
+
+**LangSmith export** stays behind `app/agents/tracing_boundary.py`. Phase 7 also refuses, before anything is sent,
+one-time codes and opaque tokens in exported strings, cookie and session strings in a body, LangSmith keys, and any
+credential in a request's URL or headers (other than LangSmith's own key). No debug or capture switch widens it.
+
 ## 10. Claude Desktop + MCP
 
 ### What this feature does
@@ -2458,6 +2528,69 @@ It appears in **Running workers → Application** (Kill, Retry, Run now, setting
 python scripts/application_dry_run.py postgresql+psycopg://localhost/jobhunt_test
 ```
 
+### 10b. Guarded submission and the browser-use backend (Phase 6, off by default)
+
+Phase 6 lets the application worker submit applications for you (auto submit), and read forms no adapter knows.
+Everything below is off unless you turn it on.
+
+| Mode | What it does |
+| --- | --- |
+| `observe`, `assist` | As above (§10a), now also on dynamic forms through the browser-use backend. |
+| `guarded_auto` | Auto submit: a run fills the form and presses the final Submit **once**, after every check below; it stops and opens the browser window for you only when something needs you. |
+
+**Auto submit.**
+- **Server and account:** the server runs `guarded_auto`, and your account turned it on (Settings → Auto submit).
+  Then every job you approve is queued for submission at once; "Apply for me" in the Apply kit does the same by hand.
+- **Sites:** any board the browser can complete: Greenhouse through its form adapter, anything else through the
+  browser-use backend. LinkedIn, Indeed and Ashby applications are never automated.
+- **PreSubmitValidator:** passes twice, before the claim and again just before the click. It checks:
+  - the approved packet is unchanged, and the exact approved resume and cover letter files are attached;
+  - every required field holds exactly its verified answer (or one you filled in the window and then pressed
+    Continue), and sensitive answers were confirmed for this application;
+  - any attestation the form asks for ("I certify…") is one you approved word for word, or ticked yourself;
+  - the page shows no CAPTCHA, code or login, and the form's shape is the one planned for.
+- **When it needs you:** a question with no saved answer, an attestation, a login, a code or CAPTCHA, or a form whose
+  Submit button it cannot tell apart. The window opens with the reason on the page; fill it there and press Continue
+  (it checks everything again and submits), or submit it yourself there. A CAPTCHA needs no Continue: solve it in the
+  window and the run carries on by itself within a few seconds (`APPLICATION_CHALLENGE_POLL_SECONDS`). Either way the
+  run picks the page up where you left it; it is not reloaded.
+- **Claim and intent:** the run takes the same pre-submit claim Claude Desktop and the Apply kit use, then writes a
+  SubmissionIntent. It commits CLICKING just before the click.
+
+It is recorded as Applied (READY_TO_APPLY → APPLYING → APPLIED) only when the site's own evidence confirms it: a
+successful response from the application's site, the form gone, and a confirmation page. Anything less, or a crash,
+a timeout or a Kill once the click was authorized, is **submission uncertain**. The posting stays reserved, nothing is
+ever clicked again, and the Apply kit asks you whether it went through. While a guarded run owns a posting, Claude
+Desktop and the Apply kit cannot start a submission of it (`ROUTE_HELD`).
+
+**The browser-use backend.** For forms without an adapter (Lever, Workable, employer sites), Job Hunt OS runs its own
+small runner, `sidecars/browser_use_runner`, with the Python of your browser-use Web UI checkout (browser-use
+0.1.48). It uses only the runner's page reading and element actions. Job Hunt OS decides every step:
+- Python fills every verified answer into the element it was resolved for.
+- The **Browser Navigator** worker proposes steps only where Python cannot reach: opening the form, declining a
+  cookie banner, scrolling. It goes through the LLM gateway, as an element key and an answer reference, never a value.
+- Each proposed step is checked by Python before the browser acts.
+- Nothing can submit from there.
+
+The running Web UI itself (`BROWSER_USE_WEBUI_URL`) is only health-checked: its HTTP interface has no authentication,
+no per-user sessions and no way to veto an action (docs/architecture/agentic-roadmap.md, ADR-031).
+
+**Logins.** A login wall, a code or a signup stops the run and, on a local install with
+`BROWSER_USE_HEADLESS=false`, keeps the browser window open for `APPLICATION_TAKEOVER_TTL_MINUTES` (15).
+- **Finishing in the window:** you finish there and press **I'm done — continue** in the Apply kit (for a CAPTCHA,
+  solving it is enough); the run looks at the same page afresh, and loads the apply URL again only if the form is no
+  longer there. While a run waits for an answer you give in the Knowledge bank, its browser-use window keeps the form
+  for `APPLICATION_INPUT_HOLD_MINUTES` and fills it in place afterwards.
+- **Signup:** a signup gets a generated password, shown once, so you sign up with exactly that.
+- **Save this login:** stores the password (encrypted, never shown again) and the window's session, for that site
+  only.
+- **Next time:** the run starts signed in (`APPLICATION_AUTH_SESSIONS_ENABLED`). On a domain in
+  `APPLICATION_LOGIN_DOMAINS`, it can also fill the saved login itself, once. A failed login, a code or a CAPTCHA
+  always waits for you.
+
+Setup, the variables, the ATS matrix measured on real postings and the rollout steps:
+[docs/operations/browser-use.md](docs/operations/browser-use.md).
+
 ### Recommended batch sizes
 
 ```text
@@ -2571,7 +2704,7 @@ it is what AI workflows read; only the facts you verify are trusted when generat
         │  extract text, clean extraction noise (wording untouched)
         ▼
  Resume vN ── original file + raw text (read-only, never edited)
-        │  deterministic parser (or optional AI re-parse → comparison)
+        │  deterministic parser at once, then the AI structuring in the background (LangGraph)
         ▼
  Structured resume ── stable ids, every item UNVERIFIED
         │  you review, edit and verify in Settings → Resumes
@@ -2642,11 +2775,45 @@ verified in a later resume version reuses the same evidence row. Unverified or r
 Every change — parse, edit, add, remove, reorder, verify, reject, re-parse choice — is written to
 `resume_data_changes` with the field path, old and new value, and its source (`PARSER`, `USER`, `SYSTEM`).
 
+### Reading the file
+
+PDF, DOCX and TXT uploads (resumes and job descriptions) are read by `app/services/document_text.py`. Some PDF
+exports draw "ti", "tf", "fi" … as one glyph with a broken Unicode mapping, so the text read "architecYng" or
+"pla[orms" and every parser kept the misspelling. `app/services/text_repair.py` restores them deterministically: for
+each odd character inside lower-case words it picks the one ligature that turns the most of those words into known
+English words (a bundled word list, `app/services/data/`), and replaces only words it makes known. Clean text comes
+back unchanged; a glyph that came out as an ordinary letter cannot be detected. Upload a file again to get a repaired
+version of a resume read before this existed.
+
+### AI structuring of uploads
+
+The regex parser structures an upload at once, but it guesses at layouts (a header that names the employer before the
+title, two-column PDFs). So every new version is also queued for the **Resume Parser** model
+(`app/services/resume_parsing.py`, scheduler job `resume_parse`, Running workers → Resume parsing). It runs as a
+LangGraph graph (`app/agents/resume_parsing.py`) when `AGENT_GRAPHS_ENABLED` is on with PostgreSQL, and as the same
+steps in sequence otherwise (`RESUME_PARSE_GRAPH_MODE=off`):
+
+```text
+LOAD_RESUME → EXTRACT_STRUCTURE (the model, through the gateway) → GROUND_IN_TEXT → CHECK_QUALITY → APPLY_RESULT
+```
+
+* **Grounding is code, not the model**: a name, title, date, skill or bullet is kept only when the resume's own text
+  contains it (bullets word for word, give or take PDF line breaks). Anything else is dropped and counted; the screen
+  says how many values were left out.
+* **Check**: a result with fewer roles and far fewer bullets than the regex parse of the same text is not used.
+* **Apply**: while nobody has reviewed or edited the data, the AI result replaces it (every item unverified). Once you
+  have, it arrives as the comparison below instead. The model never runs inside a request; without an AI model the
+  regex parse simply stays.
+* **Structure uploads with AI only** (the checkbox under Upload, or Running workers → Settings → Resume parsing): a new
+  upload is queued to run now (ahead of the queue, even while the worker is paused), and the resume screen shows
+  *Structuring with AI* instead of the regex data until the model is done. The regex parse is still saved, as the
+  fallback when the model cannot answer or its result fails the check.
+
 ### Re-parsing
 
-**Re-parse resume** (deterministic) or **Re-parse with AI** (uses `app/prompts/resume_parser.py`) never replaces
-data. It produces a comparison — *current value* vs *new parser result* — and you choose **Keep current** or
-**Use new** for each difference. Values taken from the parser start unverified.
+**Re-parse resume** (deterministic) produces a comparison — *current value* vs *new parser result* — and you choose
+**Keep current** or **Use new** for each difference. **Re-parse with AI** queues the AI structuring above and shows
+its progress; it fills untouched data or produces the same comparison. Values taken from a parser start unverified.
 
 ### Multiple resume versions
 
@@ -3143,10 +3310,12 @@ LEARN_MIN_DISMISSALS=3
 
 ### Resume per search and per job, matched by tags
 
-Tag each resume with a **domain** and the **roles** it targets — "Backend: Lead Engineer, Engineering Manager",
-"Product: Associate Product Manager, Product Manager" — in Settings → Resumes, on each
-resume (its file and its data share one set of tags). The editor suggests roles per domain (Backend,
-Product, AI / ML, Data, Frontend, Full Stack, DevOps / SRE, Engineering Leadership); anything can be typed.
+Tag each resume with one or more **domains**, each with the **roles** it targets — "Backend: Lead Engineer,
+Engineering Manager", "Product: Associate Product Manager, Product Manager", or one resume for "AI / ML: AI Engineer"
+and "Data: Data Engineer" — in Settings → Resumes, on each resume (its file and its data share one set of tags;
+**+ Add domain** adds another). The editor suggests roles per domain (Backend, Product, AI / ML, Data, Frontend, Full
+Stack, DevOps / SRE, Engineering Leadership); anything can be typed. A resume scores as its best-fitting domain, so
+tagging more domains never adds up to a stronger match (`resumes.domains`; `domain` / `roles` are mirrors).
 
 Every new job gets its resume (`jobs.resume_id`, `jobs.resume_choice`), deterministically and without a model
 (`app/services/resume_matching.py`):
@@ -3164,6 +3333,16 @@ between *Auto*, *Active resume* or a specific version (`USER` / `ACTIVE`, never 
 again and a tailored packet is marked for re-tailoring. After changing tags, **Re-match existing jobs** (Versions)
 re-matches jobs that were matched automatically or never chosen — it first says how many would change and how many
 would be ranked again.
+Saving tags says how many existing jobs they would move. A job matched before its resume's tags changed says so
+under **Resume used** ("Your resume tags now match *name · vN* (role '…')") with **Re-match this job**.
+
+The screens always name the resume a job really uses, whatever the picker says: under **Resume used** the job shows
+"Uses *name · vN* — Matched by resume tags (role '…')", "Chosen by you", "Pinned by the search setup", or "No resume
+matched by tags clearly: the active resume is used" (`resume_in_use` on `GET /api/jobs/{id}` and `/api/tailor/{id}`,
+resolved like `resume_verification.for_job`, read-only). Each tailored packet records the version it was made from
+(the Tailor's context, or `source_resume_id` for packets saved by Claude Desktop or Skip tailoring), and Tailor &
+review shows "Tailored from …" with a warning to regenerate when the job now uses another resume
+(`resume.source` on `/api/tailor/{id}`). Packets made before this was recorded say so instead of guessing.
 
 `GET /api/resumes/choices` (with tags and the role catalog), `PUT /api/resumes/{id}/tags`,
 `PUT /api/profile/resumes/{document_id}/tags`, `PUT /api/resumes/{id}` (rename),

@@ -29,7 +29,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.agents import checkpoint, pilot, safety, threads, tracing_boundary
-from app.agents.effects import LeaseLost, RunHandle
+from app.agents.effects import LeaseLost, RunHandle, StepUnavailable
 from app.models import AgentThread
 from app.services import tracing
 from app.services.lifecycle import STOPPED_BY_USER
@@ -59,10 +59,12 @@ class GraphSpec:
     context: Callable[..., Any] = pilot.AgentContext
     # False: only its worker resumes it (it waits for work, not for a person); /api/agents/runs/{id}/resume refuses it.
     api_resumable: bool = True
+    # The AI Orchestration stage this graph conducts (orchestration_topology.NODES), drawn on its LangGraph view.
+    orchestration_node: str | None = None
 
 
 def _graphs() -> dict[str, GraphSpec]:
-    from app.agents import application, job_insights, preparation, qualification
+    from app.agents import application, job_insights, preparation, qualification, resume_parsing
 
     return {
         pilot.GRAPH: GraphSpec(pilot.GRAPH, pilot.GRAPH_VERSION, pilot.build, pilot.PilotInput, pilot.PilotDecision,
@@ -70,19 +72,28 @@ def _graphs() -> dict[str, GraphSpec]:
         qualification.GRAPH: GraphSpec(qualification.GRAPH, qualification.GRAPH_VERSION, qualification.build,
                                        qualification.QualificationInput, qualification.QualificationResume,
                                        qualification.summary, qualification.EXPORT_FIELDS,
-                                       context=qualification.QualificationContext, api_resumable=False),
+                                       context=qualification.QualificationContext, api_resumable=False,
+                                       orchestration_node="qualification"),
         preparation.GRAPH: GraphSpec(preparation.GRAPH, preparation.GRAPH_VERSION, preparation.build,
                                      preparation.PreparationInput, preparation.PreparationResume,
                                      preparation.summary, preparation.EXPORT_FIELDS,
-                                     context=preparation.PreparationContext, api_resumable=False),
+                                     context=preparation.PreparationContext, api_resumable=False,
+                                     orchestration_node="preparation"),
         application.GRAPH: GraphSpec(application.GRAPH, application.GRAPH_VERSION, application.build,
                                      application.ApplicationInput, application.ApplicationResume,
                                      application.summary, application.EXPORT_FIELDS,
-                                     context=application.ApplicationContext, api_resumable=False),
+                                     context=application.ApplicationContext, api_resumable=False,
+                                     orchestration_node="application_execution"),
         job_insights.GRAPH: GraphSpec(job_insights.GRAPH, job_insights.GRAPH_VERSION, job_insights.build,
                                       job_insights.InsightsInput, job_insights.InsightsResume,
                                       job_insights.summary, job_insights.EXPORT_FIELDS,
-                                      context=job_insights.InsightsContext, api_resumable=False),
+                                      context=job_insights.InsightsContext, api_resumable=False,
+                                      orchestration_node="company_insights"),
+        resume_parsing.GRAPH: GraphSpec(resume_parsing.GRAPH, resume_parsing.GRAPH_VERSION, resume_parsing.build,
+                                        resume_parsing.ResumeParsingInput, resume_parsing.ResumeParsingResume,
+                                        resume_parsing.summary, resume_parsing.EXPORT_FIELDS,
+                                        context=resume_parsing.ResumeParsingContext, api_resumable=False,
+                                        orchestration_node="resume_parser"),
     }
 
 
@@ -243,8 +254,12 @@ def execute(sessions: Callable[[], Session], run: RunHandle, command: Any = None
         except LeaseLost:
             return "lost"
         except Exception as exc:
-            log.warning("agent graph %s thread %s failed", graph, run.thread_pk, exc_info=True)
-            message = redact_text(f"{type(exc).__name__}: {exc}", ERROR_LIMIT)
+            if isinstance(exc, StepUnavailable):  # a known outside cause: one line, no traceback
+                log.warning("agent graph %s thread %s stopped: %s", graph, run.thread_pk, redact_text(str(exc), 300))
+                message = redact_text(str(exc), ERROR_LIMIT)
+            else:
+                log.warning("agent graph %s thread %s failed", graph, run.thread_pk, exc_info=True)
+                message = redact_text(f"{type(exc).__name__}: {exc}", ERROR_LIMIT)
             done = _write(sessions, run, status="FAILED", last_error=message, lock_token=None,
                           lock_expires_at=None, completed_at=utcnow())
             return "failed" if done else "lost"

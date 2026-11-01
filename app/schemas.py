@@ -77,8 +77,10 @@ class BulkTailorIn(BaseModel):
 
 class TailorTasksIn(BaseModel):
     ids: list[int] = Field(min_length=1, max_length=500)
-    mode: Literal["tailor", "skip"] = "tailor"  # skip = send the master resume unchanged
+    # skip = send the master resume unchanged; review = only review the latest packet (its review never ran or failed)
+    mode: Literal["tailor", "skip", "review"] = "tailor"
     regenerate: bool = False  # also redo jobs that already have a packet
+    revise: bool = False  # tailor mode: a revision pass that fixes what each job's last review found
     # The page target for these jobs (1, 2 or 3; app.services.resume_length). None = the default in Settings.
     pages: Literal[1, 2, 3] | None = None
 

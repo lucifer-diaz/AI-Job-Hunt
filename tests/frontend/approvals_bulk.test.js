@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const appSource = readFileSync('app/static/app.js', 'utf8').split('/* ───────────── boot ───────────── */')[0];
 const names = ['S', 'D', 'A', 'render', 'setF'];
-let ui, context, fetchMock, bulkReply;
+let ui, context, fetchMock, bulkReply, taskReply;
 
 const REASONS = [{ id: 'compensation', label: 'Pay too low' }, { id: 'location', label: 'Location or remote policy' }];
 const job = (id, over = {}) => ({ id, title: `Engineer ${id}`, company: 'Logitech', location: 'Remote', url: '', source: 'manual',
@@ -20,13 +20,14 @@ const approval = () => ({ job: job(1), min_review_score: 70, checklist: [], answ
 beforeEach(() => {
   document.body.innerHTML = '<script id="boot" type="application/json">{"user":{"email":"a@b.c"}}</script><div id="nav"></div><div id="side-foot"></div><div id="side-meta"></div><div id="brand-sub"></div><div id="top"></div><div id="view"></div><div id="overlays"></div><div id="toast"></div>';
   vi.stubGlobal('scrollTo', vi.fn());
-  bulkReply = null;
-  const answer = url => url.endsWith('/api/approvals/bulk') ? bulkReply
+  bulkReply = null; taskReply = null;
+  const answer = (url, options) => url.endsWith('/api/approvals/bulk') ? bulkReply
+    : url.endsWith('/api/tailor-tasks') ? (options?.method === 'POST' ? taskReply : ui.D.tasks || [])
     : url.includes('/workspace/summary') ? ui.D.summary
     : url.includes('/api/approvals/') ? approval()
     : url.includes('/api/approvals') ? { ...ui.D.approvalFacets, items: ui.D.approvals }
     : {};
-  fetchMock = vi.fn(async url => ({ ok: true, status: 200, text: async () => JSON.stringify(answer(url)) }));
+  fetchMock = vi.fn(async (url, options) => ({ ok: true, status: 200, text: async () => JSON.stringify(answer(url, options)) }));
   vi.stubGlobal('fetch', fetchMock);
   if (!ui) {
     context = createContext({ document, window, location, history, navigator, URLSearchParams, FormData, File, Intl, setTimeout, clearTimeout, setInterval, clearInterval, console });
@@ -42,6 +43,7 @@ beforeEach(() => {
   ui.S.pf = { tailor: { q: '', min_fit: 0, min_review: 0, board: 'all', status: 'all', sort: 'default' },
               approvals: { q: '', min_fit: 0, min_review: 0, board: 'all', status: 'all', sort: 'default' } };
   Object.assign(ui.D, {
+    tasks: [],
     approvals: [row(1), row(2, { reviewer_score: 50 }), row(3, { status: 'pending_approval', waiting: false })],
     approvalFacets: { total: 3, total_all: 3, boards: ['Manual'] }, approval: approval(),
     summary: { profile: {}, counts: {}, application_mode: 'manual_approval', model: 'm', total_jobs: 3,
@@ -140,5 +142,37 @@ describe('acting on several approvals at once', () => {
     const rows = [...view().querySelectorAll('[data-act="select-approval"]')];
     expect(rows[0].textContent).toContain('posting closed');
     expect(rows[1].textContent).not.toContain('posting closed');
+  });
+
+  it('counts the packets that can be retailored or reviewed again', () => {
+    ui.D.approvals = [row(1), row(2, { fit: null }), row(3, { status: 'pending_approval', waiting: false }),
+      row(4, { status: 'approved', waiting: false }), row(5)];
+    ui.D.tasks = [{ id: 9, job_id: 5, mode: 'review', status: 'running' }];
+    ui.A['approval-check-all']();
+    expect(button('bulk-retailor')[0].textContent).toBe('Retailor 2');   // 2 is not ranked, 4 is approved, 5 is busy
+    expect(button('bulk-rereview')[0].textContent).toBe('Re-review 3');
+    const rows = [...view().querySelectorAll('[data-act="select-approval"]')];
+    expect(rows[4].textContent).toContain('re-reviewing');
+  });
+
+  it('retailors the picked packets from their last review and unpicks the queued ones', async () => {
+    ui.A['approval-check']({ dataset: { id: '1' } }, { stopPropagation() {} });
+    ui.A['approval-check']({ dataset: { id: '3' } }, { stopPropagation() {} });
+    taskReply = { queued: [{ id: 7, job_id: 1, mode: 'tailor' }], skipped: [{ id: 3, reason: 'already queued' }] };
+    await ui.A['bulk-retailor']();
+    const [, options] = fetchMock.mock.calls.find(([u, o]) => u.endsWith('/api/tailor-tasks') && o?.method === 'POST');
+    expect(JSON.parse(options.body)).toEqual({ ids: [1, 3], mode: 'tailor', regenerate: true, revise: true });
+    expect([...ui.S.approvalPicked]).toEqual([3]);
+    expect(document.getElementById('toast').textContent).toContain('Retailoring 1 job in the background · 1 skipped');
+  });
+
+  it('reviews the picked packets again without tailoring', async () => {
+    ui.A['approval-check']({ dataset: { id: '2' } }, { stopPropagation() {} });
+    taskReply = { queued: [{ id: 8, job_id: 2, mode: 'review' }], skipped: [] };
+    await ui.A['bulk-rereview']();
+    const [, options] = fetchMock.mock.calls.find(([u, o]) => u.endsWith('/api/tailor-tasks') && o?.method === 'POST');
+    expect(JSON.parse(options.body)).toEqual({ ids: [2], mode: 'review', regenerate: true });
+    expect(ui.S.approvalPicked.size).toBe(0);
+    expect(document.getElementById('toast').textContent).toContain('Reviewing 1 job in the background');
   });
 });

@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from app.services import failover_settings
 
@@ -107,14 +107,17 @@ def percentile(values: list[int], pct: float) -> int | None:
 
 
 def summarize(rows: list[dict[str, Any]]) -> Stats:
-    """Stats over request rows ({status, error_type, latency_ms, fallback_used}). A request the gateway had to
-    fail over (fallback_used) did not get its answer from this model, so it counts against it."""
+    """Stats over request rows ({status, error_type, latency_ms, fallback_used, error_message}). A request the gateway
+    had to fail over (fallback_used) did not get its answer from this model, so it counts against it. A 429 for one
+    oversized request is not counted: it says nothing about the model."""
+    from app.services.rate_limits import too_large
+
     failures = rate_limits = schema = samples = 0
     latencies: list[int] = []
     for row in rows:
         kind = row.get("error_type")
         failed = row.get("status") == "FAILED"
-        if failed and kind in NOT_HEALTH:
+        if failed and (kind in NOT_HEALTH or (kind == "RATE_LIMIT" and too_large(row.get("error_message")))):
             continue
         samples += 1
         if failed and kind in SCHEMA_ERRORS:
@@ -164,15 +167,18 @@ def window_stats(db: Session, user_id: int, model: str, worker_type: str = "", *
     from app.models import LLMRequestLog
 
     query = select(LLMRequestLog.status, LLMRequestLog.error_type, LLMRequestLog.latency_ms,
-                   LLMRequestLog.fallback_used).where(
+                   LLMRequestLog.fallback_used, LLMRequestLog.error_message).where(
         LLMRequestLog.user_id == user_id, LLMRequestLog.provider == "litellm",
-        LLMRequestLog.requested_model == model, LLMRequestLog.created_at >= since)
+        LLMRequestLog.requested_model == model, LLMRequestLog.created_at >= since,
+        # a request never sent (held by a cooldown or token pacing) says nothing about the model
+        or_(LLMRequestLog.cost_source.is_(None), LLMRequestLog.cost_source != "not_sent"))
     if until is not None:
         query = query.where(LLMRequestLog.created_at < until)
     if worker_type:
         query = query.where(LLMRequestLog.worker_type == worker_type)
     rows = db.execute(query.order_by(LLMRequestLog.created_at.desc()).limit(MAX_ROWS)).all()
-    return summarize([{"status": r[0], "error_type": r[1], "latency_ms": r[2], "fallback_used": r[3]} for r in rows])
+    return summarize([{"status": r[0], "error_type": r[1], "latency_ms": r[2], "fallback_used": r[3],
+                       "error_message": r[4]} for r in rows])
 
 
 def baseline_p95(db: Session, user_id: int, model: str, worker_type: str, *, now: datetime,
@@ -246,13 +252,16 @@ def _row(db: Session, user_id: int, worker_type: str, model: str, create: bool =
     return row
 
 
-def _cooldown(cfg: dict[str, Any], trips: int, rest_seconds: int | None = None) -> timedelta:
+def _cooldown(cfg: dict[str, Any], trips: int, rest_seconds: int | None = None, cause: str | None = None) -> timedelta:
     """How long a route rests. A model's own rest time is exactly that, every time: it is the person's answer to "when
-    is it tried again". Without one, the account's cooldown doubles on each trip in a row, up to the longest."""
+    is it tried again". Then, for a 429, the account's rest after a rate limit, also the same every time. Otherwise the
+    account's cooldown doubles on each trip in a row, up to the longest."""
     from app.services.backoff import RateLimitPolicy
 
     if rest_seconds:
         return timedelta(seconds=rest_seconds)
+    if cause == "RATE_LIMIT" and cfg.get("rate_limit_rest_minutes"):
+        return timedelta(minutes=cfg["rate_limit_rest_minutes"])
     return RateLimitPolicy(True, cfg["cooldown_seconds"], 2.0, cfg["max_cooldown_seconds"]).delay(max(1, trips))
 
 
@@ -291,15 +300,22 @@ def _flush_logs(db: Session) -> None:
 
 
 def trip(db: Session, user_id: int, model: str, worker_type: str, *, cause: str, reason: str,
-         cfg: dict[str, Any], stats: Stats | None = None, now: datetime | None = None) -> bool:
-    """Rest a route. Returns False when it was already resting (so one outage is one event, not hundreds)."""
+         cfg: dict[str, Any], stats: Stats | None = None, now: datetime | None = None,
+         not_before: datetime | None = None) -> bool:
+    """Rest a route. Returns False when it was already resting (so one outage is one event, not hundreds).
+
+    `not_before` is when the provider said the limit clears: the route rests at least until then, since a call
+    before it can only be refused again. A route already resting is held that long too, without a new event."""
     moment = now or utcnow()
     row = _row(db, user_id, worker_type, model)
     if row.state != "HEALTHY" and row.cooling_until and row.cooling_until > moment:
+        if not_before and not_before > row.cooling_until:
+            row.cooling_until, row.reason, row.updated_at = not_before, reason[:300], moment
+            reset_cache(user_id)
         return False
     trips = int((row.stats or {}).get("trips", 0)) + 1 if row.state != "HEALTHY" or row.probe_successes else 1
     row.state = "COOLING" if cause == "RATE_LIMIT" else "DEGRADED"
-    row.cooling_until = moment + _cooldown(cfg, trips, _rest_seconds(user_id, model))
+    row.cooling_until = max(moment + _cooldown(cfg, trips, _rest_seconds(user_id, model), cause), not_before or moment)
     row.reason, row.last_changed_at, row.probe_successes, row.updated_at = reason[:300], moment, 0, moment
     row.consecutive_failures = 0
     row.stats = {**(stats.public() if stats else row.stats or {}), "trips": trips}
@@ -341,19 +357,20 @@ def reset_route(db: Session, user_id: int, model: str, worker_type: str = "") ->
 
 # ───────────── per-request outcomes ─────────────
 
-def record_outcome(entry: dict[str, Any]) -> None:
+def record_outcome(entry: dict[str, Any], rate_limit: Any = None) -> None:
     """Called with every LLM telemetry row (app.services.llm_telemetry.record). Never raises.
 
-    Success on a healthy route writes nothing. A 429 rests the model overall; a run of failures rests it for the
-    worker; a success on a resting route that has finished cooling counts toward recovery."""
+    Success on a healthy route writes nothing. A 429 rests the model overall, at least until the provider said it
+    clears (`rate_limit`, app.services.rate_limits); a run of failures rests it for the worker; a success on a resting
+    route that has finished cooling counts toward recovery."""
     try:
         user_id, model = entry.get("user_id"), entry.get("requested_model")
         if not user_id or not model or entry.get("provider") != "litellm":
             return
         failed = entry.get("status") == "FAILED"
         kind = entry.get("error_type")
-        if failed and kind in NOT_HEALTH:
-            return
+        if failed and (kind in NOT_HEALTH or entry.get("cost_source") == "not_sent"):
+            return  # a request never sent (held by a cooldown or token pacing) says nothing about the model
         worker_type = entry.get("worker_type") or ""
         known = states(user_id)
         keys = [("", model), (worker_type, model)]
@@ -364,7 +381,8 @@ def record_outcome(entry: dict[str, Any]) -> None:
             cfg = failover_settings.for_user(db, user_id)
             if not cfg["enabled"]:
                 return
-            _apply_outcome(db, user_id, model, worker_type, failed or bool(entry.get("fallback_used")), kind, cfg)
+            _apply_outcome(db, user_id, model, worker_type, failed or bool(entry.get("fallback_used")), kind, cfg,
+                           rate_limit if failed else None)
             db.commit()
             _flush_logs(db)
         reset_cache(user_id)
@@ -372,13 +390,34 @@ def record_outcome(entry: dict[str, Any]) -> None:
         log.warning("could not record a model outcome", exc_info=True)
 
 
+def _rate_limit_rest(limit: Any, cfg: dict[str, Any], now: datetime) -> tuple[datetime | None, str]:
+    """How long a 429 keeps the model out, and why: the provider's own reset when it named one; for a usage cap it
+    did not time, the account's rest after a usage limit."""
+    from app.services import rate_limits
+
+    kind = getattr(limit, "kind", rate_limits.UNKNOWN)
+    until = getattr(limit, "until", None)
+    label = rate_limits.LABELS.get(kind, "rate limited")
+    if until:
+        return until, f"the provider answered 429 ({label}); it said the limit clears at {until:%Y-%m-%d %H:%M} UTC"
+    if kind == rate_limits.USAGE_CAP:
+        minutes = cfg.get("usage_limit_rest_minutes") or 0
+        return (now + timedelta(minutes=minutes) if minutes else None,
+                f"the provider answered 429 ({label}) without saying when it resets")
+    return None, f"the provider answered 429 ({label})"
+
+
 def _apply_outcome(db: Session, user_id: int, model: str, worker_type: str, failed: bool, kind: str | None,
-                   cfg: dict[str, Any]) -> None:
+                   cfg: dict[str, Any], rate_limit: Any = None) -> None:
+    from app.services import rate_limits
+
     now = utcnow()
     if failed:
         if kind == "RATE_LIMIT":
-            trip(db, user_id, model, "", cause="RATE_LIMIT", reason="the provider answered 429 (rate limited)", cfg=cfg,
-                 now=now)
+            if getattr(rate_limit, "kind", None) == rate_limits.TOO_LARGE:
+                return  # one request over the model's limit says nothing about the model's next, smaller one
+            until, reason = _rate_limit_rest(rate_limit, cfg, now)
+            trip(db, user_id, model, "", cause="RATE_LIMIT", reason=reason, cfg=cfg, now=now, not_before=until)
             return
         row = _row(db, user_id, worker_type, model)
         halfopen = row.state != "HEALTHY" and (row.cooling_until is None or row.cooling_until <= now)

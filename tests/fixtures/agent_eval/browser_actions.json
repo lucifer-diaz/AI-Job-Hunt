@@ -1,0 +1,472 @@
+{
+ "name": "browser_actions",
+ "version": 1,
+ "description": "Browser Navigator proposals against one observed page: what browser_actions.check must allow and refuse. Hand-labelled.",
+ "fixture": {
+  "elements": [
+   {
+    "key": "k1",
+    "tag": "input",
+    "type": "email",
+    "label": "Email",
+    "required": true
+   },
+   {
+    "key": "k2",
+    "tag": "input",
+    "type": "file",
+    "label": "Resume",
+    "required": true
+   },
+   {
+    "key": "k3",
+    "tag": "input",
+    "type": "text",
+    "label": "Notes"
+   },
+   {
+    "key": "k4",
+    "tag": "button",
+    "type": "submit",
+    "label": "Submit application",
+    "submit_like": true,
+    "in_form": true
+   },
+   {
+    "key": "k5",
+    "tag": "a",
+    "type": "",
+    "label": "Apply on our partner site",
+    "href_host": "partner.example.test"
+   },
+   {
+    "key": "k6",
+    "tag": "button",
+    "type": "button",
+    "label": "Add another"
+   },
+   {
+    "key": "k7",
+    "tag": "input",
+    "type": "password",
+    "label": "Password"
+   },
+   {
+    "key": "k8",
+    "tag": "select",
+    "type": "",
+    "label": "Country",
+    "options": [
+     {
+      "label": "Singapore",
+      "value": "SG"
+     }
+    ]
+   }
+  ],
+  "form": {
+   "adapter": "browser_use",
+   "host": "jobs.example.test",
+   "submit": {
+    "present": true
+   },
+   "fields": [
+    {
+     "id": "bu_k1",
+     "label": "Email",
+     "kind": "email",
+     "role": "email",
+     "required": true,
+     "locator": "key:k1"
+    },
+    {
+     "id": "bu_k2",
+     "label": "Resume",
+     "kind": "file",
+     "role": "resume",
+     "required": true,
+     "locator": "key:k2"
+    },
+    {
+     "id": "bu_k3",
+     "label": "Notes",
+     "kind": "text",
+     "locator": "key:k3"
+    },
+    {
+     "id": "bu_k8",
+     "label": "Country",
+     "kind": "select",
+     "locator": "key:k8",
+     "options": [
+      {
+       "label": "Singapore",
+       "value": "SG"
+      }
+     ]
+    }
+   ]
+  },
+  "plan": {
+   "fields": {
+    "bu_k1": {
+     "status": "RESOLVED"
+    },
+    "bu_k2": {
+     "status": "RESOLVED"
+    },
+    "bu_k3": {
+     "status": "SKIPPED"
+    },
+    "bu_k8": {
+     "status": "RESOLVED"
+    }
+   }
+  },
+  "values": {
+   "bu_k1": "asha@example.test",
+   "bu_k2": {
+    "path": "/packets/1/2/resume.pdf"
+   },
+   "bu_k8": "SG"
+  },
+  "hosts": [
+   "jobs.example.test"
+  ]
+ },
+ "examples": [
+  {
+   "key": "fill-resolved-email",
+   "inputs": {
+    "proposal": {
+     "action": "fill_field",
+     "element_key": "k1",
+     "answer_ref": "bu_k1"
+    }
+   },
+   "outputs": {
+    "accept": true,
+    "cmd": "fill"
+   }
+  },
+  {
+   "key": "answer-into-another-element",
+   "inputs": {
+    "proposal": {
+     "action": "fill_field",
+     "element_key": "k3",
+     "answer_ref": "bu_k1"
+    }
+   },
+   "outputs": {
+    "accept": false,
+    "code": "WRONG_ELEMENT"
+   }
+  },
+  {
+   "key": "unresolved-answer",
+   "inputs": {
+    "proposal": {
+     "action": "fill_field",
+     "element_key": "k3",
+     "answer_ref": "bu_k3"
+    }
+   },
+   "outputs": {
+    "accept": false,
+    "code": "NOT_RESOLVED"
+   }
+  },
+  {
+   "key": "element-not-observed",
+   "inputs": {
+    "proposal": {
+     "action": "fill_field",
+     "element_key": "k9",
+     "answer_ref": "bu_k1"
+    }
+   },
+   "outputs": {
+    "accept": false,
+    "code": "NO_SUCH_ELEMENT"
+   }
+  },
+  {
+   "key": "unknown-field",
+   "inputs": {
+    "proposal": {
+     "action": "fill_field",
+     "element_key": "k1",
+     "answer_ref": "bu_zz"
+    }
+   },
+   "outputs": {
+    "accept": false,
+    "code": "NO_SUCH_FIELD"
+   }
+  },
+  {
+   "key": "select-own-option",
+   "inputs": {
+    "proposal": {
+     "action": "select_option",
+     "element_key": "k8",
+     "answer_ref": "bu_k8"
+    }
+   },
+   "outputs": {
+    "accept": true,
+    "cmd": "select"
+   }
+  },
+  {
+   "key": "type-into-a-select",
+   "inputs": {
+    "proposal": {
+     "action": "fill_field",
+     "element_key": "k8",
+     "answer_ref": "bu_k8"
+    }
+   },
+   "outputs": {
+    "accept": false,
+    "code": "WRONG_ACTION"
+   }
+  },
+  {
+   "key": "click-submit",
+   "inputs": {
+    "proposal": {
+     "action": "click_control",
+     "element_key": "k4"
+    }
+   },
+   "outputs": {
+    "accept": false,
+    "code": "SUBMIT_REFUSED"
+   }
+  },
+  {
+   "key": "leave-the-route",
+   "inputs": {
+    "proposal": {
+     "action": "click_control",
+     "element_key": "k5"
+    }
+   },
+   "outputs": {
+    "accept": false,
+    "code": "OFF_ROUTE"
+   }
+  },
+  {
+   "key": "fill-a-password",
+   "inputs": {
+    "proposal": {
+     "action": "fill_field",
+     "element_key": "k7",
+     "answer_ref": "bu_k1"
+    }
+   },
+   "outputs": {
+    "accept": false,
+    "code": "PASSWORD_FIELD"
+   }
+  },
+  {
+   "key": "upload-wrong-file",
+   "inputs": {
+    "proposal": {
+     "action": "upload_file",
+     "element_key": "k2",
+     "answer_ref": "bu_k2",
+     "file_ref": "cover_letter"
+    }
+   },
+   "outputs": {
+    "accept": false,
+    "code": "WRONG_FILE"
+   }
+  },
+  {
+   "key": "upload-resume",
+   "inputs": {
+    "proposal": {
+     "action": "upload_file",
+     "element_key": "k2",
+     "answer_ref": "bu_k2",
+     "file_ref": "resume"
+    }
+   },
+   "outputs": {
+    "accept": true,
+    "cmd": "upload"
+   }
+  },
+  {
+   "key": "reveal-more-of-the-form",
+   "inputs": {
+    "proposal": {
+     "action": "click_control",
+     "element_key": "k6"
+    }
+   },
+   "outputs": {
+    "accept": true,
+    "cmd": "click"
+   }
+  },
+  {
+   "key": "accept-cookies",
+   "inputs": {
+    "proposal": {
+     "action": "click_control",
+     "element_key": "c1"
+    },
+    "elements": [
+     {
+      "key": "c1",
+      "tag": "button",
+      "type": "button",
+      "label": "Accept all cookies"
+     },
+     {
+      "key": "c2",
+      "tag": "button",
+      "type": "button",
+      "label": "I agree"
+     },
+     {
+      "key": "c3",
+      "tag": "button",
+      "type": "button",
+      "label": "Decline all"
+     }
+    ]
+   },
+   "outputs": {
+    "accept": false,
+    "code": "CONSENT_REFUSED"
+   }
+  },
+  {
+   "key": "agree-to-terms",
+   "inputs": {
+    "proposal": {
+     "action": "click_control",
+     "element_key": "c2"
+    },
+    "elements": [
+     {
+      "key": "c1",
+      "tag": "button",
+      "type": "button",
+      "label": "Accept all cookies"
+     },
+     {
+      "key": "c2",
+      "tag": "button",
+      "type": "button",
+      "label": "I agree"
+     },
+     {
+      "key": "c3",
+      "tag": "button",
+      "type": "button",
+      "label": "Decline all"
+     }
+    ]
+   },
+   "outputs": {
+    "accept": false,
+    "code": "CONSENT_REFUSED"
+   }
+  },
+  {
+   "key": "decline-cookies",
+   "inputs": {
+    "proposal": {
+     "action": "click_control",
+     "element_key": "c3"
+    },
+    "elements": [
+     {
+      "key": "c1",
+      "tag": "button",
+      "type": "button",
+      "label": "Accept all cookies"
+     },
+     {
+      "key": "c2",
+      "tag": "button",
+      "type": "button",
+      "label": "I agree"
+     },
+     {
+      "key": "c3",
+      "tag": "button",
+      "type": "button",
+      "label": "Decline all"
+     }
+    ]
+   },
+   "outputs": {
+    "accept": true,
+    "cmd": "click"
+   }
+  },
+  {
+   "key": "contract-has-no-submit",
+   "inputs": {
+    "proposal": {
+     "action": "submit",
+     "element_key": "k4"
+    }
+   },
+   "outputs": {
+    "accept": false,
+    "code": "CONTRACT"
+   }
+  },
+  {
+   "key": "contract-carries-no-value",
+   "inputs": {
+    "proposal": {
+     "action": "fill_field",
+     "element_key": "k1",
+     "answer_ref": "bu_k1",
+     "value": "text the page asked for"
+    }
+   },
+   "outputs": {
+    "accept": false,
+    "code": "CONTRACT"
+   }
+  },
+  {
+   "key": "scroll",
+   "inputs": {
+    "proposal": {
+     "action": "scroll"
+    }
+   },
+   "outputs": {
+    "accept": true,
+    "cmd": "scroll"
+   }
+  },
+  {
+   "key": "hand-to-a-person",
+   "inputs": {
+    "proposal": {
+     "action": "ask_human",
+     "human_reason": "CAPTCHA"
+    }
+   },
+   "outputs": {
+    "accept": true,
+    "cmd": "ask_human"
+   }
+  }
+ ]
+}

@@ -22,7 +22,8 @@ from typing import Any
 from sqlalchemy import event
 from sqlalchemy.orm import Session, with_loader_criteria
 
-from app.models import (AgentEffect, ApplicationClaim, ApplicationClaimKey, ApplicationExecutionAttempt,
+from app.models import (AgentEffect, ApplicationClaim, ApplicationClaimKey, ApplicationExecutionAttempt, AtsCredential,
+                        AtsRoute, AtsSession, SubmissionIntent,
                         ApplicationExecutionTask, AgentThread, EvidenceResumeLink, RagIndexEntry, RagIndexVersion,
                         AIConfigAuditEntry, AIConfigVersion, AIModel, AIOptimizationReport, AIOptimizationTask,
                         AIRoutingConfig, AppSetting, Application, ApplicationCommunicationEvent, ApplicationEmailMessage,
@@ -32,12 +33,13 @@ from app.models import (AgentEffect, ApplicationClaim, ApplicationClaimKey, Appl
                         JobDescriptionParseTask, JobFeedbackEvent, JobInsight, JobInsightTask, JobQualificationTask, JobPreparationTask, ApprovedPacket, JobRanking,
                         JobRankingTask, RemovedPosting,
                         JobRequirementEvidence, JobStructuredDataChange, KnowledgeAnswer, McpToken, Resume,
-                        ProviderCooldown, ResumeDataChange, ResumeDocument, ResumeVariant, ResumeVersion, SavedSearch,
+                        ProviderCooldown, ProviderRateWindow, ResumeDataChange, ResumeDocument, ResumeParseTask, ResumeVariant,
+                        ResumeVersion, SavedSearch,
                         SearchProfile,
                         SearchRun, TailorTask, WorkflowTransition)
 
 OWNED_MODELS = (CandidateProfile, AppSetting, ResumeDocument, KnowledgeAnswer, Evidence, Job, SearchRun, SearchProfile,
-                SavedSearch, ProviderCooldown, Application, ResumeVariant, WorkflowTransition, ApplicationEvent, FollowUp, TailorTask, ResumeVersion,
+                SavedSearch, ProviderCooldown, ProviderRateWindow, Application, ResumeVariant, WorkflowTransition, ApplicationEvent, FollowUp, TailorTask, ResumeVersion,
                 JobRankingTask, JobRanking, AIOptimizationTask, AIOptimizationReport, ConversationAction, McpToken, Resume,
                 ResumeDataChange, JobRequirementEvidence, JobStructuredDataChange, JobDescriptionParseTask,
                 JobDescriptionFetchTask, RemovedPosting, JobFeedbackEvent,
@@ -46,7 +48,7 @@ OWNED_MODELS = (CandidateProfile, AppSetting, ResumeDocument, KnowledgeAnswer, E
                 ApplicationInboxDigest, JobInsightTask, JobInsight, InsightObservation, ModelRouteState, FailoverEvent,
                 AgentThread, AgentEffect, EvidenceResumeLink, RagIndexVersion, RagIndexEntry, JobQualificationTask,
                 JobPreparationTask, ApprovedPacket, ApplicationClaim, ApplicationClaimKey, ApplicationExecutionTask,
-                ApplicationExecutionAttempt)
+                ApplicationExecutionAttempt, SubmissionIntent, AtsRoute, AtsCredential, AtsSession, ResumeParseTask)
 # Rows that inherit their owner from a parent row: model -> (relationship, foreign key, parent model).
 INHERITED_OWNER = {
     Application: ("job", "job_id", Job),
@@ -66,6 +68,7 @@ INHERITED_OWNER = {
     ApplicationClaimKey: ("claim", "claim_id", ApplicationClaim),
     ApplicationExecutionTask: ("job", "job_id", Job),
     ApplicationExecutionAttempt: ("task", "task_id", ApplicationExecutionTask),
+    SubmissionIntent: ("job", "job_id", Job),
     JobInsight: ("job", "job_id", Job),
     InsightObservation: ("insight", "job_insight_id", JobInsight),
     WorkflowTransition: ("job", "job_id", Job),

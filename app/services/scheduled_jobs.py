@@ -34,6 +34,7 @@ from app.models import (
     JobDescriptionParseTask,
     JobInsightTask,
     JobRankingTask,
+    ResumeParseTask,
     SearchRun,
     User,
 )
@@ -45,6 +46,7 @@ from app.services import (
     job_description,
     monitoring,
     ranker,
+    resume_parsing,
     server_settings,
     system_log,
     threads,
@@ -325,6 +327,39 @@ def _prepare_jd_parsing(ctx: JobContext) -> dict[str, Any] | str:
 def _claim_jd_parsing(ctx: JobContext, limit: int) -> list[job_description.ParseClaim]:
     with ctx.sessions() as db:
         return job_description.claim(db, worker_id=ctx.worker_id, limit=limit)
+
+
+def _prepare_resume_parsing(ctx: JobContext) -> dict[str, Any] | str:
+    with ctx.sessions() as db:
+        if not _is_postgres(db):
+            return "Resume parsing needs PostgreSQL (FOR UPDATE SKIP LOCKED)"
+        return {"recovered": resume_parsing.recover_expired(db)}
+
+
+def _claim_resume_parsing(ctx: JobContext, limit: int) -> list[resume_parsing.ParseClaim]:
+    with ctx.sessions() as db:
+        return resume_parsing.claim(db, worker_id=ctx.worker_id, limit=limit)
+
+
+async def resume_parse(ctx: JobContext) -> dict[str, Any]:
+    """Structure uploaded resumes with the Resume Parser model (the LangGraph graph when it can run),
+    `resume_parse_concurrency` at a time."""
+    from app.services import resume_parsing_graph
+
+    if not get_settings().resume_parse_enabled:
+        return skipped("Resume parsing is off (RESUME_PARSE_ENABLED)")
+    details = await threads.run_io(_prepare_resume_parsing, ctx)
+    if isinstance(details, str):
+        return skipped(details)
+    claimed, outcomes = await run_live(
+        concurrency="resume_parse_concurrency", batch="resume_parse_batch_size",
+        claim=lambda n: _claim_resume_parsing(ctx, n),
+        process=lambda c: threads.run_work(resume_parsing_graph.run, ctx.sessions, c),
+        heartbeat=renew(ctx.sessions, ResumeParseTask, get_settings().resume_parse_lease_seconds))
+    summary = {"claimed": claimed, **{name: outcomes.get(name, 0) for name in resume_parsing.OUTCOMES}, **details}
+    if not claimed:
+        return skipped("No resumes waiting", **summary)
+    return summary
 
 
 async def jd_parsing(ctx: JobContext) -> dict[str, Any]:
@@ -776,7 +811,10 @@ def _prepare_application_execution(ctx: JobContext, mode: str) -> dict[str, Any]
     with ctx.sessions() as db:
         details: dict[str, Any] = {"mode": mode,
                                    "expired_leases": application_execution.recover_expired(db, ctx.now),
-                                   "claims_now_uncertain": apply_queue.expire_claims(db, now=ctx.now)}
+                                   "claims_now_uncertain": apply_queue.expire_claims(db, now=ctx.now),
+                                   "takeovers_ended": application_execution.end_expired_takeovers(db, ctx.now),
+                                   "submitted_in_window": application_execution.watch_windows(db),
+                                   "captchas_answered": application_execution.watch_challenges(db)}
         if mode == "off":
             details["released"] = application_execution.release(db, ctx.now)
     return details
@@ -810,8 +848,11 @@ async def application_execution_job(ctx: JobContext) -> dict[str, Any]:
         if not details.get("released") and not details.get("expired_leases"):
             return skipped("The application worker is off (APPLICATION_EXECUTION_MODE)", **details)
         return details
+    from app.infrastructure.application_browser.browser_use_sidecar import get_sidecars
+
     browser = get_application_sessions()
     run_async = application_execution.loop_runner(asyncio.get_running_loop())
+    await get_sidecars().reap()  # takeover windows nobody came back to
     try:
         claimed, outcomes = await run_live(
             concurrency="application_execution_concurrency", batch="application_execution_batch_size",
@@ -963,6 +1004,9 @@ JOBS: list[JobSpec] = [
             "Filters and queues new jobs, then ranks a bounded batch of ranking tasks, a few at a time."),
     JobSpec("jd_parsing", "Job description parsing", "jd_parse_interval_minutes", jd_parsing,
             "Parses job descriptions into structured requirements, each tied to the sentence it came from."),
+    JobSpec("resume_parse", "Resume parsing", "resume_parse_interval_minutes", resume_parse,
+            "Structures uploaded resumes with the Resume Parser model (LangGraph when AGENT_GRAPHS_ENABLED), keeps only "
+            "what the resume's text states, and fills the structured data while nobody has reviewed it."),
     JobSpec("jd_recovery", "Job description recovery", "jd_recovery_interval_minutes", jd_recovery_job,
             "Reads missing job descriptions from their posting URLs: HTTP first, the browser only when needed."),
     JobSpec("listing_check", "Removed posting check", "listing_check_interval_minutes", listing_check,

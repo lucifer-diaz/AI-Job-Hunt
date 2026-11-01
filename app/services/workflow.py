@@ -32,6 +32,7 @@ from app.prompts import (
     build_review_prompt,
     build_tailoring_prompt,
 )
+from app.services import prompt_budget
 from app.services import resume_verification as rv
 from app.services.contacts import recruiters_of
 from app.services.context_builder import (
@@ -40,6 +41,7 @@ from app.services.context_builder import (
     build_followup_context,
     build_review_context,
     build_tailoring_context,
+    fit_prompt,
 )
 from app.services.llm import LLMCall, LLMClient, LLMResult
 from app.services.resume_format import (
@@ -103,7 +105,10 @@ def tailor_job(db: Session, job: Job, progress: Progress = _no_progress, pages: 
         context.revision_feedback = feedback
     progress("tailoring")
     llm = LLMClient.for_user(db)
-    prompt = build_tailoring_prompt(candidate_profile=profile, job=job, context=context)
+    # Within the Tailor's prompt token budget, when it has one; the citable ids below are taken after trimming.
+    prompt = fit_prompt(context, job, lambda: build_tailoring_prompt(candidate_profile=profile, job=job,
+                                                                     context=context),
+                        prompt_budget.budget_for(db, job.user_id, "TAILOR"))
     result = llm.generate_prompt(prompt, LLMCall(workflow_type="job", entity_id=job.id,
                                                  context_stats=context.call_stats()))
     # Citable: the evidence list, and the id of every source bullet and project bullet the context showed.
@@ -198,9 +203,15 @@ def persist_tailored_resume(db: Session, job: Job, content: dict, *, markdown: s
     content = {**content, "cover_letter": strip_citations(content.get("cover_letter", "") or "").strip()}
     version = (db.scalar(select(ResumeVariant.version).where(ResumeVariant.job_id == job.id)
                          .order_by(desc(ResumeVariant.version)).limit(1)) or 0) + 1
+    profile = rv.for_job(db, get_profile(db), job)
+    # Which resume version the packet was made from, so the Tailor screen can name it. The backend Tailor records it
+    # in its context; every other path (Claude Desktop over MCP, skip tailoring) records the job's resolved resume.
+    if not (content.get("context") or {}).get("id") and not content.get("source_resume_id"):
+        source = rv.resume_for(db, profile, create=False) if profile is not None else None
+        if source is not None:
+            content["source_resume_id"] = source.id
     resume = ResumeVariant(job_id=job.id, version=version, content=content,
-                           markdown=build_resume_markdown(rv.for_job(db, get_profile(db), job), content)
-                           if markdown is None else markdown,
+                           markdown=build_resume_markdown(profile, content) if markdown is None else markdown,
                            cover_letter=content.get("cover_letter", "") or "")
     db.add(resume)
     job.status = "tailored"
@@ -229,6 +240,18 @@ def skip_tailoring(db: Session, job: Job, progress: Progress = _no_progress) -> 
     markdown = render_resume(parse_resume(profile.master_resume), name=profile.name, headline=profile.headline)
     resume = persist_tailored_resume(db, job, {"untailored": True, "summary": "", "skills": [], "experience": [],
                                                "selected_evidence_ids": [], "cover_letter": ""}, markdown=markdown)
+    progress("reviewing")
+    review_resume(db, resume)
+    return resume
+
+
+def review_packet(db: Session, job: Job, progress: Progress = _no_progress) -> ResumeVariant:
+    """Review the latest saved packet of a job, without tailoring it again: for a packet whose review never ran or
+    failed (tailoring saves the version before the Reviewer runs). No new version is made."""
+    resume = db.scalar(select(ResumeVariant).where(ResumeVariant.job_id == job.id)
+                       .order_by(desc(ResumeVariant.version)).limit(1))
+    if resume is None:
+        raise ValueError("This job has no packet to review")
     progress("reviewing")
     review_resume(db, resume)
     return resume
@@ -448,8 +471,10 @@ def store_review(db: Session, resume: ResumeVariant, notes: dict, *, commit: boo
         db.commit()
 
 
-def approve_job(db: Session, job: Job, *, override: bool = False, note: str = "") -> Application:
-    """Approve the latest reviewed packet. `override` records that the reviewer minimum was waived for it."""
+def approve_job(db: Session, job: Job, *, override: bool = False, note: str = "", by_person: bool = False) -> Application:
+    """Approve the latest reviewed packet. `override` records that the reviewer minimum was waived for it.
+    `by_person`: the candidate approved it on a screen, which may overrule the ranking policy's archive
+    (approval.path_to_ready); automatic approvals never pass it."""
     from app.services import approval
 
     latest = db.scalar(select(ResumeVariant).where(ResumeVariant.job_id == job.id)
@@ -458,7 +483,7 @@ def approve_job(db: Session, job: Job, *, override: bool = False, note: str = ""
         raise ValueError("The latest resume must be reviewed before approval")
     # The canonical state goes to READY_TO_APPLY through validated transitions, or the approval is refused before
     # anything is written (approval.ApprovalRefused).
-    approval.reconcile_to_ready(db, job, latest)
+    approval.reconcile_to_ready(db, job, latest, by_person=by_person)
     application = job.application
     if not application:
         application = Application(job_id=job.id)
@@ -484,18 +509,61 @@ def approve_job(db: Session, job: Job, *, override: bool = False, note: str = ""
     from app.services import preparation
 
     preparation.on_decision(db, job, "approved")  # a preparation graph run waiting for this ends (never blocks)
+    from app.services import application_execution
+
+    application_execution.on_approved(db, job)  # auto submit, when the account turned it on (never blocks)
     db.commit()
     db.refresh(application)
     return application
 
 
+# Where a submitted job's canonical state already is, or has moved past: nothing to advance.
+_SUBMITTED_STATES = ("APPLIED", "FOLLOWUP_DUE", "FOLLOWED_UP", "INTERVIEW", "REJECTED", "OFFER")
+
+
+def advance_to_applied(db: Session, job: Job, *, actor: str, reason: str) -> str | None:
+    """Move the canonical state READY_TO_APPLY → APPLYING → APPLIED through validated transitions (work_queue),
+    reconciling an older approval to READY_TO_APPLY first where the stored facts back it (approval.reconcile_to_ready).
+    Never forges a step: when no backed path exists the state stays where it is and the reason is returned for the
+    audit trail. Does not commit."""
+    from app.services import approval
+    from app.services.lifecycle import InvalidTransition, parse_state
+    from app.services.lifecycle import WorkflowState as S
+    from app.services.work_queue import transition
+
+    state = parse_state(job.state) if job.state else None
+    if state is not None and state.value in _SUBMITTED_STATES:
+        return None
+    try:
+        if state not in (S.READY_TO_APPLY, S.APPLYING):
+            variant = db.get(ResumeVariant, job.application.approved_resume_id) if job.application and \
+                job.application.approved_resume_id else None
+            if variant is None:
+                return f"the canonical state stayed {state.value if state else 'unset'}: no approved version"
+            approval.reconcile_to_ready(db, job, variant)
+        if parse_state(job.state) is S.READY_TO_APPLY:
+            transition(db, job, S.APPLYING, actor=actor, reason=reason)
+        transition(db, job, S.APPLIED, actor=actor, reason=reason)
+    except (approval.ApprovalRefused, InvalidTransition) as exc:
+        return f"the canonical state stayed {job.state}: {exc}"[:300]
+    return None
+
+
 def mark_applied(db: Session, job: Job, *, submitted_by: str = "you", submitted_via: str | None = None,
-                 confirmation_id: str | None = None, claim: dict | None = None) -> Application:
-    """Record the submission on the application and the job. Callers go through apply_queue.record_submission, which
-    takes the account lock and checks the packet, duplicates and claims first; `claim` is its provenance."""
+                 confirmation_id: str | None = None, claim: dict | None = None,
+                 evidence: dict | None = None) -> Application:
+    """Record the submission on the application and the job, and move the canonical state to APPLIED (through
+    APPLYING). Callers go through apply_queue.record_submission, which takes the account lock and checks the packet,
+    duplicates and claims first; `claim` is its provenance and `evidence` says how the submission is known:
+    `verified_browser` (the confirmation verifier saw the site's evidence) or `reported` (a person or Claude Desktop
+    said so). A report is never treated as verified."""
     application = job.application or approve_job(db, job)
     if application.status != "approved":
         raise ValueError("Application must be approved before marking applied")
+    provenance = {"evidence": (evidence or {}).get("kind") or "reported",
+                  **({"verification": evidence.get("facts")} if evidence and evidence.get("facts") else {})}
+    not_advanced = advance_to_applied(db, job, actor=(submitted_via or "person")[:60],
+                                      reason=f"Submitted by {submitted_by} ({provenance['evidence']})")
     applied_at = datetime.now(UTC).replace(tzinfo=None)
     application.status = "applied"
     application.stage = "applied"
@@ -510,7 +578,8 @@ def mark_applied(db: Session, job: Job, *, submitted_by: str = "you", submitted_
                             detail=detail + (f" · confirmation {confirmation_id}" if confirmation_id else ""),
                             occurred_at=applied_at,
                             meta={**({"confirmation_id": confirmation_id} if confirmation_id else {}),
-                                  **(claim or {})} or None))
+                                  **(claim or {}), **provenance,
+                                  **({"state_not_advanced": not_advanced} if not_advanced else {})}))
     db.commit()
     db.refresh(application)
     return application

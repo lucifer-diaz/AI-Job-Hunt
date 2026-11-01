@@ -104,6 +104,15 @@ def performance(f: monitoring.MonitoringFilter = Filter,
     return out
 
 
+@router.get("/feedback")
+def feedback(user: CurrentUser = Depends(current_user), db: Session = Depends(get_user_db)) -> dict[str, Any]:
+    """Human correction rates of the signed-in account's own automated results, and its recruiter outcomes beside
+    them (never attributed to a model). Always the account's own: per-account tables are not pooled."""
+    from app.services.agent_eval import feedback as agent_feedback
+
+    return agent_feedback.report(db, user.id)
+
+
 @router.get("/costs")
 def costs(f: monitoring.MonitoringFilter = Filter, db: Session = Depends(get_user_db)):
     items = monitoring.rows(db, f)

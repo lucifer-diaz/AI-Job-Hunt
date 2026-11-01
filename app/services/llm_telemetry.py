@@ -39,7 +39,7 @@ STAGE_BY_PROMPT = {
     "ranking": "RANKER", "tailoring": "TAILOR", "cover_letter": "TAILOR", "review": "REVIEWER", "resume_parser": "RESUME_PARSER",
     "evidence_extraction": "RESUME_PARSER", "application_question": "APPLICATION", "application_form": "APPLICATION", "followup": "FOLLOW_UP",
     "inbox": "INBOX", "company_insights": "COMPANY_INSIGHTS", "interview_insights": "INTERVIEW_INSIGHTS", "job_description_parser": "JD_PARSER", "job_description_recovery": "JD_RECOVERY", "ai_optimization": "ADVISOR",
-    "application_inbox": "INBOX", "application_email_match": "INBOX",
+    "application_inbox": "INBOX", "application_email_match": "INBOX", "browser_navigation": "BROWSER_NAVIGATION",
 }
 VALIDATION_FAILURE_REASONS = ("INVALID_JSON", "WRONG_OUTPUT_SCHEMA", "POSSIBLE_CROSS_WORKER_OUTPUT",
                               "SEMANTIC_VALIDATION")
@@ -310,7 +310,8 @@ def _context_selection(stats: dict[str, Any] | None) -> dict[str, Any]:
     stats = stats or {}
     return {key: stats.get(key) for key in ("full_available_context_tokens", "selected_context_tokens",
                                             "context_reduction_percent", "raw_job_tokens",
-                                            "selected_job_context_tokens", "job_context_reduction_percent")}
+                                            "selected_job_context_tokens", "job_context_reduction_percent",
+                                            "retrieval_ms", "retrieval_mode")}
 
 
 def _routing(attempt: Attempt) -> dict[str, Any]:
@@ -366,7 +367,7 @@ def record(attempt: Attempt, *, latency_ms: int, error: BaseException | None = N
         log_call(entry)
         from app.services import model_health
 
-        model_health.record_outcome(entry)  # route health: never raises
+        model_health.record_outcome(entry, rate_limit=getattr(error, "rate_limit", None))  # never raises
     except Exception:  # noqa: BLE001  telemetry is best effort by design
         log.warning("could not record LLM telemetry for %s/%s", attempt.provider, attempt.requested_model,
                     exc_info=True)

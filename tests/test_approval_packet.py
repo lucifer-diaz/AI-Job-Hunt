@@ -300,14 +300,63 @@ def test_putting_it_back_requeues_the_ranking_and_approval_opens_once_it_qualifi
         assert db.get(Job, job_id).state is S.READY_TO_APPLY
 
 
-def test_a_job_archived_by_ranking_offers_rank_again():
-    job_id, _ = job_with_packet(S.ARCHIVED, status="pending_approval")
+def _archived_by_ranking(score: float = 90) -> int:
+    job_id, _ = job_with_packet(S.ARCHIVED, score=score, status="pending_approval")
     with SessionLocal() as db:
         db.query(Job).filter(Job.id == job_id).update({"previous_state": S.RANKED, "description": POSTING})
         db.commit()
+    return job_id
+
+
+def test_a_job_archived_by_ranking_offers_rank_again_and_your_approval_overrules_it():
+    job_id = _archived_by_ranking()
     pipeline = client.get(f"/api/jobs/{job_id}").json()["pipeline"]
     assert pipeline["action"] == "rank" and pipeline["action_label"] == "Rank again"
-    assert "Rank again" in client.post(f"/api/jobs/{job_id}/approve").json()["detail"]
+    assert pipeline["approval_blocked"] is False
+    assert client.post(f"/api/jobs/{job_id}/approve", json={"note": "Already shortlisted"}).status_code == 200
+    assert _history(job_id) == [("ARCHIVED", "QUALIFIED", "person"), ("QUALIFIED", "TAILORING", "reconcile"),
+                                ("TAILORING", "TAILORED", "reconcile"), ("TAILORED", "REVIEWED", "reconcile"),
+                                ("REVIEWED", "READY_TO_APPLY", "approval")]
+    with SessionLocal() as db:
+        assert db.get(Job, job_id).application.status == "approved"
+
+
+def test_approving_a_job_whose_ranking_you_stopped_reopens_it():
+    from app.services.lifecycle import STOPPED_BY_USER
+
+    job_id, _ = job_with_packet(S.SKIPPED, status="pending_approval")
+    with SessionLocal() as db:
+        job = db.get(Job, job_id)
+        db.query(Job).filter(Job.id == job_id).update({"previous_state": S.RANK_PENDING, "description": POSTING})
+        db.add(WorkflowTransition(job_id=job_id, user_id=job.user_id, from_state=S.RANK_PENDING, to_state=S.SKIPPED,
+                                  actor="user:1", reason=STOPPED_BY_USER))
+        db.commit()
+    pipeline = client.get(f"/api/jobs/{job_id}").json()["pipeline"]
+    assert pipeline["title"] == "Taken out of ranking" and pipeline["approval_blocked"] is False
+    with SessionLocal() as db:
+        db.info["user_id"] = _user()
+        with pytest.raises(approval.ApprovalRefused, match="stopped this job's ranking"):
+            approve_job(db, db.get(Job, job_id))  # never without the person
+        db.rollback()
+    assert client.post(f"/api/jobs/{job_id}/approve", json={"note": "Interviewing"}).status_code == 200
+    assert _history(job_id)[1:3] == [("SKIPPED", "QUALIFIED", "person"), ("QUALIFIED", "TAILORING", "reconcile")]
+    assert _history(job_id)[-1] == ("REVIEWED", "READY_TO_APPLY", "approval")
+
+
+def test_only_a_person_overrules_the_ranking_archive():
+    job_id = _archived_by_ranking()
+    before = _counts(job_id)
+    with SessionLocal() as db:
+        db.info["user_id"] = _user()
+        with pytest.raises(approval.ApprovalRefused, match="only you can approve"):
+            approve_job(db, db.get(Job, job_id))  # automatic approvals (auto mode, tailor tasks) pass no by_person
+        db.rollback()
+    assert _counts(job_id) == before
+    # No worker may reopen it either.
+    from app.services.work_queue import transition
+
+    with SessionLocal() as db, pytest.raises(Exception, match="Only the candidate"):
+        transition(db, db.get(Job, job_id), S.QUALIFIED, actor="ranker")
 
 
 def test_a_held_job_without_a_description_is_sent_to_add_one():

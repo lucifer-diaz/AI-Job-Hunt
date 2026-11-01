@@ -20,6 +20,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Qu
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import and_, desc, exists, func, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.auth import get_user_db
@@ -48,6 +49,7 @@ from app.services import (
     feedback_learning,
     ranker,
     resume_length,
+    resume_matching,
     resume_verification,
 )
 from app.services.approval import ApprovalRefused
@@ -111,7 +113,10 @@ from app.services.tracker import (
     INACTIVE_STAGES,
     INTERVIEW_STAGES,
     REPLY_STAGES,
+    archive_older_than,
+    older_than,
     set_stage,
+    unarchive,
 )
 from app.services.url_safety import UnsafeURL, check_public_url
 from app.services.user_settings import apify_token, lock_settings_row, settings_for
@@ -270,6 +275,75 @@ def job_card(job: Job) -> dict:
         "posting_closed": ({"at": job.posting_closed_at.isoformat(), "ago": ago(job.posting_closed_at),
                             "reason": job.posting_closed_reason} if job.posting_closed_at else None),
     }
+
+
+# How a job's resume was chosen (Job.resume_choice), in the words the job and Tailor screens show.
+RESUME_CHOICE_LABELS = {
+    "AUTO": "Matched by resume tags",
+    "SETUP": "Pinned by the search setup",
+    "USER": "Chosen by you",
+    "ACTIVE": "Pinned to the active resume",
+}
+
+
+def resume_ref(resume: Resume | None) -> dict | None:
+    """A resume version as the screens name it: never its text."""
+    if resume is None:
+        return None
+    return {"id": resume.id, "name": resume.name or f"Version {resume.version}", "version": resume.version,
+            "is_active": bool(resume.is_active), "domains": resume_matching.groups(resume)}
+
+
+def resume_in_use(db: Session, job: Job) -> dict | None:
+    """The resume ranking and tailoring read for this job now, resolved the way resume_verification.for_job resolves
+    it (the job's own resume, else the active one), and why. Read-only: never activates or re-matches anything."""
+    profile = get_profile(db)
+    chosen = resume_verification.chosen_resume(db, profile, job)
+    resume = chosen or resume_verification.active_resume(db, profile, create=False)
+    if resume is None:
+        return None
+    choice = job.resume_choice if chosen is not None or job.resume_choice == "ACTIVE" else None
+    rematch = stale_match(db, job, resume.id)
+    if choice in RESUME_CHOICE_LABELS:
+        how = RESUME_CHOICE_LABELS[choice]
+        if choice == "AUTO" and (reason := resume_matching.score(resume, job).reason):
+            how = f"{how} ({reason})"
+    elif job.resume_id is not None:
+        how = "The chosen resume is gone: the active resume is used"
+    elif rematch is not None:
+        how = "No resume matched by tags when this job was found: the active resume is used"
+    else:
+        how = "No resume matched by tags clearly: the active resume is used"
+    return {**resume_ref(resume), "choice": choice, "how": how, "rematch": rematch}
+
+
+def stale_match(db: Session, job: Job, in_use_id: int | None = None) -> dict | None:
+    """What matching by today's tags would change for a job: the resume they pick (None: the active one) and why.
+
+    A job matched automatically (or never) may have been matched before its tags changed: any difference is offered.
+    A pinned job (by the person or its search) is offered the tag match only when the tags clearly pick a resume other
+    than the one it uses (`pinned`: taking it replaces that choice). None when nothing would change. Read-only:
+    re-matching stays the person's action, since a ranked job is ranked again."""
+    match = resume_matching.pick(resume_matching.tagged_resumes(db, job.user_id), job)
+    target = match.resume_id if match else None
+    pinned = job.resume_choice not in resume_matching.REMATCHABLE
+    if (target is None or target == in_use_id) if pinned else target == job.resume_id:
+        return None
+    resume = db.get(Resume, target) if target is not None else None
+    return {"resume": resume_ref(resume), "reason": match.reason if match else "no resume matches clearly now",
+            "pinned": pinned}
+
+
+def packet_source_resume(db: Session, job: Job, variant: ResumeVariant, now: dict | None = None) -> dict:
+    """The resume version a saved packet was tailored from, as its own content records it (the tailoring context's
+    resume id, or an untailored packet's source), and whether that is still the resume the job would use now."""
+    content = variant.content or {}
+    source_id = (content.get("context") or {}).get("id") or content.get("source_resume_id")
+    resume = db.scalar(select(Resume).where(Resume.id == source_id)) if source_id else None
+    now = now if now is not None else resume_in_use(db, job)
+    return {"recorded": source_id is not None, "resume": resume_ref(resume),
+            "deleted": source_id is not None and resume is None,
+            "differs": bool(source_id and now and now["id"] != source_id)}
 
 
 def get_job(db: Session, job_id: int) -> Job:
@@ -874,7 +948,8 @@ def jobs_search(q: str = "", min_fit: int = 0, max_fit: int = 0, board: str = "a
     if ids_only:  # "select all matching" across every page
         chosen = rows[:5000]
         return {"ids": [j.id for j in chosen], "total": total,
-                "ranked_ids": [j.id for j in chosen if j.fit_score is not None]}
+                "ranked_ids": [j.id for j in chosen if j.fit_score is not None],
+                "parsed_ids": [j.id for j in chosen if described[j.id] == "PARSED"]}
     pages = max(1, -(-total // per_page))
     page = min(page, pages)
     boards = sorted({board_label(j.source) for j in jobs})
@@ -885,6 +960,7 @@ def jobs_search(q: str = "", min_fit: int = 0, max_fit: int = 0, board: str = "a
                                    for key, name in job_description.DESCRIPTION_STATES.items()],
             "total_all": total_all, "applied_hidden": applied_hidden,
             "domain_counts": {"matching": domain_counts["matching"], "not_matching": domain_counts["not_matching"]},
+            "parse_enabled": get_settings().jd_parse_enabled,
             "page": page, "pages": pages, "per_page": per_page, "boards": boards,
             "locations": location_facets([j.location for j in jobs]),
             "job_types": sorted({(j.job_type or "").strip().lower() for j in jobs} - {""}),
@@ -979,10 +1055,53 @@ def bulk_delete(payload: BulkIdsIn, db: Session = Depends(get_user_db)):
 @router.post("/api/jobs/bulk-rank", status_code=202)
 def bulk_rank(payload: BulkIdsIn, request: Request, background: BackgroundTasks, rerank: bool = False,
               db: Session = Depends(get_user_db)):
-    """Queue ranking for selected jobs. `rerank` also re-ranks ranked jobs as a new version."""
-    out = ranker.request_ranking(db, payload.ids, force=rerank, only_unranked=not rerank, actor=f"user:{db.info['user_id']}")
+    """Queue ranking for selected jobs. `rerank` also re-ranks ranked jobs as a new version.
+
+    While parsing is on, only jobs whose current description is parsed are ranked: Parse them first."""
+    from app.services import job_description  # local import, as app.services.sources does
+
+    ids, unparsed = list(dict.fromkeys(payload.ids)), []
+    if get_settings().jd_parse_enabled:
+        jobs = db.scalars(select(Job).where(Job.id.in_(ids))).all()
+        statuses = job_description.latest_parse_statuses(db, [job.id for job in jobs])
+        parsed = {job.id for job in jobs if job_description.description_state(job, statuses.get(job.id)) == "PARSED"}
+        unparsed = [job.id for job in jobs if job.id not in parsed]
+        ids = [job_id for job_id in ids if job_id not in unparsed]
+    out = ranker.request_ranking(db, ids, force=rerank, only_unranked=not rerank, actor=f"user:{db.info['user_id']}")
+    out["skipped"] += [{"id": job_id, "reason": "not parsed yet"} for job_id in unparsed]
     run_soon(background, request.app, "ranking")
     return out
+
+
+@router.post("/api/jobs/bulk-parse", status_code=202)
+def bulk_parse(payload: BulkIdsIn, request: Request, background: BackgroundTasks, db: Session = Depends(get_user_db)):
+    """Queue a parse of each selected job's description. The parse worker does the model calls; ranking follows."""
+    from app.services import job_description  # local import, as app.services.sources does
+
+    ids = list(dict.fromkeys(payload.ids))
+    jobs = {job.id: job for job in db.scalars(select(Job).where(Job.id.in_(ids))).all()}
+    statuses = job_description.latest_parse_statuses(db, list(jobs))
+    queued, skipped = [], []
+    for job_id in ids:
+        job = jobs.get(job_id)
+        state = job_description.description_state(job, statuses.get(job_id)) if job else None
+        why = ("not found" if job is None
+               else "hidden: not matching your domain" if job.domain_match == "NOT_MATCHING"
+               else "no description" if state == "NO_DESCRIPTION"
+               else "already parsed" if state == "PARSED"
+               else "already parsing" if state == "PARSING"
+               else None)
+        if not why:
+            try:  # the parse sweep may queue the same job at the same moment
+                with db.begin_nested():
+                    job_description.queue_parse(db, job, reason="manual")
+            except IntegrityError:
+                why = "already parsing"
+        (skipped.append({"id": job_id, "reason": why}) if why else queued.append(job_id))
+    db.commit()
+    if queued:
+        run_soon(background, request.app, "jd_parsing")
+    return {"queued": queued, "skipped": skipped}
 
 
 @router.get("/api/jobs/{job_id}")
@@ -1015,10 +1134,14 @@ def job_detail(job_id: int, db: Session = Depends(get_user_db)):
 
     return {**job_card(job), "description": job.description, "fit_analysis": job.fit_analysis or {},
             "description_state": job_description.description_state(job, parse_status),
+            "parse_enabled": get_settings().jd_parse_enabled,
             "description_recovery": jd_recovery.status_of(db, job),
             "rank_pct": rank, "wizard": [{"label": l, "done": d, "meta": m} for l, d, m in steps],
             "gap_notes": gap_notes, "notes": app.notes if app else "",
-            "resume_id": resume.id if resume else None, "pipeline": ranker.pipeline_status(db, job)}
+            "resume_id": resume.id if resume else None, "pipeline": ranker.pipeline_status(db, job),
+            # Which resume ranking and tailoring read for this job now, and the one its latest packet was made from.
+            "resume_in_use": (in_use := resume_in_use(db, job)),
+            "packet_source": packet_source_resume(db, job, resume, in_use) if resume else None}
 
 
 class JobUrlIn(BaseModel):
@@ -1149,8 +1272,7 @@ _JD_LABELS = {
 
 def read_job_file(filename: str, content_type: str, data: bytes) -> str:
     """The text of an uploaded job description (PDF, DOCX or TXT). Raises HTTPException for an unusable file."""
-    from io import BytesIO
-
+    from app.services import document_text
     from app.services.structured_resume import clean_raw_text
 
     suffix = Path(filename or "").suffix.lower()
@@ -1160,14 +1282,7 @@ def read_job_file(filename: str, content_type: str, data: bytes) -> str:
     if not data:
         raise HTTPException(400, "The file is empty")
     try:
-        if kind == "application/pdf":
-            from pypdf import PdfReader
-            text = "\n".join(page.extract_text() or "" for page in PdfReader(BytesIO(data)).pages)
-        elif kind == "text/plain":
-            text = data.decode("utf-8", errors="replace")
-        else:
-            from docx import Document
-            text = "\n".join(p.text for p in Document(BytesIO(data)).paragraphs)
+        text = document_text.extract(kind, data, errors="replace")
     except Exception as exc:
         raise HTTPException(422, f"Could not read the file ({exc.__class__.__name__})") from exc
     text = clean_raw_text(text)
@@ -1923,6 +2038,8 @@ def packet(db: Session, job: Job) -> dict:
         "id": resume.id, "version": resume.version, "created_at": resume.created_at.isoformat(),
         "generated": ago(resume.created_at), "reviewer_score": resume.reviewer_score, "markdown": resume.markdown,
         "untailored": bool((resume.content or {}).get("untailored")),
+        # The resume version this packet was tailored from, and the one the job resolves to now.
+        "source": packet_source_resume(db, job, resume, in_use := resume_in_use(db, job)), "resume_in_use": in_use,
         "cover_letter": strip_citations(resume.cover_letter), "cover_words": len(resume.cover_letter.split()),
         "edits": edits, "review": review, "keywords": coverage,
         "ats_pct": ats_keywords.score(coverage),
@@ -2288,12 +2405,25 @@ def apply_kit(job_id: int, db: Session = Depends(get_user_db)):
 
 def _execution_view(db: Session, job: Job) -> dict:
     """The job's latest application worker run (Phase 5) and whether the worker is on, for the Apply kit."""
-    from app.services import application_execution
+    from app.application_api import _takeover_view
+    from app.services import application_execution, submission
 
     task = application_execution.latest(db, job.id)
+    intents = submission.intents(db, task.id) if task is not None else []
     return {"execution": application_execution.view(task) if task is not None else None,
             "execution_confirmations": application_execution.confirmations(db, task) if task is not None else [],
-            "execution_mode": application_execution.available_mode(db)}
+            "execution_questions": application_execution.questions(db, task) if task is not None else [],
+            "execution_mode": application_execution.available_mode(db),
+            "execution_intent": submission.view(intents[-1]) if intents else None,
+            "execution_takeover": _takeover_view(task),
+            "guarded_consent": submission.consent(db, job.user_id)["enabled"],
+            "browser_use_ready": _browser_use_ready()}
+
+
+def _browser_use_ready() -> bool:
+    from app.infrastructure.application_browser.browser_use_sidecar import configured
+
+    return configured()
 
 
 def _open_claim_view(db: Session, job: Job) -> dict | None:
@@ -2370,6 +2500,7 @@ def app_payload(db: Session, app: Application) -> dict:
     return {
         "id": app.id, "job_id": job.id, "title": job.title, "company": job.company, "location": job.location,
         "url": job.url, "fit": None if job.fit_score is None else round(job.fit_score), "stage": stage,
+        "archived": app.archived_at is not None,
         "age": ago(app.applied_at), "tag": tag, "tone": tone,
         "meta": f"applied {day_label(app.applied_at)}" + (f" · follow-up {day_label(app.followup_due_at)}" if app.followup_due_at and stage == "applied" else ""),
         "recruiter_name": app.recruiter_name, "recruiter_email": app.recruiter_email, "notes": app.notes,
@@ -2421,6 +2552,31 @@ def tracker_stages(payload: StagesIn, db: Session = Depends(get_user_db)):
     row.preferences = current
     db.commit()
     return tracker(db)
+
+
+class TrackerArchiveIn(BaseModel):
+    days: int = Field(ge=0, le=3650)  # 0: any age
+    scope: Literal["no_reply", "live", "finished", "all"] = "no_reply"
+    dry_run: bool = False
+
+
+@router.post("/api/tracker/archive")
+def tracker_archive(payload: TrackerArchiveIn, db: Session = Depends(get_user_db)):
+    """Archive the applications submitted more than `days` ago that are in the scope's stages (app.services.tracker).
+    `dry_run` only counts them, for the preview the screen shows before anything moves."""
+    if payload.dry_run:
+        return older_than(db, payload.days, payload.scope).summary()
+    summary = archive_older_than(db, payload.days, payload.scope)
+    db.commit()
+    return {**summary, "tracker": tracker(db)}
+
+
+@router.post("/api/applications/{application_id}/unarchive")
+def unarchive_application(application_id: int, db: Session = Depends(get_user_db)):
+    app = get_app(db, application_id)
+    if unarchive(db, app):
+        db.commit()
+    return app_payload(db, app)
 
 
 class StageIn(BaseModel):
@@ -2597,7 +2753,8 @@ def resume_list(db: Session = Depends(get_user_db)):
              "in_use": bool(active is not None and active.resume_document_id == d.id),
              "version_id": versions[d.id].id if d.id in versions else None,
              "domain": versions[d.id].domain if d.id in versions else None,
-             "roles": (versions[d.id].roles or []) if d.id in versions else []} for d in docs]
+             "roles": (versions[d.id].roles or []) if d.id in versions else [],
+             "domains": resume_matching.groups(versions[d.id]) if d.id in versions else []} for d in docs]
 
 
 @router.post("/api/profile/resumes/{document_id}/primary")

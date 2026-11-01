@@ -101,6 +101,17 @@ FIELDS: dict[str, tuple[Field, ...]] = {
                        "rag_index_max_attempts", 1, 10),
                  Field("retry_seconds", "First retry wait (seconds)", "Doubles with each attempt, up to an hour.",
                        "int", "rag_index_retry_seconds", 10, 3600)),
+    "resume_parsing": (AUTO,
+                       Field("max_attempts", "Attempts per resume",
+                             "How often a resume is sent to the Resume Parser model before it is marked failed.",
+                             "int", "resume_parse_max_attempts", 1, 10),
+                       Field("retry_seconds", "Wait before a retry (seconds)",
+                             "Multiplied by the attempt number: the second retry waits twice as long.", "int",
+                             "resume_parse_retry_seconds", 10, 86400),
+                       Field("ai_only", "Structure uploads with AI only",
+                             "On: a new upload goes straight to the Resume Parser model (ahead of the queue, even "
+                             "while paused), and its data is shown once the model is done. The quick regex parse is "
+                             "kept only as the fallback when the model cannot answer.", "bool", False)),
     "tailoring": (AUTO,
                   Field("max_attempts", "Attempts per packet",
                         "How often an interrupted tailoring run is restarted before it is marked failed.", "int", 2,

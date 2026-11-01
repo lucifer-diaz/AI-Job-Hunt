@@ -6,7 +6,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 // Discovery quality in the UI: hidden (not matching) jobs can be listed and kept, each job and each search setup can
 // choose its resume, and Settings → Domain filter shows the lists and what was learned.
 const appSource = readFileSync('app/static/app.js', 'utf8').split('/* ───────────── boot ───────────── */')[0];
-const names = ['S', 'D', 'A', 'render', 'resumeSelect', 'chooseResume', 'renderDomainSettings', 'searchPayload'];
+const names = ['S', 'D', 'A', 'render', 'resumeSelect', 'chooseResume', 'renderDomainSettings', 'searchPayload', 'resumeTags', 'resumeTagBody', 'resumeInUseNote'];
 let ui, context, fetchMock;
 
 const response = (data, status = 200) => ({ ok: status < 400, status, text: async () => JSON.stringify(data) });
@@ -83,6 +83,102 @@ describe('resume per job', () => {
   });
 });
 
+describe('a job matched before its resume was tagged', () => {
+  const inUse = rematch => ({ id: 3, name: 'Backend resume', version: 2, is_active: true, how: 'the active resume is used', rematch });
+
+  it('names the resume its tags match now, with a button, only when re-matching would change it', () => {
+    expect(ui.resumeInUseNote(inUse(null), '', 7)).not.toContain('job-rematch');
+    const html = ui.resumeInUseNote(inUse({ resume: { id: 5, name: 'ML resume', version: 3, is_active: false }, reason: "role 'Staff Software Engineer'" }), '', 7);
+    expect(html).toContain('ML resume · v3');
+    expect(html).toContain("role &#39;Staff Software Engineer&#39;");
+    expect(html).toContain('data-act="job-rematch"');
+    expect(ui.resumeInUseNote(inUse({ resume: null, reason: 'x' }), '', 7)).toContain('no resume clearly');
+    expect(ui.resumeInUseNote(inUse({ resume: null, reason: 'x' }))).not.toContain('job-rematch');
+    const pinned = ui.resumeInUseNote(inUse({ resume: { id: 5, name: 'ML resume', version: 3 }, reason: 'r', pinned: true }), '', 7);
+    expect(pinned).toContain('Use the tag match');
+    expect(pinned).toContain('data-pinned="1"');
+  });
+
+  it('re-matches the job as auto, asking first when it was ranked', async () => {
+    ui.D.jobModal = { id: 7, fit: 82 };
+    vi.stubGlobal('confirm', vi.fn(() => false)); context.confirm = confirm;
+    await ui.A['job-rematch']({ dataset: { id: '7' } });
+    expect(fetchMock.mock.calls.some(([url]) => url === '/api/jobs/7/resume')).toBe(false);
+    vi.stubGlobal('confirm', vi.fn(() => true)); context.confirm = confirm;
+    await ui.A['job-rematch']({ dataset: { id: '7' } });
+    const call = fetchMock.mock.calls.find(([url]) => url === '/api/jobs/7/resume');
+    ui.D.jobModal = { id: 7, fit: null };
+    await ui.A['job-rematch']({ dataset: { id: '7', pinned: '1' } });
+    expect(confirm.mock.calls.at(-1)[0]).toContain('replaces the resume you or its search chose');
+    expect(call[1].method).toBe('PUT');
+    expect(JSON.parse(call[1].body)).toEqual({ mode: 'auto' });
+  });
+
+  it('watches the ranking it queued, so the open job shows the new fit when it is done', async () => {
+    const watched = [], original = context.watchRanking;
+    context.watchRanking = ids => { watched.push(ids); return Promise.resolve(); };
+    ui.D.jobModal = { id: 7, fit: null };
+    fetchMock.mockImplementation(async () => response({ changed: [7], ranking_queued: [7], ranking_skipped: [] }));
+    await ui.A['job-rematch']({ dataset: { id: '7' } });
+    expect(watched).toEqual([[7]]);
+    fetchMock.mockImplementation(async () => response({ changed: [], ranking_queued: [], ranking_skipped: [] }));
+    await ui.A['job-rematch']({ dataset: { id: '7' } });
+    expect(watched).toEqual([[7]]);
+    context.watchRanking = original;
+  });
+});
+
+describe('Settings → Resumes: re-matching jobs to the tags', () => {
+  const tagged = [{ id: 1, domains: [{ domain: 'Backend', roles: ['Staff Software Engineer'] }] }];
+  const plan = { jobs: 40, changing: 3, reranked: 2, into: [{ resume: 'Rohan_Roy_AI_Engineer.pdf · v9', jobs: 3 }],
+    options: { stages: [], setups: [{ id: 4, name: 'AI Engineer Europe' }], boards: [{ name: 'greenhouse', jobs: 12 }] } };
+  const posts = () => fetchMock.mock.calls.filter(([url]) => url.startsWith('/api/jobs/resume/rematch'));
+  beforeEach(() => {
+    runInContext('RD.rematch = null', context);
+    fetchMock.mockImplementation(async url => response(url.startsWith('/api/jobs/resume/rematch') ? plan : {}));
+  });
+
+  it('offers the button above the list once a resume is tagged', () => {
+    expect(context.rdRematchBar([{ id: 1, roles: [] }])).toBe('');
+    expect(context.rdRematchBar(tagged)).toContain('data-act="resume-rematch"');
+  });
+
+  it('opens the filters, counts the selected jobs and narrows them by stage, date, search and board', async () => {
+    await ui.A['resume-rematch']();
+    let [url, opts] = posts().at(-1);
+    expect(url).toBe('/api/jobs/resume/rematch?dry_run=true');
+    expect(JSON.parse(opts.body)).toEqual({ stages: ['new', 'ranked', 'tailored'], found_within_days: null, saved_search_id: null, board: null });
+    const html = context.rdRematchBar(tagged);
+    expect(html).toContain('<b>40</b> jobs selected');
+    expect(html).toContain('3 → Rohan_Roy_AI_Engineer.pdf · v9');
+    expect(html).toContain('Re-match 3 jobs');
+    expect(html).toContain('AI Engineer Europe');
+    expect(html).toContain('greenhouse (12)');
+
+    await ui.A['rm-stage']({ value: 'archived', checked: true });
+    await ui.A['rm-stage']({ value: 'new', checked: false });
+    await ui.A['rm-filter']({ dataset: { key: 'found' }, value: '30' });
+    await ui.A['rm-filter']({ dataset: { key: 'setup' }, value: '4' });
+    await ui.A['rm-filter']({ dataset: { key: 'board' }, value: 'greenhouse' });
+    [, opts] = posts().at(-1);
+    expect(JSON.parse(opts.body)).toEqual({ stages: ['ranked', 'tailored', 'archived'], found_within_days: 30, saved_search_id: 4, board: 'greenhouse' });
+  });
+
+  it('re-matches only the selected jobs, after asking', async () => {
+    await ui.A['resume-rematch']();
+    await ui.A['rm-filter']({ dataset: { key: 'found' }, value: '7' });
+    vi.stubGlobal('confirm', vi.fn(() => false)); context.confirm = confirm;
+    await ui.A['rm-run']();
+    expect(posts().some(([url]) => url === '/api/jobs/resume/rematch')).toBe(false);
+    vi.stubGlobal('confirm', vi.fn(() => true)); context.confirm = confirm;
+    await ui.A['rm-run']();
+    const run = posts().find(([url]) => url === '/api/jobs/resume/rematch');
+    expect(JSON.parse(run[1].body).found_within_days).toBe(7);
+    ui.A['rm-close']();
+    expect(runInContext('RD.rematch', context)).toBe(null);
+  });
+});
+
 describe('hidden jobs', () => {
   it('keeps one job or the selection', async () => {
     await ui.A['domain-keep']({ dataset: { id: '7' } });
@@ -133,5 +229,23 @@ describe('deleting a resume version', () => {
     expect(call[0]).toBe('/api/resumes/9');
     expect(ui.D.resumeChoices).toBe(null);
     expect(fetchMock.mock.calls.some(([url]) => url === '/api/settings/resume')).toBe(true);
+  });
+
+  it('tags a resume with several domains, each with its own roles', () => {
+    ui.S.tagEdit = null;
+    const shown = ui.resumeTags('version', 9, 'AI / ML', ['AI Engineer', 'Data Engineer'],
+      [{ domain: 'AI / ML', roles: ['AI Engineer'] }, { domain: 'Data', roles: ['Data Engineer'] }]);
+    expect(shown).toContain('AI / ML'); expect(shown).toContain('Data Engineer'); expect(shown).toContain('Edit tags');
+    ui.A['rtag-edit']({ dataset: { kind: 'version', id: '9', groups: JSON.stringify([{ domain: 'AI / ML', roles: ['AI Engineer'] }]) } });
+    expect(ui.S.forms.rtag.groups).toEqual([0]);
+    ui.A['rtag-add-group']();
+    ui.S.forms.rtag.domain_1 = 'Data';
+    ui.A['rtag-add']({ dataset: { role: 'Data Engineer', index: '1' } });
+    ui.D.resumeCatalog = [{ domain: 'Data', roles: ['Data Engineer', 'Analytics Engineer'] }];
+    const editor = ui.resumeTags('version', 9);
+    expect(editor).toContain('Remove domain'); expect(editor).toContain('+ Analytics Engineer');
+    expect(ui.resumeTagBody()).toEqual({ domains: [{ domain: 'AI / ML', roles: ['AI Engineer'] }, { domain: 'Data', roles: ['Data Engineer'] }] });
+    ui.A['rtag-remove-group']({ dataset: { index: '0' } });
+    expect(ui.resumeTagBody()).toEqual({ domains: [{ domain: 'Data', roles: ['Data Engineer'] }] });
   });
 });

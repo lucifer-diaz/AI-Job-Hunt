@@ -61,15 +61,20 @@ from app.prompts.ranking import (
     posting_facts,
     ranking_profile_facts,
 )
-from app.services import backoff, job_description, user_settings, worker_settings
+from app.services import backoff, job_description, prompt_budget, rate_limits, user_settings, worker_settings
 from app.services import resume_verification as rv
-from app.services.context_builder import build_ranking_context, latest_ranking_context_hash
+from app.services.context_builder import (
+    build_ranking_context,
+    fit_prompt,
+    latest_ranking_context_hash,
+)
 from app.services.lifecycle import STOPPED_BY_USER, ErrorCategory, InvalidTransition
 from app.services.lifecycle import WorkflowState as S
 from app.services.llm import (
     LLMCall,
     LLMClient,
     LLMConfigError,
+    LLMContextOverflowError,
     LLMError,
     LLMRateLimitError,
     LLMResponseError,
@@ -320,7 +325,10 @@ def _held(db: Session, job: Job) -> dict[str, Any] | None:
                      .order_by(desc(WorkflowTransition.id)).limit(1))
     since = last.created_at.isoformat() if last is not None and last.created_at else None
     why = redact_text(last.reason, 300) if last is not None and last.reason else None
-    blocked = state not in approval.PREPARATION_STATES
+    # A ranking archive, or a ranking the candidate stopped, does not block their own approval
+    # (approval.path_to_ready reopens it for them).
+    blocked = state not in approval.PREPARATION_STATES and not (
+        (state is S.ARCHIVED and previous in REOPENABLE_ARCHIVE_SOURCES) or removed_by_user(db, job))
     base = {"state": state.value, "previous_state": previous.value if previous else None, "since": since,
             "reason": why, "approval_blocked": blocked}
     if state is S.FAILED and previous in (S.RANK_PENDING, S.RANKING):
@@ -338,7 +346,8 @@ def _held(db: Session, job: Job) -> dict[str, Any] | None:
     if state is S.ARCHIVED and previous in REOPENABLE_ARCHIVE_SOURCES:
         return {**base, "stage": "ranking", "title": "Archived by ranking", "action": "rank",
                 "action_label": "Rank again",
-                "message": "The ranking policy archived it. Ranking it again uses your current profile and policy."}
+                "message": "The ranking policy archived it. Ranking it again uses your current profile and policy; "
+                           "approving its reviewed packet yourself overrules the archive."}
     if state is S.ARCHIVED:
         return {**base, "stage": "archived", "title": "Archived", "action": None, "action_label": None,
                 "message": "It was archived outside ranking. Restore it from Discovery to bring it back."}
@@ -346,7 +355,8 @@ def _held(db: Session, job: Job) -> dict[str, Any] | None:
         return {**base, "stage": "ranking", "title": "Taken out of ranking", "action": "rank",
                 "action_label": "Put back in ranking",
                 "message": "You (or Kill in Running workers) took it out of ranking. Putting it back runs it through "
-                           "the filters and the ranker like a new job."}
+                           "the filters and the ranker like a new job; approving its reviewed packet yourself also "
+                           "brings it back."}
     if state is S.SKIPPED:
         return {**base, "stage": "skipped", "title": "Skipped", "action": None, "action_label": None,
                 "message": "It was skipped and cannot be put back from here."}
@@ -846,7 +856,11 @@ def classify(exc: Exception) -> tuple[ErrorCategory, bool, bool]:
     if isinstance(exc, (LLMTimeoutError, TimeoutError)):
         return ErrorCategory.TIMEOUT, True, False
     if isinstance(exc, LLMRateLimitError):
+        if getattr(exc.rate_limit, "kind", None) == rate_limits.TOO_LARGE:
+            return ErrorCategory.VALIDATION, False, False  # larger than the model's whole limit: no wait makes it fit
         return ErrorCategory.RATE_LIMITED, True, False
+    if isinstance(exc, LLMContextOverflowError):
+        return ErrorCategory.VALIDATION, False, False  # the same prompt cannot fit next time either
     if isinstance(exc, (LLMResponseError, RankingSchemaError)):
         return ErrorCategory.VALIDATION, True, False  # the model may answer correctly next time
     if isinstance(exc, LLMError):
@@ -964,10 +978,38 @@ def _failed(db: Session, claimed: TaskClaim, exc: Exception, now: datetime) -> s
     message = f"{type(exc).__name__}: {exc}"
     if wait:
         return _wait(db, claimed, message, now)
+    if isinstance(exc, LLMRateLimitError) and exc.held_seconds:
+        return _paced(db, claimed, message, exc.held_seconds, now)
     task, job = _owned(db, claimed)
     outcome = _retry_or_fail(db, task, job, category, message, retryable=retryable, actor=claimed.worker_id, now=now)
     db.commit()
     return outcome
+
+
+def _paced(db: Session, claimed: TaskClaim, message: str, seconds: int, now: datetime) -> str:
+    """Token pacing held the request until the model's token window resets: nothing was sent, so the attempt is given
+    back and the task comes back at the reset, not on the failure backoff."""
+    task, job = _owned(db, claimed)
+    _clear_lease(task)
+    task.attempt_count = max(0, task.attempt_count - 1)
+    task.status, task.next_attempt_at = PENDING, now + timedelta(seconds=max(1, seconds))
+    task.last_error, task.error_category = message[:MAX_ERROR_LENGTH], ErrorCategory.RATE_LIMITED
+    if job is not None and job.state is S.RANKING:
+        transition(db, job, S.RANK_PENDING, actor=claimed.worker_id, now=now,
+                   reason=f"Waiting {seconds}s for the model's token window; no request was sent")
+    db.commit()
+    return "retrying"
+
+
+def ranking_job_hash(job: Job, context: Any) -> str:
+    """The posting side of a ranking's identity. The structured requirements are part of the input: a posting
+    parsed after a ranking is a new input. A prompt trimmed to a budget may also keep fewer responsibilities, so
+    then they count too; untrimmed they follow from the structured hash, and the hash stays what it always was."""
+    job_context = context.job_context
+    return _hash({**posting_facts(job), "description": job.description or "",
+                  "structured": job.structured_description_hash,
+                  "requirements": job_context.get("required", []) + job_context.get("preferred", []),
+                  **({"responsibilities": job_context.get("responsibilities", [])} if context.stats.trimmed else {})})
 
 
 def _identical(db: Session, job_id: int, inputs: RankingInputs) -> JobRanking | None:
@@ -1081,23 +1123,23 @@ def _process(db: Session, claimed: TaskClaim, clock: Callable[[], datetime]) -> 
     db.commit()  # a first use may have parsed the active resume version
     job = db.get(Job, claimed.job_id)
     profile = rv.for_job(db, _profile(db, claimed.user_id), job)
+    # Within the Ranker's prompt token budget, when it has one: trimmed before the inputs are hashed and the citable
+    # ids taken, so both describe the prompt that is sent.
+    prompt = fit_prompt(context, job, lambda: build_ranking_prompt(candidate_profile=profile, job=job, context=context),
+                        prompt_budget.budget_for(db, claimed.user_id, "RANKER"))
     evidence = context.relevant_evidence
     inputs = RankingInputs(
         profile_id=profile.id, resume_id=snapshot.id, resume_version=snapshot.version,
         resume_content_hash=snapshot.content_hash, profile_hash=_hash(ranking_profile_facts(profile)),
         # Covers the selected resume facts and their verification too, so verifying data leads to a fresh ranking.
         evidence_hash=_hash({"evidence": evidence, "context": latest_ranking_context_hash(context)}),
-        # The structured requirements are part of the input: a posting parsed after a ranking is a new input.
-        job_hash=_hash({**posting_facts(job), "description": job.description or "",
-                        "structured": job.structured_description_hash,
-                        "requirements": context.job_context.get("required", []) + context.job_context.get("preferred", [])}),
+        job_hash=ranking_job_hash(job, context),
         # Citable: the evidence list and the evidence behind each verified bullet (app.services.context_builder).
         verified_ids=frozenset(context.evidence_ids), policy=policy_for(db, claimed.user_id))
     if not claimed.force:
         existing = _identical(db, job.id, inputs)
         if existing is not None:  # the same inputs were already ranked: no second model call
             return _complete(db, claimed, inputs, clock(), existing=existing)
-    prompt = build_ranking_prompt(candidate_profile=profile, job=job, context=context)
     try:
         verified, job_id = set(inputs.verified_ids), job.id
         result = LLMClient.for_user(db, claimed.user_id).generate_prompt(prompt, LLMCall(

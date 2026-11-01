@@ -25,9 +25,15 @@ from app.infrastructure.application_browser.service import (
     ApplicationSessionManager,
     PageLoad,
 )
-from app.infrastructure.browser.service import BLOCKED_URL, BrowserService, NavigationFailed
+from app.infrastructure.browser.service import (
+    BLOCKED_URL,
+    TIMEOUT,
+    BrowserService,
+    NavigationFailed,
+)
 
 log = logging.getLogger("jobhunt.application_browser")
+FIELD_TIMEOUT_MS = 5000
 
 
 def _utcnow() -> datetime:
@@ -84,7 +90,11 @@ class _Page(ApplicationPage):
                         title=await self._page.title() if error is None else "", blocked_requests=self._blocked)
         await self._record(url, started, clock, load, error)
         if error is not None:
-            raise NavigationFailed("OTHER", f"The application page could not be loaded ({type(error).__name__})")
+            from app.infrastructure.browser.playwright_service import classify_navigation_error
+
+            category = classify_navigation_error(error)
+            why = "did not load in time" if category == TIMEOUT else f"could not be loaded ({category.lower()})"
+            raise NavigationFailed(category, f"The application page {why} ({type(error).__name__})")
         return load
 
     async def _record(self, url: str, started: datetime, clock: float, load: PageLoad, error: Exception | None) -> None:
@@ -105,23 +115,25 @@ class _Page(ApplicationPage):
     async def html(self) -> str:
         return await self._page.content()
 
+    # Each field action waits at most FIELD_TIMEOUT_MS: a field that cannot be acted on (hidden, detached, not
+    # editable) is reported quickly and validation decides, instead of one field using up the whole step.
     async def fill(self, locator: str, text: str) -> None:
-        await self._page.locator(locator).first.fill(text)
+        await self._page.locator(locator).first.fill(text, timeout=FIELD_TIMEOUT_MS)
 
     async def select(self, locator: str, value: str) -> None:
-        await self._page.locator(locator).first.select_option(value=value)
+        await self._page.locator(locator).first.select_option(value=value, timeout=FIELD_TIMEOUT_MS)
 
     async def check(self, locator: str) -> None:
-        await self._page.locator(locator).first.check()
+        await self._page.locator(locator).first.check(timeout=FIELD_TIMEOUT_MS)
 
     async def upload(self, locator: str, path: str) -> None:
-        await self._page.locator(locator).first.set_input_files(path)
+        await self._page.locator(locator).first.set_input_files(path, timeout=FIELD_TIMEOUT_MS)
 
     async def value_of(self, locator: str) -> str:
-        return await self._page.locator(locator).first.input_value()
+        return await self._page.locator(locator).first.input_value(timeout=FIELD_TIMEOUT_MS)
 
     async def is_checked(self, locator: str) -> bool:
-        return await self._page.locator(locator).first.is_checked()
+        return await self._page.locator(locator).first.is_checked(timeout=FIELD_TIMEOUT_MS)
 
 
 class EphemeralApplicationSessions(ApplicationSessionManager):

@@ -121,10 +121,13 @@ const MON_PERF_DIMS = {
     ['Schema pass', g => monPct(g.reliability.schema_pass_rate)], ['Cost/req', g => g.cost.free ? '$0' : monCost(g.cost.per_request)]]],
   reliability: ['Reliability', [['Requests', g => g.requests.toLocaleString()], ['Success', g => monPct(g.reliability.success_rate)], ['First-try', g => monPct(g.reliability.retry_adjusted_success_rate)],
     ['Timeout', g => monPct(g.reliability.timeout_rate)], ['Rate limit', g => monPct(g.reliability.rate_limit_rate)], ['Retried', g => monPct(g.reliability.retry_rate)],
-    ['Fallback', g => monPct(g.reliability.fallback_rate)], ['Escalation', g => monPct(g.reliability.escalation_rate)], ['Schema pass', g => monPct(g.reliability.schema_pass_rate)]]],
+    ['Fallback', g => monPct(g.reliability.fallback_rate)], ['Failover', g => monPct(g.reliability.failover_rate)],
+    ['Off config', g => g.reliability.model_mismatch_samples ? `${monPct(g.reliability.model_mismatch_rate)} of ${g.reliability.model_mismatch_samples}` : '—'],
+    ['Escalation', g => monPct(g.reliability.escalation_rate)], ['Schema pass', g => monPct(g.reliability.schema_pass_rate)]]],
   latency: ['Latency', [['Requests', g => g.requests.toLocaleString()], ['p50', g => monMs(g.latency.p50_ms)], ['p75', g => monMs(g.latency.p75_ms)], ['p95', g => monMs(g.latency.p95_ms)],
     ['p99', g => monMs(g.latency.p99_ms)], ['TTFT p50', g => monMs(g.latency.ttft_p50_ms)], ['Generation', g => monMs(g.latency.generation_avg_ms)],
-    ['Queue wait p95', g => monMs(g.latency.queue_wait_p95_ms)], ['Tok/s', g => monRate(g.latency.tokens_per_sec)], ['ms / out token', g => g.latency.ms_per_output_token ?? '—']]],
+    ['Queue wait p95', g => monMs(g.latency.queue_wait_p95_ms)],
+    ['Retrieval p50 / p95', g => g.latency.retrieval_samples ? `${monMs(g.latency.retrieval_p50_ms)} / ${monMs(g.latency.retrieval_p95_ms)}` : '—'], ['Tok/s', g => monRate(g.latency.tokens_per_sec)], ['ms / out token', g => g.latency.ms_per_output_token ?? '—']]],
   throughput: ['Throughput', [['Requests', g => g.requests.toLocaleString()], ['Req/min', g => monPerMin(g.throughput.requests_per_min)], ['Req/hour', g => monPerMin(g.throughput.requests_per_hour)],
     ['OK req/min', g => monPerMin(g.throughput.successful_requests_per_min)], ['In tok/min', g => monTokens(g.throughput.input_tokens_per_min)], ['Out tok/min', g => monTokens(g.throughput.output_tokens_per_min)],
     ['Peak req/min', g => g.throughput.peak_requests_per_min ?? '—'], ['Peak concurrency', g => g.throughput.peak_concurrency ?? '—']]],
@@ -354,7 +357,7 @@ function renderMonRouting(r) {
   return `<div class="mon-grid">${monCard('routing', 'Model routing', 'Inference time by worker (wall-clock latency) · escalation and fallback are counted separately',
     monBars(workers, x => x.inference_ms, x => monPct(x.inference_share, 0), x => `${monWorker(x.worker_type)} · ${x.requests} requests · models ${x.models.map(m => m[0]).join(', ') || '—'} · escalated ${monPct(x.escalation_rate)} · fallback ${monPct(x.fallback_rate)} · p95 ${monMs(x.p95_latency_ms)}`, { labelWidth: 150, valueWidth: 52 })
       + tiers + escalations + (notes.length ? `<div class="xs muted mt8">${esc(notes.join(' · '))}</div>` : ''),
-    monTable(['Worker', 'Requests', 'Configured', 'Actual model', 'Escalated', 'Fallback', 'Schema failures', 'p95', 'Inference share'], workers.map(x => [monWorker(x.worker_type), x.requests, x.configured.map(m => m[0]).join(', ') || '—', x.models.map(m => m[0]).join(', ') || '—', monPct(x.escalation_rate), monPct(x.fallback_rate), monPct(x.schema_failure_rate), monMs(x.p95_latency_ms), monPct(x.inference_share)])))}
+    monTable(['Worker', 'Requests', 'Configured', 'Actual model', 'Off config', 'Escalated', 'Fallback', 'Failover', 'Schema failures', 'p50 / p95 / p99', 'Inference share'], workers.map(x => [monWorker(x.worker_type), x.requests, x.configured.map(m => m[0]).join(', ') || '—', x.models.map(m => m[0]).join(', ') || '—', x.model_mismatch_samples ? monPct(x.model_mismatch_rate) : '—', monPct(x.escalation_rate), monPct(x.fallback_rate), monPct(x.failover_rate), monPct(x.schema_failure_rate), `${monMs(x.p50_latency_ms)} / ${monMs(x.p95_latency_ms)} / ${monMs(x.p99_latency_ms)}`, monPct(x.inference_share)])))}
     ${monCard('routing-models', 'Models behind the workers', 'Per model: schema failures, latency and share of inference time',
       monBars(r.models.map(x => ({ ...x, _label: x.model })), x => x.inference_ms, x => monPct(x.inference_share, 0), x => `${x.model} · ${x.requests} requests · schema failures ${monPct(x.schema_failure_rate)} · p95 ${monMs(x.p95_latency_ms)}`, { labelWidth: 170, valueWidth: 52 }),
       monTable(['Model', 'Requests', 'Schema failures', 'Failure rate', 'p95', 'Avg confidence', 'Inference share'], r.models.map(x => [x.model, x.requests, monPct(x.schema_failure_rate), monPct(x.failure_rate), monMs(x.p95_latency_ms), x.avg_confidence ?? '—', monPct(x.inference_share)])))}</div>`;

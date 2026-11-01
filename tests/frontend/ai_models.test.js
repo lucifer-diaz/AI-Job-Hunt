@@ -155,6 +155,23 @@ describe('AI Orchestration → Models & routing', () => {
     expect(document.getElementById('toast').textContent).toBe('Ranker saved · v5');
   });
 
+  it('offers a prompt token budget only to a worker that trims its prompt, and saves it', async () => {
+    routes['GET /api/settings/ai'] = () => ({ ...overview(), workers: [
+      worker('RANKER', 'Ranker', { tier: 'PRIMARY_REASONING', prompt_token_budget: 6000 }, 'local-reasoning', { trims_prompt: true }),
+      ...overview().workers.slice(1)] });
+    routes['PUT /api/settings/ai/workers/RANKER'] = () => ({ worker: {}, draft_revision: 8 });
+    routes['POST /api/settings/ai/apply'] = () => ({ status: 'SYNCED', version: 5 });
+    await open('workers');
+    ui.A['aim-worker']({ dataset: { worker: 'REVIEWER' } });
+    expect(document.getElementById('aiw-prompt_token_budget')).toBeNull();
+    ui.A['aim-worker']({ dataset: { worker: 'RANKER' } });
+    expect(document.getElementById('aiw-prompt_token_budget').value).toBe('6000');
+    expect(document.querySelector('.aim-drawer').textContent).toContain('Required requirements are never left out');
+    ui.setF('aiw', 'prompt_token_budget', '7000');
+    await ui.A['aim-worker-save']({ dataset: { worker: 'RANKER' } });
+    expect(body('PUT', '/api/settings/ai/workers/RANKER')).toMatchObject({ prompt_token_budget: 7000 });
+  });
+
   it('gives the Embedder its own dialog: embedding models only, no tiers, backups or generation settings', async () => {
     const embedder = worker('EMBEDDER', 'Embedder', { mode: 'FIXED', primary_model: null, tier: null, enabled: false }, null,
       { capability: 'EMBEDDING', optional: true, structured_output_required: false, min_context_tokens: 0 });
@@ -192,23 +209,119 @@ describe('AI Orchestration → Models & routing', () => {
     expect(body('PUT', '/api/settings/ai/workers/INBOX_CLASSIFIER')).toMatchObject({ model_mode: 'AUTO_ROUTER', tier_name: 'FAST' });
   });
 
+  it('sets a model for a worker added after the account was configured (no config row yet)', async () => {
+    routes['GET /api/settings/ai'] = () => ({ ...overview(), workers: [...overview().workers, { worker_type: 'BROWSER_NAVIGATOR', label: 'Browser Navigator', description: 'Next step', structured_output_required: true, min_context_tokens: 16384, has_prompt: true, config: null, resolved: { model: null, assignment: null, note: 'nothing assigned' } }] });
+    routes['PUT /api/settings/ai/workers/BROWSER_NAVIGATOR'] = () => ({});
+    routes['POST /api/settings/ai/apply'] = () => ({ status: 'PENDING', version: 5 });
+    await open('workers');
+    expect(text()).toContain('Browser Navigator');
+    await ui.A['aim-worker-target']({ dataset: { worker: 'BROWSER_NAVIGATOR' }, value: 'model:local-reasoning' });
+    expect(body('PUT', '/api/settings/ai/workers/BROWSER_NAVIGATOR')).toEqual({ revision: 7, model_mode: 'FIXED', primary_model: 'local-reasoning', tier_name: null });
+    expect(document.getElementById('toast').textContent).not.toContain('Cannot read properties');
+  });
+
   it('shows a refused save with its reasons, keeps the drawer, and undoes it on request', async () => {
     routes['PUT /api/settings/ai/workers/RANKER'] = () => ({});
-    routes['POST /api/settings/ai/apply'] = () => [{ detail: { message: 'invalid', validation: { errors: [{ message: 'A model can appear only once' }], warnings: [{ message: 'unknown JSON support' }] } } }, 422];
+    routes['POST /api/settings/ai/apply'] = () => [{ detail: { message: 'invalid', validation: { errors: [{ message: 'A model can appear only once', subject: 'Ranker' }], warnings: [{ message: 'unknown JSON support', subject: 'Ranker' }, { message: 'unknown JSON support', subject: 'Ranker' }, { message: 'Reviewer has no usable model', subject: 'Reviewer' }] } } }, 422];
     routes['POST /api/settings/ai/discard'] = () => ({ status: 'DISCARDED' });
     await open('workers');
     ui.A['aim-worker']({ dataset: { worker: 'RANKER' } });
     ui.setF('aiw', 'backup_0', 'local-reasoning');
     await ui.A['aim-worker-save']({ dataset: { worker: 'RANKER' } });
     expect(ui.AIM.drawer).toBe('RANKER'); expect(ui.S.forms.aiw.backup_0).toBe('local-reasoning');
-    expect(document.getElementById('toast').textContent).toContain('Not saved: A model can appear only once');
-    expect(text()).toContain('Not saved.'); expect(text()).toContain('unknown JSON support');
+    expect(document.getElementById('toast').textContent).toContain('Not saved: Ranker: A model can appear only once');
+    expect(text()).toContain('Not saved.');
+    expect(ui.AIM.failed.warnings.map(w => w.text)).toEqual(['Ranker: unknown JSON support', 'Reviewer has no usable model']);
     await ui.A['aim-discard']();
     expect(call('POST', '/api/settings/ai/discard').length).toBe(1);
     expect(ui.AIM.failed).toBeNull(); expect(ui.S.forms.aiw).toBeUndefined();
     routes['POST /api/settings/ai/apply'] = () => [{ detail: 'LiteLLM refused the deployment' }, 502];
     await ui.A['aim-apply']();
-    expect(ui.AIM.failed.errors).toEqual(['LiteLLM refused the deployment']);
+    expect(ui.AIM.failed.errors.map(e => e.text)).toEqual(['LiteLLM refused the deployment']);
+  });
+  it('links each refused-save problem to where it is fixed, and names every worker a repeated warning is about', async () => {
+    const issue = (path, subject, message) => ({ path, subject, message });
+    routes['POST /api/settings/ai/apply'] = () => [{ detail: { message: 'invalid', validation: {
+      errors: [issue('workers.RANKER.fallback_model', 'Ranker', 'The fallback model cannot be the primary model'), issue('workers.REVIEWER.escalation', 'Reviewer', 'Escalation model local-fast is disabled'), issue('models.local-deep.fallback_models.0', 'Model local-deep', 'Fallback model mystery is disabled'), issue('routing.tier_models.SIMPLE', 'Auto Router', 'Map the SIMPLE routing tier to a model'), issue('somewhere', undefined, 'Odd')],
+      warnings: [issue('workers.RANKER.primary_model', 'Ranker', 'unknown JSON'), issue('workers.REVIEWER.primary_model', 'Reviewer', 'unknown JSON')] } } }, 422];
+    await open('workers');
+    await ui.A['aim-apply']();
+    const view = document.getElementById('view');
+    expect(view.querySelectorAll('.aim-failed [data-act="aim-fix"]').length).toBe(6);  // 4 errors with a place, 2 workers
+    expect(text()).toContain('unknown JSON — Ranker, Reviewer');
+    const fix = path => view.querySelector(`[data-act="aim-fix"][data-path="${path}"]`);
+    ui.A['aim-fix'](fix('workers.RANKER.fallback_model'));
+    expect(ui.AIM.drawer).toBe('RANKER'); expect(document.activeElement.id).toBe('aiw-backup_0');
+    ui.A['aim-fix'](fix('workers.REVIEWER.escalation'));
+    expect(ui.AIM.drawer).toBe('REVIEWER'); expect(document.activeElement.id).toBe('aiw-esc_target');
+    ui.A['aim-fix'](fix('models.local-deep.fallback_models.0'));
+    expect(ui.AIM.tab).toBe('models'); expect(ui.AIM.drawer).toBeNull(); expect(ui.AIM.fbEdit).toBe('local-deep');
+    expect(document.activeElement.dataset.model).toBe('local-deep');
+    ui.A['aim-fix'](fix('routing.tier_models.SIMPLE'));
+    expect(document.activeElement.id).toBe('aim-route-tier_SIMPLE');
+    expect(view.querySelector('[data-act="aim-fix"][data-path="somewhere"]')).toBeNull();
+  });
+  it('shows requests too big for their model with the fixes that fit, and applies the one a person picks', async () => {
+    const size = (extra = {}) => ({ worker_type: 'RANKER', label: 'Ranker', model: 'local-reasoning', count: 36, last_at: '2026-10-25T22:37:42',
+      limits: [{ deployment: 'openai/gpt-oss-120b', kind: 'TPM', counts: 'total', limit: 8000, requested: 10159 }, { deployment: 'qwen/qwen3.8-27b', kind: 'OTPM', counts: 'output', limit: 1000, requested: 1667 }],
+      typical_input: 6327, typical_output: 800, input_over: false, output_cap: { value: 1000, typical_output: 800, known_safe: true, applied: false, current: null },
+      models: [{ name: 'local-deep', context_window: 131072, proven: true, in_chain: false }], has_backup: false, ...extra });
+    routes['GET /api/settings/ai'] = () => ({ ...overview(), request_size: [size(), size({ worker_type: 'REVIEWER', label: 'Reviewer', input_over: true, output_cap: null, models: [] })] });
+    routes['PUT /api/settings/ai/workers/RANKER'] = () => ({});
+    routes['POST /api/settings/ai/apply'] = () => ({ status: 'APPLIED', version: 5 });
+    await open('workers');
+    expect(text()).toContain('Requests too big for their model');
+    expect(text()).toContain('36 requests refused as too large');
+    expect(text()).toContain('8K prompt + answer tokens/min (TPM)');
+    expect(text()).toContain('they are not cut short');
+    expect(text()).toContain("The prompt alone (~6.2K) is over local-reasoning's limit");  // the Reviewer: no cap is offered
+    expect(text()).toContain('No model in your catalog is known to have room');
+    expect(text()).toContain('Last 7 days · 2 workers · 72 requests refused');
+    const view = document.getElementById('view');
+    const [rankerCard, reviewerCard] = view.querySelectorAll('.aim-size');
+    // The meter draws the limit these requests overrun most: 6.3K + 800 against the 8K prompt + answer limit.
+    expect(rankerCard.querySelector('.aim-size-meter').getAttribute('aria-label')).toContain('against a limit of 7.8K prompt + answer');
+    expect(rankerCard.querySelector('.aim-size-verdict.brand [data-act="aim-size-cap"]')).not.toBeNull();
+    expect(reviewerCard.querySelector('.aim-size-verdict.warn').textContent).toContain('Switch to a model with more room');
+    expect(reviewerCard.querySelector('[data-act="aim-tab"][data-tab="models"]')).not.toBeNull();
+    const switchBtn = rankerCard.querySelector('[data-act="aim-size-use"]');
+    expect(switchBtn.getAttribute('aria-label')).toBe('Use local-deep instead of local-reasoning for Ranker');
+    expect(switchBtn.classList.contains('primary')).toBe(false);  // the cap is this card's primary action
+    expect(rankerCard.textContent).toContain('Recommended');
+    await ui.A['aim-size-cap'](view.querySelector('[data-act="aim-size-cap"]'));
+    expect(body('PUT', '/api/settings/ai/workers/RANKER')).toEqual({ revision: 7, max_output_tokens: 1000 });
+    await ui.A['aim-size-backup'](view.querySelector('[data-act="aim-size-backup"]'));
+    expect(body('PUT', '/api/settings/ai/workers/RANKER')).toEqual({ revision: 7, fallback_model: 'local-deep', secondary_models: [] });
+    await ui.A['aim-size-use'](view.querySelector('[data-act="aim-size-use"]'));
+    expect(body('PUT', '/api/settings/ai/workers/RANKER')).toMatchObject({ model_mode: 'FIXED', primary_model: 'local-deep', fallback_model: null, secondary_models: [] });
+    // A refusing backup or escalation model is replaced where it is; the worker's own model stays.
+    const use = (role, replace) => ({ dataset: { worker: 'RANKER', model: 'local-deep', replace, role } });
+    const ranker = overview().workers.find(w => w.worker_type === 'RANKER');
+    ui.AIM.data.workers = ui.AIM.data.workers.map(w => w.worker_type === 'RANKER' ? { ...ranker, config: { ...ranker.config, fallback_model: 'local-fast', secondary_models: ['mystery'], escalation: { model: 'mystery', tier: null, conditions: ['LOW_CONFIDENCE'], confidence_threshold: 0.8 } } } : w);
+    await ui.A['aim-size-use'](use('backup', 'local-fast'));
+    expect(body('PUT', '/api/settings/ai/workers/RANKER')).toEqual({ revision: 7, fallback_model: 'local-deep', secondary_models: ['mystery'] });
+    ui.AIM.data.workers = ui.AIM.data.workers.map(w => w.worker_type === 'RANKER' ? { ...ranker, config: { ...ranker.config, escalation: { model: 'mystery', tier: null, conditions: ['LOW_CONFIDENCE'], confidence_threshold: 0.8 } } } : w);
+    await ui.A['aim-size-use'](use('escalation', 'mystery'));
+    expect(body('PUT', '/api/settings/ai/workers/RANKER')).toEqual({ revision: 7, escalation: { model: 'local-deep', tier: null, conditions: ['LOW_CONFIDENCE'], confidence_threshold: 0.8 } });
+  });
+  it('makes switching the primary fix when no cap helps, folds extra models away and marks existing backups', async () => {
+    const m = (name, extra = {}) => ({ name, context_window: 131072, proven: false, in_chain: false, ...extra });
+    routes['GET /api/settings/ai'] = () => ({ ...overview(), request_size: [{ worker_type: 'RANKER', label: 'Ranker', model: 'local-reasoning', role: 'primary', count: 1, last_at: '2026-10-25T22:37:42',
+      limits: [{ deployment: 'openai/gpt-oss-120b', kind: 'ITPM', counts: 'input', limit: 6000, requested: 7000 }], typical_input: 7000, typical_output: null, input_over: true, output_cap: null,
+      models: [m('local-deep', { proven: true, in_chain: true }), m('local-fast'), m('mystery', { context_window: null })], has_backup: true }] });
+    await open('workers');
+    const card = document.querySelector('#view .aim-size');
+    expect(card.textContent).toContain('1 request refused as too large');
+    const [first, second] = card.querySelectorAll('.aim-size-model');
+    expect(first.querySelector('[data-act="aim-size-use"]').classList.contains('primary')).toBe(true);
+    expect(first.querySelector('[data-act="aim-size-backup"]')).toBeNull();
+    expect(first.textContent).toContain('Backup');
+    expect(first.textContent).toContain('Proven for this worker');
+    expect(second.querySelector('[data-act="aim-size-backup"]')).not.toBeNull();
+    const more = card.querySelector('details[data-settings-details="aim-size-more:RANKER:local-reasoning"]');
+    expect(more.textContent).toContain('1 more model');
+    expect(more.textContent).toContain('context unknown');
+    expect(card.querySelector('details[data-settings-details="aim-size-limits:RANKER:local-reasoning"]').textContent).toContain('prompt tokens/min (ITPM)');
   });
   it('saves backups in order as the fallback and secondary models, growing the list as it fills', async () => {
     routes['PUT /api/settings/ai/workers/RANKER'] = () => ({ worker: {}, draft_revision: 8 });
@@ -304,7 +417,7 @@ describe('AI Orchestration → Models & routing', () => {
     routes['GET /api/settings/ai'] = () => ({ ...overview(), models: [model('local-fast', { managed: true }), model('whisper')],
       removed_models: [{ name: 'old-model', removed_at: '2026-10-10T11:00:00' }] });
     routes['POST /api/settings/ai/models/local-fast/remove'] = () => [{ detail: { message: 'local-fast is still used by: tier FAST', references: ['tier FAST', 'Ranker (backup 1)'] } }, 409];
-    routes['POST /api/settings/ai/models/whisper/remove'] = () => ({ removed: 'whisper' });
+    routes['POST /api/settings/ai/models/whisper/remove'] = () => ({ removed: 'whisper', dropped: ['Tailor (backup 1)'] });
     routes['POST /api/settings/ai/models/old-model/restore'] = () => ({ restored: 'old-model' });
     routes['POST /api/settings/ai/apply'] = () => ({ status: 'SYNCED', version: 5 });
     await open('models');
@@ -319,7 +432,7 @@ describe('AI Orchestration → Models & routing', () => {
     await ui.A['aim-model-remove']({ dataset: { name: 'whisper', managed: '' } });
     expect(confirm.mock.calls.at(-1)[0]).toContain('It stays in LiteLLM');
     expect(body('POST', '/api/settings/ai/models/whisper/remove')).toEqual({ revision: 7 });
-    expect(document.getElementById('toast').textContent).toBe('whisper deleted · v5');
+    expect(document.getElementById('toast').textContent).toBe('whisper deleted · no longer a backup for Tailor · v5');
     confirm.mockReturnValueOnce(false);
     ui.A['aim-model-remove']({ dataset: { name: 'whisper', managed: '' } });
     expect(call('POST', '/api/settings/ai/models/whisper/remove')).toHaveLength(1);  // cancelled: not sent again
@@ -469,6 +582,10 @@ describe('Settings → AI Models actions', () => {
     await ui.A['aim-model-toggle']({ dataset: { name: 'local-fast', on: '' } });
     expect(body('PUT', '/api/settings/ai/models/local-fast')).toEqual({ revision: 7, enabled: false });
     expect(document.getElementById('toast').textContent).toBe('local-fast disabled · v5');
+    routes['PUT /api/settings/ai/models/local-fast'] = () => ({ dropped: ['Ranker (backup 1)', 'Reviewer (backup 2)', 'Ranker (backup 3)', "local-deep's fallbacks"] });
+    await ui.A['aim-model-toggle']({ dataset: { name: 'local-fast', on: '' } });
+    expect(document.getElementById('toast').textContent).toBe("local-fast disabled · no longer a backup for Ranker, Reviewer, local-deep's fallbacks · v5");
+    routes['PUT /api/settings/ai/models/local-fast'] = ok;
     await ui.A['aim-model-type']({ dataset: { name: 'local-fast' }, value: 'FAST' });
     expect(body('PUT', '/api/settings/ai/models/local-fast')).toEqual({ revision: 7, model_type: 'FAST' });
     await ui.A['aim-model-unmanage']({ dataset: { name: 'local-fast' } });
@@ -477,7 +594,7 @@ describe('Settings → AI Models actions', () => {
     ui.A['aim-model-unmanage']({ dataset: { name: 'local-fast' } });
     await ui.A['aim-sync']();
     expect(document.getElementById('toast').textContent).toBe('5 models discovered, 1 new · v5');
-    expect(call('POST', '/api/settings/ai/apply').length).toBe(4);
+    expect(call('POST', '/api/settings/ai/apply').length).toBe(5);
     routes['GET /api/settings/ai'] = () => ({ ...overview(), models: [] });
     await open('models');
     expect(text()).toContain('No models yet');

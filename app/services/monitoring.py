@@ -104,6 +104,19 @@ def _rate(part: int, whole: int) -> float | None:
     return round(part / whole, 4) if whole else None
 
 
+def off_configuration(r: Any) -> bool | None:
+    """Whether the request was answered by a model other than the one configured for it. None when that is not
+    known: no configured model recorded, the auto router (whose choice is the configuration), or no answer recorded.
+
+    Compared at the gateway's own level: the configured name is a deployment (model group), so the answering model
+    group is compared with it, and the provider's model name only when the gateway reported no group."""
+    configured = r.configured_model
+    actual = r.model_group or r.model
+    if not configured or not actual or configured == "AUTO_ROUTER" or r.status == "FAILED":
+        return None
+    return actual != configured
+
+
 def rows(db: Session, f: MonitoringFilter, columns: tuple = ROW_COLUMNS) -> list[Any]:
     query = select(*columns).where(LLMRequestLog.created_at >= f.start, LLMRequestLog.created_at <= f.end)
     if f.user_id is not None:
@@ -134,7 +147,8 @@ def summary(items: list[Any]) -> dict[str, Any]:
         "total_tokens": sum(r.total_tokens or 0 for r in items),
         "estimated_token_requests": sum(r.usage_source == "estimated" for r in items),
         "requests_without_usage": sum(r.usage_source == "none" for r in items),
-        "estimated_cost": _money(sum(costs, Decimal(0))) if costs else (0.0 if requests else None),
+        # NULL means unknown, not free: with no priced request the total is unknown, and unpriced_requests says why.
+        "estimated_cost": _money(sum(costs, Decimal(0))) if costs else None,
         "unpriced_requests": sum(r.estimated_cost is None for r in items),
         "avg_latency_ms": _mean(latencies), "p50_latency_ms": percentile(latencies, 50),
         "p95_latency_ms": percentile(latencies, 95), "p99_latency_ms": percentile(latencies, 99),
@@ -212,6 +226,9 @@ def timeseries(items: list[Any], f: MonitoringFilter) -> list[dict[str, Any]]:
             bucket["unpriced_requests"] += 1
         else:
             bucket["estimated_cost"] = round(bucket["estimated_cost"] + float(r.estimated_cost), 6)
+    for bucket in days.values():  # a day with requests but none priced is unknown, not free; an idle day is $0
+        if bucket["requests"] and bucket["unpriced_requests"] == bucket["requests"]:
+            bucket["estimated_cost"] = None
     return list(days.values())
 
 
@@ -219,7 +236,8 @@ def latency(items: list[Any]) -> dict[str, Any]:
     stats = summary(items)
     return {"overall": {key: stats[key] for key in ("avg_latency_ms", "p50_latency_ms", "p95_latency_ms", "p99_latency_ms")},
             "by_stage": [{"stage": s["stage"], "requests": s["requests"], "avg_latency_ms": s["avg_latency_ms"],
-                          "p95_latency_ms": s["p95_latency_ms"]} for s in by_stage(items) if s["requests"]]}
+                          "p50_latency_ms": s["p50_latency_ms"], "p95_latency_ms": s["p95_latency_ms"],
+                          "p99_latency_ms": s["p99_latency_ms"]} for s in by_stage(items) if s["requests"]]}
 
 
 def context(items: list[Any]) -> dict[str, Any]:
@@ -300,6 +318,7 @@ def routing(items: list[Any]) -> dict[str, Any]:
         checked = [r for r in group if r.structured_output_valid is not None]
         first = [r for r in group if not r.escalated]
         confidences = [r.confidence for r in group if r.confidence is not None]
+        compared = [x for x in (off_configuration(r) for r in group) if x is not None]
         return {"requests": len(group), "failure_rate": _rate(sum(r.status == "FAILED" for r in group), len(group)),
                 "schema_failure_rate": _rate(sum(r.structured_output_valid is False for r in group), len(checked)),
                 "escalations": sum(bool(r.escalated) for r in group),
@@ -307,7 +326,11 @@ def routing(items: list[Any]) -> dict[str, Any]:
                 "fallbacks": sum(r.fallback_used is True for r in group),
                 "fallback_rate": _rate(sum(r.fallback_used is True for r in group),
                                        sum(r.fallback_used is not None for r in group)),
-                "avg_latency_ms": _mean(latencies), "p95_latency_ms": percentile(latencies, 95),
+                "failovers": sum(r.routing_cause == "FAILOVER" for r in group),
+                "failover_rate": _rate(sum(r.routing_cause == "FAILOVER" for r in group), len(group)),
+                "model_mismatch_rate": _rate(sum(compared), len(compared)), "model_mismatch_samples": len(compared),
+                "avg_latency_ms": _mean(latencies), "p50_latency_ms": percentile(latencies, 50),
+                "p95_latency_ms": percentile(latencies, 95), "p99_latency_ms": percentile(latencies, 99),
                 "inference_ms": sum(latencies), "inference_share": _share(sum(latencies), total_time),
                 "avg_confidence": round(sum(confidences) / len(confidences), 3) if confidences else None,
                 "input_tokens": sum(r.input_tokens or 0 for r in group),

@@ -23,6 +23,7 @@ function knowledgeFiltered(section) {
   return knowledgeRows(section).filter(row => {
     const text = section === 'answers' ? [row.question, row.answer, knowledgeLabel(row.category)] : [row.claim, row.company, row.role, ...(row.skills || [])];
     return text.join(' ').toLowerCase().includes(query)
+      && (section !== 'answers' || !f.ids?.length || f.ids.includes(row.id))
       && (f.status === 'all' || row.verified === (f.status === 'verified'))
       && (section !== 'evidence' || evidenceMatchesResume(row, f.resume || 'all'))
       && (section !== 'answers' || ((f.category === 'all' || row.category === f.category)
@@ -45,6 +46,12 @@ function knowledgeToolbar(section) {
     ${knowledgeSelect('status', 'Verification', [['all', 'All statuses'], ['verified', 'Verified'], ['review', 'Needs review']], f)}
     ${section === 'evidence' && evidenceResumes().length ? knowledgeSelect('resume', 'Resume', [['all', 'All resumes'], ...evidenceResumes().map(r => [String(r.id), `${evidenceResumeName(r)} · ${r.evidence_in_scope ?? 0} facts in scope`]), ['untagged', 'Untagged (all resumes)']], f) : ''}
     ${section === 'answers' ? knowledgeSelect('category', 'Category', [['all', 'All categories'], ...categories.map(c => [c, knowledgeLabel(c)])], f) + knowledgeSelect('sensitive', 'Sensitivity', [['all', 'All answers'], ['sensitive', 'Sensitive'], ['standard', 'Not sensitive']], f) : ''}</div>`;
+}
+// Shown while the list is limited to the questions an application asked (from the Apply kit).
+function knowledgeIdsBanner(section) {
+  const ids = knowledgeState().filters.answers.ids;
+  if (section !== 'answers' || !ids?.length) return '';
+  return `<div class="banner mb12" role="status"><span class="grow">Showing the ${ids.length} question${ids.length === 1 ? '' : 's'} an application is waiting for. Edit each one, add your answer and mark it verified: the application continues by itself.</span>${btn('Show all answers', 'kn-clear-ids', {}, 'sm')}</div>`;
 }
 function knowledgeBadges(row) {
   return `${pill(row.verified ? 'Verified' : 'Needs review', row.verified ? 'good' : 'warn')}${row.sensitive ? pill('Sensitive · confirm each time', 'bad') : ''}`;
@@ -170,7 +177,7 @@ function renderKnowledge() {
     ${D.knowledgeLoadError ? `<div class="knowledge-notice" role="alert">${esc(D.knowledgeLoadError)} ${btn('Retry loading', 'kn-retry', {}, 'sm')}</div>` : ''}
     ${ui.errors[section] ? `<div class="knowledge-notice" role="alert">${esc(ui.errors[section])}</div>` : ''}
     ${knowledgeEditor(section)}
-    ${D.knowledgeLoading ? '<div class="card knowledge-empty" role="status">Loading your Knowledge bank…</div>' : D.knowledgeLoadError ? '' : !D.knowledge || !D.evidence ? '<div class="card knowledge-empty" role="status">Loading your Knowledge bank…</div>' : `<section class="card knowledge-library" aria-label="${section === 'answers' ? 'Saved answers' : 'Evidence claims'}">${knowledgeToolbar(section)}${knowledgeList(section)}</section>`}</div>`;
+    ${D.knowledgeLoading ? '<div class="card knowledge-empty" role="status">Loading your Knowledge bank…</div>' : D.knowledgeLoadError ? '' : !D.knowledge || !D.evidence ? '<div class="card knowledge-empty" role="status">Loading your Knowledge bank…</div>' : `<section class="card knowledge-library" aria-label="${section === 'answers' ? 'Saved answers' : 'Evidence claims'}">${knowledgeIdsBanner(section)}${knowledgeToolbar(section)}${knowledgeList(section)}</section>`}</div>`;
 }
 function knowledgeOpen(id) {
   const section = S.knowledgeSection || 'answers', ui = knowledgeState();
@@ -248,6 +255,7 @@ async function knowledgeCopy(id) {
   }, 'Answer copied');
 }
 const KNOWLEDGE_ACTIONS = {
+  'kn-clear-ids': () => { delete knowledgeState().filters.answers.ids; render(); },
   'kn-add': () => knowledgeOpen(),
   'kn-edit': el => knowledgeOpen(Number(el.dataset.id)),
   'kn-cancel': knowledgeCancel,

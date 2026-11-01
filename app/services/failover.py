@@ -17,7 +17,7 @@ import time
 from dataclasses import replace
 from typing import Any
 
-from app.services import failover_settings, model_health
+from app.services import failover_settings, model_health, token_pacing
 from app.services.model_resolution import ResolvedWorker
 
 log = logging.getLogger("jobhunt.failover")
@@ -57,9 +57,10 @@ def _key(algorithm: str, user_id: int, worker_type: str, model: str, position: i
     return (0.0, position)  # PRIORITY: the configured order
 
 
-def order(worker: ResolvedWorker, user_id: int, cfg: dict[str, Any]) -> list[str]:
+def order(worker: ResolvedWorker, user_id: int, cfg: dict[str, Any], tokens_needed: int | None = None) -> list[str]:
     chain = [worker.model, *worker.chain()]
-    healthy = [m for m in chain if not model_health.resting(user_id, m, worker.worker_type)]
+    healthy = [m for m in chain if not model_health.resting(user_id, m, worker.worker_type)
+               and not _waiting(user_id, m, tokens_needed)]
     if worker.model in healthy:  # the primary keeps its place; a resting backup moves behind the healthy ones
         return [*healthy, *(m for m in chain if m not in healthy)]
     rest = [m for m in chain if m not in healthy]
@@ -67,22 +68,34 @@ def order(worker: ResolvedWorker, user_id: int, cfg: dict[str, Any]) -> list[str
     return [*ranked, *rest]
 
 
-def apply(worker: ResolvedWorker, user_id: int | None) -> ResolvedWorker:
-    """The worker with its models ordered by health. The same object when nothing is resting."""
+def _waiting(user_id: int, model: str, tokens_needed: int | None) -> bool:
+    """Whether the model's per-minute token window cannot take this request until it resets (token_pacing)."""
+    return bool(tokens_needed) and token_pacing.waiting(user_id, f"LITELLM:{model}", tokens_needed) is not None
+
+
+def apply(worker: ResolvedWorker, user_id: int | None, *, tokens_needed: int | None = None) -> ResolvedWorker:
+    """The worker with its models ordered by health. The same object when nothing is resting.
+
+    `tokens_needed` (a gateway request's estimated prompt plus answer) also moves a model whose token window is
+    exhausted for this minute behind the others, until the window resets."""
     try:
-        if user_id is None or not worker.model or not worker.chain() or not model_health.states(user_id):
+        if user_id is None or not worker.model or not worker.chain():
+            return worker
+        if not model_health.states(user_id) and not _waiting(user_id, worker.model, tokens_needed):
             return worker
         cfg = _config(user_id)
         if not cfg["enabled"]:
             return worker
-        ordered = order(worker, user_id, cfg)
+        ordered = order(worker, user_id, cfg, tokens_needed)
         if ordered == [worker.model, *worker.chain()]:
             return worker
         if ordered[0] == worker.model:  # only the backups were reordered: no failover, nothing to note
             return replace(worker, fallback_model=ordered[1] if len(ordered) > 1 else None,
                            secondary_models=tuple(ordered[2:]), model_fallbacks=(),
                            capabilities={**worker.capabilities})
-        note = f"failover: {worker.model} is resting; using {ordered[0]}"
+        why = ("is waiting for its token window" if _waiting(user_id, worker.model, tokens_needed)
+               and not model_health.resting(user_id, worker.model, worker.worker_type) else "is resting")
+        note = f"failover: {worker.model} {why}; using {ordered[0]}"
         return replace(worker, model=ordered[0], fallback_model=ordered[1] if len(ordered) > 1 else None,
                        secondary_models=tuple(ordered[2:]), model_fallbacks=(), failed_over_from=worker.model,
                        note="; ".join(x for x in (worker.note, note) if x),

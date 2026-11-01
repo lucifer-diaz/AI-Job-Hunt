@@ -14,7 +14,7 @@ from app.services import model_resolution
 from app.services.ai_workers import WORKERS
 from app.services.model_resolution import resolve, resolve_model
 from app.settings import get_settings
-from tests.litellm_fake import MASTER_KEY, Account, deployment
+from tests.litellm_fake import MASTER_KEY, Account, deployment, embedding_deployment
 
 
 def snapshot(**workers):
@@ -216,19 +216,86 @@ def test_invalid_configurations_are_rejected_before_anything_changes(account, ch
     account.worker("RANKER", **changes)
     preview = account.call("POST", "/preview")
     assert not preview["can_apply"]
-    assert any(message in e["message"] for e in preview["validation"]["errors"]), preview["validation"]["errors"]
+    assert any(message in e["message"] and e["subject"] == "Ranker" for e in preview["validation"]["errors"]), \
+        preview["validation"]["errors"]
     rejected = account.apply(expect=422)
     assert rejected["detail"]["validation"]["errors"]
     assert account.get("")["active_version"] == 2
     assert ("APPLY", "REJECTED") in [(a["action"], a["result"]) for a in account.get("/audit")["entries"]]
 
 
+def test_a_prompt_token_budget_is_versioned_and_resolved(account):
+    account.call("POST", "/models/sync")
+    account.apply()
+    account.worker("RANKER", prompt_token_budget=7000)
+    account.worker("REVIEWER", prompt_token_budget=7000)
+    preview = account.call("POST", "/preview")
+    labels = {c["label"]: c for c in preview["changes"]}
+    assert labels["Ranker · prompt token budget"]["before"] is None
+    assert labels["Ranker · prompt token budget"]["after"] == 7000
+    assert any("Reviewer does not trim its prompt" in w["message"] for w in preview["validation"]["warnings"])
+    assert model_resolution.get(account.user_id, "RANKER").prompt_token_budget is None  # the draft is not live
+    assert account.apply()["status"] == "SYNCED"
+    assert model_resolution.get(account.user_id, "RANKER").prompt_token_budget == 7000
+    workers = {w["worker_type"]: w for w in account.get("")["workers"]}
+    assert workers["RANKER"]["trims_prompt"] and not workers["REVIEWER"]["trims_prompt"]
+    assert workers["RANKER"]["config"]["prompt_token_budget"] == 7000
+
+
 @pytest.mark.parametrize("changes", [{"temperature": 3}, {"max_output_tokens": 0}, {"retry_count": 50},
+                                     {"prompt_token_budget": 100},
                                      {"model_mode": "SOMETIMES"}, {"reasoning_effort": "extreme"},
                                      {"escalation": {"conditions": ["WHENEVER"]}}])
 def test_out_of_range_values_are_refused_at_edit_time(account, changes):
     response = account.client.put("/api/settings/ai/workers/RANKER", json=changes)
     assert response.status_code == 422, response.text
+
+
+@pytest.mark.parametrize("worker_type", sorted(WORKERS))
+def test_a_litellm_model_name_with_spaces_can_be_assigned_to_every_worker(account, litellm, worker_type):
+    chat = {"max_input_tokens": 128000, "supports_response_schema": True}
+    if WORKERS[worker_type].capability == "EMBEDDING":
+        litellm.deployments.append(embedding_deployment("Embed Small v3", "openai/text-embedding-3-small", 16))
+        changes = {"primary_model": "Embed Small v3", "enabled": True}
+    else:
+        for name in ("Groq B4", "Groq B4 backup", "Groq B4 second"):
+            litellm.deployments.append(deployment(name, f"groq/{name.replace(' ', '-').lower()}", info=chat))
+        changes = {"primary_model": "Groq B4", "fallback_model": "Groq B4 backup",
+                   "secondary_models": ["Groq B4 second"]}
+    account.call("POST", "/models/sync")
+    account.apply()
+    account.worker(worker_type, model_mode="FIXED", **changes)
+    preview = account.call("POST", "/preview")
+    assert preview["can_apply"], preview["validation"]["errors"]
+    account.apply()
+    resolved = model_resolution.get(account.user_id, worker_type)
+    assert resolved.model == changes["primary_model"]
+    assert resolved.fallback_model == changes.get("fallback_model")
+
+
+def test_tiers_model_fallbacks_and_the_auto_router_accept_model_names_with_spaces(account, litellm):
+    chat = {"max_input_tokens": 128000, "supports_response_schema": True}
+    litellm.deployments += [deployment("Groq B4", "groq/b4", info=chat), deployment("Groq B5", "groq/b5", info=chat),
+                            deployment("Auto Router", "auto_router/auto_router", info=chat)]
+    account.call("POST", "/models/sync")
+    account.apply()
+    account.call("PUT", "/tiers/FAST", json={"revision": account.revision(), "litellm_model_name": "Groq B4"})
+    account.call("PUT", "/models/Groq B4", json={"revision": account.revision(), "fallback_models": ["Groq B5"]})
+    account.call("PUT", "/routing", json={"revision": account.revision(), "auto_router_model_name": "Auto Router",
+                                          "tier_models": {"SIMPLE": "Groq B4"}})
+    errors = account.call("POST", "/preview")["validation"]["errors"]
+    assert not [e for e in errors if "valid" in e["message"] and "name" in e["message"]], errors
+    active = account.get("")["draft"]
+    assert active["tiers"]["FAST"]["model"] == "Groq B4"
+    assert active["models"]["Groq B4"]["fallback_models"] == ["Groq B5"]
+    assert active["routing"]["auto_router_model_name"] == "Auto Router"
+
+
+def test_a_model_name_with_other_characters_is_still_refused(account):
+    for bad in ("Groq\nB4", "Groq\tB4", "x;y", "-leading"):
+        response = account.client.put("/api/settings/ai/workers/JD_PARSER",
+                                      json={"model_mode": "FIXED", "primary_model": bad})
+        assert response.status_code == 422, (bad, response.text)
 
 
 def test_a_circular_fallback_through_litellm_router_settings_is_rejected(account, litellm):
@@ -244,7 +311,8 @@ def test_structured_output_requirements_warn_or_block(account, litellm):
     account.call("POST", "/models/sync")
     account.worker("REVIEWER", model_mode="FIXED", primary_model="no-json")
     warnings = account.call("POST", "/preview")["validation"]["warnings"]
-    assert any("Structured Output Required" in w["message"] for w in warnings)  # unknown: warn, allow
+    assert any("Structured Output Required" in w["message"] and w["subject"] == "Reviewer"
+               for w in warnings)  # unknown: warn, allow, and say which worker
     account.call("PUT", "/models/no-json", json={"overrides": {"supports_structured_output": False}})
     errors = account.call("POST", "/preview")["validation"]["errors"]
     assert any("cannot return structured output" in e["message"] for e in errors)  # known lack: block
@@ -472,11 +540,10 @@ def test_removing_a_model_is_refused_while_used_and_a_sync_does_not_bring_it_bac
                         json={"revision": account.revision()})["detail"]
     assert "tier PRIMARY_REASONING" in used["references"]
     account.call("PUT", "/models/tier-2-reasoning", json={"revision": account.revision(), "fallback_models": ["cloud-mini"]})
-    refused = account.call("POST", "/models/cloud-mini/remove", expect=409, json={"revision": account.revision()})
-    assert "tier-2-reasoning's fallbacks" in refused["detail"]["references"]
-    account.call("PUT", "/models/tier-2-reasoning", json={"revision": account.revision(), "fallback_models": []})
     before = account.get("")["active_version"]
-    account.call("POST", "/models/cloud-mini/remove", json={"revision": account.revision()})
+    removed = account.call("POST", "/models/cloud-mini/remove", json={"revision": account.revision()})
+    assert removed["dropped"] == ["tier-2-reasoning's fallbacks"]  # a fallback is dropped, not a reason to refuse
+    assert account.get("")["draft"]["models"]["tier-2-reasoning"]["fallback_models"] == []
     out = account.apply()
     overview = account.get("")
     assert "cloud-mini" not in [m["name"] for m in overview["models"]]
@@ -491,6 +558,54 @@ def test_removing_a_model_is_refused_while_used_and_a_sync_does_not_bring_it_bac
     assert "cloud-mini" not in [m["name"] for m in account.get("")["models"]]
     assert [r["name"] for r in account.get("")["removed_models"]] == ["cloud-mini"]
     account.call("POST", "/models/nothing-here/remove", expect=404, json={"revision": account.revision()})
+
+
+def _backups(data, worker_type):
+    config = data["draft"]["workers"][worker_type]
+    return config["fallback_model"], config["secondary_models"]
+
+
+def test_disabling_a_model_drops_it_from_backups_and_model_fallbacks_and_applies(account, litellm):
+    account.call("POST", "/models/sync")
+    account.worker("RANKER", fallback_model="cloud-mini", secondary_models=["tier-3-review"])
+    account.worker("REVIEWER", fallback_model="tier-1-fast", secondary_models=["cloud-mini", "tier-2-reasoning"])
+    account.call("PUT", "/models/tier-2-reasoning", json={"revision": account.revision(),
+                                                          "fallback_models": ["cloud-mini", "tier-1-fast"]})
+    account.apply()
+    out = account.call("PUT", "/models/cloud-mini", json={"revision": account.revision(), "enabled": False})
+    assert out["dropped"] == ["Ranker (backup 1)", "Reviewer (backup 2)", "tier-2-reasoning's fallbacks"]
+    data = account.get("")
+    assert _backups(data, "RANKER") == ("tier-3-review", [])  # the next backup moves up
+    assert _backups(data, "REVIEWER") == ("tier-1-fast", ["tier-2-reasoning"])  # order kept
+    assert data["draft"]["models"]["tier-2-reasoning"]["fallback_models"] == ["tier-1-fast"]
+    assert account.apply()["status"] != "FAILED"
+    active = model_resolution.active_snapshot(account.user_id)[1]
+    assert active["models"]["cloud-mini"]["enabled"] is False and active["workers"]["RANKER"]["fallback_model"] == "tier-3-review"
+    with SessionLocal() as db:
+        entry = db.scalar(select(AIConfigAuditEntry).where(AIConfigAuditEntry.user_id == account.user_id,
+                                                           AIConfigAuditEntry.action == "DISABLE"))
+        assert entry.changes == [{"model": "cloud-mini", "dropped_from": out["dropped"]}]
+    again = account.call("PUT", "/models/cloud-mini", json={"revision": account.revision(), "enabled": True})
+    assert again["dropped"] == [] and _backups(account.get(""), "RANKER") == ("tier-3-review", [])  # not restored
+
+
+def test_a_main_or_tier_model_is_never_dropped_and_still_blocks_removal(account, litellm):
+    account.call("POST", "/models/sync")
+    account.worker("REVIEWER", model_mode="FIXED", primary_model="cloud-mini")
+    account.worker("RANKER", fallback_model="cloud-mini")
+    account.apply()
+    out = account.call("PUT", "/models/cloud-mini", json={"revision": account.revision(), "enabled": False})
+    assert out["dropped"] == ["Ranker (backup 1)"]
+    assert account.get("")["draft"]["workers"]["REVIEWER"]["primary_model"] == "cloud-mini"  # its own model: kept
+    applied = account.apply()
+    assert any("Reviewer has no usable model" in w["message"] for w in applied["warnings"])
+    account.call("PUT", "/models/cloud-mini", json={"revision": account.revision(), "enabled": True})
+    account.worker("RANKER", fallback_model="cloud-mini")
+    used = account.call("POST", "/models/cloud-mini/remove", expect=409, json={"revision": account.revision()})
+    assert used["detail"]["references"] == ["Reviewer (its model)"]
+    assert _backups(account.get(""), "RANKER") == ("cloud-mini", [])  # a refused removal drops nothing
+    tier = account.call("POST", "/models/tier-1-fast/remove", expect=409, json={"revision": account.revision()})
+    assert "tier FAST" in tier["detail"]["references"]
 
 
 def test_removing_a_managed_model_deletes_its_deployment_and_a_rollback_brings_it_back(account, litellm):
@@ -520,3 +635,15 @@ def test_verification_counts_a_primary_models_own_fallbacks():
     snap["models"]["mid"]["fallback_models"] = ["deep"]
     snap["models"]["fast"]["fallback_models"] = ["never-used"]  # not a primary: its fallbacks join no chain
     assert "deep" in _referenced(snap) and "never-used" not in _referenced(snap)
+
+
+def test_validation_issues_name_what_they_are_about():
+    from app.services.ai_model_config import _issue, issue_text
+    assert _issue("workers.RANKER.fallback_model", "x")["subject"] == "Ranker"
+    assert _issue("tiers.FAST.model", "x")["subject"] == "Tier FAST"
+    assert _issue("routing.tier_models.SIMPLE", "x")["subject"] == "Auto Router"
+    assert _issue("models.gpt-4.1.fallback_models.0", "x")["subject"] == "Model gpt-4.1"
+    assert "subject" not in _issue("somewhere", "x")
+    assert issue_text(_issue("workers.RANKER.fallback_model", "The fallback model cannot be the primary model")) == \
+        "Ranker: The fallback model cannot be the primary model"
+    assert issue_text(_issue("workers.REVIEWER.mode", "Reviewer has no usable model")) == "Reviewer has no usable model"

@@ -492,6 +492,8 @@ def get_job_packet(db: Session, job_id: int, formats: list[str] | None = None,
     reason = apply_queue.not_ready_reason(db, job)
     if reason:
         raise ToolError(f"Job {job.id} is not ready to apply to: {reason}")
+    if apply_queue.guarded_hold(db, job) is not None:
+        raise ToolError(f"Job {job.id}: {apply_queue.ROUTE_HELD_REASON} ({apply_queue.ROUTE_HELD})")
     application = job.application
     resume = apply_queue.approved_resume(db, application)
     content = resume.content or {}
