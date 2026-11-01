@@ -232,7 +232,9 @@ class Settings(BaseSettings):
     resume_parse_graph_mode: str = "on"
     # RESUME_EXTRACTION_V2: read uploaded PDFs with app.services.resume_extraction (PDFium, which honours the
     # /ActualText some producers write for ligature glyphs, line-break hyphen joining and a quality report) instead
-    # of pypdf. Off by default; off, extraction is exactly as before. Job description files are read the same way.
+    # of pypdf. Off by default; off, extraction is exactly as before. The server's default: an account can choose for its
+    # own resume uploads (worker setting resume_parsing.extraction_v2, Settings → Resumes). Job description files
+    # follow this value.
     resume_extraction_v2: bool = False
     # Re-rank qualified jobs once their description has been parsed. Off by default: parsing a backlog would
     # otherwise start a round of ranking calls.

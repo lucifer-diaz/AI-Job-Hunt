@@ -319,6 +319,34 @@ def test_without_ai_only_an_upload_waits_its_turn(user):
     assert client.get("/api/settings/resume").json()["ai_only"] is False
 
 
+def test_the_pdf_reader_follows_the_server_until_the_account_chooses(user, monkeypatch):
+    from app.services import document_text, worker_settings
+    from app.settings import get_settings
+
+    seen = []
+    real = document_text.extract
+
+    def spy(kind, data, **kwargs):
+        seen.append(kwargs.get("v2"))
+        return real(kind, data, **kwargs)
+
+    monkeypatch.setattr(document_text, "extract", spy)
+    monkeypatch.setattr(get_settings(), "resume_extraction_v2", False)
+    assert client.get("/api/settings/resume").json()["extraction_v2"] is False
+    upload()
+    monkeypatch.setattr(get_settings(), "resume_extraction_v2", True)  # the server default moves: so does the account
+    assert client.get("/api/settings/resume").json()["extraction_v2"] is True
+    with sessions_for(user)() as db:
+        worker_settings.update(db, user, {"resume_parsing": {"extraction_v2": False}})  # the account's own choice wins
+    assert client.get("/api/settings/resume").json()["extraction_v2"] is False
+    upload("Another resume\nSkills\nPython")
+    assert seen == [False, False]
+    with sessions_for(user)() as db:
+        field = next(f for f in worker_settings.describe(db, user)["resume_parsing"]["fields"]
+                     if f["name"] == "extraction_v2")
+    assert field["type"] == "bool" and field["default"] is True, "Running workers → Settings shows the server's value"
+
+
 # ───────────── the graph ─────────────
 
 def test_the_graph_fills_the_resume_and_records_each_step_once(user):

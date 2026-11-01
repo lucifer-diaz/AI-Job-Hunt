@@ -2785,7 +2785,9 @@ English words (a bundled word list, `app/services/data/`), and replaces only wor
 back unchanged; a glyph that came out as an ordinary letter cannot be detected. Upload a file again to get a repaired
 version of a resume read before this existed.
 
-With `RESUME_EXTRACTION_V2=true` (off by default) a PDF is read by `app/services/resume_extraction/` instead: PDFium
+With the new reader on (Settings → Resumes → "Read PDF uploads with the new reader", per account; an account that never
+chose follows the server's `RESUME_EXTRACTION_V2`, off by default; job description files follow the server) a PDF is
+read by `app/services/resume_extraction/` instead: PDFium
 (`pypdfium2`) rather than pypdf, because PDFium honours the `/ActualText` that producers such as Apple Pages write
 beside a ligature glyph whose mapping is broken, so "Kafka" no longer reads "Kaga". Lines are rebuilt from the
 characters' positions (each word keeps its page, box and font for later stages), a word a line break split is joined

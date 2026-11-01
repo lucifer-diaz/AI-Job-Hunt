@@ -605,14 +605,13 @@ describe('resume data', () => {
     ui.A['settings-discard']({ dataset: { form: 'resume-data' } });
     expect(ui.RD.editing).toBeNull();
   });
-  it('shows raw text read-only, the original file link and change history', async () => {
+  it('shows raw text read-only, the original file in the menu and change history', async () => {
     await open(detail(), { 'GET /api/resumes/5/raw': { raw_text: 'RAW <b>resume</b>' }, 'GET /api/resumes/5/changes': { total: 1, items: [{ change_type: 'UPDATE', source: 'USER', field_path: 'summary.text', old_value: 'a', new_value: { x: 1 }, changed_at: '2026-09-02T10:00:00' }] } });
     ui.A['rd-tab']({ dataset: { tab: 'raw' } }); await settle();
     const raw = document.querySelector('[data-rd-raw]');
     expect(raw.textContent).toBe('RAW <b>resume</b>');
     expect(document.querySelector('[data-rd-raw] textarea, #rd-detail textarea')).toBeNull();
-    ui.A['rd-tab']({ dataset: { tab: 'original' } });
-    expect(document.querySelector('a[href="/api/resumes/5/original"]')).toBeTruthy();
+    expect(document.querySelector('#rd-detail .rd-menu a[href="/api/resumes/5/original"]')).toBeTruthy();
     ui.A['rd-tab']({ dataset: { tab: 'history' } }); await settle();
     expect(document.querySelector('[data-rd-change-type="UPDATE"]').textContent).toContain('summary.text');
   });
@@ -668,6 +667,16 @@ describe('resume data', () => {
     expect(saved).toEqual({ workers: { resume_parsing: { ai_only: false } } });
     expect(view.innerHTML).toContain('Builds &lt;platforms&gt;');
   });
+  it('reads PDF uploads with the new reader: the toggle shows the account value and saves the worker setting', async () => {
+    let saved;
+    const active = detail({ parser: 'deterministic' });
+    await open(active, { 'GET /api/settings/resume': { active, versions: [active], policy: {}, ai_only: false, extraction_v2: true },
+      'PUT /api/workers/settings': body => { saved = body; return { account: {} }; } });
+    expect(document.getElementById('rd-extraction-v2').checked).toBe(true);
+    await ui.A['rd-extraction-v2']({ checked: false }); await settle();
+    expect(saved).toEqual({ workers: { resume_parsing: { extraction_v2: false } } });
+    expect(ui.D.resumeData.extraction_v2).toBe(false);
+  });
   it('renders every section type and edits single-object sections', async () => {
     const v = verification('UNVERIFIED');
     const base = detail();
@@ -682,16 +691,35 @@ describe('resume data', () => {
     await open(detail({ structured, verified_at: null, has_original: false, source_filename: null, verification_status: 'SOMETHING_NEW',
       progress: { ...base.progress, blocking: Array.from({ length: 7 }, (_, i) => ({ label: `item ${i}` })) } }));
     const view = document.getElementById('view').innerHTML;
-    for (const text of ['Atlas', 'Served 2M users', 'BTech · CS · IIT', 'CKA', 'Hackathon winner', 'Hindi · Native', 'German', 'Open source maintainer', '2021 – Present', 'Not verified yet', '…']) expect(view).toContain(text);
+    for (const text of ['Atlas', 'Served 2M users', 'BTech · CS · IIT', 'CKA', 'Hackathon winner', 'Hindi · Native', 'German', 'Open source maintainer', '2021 – Present']) expect(view).toContain(text);
     ui.A['rd-edit']({ dataset: { section: 'personal_information' } });
     input('rd-personal_information-full_name', 'Alex M');
     expect(ui.resumeDataDirty()).toBe(true);
     ui.A['rd-cancel']();
     ui.A['rd-edit']({ dataset: { section: 'summary' } });
     expect(document.getElementById('rd-summary-text').value).toBe('');
-    ui.rdReset();
-    ui.A['rd-tab']({ dataset: { tab: 'original' } });
-    expect(document.getElementById('view').innerHTML).toContain('no longer stored');
+    ui.rdReset(); ui.render();
+    expect(document.querySelector('#rd-detail a[href$="/original"]')).toBeNull();  // no stored file: nothing to download
+  });
+  it('reviews in one place: skill chips, hidden empty sections, Add section and Review next', async () => {
+    const base = detail();
+    const structured = { ...base.structured, skills: [{ id: 'skill_py', name: 'Python', category: 'Languages', verification: verification('VERIFIED') }, { id: 'skill_k', name: 'Kafka', category: 'Data', verification: verification('UNVERIFIED') }] };
+    await open(detail({ structured }));
+    const chips = [...document.querySelectorAll('#rd-section-skills .rd-chip')];
+    expect(chips.map(c => c.textContent.replace(/[^A-Za-z]/g, ''))).toEqual(expect.arrayContaining([expect.stringContaining('Python'), expect.stringContaining('Kafka')]));
+    expect(document.querySelector('[data-rd-item="skill_py"] [aria-label^="Undo"]')).toBeTruthy();  // decided: only undo
+    expect(document.querySelector('[data-rd-item="skill_k"] [aria-label="Verify"]')).toBeTruthy();
+    expect(document.getElementById('rd-section-certifications')).toBeNull();  // empty and optional: out of the way
+    expect(document.querySelector('[data-act="rd-add-section"][data-section="certifications"]')).toBeTruthy();
+    ui.A['rd-add-section']({ dataset: { section: 'certifications' } });
+    expect(ui.RD.editing).toBe('certifications');
+    expect(document.getElementById('rd-certifications-0-name')).toBeTruthy();
+    ui.A['rd-cancel']();
+    expect(document.querySelector('[data-act="rd-next"]').textContent).toContain('2 left');
+    ui.A['rd-next']();
+    expect(document.activeElement.getAttribute('aria-label')).toBe('Verify');
+    expect(document.activeElement.closest('[data-rd-item]').dataset.rdItem).toBe('summary');
+    expect(document.querySelector('label.rd-upload input#resume-file')).toBeTruthy();  // upload from the library header
   });
   it('handles no resume and load failures', async () => {
     route({ 'GET /api/settings/resume': { active: null, versions: [], policy: {} } });

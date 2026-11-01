@@ -118,6 +118,12 @@ def role_line(role: dict[str, Any]) -> str:
     return f"{role['title']} | {role['company']} | {role['location']} | {role['dates']}"
 
 
+def role_lines(role: dict[str, Any]) -> list[str]:
+    """A role's header as the document writes it: `header` when the ground truth records it (a real layout that names
+    the company once above several roles), else the one line the fixture builder renders."""
+    return list(role.get("header") or [role_line(role)])
+
+
 def section_lines(resume: dict[str, Any], kind: str) -> list[str]:
     """The lines a section is written as (the builder renders exactly these words)."""
     if kind == "summary":
@@ -126,9 +132,10 @@ def section_lines(resume: dict[str, Any], kind: str) -> list[str]:
         return [f"{g['category']}: " * bool(g["category"]) + ", ".join(i["name"] for i in g["items"])
                 for g in resume["skills"]]
     if kind == "experience":
-        return [line for r in resume["experience"] for line in (role_line(r), *r["bullets"])]
+        return [line for r in resume["experience"] for line in (*role_lines(r), *r["bullets"])]
     if kind == "education":
-        return [f"{e['degree']} | {e['institution']} | {e['dates']}" for e in resume["education"]]
+        return [f"{e['degree']}{', ' + e['field_of_study'] if e.get('field_of_study') else ''} | {e['institution']} | "
+                f"{e['dates']}" for e in resume["education"]]
     if kind == "certifications":
         return [f"{c['name']} | {c['issuer']} | {c['date']}" for c in resume["certifications"]]
     if kind == "projects":
@@ -137,10 +144,12 @@ def section_lines(resume: dict[str, Any], kind: str) -> list[str]:
 
 
 def document_lines(resume: dict[str, Any]) -> list[str]:
+    """Every line of the document. `other_lines` holds text no field does (a company's overall dates above its roles,
+    a degree's location): real layouts have it, and the words it holds are part of the text to extract."""
     lines = [resume["name"], resume["headline"], " | ".join(resume["contact"])]
     for kind in resume["order"]:
         lines += [resume["headings"][kind], *section_lines(resume, kind)]
-    return lines
+    return lines + list(resume.get("other_lines") or [])
 
 
 def load_resumes() -> dict[str, Any]:
@@ -160,6 +169,16 @@ def tokens(text: str) -> list[str]:
         if word and not re.fullmatch(r"[-–—]+", word):
             out.append(word)
     return out
+
+
+LIMITS = (300, 2000, 3000)  # structured_resume field lengths (Short, bullets, descriptions)
+_FOLD = str.maketrans({"‐": "-", "‑": "-", "‒": "-", "–": "-", "—": "-", "−": "-", "‘": "'", "’": "'", "“": '"',
+                       "”": '"'})
+
+
+def fold(word: str) -> str:
+    """A word with dash and quote variants made plain: a parser writing "2-4" for "2–4" invents nothing."""
+    return word.translate(_FOLD).casefold()
 
 
 def norm(text: str) -> str:
@@ -286,7 +305,18 @@ def score_structure(resume: dict[str, Any], data: dict[str, Any], final_text: st
     seen_text = norm(final_text)
     # A value is invented when it holds a word that neither the resume nor the extracted text has: a misread word
     # is the extraction's error, a value merged from two sections is misfiled, neither is invented.
-    vocabulary = {w.casefold() for w in tokens(" ".join(document_lines(resume))) + tokens(final_text)}
+    vocabulary = {fold(w) for w in tokens(" ".join(document_lines(resume))) + tokens(final_text)}
+
+    def invented(part: str) -> bool:
+        words = [fold(w) for w in tokens(part)]
+        for i, w in enumerate(words):
+            if w in vocabulary:
+                continue
+            cut = len(part) >= min(LIMITS)  # a value as long as a field's limit was cut there (structured_resume)
+            if i == len(words) - 1 and cut and any(v.startswith(w) for v in vocabulary):
+                continue  # its last word may be partial ("s" for "systems"): cut, not invented
+            return True
+        return False
     for field, values in want.items():
         found = Counter(_key(v) for v in got[field])
         expected += len(values)
@@ -307,7 +337,7 @@ def score_structure(resume: dict[str, Any], data: dict[str, Any], final_text: st
             continue  # normalised (2020-08): the raw dates are words of the text
         for value in values:
             for part in _flat(value):
-                if any(w.casefold() not in vocabulary for w in tokens(part)):
+                if invented(part):
                     hallucinated.append(f"{field}: {part}")
     everything = norm(json.dumps(data, ensure_ascii=False))
     dropped = [i["name"] for g in resume["skills"] for i in g["items"]

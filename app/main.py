@@ -93,6 +93,7 @@ from app.services import (
     mcp_tokens,
     preparation,
     ranker,
+    resume_parsing,
     resume_verification,
     server_settings,
     tailor_tasks,
@@ -975,7 +976,8 @@ async def resume_upload(file: UploadFile = File(...), db: Session = Depends(get_
     if not data:
         raise HTTPException(400, "Resume is empty")
     try:
-        extracted = document_text.extract(file.content_type, data)
+        extracted = document_text.extract(file.content_type, data,
+                                          v2=resume_parsing.extraction_v2(db, require_user_id(db)))
     except Exception as exc:
         raise HTTPException(422, f"Could not read resume: {exc}") from exc
     extracted = clean_raw_text(extracted)

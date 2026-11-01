@@ -146,3 +146,26 @@ def test_v2_reads_the_actualtext_pdfs_without_errors_and_keeps_the_hard_gates():
     assert v2["field_recall"] >= current["field_recall"] and v2["field_precision"] >= current["field_precision"]
     assert v2["valid_words_altered"] == 0 and v2["hallucinated_values"] == 0
     assert v2["quality_routing"] == 1.0 and current["quality_routing"] is None
+
+
+def test_ground_truth_can_state_a_role_header_as_the_document_writes_it():
+    role = {"title": "Lead Engineer", "company": "Zendrive", "location": "Remote, US", "dates": "Jun 2024 - Oct 2025",
+            "bullets": []}
+    assert rx.role_lines(role) == ["Lead Engineer | Zendrive | Remote, US | Jun 2024 - Oct 2025"]
+    assert rx.role_lines({**role, "header": ["Zendrive", "Lead Engineer"]}) == ["Zendrive", "Lead Engineer"]
+    edu = {"degree": "B.Tech", "field_of_study": "CS", "institution": "KGEC", "dates": "2010 - 2014"}
+    assert rx.section_lines({"education": [edu]}, "education") == ["B.Tech, CS | KGEC | 2010 - 2014"]
+
+
+def test_a_normalised_dash_or_a_value_cut_at_its_limit_is_not_invented():
+    resume = rx.load_resumes()["ana"]
+    text = "\n".join(rx.document_lines(resume))
+    dash = {"summary": "", "skills": [], "experience": [{"job_title": "x", "company": "", "responsibilities": [
+        "Led the transformation of nightly batch jobs into real-time workflows, cutting reporting latency from 6 hours "
+        "to 4 minutes."]}], "education": [], "certifications": [], "projects": []}
+    assert rx.score_structure(resume, dash, text.replace("–", "—"))["hallucinated"] == ["roles: x"]
+    long = ("Data platform engineer with nine years of experience building streaming pipelines, workflow automation and "
+            "analytics platforms. Led the digital transformation of batch reporting into real-time Kafka services with a "
+            "focus on reliability and cost optimization. Data platform engineer with nine years of experience build")[:300]
+    cut = {**dash, "experience": [], "projects": [{"name": long}]}
+    assert len(long) == 300 and rx.score_structure(resume, cut, text)["hallucinated"] == []

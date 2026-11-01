@@ -274,8 +274,11 @@ The rules a change has to keep:
 `app/services/resume_extraction/` (README §11 "Reading the file", `docs/resume-extraction-plan.md`) reads an uploaded
 PDF when `RESUME_EXTRACTION_V2` is on. The rules a change has to keep:
 
-* **Off is the old path, byte for byte.** `document_text.extract` calls the pipeline only for a PDF with the flag on;
+* **Off is the old path, byte for byte.** `document_text.extract` calls the pipeline only for a PDF with V2 on;
   DOCX and TXT read through `document_text.read_plain` either way (`tests/test_resume_extraction_text_layer.py`).
+* **The switch is per account, defaulting to the server.** A resume upload passes `resume_parsing.extraction_v2`
+  (worker setting `resume_parsing.extraction_v2`, Settings → Resumes); a value the account never set follows
+  `RESUME_EXTRACTION_V2`. Callers without an account (job description files) pass nothing and follow the server.
 * **The text the file states comes first.** PDFium (`text_layer.read_pdfium`) honours `/ActualText`; pypdf is only the
   fallback for a file PDFium cannot open. Every word keeps its page, box and font: never drop provenance.
 * **Normalise artefacts, never meaning.** `normalize.TABLE` lists the characters that change; no NFKC. A line-break

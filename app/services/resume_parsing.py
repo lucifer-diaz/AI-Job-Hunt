@@ -133,6 +133,11 @@ def ai_only(db: Session, user_id: int) -> bool:
     return bool(worker_settings.get(db, user_id, KIND, "ai_only"))
 
 
+def extraction_v2(db: Session, user_id: int) -> bool:
+    """Whether this account's PDF uploads are read by resume extraction V2 (worker setting, else the server's)."""
+    return bool(worker_settings.get(db, user_id, KIND, "extraction_v2"))
+
+
 def queue_after_upload(db: Session, resume: Resume) -> None:
     """The upload hook: queue the new version (run now when the account structures uploads with AI only), and wake
     the worker. Never fails the upload."""
