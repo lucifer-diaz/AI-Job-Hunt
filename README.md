@@ -70,6 +70,61 @@ Auto-submit is intentionally not offered: approved packets always become an appl
 - Docker deployment
 - Separate cron command for scheduled follow-ups
 
+## Architecture
+
+```mermaid
+flowchart LR
+    SPA["Web workspace<br/>(vanilla JS)"]
+    Claude["Claude Desktop"]
+    API["FastAPI<br/>backend"]
+    MCP["MCP server<br/>(stdio)"]
+    Sched["Scheduler<br/>& workers"]
+    PG[("PostgreSQL<br/>+ pgvector")]
+    Files[("Resumes<br/>& packets")]
+    LiteLLM["LiteLLM proxy"]
+    Models["OpenAI · Anthropic · Gemini<br/>OpenRouter · Ollama"]
+    Apify["Apify actors"]
+    Gmail["Gmail API<br/>(read-only)"]
+    Chromium["Headless Chromium<br/>(Playwright)"]
+    Runner["browser-use runner<br/>(optional)"]
+    Sites["Job postings<br/>& ATS sites"]
+
+    SPA -- "REST + session" --> API
+    Claude -- "MCP token" --> MCP
+    API --> Files
+    API --> PG
+    MCP --> PG
+    API -- "starts" --> Sched
+    Sched -- "tasks · state · telemetry" --> PG
+    Sched -- "prompts" --> LiteLLM
+    LiteLLM --> Models
+    Sched -- "job search · research" --> Apify
+    Sched -- "application replies" --> Gmail
+    Sched -- "JD recovery" --> Chromium
+    Chromium --> Sites
+    Sched -- "application forms" --> Runner
+    Runner --> Sites
+```
+
+The scheduler runs inside the FastAPI process, and PostgreSQL is the only queue and shared state (no Redis, Celery or
+separate worker service). Every model call goes through the LLM gateway (`LLMClient`), which picks each worker's model
+from its configuration and sends it to LiteLLM or straight to the provider. Every third-party call (models, Apify,
+Gmail, job sites) goes through the instrumented client (`external_api`), so it shows up in Monitoring.
+
+| Layer | Stack |
+| --- | --- |
+| Frontend | Server-rendered Jinja pages with a single-page workspace in plain JavaScript (`app/static`), no build step |
+| Backend | Python 3.11+, FastAPI, SQLAlchemy 2, Pydantic v2, Alembic |
+| Data | PostgreSQL (SQLite for local development), pgvector for optional retrieval, local files for resumes and packets |
+| Background work | Built-in asyncio scheduler (`app/scheduler.py`) with PostgreSQL task tables (`FOR UPDATE SKIP LOCKED` leases) |
+| AI | LiteLLM gateway or a direct provider (OpenAI, Anthropic, Gemini, OpenRouter, Ollama), per-worker models with failover; LangGraph for agent graphs |
+| Discovery & research | Apify actors, Lever and Greenhouse imports |
+| Browser | Playwright with headless Chromium; optional browser-use runner for application forms |
+| Integrations | Gmail (read-only, OAuth), MCP server for Claude Desktop, Google ADK agent (`job_hunt_agent`) |
+| Auth | Email and password accounts, HTTP-only session cookies, encrypted per-account API keys |
+| Tests | pytest, Vitest + jsdom |
+| Deployment | Docker, Render or Railway |
+
 ## 1. Local run
 
 ```bash
