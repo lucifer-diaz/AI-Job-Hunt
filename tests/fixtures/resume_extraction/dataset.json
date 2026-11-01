@@ -1,0 +1,370 @@
+{
+ "name": "resume_extraction",
+ "version": 1,
+ "description": "Resume extraction: synthetic resumes (resumes.json, hand-written) rendered by scripts/build_resume_fixtures.py to PDF in four layouts (clean, ligature ToUnicode broken, broken with /ActualText), DOCX and TXT; plus hand-written text-layer corruption cases. Scores the text a pipeline extracts and the structure it parses against the hand-written ground truth.",
+ "fixture": {
+  "resumes_sha256": "d55140874c2d3cdc3b94eb94ac051d9018a2dd8586a20bcb3360fcca35a4da2b"
+ },
+ "examples": [
+  {
+   "key": "ana-single-clean",
+   "inputs": {
+    "document": "ana-single-clean.pdf",
+    "kind": "application/pdf",
+    "sha256": "fe25d7095f31779a5f0428b91e9738cd4ca1ab1a4a738c976e7af57e2337dbeb"
+   },
+   "outputs": {
+    "resume": "ana"
+   },
+   "metadata": {
+    "layout": "single",
+    "variant": "clean",
+    "format": "pdf"
+   }
+  },
+  {
+   "key": "ana-single-broken",
+   "inputs": {
+    "document": "ana-single-broken.pdf",
+    "kind": "application/pdf",
+    "sha256": "84447e2fd9d9b5588c2e2839fe485bb1189654ecafa5762c96ab8eccd6251e2e"
+   },
+   "outputs": {
+    "resume": "ana"
+   },
+   "metadata": {
+    "layout": "single",
+    "variant": "broken",
+    "format": "pdf"
+   }
+  },
+  {
+   "key": "ana-single-actualtext",
+   "inputs": {
+    "document": "ana-single-actualtext.pdf",
+    "kind": "application/pdf",
+    "sha256": "7c1c52056843dab1c588282a3a9e4b40099c09b39e6415401fd2f18d23220bcf"
+   },
+   "outputs": {
+    "resume": "ana"
+   },
+   "metadata": {
+    "layout": "single",
+    "variant": "actualtext",
+    "format": "pdf"
+   }
+  },
+  {
+   "key": "ben-two_column-clean",
+   "inputs": {
+    "document": "ben-two_column-clean.pdf",
+    "kind": "application/pdf",
+    "sha256": "be4859b45a77f3b73c4693ed4c1e7155e9c9c1374448baf7a43aae24537d30d2"
+   },
+   "outputs": {
+    "resume": "ben"
+   },
+   "metadata": {
+    "layout": "two_column",
+    "variant": "clean",
+    "format": "pdf"
+   }
+  },
+  {
+   "key": "ben-two_column-broken",
+   "inputs": {
+    "document": "ben-two_column-broken.pdf",
+    "kind": "application/pdf",
+    "sha256": "9c3fea39c6fce15bdbdb96e1a1680e851f4af27bdb200eb701a5a295c32f5993"
+   },
+   "outputs": {
+    "resume": "ben"
+   },
+   "metadata": {
+    "layout": "two_column",
+    "variant": "broken",
+    "format": "pdf"
+   }
+  },
+  {
+   "key": "ben-two_column-actualtext",
+   "inputs": {
+    "document": "ben-two_column-actualtext.pdf",
+    "kind": "application/pdf",
+    "sha256": "b5c50c18e0307938f431acc63dc16012d23fc747d34269e2d771f0283ad80a4c"
+   },
+   "outputs": {
+    "resume": "ben"
+   },
+   "metadata": {
+    "layout": "two_column",
+    "variant": "actualtext",
+    "format": "pdf"
+   }
+  },
+  {
+   "key": "chloe-sidebar-clean",
+   "inputs": {
+    "document": "chloe-sidebar-clean.pdf",
+    "kind": "application/pdf",
+    "sha256": "c9275976494dfbf3a9fc772711278609f0082384de084b9958fd2bf29492c583"
+   },
+   "outputs": {
+    "resume": "chloe"
+   },
+   "metadata": {
+    "layout": "sidebar",
+    "variant": "clean",
+    "format": "pdf"
+   }
+  },
+  {
+   "key": "chloe-sidebar-broken",
+   "inputs": {
+    "document": "chloe-sidebar-broken.pdf",
+    "kind": "application/pdf",
+    "sha256": "185c8f21e4ca6aa8b96dd6c6639ec1a1c665f4e0d1d6edb9f0be286d4259a9ee"
+   },
+   "outputs": {
+    "resume": "chloe"
+   },
+   "metadata": {
+    "layout": "sidebar",
+    "variant": "broken",
+    "format": "pdf"
+   }
+  },
+  {
+   "key": "chloe-sidebar-actualtext",
+   "inputs": {
+    "document": "chloe-sidebar-actualtext.pdf",
+    "kind": "application/pdf",
+    "sha256": "bc72e460e57448caf8d29263ec00b451e929fb87e9b8e01ec4f7864ead42ddf2"
+   },
+   "outputs": {
+    "resume": "chloe"
+   },
+   "metadata": {
+    "layout": "sidebar",
+    "variant": "actualtext",
+    "format": "pdf"
+   }
+  },
+  {
+   "key": "dev-table-clean",
+   "inputs": {
+    "document": "dev-table-clean.pdf",
+    "kind": "application/pdf",
+    "sha256": "65ccaa507475fccf35f568adb49e23b13838106653628fa66699475483292954"
+   },
+   "outputs": {
+    "resume": "dev"
+   },
+   "metadata": {
+    "layout": "table",
+    "variant": "clean",
+    "format": "pdf"
+   }
+  },
+  {
+   "key": "dev-table-broken",
+   "inputs": {
+    "document": "dev-table-broken.pdf",
+    "kind": "application/pdf",
+    "sha256": "8320b3a5b0a9cc1ba085dc404f04395ff171056f4924b921a913b08cb3541a45"
+   },
+   "outputs": {
+    "resume": "dev"
+   },
+   "metadata": {
+    "layout": "table",
+    "variant": "broken",
+    "format": "pdf"
+   }
+  },
+  {
+   "key": "dev-table-actualtext",
+   "inputs": {
+    "document": "dev-table-actualtext.pdf",
+    "kind": "application/pdf",
+    "sha256": "bc919c1d5755b1f2fff53b7aecceb8ee0e4a8468507838b350755048bf151b62"
+   },
+   "outputs": {
+    "resume": "dev"
+   },
+   "metadata": {
+    "layout": "table",
+    "variant": "actualtext",
+    "format": "pdf"
+   }
+  },
+  {
+   "key": "ana-docx",
+   "inputs": {
+    "document": "ana.docx",
+    "kind": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "sha256": "ac64a86b1c4c99f60ca614db095c2d5de8673b29c642d0677a56301e163c7111"
+   },
+   "outputs": {
+    "resume": "ana"
+   },
+   "metadata": {
+    "layout": "plain",
+    "variant": "clean",
+    "format": "docx"
+   }
+  },
+  {
+   "key": "dev-docx",
+   "inputs": {
+    "document": "dev.docx",
+    "kind": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "sha256": "3c6f9242ba019c5051e65eed6836deca95a6aba0615f0dcc99f14170e39e8051"
+   },
+   "outputs": {
+    "resume": "dev"
+   },
+   "metadata": {
+    "layout": "skills_table",
+    "variant": "clean",
+    "format": "docx"
+   }
+  },
+  {
+   "key": "ben-txt",
+   "inputs": {
+    "document": "ben.txt",
+    "kind": "text/plain",
+    "sha256": "13ca573cb105b3da9e27ebdf193fd73b50af2dc0de121e03125f2646d2671aa3"
+   },
+   "outputs": {
+    "resume": "ben"
+   },
+   "metadata": {
+    "layout": "plain",
+    "variant": "clean",
+    "format": "txt"
+   }
+  },
+  {
+   "key": "chloe-txt",
+   "inputs": {
+    "document": "chloe.txt",
+    "kind": "text/plain",
+    "sha256": "a2fc731d20a4f4966f34ff76d1f9cd011663c02b80329437ba8068c83f09e987"
+   },
+   "outputs": {
+    "resume": "chloe"
+   },
+   "metadata": {
+    "layout": "plain",
+    "variant": "clean",
+    "format": "txt"
+   }
+  },
+  {
+   "key": "text-calibri-like",
+   "metadata": {
+    "format": "text",
+    "what": "the real Calibri PDF's mappings: Y/Z for ti, [ and B for tf, 4 for ft, C for tt, g for fk"
+   },
+   "inputs": {
+    "text_layer": "Data engineer specializing in architecYng cloud-naYve pla[orms and real-Yme streaming. Built producYon-grade So4ware for QualiﬁcaZon workflows on Kaga and RAG/Kaga. PlaBorm & Infrastructure: Python, Kubernetes. Portfolio: hCps://portfolio.example.test"
+   },
+   "outputs": {
+    "text": "Data engineer specializing in architecting cloud-native platforms and real-time streaming. Built production-grade Software for Qualification workflows on Kafka and RAG/Kafka. Platform & Infrastructure: Python, Kubernetes. Portfolio: https://portfolio.example.test"
+   }
+  },
+  {
+   "key": "text-lowercase-g",
+   "metadata": {
+    "format": "text",
+    "what": "a ligature read as a real lower-case letter (fk -> g)"
+   },
+   "inputs": {
+    "text_layer": "Operated Kaga clusters, wrote Kaga Connect sinks and tuned Kaga Streams consumers."
+   },
+   "outputs": {
+    "text": "Operated Kafka clusters, wrote Kafka Connect sinks and tuned Kafka Streams consumers."
+   }
+  },
+  {
+   "key": "text-lowercase-y",
+   "metadata": {
+    "format": "text",
+    "what": "ti read as lower-case y"
+   },
+   "inputs": {
+    "text_layer": "Led the digital transformayon program and the optimizayon of reporting, with automayon of every release."
+   },
+   "outputs": {
+    "text": "Led the digital transformation program and the optimization of reporting, with automation of every release."
+   }
+  },
+  {
+   "key": "text-valid-words",
+   "metadata": {
+    "format": "text",
+    "what": "nothing to repair: must come back unchanged"
+   },
+   "inputs": {
+    "text_layer": "Python, Hybrid cloud, Analytics, API Gateway, PyTorch, YAML, BigQuery, eBay, iOS, k8s, C#, Yelp, Zoom, GitHub, Gong.io, 4 engineers, arr[i], Q4 2023, Synergy, Byzantine, Gauge, Rhythm, Syzygy."
+   },
+   "outputs": {
+    "text": "Python, Hybrid cloud, Analytics, API Gateway, PyTorch, YAML, BigQuery, eBay, iOS, k8s, C#, Yelp, Zoom, GitHub, Gong.io, 4 engineers, arr[i], Q4 2023, Synergy, Byzantine, Gauge, Rhythm, Syzygy."
+   }
+  },
+  {
+   "key": "text-real-brackets",
+   "metadata": {
+    "format": "text",
+    "what": "a mapped symbol next to real uses of the same symbol"
+   },
+   "inputs": {
+    "text_layer": "Built pla[orms and the pla[orms team's data[key] lookups."
+   },
+   "outputs": {
+    "text": "Built platforms and the platforms team's data[key] lookups."
+   }
+  },
+  {
+   "key": "text-single-occurrence",
+   "metadata": {
+    "format": "text",
+    "what": "a broken glyph that occurs once"
+   },
+   "inputs": {
+    "text_layer": "Shipped So4ware for three clients."
+   },
+   "outputs": {
+    "text": "Shipped Software for three clients."
+   }
+  },
+  {
+   "key": "text-unicode-ligatures",
+   "metadata": {
+    "format": "text",
+    "what": "Unicode ligature characters (NFKC)"
+   },
+   "inputs": {
+    "text_layer": "Certiﬁcation in workﬂow automation, ﬁnance and aﬃliate oﬀers."
+   },
+   "outputs": {
+    "text": "Certification in workflow automation, finance and affiliate offers."
+   }
+  },
+  {
+   "key": "text-line-break-hyphens",
+   "metadata": {
+    "format": "text",
+    "what": "words hyphenated across a line break, and a real compound"
+   },
+   "inputs": {
+    "text_layer": "Ran produc-\ntion systems for real-\ntime analytics and optimiza-\ntion."
+   },
+   "outputs": {
+    "text": "Ran production systems for real-time analytics and optimization."
+   }
+  }
+ ]
+}

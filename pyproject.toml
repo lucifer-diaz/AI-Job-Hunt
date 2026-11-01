@@ -35,7 +35,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.4,<9", "pytest-asyncio>=1.1,<2", "ruff>=0.12,<1", "pytest-cov>=7,<8"]
+dev = ["pytest>=8.4,<9", "pytest-asyncio>=1.1,<2", "ruff>=0.12,<1", "pytest-cov>=7,<8",
+       "fonttools>=4.50,<5"]  # fonttools: scripts/build_resume_fixtures.py only
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

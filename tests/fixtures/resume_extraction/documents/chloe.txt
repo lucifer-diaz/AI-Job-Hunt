@@ -1,0 +1,28 @@
+Chloe Fitzgerald
+Engineering Manager, Platform
+Denver, CO | chloe.fitzgerald@example.test | +1 720 555 0117 | https://chloefitz.example.test
+
+About
+Engineering manager who builds platform teams and the internal tooling they rely on. Known for attention to developer experience, pragmatic architecture and calm incident leadership.
+
+Areas of Expertise
+Engineering Leadership, Platform Strategy, Incident Management, API Gateway Design, Go, Kubernetes, Terraform, Tessellate DSL
+
+Career History
+Engineering Manager, Platform | Adatum Cloud | Denver, CO | Apr 2019 – Present
+• Grew the platform organization from 6 to 22 engineers across 3 teams with 92% retention.
+• Launched an internal developer portal that reduced service setup time from 2 weeks to 1 day.
+• Ran the API gateway consolidation that retired 11 bespoke proxies and simplified on-call.
+
+Staff Software Engineer | Wingtip Toys | Boulder, CO | Sep 2014 – Mar 2019
+• Designed the order workflow engine in Go that handled the holiday peak of 18,000 orders per minute.
+• Introduced service level objectives and an incident review process adopted company-wide.
+• Wrote the settings service and its YAML schema used by 40 microservices.
+
+
+Selected Projects
+Pipeline Lint: Open source linter for CI workflow files with 1,200 GitHub stars.
+On-call Atlas: Shift scheduling tool that balances on-call load across time zones.
+
+Academic Background
+B.S. Electrical Engineering | Mesa State Institute | 2008 – 2012
