@@ -1,48 +1,72 @@
-# Job Hunt OS — Commercial Licensing
+# Job Hunt OS — Licensing and Editions
 
-Job Hunt OS is **source-available for noncommercial purposes** under the [PolyForm Noncommercial License 1.0.0](LICENSE). It is **not OSI-defined open-source software** because commercial use is restricted.
+Job Hunt OS is **source-available** under the [PolyForm Noncommercial License 1.0.0](LICENSE). It is **not open
+source** as the Open Source Initiative defines it, because commercial use needs a separate license.
 
-**Rohan Roy**, the individual project steward, reserves the right to offer other terms, including paid hosted, SaaS, business and enterprise versions. Public GitHub access **does not** grant those commercial rights.
+**Rohan Roy**, the project steward, holds the rights needed to offer the software under other terms as well, including
+paid hosted, business and enterprise editions. Public access to the repository does not grant those commercial rights.
 
-## Examples of use under the public license
+## Editions
 
-Subject to the full license terms, examples of permitted purposes include:
+| Edition | Where it lives | License |
+| --- | --- | --- |
+| **Community edition** | This public repository | PolyForm Noncommercial 1.0.0 |
+| **Commercial edition** (paid hosting, business or enterprise use) | Offered by Rohan Roy; commercial-only additions may live in a separate private repository | A separate written commercial license |
 
-- Learning from the code, personal experiments and noncommercial research.
-- Self-hosting for personal, noncommercial job hunting without anticipated commercial application.
-- Building or distributing noncommercial forks while preserving the license and required notices.
-- Uses expressly permitted for qualifying noncommercial organizations by the actual PolyForm license.
+How the two stay possible together:
 
-## Examples that require separate written commercial permission
+- **One owner of the licensing rights.** Rohan Roy wrote the original code and, through the
+  [Contributor License Agreement](CLA.md), receives a sublicensable, nonexclusive license to every accepted
+  contribution. That lets him publish the same code under the public license and license it commercially at the same
+  time, without asking each contributor again.
+- **The public license does not limit the licensor.** PolyForm Noncommercial binds people who use the software under
+  it; it does not stop the licensor from granting other licenses ("These terms do not ... prevent the licensor from
+  granting licenses to anyone else").
+- **Commercial-only code stays out of this repository.** Features that exist only in the paid edition belong in a
+  private repository or package that depends on the community edition, so nothing in this repository is ever
+  released under the public license by accident.
+- **The community edition can be relicensed later.** The CLA also allows contributions to be distributed under any
+  later public license, including an OSI-approved open-source license. If the community edition is ever moved to such
+  a license, that applies to versions published from then on; copies already received under PolyForm Noncommercial
+  keep their original terms.
 
-- Offering Job Hunt OS as a paid, freemium, ad-supported, white-label, subscription or otherwise commercially advantageous hosted service.
-- Packaging, sublicensing or selling access to Job Hunt OS or substantial portions of it.
-- Providing the software as part of a commercial product or as a paid service to third parties.
-- Running it for a for-profit business's operational benefit, including internal recruitment or consulting, if that use is outside the noncommercial license.
-- Redistributing a modified commercial edition, even if the original source is publicly accessible.
+## Uses the public license allows
 
-These examples are **guidance**, not additional permissions, and do not modify the legal meaning of the standard LICENSE. If in doubt, request written permission before using the code for business purposes.
+Subject to the full license text, for example:
 
-## Project steward's commercial rights
+- learning from the code, personal experiments and noncommercial research;
+- self-hosting for your own job hunt, without any anticipated commercial application;
+- building and sharing noncommercial forks, with the license and required notices kept;
+- use by charitable, educational, public research, public safety or health, environmental protection or government
+  organizations, which the license expressly permits whatever their funding.
 
-Rohan Roy retains the ability to license work he owns independently. Under the separate [Contributor License Agreement](CLA.md), accepted contributors can grant Rohan Roy a perpetual, nonexclusive, royalty-free, sublicensable right to commercialize and relicense their Contributions. This enables a paid hosted product without obtaining a new permission from each contributor for every deployment.
+## Uses that need a commercial license
 
-Third-party libraries, bundled media, data, model licenses and other independently licensed content **are not relicensed** by this project's public license or CLA. Their independent license conditions continue to apply.
+For example:
 
-## Request a commercial license
+- offering Job Hunt OS, or a modified version, as a paid, freemium, ad-supported, white-label or subscription service;
+- selling, sublicensing or bundling access to the software or substantial parts of it;
+- using it to provide paid services to others, such as recruiting, staffing, career coaching or consulting;
+- use by a for-profit business for its own operations, where that use is not covered by the public license.
 
-To start a commercial-license discussion, open a [Commercial Licensing inquiry](https://github.com/triump0870/AI-Job-Hunt/issues/new?template=commercial-license-request.md) in the project GitHub repository. Share only nonconfidential details (organization, intended use, hosting model, and whether you expect to redistribute the software); Rohan Roy can arrange a private channel for pricing and contract details. Do not put sensitive commercial information or personal data in a public issue.
+These examples are guidance, not extra permissions or restrictions. The [LICENSE](LICENSE) text controls; this page
+does not change it. If you are unsure, ask before using the software for business purposes.
 
-No commercial rights are granted by merely opening an issue, receiving an informal reply, or making a payment without an executed license. A separate written commercial license must be authorized by Rohan Roy or a person he has explicitly appointed in writing.
+## Third-party components
+
+Libraries, fonts, models, data and other independently licensed material are **not** relicensed by this project's
+license, the CLA or a commercial license. Their own terms continue to apply. See
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+## Requesting a commercial license
+
+Open a [commercial licensing inquiry](https://github.com/triump0870/AI-Job-Hunt/issues/new?template=commercial-license-request.md).
+Share only non-confidential details (organization, intended use, hosting model, scale); pricing and contract details
+are arranged privately.
+
+No commercial rights come from opening an issue, an informal reply or a payment alone. A commercial license exists only
+once a written agreement is signed by Rohan Roy or a person he has appointed in writing.
 
 ## Trademarks
 
-Code rights and branding rights are separate. The Job Hunt OS name and project branding may not be used to imply an official, endorsed, or affiliated service without written permission. See [TRADEMARKS.md](TRADEMARKS.md).
-
-## License precedence
-
-The full [LICENSE](LICENSE) controls public software rights. This page explains the intended commercial boundary but does not amend the standard PolyForm license. Commercial licenses and contributor agreements are separate contracts between their signatories.
-
-## Current rights holder
-
-The commercial-licensing contact and proposed licensor is **Rohan Roy, personally**. This statement applies only to code and intellectual property he owns or has obtained valid licensing rights to; it does not override third-party or prior contributor copyrights. A future company may license the work only through appropriate authorization, assignment, or sublicensing.
+Rights in the code and rights in the name are separate. See [TRADEMARKS.md](TRADEMARKS.md).

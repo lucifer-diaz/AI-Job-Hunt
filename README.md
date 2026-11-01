@@ -3610,6 +3610,6 @@ The project's original code is available under the [PolyForm Noncommercial Licen
 
 We welcome community contributions. Please read [CONTRIBUTING.md](CONTRIBUTING.md) and sign the [Contributor License Agreement](CLA.md) before any substantive contribution is merged. Contributors retain copyright to their own original work while granting Rohan Roy personally the right to operate paid hosted and other commercially licensed versions without royalties.
 
-For business licensing, see [COMMERCIAL-LICENSING.md](COMMERCIAL-LICENSING.md). For branding, see [TRADEMARKS.md](TRADEMARKS.md). Third-party dependencies retain their own licenses.
+This repository is the **community edition**. A commercial edition (paid hosting, business and enterprise use) is licensed separately; see [COMMERCIAL-LICENSING.md](COMMERCIAL-LICENSING.md) for how the editions relate. For branding, see [TRADEMARKS.md](TRADEMARKS.md).
 
-The license applies to the portions of Job Hunt OS for which Rohan Roy or contributing licensors have the appropriate rights. Third-party dependencies, third-party materials, and prior contributor work remain subject to their applicable terms.
+Third-party dependencies keep their own licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

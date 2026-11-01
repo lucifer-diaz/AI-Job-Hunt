@@ -18,12 +18,15 @@ Thanks for helping improve Job Hunt OS. We welcome bug reports, documentation, r
 ## Local development and checks
 
 ```bash
-python -m pip install -e '.[dev]'
+python -m pip install -r requirements.txt 'pytest>=8.4,<9' 'pytest-asyncio>=1.1,<2' 'ruff>=0.12,<1' 'pytest-cov>=7,<8'
 python -m pytest
 python -m ruff check app tests
+npm ci
+npx vitest run
 ```
 
-Provide commands and results actually run; never claim full-suite success if environment-dependent tests were skipped. Use disposable databases for migration checks and avoid production API credentials in tests.
+Run both suites: `pytest` for the backend and `npx vitest run` for `app/static/*.js`. Ranking and cleanup tests need
+PostgreSQL (`TEST_DATABASE_URL`) and are skipped on SQLite. Provide commands and results actually run; never claim full-suite success if environment-dependent tests were skipped. Use disposable databases for migration checks and avoid production API credentials in tests.
 
 ## Project-specific engineering rules
 
@@ -31,7 +34,7 @@ Provide commands and results actually run; never claim full-suite success if env
 - All external provider calls go through the instrumentation layer.
 - No direct cross-user database access; use tenant-aware APIs and retrieval constraints.
 - Keep verified candidate evidence and approved resumes immutable at the applicable approval boundary.
-- Preserve the existing MCP/application queue. Submissions require durable pre-submit claims and human authorization; no CAPTCHA bypass or misleading applied state.
+- Preserve the existing MCP/application queue. Every submission takes a pre-submit claim (`apply_queue.begin_submission`); only the guarded path may click Submit, and only for an account that switched auto submit on; everything else is submitted by a person. No CAPTCHA bypass or misleading applied state.
 - Gmail read access is scoped, and collected third-party content is untrusted.
 - Never add uninstrumented scraping, stealth bypass, credential capture or undisclosed telemetry.
 

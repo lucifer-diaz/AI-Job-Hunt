@@ -1,84 +1,121 @@
-# Job Hunt OS — Contributor License Agreement
+# Job Hunt OS — Individual Contributor License Agreement
 
-This **nonexclusive** Contributor License Agreement (CLA) is separate from the public PolyForm Noncommercial license. Its purpose is to let Rohan Roy commercialize accepted contributions, including through paid hosted services, while contributors retain copyright in their own original work. This agreement takes effect for a contributor only upon an authorized signature or properly recorded affirmative electronic acceptance. Professional legal review is strongly recommended before the first acceptance.
+**Version 1.0 — 2026-11-01**
 
-**Project:** Job Hunt OS (`https://github.com/triump0870/AI-Job-Hunt`)
+This **nonexclusive** Contributor License Agreement ("Agreement") is separate from the public PolyForm Noncommercial
+License 1.0.0 under which Job Hunt OS is published. It lets the Steward offer accepted Contributions both in the free
+public edition and in paid, hosted or otherwise commercially licensed editions, while each Contributor keeps the
+copyright in their own original work.
 
-**Project Steward / Grantee:** Rohan Roy, acting in his individual capacity, together with lawful successors and permitted assigns ("Steward").
+**Project:** Job Hunt OS (`https://github.com/triump0870/AI-Job-Hunt`) and any successor repositories, forks or
+editions maintained by the Steward (the "Project").
 
-**Contributor:** The individual or organization identified in the signature/acceptance record ("Contributor").
+**Steward:** Rohan Roy, acting in his individual capacity, together with his lawful successors and permitted assigns
+("Steward").
 
-**Effective date:** The date of the Contributor’s verified signature or affirmative electronic acceptance, as recorded by the Steward.
+**Contributor:** The individual identified in the signature or acceptance record below ("Contributor"). Contributions
+owned by an employer or other organization also need that organization's written authority (Section 6).
 
-## 1. Scope
+**Effective date:** The date of the Contributor's signature or recorded affirmative electronic acceptance.
 
-A "Contribution" is original code, documentation, tests, designs, or other copyrightable material that Contributor intentionally submits to Job Hunt OS for inclusion, including subsequent contributions sent through a GitHub account identified below, unless specifically designated "Not a Contribution" before acceptance. Submission alone does not establish this Agreement; it must be affirmatively signed or accepted using an approved, auditable electronic-signature process.
+## 1. Contributions
 
-## 2. Copyright license to the Steward
+A "Contribution" is any original code, documentation, test, design or other copyrightable material that Contributor
+intentionally submits to the Project for inclusion, through any GitHub account named in the acceptance record, on or
+after the effective date. Material clearly marked "Not a Contribution" before it is accepted is excluded. This
+Agreement is formed only by Contributor's signature or affirmative electronic acceptance; submitting material alone
+does not form it.
 
-Contributor grants Steward a **perpetual, worldwide, nonexclusive, irrevocable (subject to applicable law), fully paid-up, royalty-free, transferable and sublicensable** copyright license to use, reproduce, modify, prepare derivative works of, distribute, make available, publicly display and perform, and otherwise exploit each Contribution, in source and object code form.
+## 2. Copyright license
 
-The grant expressly includes the right, **without further consent, attribution beyond applicable mandatory law, notice, royalties, revenue sharing, or payment**, to:
+Contributor grants the Steward a perpetual, worldwide, nonexclusive, irrevocable, fully paid-up, royalty-free,
+transferable and sublicensable (through multiple tiers) copyright license to use, reproduce, modify, prepare
+derivative works of, distribute, make available, publicly display, publicly perform and otherwise exploit each
+Contribution, in source and object form.
 
-- combine Contributions with other proprietary or publicly licensed software;
-- operate commercial, subscription, managed, SaaS, hosted, white-label and enterprise versions of Job Hunt OS;
+Without further consent, notice, royalties, revenue sharing or payment, this license includes the right to:
+
+- combine Contributions with proprietary or publicly licensed software;
+- operate commercial, subscription, managed, hosted, SaaS, white-label and enterprise versions of the Project;
 - sell licenses and services based on or incorporating Contributions;
-- issue commercial sublicenses to customers, hosting partners and distributors;
-- offer Contributions under the existing noncommercial license or **any other future license**, including closed-source proprietary or OSI-approved open-source licenses;
-- sublicense or transfer the above rights to a successor or purchaser of the Project or its business.
+- grant sublicenses to customers, hosting partners and distributors;
+- distribute Contributions under the Project's current public license, under any later public license (including an
+  open-source license approved by the Open Source Initiative), and under proprietary licenses, at the same time or at
+  different times, for different editions of the Project;
+- transfer or sublicense these rights to a successor to, or purchaser of, the Project or the business operating it.
 
-The Steward can make these choices independently, including monetization and license changes; Contributor approval is not needed for each use.
+The Steward decides these matters independently; Contributor's approval is not needed for any particular use.
 
-## 3. Contributor ownership and rights
+## 3. Patent license
 
-Contributor retains copyright and ownership of their original Contributions, subject to the licenses they have granted. This Agreement **does not assign exclusive ownership** of Contributions to the Steward. Contributor remains free to use and license their own independently owned Contributions elsewhere, subject to third-party rights and contracts. Contributor receives **no equity, royalties, revenue share or partnership interest** in the Steward's commercial business merely by contributing.
+Contributor grants the Steward, and every recipient of software distributed by or under authority of the Steward, a
+perpetual, worldwide, nonexclusive, royalty-free, irrevocable (except as stated in this Section), transferable and
+sublicensable patent license to make, have made, use, offer to sell, sell, import and otherwise transfer the
+Contribution, alone or combined with the Project as it stood when the Contribution was submitted. The license covers
+only patent claims Contributor owns or can license that are necessarily infringed by the Contribution alone or by that
+combination.
 
-## 4. Patent rights
+If a recipient starts patent litigation alleging that a Contribution, or the Project as combined with it, infringes a
+patent, the patent licenses that recipient received under this Section for that Contribution end on the date the
+litigation is filed.
 
-Contributor grants Steward and its sublicensees a perpetual, worldwide, nonexclusive, royalty-free, irrevocable (except as provided below), transferable patent license to make, have made, use, offer for sale, sell, import, deploy and otherwise transfer Contributions, limited to patent claims Contributor owns or controls that are necessarily infringed by the Contribution alone or its combination with the Project as submitted. This does not license claims infringed only by unrelated later combinations. A patent retaliation clause, if desired, should be added only after counsel review.
+## 4. What Contributor keeps
 
-## 5. Authorship, attribution and moral rights
+Contributor keeps the copyright in their original Contributions and may use and license them to anyone else. This
+Agreement does not assign ownership and gives the Steward no exclusive rights. Contributor receives no equity,
+royalties, revenue share, employment, agency or partnership interest by contributing.
 
-The Steward may adapt, combine, edit or remove accepted Contributions and use them commercially without additional author approval. To the extent local law permits, Contributor agrees not to assert moral rights against uses authorized by this Agreement, while retaining any rights that cannot lawfully be waived. Nothing in this clause authorizes deliberate false attribution in violation of applicable law. Contributor credit may be given in project history or CONTRIBUTORS files, but is not a condition on commercial operation except where legally required.
+## 5. Moral rights and attribution
 
-## 6. Authority and third-party materials
+The Steward may adapt, combine, edit or remove accepted Contributions. To the extent the law allows, Contributor waives,
+or agrees not to assert, moral rights against uses this Agreement permits; rights that cannot lawfully be waived are
+kept. Nothing here permits false attribution. Credit may be given in the Project history or a contributors file, but
+is not a condition of any use except where the law requires it.
 
-Contributor represents, to the best of their knowledge, that:
+## 6. Contributor's representations
 
-1. They own the rights being licensed or have documented authority from their employer or other rights holder.
-2. They disclose any third-party, copied, generated or separately licensed material and its source/license before acceptance.
-3. Their Contribution is not knowingly subject to a restriction inconsistent with this Agreement or with the Steward's commercial licensing rights.
-4. They will not submit passwords, secrets, customer data or confidential employer information.
-5. They will promptly notify maintainers if any representation becomes inaccurate.
+Contributor represents that, to the best of their knowledge:
 
-If the Contribution is owned by an employer or other organization, an **authorized corporate CLA or written permission** may also be required. A personal CLA cannot license company-owned material without authority.
+1. each Contribution is their original work, or they have the right to license it under this Agreement;
+2. if an employer or other organization has rights in a Contribution, it has given written permission to submit it
+   under this Agreement, or has signed a corporate agreement with the Steward;
+3. any third-party, copied, AI-generated or separately licensed material in a Contribution is identified, with its
+   source and license, when the Contribution is submitted;
+4. no Contribution is knowingly subject to an obligation inconsistent with this Agreement (for example a license that
+   would require the Steward's proprietary editions to be released under that license);
+5. no Contribution contains passwords, secrets, personal data or confidential information.
 
-## 7. No obligation to use; no warranties
+Contributor will notify the Steward promptly if any of these representations becomes inaccurate.
 
-Steward has no obligation to accept, distribute or maintain any Contribution. Except for the express authority representations above, each Contribution is provided as is, without warranties to the extent allowed by law. Nothing creates employment, agency, partnership, confidentiality or a compensation relationship.
+## 7. No obligation; no warranty
 
-## 8. Governing law, amendment and records
+The Steward need not accept, use, distribute or maintain any Contribution. Except for Section 6, Contributions are
+provided "as is", without warranties or conditions of any kind, to the extent the law allows.
 
-**Governing law and venue:** This Agreement is governed by the laws of India. Subject to mandatory applicable law, courts of competent jurisdiction in Mumbai, Maharashtra, India have exclusive jurisdiction over disputes arising from this Agreement. Contributors residing in other jurisdictions may have mandatory protections that override this choice; the Steward should have cross-border enforceability reviewed by counsel.
+## 8. Changes to this Agreement
 
-Any change to this Agreement applies only when the Contributor affirmatively accepts the new terms; previously granted rights cannot be silently withdrawn. The Steward will keep an auditable record of accepted agreements, dates, identities and the contributions covered. Privacy policy and record retention must be reviewed before launching a signature service.
+The Steward may publish new versions of this Agreement. A new version applies to a Contributor only after they accept
+it. Rights already granted under an accepted version stay in force.
 
-## Signature and acceptance
+## 9. Governing law and venue
 
-By signing, Contributor agrees to the grants above and confirms authority to submit their Contributions.
+This Agreement is governed by the laws of India. The courts at Mumbai, Maharashtra, India have exclusive jurisdiction
+over disputes arising from it, except where mandatory law that applies to the Contributor provides otherwise.
 
-- Full legal name / legal entity: ______________________________
-- GitHub account(s): _________________________________________
-- Email: ____________________________________________________
-- Employer/organization, if applicable: _______________________
-- Authorized signatory and title, for entities: ______________
-- Signature (physical or verified electronic): _______________
-- Date: _____________________________________________________
+## 10. Entire agreement
 
-**Steward acceptance record:** __________________________________
+This Agreement is the entire agreement between Contributor and the Steward about Contributions. If any provision is
+unenforceable, the rest remains in effect.
 
-**Signature record verification:** Keep the signed/accepted agreement, date/time, legal identity, GitHub handle, version of this CLA, affected contribution/PR identifiers, and proof of assent in access-controlled records. A PR checkbox or Git commit sign-off is **not** by itself an executed CLA.
+## Acceptance
 
-**No signature from Rohan Roy on each individual CLA is required for the copyright grant to be proposed, but the record of project acceptance should be retained.** Consult local counsel on the procedure required for contract formation and enforceability.
+By signing or electronically accepting this Agreement, Contributor agrees to it for all present and future
+Contributions.
 
-> For individual contributors, preserve evidence of an actual signature or affirmative electronically recorded assent. Do **not** rely solely on a casual PR comment, unchecked checkbox or ordinary `Signed-off-by` line as a substitute for an enforceable CLA.
+- Full legal name: ______________________________
+- GitHub account(s): ______________________________
+- Email: ______________________________
+- Employer or organization with rights in the Contributions, if any: ______________________________
+- Agreement version accepted: 1.0
+- Signature (physical or verified electronic): ______________________________
+- Date: ______________________________

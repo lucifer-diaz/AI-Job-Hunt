@@ -1,45 +1,70 @@
-# Job Hunt OS — publication and legal adoption checklist
+# Job Hunt OS — publication and licensing checklist
 
-**Prepared for:** Rohan Roy (individual project steward)  
-**Public license:** PolyForm Noncommercial License 1.0.0  
-**Status:** Owner details filled and document pack assembled. Publishing readiness and contributor contract enforceability are **not** yet verified.
+**For:** Rohan Roy (project steward)
+**Public license:** PolyForm Noncommercial License 1.0.0 (community edition)
+**Commercial edition:** separate written licenses from Rohan Roy (see [COMMERCIAL-LICENSING.md](COMMERCIAL-LICENSING.md))
 
-## Completed in this document pack
+This is a release-control checklist, not legal advice.
 
-- [x] Identify **Rohan Roy, personally**, as proposed public licensor and commercial CLA beneficiary for rights he actually owns or controls.
-- [x] Select the noncommercial public-use / separate-commercial-license business model.
-- [x] Include the full standard, unmodified PolyForm Noncommercial License 1.0.0 text.
-- [x] Add a separate Required Notice naming Rohan Roy without asserting ownership of unrelated third-party code.
-- [x] Provide a CLA granting Rohan Roy broad nonexclusive commercial hosting, sublicensing and relicensing rights; contributors retain their original copyright.
-- [x] Draft contribution, public commercial licensing, trademark, third-party and security policies, plus PR and inquiry templates.
+## Done
 
-## Legal review required before first contributor signature
+- [x] Rohan Roy named as the public licensor and the CLA's grantee.
+- [x] Model chosen: noncommercial public edition, separately licensed commercial edition.
+- [x] `LICENSE` holds the standard, unmodified PolyForm Noncommercial 1.0.0 text.
+- [x] `NOTICE` holds the `Required Notice:` line the license asks distributors to pass on.
+- [x] License declared in package metadata (`pyproject.toml`, `package.json`).
+- [x] CLA (version 1.0) grants a sublicensable copyright and patent license, including relicensing under future public
+      or proprietary licenses, so both editions can carry contributed code.
+- [x] Contribution, commercial licensing, trademark, third-party and security policies; PR and inquiry templates;
+      README license section.
+- [x] Dependency license audit (2026-11-01): no GPL, AGPL, SSPL or noncommercial dependency; results in
+      [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+- [x] Authorship check (2026-11-01, all branches): every commit is by Rohan Roy (as `Rohan Roy` or `triump0870`, same
+      email) or an AI coding assistant working for him (`Claude`, and `Co-Authored-By: Claude` trailers). No other
+      person has contributed, so no other copyright holder needs to grant rights in the existing code.
 
-- [ ] An India-qualified IP lawyer checks the CLA, including governing law and Mumbai venue, nonexclusive license and patent rights, future transfer to a company, author moral rights, contributor ownership, irrevocability and enforcement for non-Indian contributors.
-- [ ] Verify whether any code was written as an employee, under work-for-hire, for a prior company/client, by a contractor, or by other coauthors. Obtain assignments, grants or permission from all copyright holders as needed. Naming Rohan Roy in NOTICE does **not** transfer other people's copyrights.
-- [ ] Decide whether organization-owned contributions need a separately signed corporate CLA or employer signatory/authorization, and obtain it before merging.
-- [ ] Deploy an auditable signature process: qualified electronic signature or signed agreement with contributor identity/GitHub account, timestamp, document version and contribution mapping. Store records securely. Do **not** treat PR checkbox or DCO sign-off as a signed CLA.
-- [ ] Review a privacy notice for retaining contributor signature/contact metadata and delete/export procedures as required.
-- [ ] If Rohan Roy later transfers hosting to a company, document the actual assignment or sublicense and control of relevant marks/domains. The individual CLA does not automatically prove company ownership.
+## Before accepting the first outside contribution
 
-## License compliance and publishing readiness
+- [ ] Have an India-qualified IP lawyer review the CLA: governing law and Mumbai venue, the patent license and its
+      litigation clause, moral-rights waiver, transfer to a future company, irrevocability, and enforceability for
+      contributors abroad.
+- [ ] Decide on a corporate CLA for contributions owned by employers, and get one signed before merging such work.
+- [ ] Set up an auditable signing process (for example the CLA Assistant GitHub App, or an e-signature service) that
+      records identity, GitHub account, CLA version, date and the PRs covered. A PR checkbox or a `Signed-off-by` line
+      is not a signed CLA.
+- [ ] Publish a short privacy note on how signature records are kept, and for how long.
+- [ ] Never merge a copyrightable outside contribution without a matching signed CLA record: one unsigned contribution
+      in the code would stop that code from being offered commercially.
 
-- [ ] Review the intended commercial scope: PolyForm's standard text explicitly permits certain nonprofit, educational, research and government organizations regardless of source of funding. The explanatory policy must not purport to override that standard text.
-- [ ] Audit licenses of every direct/transitive dependency, vendored asset, font, model, data set, generated code, template and prior contributor snippet; fulfill any attribution, patent, copyleft and source-offer requirements.
-- [ ] Complete `THIRD_PARTY_NOTICES.md` from the real audit results; do not publish it as if licenses are already verified.
-- [ ] Audit complete Git history and working tree for secrets/credentials, `.env` files, tokens, private keys, cookies, resumes, personal data, research datasets and employer secrets. **Rotate** any previously exposed secrets and rewrite history if required.
-- [ ] Confirm `.gitignore`, CI, sample configs and container images exclude secrets and browser profiles. Run a dependency vulnerability scan, tests, and packaging checks.
-- [ ] Enable GitHub Issues for licensing inquiries; verify `.github/ISSUE_TEMPLATE/commercial-license-request.md` renders and private contact can be arranged.
-- [ ] Enable **GitHub private vulnerability reporting** and test the `SECURITY.md` destination. If not available, establish a verified private security contact before going public.
-- [ ] Add `README-LICENSE-SECTION.md` content to the repository README (not as a second README).
-- [ ] Copy the other files (LICENSE, NOTICE, CLA.md, CONTRIBUTING.md, COMMERCIAL-LICENSING.md, TRADEMARKS.md, SECURITY.md, THIRD_PARTY_NOTICES.md, .github templates) into the repository in a **reviewed PR**, not directly to `main`.
-- [ ] If accepting actual commercial users, prepare a commercial license agreement and order form separate from the public-use policy; agree to service/support, data processing, liability and jurisdiction terms.
-- [ ] Obtain final approval from Rohan Roy before changing repository visibility to Public; then announce source-available (not OSI open source) terms accurately.
+## Before making the repository public
 
-## Contact configuration
+- [ ] Confirm no part of the code was written for an employer or client who could own it (employment contracts,
+      work-for-hire, client agreements).
+- [ ] AI-assisted code: much of the history was written with an AI coding assistant under Rohan Roy's direction. The
+      assistant's provider assigns its outputs to the user, but how far copyright protects AI-generated material
+      varies by country. Ask the lawyer whether this affects enforcing the license, and keep the commit history as a
+      record of human direction and review.
+- [ ] Scan the full Git history for secrets, `.env` files, tokens, private keys, cookies, resumes and personal data;
+      rotate anything found and rewrite history if needed.
+- [ ] Confirm `.gitignore`, CI, sample configuration and container images exclude secrets and browser profiles.
+- [ ] Create the `commercial-license` label (the inquiry template applies it) and check the template renders.
+- [ ] Enable GitHub private vulnerability reporting and test the link in [SECURITY.md](SECURITY.md).
+- [ ] Final approval from Rohan Roy, then describe the project as **source-available**, never "open source".
 
-- **Commercial requests:** public GitHub licensing issue template, followed by private contracting as necessary; optional dedicated email can be added later.
-- **Security:** GitHub private vulnerability reporting **must be enabled** before release or a verified private alternative provided.
-- **Contributor signatures:** arrange an auditable CLA signature and verification workflow before accepting copyrightable pull requests.
+## Before selling the commercial edition
 
-This checklist is not legal advice or proof that any software copyright, trademark or third-party right is owned by Rohan Roy. It is a release-control checklist.
+- [ ] Prepare a commercial license agreement and order form (scope, users, hosting, support, data processing,
+      liability, jurisdiction), separate from the public license.
+- [ ] Keep paid-only features in a private repository or package, never in this public repository.
+- [ ] If a company will run the commercial edition, give it the rights in writing (an assignment or a license from
+      Rohan Roy, covering the code, the CLA rights and the name and domains). The CLA lets those rights be transferred,
+      but the transfer has to be documented.
+- [ ] Re-run the dependency audit and pass on the notices third-party licenses require.
+- [ ] Consider registering the "Job Hunt OS" name as a trademark before marketing a paid service under it.
+
+## If the community edition should later become open source
+
+- [ ] Choose the license (for example AGPL-3.0, which keeps hosted competitors from closing their changes, or a
+      permissive one). The CLA already allows it for contributed code.
+- [ ] Update `LICENSE`, `NOTICE`, the package metadata and these documents in one release, and say from which version
+      the new license applies; earlier releases keep PolyForm Noncommercial.
