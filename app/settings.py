@@ -418,6 +418,9 @@ class Settings(BaseSettings):
     # A window handed over for a CAPTCHA is asked this often whether the person solved it; the run then continues by
     # itself (a reCAPTCHA answer lasts about two minutes, so this stays short).
     application_challenge_poll_seconds: int = 5
+    # A window handed over for fields only the person can fill continues by itself once every one of them holds
+    # something that has not changed for this long (they stopped typing). 0: as soon as they are all filled.
+    application_fields_settle_seconds: int = 20
     # A form read in a browser-use session is kept this long while the run waits for an answer in the Knowledge bank,
     # so it is filled in place afterwards (the session's own time is extended to match; after it, it is read again).
     application_input_hold_minutes: int = 60

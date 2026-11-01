@@ -391,6 +391,7 @@ mark.m-gap{background:#fff3e0;color:var(--warn);padding:0 2px;border-radius:3px}
 .empty-title{font-size:15px;font-weight:600;margin-bottom:6px}
 .banner{display:flex;gap:10px;align-items:center;border:1px solid var(--brand-line);background:var(--brand-softer);border-radius:12px;padding:11px 14px;font-size:12.5px;color:var(--ink2)}
 .banner.warn{border-color:var(--warn-line);background:var(--warn-soft);color:var(--warn-deep)}
+.banner.stack{flex-direction:column;align-items:stretch;gap:4px}
 pre.plain{white-space:pre-wrap;font-family:var(--sans);font-size:13px;line-height:1.6;margin:0;color:var(--ink2)}
 
 @media (max-width:900px){

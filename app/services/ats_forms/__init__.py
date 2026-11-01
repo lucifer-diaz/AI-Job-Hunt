@@ -33,7 +33,17 @@ ACCOUNT_REQUIRED = "ACCOUNT_REQUIRED"  # the site wants a new account first: a p
 POSTING_CLOSED, NO_FORM, UNSUPPORTED = "POSTING_CLOSED", "NO_FORM", "UNSUPPORTED_SITE"
 HUMAN_BLOCKERS = (LOGIN_REQUIRED, OTP_REQUIRED, CAPTCHA, ACCOUNT_REQUIRED)
 OTP_MARKERS = ("one-time code", "one time code", "verification code", "enter the code", "6-digit code",
-               "security code", "two-factor", "2fa", "one-time passcode", "authenticator app")
+               "8-character code", "security code", "two-factor", "2fa", "one-time passcode", "authenticator app")
+# A code the site emailed to finish the application (Greenhouse after Submit: "A verification code was sent to …").
+EMAIL_CODE_MARKERS = ("code was sent to", "code has been sent to", "sent a code to", "emailed you a code",
+                      "check your email for", "code to confirm")
+EMAIL_CODE_REQUIRED = "EMAIL_CODE_REQUIRED"
+
+
+def asks_email_code(text: str | None) -> bool:
+    """The page asks for a code the site emailed (not an authenticator or SMS code a person keeps elsewhere)."""
+    lowered = " ".join((text or "").lower().split())
+    return "code" in lowered and any(marker in lowered for marker in EMAIL_CODE_MARKERS)
 SIGNUP_MARKERS = ("create an account", "create account", "create your account", "sign up", "register now",
                   "confirm password", "verify password", "re-enter password", "new account")
 # A field that makes the candidate attest, consent or agree to something. Never answered from a saved answer alone in

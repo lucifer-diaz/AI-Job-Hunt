@@ -681,3 +681,93 @@ def test_two_captchas_on_a_page_are_answered_only_when_both_are(runner, tmp_path
     assert page["captcha"] == {"present": True, "solved": False, "kind": "recaptcha"}
     assert one["solved"] is False  # one of two answered: still a CAPTCHA
     assert both == {"present": True, "solved": True, "kind": "recaptcha"}
+
+
+RELOCATION_QUESTION = "Are you open to relocation for this role?"
+START_QUESTION = "When could you start?"
+# The new Greenhouse board's markup in miniature: the resume input's own label is its button ("Attach"), the question
+# is the group's heading. Answering the Python question reveals two more required questions (the page grows).
+GROWING_PAGE = f"""<!doctype html><html><head><title>Apply</title></head><body>
+<form id="apply" action="/apply/submit" method="post">
+  <div class="field"><label for="name">Full name *</label><input type="text" id="name" name="name" required></div>
+  <div class="field"><label for="mail">Email address *</label><input type="email" id="mail" name="mail" required></div>
+  <div class="file-upload" role="group" aria-labelledby="upload-label-resume">
+    <div id="upload-label-resume">Resume/CV<span>*</span></div>
+    <label for="resume" class="button">Attach</label><input type="file" id="resume" name="resume">
+  </div>
+  <div class="field"><label for="py">{aps.PYTHON_QUESTION} *</label><input type="text" id="py" name="py" required></div>
+  <div id="more"></div>
+  <button type="submit">Submit application</button>
+</form>
+<script>
+document.getElementById('py').addEventListener('input', function () {{
+  if (document.getElementById('reloc')) return;
+  document.getElementById('more').innerHTML =
+    '<div class="field"><label for="reloc">{RELOCATION_QUESTION} *</label><input type="text" id="reloc" name="reloc" required></div>' +
+    '<div class="field"><label for="start">{START_QUESTION} *</label><input type="text" id="start" name="start" required></div>';
+}});
+</script></body></html>""".encode()
+
+
+def test_a_page_that_grows_in_the_window_uses_and_saves_answer_library_questions(runner, pg_sessions, pg_engine,
+                                                                                 monkeypatch, tmp_path):
+    """The resume input labelled "Attach" in a "Resume/CV *" group is the resume, and is attached. Questions the page
+    shows only after the person typed in the window are looked up in the Answer library (relocation: answered, filled)
+    or saved there for the person (start date: listed with the run's questions)."""
+    from app.models import KnowledgeAnswer
+    from app.services import application_execution
+    from app.services.knowledge import question_key
+
+    aps.configure(monkeypatch, "assist")
+    for name, value in (("browser_use_webui_enabled", True), ("browser_use_headless", False),
+                        ("mcp_packet_dir", str(tmp_path / "packets")), ("application_fields_settle_seconds", 600)):
+        monkeypatch.setattr(aps.get_settings(), name, value)
+    checkpoint.forget_setup()
+    qs.clear_checkpoints(pg_engine)
+    sessions = qs.app_sessions(pg_engine)
+    manager = _VisibleWindow()
+    bus.set_sidecars(manager)
+    with gs.FakeATS("confirm", pages={"growing.html": GROWING_PAGE}) as ats:
+        user = aps.owner(sessions)
+        aps.answer(sessions, user, RELOCATION_QUESTION, "Yes")
+        job_id = aps.approved_job(sessions, user, ats.url("growing"))
+        aps.enqueue(sessions, user, job_id)
+
+        async def go():
+            await aps.drive_async(sessions, passes=6)
+            task = aps.task_of(sessions, job_id)
+            assert (task.stage, task.interrupt["reason"]) == ("NEEDS_HUMAN", "FIELDS_NEED_YOU"), task.result_code
+            resume = next(f for f in task.form["fields"] if f["kind"] == "file")
+            assert (resume["role"], resume["label"], resume["required"]) == ("resume", "Resume/CV", True)
+            session = manager.get(user, task.id)
+            page = await session.call("observe")
+            field = next(e for e in page["elements"]
+                         if e.get("tag") == "input" and aps.PYTHON_QUESTION in (e.get("label") or ""))
+            await session.call("fill", key=field["key"], text="11")  # the person types; the page grows
+            with sessions() as db:
+                db.info["user_id"] = user
+                application_execution.continue_after_takeover(db, task.id)
+            await aps.drive_async(sessions, passes=6)
+            task = aps.task_of(sessions, job_id)
+            page = await session.call("observe")
+            values = {}
+            for e in page["elements"]:
+                if e.get("tag") == "input" and e.get("type") in ("text", "file"):
+                    values[e.get("label")] = await session.call("read", key=e["key"])
+            await manager.close(user, task.id)
+            return task, values
+        task, values = asyncio.run(go())
+        posts = list(ats.posts)
+    bus.set_sidecars(None)
+    assert (task.stage, task.interrupt["reason"]) == ("NEEDS_HUMAN", "FIELDS_NEED_YOU"), task.result_code
+    assert [f["label"] for f in task.interrupt["fields"]] == [START_QUESTION]  # only what the library cannot answer
+    relocation = next(v for label, v in values.items() if RELOCATION_QUESTION in (label or ""))
+    assert relocation["value"] == "Yes"  # the saved answer, filled in place
+    assert any(n.endswith(".pdf") for v in values.values() for n in v.get("files") or [])  # the resume is attached
+    with sessions() as db:
+        db.info["user_id"] = user
+        saved = db.scalar(select(KnowledgeAnswer).where(KnowledgeAnswer.question_key == question_key(START_QUESTION)))
+        assert saved is not None and not saved.verified  # waiting in the library for the person
+    assert saved.id in task.interrupt["question_ids"]
+    labels = {f["label"] for f in task.plan["extra_fields"]}
+    assert labels == {RELOCATION_QUESTION, START_QUESTION} and posts == []

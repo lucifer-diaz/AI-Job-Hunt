@@ -363,7 +363,9 @@ def _application_facts(task: Any, status: str) -> dict[str, Any]:
         out["waiting_detail"] = {"kind": waiting.get("kind") or task.stage, "reason": waiting.get("reason"),
                                  "questions": len(waiting.get("question_ids") or []),
                                  "confirmations": len(waiting.get("confirm_question_ids") or []),
-                                 "fields": len(waiting.get("fields") or []), "expires_at": waiting.get("expires_at")}
+                                 "fields": len(waiting.get("fields") or []), "expires_at": waiting.get("expires_at"),
+                                 "takeover": bool(waiting.get("takeover")),
+                                 "continued": bool(waiting.get("continued"))}
         out["can_run_now"] = False  # it resumes by itself once the person has done what it needs
     return out
 
@@ -1188,14 +1190,16 @@ def _step(key: str) -> tuple[str, str]:
     """A recorded graph step (its effect key) in words, and its tone."""
     parts = key.split(":")
     name = parts[0]
-    if name == "resolve_answers" and len(parts) >= 5:
-        asked, confirm = int(parts[3] or 0), int(parts[4] or 0)
+    if "takeover" in parts:  # resolve_answers:<task>:takeover:a<n>:<reason>:<fields> too
+        reason = next((p for p in reversed(parts) if p and not p.isdigit()), "")
+        return f"Waited for you in the browser window ({reason.replace('_', ' ').lower()})", "warn"
+    if name == "resolve_answers" and len(parts) >= 5 and parts[2].startswith("a") \
+            and parts[3].isdigit() and parts[4].isdigit():
+        asked, confirm = int(parts[3]), int(parts[4])
         if asked or confirm:
             return (f"Saved {asked} question{'s' if asked != 1 else ''} for you to answer"
                     + (f" and {confirm} to confirm" if confirm else ""), "warn")
         return "Found a verified source for every answer", "good"
-    if "takeover" in parts:
-        return f"Waited for you in the browser window ({(parts[-1] or '').replace('_', ' ').lower()})", "warn"
     if name == "fill" and parts[-1] == "done":
         return "Finished filling the form", "good"
     if name == "fill":

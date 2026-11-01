@@ -748,6 +748,11 @@ ADR-035). The rules a change has to keep:
   * A saved session keeps only its own domain's cookies and origins and is used only by that account's runner for that
     domain (`APPLICATION_AUTH_SESSIONS_ENABLED`). A login is attempted once per run.
   * OTP, CAPTCHA, a failed login and every signup wait for the person. No run ever creates an account or accepts terms.
+* **A code the site emails after Submit is the person's to enter** (`application_inbox/codes.py`). A click that ends on
+  such a page (`ats_forms.asks_email_code`) is UNCERTAIN with `email_code` on the intent, and the window stays with
+  the person. Only when they press "Get code from Gmail" does one targeted read-only search (the ATS's sender, mail
+  after the click) find it, and only that response returns it, `NO_CAPTURE`. It is never stored, logged or put in graph
+  state. The run never types a code, never imitates human timing, and never solves a CAPTCHA.
 * **A window handed to the person is a normal browser.**
   * A headful session is parked for `APPLICATION_TAKEOVER_TTL_MINUTES` and then sends what the person sends (logins,
     uploads, their own submission); there is nothing to start first, and no Start submission in the Apply kit.
@@ -781,6 +786,13 @@ ADR-035). The rules a change has to keep:
   * The person's values are never stored on the task, the checkpoint or a log. They are read from the window only when
     the person asks to save them to the Knowledge bank (`save-window-answers`, as their verified answers).
   * Headless runs end NEEDS_HUMAN and list the fields instead.
+  * The run also continues by itself once every pointed-out field holds something unchanged for
+    `APPLICATION_FIELDS_SETTLE_SECONDS` (`watch_fields`, with `watch_filled_windows` as the scheduler fallback). Value
+    digests stay in the watcher's memory. Continue is also offered on the task's Running workers row.
+  * Questions a page grows after ANALYZE_FORM (`application._plan_grown`) go through `answer_resolver.plan` like planned
+    ones: verified saved answers are used, and unanswered required ones are saved to the Knowledge bank. They live in
+    `plan["extra_fields"]`, never in `task.form` (its fingerprint stays). PreSubmitValidator and `save-window-answers`
+    check and read them too.
 * **The ATS map is facts, per account** (`ats_routes`, `ats_map.observe`): from posting URLs and run outcomes, never a
   model, never a guessed employer site. A login belongs to a route's `login_domain`: per tenant where the ATS has
   per-employer accounts (Workday, iCIMS, Taleo, SuccessFactors). Where employers share a host (SuccessFactors,

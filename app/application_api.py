@@ -9,6 +9,7 @@
     POST /api/jobs/{id}/application-execution            → queue the execution worker (OBSERVE, ASSIST, GUARDED_AUTO)
     POST /api/application-executions/{id}/confirm        → the person confirms sensitive answers for this execution
     POST /api/application-executions/{id}/continue       → the person finished in the kept browser window (takeover)
+    GET  /api/application-executions/{id}/email-code     → the code the site emailed after Submit, for the person to paste
     POST /api/application-executions/{id}/signup         → a pending login with a generated password, shown once
     POST /api/application-executions/{id}/save-login     → keep the window's login (session) and the password
 
@@ -361,6 +362,20 @@ def application_backends_status(user: CurrentUser = Depends(current_user)) -> di
     return out
 
 
+@router.get("/api/application-executions/{task_id}/email-code")
+def email_code(task_id: int, db: Session = Depends(get_user_db)) -> dict[str, Any]:
+    """The verification code the site emailed after the final click, read from the account's Gmail (read-only) when
+    the person asks, for them to paste into the window. Returned to this response only: never stored or logged. The
+    run never enters it."""
+    from fastapi.responses import JSONResponse
+
+    from app.services.application_inbox import codes
+
+    found = codes.find_code(db, _task(db, task_id))
+    # Never cached by the browser or a proxy: the code is good for one application.
+    return JSONResponse(found, headers={"Cache-Control": "no-store"})
+
+
 @router.post("/api/application-executions/{task_id}/save-window-answers")
 def save_window_answers(task_id: int, db: Session = Depends(get_user_db)) -> dict[str, Any]:
     """Keep what the person typed in the open browser window for fields nothing verified could fill: each one becomes
@@ -368,7 +383,7 @@ def save_window_answers(task_id: int, db: Session = Depends(get_user_db)) -> dic
     the run's own window into the database; never returned, logged or stored on the run."""
     from app.infrastructure.application_browser.browser_use_sidecar import get_sidecars
     from app.models import KnowledgeAnswer
-    from app.services.ats_forms import ApplicationForm, generic
+    from app.services.ats_forms import ApplicationForm, FormField, generic
     from app.services.knowledge import question_key
 
     task = _task(db, task_id)
@@ -381,9 +396,10 @@ def save_window_answers(task_id: int, db: Session = Depends(get_user_db)) -> dic
     if session is None:
         raise HTTPException(409, "The browser window is closed; answer these questions in the Knowledge bank")
     form = ApplicationForm.model_validate(task.form)
+    grown = [FormField.model_validate(f) for f in (task.plan or {}).get("extra_fields") or []]
     manager.run_threadsafe(session.call("observe"), timeout=60)
     saved = 0
-    for field in form.fields:
+    for field in [*form.fields, *grown]:
         key = generic.key_of(field.locator)
         if field.id not in person or key is None or field.kind == "file":
             continue

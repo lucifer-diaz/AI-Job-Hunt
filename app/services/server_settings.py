@@ -206,6 +206,11 @@ CONFIG: dict[str, Config] = {c.name: c for c in (
            "After you solve a CAPTCHA in the window, the application continues by itself; the window is checked this "
            "often (a solved CAPTCHA lasts about two minutes).", "int",
            (Choice("3", "3 seconds", ""), Choice("5", "5 seconds", ""), Choice("10", "10 seconds", "")), low=2, high=30),
+    Config("application_fields_settle_seconds", "applications", "When a window you filled continues by itself",
+           "After you fill the highlighted fields in the window, the application continues once all of them have "
+           "stopped changing for this long. You can always press Continue sooner.", "int",
+           (Choice("10", "10 seconds", ""), Choice("20", "20 seconds", ""), Choice("60", "1 minute", "")),
+           low=0, high=600),
     Config("application_input_hold_minutes", "applications", "How long a read form waits for your answer",
            "While a run waits for an answer you give in the Knowledge bank, its browser-use window keeps the form so "
            "it is filled in place afterwards. Past this, the form is read again.", "int",

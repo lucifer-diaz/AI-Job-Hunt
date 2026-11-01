@@ -286,9 +286,22 @@ describe('Running workers', () => {
   });
 
   it('points the person at the browser window when fields are highlighted there', async () => {
-    routes.parsing = { ...parsing(), rows: [row({ kind: 'application', status: 'QUEUED', can_run_now: false, waiting_for: 'YOU', backend: 'browser_use_webui', waiting_detail: { kind: 'NEEDS_HUMAN', reason: 'FIELDS_NEED_YOU', fields: 2 } })] };
+    routes.parsing = { ...parsing(), rows: [row({ kind: 'application', status: 'QUEUED', can_run_now: false, waiting_for: 'YOU', backend: 'browser_use_webui', waiting_detail: { kind: 'NEEDS_HUMAN', reason: 'FIELDS_NEED_YOU', fields: 2, takeover: true, continued: false } })] };
     const text = (await open()).querySelector('.wk-row').textContent;
-    expect(text).toContain('Waiting for you in the browser window: fill 2 highlighted fields, then Continue in the Apply kit');
+    expect(text).toContain('Waiting for you in the browser window: fill 2 highlighted fields: it carries on by itself when you finish, or press Continue');
+    // Done in the window: say so from here, without opening the Apply kit.
+    const done = view().querySelector('.wk-row [data-act="wk-continue"]');
+    expect(done.textContent).toContain('I’m done — continue');
+    expect(view().querySelector('.wk-row [data-act="open-kit"]')).not.toBeNull();
+    await ui.A['wk-continue']({ dataset: { id: done.dataset.id } });
+    expect(posts()).toContain('/api/application-executions/11/continue');
+  });
+
+  it('offers no Continue for a run that already continued or waits for answers, not the window', async () => {
+    routes.parsing = { ...parsing(), rows: [row({ kind: 'application', status: 'QUEUED', can_run_now: false, waiting_for: 'YOU', waiting_detail: { kind: 'NEEDS_HUMAN', reason: 'FIELDS_NEED_YOU', fields: 2, takeover: true, continued: true } })] };
+    expect((await open()).querySelector('.wk-row [data-act="wk-continue"]')).toBeNull();
+    routes.parsing = { ...parsing(), rows: [row({ kind: 'application', status: 'QUEUED', can_run_now: false, waiting_for: 'YOU', waiting_detail: { kind: 'NEEDS_INPUT', questions: 2 } })] };
+    expect((await open()).querySelector('.wk-row [data-act="wk-continue"]')).toBeNull();
   });
 
   it('opens a task’s history from its name, newest first, with the browser-use option for an application', async () => {

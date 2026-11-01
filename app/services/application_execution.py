@@ -320,6 +320,10 @@ def continue_after_takeover(db: Session, task_id: int) -> ApplicationExecutionTa
 
 # Takeovers a person settles in the window by answering a CAPTCHA: the run continues by itself once it is answered.
 CHALLENGE_REASONS = ("CAPTCHA_OR_ANTI_BOT", "NAVIGATOR_CAPTCHA")
+# Takeovers a person settles by filling the pointed-out fields: the run continues by itself once every one of them
+# holds something that has not changed for APPLICATION_FIELDS_SETTLE_SECONDS (they stopped typing).
+FIELD_REASONS = ("FIELDS_NEED_YOU",)
+_fields_seen: dict[tuple[int, int], tuple[tuple[str, ...], float]] = {}  # window → (value digests, unchanged since)
 _watching: dict[tuple[int, int], Any] = {}
 _widget_seen: set[tuple[int, int]] = set()  # windows where a challenge widget was seen while it waited
 
@@ -342,9 +346,9 @@ def _watched(user_id: int, task_id: int) -> bool:
     return running is not None and not running.done()
 
 
-def challenge_solved(db: Session, user_id: int, task_id: int) -> bool | None:
-    """The window of this task reports its CAPTCHA answered: continue the run as the Continue button would (marked
-    `continued_by: window`). True: woken. None: not settled yet (the run is still handing the window over), ask again.
+def _continue_from_window(db: Session, user_id: int, task_id: int, reasons: tuple[str, ...]) -> bool | None:
+    """Continue the run as the Continue button would (marked `continued_by: window`) when it waits in its window for
+    one of `reasons`. True: woken. None: not settled yet (the run is still handing the window over), ask again.
     False: nothing to continue (another reason, already continued, ended). Commits when it wakes."""
     task = db.get(ApplicationExecutionTask, task_id)
     if task is None or task.user_id != user_id:
@@ -353,13 +357,24 @@ def challenge_solved(db: Session, user_id: int, task_id: int) -> bool | None:
         return None
     waiting = dict(task.interrupt or {})
     if task.status != PENDING or task.stage != "NEEDS_HUMAN" or not waiting.get("takeover") \
-            or waiting.get("reason") not in CHALLENGE_REASONS or waiting.get("continued"):
+            or waiting.get("reason") not in reasons or waiting.get("continued"):
         return False
     waiting.update(continued=True, continued_by="window")
     task.interrupt = waiting
     woken = wake(db, task)
     db.commit()
     return woken
+
+
+def challenge_solved(db: Session, user_id: int, task_id: int) -> bool | None:
+    """The window of this task reports its CAPTCHA answered: continue the run (see `_continue_from_window`)."""
+    return _continue_from_window(db, user_id, task_id, CHALLENGE_REASONS)
+
+
+def fields_filled(db: Session, user_id: int, task_id: int) -> bool | None:
+    """Every field the window pointed out holds something and stopped changing: continue the run (see
+    `_continue_from_window`). The run reads the page again and checks every field before it acts."""
+    return _continue_from_window(db, user_id, task_id, FIELD_REASONS)
 
 
 def watch_challenge(sessions: Callable[[], Session], user_id: int, task_id: int) -> None:
@@ -405,6 +420,149 @@ def watch_challenge(sessions: Callable[[], Session], user_id: int, task_id: int)
         _watching[(user_id, task_id)] = asyncio.run_coroutine_threadsafe(poll(), loop)
     except Exception:  # the Continue button and the scheduler pass still work
         log.warning("could not watch the CAPTCHA window of execution %s", task_id, exc_info=True)
+
+
+async def fields_reading(session: Any, field_ids: list[str]) -> tuple[str, ...] | None:
+    """A digest of what each pointed-out field holds now, or None while any of them is empty or not on the page. The
+    page is observed afresh (the person may have changed it) and each field read by its element key; a radio group is
+    read through one of its options. The digests stay in this process's memory, never stored, logged or returned."""
+    import hashlib
+
+    observation = await session.call("observe", timeout=60, record=False)
+    elements = observation.get("elements") or []
+    by_key = {e["key"]: e for e in elements if e.get("key")}
+    by_group = {e["group_key"]: e for e in elements if e.get("group_key")}
+    attached = observation.get("attached") or {}
+    out: list[str] = []
+    for field_id in field_ids:
+        key = field_id[3:] if field_id.startswith("bu_") else None
+        if key is not None and key in attached:  # a file input the board replaced with the uploaded file's name
+            out.append(hashlib.sha256(f"file|{attached[key]}".encode()).hexdigest())
+            continue
+        element = by_key.get(key or "") or by_group.get(key or "")
+        if element is None:
+            return None
+        read = await session.call("read", key=element["key"], timeout=60, record=False)
+        if not read.get("filled"):
+            return None
+        out.append(hashlib.sha256(repr(sorted(read.items())).encode()).hexdigest())
+    return tuple(out)
+
+
+def settled(key: tuple[int, int], reading: tuple[str, ...] | None, now: float | None = None) -> bool:
+    """Every field is filled and nothing changed for APPLICATION_FIELDS_SETTLE_SECONDS: the person stopped typing."""
+    import time
+
+    from app.services import server_settings
+
+    now = time.monotonic() if now is None else now
+    if not reading:
+        _fields_seen.pop(key, None)
+        return False
+    seen = _fields_seen.get(key)
+    if seen is None or seen[0] != reading:
+        _fields_seen[key] = (reading, now)
+        return False
+    return now - seen[1] >= max(0, server_settings.value("application_fields_settle_seconds"))
+
+
+def _field_ids(task: ApplicationExecutionTask | None) -> list[str]:
+    waiting = (task.interrupt or {}) if task is not None else {}
+    if task is None or task.status != PENDING or waiting.get("reason") not in FIELD_REASONS \
+            or not waiting.get("takeover") or waiting.get("continued"):
+        return []
+    return [f["id"] for f in waiting.get("fields") or [] if f.get("id")]
+
+
+def watch_fields(sessions: Callable[[], Session], user_id: int, task_id: int) -> None:
+    """Watch a window handed over for fields only the person can fill (FIELDS_NEED_YOU): every
+    APPLICATION_CHALLENGE_POLL_SECONDS, read whether each pointed-out field holds something, and continue the run once
+    all of them do and have not changed for a moment. Same loop and rules as `watch_challenge`; never raises."""
+    try:
+        from app.infrastructure.application_browser.browser_use_sidecar import get_sidecars
+        from app.services import server_settings, threads
+
+        manager = get_sidecars()
+        loop = getattr(manager, "loop", None)
+        if loop is None or loop.is_closed() or _watched(user_id, task_id):
+            return
+        key = (user_id, task_id)
+
+        def fields() -> list[str] | None:
+            with sessions() as db:
+                db.info["user_id"] = user_id
+                task = db.get(ApplicationExecutionTask, task_id)
+                if task is not None and task.status == PROCESSING:
+                    return None  # still handing the window over
+                return _field_ids(task)
+
+        def settle() -> bool | None:
+            with sessions() as db:
+                db.info["user_id"] = user_id
+                return fields_filled(db, user_id, task_id)
+
+        async def poll() -> None:
+            try:
+                while True:
+                    await asyncio.sleep(max(1, server_settings.value("application_challenge_poll_seconds")))
+                    session = manager.get(user_id, task_id)
+                    if session is None or session.parked_until is None:
+                        return
+                    ids = await threads.run_io(fields)
+                    if ids is None:
+                        continue
+                    if not ids:
+                        return
+                    try:
+                        reading = await fields_reading(session, ids)
+                    except Exception:  # a busy or navigating page: ask again
+                        log.debug("window of execution %s did not answer", task_id, exc_info=True)
+                        continue
+                    if not settled(key, reading):
+                        continue
+                    done = await threads.run_io(settle)
+                    if done is not None:
+                        return
+            finally:
+                _watching.pop(key, None)
+                _fields_seen.pop(key, None)
+
+        _watching[key] = asyncio.run_coroutine_threadsafe(poll(), loop)
+    except Exception:  # the Continue button and the scheduler pass still work
+        log.warning("could not watch the browser window of execution %s", task_id, exc_info=True)
+
+
+def watch_filled_windows(db: Session, limit: int = 20) -> int:
+    """Each scheduler pass, for windows waiting for pointed-out fields with no watcher running (a restart): continue
+    the ones whose fields are all filled and unchanged since the last pass. Never raises."""
+    try:
+        from app.infrastructure.application_browser.browser_use_sidecar import get_sidecars
+
+        manager = get_sidecars()
+        windows = manager.handed_over()[:limit]
+    except Exception:  # noqa: BLE001
+        return 0
+    woken, account = 0, db.info.get("user_id")
+    for user_id, task_id in windows:
+        if account not in (None, user_id) or _watched(user_id, task_id):
+            continue
+        db.info["user_id"] = user_id
+        try:
+            task = db.get(ApplicationExecutionTask, task_id)
+            ids = _field_ids(task) if task is not None and task.user_id == user_id else []
+            session = manager.get(user_id, task_id) if ids else None
+            if session is None:
+                continue
+            reading = manager.run_threadsafe(fields_reading(session, ids), timeout=120)
+            if settled((user_id, task_id), reading) and fields_filled(db, user_id, task_id):
+                woken += 1
+                _fields_seen.pop((user_id, task_id), None)
+        except Exception:  # one window never stops the others, nor the pass
+            db.rollback()
+            log.warning("could not check the browser window of execution %s", task_id, exc_info=True)
+        finally:
+            db.info["user_id"] = account
+    return woken
 
 
 def watch_challenges(db: Session, limit: int = 20) -> int:

@@ -165,4 +165,24 @@ describe('the Apply kit claim', () => {
     await ui.A['kit-save-window']({ dataset: { exec: '9' } });
     expect(calls.some(([m, u]) => m === 'POST' && u.endsWith('/api/application-executions/9/save-window-answers'))).toBe(true);
   });
+  it('looks up the code the site emailed after Submit only when asked, for the person to copy', async () => {
+    const execution = { id: 9, mode: 'GUARDED_AUTO', status: 'COMPLETED', stage: 'SUBMISSION_UNCERTAIN', interrupt: null, result_code: 'SUBMISSION_UNCERTAIN' };
+    const intent = { id: 3, status: 'UNCERTAIN', reason: 'The site emailed you a code to finish the application', evidence: { email_code: true } };
+    ui.S.kitEmailCode = null;
+    let el = html(kit({ execution_mode: 'guarded_auto', guarded_consent: true, execution, execution_intent: intent }));
+    expect(el.textContent).toContain('The site emailed you a code to finish the application');
+    expect(acts(el)).toContain('kit-email-code');
+    expect(acts(el)).not.toContain('kit-copy-email-code');
+    expect(calls.some(([, u]) => u.includes('/email-code'))).toBe(false);  // nothing read until the person asks
+    fetchMock.mockImplementationOnce(async (url) => { calls.push(['GET', url, null]); return { ok: true, status: 200, text: async () => JSON.stringify({ status: 'FOUND', code: 'Wz3K9pQa' }) }; });
+    await ui.A['kit-email-code']({ dataset: { exec: '9' } });
+    expect(calls.find(([, u]) => u === '/api/application-executions/9/email-code')).toBeTruthy();
+    el = html(ui.D.kit);
+    expect(el.textContent).toContain('Wz3K9pQa');
+    expect(acts(el)).toContain('kit-copy-email-code');
+    ui.A['close-kit']();
+    expect(ui.S.kitEmailCode).toBeNull();  // the code is gone with the kit
+    // Any other unknown outcome has no code to look up.
+    expect(acts(html(kit({ execution_mode: 'guarded_auto', execution, execution_intent: { ...intent, evidence: {} } })))).not.toContain('kit-email-code');
+  });
 });
