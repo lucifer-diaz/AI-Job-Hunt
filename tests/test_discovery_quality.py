@@ -732,7 +732,11 @@ def test_the_job_and_its_packet_name_the_resume_they_use(user, resumes, client):
     packet = client.get(f"/api/tailor/{job_id}").json()["resume"]
     assert packet["source"]["resume"]["id"] == ml and packet["source"]["differs"]
     assert packet["resume_in_use"]["id"] == active and packet["resume_in_use"]["choice"] == "ACTIVE"
-    assert packet["resume_in_use"]["rematch"] is None, "a pinned choice is never offered a re-match"
+    # Pinned to the active resume while the tags clearly pick the ML one: the tag match is offered, flagged as
+    # replacing the person's choice. Nothing changes until they take it.
+    assert packet["resume_in_use"]["rematch"]["resume"]["id"] == ml and packet["resume_in_use"]["rematch"]["pinned"]
+    client.put(f"/api/jobs/{job_id}/resume", json={"mode": "fixed", "resume_id": ml})
+    assert client.get(f"/api/jobs/{job_id}").json()["resume_in_use"]["rematch"] is None, "already the tag match"
 
 
 def test_a_job_matched_before_its_resume_was_tagged_is_offered_a_rematch(user, resumes, client):
@@ -751,6 +755,7 @@ def test_a_job_matched_before_its_resume_was_tagged_is_offered_a_rematch(user, r
     detail = client.get(f"/api/jobs/{job_id}").json()["resume_in_use"]
     assert detail["id"] == active and detail["choice"] is None
     assert detail["rematch"]["resume"]["id"] == ml and "staff software engineer" in detail["rematch"]["reason"].lower()
+    assert detail["rematch"]["pinned"] is False
     assert "when this job was found" in detail["how"]
     with SessionLocal() as db:
         db.info["user_id"] = user
@@ -766,7 +771,8 @@ def test_a_job_matched_before_its_resume_was_tagged_is_offered_a_rematch(user, r
         resume_matching.set_tags(db.get(Resume, ml), [])
         db.commit()
     detail = client.get(f"/api/jobs/{job_id}").json()["resume_in_use"]
-    assert detail["id"] == ml and detail["rematch"] == {"resume": None, "reason": "no resume matches clearly now"}
+    assert detail["id"] == ml and detail["rematch"] == {"resume": None, "reason": "no resume matches clearly now",
+                                                            "pinned": False}
 
 
 def test_rematch_takes_only_the_jobs_the_filters_select(user, resumes, client):

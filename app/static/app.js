@@ -1780,7 +1780,7 @@ const resumeInUseNote = (u, extra = '', jobId = null) => !u ? ''
 // Tags changed since this job was matched (workspace.stale_match): say what they pick now, and re-match on a click only,
 // since a ranked job is ranked again.
 const rematchNote = (r, jobId) => !r || jobId == null ? ''
-  : `<div class="row gap8 wrap mt4" style="align-items:center" data-rematch="${attr(r.resume?.id ?? '')}"><span class="xs" style="color:var(--warn)">Your resume tags now match ${r.resume ? `<b>${esc(resumeName(r.resume))}</b>` : 'no resume clearly (the active resume would be used)'} (${esc(r.reason)})</span>${btn(label('rematch' + jobId, 'Re-match this job', 'Re-matching…'), 'job-rematch', { id: jobId }, 'sm soft', isBusy('rematch' + jobId))}</div>`;
+  : `<div class="row gap8 wrap mt4" style="align-items:center" data-rematch="${attr(r.resume?.id ?? '')}"><span class="xs" style="color:var(--warn)">Your resume tags ${r.pinned ? '' : 'now '}match ${r.resume ? `<b>${esc(resumeName(r.resume))}</b>` : 'no resume clearly (the active resume would be used)'} (${esc(r.reason)})</span>${btn(label('rematch' + jobId, r.pinned ? 'Use the tag match' : 'Re-match this job', 'Re-matching…'), 'job-rematch', { id: jobId, pinned: r.pinned ? 1 : '' }, 'sm soft', isBusy('rematch' + jobId))}</div>`;
 // The resume a packet was tailored from (workspace.packet_source_resume), and a warning when the job now uses another.
 function packetSourceNote(src, now) {
   if (!src) return '';
@@ -2449,7 +2449,9 @@ const A = {
   }, out => out.changing ? `Tags saved — ${out.changing} existing job${out.changing === 1 ? '' : 's'} would now use another resume: use Re-match jobs to resume tags` : 'Tags saved — new jobs are matched with them'),
   'job-rematch': el => busy('rematch' + el.dataset.id, async () => {
     const ranked = D.jobModal?.id === Number(el.dataset.id) && D.jobModal.fit != null;
-    if (ranked && !confirm('This job will be ranked again with the resume its tags match now (model calls). A tailored packet is tailored again from it when automatic tailoring is on, otherwise it waits for you to regenerate it. Continue?')) return { cancelled: true };
+    const why = [el.dataset.pinned ? 'This replaces the resume you or its search chose with the one its tags match.' : '',
+      ranked ? 'The job will be ranked again with it (model calls). A tailored packet is tailored again from it when automatic tailoring is on, otherwise it waits for you to regenerate it.' : ''].filter(Boolean);
+    if (why.length && !confirm(`${why.join(' ')} Continue?`)) return { cancelled: true };
     const out = await api(`/api/jobs/${el.dataset.id}/resume`, { method: 'PUT', body: { mode: 'auto' } });
     if (S.jobOpen) D.jobModal = await api(`/api/jobs/${S.jobOpen}`).catch(() => D.jobModal);
     await load();

@@ -94,6 +94,9 @@ describe('a job matched before its resume was tagged', () => {
     expect(html).toContain('data-act="job-rematch"');
     expect(ui.resumeInUseNote(inUse({ resume: null, reason: 'x' }), '', 7)).toContain('no resume clearly');
     expect(ui.resumeInUseNote(inUse({ resume: null, reason: 'x' }))).not.toContain('job-rematch');
+    const pinned = ui.resumeInUseNote(inUse({ resume: { id: 5, name: 'ML resume', version: 3 }, reason: 'r', pinned: true }), '', 7);
+    expect(pinned).toContain('Use the tag match');
+    expect(pinned).toContain('data-pinned="1"');
   });
 
   it('re-matches the job as auto, asking first when it was ranked', async () => {
@@ -104,6 +107,9 @@ describe('a job matched before its resume was tagged', () => {
     vi.stubGlobal('confirm', vi.fn(() => true)); context.confirm = confirm;
     await ui.A['job-rematch']({ dataset: { id: '7' } });
     const call = fetchMock.mock.calls.find(([url]) => url === '/api/jobs/7/resume');
+    ui.D.jobModal = { id: 7, fit: null };
+    await ui.A['job-rematch']({ dataset: { id: '7', pinned: '1' } });
+    expect(confirm.mock.calls.at(-1)[0]).toContain('replaces the resume you or its search chose');
     expect(call[1].method).toBe('PUT');
     expect(JSON.parse(call[1].body)).toEqual({ mode: 'auto' });
   });
