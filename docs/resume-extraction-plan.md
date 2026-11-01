@@ -1,6 +1,6 @@
 # Resume extraction V2: Phase 0 findings and plan
 
-Status: **Phases 1 – 2 done; Phase 3 (sections + persistence) next.** Agreed decisions are in section 10; where they differ from the
+Status: **Phases 1 – 3 done; Phase 4 (sections review) next.** Agreed decisions are in section 10; where they differ from the
 recommendations in sections 5 – 9, section 10 wins.
 
 ## 1. Summary
@@ -290,3 +290,24 @@ position is found, not claimed) and cheaper. Keep a `source_quote` only for summ
   correction engine (Phase 6) must handle digit glyphs (`text-digit-glyph`, dataset v2).
 * Found on the way: pypdfium2 5 returns char boxes as (left, bottom, right, top); boxes are ink bounds, so letter gaps
   are no evidence of a space; a comma hangs below the baseline, so a line is a band, not the previous glyph's height.
+
+### Resumes tab redesign and real resumes (between Phases 2 and 3)
+
+* Settings → Resumes simplified (10,500px / 215 buttons → about 5,800px): compact library with a menu per resume,
+  a review header with progress and one next step (Review next → Verify resume), Review / Text / History tabs, sticky
+  section chips, skills as chips, empty optional sections behind "+ Add section", one folded options panel.
+* The new reader is an account worker setting (`resume_parsing.extraction_v2`) defaulting to the server's flag.
+* The eval scores real resumes in the gitignored `real/` folder (`--with-real-resumes`).
+
+### Phase 3: sections, structure, Word documents, extraction record (done)
+
+* `sections.py` (synonyms, keywords, house style learnt from known headings; header protected), `structure.py`
+  (line features from the text layer or Word paragraphs, columns from page gaps, the parse view: roles from real
+  layouts, bullets without characters, wrapped lines joined), `docx_reader.py` (tables, list bullets, styles),
+  `store.py`; migration 0065 (`resume_extractions`, `resume_extraction_feedback`, both owned).
+* Upload with V2 records the extraction before the version is parsed; the regex parser (first parse, quick re-parse,
+  the AI parse's quality check) reads the parse view; the resume detail carries `extraction` (route, sections).
+* Eval (`docs/evals/resume-extraction-phase3.md`): field recall 0.396 → 0.930 (0.948 with the real resumes), precision
+  0.769 → 0.936, misfiled 120 → 3, cer_clean 0.0; real resumes: all 7 roles right. Hard gates stay at 0.
+* Fixed on the way: `delete_version` left a pending AI-parse task behind on SQLite (no cascade), which could block a
+  later resume reusing the id.

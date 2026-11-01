@@ -293,7 +293,7 @@ function rdResumeList(current) {
   const accept = 'accept=".txt,.pdf,.docx" aria-label="Upload resume"';
   const upload = versions.length ? `<label class="btn sm primary rd-upload" for="resume-file" title="PDF, DOCX or TXT · up to ${BOOT.max_upload_mb} MB">＋ Upload resume<input type="file" id="resume-file" ${accept}></label>` : '';
   const rows = versions.map(v => rdResumeCard(v, current)).join('')
-    || `<label class="settings-upload" for="resume-file"><strong>＋ Upload your resume</strong><span>PDF, DOCX or TXT · up to ${BOOT.max_upload_mb} MB · it is read into data you review here</span><input type="file" id="resume-file" ${accept}></label>`;
+    || `<div class="settings-empty"><strong>Your experience starts here</strong><p>Upload a resume to make your applications more personal. It is read into data you review and verify here.</p></div><label class="settings-upload" for="resume-file"><strong>＋ Upload your resume</strong><span>PDF, DOCX or TXT · up to ${BOOT.max_upload_mb} MB</span><input type="file" id="resume-file" ${accept}></label>`;
   return `<section class="settings-group rd-library"><div class="row between gap10 wrap mb12"><div class="settings-group-title" style="margin:0"><h3>Your resumes</h3><p>The active resume is used for ranking, tailoring and review, unless a job’s title matches another resume’s target roles. Uploading never changes which one is active.</p></div>${upload}</div>
     ${rdRematchBar(versions)}<div class="rd-library-list">${rows}</div></section>`;
 }
@@ -355,6 +355,7 @@ function rdHeader() {
     <div class="row between gap10 wrap" style="align-items:flex-start"><div class="grow"><span class="settings-eyebrow">REVIEWING</span><div class="row gap8 wrap" style="align-items:center"><strong class="rd-title">${esc(active.name || 'Resume')} · v${active.version}</strong>${active.is_active ? pill('Active', 'good') : `${pill('Not active', 'muted')}${btn('Make active', 'rd-activate', { id: active.id }, 'sm ghost', locked)}`}${pill(statusLabel, tone)}</div></div><span class="settings-complete" data-rd-percent>${p.percent}% reviewed</span></div>
     <div class="rd-progress" role="progressbar" aria-label="Facts reviewed" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${p.percent}"><span style="width:${p.percent}%"></span></div>
     <p class="settings-help">${counts}. Only verified facts are used in tailored applications.${active.verified_at ? ` Last verified ${esc(rdDate(active.verified_at))}.` : ''}</p>
+    ${active.is_active ? '' : '<p class="settings-help"><b>This resume is not active.</b> Reviewing it does not change which resume is used: it is used for jobs that match its target roles, or that you or a search setup chose it for.</p>'}
     ${RD.blocking?.length ? `<div class="settings-notice"><strong>${blocking.length} required item${blocking.length === 1 ? '' : 's'} still need review</strong><p>${blocking.slice(0, 5).map(b => esc(b.label)).join(' · ')}${blocking.length > 5 ? ' …' : ''}</p></div>` : ''}
     <div class="rd-head-actions">${next}${verify}${menu}</div>${rdAiParse(active.ai_parse)}</section>` +
     rdComparison(active.pending_reparse);

@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session, object_session
 from app.auth import get_user_db
 from app.models import Resume, ResumeDocument, SavedSearch
 from app.services import resume_matching, resume_parsing
+from app.services.resume_extraction import store as extraction_store
 from app.services import resume_verification as rv
 from app.services.structured_resume import SECTION_LABELS, StructuredResumeIn
 from app.services.user_settings import (
@@ -94,7 +95,9 @@ def detail(resume: Resume) -> dict:
     return {**summary(resume), "structured": resume.structured_data, "progress": rv.progress(resume.structured_data),
             "pending_reparse": resume.pending_reparse, "sections": SECTION_LABELS,
             # The latest AI structuring of this version (app.services.resume_parsing): status and counts only.
-            "ai_parse": resume_parsing.status_of(db, resume.id) if db is not None else None}
+            "ai_parse": resume_parsing.status_of(db, resume.id) if db is not None else None,
+            # How its file was read (resume extraction V2): quality route and the sections found; None = unknown.
+            "extraction": extraction_store.summary(db, resume.id) if db is not None else None}
 
 
 def _commit(db: Session, resume: Resume) -> dict:

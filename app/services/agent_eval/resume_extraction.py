@@ -48,13 +48,13 @@ REAL = ROOT / "real"
 
 @dataclass(frozen=True)
 class Pipeline:
-    read: Callable[[str, bytes], tuple[str, str]]  # (kind, bytes) → (raw text layer, final text)
+    read: Callable[[str, bytes], tuple[str, str, Any]]  # (kind, bytes) → (raw text layer, final text, context)
     repair: Callable[[str], str]  # raw text layer → final text
-    structure: Callable[[str], dict[str, Any]]  # final text → StructuredResumeIn-shaped data
+    structure: Callable[[str, Any], dict[str, Any]]  # (final text, context) → StructuredResumeIn-shaped data
     route: Callable[[str, bytes], str] | None = None  # (kind, bytes) → quality route (clean / suspicious / poor)
 
 
-def _current_read(kind: str, data: bytes) -> tuple[str, str]:
+def _current_read(kind: str, data: bytes) -> tuple[str, str, Any]:
     from io import BytesIO
 
     from app.services import document_text
@@ -66,7 +66,7 @@ def _current_read(kind: str, data: bytes) -> tuple[str, str]:
         layer = "\n".join(page.extract_text() or "" for page in PdfReader(BytesIO(data)).pages)
     else:
         layer = document_text.extract(kind, data)
-    return layer, clean_raw_text(document_text.extract(kind, data))
+    return layer, clean_raw_text(document_text.extract(kind, data)), None
 
 
 def _current_repair(text: str) -> str:
@@ -76,18 +76,25 @@ def _current_repair(text: str) -> str:
     return clean_raw_text(repair_glyphs(text))
 
 
-def _current_structure(text: str) -> dict[str, Any]:
+def _current_structure(text: str, context: Any = None) -> dict[str, Any]:
     from app.services.structured_resume import parse_deterministic
 
     return parse_deterministic(text)
 
 
-def _v2_read(kind: str, data: bytes) -> tuple[str, str]:
+def _v2_read(kind: str, data: bytes) -> tuple[str, str, Any]:
     from app.services.resume_extraction import pipeline
     from app.services.structured_resume import clean_raw_text
 
     out = pipeline.extract(kind, data)
-    return out.text_layer, clean_raw_text(out.text)
+    return out.text_layer, clean_raw_text(out.text), out
+
+
+def _v2_structure(text: str, context: Any = None) -> dict[str, Any]:
+    from app.services.resume_extraction import pipeline
+    from app.services.structured_resume import parse_deterministic
+
+    return parse_deterministic(context.view if context is not None else pipeline.parse_view(text))
 
 
 def _v2_repair(text: str) -> str:
@@ -106,7 +113,7 @@ def _v2_route(kind: str, data: bytes) -> str:
 
 PIPELINES: dict[str, Pipeline] = {
     "current": Pipeline(_current_read, _current_repair, _current_structure),
-    "v2": Pipeline(_v2_read, _v2_repair, _current_structure, _v2_route),
+    "v2": Pipeline(_v2_read, _v2_repair, _v2_structure, _v2_route),
 }
 # The quality route each fixture variant should get: the file's mapping is broken, or it is not.
 EXPECTED_ROUTE = {"clean": ("clean",), "actualtext": ("clean",), "broken": ("suspicious", "poor")}
@@ -182,7 +189,7 @@ def fold(word: str) -> str:
 
 
 def norm(text: str) -> str:
-    return " ".join((text or "").split()).strip(" .").casefold()
+    return fold(" ".join((text or "").split()).strip(" ."))
 
 
 def edit_distance(a: str, b: str) -> int:
@@ -240,7 +247,7 @@ def corrections(expected: list[str], layer: list[str], final: list[str]) -> tupl
             continue  # unchanged, or only white space moved
         produces = all(w in want for w in after)
         destroys = bool(before) and all(w in want for w in before)
-        misleads = any(w not in want and known(w) for w in after)
+        misleads = any(w not in want and not w.endswith("-") and known(w) for w in after)  # "production-" is half a word
         if produces and not destroys:
             made, right = made + 1, right + 1
         elif destroys or misleads:
@@ -279,7 +286,7 @@ def produced_facts(data: dict[str, Any]) -> dict[str, list[Any]]:
 
 def expected_facts(resume: dict[str, Any]) -> dict[str, list[Any]]:
     return {
-        "skills": [i["name"] for g in resume["skills"] for i in g["items"]],
+        "skills": list({norm(i["name"]): i["name"] for g in resume["skills"] for i in g["items"]}.values()),  # once each
         "roles": [(r["title"], r["company"]) for r in resume["experience"]],
         "dates": [(r["company"], r["start"], r["end"]) for r in resume["experience"]],
         "bullets": [b for r in resume["experience"] for b in r["bullets"]],
@@ -390,10 +397,10 @@ def run(ds: Dataset, ctx: dict[str, Any]) -> SuiteResult:
 
     for key, path, kind, resume, variant in docs:
         data = path.read_bytes()
-        layer, final = pipeline.read(kind, data)
+        layer, final, context = pipeline.read(kind, data)
         expected = tokens("\n".join(document_lines(resume)))
         out = add_text(variant, expected, tokens(layer), tokens(final))
-        s = score_structure(resume, pipeline.structure(final), final)
+        s = score_structure(resume, pipeline.structure(final, context), final)
         totals.update({k: s[k] if isinstance(s[k], int) else len(s[k]) for k in
                        ("facts_expected", "facts_produced", "facts_correct", "misfiled", "hallucinated",
                         "unrecognized_dropped", "bullets", "bullets_intact")})

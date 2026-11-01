@@ -4,8 +4,9 @@ PDF text has its broken ligature glyphs restored (app.services.text_repair) befo
 parser, the AI parser and grounding all read "architecting", not "architecYng". Raises whatever the reader raises for
 an unreadable file; callers turn that into their own message.
 
-With V2 on, a PDF is read by app.services.resume_extraction instead (PDFium, which honours the /ActualText some
-producers write for ligatures, plus line-break hyphen joining); off, the path below is unchanged. A resume upload
+With V2 on, a PDF or DOCX is read by app.services.resume_extraction instead (PDFium, which honours the /ActualText
+some producers write for ligatures, plus line-break hyphen joining; a Word document's tables as well as its
+paragraphs); off, the path below is unchanged. A resume upload
 passes the account's choice (`v2`, Settings → Resumes); everything else follows the server (RESUME_EXTRACTION_V2).
 """
 from __future__ import annotations
@@ -22,11 +23,11 @@ PDF, DOCX, TXT = ("application/pdf", "application/vnd.openxmlformats-officedocum
 def extract(kind: str, data: bytes, *, errors: str = "strict", v2: bool | None = None) -> str:
     """Raw text (not cleaned: callers run clean_raw_text) of a file of media type `kind`. `v2` None follows the
     server's RESUME_EXTRACTION_V2."""
-    if kind == PDF:
-        if get_settings().resume_extraction_v2 if v2 is None else v2:
-            from app.services.resume_extraction import pipeline
+    if kind in (PDF, DOCX) and (get_settings().resume_extraction_v2 if v2 is None else v2):
+        from app.services.resume_extraction import pipeline
 
-            return pipeline.extract(kind, data, errors=errors).text
+        return pipeline.extract(kind, data, errors=errors).text
+    if kind == PDF:
         from pypdf import PdfReader
 
         return repair_glyphs("\n".join(page.extract_text() or "" for page in PdfReader(BytesIO(data)).pages))

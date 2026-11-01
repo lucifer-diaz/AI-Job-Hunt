@@ -280,8 +280,10 @@ describe('focused settings UI', () => {
     expect(document.querySelector('.settings-identity img')).toBeNull();
     resumesLoaded([resumeCard({ name: '<svg onload=alert(1)>', file: { id: 1, filename: '<svg onload=alert(1)>.txt', size: 10 } }),
       resumeCard({ id: 2, name: 'other.txt', version: 2, is_active: false, file: null })]); section('resumes');
-    expect(document.querySelector('.settings-resume svg')).toBeNull();
-    expect(document.body.textContent).toContain('Uploading or editing never changes which resume is active');
+    expect(document.querySelectorAll('[data-rd-resume]').length).toBe(2);
+    expect(document.querySelector('[data-rd-resume] svg')).toBeNull();
+    expect(document.body.textContent).toContain('<svg onload=alert(1)>');  // shown as text, never as markup
+    expect(document.body.textContent).toContain('Uploading never changes which one is active');
     expect([...document.querySelectorAll('[data-act="rd-activate"]')].map(b => b.dataset.id)).toEqual(['2']);
     expect(document.body.textContent).toContain('Created from text');
   });
@@ -635,7 +637,7 @@ describe('resume data', () => {
     const old = detail({ id: 4, name: 'old.pdf', version: 1, is_active: false });
     await open(detail(), { 'GET /api/settings/resume?resume_id=4': { active: detail(), current: old, versions: [detail(), old], policy: {} },
       'POST /api/resumes/4/activate': detail(), 'PUT /api/settings/resume/policy': body => { policy = body; return { allow_unverified_resume_facts: true, ranking_uses_unverified: true }; } });
-    expect(document.getElementById('view').textContent).toContain('Used by ML roles');
+    expect(document.getElementById('view').textContent).toContain('used by ML roles');
     expect(document.querySelector('[data-act="rd-default"]')).toBeNull();
     // Viewing another version opens it for editing without making it active.
     await ui.A['rd-view']({ dataset: { id: '4' } });

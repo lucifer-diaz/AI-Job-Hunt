@@ -675,7 +675,9 @@ def check(sessions: Callable[[], Session], c: ParseClaim, within: Within = None)
         if task is None:
             return {"step": CHECK, "outcome": "lost"}
         resume = db.get(Resume, task.resume_id)
-        baseline = shape(sr.parse_deterministic(resume.raw_text if resume is not None else ""))
+        from app.services.resume_verification import parse_text
+
+        baseline = shape(sr.parse_deterministic(parse_text(db, resume) if resume is not None else ""))
         ai = shape(task.staged or {})
         problem = acceptable(ai, baseline)
         if not _record(db, within, CHECK):

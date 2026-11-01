@@ -74,6 +74,19 @@ class TextLayer:
 
 
 @dataclass
+class LineInfo:
+    """One line of the extracted text with what the file says about its look (all None for a text file)."""
+
+    text: str
+    size: float | None = None  # median glyph height of its words
+    bold: bool = False
+    x0: float | None = None  # left edge, PDF points
+    style: str | None = None  # a Word paragraph style ("Heading 1", "List Bullet")
+    bullet: bool = False  # a list item whose marker is not a character (a drawn bullet, Word numbering)
+    segments: list[str] | None = None  # the line's words split where the page leaves a column gap
+
+
+@dataclass
 class PageQuality:
     number: int
     chars: int
@@ -108,3 +121,5 @@ class Extraction:
     text_layer: str  # the file's own text before any repair (TextLayer.text), for evaluation and review
     quality: QualityReport
     layer: TextLayer | None = None  # None for formats without layout (TXT)
+    sections: list[dict[str, object]] = field(default_factory=list)  # sections.Heading.as_dict(), in order
+    view: str = ""  # structure.view: the cleaned text with its structure marked, for the parser

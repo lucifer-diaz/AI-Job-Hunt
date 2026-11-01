@@ -274,8 +274,9 @@ The rules a change has to keep:
 `app/services/resume_extraction/` (README §11 "Reading the file", `docs/resume-extraction-plan.md`) reads an uploaded
 PDF when `RESUME_EXTRACTION_V2` is on. The rules a change has to keep:
 
-* **Off is the old path, byte for byte.** `document_text.extract` calls the pipeline only for a PDF with V2 on;
-  DOCX and TXT read through `document_text.read_plain` either way (`tests/test_resume_extraction_text_layer.py`).
+* **Off is the old path, byte for byte.** `document_text.extract` calls the pipeline only for a PDF or DOCX with V2
+  on; TXT reads through `document_text.read_plain` either way. A version read without V2 has no `ResumeExtraction` row
+  and is parsed from its raw text exactly as before (`resume_verification.parse_text`).
 * **The switch is per account, defaulting to the server.** A resume upload passes `resume_parsing.extraction_v2`
   (worker setting `resume_parsing.extraction_v2`, Settings → Resumes); a value the account never set follows
   `RESUME_EXTRACTION_V2`. Callers without an account (job description files) pass nothing and follow the server.
@@ -285,6 +286,12 @@ PDF when `RESUME_EXTRACTION_V2` is on. The rules a change has to keep:
   hyphen is removed only when the joined word is known and its halves are not; otherwise the hyphen stays.
 * **Deterministic, local, cheap.** No model, no network and no OCR in this step: it may run in the upload request.
   The quality report and the log line hold counts, routes and flags, never resume words.
+* **Structure is marked, never written into the resume.** `sections.detect` (synonyms, keywords, the document's own
+  heading style; never a model) and `structure.view` produce the parse view the regex parser reads. `Resume.raw_text`
+  stays what the file says; the view, stored on `ResumeExtraction`, holds only its words plus markers ("## Section",
+  "### Title | Company | …", "- "). An unknown heading starts its own section: lines never run on into a neighbour
+  and are never dropped. Only `resume_extraction.store` writes `resume_extractions`; a person's decisions go to
+  `resume_extraction_feedback`.
 * **Measured, not assumed.** Run `python scripts/agent_eval.py --suite resume_extraction --resume-pipeline v2`; its
   hard gates (`valid_words_altered`, `hallucinated_values`) stay at 0. Fixtures are synthetic
   (`tests/fixtures/resume_extraction/`, rebuilt by `scripts/build_resume_fixtures.py`); a real resume goes only in the

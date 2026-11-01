@@ -37,13 +37,15 @@ def test_off_reads_a_pdf_exactly_as_before(monkeypatch):
     assert "Kaga" in before, "pypdf ignores ActualText: the bug V2 fixes"
 
 
-def test_on_reads_actualtext_and_leaves_docx_and_txt_as_they_were(v2):
+def test_on_reads_actualtext_and_leaves_txt_as_it_was(v2):
     text = document_text.extract(document_text.PDF, _pdf("ana-single-actualtext.pdf"))
     assert "Apache Kafka" in text and "Kaga" not in text and "Software Engineer" in text
     assert "https://linkedin.example.test/in/anawhitfield" in text
-    for name, kind in (("ana.docx", document_text.DOCX), ("ben.txt", document_text.TXT)):
-        assert document_text.extract(kind, (DOCS / name).read_bytes()) == document_text.read_plain(
-            kind, (DOCS / name).read_bytes())
+    data = (DOCS / "ben.txt").read_bytes()
+    assert document_text.extract(document_text.TXT, data) == document_text.read_plain(document_text.TXT, data)
+    # A Word document's paragraphs read as before; V2 adds its tables (tests/test_resume_extraction_structure.py).
+    docx = (DOCS / "ana.docx").read_bytes()
+    assert document_text.extract(document_text.DOCX, docx) == document_text.read_plain(document_text.DOCX, docx)
 
 
 # ───────────── [A] text layer ─────────────

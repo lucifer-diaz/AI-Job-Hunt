@@ -120,8 +120,8 @@ def test_a_pipeline_that_rewrites_valid_words_is_blocked(monkeypatch):
 def test_a_pipeline_that_invents_a_skill_is_blocked(monkeypatch):
     current = rx.PIPELINES["current"]
 
-    def inventive(text: str) -> dict:
-        data = current.structure(text)
+    def inventive(text: str, context=None) -> dict:
+        data = current.structure(text, context)
         return {**data, "skills": [*data.get("skills", []), {"name": "Haskell", "category": ""}]}
 
     monkeypatch.setitem(rx.PIPELINES, "inventive", rx.Pipeline(current.read, current.repair, inventive))
