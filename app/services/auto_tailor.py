@@ -13,6 +13,10 @@ A job is queued automatically only when all of these hold:
   task. The decision is kept on the job, not the task: QUEUED once this module queued it, DECLINED once the person
   cancelled one of its tasks. Clearing finished tasks therefore never lets a cancelled or failed job back in.
 
+The one other job it queues is a packet whose resume the person changed (`discovery.repoint_jobs`: re-tailoring,
+`auto_tailor_status` RESUME_CHANGED): once the new ranking qualifies it, with no tailoring task still active. The fit
+score and the other account rules apply as above.
+
 Each job is claimed with a guarded UPDATE before it is queued, and `uq_tailor_tasks_active_job` allows one active
 task per job, so the ranking hook, the sweep and a person clicking Tailor at the same moment queue it once.
 
@@ -26,18 +30,21 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import exists, func, select, update
+from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.models import Job, JobRanking, TailorTask
 from app.services import preparation, system_log, tailor_tasks
 from app.services.lifecycle import WorkflowState as S
 from app.services.user_settings import auto_tailor_for, execution_mode_for
+from app.services.workflow import NEEDS_RETAILOR
 
 log = logging.getLogger("jobhunt.auto_tailor")
 
 SessionFactory = Callable[[], Session]
 TAILOR_QUEUE_STATUS = "shortlisted"
+# A job automatic tailoring may claim: undecided, or a packet whose resume the person changed.
+CLAIMABLE = or_(Job.auto_tailor_status.is_(None), Job.auto_tailor_status == tailor_tasks.RESUME_CHANGED)
 
 
 def _enabled_at(config: dict[str, Any]) -> datetime | None:
@@ -57,9 +64,11 @@ def _candidates(db: Session, config: dict[str, Any], *, manual: bool = False):
     since = _enabled_at(config)
     if not config["enabled"] or (since is None and not manual) or execution_mode_for(db) != "backend":
         return None
-    query = select(Job).where(Job.state == S.QUALIFIED, Job.status == TAILOR_QUEUE_STATUS,
-                              Job.fit_score.is_not(None),
-                              Job.auto_tailor_status.is_(None), ~exists().where(TailorTask.job_id == Job.id),
+    first = and_(Job.status == TAILOR_QUEUE_STATUS, Job.auto_tailor_status.is_(None),
+                 ~exists().where(TailorTask.job_id == Job.id))
+    retailor = and_(Job.status == NEEDS_RETAILOR, Job.auto_tailor_status == tailor_tasks.RESUME_CHANGED,
+                    ~exists().where(TailorTask.job_id == Job.id, TailorTask.status.in_(tailor_tasks.ACTIVE)))
+    query = select(Job).where(Job.state == S.QUALIFIED, Job.fit_score.is_not(None), or_(first, retailor),
                               preparation.untouched())
     if not manual:
         ranked_at = (select(func.max(JobRanking.created_at)).where(JobRanking.job_id == Job.id)
@@ -82,7 +91,7 @@ def queue(db: Session, job_ids: list[int] | None = None, *, manual: bool = False
     # guarded UPDATE lets exactly one of them win (the other waits on the row and then matches nothing). The claim
     # commits together with the task in enqueue, so a failure undoes both and the sweep can try again.
     claimed = [job_id for job_id in ids if db.execute(
-        update(Job).where(Job.id == job_id, Job.auto_tailor_status.is_(None))
+        update(Job).where(Job.id == job_id, CLAIMABLE)
         .values(auto_tailor_status=tailor_tasks.AUTO_QUEUED).execution_options(synchronize_session=False)).rowcount]
     if not claimed:
         db.rollback()

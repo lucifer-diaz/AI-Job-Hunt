@@ -1867,8 +1867,12 @@ const resumeValue = (id, choice) => choice === 'ACTIVE' || (choice === 'SETUP' &
 // The resume a job actually resolves to (workspace.resume_in_use) and why, so "Auto — best match by tags" is never a
 // mystery: the select shows the choice, this line names the resume ranking and tailoring read.
 const resumeName = r => `${r.name}${r.name === `Version ${r.version}` ? '' : ` · v${r.version}`}${r.is_active ? ' (active)' : ''}`;
-const resumeInUseNote = (u, extra = '') => !u ? ''
-  : `<div class="xs faint mt4" data-resume-in-use="${attr(u.id)}">Uses <b class="ink2">${esc(resumeName(u))}</b> — ${esc(u.how)}${extra}</div>`;
+const resumeInUseNote = (u, extra = '', jobId = null) => !u ? ''
+  : `<div class="xs faint mt4" data-resume-in-use="${attr(u.id)}">Uses <b class="ink2">${esc(resumeName(u))}</b> — ${esc(u.how)}${extra}</div>${rematchNote(u.rematch, jobId)}`;
+// Tags changed since this job was matched (workspace.stale_match): say what they pick now, and re-match on a click only,
+// since a ranked job is ranked again.
+const rematchNote = (r, jobId) => !r || jobId == null ? ''
+  : `<div class="row gap8 wrap mt4" style="align-items:center" data-rematch="${attr(r.resume?.id ?? '')}"><span class="xs" style="color:var(--warn)">Your resume tags ${r.pinned ? '' : 'now '}match ${r.resume ? `<b>${esc(resumeName(r.resume))}</b>` : 'no resume clearly (the active resume would be used)'} (${esc(r.reason)})</span>${btn(label('rematch' + jobId, r.pinned ? 'Use the tag match' : 'Re-match this job', 'Re-matching…'), 'job-rematch', { id: jobId, pinned: r.pinned ? 1 : '' }, 'sm soft', isBusy('rematch' + jobId))}</div>`;
 // The resume a packet was tailored from (workspace.packet_source_resume), and a warning when the job now uses another.
 function packetSourceNote(src, now) {
   if (!src) return '';
@@ -2027,7 +2031,7 @@ function renderJobModal() {
       <section class="card flush" style="flex:1 1 420px;min-width:0"><div class="tabs under">${[['description', 'Description'], ['structured', 'Structured JD'], ['requirements', 'Requirements map'], ['insights', 'Insights'], ['notes', 'Notes']].map(([id, t]) => `<button class="${S.jobTab === id ? 'on' : ''}" data-act="job-tab" data-id="${id}">${t}</button>`).join('')}</div>${tab}</section>
       <div class="col gap14" style="flex:1 1 280px;min-width:0">
         <section class="card pad18"><div class="row gap8 mb14">${pill('AI', 'brand')}<span class="card-title sm">Fit breakdown</span></div>
-          ${D.resumeChoices?.length ? `<div class="mb12"><div class="row gap8" style="align-items:center;min-width:0"><span class="xs muted" style="white-space:nowrap">Resume used</span>${resumeSelect('job-resume', j.resume_choice_id, { id: j.id, choice: j.resume_choice })}</div>${j.resume_in_use ? resumeInUseNote(j.resume_in_use) : j.resume_choice === 'AUTO' ? '<div class="xs faint mt4">Matched by resume tags</div>' : ''}${j.packet_source?.differs || (j.packet_source && !j.resume_in_use) ? packetSourceNote(j.packet_source, j.resume_in_use) : ''}</div>` : ''}
+          ${D.resumeChoices?.length ? `<div class="mb12"><div class="row gap8" style="align-items:center;min-width:0"><span class="xs muted" style="white-space:nowrap">Resume used</span>${resumeSelect('job-resume', j.resume_choice_id, { id: j.id, choice: j.resume_choice })}</div>${j.resume_in_use ? resumeInUseNote(j.resume_in_use, '', j.id) : j.resume_choice === 'AUTO' ? '<div class="xs faint mt4">Matched by resume tags</div>' : ''}${j.packet_source?.differs || (j.packet_source && !j.resume_in_use) ? packetSourceNote(j.packet_source, j.resume_in_use) : ''}</div>` : ''}
           ${j.fit == null && j.needs_description ? '<div class="small muted">Not ranked: add the job description first — a score from a title alone would mean nothing.</div>'
           : j.fit == null && needsParse(j) ? `<div class="small muted mb12">Not ranked yet: ranking waits for the description to be parsed.</div>${parseBtn(j, 'soft')}`
           : j.fit == null ? `<div class="small muted mb12">Not ranked yet.</div>${btn(label('rank' + j.id, 'Rank this job', 'Queueing…'), 'rank-job', { id: j.id }, 'soft', isBusy('rank' + j.id))}` : `
@@ -2532,14 +2536,20 @@ const A = {
     const out = await api(url, { method: 'PUT', body });
     S.tagEdit = null; delete S.forms.rtag; D.resumeChoices = null;
     D.resumeData = await api(rdResumeUrl()).catch(() => D.resumeData);  // the resume being reviewed stays open
+    const plan = await api('/api/jobs/resume/rematch?dry_run=true', { method: 'POST' }).catch(() => null);
+    return { ...out, changing: plan?.changing || 0 };
+  }, out => out.changing ? `Tags saved — ${out.changing} existing job${out.changing === 1 ? '' : 's'} would now use another resume: use Re-match jobs to resume tags` : 'Tags saved — new jobs are matched with them'),
+  'job-rematch': el => busy('rematch' + el.dataset.id, async () => {
+    const ranked = D.jobModal?.id === Number(el.dataset.id) && D.jobModal.fit != null;
+    const why = [el.dataset.pinned ? 'This replaces the resume you or its search chose with the one its tags match.' : '',
+      ranked ? 'The job will be ranked again with it (model calls). A tailored packet is tailored again from it when automatic tailoring is on, otherwise it waits for you to regenerate it.' : ''].filter(Boolean);
+    if (why.length && !confirm(`${why.join(' ')} Continue?`)) return { cancelled: true };
+    const out = await api(`/api/jobs/${el.dataset.id}/resume`, { method: 'PUT', body: { mode: 'auto' } });
+    if (S.jobOpen) D.jobModal = await api(`/api/jobs/${S.jobOpen}`).catch(() => D.jobModal);
+    await load();
+    if (out.ranking_queued?.length) watchRanking(out.ranking_queued);  // the open job shows the new fit once ranked
     return out;
-  }, 'Tags saved — new jobs are matched with them'),
-  'resume-rematch': () => busy('resumeRematch', async () => {
-    const plan = await api('/api/jobs/resume/rematch?dry_run=true', { method: 'POST' });
-    if (!plan.changing) return { ...plan, skipped: true };
-    if (!confirm(`${plan.changing} of ${plan.jobs} job${plan.jobs === 1 ? '' : 's'} would switch resume${plan.reranked ? `, and ${plan.reranked} ranked job${plan.reranked === 1 ? '' : 's'} would be ranked again (model calls)` : ''}. Pinned choices are not touched. Continue?`)) return { cancelled: true };
-    return api('/api/jobs/resume/rematch', { method: 'POST' });
-  }, out => out.cancelled ? '' : out.skipped ? 'Every job already has its best-matching resume' : `${out.changing} job${out.changing === 1 ? '' : 's'} re-matched · ${out.reranked} queued for ranking`),
+  }, out => out.cancelled ? '' : `Re-matched${out.ranking_queued?.length ? ' · queued for ranking' : ''}`),
   'domain-keep': el => busy('keep' + el.dataset.id, async () => {
     const out = await api(`/api/jobs/${el.dataset.id}/domain-keep`, { method: 'POST' });
     if (S.jobOpen) D.jobModal = await api(`/api/jobs/${S.jobOpen}`).catch(() => D.jobModal);

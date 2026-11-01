@@ -303,15 +303,35 @@ def resume_in_use(db: Session, job: Job) -> dict | None:
     if resume is None:
         return None
     choice = job.resume_choice if chosen is not None or job.resume_choice == "ACTIVE" else None
+    rematch = stale_match(db, job, resume.id)
     if choice in RESUME_CHOICE_LABELS:
         how = RESUME_CHOICE_LABELS[choice]
         if choice == "AUTO" and (reason := resume_matching.score(resume, job).reason):
             how = f"{how} ({reason})"
     elif job.resume_id is not None:
         how = "The chosen resume is gone: the active resume is used"
+    elif rematch is not None:
+        how = "No resume matched by tags when this job was found: the active resume is used"
     else:
         how = "No resume matched by tags clearly: the active resume is used"
-    return {**resume_ref(resume), "choice": choice, "how": how}
+    return {**resume_ref(resume), "choice": choice, "how": how, "rematch": rematch}
+
+
+def stale_match(db: Session, job: Job, in_use_id: int | None = None) -> dict | None:
+    """What matching by today's tags would change for a job: the resume they pick (None: the active one) and why.
+
+    A job matched automatically (or never) may have been matched before its tags changed: any difference is offered.
+    A pinned job (by the person or its search) is offered the tag match only when the tags clearly pick a resume other
+    than the one it uses (`pinned`: taking it replaces that choice). None when nothing would change. Read-only:
+    re-matching stays the person's action, since a ranked job is ranked again."""
+    match = resume_matching.pick(resume_matching.tagged_resumes(db, job.user_id), job)
+    target = match.resume_id if match else None
+    pinned = job.resume_choice not in resume_matching.REMATCHABLE
+    if (target is None or target == in_use_id) if pinned else target == job.resume_id:
+        return None
+    resume = db.get(Resume, target) if target is not None else None
+    return {"resume": resume_ref(resume), "reason": match.reason if match else "no resume matches clearly now",
+            "pinned": pinned}
 
 
 def packet_source_resume(db: Session, job: Job, variant: ResumeVariant, now: dict | None = None) -> dict:

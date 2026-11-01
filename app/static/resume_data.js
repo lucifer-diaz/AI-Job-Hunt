@@ -194,13 +194,61 @@ function rdResumeCard(v, current) {
 function rdRenameEditor(v) {
   return `<div class="row gap8 wrap" style="align-items:center" data-rd-rename="${v.id}">${inputF('rdname', 'name', v.name || '', `maxlength="300" aria-label="Resume name" style="margin:0;flex:0 1 320px;min-width:0" data-enter="rd-rename-save" data-id="${v.id}"`)}<span class="small muted">· v${v.version}</span>${btn(label('rdRename', 'Save name', 'Saving…'), 'rd-rename-save', { id: v.id }, 'sm primary', isBusy('rdRename'))}${btn('Cancel', 'rd-rename-cancel', {}, 'sm')}</div>`;
 }
+// Re-matching jobs to the resume tags (POST /api/jobs/resume/rematch): above the list, so it is found right after
+// tagging. The person narrows the jobs (stage, when found, search, board); a dry run counts them as the filters change,
+// and the run asks first. Pinned choices, approved and applied jobs are never touched.
+const RM_STAGES = { new: 'Not ranked yet', ranked: 'Ranked', tailored: 'Tailored', archived: 'Archived' };
+const RM_DEFAULT_STAGES = ['new', 'ranked', 'tailored'];
+const RM_FOUND = [['', 'Any time'], ['7', 'Last 7 days'], ['30', 'Last 30 days'], ['90', 'Last 90 days']];
+const rmStages = R => R.filters.stages ?? RM_DEFAULT_STAGES;
+function rdRematchBody(R = RD.rematch) {
+  const f = R.filters;
+  return { stages: rmStages(R), found_within_days: Number(f.found) || null, saved_search_id: Number(f.setup) || null, board: f.board || null };
+}
+async function rdRematchPlan() {
+  const R = RD.rematch;
+  if (!R) return;
+  const seq = ++R.seq;
+  R.loading = true; render();
+  try {
+    const plan = await api('/api/jobs/resume/rematch?dry_run=true', { method: 'POST', body: rdRematchBody(R) });
+    if (RD.rematch === R && seq === R.seq) R.plan = plan;  // only the answer to the latest filters counts
+  } catch (err) { toast(err.message, true); }
+  finally { if (seq === R.seq) R.loading = false; render(); }
+}
+function rdRematchCount(R) {
+  const p = R.plan;
+  if (!p) return R.loading ? 'Counting jobs…' : '';
+  const s = n => (n === 1 ? '' : 's');
+  const into = p.into?.length ? ` (${p.into.map(i => `${i.jobs} → ${esc(i.resume)}`).join(', ')})` : '';
+  return `<b>${p.jobs}</b> job${s(p.jobs)} selected · <b>${p.changing}</b> would switch resume${into}${p.reranked ? ` · ${p.reranked} ranked again (model calls)` : ''}${R.loading ? ' · updating…' : ''}`;
+}
+function rdRematchBar(versions) {
+  if (!versions.some(v => v.domain || v.roles?.length || v.domains?.length)) return '';
+  const R = RD.rematch;
+  if (!R) return `<div class="row gap8 wrap mb12" style="align-items:center" data-rd-rematch>${btn('Re-match jobs to resume tags…', 'resume-rematch', {}, 'sm primary')}<span class="settings-help">New jobs use the tags right away. Choose which jobs found earlier to re-match — by stage, when they were found, the search or the board.</span></div>`;
+  const opts = R.plan?.options || { setups: [], boards: [] };
+  const sel = (key, list, value) => `<select class="select" style="margin:0;width:auto;padding:6px 8px" data-act-change="rm-filter" data-key="${key}" aria-label="${attr(key)}">${list.map(([v, t]) => `<option value="${attr(v)}" ${String(v) === String(value) ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select>`;
+  const stages = rmStages(R);
+  const n = R.plan?.changing || 0;
+  return `<div class="mb12" data-rd-rematch style="border:1px solid var(--line);border-radius:12px;padding:14px 16px">
+    <div class="row gap16 wrap" style="align-items:center">
+      <div class="row gap8 wrap" style="align-items:center"><span class="xs muted">Stage</span>${Object.entries(RM_STAGES).map(([id, text]) => `<label class="settings-check" style="margin:0"><input type="checkbox" data-act-change="rm-stage" value="${id}" ${stages.includes(id) ? 'checked' : ''}> ${text}</label>`).join('')}</div>
+      <label class="row gap8" style="align-items:center"><span class="xs muted">Found</span>${sel('found', RM_FOUND, R.filters.found)}</label>
+      ${opts.setups.length ? `<label class="row gap8" style="align-items:center"><span class="xs muted">Search</span>${sel('setup', [['', 'All searches'], ...opts.setups.map(x => [x.id, x.name])], R.filters.setup)}</label>` : ''}
+      ${opts.boards.length ? `<label class="row gap8" style="align-items:center"><span class="xs muted">Board</span>${sel('board', [['', 'All boards'], ...opts.boards.map(b => [b.name, `${b.name} (${b.jobs})`])], R.filters.board)}</label>` : ''}
+    </div>
+    <div class="small mt10" data-rm-count>${rdRematchCount(R)}</div>
+    <div class="row gap8 wrap mt10" style="align-items:center">${btn(label('resumeRematch', `Re-match ${n} job${n === 1 ? '' : 's'}`, 'Re-matching…'), 'rm-run', {}, 'sm primary', isBusy('resumeRematch') || !n || R.loading)}${btn('Close', 'rm-close', {}, 'sm')}<span class="settings-help">Jobs that switch are ranked again; tailored ones are re-tailored when automatic tailoring is on. Approved, applied and pinned jobs never move.</span></div>
+  </div>`;
+}
 function rdResumeList(current) {
   const versions = D.resumeData.versions || [];
   return settingsGroup('Your resumes', 'Each resume has its own data and the roles it is for. The active resume is used for ranking, tailoring and review, unless a job’s title matches another resume’s target roles, or its search setup or you chose one. Uploading or editing never changes which resume is active.',
-    `<div class="settings-resume-list">${versions.map(v => rdResumeCard(v, current)).join('') || '<div class="settings-empty"><strong>Your experience starts here</strong><p>Upload a resume to make your applications more personal. It is parsed into data you can review and verify here.</p></div>'}</div>
+    `${rdRematchBar(versions)}<div class="settings-resume-list">${versions.map(v => rdResumeCard(v, current)).join('') || '<div class="settings-empty"><strong>Your experience starts here</strong><p>Upload a resume to make your applications more personal. It is parsed into data you can review and verify here.</p></div>'}</div>
     <label class="settings-upload" for="resume-file"><strong>＋ Upload ${versions.length ? 'another resume' : 'your resume'}</strong><span>PDF, DOCX or TXT · up to ${BOOT.max_upload_mb} MB</span><input type="file" id="resume-file" accept=".txt,.pdf,.docx" aria-label="Upload resume"></label>
     <label class="settings-check mt8" for="rd-ai-only"><input type="checkbox" id="rd-ai-only" data-act-change="rd-ai-only" ${D.resumeData.ai_only ? 'checked' : ''}> Structure uploads with AI only<span class="settings-help"> · the Resume Parser model reads a new upload right away and its data is shown when it is done; the quick parse is kept only as a fallback</span></label>
-    ${versions.some(v => v.domain || v.roles?.length) ? `<div class="row gap8 mt12" style="align-items:center">${btn(label('resumeRematch', 'Re-match existing jobs', 'Checking…'), 'resume-rematch', {}, 'sm soft', isBusy('resumeRematch'))}<span class="settings-help">New jobs use the target roles right away; this re-matches jobs found earlier (not ones you or a search pinned).</span></div>` : ''}`);
+`);
 }
 function rdPolicy() {
   const policy = D.resumeData.policy || {};
@@ -301,6 +349,23 @@ function renderResumesScreen() {
 const renderResumeDataSettings = renderResumesScreen;
 
 const RESUME_DATA_ACTIONS = {
+  'resume-rematch': () => { RD.rematch = { filters: { stages: null, found: '', setup: '', board: '' }, plan: null, loading: false, seq: 0 }; return rdRematchPlan(); },
+  'rm-stage': el => {
+    const R = RD.rematch, stages = new Set(rmStages(R));
+    if (el.checked) stages.add(el.value); else stages.delete(el.value);
+    R.filters.stages = Object.keys(RM_STAGES).filter(id => stages.has(id));
+    return rdRematchPlan();
+  },
+  'rm-filter': el => { RD.rematch.filters[el.dataset.key] = el.value; return rdRematchPlan(); },
+  'rm-close': () => { RD.rematch = null; render(); },
+  'rm-run': () => busy('resumeRematch', async () => {
+    const R = RD.rematch, plan = R?.plan;
+    if (!plan?.changing) return { skipped: true };
+    if (!confirm(`${plan.changing} of the ${plan.jobs} selected job${plan.jobs === 1 ? '' : 's'} would switch resume${plan.reranked ? `, and ${plan.reranked} ranked job${plan.reranked === 1 ? '' : 's'} would be ranked again (model calls)` : ''}. Pinned choices are not touched. Continue?`)) return { cancelled: true };
+    const out = await api('/api/jobs/resume/rematch', { method: 'POST', body: rdRematchBody(R) });
+    await rdRematchPlan();
+    return out;
+  }, out => out.cancelled ? '' : out.skipped ? 'Every selected job already has its best-matching resume' : `${out.changing} job${out.changing === 1 ? '' : 's'} re-matched · ${out.reranked} queued for ranking`),
   'rd-reload': () => resumeDataLoad(),
   'rd-tab': el => { if (RD.editing && resumeDataDirty() && !confirm('Discard unsaved resume data edits?')) return; rdReset(); RD.tab = el.dataset.tab; render(); },
   'rd-jump': (el, e) => { e?.preventDefault?.(); RD.tab = 'structured'; render(); document.getElementById(`rd-section-${el.dataset.section}`)?.scrollIntoView?.({ block: 'start' }); },
