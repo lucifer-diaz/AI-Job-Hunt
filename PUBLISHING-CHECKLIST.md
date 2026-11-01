@@ -29,9 +29,23 @@ This is a release-control checklist, not legal advice.
       litigation clause, moral-rights waiver, transfer to a future company, irrevocability, and enforceability for
       contributors abroad.
 - [ ] Decide on a corporate CLA for contributions owned by employers, and get one signed before merging such work.
-- [ ] Set up an auditable signing process (for example the CLA Assistant GitHub App, or an e-signature service) that
-      records identity, GitHub account, CLA version, date and the PRs covered. A PR checkbox or a `Signed-off-by` line
-      is not a signed CLA.
+- [x] Signing process: CLA Assistant (cla-assistant.io) is linked to this repository. It records each signer's GitHub
+      account, the date and the version of the agreement (its gist revision), and sets the `license/cla` check on
+      every pull request.
+- [ ] Make the CLA Assistant gist hold exactly the text of `CLA.md` (Version 1.0). Whenever `CLA.md` changes, bump its
+      version and update the gist in the same step: CLA Assistant then asks everyone to sign the new version.
+- [ ] Add a file named `metadata` to that gist with the contents of
+      [`docs/legal/cla-assistant-metadata.json`](docs/legal/cla-assistant-metadata.json), so a signature also records
+      the signer's legal name, email and whether an employer has rights in the work (CLA.md asks for them; a GitHub
+      login alone may not identify a person well enough to enforce the agreement).
+- [ ] Require the `license/cla` status check on `main` (Settings → Branches → branch protection rule), so nothing
+      unsigned can be merged.
+- [ ] Commits authored by `Claude <noreply@anthropic.com>` (AI-assisted commits made for Rohan Roy) belong to no GitHub
+      account, so CLA Assistant cannot match them and the check stays pending on those pull requests. Either commit as
+      your own GitHub identity (set the AI tool's git author to your name and email), or, as the repository owner,
+      merge them knowing they are your own work. Never extend that to anyone else's commits.
+- [ ] Export the signatures from CLA Assistant (its dashboard offers a CSV) after each new signer, and keep the copies
+      with the gist revision: the hosted service is free and not guaranteed to keep records forever.
 - [ ] Publish a short privacy note on how signature records are kept, and for how long.
 - [ ] Never merge a copyrightable outside contribution without a matching signed CLA record: one unsigned contribution
       in the code would stop that code from being offered commercially.

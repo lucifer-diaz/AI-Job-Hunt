@@ -1,0 +1,31 @@
+{
+  "name": {
+    "title": "Full legal name",
+    "type": "string",
+    "githubKey": "name",
+    "required": true
+  },
+  "email": {
+    "title": "Email",
+    "type": "string",
+    "githubKey": "email",
+    "required": true
+  },
+  "signingAs": {
+    "title": "Does an employer or other organization have rights in your contributions?",
+    "oneOf": [
+      {"type": "string", "enum": ["No, the contributions are my own."]},
+      {"type": "string", "enum": ["Yes, and it has given me written permission to submit them under this CLA."]}
+    ],
+    "required": true
+  },
+  "employer": {
+    "title": "If yes: the organization's name",
+    "type": "string"
+  },
+  "agreement": {
+    "title": "I have read the Job Hunt OS Individual Contributor License Agreement, Version 1.0, and I accept it.",
+    "type": "boolean",
+    "required": true
+  }
+}

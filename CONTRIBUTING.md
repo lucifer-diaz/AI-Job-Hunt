@@ -46,13 +46,26 @@ PostgreSQL (`TEST_DATABASE_URL`) and are skipped on SQLite. Provide commands and
 - [ ] New API, migration, model routing, and prompt behavior is documented.
 - [ ] Third-party materials and attribution are disclosed.
 - [ ] No keys, secrets or private candidate data are included.
-- [ ] Any commercial-use rights for these Contributions are granted by my signed or otherwise validly executed CLA.
+- [ ] I have signed the CLA through CLA Assistant, and the `license/cla` check is green.
 
 ## CLA process for contributors
 
-- Before the first substantive PR is merged, contact a maintainer via your PR to arrange an auditable electronic signature or signed copy of [CLA.md](CLA.md). Do not put your home address or other sensitive identity documents in the PR.
-- Include the GitHub username and any employer/company authorization needed to license your submission.
-- A maintainer verifies the actual signed CLA record privately before accepting copyrightable contributions. A checkbox, casual PR comment, or Signed-off-by line alone does not substitute for the agreement.
+The CLA is signed through [CLA Assistant](https://cla-assistant.io), once per GitHub account:
+
+1. Open your pull request. The CLA Assistant bot comments on it and sets the `license/cla` check.
+2. Follow the bot's link, sign in with GitHub, read the agreement (the same text as [CLA.md](CLA.md)) and accept it.
+   The signature covers this and all your future pull requests.
+3. The check turns green. A pull request is merged only with a green `license/cla` check.
+
+- **Every commit author must sign.** CLA Assistant checks each commit's author email. If a commit's email is not on
+  your GitHub account, the bot says the author "is not a GitHub user": add that email to your account (GitHub →
+  Settings → Emails) or rewrite the commit with your account's email.
+- **Work owned by an employer** also needs that employer's written permission (CLA Section 6). Say so in the pull
+  request, and a maintainer will arrange it privately before merging. Do not post identity documents or your home
+  address in the pull request.
+- **A new CLA version** asks you to accept it again before your next pull request is merged; rights you already granted
+  stay in force.
+- A checkbox, a PR comment or a `Signed-off-by` line is not a signature.
 - Contributors retain their original copyright and may reuse their original code elsewhere, subject to others’ rights, while granting Rohan Roy broad commercial sublicensing/relicensing rights. Merely contributing does not create a royalty/equity entitlement.
 
 ## Code review and maintenance

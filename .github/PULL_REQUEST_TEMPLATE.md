@@ -17,7 +17,6 @@
 
 ## Contribution agreement
 
-- [ ] I have signed the **Job Hunt OS CLA** via the designated signing workflow (or have been told it is not required for this non-copyrightable change).
-- [ ] I understand that the CLA grants **Rohan Roy** broad nonexclusive rights, **including commercial hosting, sublicensing and proprietary relicensing**, without royalties. My own copyright is retained.
+- [ ] I understand that the [CLA](https://github.com/triump0870/AI-Job-Hunt/blob/main/CLA.md) grants **Rohan Roy** broad nonexclusive rights, **including commercial hosting, sublicensing and proprietary relicensing**, without royalties. My own copyright is retained.
 
-A checked box does not by itself replace a required signed CLA. A maintainer will verify the signed CLA record before merging substantive contributions.
+The CLA is signed through CLA Assistant: its bot comments on this pull request with a link the first time you contribute. A pull request is merged only once the `license/cla` check is green; a checked box is not a signature.

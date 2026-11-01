@@ -3608,7 +3608,7 @@ and the associated routing and styles together.
 
 The project's original code is available under the [PolyForm Noncommercial License 1.0.0](LICENSE). You may use, study, modify and share it for purposes permitted by that license, including personal noncommercial self-hosting. **Commercial use (including paid hosted/SaaS offerings) requires a separate written license** from Rohan Roy.
 
-We welcome community contributions. Please read [CONTRIBUTING.md](CONTRIBUTING.md) and sign the [Contributor License Agreement](CLA.md) before any substantive contribution is merged. Contributors retain copyright to their own original work while granting Rohan Roy personally the right to operate paid hosted and other commercially licensed versions without royalties.
+We welcome community contributions. Please read [CONTRIBUTING.md](CONTRIBUTING.md) and sign the [Contributor License Agreement](CLA.md) before any substantive contribution is merged (the CLA Assistant bot asks you to on your first pull request). Contributors retain copyright to their own original work while granting Rohan Roy personally the right to operate paid hosted and other commercially licensed versions without royalties.
 
 This repository is the **community edition**. A commercial edition (paid hosting, business and enterprise use) is licensed separately; see [COMMERCIAL-LICENSING.md](COMMERCIAL-LICENSING.md) for how the editions relate. For branding, see [TRADEMARKS.md](TRADEMARKS.md).
 
