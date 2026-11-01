@@ -36,7 +36,7 @@ const S = {
   kitJob: null, tailorJob: null, tailorTab: 'diff', editing: null,
   tailorMode: 'single', tailorChecked: new Set(), tailorRegenerate: false, tailorPages: '',  // '' = the default length in Settings
   pf: { tailor: pfDefaults('tailor'), approvals: pfDefaults('approvals') },
-  approvalJob: null, approvalPicked: new Set(), bulkRejecting: false, rejecting: null, overriding: null, selApp: null, trackerView: 'board', tf: { q: '', location: 'all', min_fit: 0 }, rf: { q: '', location: 'all' }, runSel: null, setupSel: null,
+  approvalJob: null, approvalPicked: new Set(), bulkRejecting: false, rejecting: null, overriding: null, selApp: null, trackerView: 'board', trackerArchive: null, showArchived: false, addingStage: false, tf: { q: '', location: 'all', min_fit: 0 }, rf: { q: '', location: 'all' }, runSel: null, setupSel: null,
   scheduling: false, editingRecruiter: false, recruiterDraft: [], ivDraft: null, manualMissing: null,
   polling: null, busy: {}, forms: {}, apifyImport: false, importPick: new Set(), autoRefreshed: false,
 };
@@ -205,6 +205,8 @@ function go(screen, extra = {}) {
   // Opening one job's packet lands on that packet, not on the task list and filters above it (focusPacket).
   const tailorFocus = screen === 'tailor' && !!extra.tailorJob;
   Object.assign(S, { screen, editing: null, scheduling: false, editingRecruiter: false, tailorFocus }, extra);
+  // Opening one application from elsewhere shows it, even when it is archived or the board's filters hide it.
+  S.trackerReveal = screen === 'tracker' && extra.selApp ? Number(extra.selApp) : null;
   setHash(); window.scrollTo(0, 0); render(); load();
 }
 // Scroll the requested job's packet ("Tailoring for …") into view once it has loaded, then forget the request so
@@ -249,6 +251,7 @@ const LOADERS = {
     D.tracker = await api('/api/tracker');
     const apps = D.tracker.applications;
     if (!apps.some(a => a.id === S.selApp)) S.selApp = (apps[0] || {}).id || null;
+    revealTrackerApp();
   },
   knowledge: loadKnowledge,
   async monitoring() { await loadMonitoring(); },
@@ -1625,48 +1628,136 @@ function filterTracker(apps, f) {
     && (!f.min_fit || (a.fit ?? -1) >= f.min_fit)
     && (!q || `${a.title} ${a.company} ${a.location || ''}`.toLowerCase().includes(q)));
 }
-function renderTrackerFilters(all, shown) {
+// A link to one application (go('tracker', { selApp })) brings it onto the board: archived cards are shown and
+// filters that hide it are cleared, once, so the detail panel and the board always agree.
+function revealTrackerApp() {
+  const id = S.trackerReveal; S.trackerReveal = null;
+  const app = id && D.tracker?.applications.find(a => a.id === id);
+  if (!app) return;
+  if (app.archived) S.showArchived = true;
+  if (!filterTracker([app], S.tf).length) S.tf = { q: '', location: 'all', min_fit: 0 };
+}
+function renderTrackerFilters(all, shown, archived) {
   const f = S.tf, active = f.q || f.location !== 'all' || f.min_fit;
   const opts = (list, cur) => list.map(([v, t]) => `<option value="${attr(v)}" ${String(v) === String(cur) ? 'selected' : ''}>${esc(t)}</option>`).join('');
-  return `<section class="card flush"><div class="toolbar" style="border-bottom:0">
-    <input class="input grow" style="min-width:180px" id="tf-q" data-tf="q" value="${attr(f.q)}" placeholder="Search role, company or location…">
+  return `<div class="tr-toolbar">
+    <label class="tr-search"><span class="tr-search-icon" aria-hidden="true">⌕</span><input class="input bare" id="tf-q" data-tf="q" value="${attr(f.q)}" placeholder="Search role, company or location…" aria-label="Search applications"></label>
     <select class="select" id="tf-location" data-tf="location" aria-label="Location">${opts(locationOptions(trackerLocations(all)), f.location)}</select>
     <select class="select" id="tf-min" data-tf="min_fit" aria-label="Minimum fit">${opts([[0, 'Any fit'], [50, 'Fit ≥ 50'], [70, 'Fit ≥ 70'], [80, 'Fit ≥ 80']], f.min_fit)}</select>
-    ${active ? `<span class="small muted">Showing ${shown} of ${all.length}</span>${btn('Reset', 'tracker-reset-filters', {}, 'sm')}` : ''}</div></section>`;
+    ${active ? `<span class="tr-showing">Showing ${shown} of ${all.length}</span>${btn('Reset', 'tracker-reset-filters', {}, 'sm ghost')}` : ''}
+    <span class="grow"></span>
+    ${archived ? `<button class="tr-chip ${S.showArchived ? 'on' : ''}" data-act="tracker-show-archived" aria-pressed="${S.showArchived}">${S.showArchived ? 'Hide archived' : `Show archived (${archived})`}</button>` : ''}
+    ${btn('Archive old…', 'tracker-archive-open', {}, 'sm' + (S.trackerArchive ? ' primary' : ''))}</div>`;
+}
+
+// Rejected and Closed hold finished applications: their columns are folded to a narrow strip unless the viewer
+// opened them (remembered in this browser). A card can still be dropped on a folded column.
+const FOLDABLE_STAGES = ['rejected', 'closed'], OPEN_STAGES_KEY = 'trackerOpenStages';
+const openStages = (() => { try { return new Set(JSON.parse(localStorage.getItem(OPEN_STAGES_KEY) || '[]')); } catch { return new Set(); } })();
+const stageFolded = id => FOLDABLE_STAGES.includes(id) && !openStages.has(id);
+function toggleStage(id) {
+  if (openStages.has(id)) openStages.delete(id); else openStages.add(id);
+  try { localStorage.setItem(OPEN_STAGES_KEY, JSON.stringify([...openStages])); } catch { /* storage blocked: kept for this page */ }
+}
+
+// Archive old applications: take the ones submitted more than N days ago (0: any age) off the board; a live one also
+// moves to Closed. The server counts them first (dry_run), so the button says exactly how many, and from which stages.
+const ARCHIVE_PRESETS = [15, 30, 45, 60, 90];
+const ARCHIVE_SCOPES = [['no_reply', 'Applied and Acknowledged (no reply yet)'], ['live', 'Every live stage, interviews and offers included'],
+  ['finished', 'Rejected and Closed'], ['all', 'Everything, live and finished']];
+function renderTrackerArchive() {
+  const a = S.trackerArchive; if (!a) return '';
+  const p = a.preview, n = p?.count ?? 0;
+  const stages = p?.by_stage?.length ? p.by_stage.map(s => `<span class="tr-tally"><b>${s.count}</b> ${esc(s.label)}</span>`).join('') : '';
+  return `<section class="card tr-archive">
+    <div class="row between top-align gap10"><div><div class="card-title">Archive old applications</div>
+      <div class="small muted mt4 pretty">Takes them off the board. Live ones also move to Closed, so they get no follow-ups and are no longer checked in Gmail; Rejected ones stay Rejected. Show archived brings them back into view, and Unarchive puts one back.</div></div>
+      ${btn('Cancel', 'tracker-archive-cancel', {}, 'sm ghost none')}</div>
+    <div class="tr-archive-grid">
+      <div class="caps">SUBMITTED MORE THAN</div>
+      <div class="row wrap gap6">${ARCHIVE_PRESETS.map(d => btn(`${d} days`, 'tracker-archive-days', { days: d }, 'sm ' + (a.days === d ? 'primary' : ''))).join('')}
+        <span class="tr-days"><input class="input" type="number" min="0" max="3650" id="archive-days" data-act-change="tracker-archive-days" value="${a.days}" aria-label="Days since submission"><span class="small muted">days ago</span></span>
+        ${btn('Any age', 'tracker-archive-days', { days: 0 }, 'sm ' + (a.days === 0 ? 'primary' : ''))}</div>
+      <div class="caps">FROM</div>
+      <select class="select" style="width:auto;max-width:100%" id="archive-scope" data-act-change="tracker-archive-scope" aria-label="Stages to archive">
+        ${ARCHIVE_SCOPES.map(([v, t]) => `<option value="${v}" ${a.scope === v ? 'selected' : ''}>${t}</option>`).join('')}</select>
+    </div>
+    <div class="tr-archive-foot">${btn(label('archive', a.loading ? 'Counting…' : n ? `Archive ${n} application${n === 1 ? '' : 's'}` : 'Nothing to archive', 'Archiving…'), 'tracker-archive-run', {}, 'primary', isBusy('archive') || a.loading || !n)}
+      ${stages ? `<div class="row wrap gap6">${stages}</div>` : ''}</div></section>`;
+}
+
+async function trackerArchivePreview() {
+  const a = S.trackerArchive; if (!a) return;
+  a.loading = true; render();
+  const ask = { days: a.days, scope: a.scope };
+  try {
+    const preview = await api('/api/tracker/archive', { method: 'POST', body: { ...ask, dry_run: true } });
+    if (S.trackerArchive === a && a.days === ask.days && a.scope === ask.scope) a.preview = preview;
+  } catch (e) { toast(e.message, true); }
+  finally { a.loading = false; render(); }
+}
+
+// A soft colour per company, so the same employer reads the same everywhere on the board.
+const AVATAR_TONES = [['#eeecff', '#3a2bb5'], ['#e3f6f2', '#0f7a68'], ['#fff3e0', '#9a5a00'], ['#fdeef1', '#a8263f'], ['#e8f1fd', '#1f5fa8'], ['#f1ecfb', '#6b3fa8']];
+function companyAvatar(name, cls = '') {
+  const text = String(name || '?').trim();
+  let h = 0; for (const ch of text) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+  const [bg, fg] = AVATAR_TONES[h % AVATAR_TONES.length];
+  return `<span class="tr-avatar ${cls}" style="background:${bg};color:${fg}" aria-hidden="true">${esc((text.match(/[A-Za-z0-9]/) || ['?'])[0].toUpperCase())}</span>`;
+}
+const fitBadge = n => `<span class="tr-fit ${fitCls(n)}" title="Fit score">${fitTxt(n)}</span>`;
+function trackerCard(k, sel) {
+  const tag = k.tag ? pill(k.tag, k.tone === 'warn' ? 'warn' : k.tone === 'good' ? 'good' : 'muted') : '';
+  return `<div class="kcard ${k.id === sel.id ? 'sel' : ''} ${k.archived ? 'archived' : ''}" draggable="true" data-drag-app="${k.id}" data-act="select-app" data-id="${k.id}">
+    <div class="row top-align between gap8"><div class="tr-card-title">${esc(k.title)}</div>${fitBadge(k.fit)}</div>
+    <div class="row gap6 mt6 tr-card-co">${companyAvatar(k.company)}<span class="xs ink2 tr-ellipsis">${esc(k.company)}</span></div>
+    <div class="row gap6 wrap tr-card-foot"><span class="tr-age" title="Submitted">${esc(k.age)}</span>${tag}${k.archived ? pill('archived', 'muted') : ''}</div></div>`;
 }
 
 function renderTracker() {
   const t = D.tracker; if (!t) return loading();
-  const all = t.applications, apps = filterTracker(all, S.tf);
-  const stats = [[t.stats.live, 'Live applications', 'var(--ink)'], [t.stats.replies, 'Replies', 'var(--good)'], [t.stats.due, 'Follow-ups due', 'var(--warn)'], [t.stats.response_rate, 'Response rate', 'var(--brand-ink)']];
-  const head = `<div class="row wrap gap10"><div class="row wrap gap10 grow statrow">${stats.map(([n, l, c]) => `<div class="card" style="padding:11px 15px;min-width:130px;border-radius:11px"><div class="mono bb" style="font-size:20px;color:${c}">${esc(n)}</div><div class="xs muted mt4">${l}</div></div>`).join('')}</div>
-    ${btn('Board', 'tracker-view', { id: 'board' }, S.trackerView === 'board' ? '' : 'ghost')}${btn('Timeline', 'tracker-view', { id: 'timeline' }, S.trackerView === 'timeline' ? '' : 'ghost')}${btn('Inbox insights', 'tracker-view', { id: 'inbox' }, S.trackerView === 'inbox' ? '' : 'ghost')}</div>`;
+  const archived = t.applications.filter(a => a.archived).length;
+  const all = S.showArchived ? t.applications : t.applications.filter(a => !a.archived), apps = filterTracker(all, S.tf);
+  const stats = [[t.stats.live, 'Live', ''], [t.stats.replies, 'Replies', 'good'], [t.stats.due, 'Follow-ups due', t.stats.due ? 'warn' : ''], [t.stats.response_rate, 'Response rate', 'brand']];
+  const views = [['board', 'Board'], ['timeline', 'Timeline'], ['inbox', 'Inbox insights']];
+  const head = `<div class="tr-head"><div class="tr-stats">${stats.map(([n, l, tone]) => `<div class="tr-stat${tone ? ' tone-' + tone : ''}"><div class="tr-stat-n">${esc(n)}</div><div class="tr-stat-l">${l}</div></div>`).join('')}</div>
+    <div class="seg" role="tablist" aria-label="Tracker view">${views.map(([id, l]) => `<button class="${S.trackerView === id ? 'on' : ''}" data-act="tracker-view" data-id="${id}" role="tab" aria-selected="${S.trackerView === id}">${l}</button>`).join('')}</div></div>`;
   if (S.trackerView === 'inbox') return `<div class="stack">${head}${renderInboxInsights()}</div>`;
+  const toolbar = t.applications.length ? `${renderTrackerFilters(all, apps.length, archived)}${renderTrackerArchive()}` : '';
+  if (!all.length && archived) return `<div class="stack">${head}${toolbar}<section class="card">${empty('Every application is archived', 'Show archived to see them, or unarchive one to put it back on the board.', btn(`Show archived (${archived})`, 'tracker-show-archived', {}, 'primary'))}</section></div>`;
   if (!all.length) return `<div class="stack">${head}<section class="card">${empty('No submitted applications yet', 'Approve a packet and confirm you applied from the apply kit — it lands here.', btn('Open approvals', 'go', { screen: 'approvals' }, 'primary'))}</section></div>`;
-  const filters = renderTrackerFilters(all, apps.length);
-  if (!apps.length) return `<div class="stack">${head}${filters}<section class="card">${empty('No applications match', 'Try another location or clear the filters.', btn('Reset filters', 'tracker-reset-filters', {}, 'primary'))}</section></div>`;
+  if (!apps.length) return `<div class="stack">${head}${toolbar}<section class="card">${empty('No applications match', 'Try another location or clear the filters.', btn('Reset filters', 'tracker-reset-filters', {}, 'primary'))}</section></div>`;
   if (S.trackerView === 'timeline') {
     const events = apps.flatMap(a => a.timeline.map(e => ({ ...e, app: a }))).sort((x, y) => y.at.localeCompare(x.at));
-    return `<div class="stack">${head}${filters}<section class="card">${events.map(e => `<div class="tl"><div class="tl-rail"><span class="d" style="background:${KIND_DOT[e.kind] || '#c6cad8'}"></span><span class="l"></span></div><div style="padding-bottom:16px" class="grow"><div class="small b">${esc(e.app.company)} · ${esc(e.title)}</div><div class="xs muted mt4">${fmtDateTime(e.at)}${e.detail && e.kind !== 'stage' ? ' · ' + esc(e.detail) : ''}</div></div>${btn('Open', 'select-app', { id: e.app.id, board: 1 }, 'sm none')}</div>`).join('')}</section></div>`;
+    return `<div class="stack">${head}${toolbar}<section class="card">${events.map(e => `<div class="tl"><div class="tl-rail"><span class="d" style="background:${KIND_DOT[e.kind] || '#c6cad8'}"></span><span class="l"></span></div><div style="padding-bottom:16px" class="grow row top-align gap10">${companyAvatar(e.app.company, 'sm')}<div class="grow"><div class="small b">${esc(e.app.company)} · ${esc(e.title)}</div><div class="xs muted mt4">${fmtDateTime(e.at)}${e.detail && e.kind !== 'stage' ? ' · ' + esc(e.detail) : ''}</div></div></div>${btn('Open', 'select-app', { id: e.app.id, board: 1 }, 'sm none')}</div>`).join('')}</section></div>`;
   }
-  const sel = apps.find(a => a.id === S.selApp) || apps[0];
-  const stageLabel = (t.stages.find(s => s.id === sel.stage) || { label: sel.stage }).label;
-  return `<div class="stack" style="gap:14px">${head}${filters}
-  <div class="kanban">${t.stages.map(st => { const cards = apps.filter(a => a.stage === st.id); return `<div class="kcol" data-drop-stage="${st.id}">
-      <div class="row between" style="padding:2px 4px"><div class="row gap6"><span class="dot" style="width:7px;height:7px;background:${st.dot}"></span><span class="small b">${esc(st.label)}</span></div><span class="mono xs muted">${cards.length}</span></div>
-      ${cards.map(k => `<div class="kcard ${k.id === sel.id ? 'sel' : ''}" draggable="true" data-drag-app="${k.id}" data-act="select-app" data-id="${k.id}">
-        <div class="row top-align between gap8"><div class="small b pretty" style="line-height:1.35">${esc(k.title)}</div><span class="mono bb small none ${fitCls(k.fit)}">${fitTxt(k.fit)}</span></div>
-        <div class="xs muted mt4">${esc(k.company)}</div>
-        <div class="row gap6 wrap mt8">${k.tag ? pill(k.tag, k.tone === 'warn' ? 'warn' : k.tone === 'good' ? 'good' : 'muted') : ''}${pill(k.age, 'muted')}</div></div>`).join('')}</div>`; }).join('')}
-    <div class="kadd"><div class="small b ink2">Add a stage</div><div class="xs muted" style="line-height:1.45">Track the parts of your process this board is missing.</div>
-      <div class="row gap6 wrap">${t.available_stages.map(s => btn('+ ' + esc(s.label), 'add-stage', { id: s.id }, 'sm')).join('')}</div>
-      ${t.extra_stages.length ? `<button class="btn ghost sm danger" style="margin-top:auto;justify-content:flex-start" data-act="remove-stage">Remove the last added stage</button>` : ''}</div>
-  </div>
-  <section class="card">
-    <div class="row top-align between wrap gap14 mb16"><div><div class="row gap9 wrap"><span class="card-title">${esc(sel.company)} · ${esc(sel.title)}</span>${pill(stageLabel, 'brand')}</div><div class="small muted mt4">${esc(sel.meta)}${sel.location ? ' · ' + esc(sel.location) : ''} · fit ${fitTxt(sel.fit)}</div></div>
-      <div class="row gap8 wrap">${btn('Open job', 'open-job', { id: sel.job_id }, 'sm')}${sel.resume_id ? btn('Open packet', 'go', { screen: 'tailor', job: sel.job_id }, 'sm') : ''}${sel.url ? `<a class="btn sm" href="${attr(sel.url)}" target="_blank" rel="noopener">Open posting ↗</a>` : ''}</div></div>
-    <div class="row wrap gap10 mb16 movebar" style="background:#f8f9fd;border:1px solid #eaecf5;border-radius:12px;padding:12px 14px"><span class="caps none">MOVE TO</span>
-      <div class="row wrap gap6 grow">${t.stages.map(st => btn(esc(st.label), 'move-stage', { app: sel.id, stage: st.id }, 'sm ' + (st.id === sel.stage ? 'primary' : ''))).join('')}</div><span class="xs muted none drag-hint">or drag the card between columns</span></div>
+  // The panel only ever shows a card the board shows (folded columns included), so its actions never act on an
+  // application the filters hid. A link to one hidden application reveals it first (revealTrackerApp).
+  const sel = apps.find(a => a.id === S.selApp) || apps.find(a => !stageFolded(a.stage) && !a.archived) || apps[0];
+  const selStage = t.stages.find(s => s.id === sel.stage) || { label: sel.stage, dot: '#c6cad8' };
+  const column = st => {
+    const cards = apps.filter(a => a.stage === st.id);
+    if (stageFolded(st.id)) return `<div class="kcol folded" data-drop-stage="${st.id}" data-act="tracker-fold" data-id="${st.id}" title="${attr(`Show ${st.label}`)}" role="button" aria-expanded="false">
+      <span class="dot" style="width:8px;height:8px;background:${st.dot}"></span><span class="mono xs muted">${cards.length}</span><span class="small b kfold-label">${esc(st.label)}</span><span class="tr-unfold" aria-hidden="true">›</span></div>`;
+    return `<div class="kcol" data-drop-stage="${st.id}" style="--stage:${st.dot}">
+      <div class="kcol-head"><span class="dot" style="width:8px;height:8px;background:${st.dot}"></span><span class="small b grow">${esc(st.label)}</span><span class="tr-count">${cards.length}</span>${FOLDABLE_STAGES.includes(st.id) ? `<button class="tr-icon-btn" data-act="tracker-fold" data-id="${st.id}" title="Collapse ${attr(st.label)}" aria-label="Collapse ${attr(st.label)}" aria-expanded="true">‹</button>` : ''}</div>
+      <div class="kcol-body">${cards.length ? cards.map(k => trackerCard(k, sel)).join('') : '<div class="kcol-empty">Drop a card here</div>'}</div></div>`;
+  };
+  const addStage = S.addingStage ? `<div class="kadd"><div class="row between"><span class="small b ink2">Add a stage</span><button class="tr-icon-btn" data-act="tracker-add-toggle" aria-label="Close">×</button></div>
+      <div class="xs muted" style="line-height:1.45">Track the parts of your process this board is missing.</div>
+      <div class="row gap6 wrap">${t.available_stages.map(s => btn('+ ' + esc(s.label), 'add-stage', { id: s.id }, 'sm')).join('') || '<span class="xs muted">Every stage is on the board.</span>'}</div>
+      ${t.extra_stages.length ? `<button class="btn ghost sm danger" style="margin-top:auto;justify-content:flex-start" data-act="remove-stage">Remove the last added stage</button>` : ''}</div>`
+    : `<button class="kadd-mini" data-act="tracker-add-toggle" title="Add a stage" aria-label="Add a stage">+</button>`;
+  return `<div class="stack" style="gap:14px">${head}${toolbar}
+  <div class="kanban">${t.stages.map(column).join('')}${addStage}</div>
+  <section class="card tr-detail">
+    <div class="tr-detail-head">${companyAvatar(sel.company, 'lg')}
+      <div class="grow" style="min-width:0"><div class="row gap8 wrap"><span class="card-title">${esc(sel.title)}</span>${fitBadge(sel.fit)}</div>
+        <div class="small muted mt4"><b class="ink2">${esc(sel.company)}</b>${sel.location ? ' · ' + esc(sel.location) : ''} · ${esc(sel.meta)}</div>
+        <div class="row gap6 wrap mt8"><span class="tr-stage-pill" style="--stage:${selStage.dot}"><span class="dot" style="background:${selStage.dot}"></span>${esc(selStage.label)}</span>${sel.archived ? pill('archived', 'muted') : ''}</div></div>
+      <div class="row gap8 wrap tr-detail-actions">${sel.archived ? btn(label('unarchive', 'Unarchive', 'Unarchiving…'), 'tracker-unarchive', { app: sel.id }, 'sm primary', isBusy('unarchive')) : ''}${btn('Open job', 'open-job', { id: sel.job_id }, 'sm')}${sel.resume_id ? btn('Open packet', 'go', { screen: 'tailor', job: sel.job_id }, 'sm') : ''}${sel.url ? `<a class="btn sm" href="${attr(sel.url)}" target="_blank" rel="noopener">Open posting ↗</a>` : ''}</div></div>
+    <div class="movebar"><span class="caps none">MOVE TO</span>
+      <div class="row wrap gap6 grow">${t.stages.map(st => `<button class="tr-move ${st.id === sel.stage ? 'on' : ''}" data-act="move-stage" data-app="${sel.id}" data-stage="${st.id}" ${st.id === sel.stage ? 'aria-current="true"' : ''}><span class="dot" style="background:${st.dot}"></span>${esc(st.label)}</button>`).join('')}</div><span class="xs muted none drag-hint">or drag the card between columns</span></div>
     <div class="split gap18">
       <div style="flex:1 1 320px;min-width:0"><div class="caps mb12">HISTORY</div>
         <div class="col">${sel.timeline.map(e => `<div class="tl"><div class="tl-rail"><span class="d" style="background:${KIND_DOT[e.kind] || '#c6cad8'}"></span><span class="l"></span></div><div style="padding-bottom:16px"><div class="small b">${esc(e.title)}</div><div class="xs muted mt4 pretty">${eventTime(e)}${e.detail && e.kind !== 'stage' ? ' · ' + esc(e.detail) : ''}</div>${eventContact(e)}</div></div>`).join('')}</div>
@@ -1674,8 +1765,8 @@ function renderTracker() {
         <div class="logbox"><select class="select" style="width:auto;padding:6px 8px" id="log-kind">${['note', 'call', 'email', 'referral'].map(k => `<option value="${k}">${k[0].toUpperCase() + k.slice(1)}</option>`).join('')}</select>
           <input class="input bare grow" id="log-text" placeholder="Log something — call, email, referral…" data-enter="log-event" data-app="${sel.id}">${btn(label('log', 'Add', 'Adding…'), 'log-event', { app: sel.id }, 'sm', isBusy('log'))}</div>
       </div>
-      <div style="flex:1 1 240px;min-width:0" class="col gap12">
-        <div class="box brand" style="padding:13px"><div class="caps mb8">NEXT STEP</div><div class="base b">${esc(sel.next)}</div><div class="small muted mt4">${esc(sel.next_date)}</div></div>
+      <div style="flex:1 1 260px;min-width:0" class="col gap12">
+        <div class="box brand tr-next"><div class="caps mb8">NEXT STEP</div><div class="base b">${esc(sel.next)}</div>${sel.next_date ? `<div class="small muted mt4">${esc(sel.next_date)}</div>` : ''}</div>
         ${renderRecruiters(sel)}
         <div class="box" style="padding:13px"><div class="caps mb8">SUBMITTED</div>
           <div class="small ink2" style="line-height:1.5">${sel.resume_id ? `<a href="#" data-act="go" data-screen="tailor" data-job="${sel.job_id}">${esc(sel.docs)}</a>` : esc(sel.docs)}</div>${sel.notes ? `<div class="xs muted mt8 pretty">${esc(sel.notes)}</div>` : ''}</div>
@@ -1688,6 +1779,7 @@ function renderTracker() {
       </div></div>
   </section></div>`;
 }
+
 /* recruiters and interviews */
 // Some browsers still report renamed IANA zones; show and store the current names.
 const TZ_RENAMED = { 'Asia/Calcutta': 'Asia/Kolkata', 'Asia/Saigon': 'Asia/Ho_Chi_Minh', 'Asia/Katmandu': 'Asia/Kathmandu', 'Asia/Rangoon': 'Asia/Yangon',
@@ -1718,7 +1810,7 @@ function eventContact(e) {
 function renderRecruiters(sel) {
   const list = sel.recruiters || [];
   if (!S.editingRecruiter) {
-    return `<div class="box" style="padding:13px"><div class="row between mb8"><span class="caps">RECRUITERS${list.length > 1 ? ` · ${list.length}` : ''}</span><a href="#" class="xs" data-act="edit-recruiter">${list.length ? 'Edit' : 'Add'}</a></div>
+    return `<div class="box" style="padding:13px"><div class="row between mb8"><span class="caps">RECRUITERS${list.length > 1 ? ` · ${list.length}` : ''}</span><a href="#" class="xs" data-act="edit-recruiter" data-app="${sel.id}">${list.length ? 'Edit' : 'Add'}</a></div>
       ${list.length ? `<div class="col gap10">${list.map((r, i) => `<div${i ? ' style="padding-top:10px;border-top:1px solid var(--line3)"' : ''}>
         <div class="base b">${esc(r.name || r.email || r.phone)}${i === 0 && list.length > 1 ? ' <span class="xs muted" style="font-weight:400">· primary</span>' : ''}</div>
         ${r.email && r.name ? `<div class="small mt4"><a href="mailto:${attr(r.email)}">${esc(r.email)}</a></div>` : ''}
@@ -3041,6 +3133,30 @@ const A = {
   'tracker-view': el => { S.trackerView = el.dataset.id; if (el.dataset.id === 'inbox') D.inbox = undefined; render(); },
   'select-app': el => { S.selApp = Number(el.dataset.id); S.editingRecruiter = false; S.scheduling = false; if (el.dataset.board) S.trackerView = 'board'; render(); },
   'move-stage': el => moveStage(el.dataset.app, el.dataset.stage),
+  'tracker-fold': el => { toggleStage(el.dataset.id); render(); },
+  'tracker-show-archived': () => { S.showArchived = !S.showArchived; render(); },
+  'tracker-add-toggle': () => { S.addingStage = !S.addingStage; render(); },
+  'tracker-unarchive': el => busy('unarchive', async () => {
+    await api(`/api/applications/${el.dataset.app}/unarchive`, { method: 'POST' });
+    S.selApp = Number(el.dataset.app); await load();
+  }, 'Back on the board'),
+  'tracker-archive-open': () => {
+    if (S.trackerArchive) { S.trackerArchive = null; render(); return; }
+    S.trackerArchive = { days: 30, scope: 'no_reply', preview: null, loading: false }; trackerArchivePreview();
+  },
+  'tracker-archive-cancel': () => { S.trackerArchive = null; render(); },
+  'tracker-archive-days': el => {
+    const days = Number(el.dataset.days ?? el.value);
+    if (!S.trackerArchive || !Number.isInteger(days) || days < 0) return;
+    S.trackerArchive.days = days; S.trackerArchive.preview = null; trackerArchivePreview();
+  },
+  'tracker-archive-scope': el => { if (!S.trackerArchive) return; S.trackerArchive.scope = el.value; S.trackerArchive.preview = null; trackerArchivePreview(); },
+  'tracker-archive-run': () => busy('archive', async () => {
+    const { days, scope } = S.trackerArchive;
+    const out = await api('/api/tracker/archive', { method: 'POST', body: { days, scope } });
+    D.tracker = out.tracker; S.trackerArchive = null;
+    return out;
+  }, out => `Archived ${out.count} application${out.count === 1 ? '' : 's'}`),
   'add-stage': el => busy('stages', async () => { D.tracker = await api('/api/tracker/stages', { method: 'PUT', body: { extra_stages: [...D.tracker.extra_stages, el.dataset.id] } }); }),
   'remove-stage': () => busy('stages', async () => {
     const extras = D.tracker.extra_stages.slice(0, -1), removed = D.tracker.extra_stages.at(-1);
@@ -3057,7 +3173,7 @@ const A = {
   },
   'edit-recruiter': (el, e) => {
     e.preventDefault();
-    const sel = D.tracker.applications.find(a => a.id === S.selApp);
+    const sel = D.tracker.applications.find(a => a.id === Number(el.dataset.app));
     S.recruiterDraft = (sel?.recruiters || []).map(r => ({ ...r }));
     if (!S.recruiterDraft.length) S.recruiterDraft.push({ name: '', email: '', phone: '' });
     S.editingRecruiter = true; render();

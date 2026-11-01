@@ -8,9 +8,11 @@ read it; nothing else may decide whether a state change is legal.
 
 Terminal states: OFFER, REJECTED, ARCHIVED, SKIPPED, FAILED. FAILED is terminal for automatic
 processing; an operator may requeue it, and only back to the state it failed in. An ARCHIVED job that was
-archived by ranking (from RANKED or QUALIFIED) may be reopened for re-ranking, and only to RANK_PENDING.
+archived by ranking (from RANKED or QUALIFIED) may be reopened for re-ranking (RANK_PENDING), or by the candidate
+alone, approving its packet over the ranking policy, to QUALIFIED.
 A job SKIPPED before ranking for want of a description returns to NORMALIZED once it has one.
-A job the user removed from the ranking queue returns to NORMALIZED when they ask for it to be ranked after all.
+A job the user removed from the ranking queue returns to NORMALIZED when they ask for it to be ranked after all, or,
+by the candidate alone approving its packet, to QUALIFIED.
 """
 from __future__ import annotations
 
@@ -104,7 +106,8 @@ TRANSITIONS: dict[WorkflowState, frozenset[WorkflowState]] = {
 
 TERMINAL_STATES: frozenset[WorkflowState] = frozenset(s for s, targets in TRANSITIONS.items() if not targets)
 FAILABLE_STATES: frozenset[WorkflowState] = frozenset(s for s, targets in TRANSITIONS.items() if S.FAILED in targets)
-# ARCHIVED stays terminal for automation; a job archived by ranking may be reopened, only for re-ranking.
+# ARCHIVED stays terminal for automation; a job archived by ranking may be reopened for re-ranking, or to QUALIFIED by
+# the candidate approving its packet anyway (PERSON_ONLY below).
 REOPENABLE_ARCHIVE_SOURCES: frozenset[WorkflowState] = frozenset({S.RANKED, S.QUALIFIED})
 # SKIPPED stays terminal too, with two exceptions, both from before a ranking was made: a posting that arrived
 # without a usable description is ranked after all once that description turns up (a fuller re-import, or one
@@ -113,9 +116,13 @@ REOPENABLE_ARCHIVE_SOURCES: frozenset[WorkflowState] = frozenset({S.RANKED, S.QU
 # about a skip is reversible.
 REOPENABLE_SKIP_SOURCES: frozenset[WorkflowState] = frozenset({S.NORMALIZED, S.FILTERED, S.RANK_PENDING})
 # Moves only a person may make (work_queue.transition checks the actor): a submission that was started is only ever
-# said not to have happened by the candidate, never by a worker, a sweep or an expired lease.
+# said not to have happened by the candidate, never by a worker, a sweep or an expired lease; and only the candidate
+# overrules the ranking policy's archive, or a ranking they stopped, by approving the job's packet anyway
+# (app.services.approval).
 PERSON = "person"
-PERSON_ONLY: frozenset[tuple[WorkflowState, WorkflowState]] = frozenset({(S.APPLYING, S.READY_TO_APPLY)})
+PERSON_ONLY: frozenset[tuple[WorkflowState, WorkflowState]] = frozenset({(S.APPLYING, S.READY_TO_APPLY),
+                                                                         (S.ARCHIVED, S.QUALIFIED),
+                                                                         (S.SKIPPED, S.QUALIFIED)})
 
 
 class InvalidState(ValueError):
@@ -156,9 +163,9 @@ def can_transition(current: object, target: object, *, previous_state: object | 
     if current is S.FAILED:
         # Requeue: only back to the state the job failed in.
         return previous_state is not None and parse_state(previous_state) == target and target in FAILABLE_STATES
-    if current is S.ARCHIVED and target is S.RANK_PENDING:
+    if current is S.ARCHIVED and target in (S.RANK_PENDING, S.QUALIFIED):
         return previous_state is not None and parse_state(previous_state) in REOPENABLE_ARCHIVE_SOURCES
-    if current is S.SKIPPED and target is S.NORMALIZED:
+    if current is S.SKIPPED and target in (S.NORMALIZED, S.QUALIFIED):
         return previous_state is not None and parse_state(previous_state) in REOPENABLE_SKIP_SOURCES
     return target in TRANSITIONS[current]
 
@@ -169,9 +176,9 @@ def validate_transition(current: object, target: object, *, previous_state: obje
         if current_state is S.FAILED:
             raise InvalidTransition(current_state, target_state,
                                     f"A FAILED job may only be requeued to the state it failed in ({previous_state})")
-        if current_state is S.ARCHIVED and target_state is S.RANK_PENDING:
+        if current_state is S.ARCHIVED and target_state in (S.RANK_PENDING, S.QUALIFIED):
             raise InvalidTransition(current_state, target_state,
-                                    f"Only a job archived by ranking can be re-ranked (it was archived from {previous_state})")
+                                    f"Only a job archived by ranking can be reopened (it was archived from {previous_state})")
         raise InvalidTransition(current_state, target_state)
     return target_state
 

@@ -1243,6 +1243,8 @@ class Application(Base):
     apply_blocker: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     # Post-submission tracker column: applied, acknowledged, screening, interviewing, ..., closed.
     stage: Mapped[str | None] = mapped_column(String(50), default="applied", nullable=True)
+    # Archived off the tracker board by the person (app.services.tracker.archive_older_than); NULL when on the board.
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
     job: Mapped[Job] = relationship(back_populates="application")

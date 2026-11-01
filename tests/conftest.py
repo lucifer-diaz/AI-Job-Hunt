@@ -129,12 +129,12 @@ def qualified_before_approval(request, monkeypatch):
 
     original = approval.path_to_ready
 
-    def path(db, job, variant):
+    def path(db, job, variant, **kwargs):
         if parse_state(job.state) in (S.DISCOVERED, S.NORMALIZED, S.FILTERED):
             from sqlalchemy.orm.attributes import set_committed_value
 
             set_committed_value(job, "state", S.QUALIFIED)  # as if ranked (the lifecycle guard is for real moves)
-        return original(db, job, variant)
+        return original(db, job, variant, **kwargs)
     monkeypatch.setattr(approval, "path_to_ready", path)
 
 

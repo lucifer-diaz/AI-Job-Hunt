@@ -809,7 +809,7 @@ def approve(job_id: int, payload: ApproveIn | None = None, db: Session = Depends
                                   "reviewer_score": latest.reviewer_score, "min_review_score": min_score,
                                   "can_override": True})
     try:
-        app_obj = approve_job(db, job, override=below, note=payload.note)
+        app_obj = approve_job(db, job, override=below, note=payload.note, by_person=True)
     except ApprovalRefused as exc:
         raise HTTPException(409, str(exc)) from exc
     except ValueError as exc:
