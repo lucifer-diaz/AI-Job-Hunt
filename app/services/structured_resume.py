@@ -98,6 +98,9 @@ class SkillIn(_In):
     id: str | None = Field(default=None, max_length=120)
     name: str = Field(max_length=200)
     category: str = Field(default="", max_length=120)
+    # How the resume writes it when `name` is a normalized form ("Kafka" for "Apache Kafka"); kept only when grounding
+    # found it in the text (resume extraction V2). Absent otherwise.
+    raw: str | None = Field(default=None, max_length=200)
 
 
 class ExperienceIn(_In):
@@ -566,7 +569,7 @@ def materialize(source: StructuredResumeIn | dict[str, Any], previous: dict[str,
         "summary": {"id": ids.take("summary", "summary"), "text": summary.text},
     }
     out["skills"] = [{"id": ids.take(s.id, f"skill_{slug(s.name) or short_hash(s.name)}"), "name": s.name,
-                      "category": s.category} for s in data.skills if s.name]
+                      "category": s.category, **({"raw": s.raw} if s.raw else {})} for s in data.skills if s.name]
     experience = []
     for role in data.experience:
         role_id = ids.take(role.id, f"exp_{slug(role.company) or slug(role.job_title) or 'role'}_{_year(role.start_date or role.raw_start_date)}")

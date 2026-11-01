@@ -118,7 +118,7 @@ function rdItemActions(node) {
 function rdSkills(skills) {
   const groups = new Map();
   for (const skill of skills) groups.set(skill.category || '', [...(groups.get(skill.category || '') || []), skill]);
-  return [...groups].map(([category, list]) => `<div class="rd-skill-group">${category ? `<div class="caps-sm">${esc(category)}</div>` : ''}<div class="rd-chips">${list.map(s => `<span class="rd-chip is-${rdStatus(s).toLowerCase()}" data-rd-item="${attr(s.id)}">${rdBadge(s)}<span>${esc(s.name)}</span>${rdItemActions(s)}</span>`).join('')}</div></div>`).join('');
+  return [...groups].map(([category, list]) => `<div class="rd-skill-group">${category ? `<div class="caps-sm">${esc(category)}</div>` : ''}<div class="rd-chips">${list.map(s => `<span class="rd-chip is-${rdStatus(s).toLowerCase()}" data-rd-item="${attr(s.id)}"${s.raw ? ` title="The resume writes it “${attr(s.raw)}”"` : ''}>${rdBadge(s)}<span>${esc(s.name)}${s.raw ? `<span class="faint"> · written “${esc(s.raw)}”</span>` : ''}</span>${rdItemActions(s)}</span>`).join('')}</div></div>`).join('');
 }
 function rdHas(data, section) {
   const value = data[section];
@@ -193,6 +193,7 @@ function rdSectionCard(section, label, data, progress) {
 // How the file was read (resume extraction V2): the quality route, and each heading as written with the section it was
 // put in and how. Changing a heading's section re-reads the resume with it (filled while nothing is reviewed, else a
 // comparison). Folded away unless a heading needs a decision; versions read before V2 show nothing.
+const RD_HELD = { skill: 'Skill', bullet: 'Bullet', role: 'Role', summary: 'Summary', project: 'Project', certification: 'Certification', award: 'Award', language: 'Language', education: 'Education', additional: 'Additional' };
 const RD_METHOD = { synonym: ['Known', 'good'], keyword: ['Guess', 'warn'], unknown: ['Choose', 'bad'], learned: ['Your earlier choice', 'brand'], person: ['Yours', 'brand'] };
 const RD_ROUTE = { clean: ['Read cleanly', 'good'], suspicious: ['A few words may be misread', 'warn'], poor: ['Many words may be misread', 'bad'], no_text: ['No text found (a scan?)', 'bad'] };
 function rdSectionsPanel(active) {
@@ -206,9 +207,11 @@ function rdSectionsPanel(active) {
   }).join('') || '<p class="settings-help">No section headings were found: everything was read as one block.</p>';
   const help = ex.unplaced ? `<div class="settings-notice"><strong>${ex.unplaced} heading${ex.unplaced === 1 ? '' : 's'} need${ex.unplaced === 1 ? 's' : ''} a section</strong><p>The reader could not place ${ex.unplaced === 1 ? 'it' : 'them'}. Choose a section to verify this resume; your choice is remembered for your next uploads.</p></div>` : '';
   const reasons = (ex.quality?.reasons || []).length ? ` · ${esc(ex.quality.reasons.join(' · '))}` : '';
+  const review = ex.review || [];
+  const held = review.length ? `<div class="rd-held mt16"><div class="caps-sm mb8">Held back for review · ${review.length}</div><p class="settings-help mb8">The AI parse proposed ${review.length === 1 ? 'this value' : 'these values'}, but the resume’s text does not contain ${review.length === 1 ? 'it' : 'them'} (a reworded or corrected word, or something it inferred). ${review.length === 1 ? 'It is' : 'They are'} not used unless you add ${review.length === 1 ? 'it' : 'them'}.</p>${review.map(item => `<div class="rd-held-row" data-rd-held="${attr(item.id)}"><span class="pill plain">${esc(RD_HELD[item.kind] || item.kind)}</span><div class="grow"><span>${esc(item.value)}</span>${item.where ? `<div class="faint small">${esc(item.where)}</div>` : ''}</div>${item.addable ? btn('Add', 'rd-review', { id: item.id, action: 'add' }, 'sm', locked) : '<span class="faint small">add it with Edit</span>'}${btn('Discard', 'rd-review', { id: item.id, action: 'discard' }, 'sm ghost', locked)}</div>`).join('')}</div>` : '';
   // <small>, not <span>: the details summary turns its <span> (the "+") when open.
-  const title = `<small class="rd-sec-sum"><b>How it was read</b>${pill(route, tone)}<em class="faint">${ex.sections.length} section${ex.sections.length === 1 ? '' : 's'}${ex.unplaced ? ` · ${ex.unplaced} to place` : ''}</em></small>`;
-  return `<details class="settings-details rd-sections" data-settings-details="resume-sections" ${ex.unplaced || SETTING_DETAILS.has('resume-sections') ? 'open' : ''}><summary>${title}<span aria-hidden="true">+</span></summary><div class="settings-details-body">${help}<p class="settings-help mb8">Each heading as the file writes it, and the section its lines were put in. Wrong? Pick another: the resume is read again with it${reasons}.</p><div class="rd-sec-list">${rows}</div></div></details>`;
+  const title = `<small class="rd-sec-sum"><b>How it was read</b>${pill(route, tone)}<em class="faint">${ex.sections.length} section${ex.sections.length === 1 ? '' : 's'}${ex.unplaced ? ` · ${ex.unplaced} to place` : ''}${review.length ? ` · ${review.length} held back` : ''}</em></small>`;
+  return `<details class="settings-details rd-sections" data-settings-details="resume-sections" ${ex.unplaced || review.length || SETTING_DETAILS.has('resume-sections') ? 'open' : ''}><summary>${title}<span aria-hidden="true">+</span></summary><div class="settings-details-body">${help}<p class="settings-help mb8">Each heading as the file writes it, and the section its lines were put in. Wrong? Pick another: the resume is read again with it${reasons}.</p><div class="rd-sec-list">${rows}</div>${held}</div></details>`;
 }
 // The sections at a glance, sticky while reviewing: jump to one, or add one the parser did not find.
 function rdNav(data, progress) {
@@ -532,6 +535,13 @@ const RESUME_DATA_ACTIONS = {
     });
   },
   'rd-policy-source': el => rdRun(async () => { D.resumeData = { ...D.resumeData, policy: await api('/api/settings/resume/policy', { method: 'PUT', body: { resume_source: el.value } }) }; }, el.value === 'master_text' ? 'AI now works from the resume text as written' : 'AI now works from your structured resume data'),
+  // A value the AI parse proposed that the text does not contain: added as the person's change (unverified) or discarded.
+  'rd-review': el => {
+    const active = rdActive(), add = el.dataset.action === 'add';
+    return rdRun(async () => {
+      rdApply(await api(`/api/resumes/${active.id}/review`, { method: 'POST', body: { id: el.dataset.id, action: el.dataset.action } }));
+    }, add ? 'Added: review it like any other fact' : 'Discarded');
+  },
   'rd-section-assign': el => {
     if (!el.value) return;
     const active = rdActive();

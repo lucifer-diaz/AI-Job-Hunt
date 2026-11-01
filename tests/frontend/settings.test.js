@@ -723,6 +723,23 @@ describe('resume data', () => {
     expect(document.querySelector('[data-act="rd-verify-resume"]').disabled).toBe(false);
     expect(document.querySelector('.rd-sections summary').textContent).not.toContain('to place');
   });
+  it('lists values the AI parse could not ground and adds or discards them', async () => {
+    let sent;
+    const review = [{ id: 'h1', kind: 'skill', value: 'Rust', where: 'Skills', addable: true },
+      { id: 'h2', kind: 'project', value: 'Search Ranker', where: '', addable: false }];
+    const ex = rv => ({ source: 'pdfium', quality: { route: 'clean', reasons: [] }, choices: [], unplaced: 0, sections: [], review: rv });
+    const base = detail();
+    const structured = { ...base.structured, skills: [{ id: 'skill_k', name: 'Apache Kafka', raw: 'Kafka', category: '', verification: { status: 'UNVERIFIED', updated_at: null } }] };
+    await open(detail({ structured, extraction: ex(review) }), { 'POST /api/resumes/5/review': body => { sent = body; return detail({ structured, extraction: ex(review.slice(1)) }); } });
+    expect(document.querySelector('.rd-sections').open).toBe(true);
+    expect(document.querySelectorAll('[data-rd-held]').length).toBe(2);
+    expect(document.querySelector('[data-rd-held="h2"]').textContent).toContain('add it with Edit');
+    expect(document.querySelector('[data-rd-held="h2"] [data-action="add"]')).toBeNull();
+    expect(document.querySelector('[data-rd-item="skill_k"]').textContent).toContain('written “Kafka”');
+    await ui.A['rd-review']({ dataset: { id: 'h1', action: 'add' } }); await settle();
+    expect(sent).toEqual({ id: 'h1', action: 'add' });
+    expect(document.querySelectorAll('[data-rd-held]').length).toBe(1);
+  });
   it('shows nothing about reading for a version read before the new reader', async () => {
     await open(detail({ extraction: null }));
     expect(document.querySelector('.rd-sections')).toBeNull();

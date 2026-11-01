@@ -1,6 +1,6 @@
 # Resume extraction V2: Phase 0 findings and plan
 
-Status: **Phases 1 – 4 done; Phase 5 (AI parser on the parse view, grounding, review list) next.** Agreed decisions are in section 10; where they differ from the
+Status: **Phases 1 – 5 done; Phase 6 (OCR + corrections for PDFs without ActualText) next.** Agreed decisions are in section 10; where they differ from the
 recommendations in sections 5 – 9, section 10 wins.
 
 ## 1. Summary
@@ -325,3 +325,18 @@ position is found, not claimed) and cheaper. Keep a `source_quote` only for summ
   precision 0.950 → 0.954 with the real resumes (synthetic 0.936 → 0.943).
 * Not covered: in a text file an unknown heading is not detected at all, so it cannot be picked from the list (its
   lines stay where they are written); assigning arbitrary lines is a possible follow-up.
+
+### Phase 5: AI parser on the parse view, raw terms, review list (done)
+
+* Prompt v7 (`build_resume_parser_prompt(..., marked=True)`) for versions read with V2: sections and roles come
+  marked, words are copied exactly (the v6 "fix obvious corruption" rule, whose fixes grounding always dropped, is
+  gone), a normalized skill names its written form (`raw`). v6 is unchanged for every other version (golden tests).
+* Grounding keeps a normalized skill when its `raw` is in the text and `normalizes(raw, name)` holds (containment,
+  alias, initials; "Python" → "Rust" never); the unit keeps `raw` and the chip shows "written “Kafka”".
+* `held_back` lists what grounding dropped (skills, bullets, roles, projects, certifications, awards, languages,
+  education, summary, additional lines) on the record's review list, written under the task's lease; Settings →
+  Resumes → "Held back for review" adds a skill, a bullet or a missing summary through the normal edit path (unverified)
+  or discards; both are feedback rows. `POST /api/resumes/{id}/review`.
+* Not built: per-field correction claims from the model (`was_corrected` + evidence) — Phase 6 owns corrections, with
+  OCR and lexicon evidence; and an eval suite over recorded AI outputs (grounding is unit-tested; the resume_extraction
+  suite scores the regex path).

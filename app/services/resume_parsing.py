@@ -80,10 +80,24 @@ def utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
-def _prompt_version() -> str:
-    from app.prompts.resume_parser import RESUME_PARSER_PROMPT_VERSION
+def _prompt_version(marked: bool = False) -> str:
+    """The prompt version a version is structured with: v7 for a resume read with V2 (its parse view), else v6."""
+    from app.prompts.resume_parser import (
+        RESUME_PARSER_PROMPT_VERSION,
+        RESUME_PARSER_V2_PROMPT_VERSION,
+    )
 
-    return RESUME_PARSER_PROMPT_VERSION
+    return RESUME_PARSER_V2_PROMPT_VERSION if marked else RESUME_PARSER_PROMPT_VERSION
+
+
+def _view(db: Session, resume: Resume | None) -> str | None:
+    """The parse view of a version read with resume extraction V2 (None otherwise)."""
+    if resume is None:
+        return None
+    from app.services.resume_extraction import store
+
+    row = store.record(db, resume.id)
+    return row.parse_view if row is not None and row.parse_view else None
 
 
 # ───────────── the queue ─────────────
@@ -114,7 +128,7 @@ def enqueue(db: Session, resume: Resume, *, reason: str = UPLOAD, run_now: bool 
             active.run_now_at, active.next_attempt_at = now, None
         return active
     if reason != USER_REQUEST:
-        if resume.parser == "llm" and resume.parser_version == _prompt_version():
+        if resume.parser == "llm" and resume.parser_version == _prompt_version(_view(db, resume) is not None):
             return None
         last = latest_task(db, resume.id)
         if last is not None and last.raw_text_hash == resume.raw_text_hash and (
@@ -421,7 +435,18 @@ def ground(data: dict[str, Any], raw_text: str) -> tuple[dict[str, Any], dict[st
         out["summary"] = ""
         count.drop("summary")
 
-    skills = [s for s in out.get("skills") or [] if isinstance(s, dict) and src.has_skill(s.get("name"))]
+    skills = []
+    for skill in out.get("skills") or []:
+        if not isinstance(skill, dict):
+            continue
+        skill = dict(skill)
+        raw = skill.pop("raw", None)
+        if src.has_skill(skill.get("name")):
+            if raw and not src.has(skill.get("name")) and src.has(raw) and normalizes(raw, skill.get("name")):
+                skill["raw"] = raw  # kept through an alias ("K8s" for "Kubernetes"): say how the resume writes it
+            skills.append(skill)
+        elif raw and src.has(raw) and normalizes(raw, skill.get("name")):
+            skills.append({**skill, "raw": raw})  # a normalized name ("Apache Kafka") of a term the text has ("Kafka")
     count.drop("skills", len(out.get("skills") or []) - len(skills))
     for skill in skills:
         if skill.get("category") and not src.has(skill["category"]):
@@ -511,6 +536,75 @@ def ground(data: dict[str, Any], raw_text: str) -> tuple[dict[str, Any], dict[st
     out["languages"] = languages
     out["additional_information"] = _passages(out.get("additional_information"), src, count, "additional")
     return sr.fit_parser_output(out), count.dropped
+
+
+def normalizes(raw: Any, name: Any) -> bool:
+    """`name` is a normalized form of `raw`, by a rule code can check: the same words with more around them ("Kafka" →
+    "Apache Kafka"), a known alias ("K8s" → "Kubernetes") or its initials ("GCP" → "Google Cloud Platform"). Never a
+    different skill ("Python" → "Rust")."""
+    raw_n, name_n = _norm(raw), _norm(name)
+    if not raw_n or not name_n:
+        return False
+    if f" {raw_n} " in f" {name_n} " or f" {name_n} " in f" {raw_n} ":
+        return True
+    if raw_n in SKILL_ALIASES.get(str(name or "").strip().lower(), ()):
+        return True
+    initials = "".join(word[0] for word in name_n.split())
+    return len(raw_n) >= 2 and " " not in raw_n and raw_n == initials and len(initials) >= 2
+
+
+_LIMIT = 60  # held-back values kept per parse
+
+
+def held_back(before: dict[str, Any], after: dict[str, Any]) -> list[dict[str, Any]]:
+    """What grounding left out of the model's answer, for the person to add or discard: skills, bullets, roles,
+    projects, certifications, awards, languages, education, the summary and additional lines. Values only (and where
+    they sat), never a field the text half-supports; at most _LIMIT."""
+    out: list[dict[str, Any]] = []
+
+    def hold(kind: str, value: Any, where: str = "") -> None:
+        text = _text_of(value).strip() if not isinstance(value, str) else value.strip()
+        if text and len(out) < _LIMIT:
+            item = {"kind": kind, "value": text[:600], "where": where[:200]}
+            item["id"] = sr.short_hash(kind, item["value"], item["where"])
+            if all(i["id"] != item["id"] for i in out):
+                out.append(item)
+
+    kept_skills = {_norm(s.get("name")) for s in after.get("skills") or [] if isinstance(s, dict)}
+    for skill in before.get("skills") or []:
+        if isinstance(skill, dict) and _norm(skill.get("name")) not in kept_skills:
+            hold("skill", skill.get("name") or "", skill.get("category") or "")
+    if (before.get("summary") or "") and not (after.get("summary") or ""):
+        hold("summary", before["summary"])
+    kept_roles = {(_norm(r.get("job_title")), _norm(r.get("company"))) for r in after.get("experience") or []}
+    kept_bullets = {_norm(_text_of(b)) for r in after.get("experience") or []
+                    for b in [*(r.get("achievements") or []), *(r.get("responsibilities") or [])]}
+    for role in before.get("experience") or []:
+        label = " · ".join(p for p in (role.get("job_title"), role.get("company")) if p)
+        key = (_norm(role.get("job_title")), _norm(role.get("company")))
+        if key not in kept_roles and not any(k[0] == key[0] or k[1] == key[1] for k in kept_roles if any(k)):
+            hold("role", label)
+        for bullet in [*(role.get("achievements") or []), *(role.get("responsibilities") or [])]:
+            if _norm(_text_of(bullet)) not in kept_bullets:
+                hold("bullet", bullet, label)
+    for kind, key in (("project", "name"), ("certification", "name"), ("award", "title"), ("language", "name")):
+        section = {"project": "projects", "certification": "certifications", "award": "awards",
+                   "language": "languages"}[kind]
+        kept = {_norm(i.get(key)) for i in after.get(section) or [] if isinstance(i, dict)}
+        for item in before.get(section) or []:
+            if isinstance(item, dict) and item.get(key) and _norm(item.get(key)) not in kept:
+                hold(kind, item[key])
+    kept_education = {(_norm(e.get("degree")), _norm(e.get("institution"))) for e in after.get("education") or []}
+    for item in before.get("education") or []:
+        if isinstance(item, dict) and (_norm(item.get("degree")), _norm(item.get("institution"))) not in kept_education \
+                and not any(k[0] == _norm(item.get("degree")) or k[1] == _norm(item.get("institution"))
+                            for k in kept_education if any(k)):
+            hold("education", " · ".join(p for p in (item.get("degree"), item.get("institution")) if p))
+    kept_extra = {_norm(_text_of(v)) for v in after.get("additional_information") or []}
+    for value in before.get("additional_information") or []:
+        if _norm(_text_of(value)) not in kept_extra:
+            hold("additional", value)
+    return out
 
 
 def shape(data: dict[str, Any]) -> dict[str, int]:
@@ -625,9 +719,10 @@ def extract(sessions: Callable[[], Session], c: ParseClaim, generate: Generate |
         if task.staged is not None and task.step == EXTRACT:
             return {"step": EXTRACT, **shape(task.staged)}  # a replayed node: the model already answered
         resume = db.get(Resume, task.resume_id)
-        text = resume.raw_text if resume is not None else ""
+        view = _view(db, resume)  # read with V2: the model reads the structure the reader marked (prompt v7)
+        text = view or (resume.raw_text if resume is not None else "")
         db.rollback()
-    prompt = build_resume_parser_prompt(text or "")
+    prompt = build_resume_parser_prompt(text or "", marked=view is not None)
     call = LLMCall(workflow_type="profile", entity_id=c.resume_id, attempt=c.attempt, validate=checked)
     try:
         with backoff.bypass(c.run_now):
@@ -662,6 +757,10 @@ def ground_step(sessions: Callable[[], Session], c: ParseClaim, within: Within =
         if not _record(db, within, GROUND):
             db.rollback()
             return {"step": GROUND}
+        from app.services.resume_extraction import store
+
+        if resume is not None and (row := store.record(db, resume.id)) is not None:
+            row.review = held_back(task.staged or {}, grounded)  # V2: shown to the person, never used unasked
         task.staged, task.step = grounded, GROUND
         task.counts = {"dropped": dropped, "kept": shape(grounded)}
         db.commit()
@@ -728,7 +827,7 @@ def apply(sessions: Callable[[], Session], c: ParseClaim, within: Within = None)
             db.rollback()
             return {"step": APPLY}
         rv.ensure_structured(db, resume)
-        version = _prompt_version()
+        version = _prompt_version(_view(db, resume) is not None)
         if untouched(db, resume, task.base_revision):
             proposed = sr.materialize(task.staged or {})
             rv.record(db, resume, "*", "PARSE", "PARSER",

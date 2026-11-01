@@ -2804,7 +2804,9 @@ quality report and the section map; the stored text stays what the file says. In
 it was read" lists each heading as the file writes it with the section it was put in (Known, Guess, Choose, Yours);
 picking another section reads the resume again with it (filled while nothing is reviewed, else a comparison), a
 heading no table could place must be assigned before the resume can be verified, and each choice is remembered for
-the account's next uploads.
+the account's next uploads. The AI structuring of such a resume reads the marked view (prompt v7): a skill it
+normalizes keeps how the resume writes it ("Apache Kafka · written “Kafka”"), and anything it proposes that the text
+does not contain is no longer dropped silently but listed under "Held back for review", to add or discard.
 Measure any change with `python scripts/agent_eval.py --suite resume_extraction --resume-pipeline v2`
 (`docs/resume-extraction-plan.md`, `docs/evals/`).
 

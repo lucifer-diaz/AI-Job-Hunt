@@ -266,6 +266,24 @@ def assign_section(resume_id: int, payload: SectionAssignIn, db: Session = Depen
     return {**_commit(db, resume), "section_result": out}
 
 
+class ReviewActionIn(BaseModel):
+    id: str = Field(max_length=40)
+    action: str = Field(pattern="^(add|discard)$")
+
+
+@router.post("/api/resumes/{resume_id}/review")
+def review_value(resume_id: int, payload: ReviewActionIn, db: Session = Depends(get_user_db)):
+    """A value the AI parse proposed but the resume's text does not contain: add it (your change, unverified) or
+    discard it."""
+    resume = _resume(db, resume_id)
+    try:
+        out = extraction_store.review_action(db, resume, payload.id, payload.action)
+    except (extraction_store.ReviewItemError, rv.ResumeConflict) as exc:
+        db.rollback()
+        raise HTTPException(400, str(exc)) from exc
+    return {**_commit(db, resume), "review_result": out}
+
+
 @router.post("/api/resumes/{resume_id}/reparse")
 def reparse(resume_id: int, payload: ReparseIn, db: Session = Depends(get_user_db)):
     resume = _resume(db, resume_id)

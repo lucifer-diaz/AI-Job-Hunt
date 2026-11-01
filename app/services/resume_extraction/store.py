@@ -10,6 +10,9 @@ the parser and the review screen, and changed only by a person's section choices
     learned(db, user_id)            the account's own heading choices, counted, for its next uploads
     unplaced(db, resume_id)         headings no table could place and nobody has assigned: the resume cannot be
                                     verified until they are
+    review_action(db, resume, id, action)   a value the AI parse proposed but the text does not contain (the review
+                                    list, written by resume_parsing.held_back): added through the normal edit path
+                                    (the person's change, unverified) or discarded; recorded as feedback either way
 
 No resume words beyond the document's own headings, a heading's first line as a preview and the view; nothing a
 person typed. A version without a record is "unknown", never "fine".
@@ -32,6 +35,13 @@ PREVIEW_CHARS = 90
 
 class UnknownHeading(ValueError):
     pass
+
+
+class ReviewItemError(ValueError):
+    pass
+
+
+ADDABLE = ("skill", "bullet", "summary")  # the rest is added with Edit in its section
 
 
 # ───────────── writing ─────────────
@@ -117,6 +127,7 @@ def summary(db: Session, resume_id: int) -> dict[str, Any] | None:
             "sections": [{**{k: s.get(k) for k in ("text", "kind", "method", "signal", "line")},
                           "preview": _preview(texts, int(s.get("line") or 0))} for s in row.sections],
             "unplaced": sum(s.get("method") == "unknown" for s in row.sections),
+            "review": [{**item, "addable": item.get("kind") in ADDABLE} for item in row.review or []],
             "choices": [{"kind": k, "label": sections.CHOICE_LABELS[k]} for k in sections.CHOICES]}
 
 
@@ -175,3 +186,39 @@ def assign(db: Session, resume: Resume, line: int, kind: str) -> dict[str, Any]:
         return {"filled": True}
     rv.compare(db, resume, parsed, parser="deterministic", parser_version=sr.PARSER_VERSION)
     return {"filled": False}
+
+
+def review_action(db: Session, resume: Resume, item_id: str, action: str) -> dict[str, Any]:
+    """Add a held-back value to the resume's data, or discard it. Does not commit."""
+    from app.services import resume_verification as rv
+    from app.services import structured_resume as sr
+
+    row = record(db, resume.id)
+    item = next((i for i in (row.review or []) if i.get("id") == item_id), None) if row is not None else None
+    if item is None:
+        raise ReviewItemError("That value is no longer waiting for review")
+    if action not in ("add", "discard"):
+        raise ReviewItemError("Choose add or discard")
+    if action == "add":
+        if item["kind"] not in ADDABLE:
+            raise ReviewItemError("Add it with Edit in its section")
+        data = sr.as_input(rv.ensure_structured(db, resume)).model_dump()
+        if item["kind"] == "skill":
+            data["skills"].append({"name": item["value"], "category": item.get("where") or ""})
+        elif item["kind"] == "summary":
+            if (data.get("summary") or {}).get("text"):
+                raise ReviewItemError("The resume already has a summary: edit it to change it")
+            data["summary"] = {"text": item["value"]}
+        else:
+            role = next((r for r in data["experience"] if " · ".join(p for p in (r.get("job_title"), r.get("company"))
+                                                                    if p) == item.get("where")), None)
+            if role is None:
+                raise ReviewItemError("Its role is not in the resume's data: add it with Edit")
+            role["achievements"].append({"text": item["value"]})
+        rv.apply_edit(db, resume, sr.StructuredResumeIn.model_validate(data), resume.revision or 0)
+    row.review = [i for i in row.review if i.get("id") != item_id]
+    db.add(ResumeExtractionFeedback(user_id=resume.user_id, resume_id=resume.id, kind="value",
+                                    subject=item["value"][:300], before={"kind": item["kind"], "where": item.get("where")},
+                                    after={"action": action}))
+    db.flush()
+    return {"action": action, "kind": item["kind"]}

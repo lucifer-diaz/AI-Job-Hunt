@@ -299,6 +299,12 @@ PDF when `RESUME_EXTRACTION_V2` is on. The rules a change has to keep:
   heading as written, applied before the synonym table on its next uploads; never another account's. A view is parsed
   with `parse_deterministic(..., marked=True)` so headings are not guessed again. A heading no table could place
   (`unknown`) blocks `verify_resume` until it is assigned.
+* **The AI parse of a V2 version reads its parse view (prompt v7) and grounding never loses silently.** A version
+  read without V2 keeps prompt v6 byte for byte. A normalized skill stays only when its written form (`raw`) is in the
+  text and `resume_parsing.normalizes` (containment, a known alias, initials) checks it is the same skill; the unit
+  keeps `raw`. What grounding drops is computed by `held_back` and stored on the record's review list — values only —
+  for the person to add (through `rv.apply_edit`: their change, unverified) or discard. Nothing on the list reaches a
+  workflow unasked; never loosen grounding to keep it.
 * **Measured, not assumed.** Run `python scripts/agent_eval.py --suite resume_extraction --resume-pipeline v2`; its
   hard gates (`valid_words_altered`, `hallucinated_values`) stay at 0. Fixtures are synthetic
   (`tests/fixtures/resume_extraction/`, rebuilt by `scripts/build_resume_fixtures.py`); a real resume goes only in the
