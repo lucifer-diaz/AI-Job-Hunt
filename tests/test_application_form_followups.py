@@ -231,3 +231,22 @@ def test_a_grown_file_input_the_board_replaced_is_still_read_as_uploaded():
     facts = application._bu_facts(ctx, Session(), planned, {"bu_n": "Asha"}, [grown])
     assert facts["uploaded"] == {"bu_f": "resume.pdf"}
     assert application._bu_facts(ctx, Session(), planned, {"bu_n": "Asha"})["uploaded"] == {}
+
+
+# ───────────── shadow sessions and savepoints ─────────────
+
+@pytest.mark.parametrize("module", ["preparation", "qualification"])
+def test_a_shadow_session_allows_a_reads_savepoint_but_refuses_a_commit(module):
+    """Retrieval guards its full-text query with a savepoint; releasing it saves nothing, so a shadow session lets
+    it through (it used to refuse it and lose the full-text ranking). A real commit is still refused."""
+    import importlib
+
+    from sqlalchemy import text
+
+    graph = importlib.import_module(f"app.agents.{module}")
+    ctx = SimpleNamespace(sessions=SessionLocal, run=SimpleNamespace(user_id=1))
+    with graph._session(ctx, True) as db:
+        with db.begin_nested():
+            assert db.execute(text("SELECT 1")).scalar() == 1
+        with pytest.raises(graph.ShadowWrite):
+            db.commit()

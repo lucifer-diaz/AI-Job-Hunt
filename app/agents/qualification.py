@@ -161,7 +161,12 @@ def _session(ctx: QualificationContext, shadow: bool) -> Iterator[Session]:
             yield db
             return
 
-        def refuse(_session: Session) -> None:
+        def refuse(session: Session) -> None:
+            # SQLAlchemy fires before_commit on a savepoint release too (a read that guards itself with
+            # begin_nested, such as retrieval's full-text query). A savepoint saves nothing, and the session is
+            # rolled back at the end: only a real commit is a write.
+            if session.in_nested_transaction():
+                return
             raise ShadowWrite("a shadow qualification run never writes")
 
         event.listen(db, "before_commit", refuse)
