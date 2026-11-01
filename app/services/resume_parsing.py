@@ -753,12 +753,13 @@ def ground_step(sessions: Callable[[], Session], c: ParseClaim, within: Within =
             return {"step": GROUND, **shape(task.staged or {}), "dropped": sum((task.counts or {}).get(
                 "dropped", {}).values())}
         resume = db.get(Resume, task.resume_id)
-        grounded, dropped = ground(task.staged or {}, resume.raw_text if resume is not None else "")
+        from app.services.resume_extraction import store
+
+        text = store.grounding_text(db, resume) if resume is not None else ""  # raw, plus the clean text (V2)
+        grounded, dropped = ground(task.staged or {}, text)
         if not _record(db, within, GROUND):
             db.rollback()
             return {"step": GROUND}
-        from app.services.resume_extraction import store
-
         if resume is not None and (row := store.record(db, resume.id)) is not None:
             row.review = held_back(task.staged or {}, grounded)  # V2: shown to the person, never used unasked
         task.staged, task.step = grounded, GROUND

@@ -1,6 +1,6 @@
 # Resume extraction V2: Phase 0 findings and plan
 
-Status: **Phases 1 – 5 done; Phase 6 (OCR + corrections for PDFs without ActualText) next.** Agreed decisions are in section 10; where they differ from the
+Status: **Phases 1 – 6 done; the resume_extraction gate passes for V2. Phase 7 (per-fact confidence) is conditional.** Agreed decisions are in section 10; where they differ from the
 recommendations in sections 5 – 9, section 10 wins.
 
 ## 1. Summary
@@ -340,3 +340,21 @@ position is found, not claimed) and cheaper. Keep a `source_quote` only for summ
 * Not built: per-field correction claims from the model (`was_corrected` + evidence) — Phase 6 owns corrections, with
   OCR and lexicon evidence; and an eval suite over recorded AI outputs (grounding is unit-tested; the resume_extraction
   suite scores the regex path).
+
+### Phase 6: OCR and evidence-backed corrections (done)
+
+* `ocr.py` (PDFium renders at 300 DPI; Tesseract through its own binary, TSV words in PDF points; pluggable; bounded
+  by pages and time; never fails an upload), `align.py` (OCR words to text-layer words by box overlap),
+  `correction.py` (only unknown or broken-looking words; the page's reading when it is a known word within two
+  characters; per-file rules from `lexicons/confusions.yaml` and the page's disagreements, accepted on at least two
+  different unknown words; each a Correction with evidence). Runs only for PDFs not routed `clean`.
+* Decision taken here (supersedes §8 "where corrected text lives" only in naming): `Resume.raw_text` keeps the file's
+  words; `store.clean_text` applies the corrections nobody undid and feeds the parse view and grounding; the record
+  stores the corrections. Settings → Resumes lists them ("Kaga → Kafka", evidence, ×count) to keep or undo; undo
+  re-reads the resume. OCR in the upload request, bounded, instead of a queue: a flagged two-page PDF adds ~2 – 5 s.
+* Eval (`docs/evals/resume-extraction-phase6.md`, with Tesseract installed): the suite's gate **passes** for v2 —
+  CER 0.0018 (broken PDFs 0.0194 → 0.0032), field precision / recall 0.983 / 0.983, misfiled 0, unrecognized dropped
+  0, bullets intact 0.991, correction precision 1.0, no valid word altered, nothing invented. Without Tesseract
+  broken PDFs fall back to rules and the gate depends on that environment.
+* Left as written, by design: words only the page could confirm but no dictionary knows (names: "WhiBield",
+  "SeaCle") and single unknown words with no page to read ("Kaga" in a text file).

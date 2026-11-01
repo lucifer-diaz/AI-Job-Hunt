@@ -87,7 +87,7 @@ def _v2_read(kind: str, data: bytes) -> tuple[str, str, Any]:
     from app.services.structured_resume import clean_raw_text
 
     out = pipeline.extract(kind, data)
-    return out.text_layer, clean_raw_text(out.text), out
+    return out.text_layer, clean_raw_text(out.clean_text), out
 
 
 def _v2_structure(text: str, context: Any = None) -> dict[str, Any]:
@@ -98,11 +98,14 @@ def _v2_structure(text: str, context: Any = None) -> dict[str, Any]:
 
 
 def _v2_repair(text: str) -> str:
+    """A text layer alone (no page to read): normalisation, glyph repair, then the consistent-rule corrections."""
+    from app.services.resume_extraction import correction
     from app.services.resume_extraction.normalize import normalize
     from app.services.structured_resume import clean_raw_text
     from app.services.text_repair import repair_glyphs
 
-    return clean_raw_text(repair_glyphs(normalize(text)))
+    repaired = repair_glyphs(normalize(text))
+    return clean_raw_text(correction.apply(repaired, correction.correct(repaired)))
 
 
 def _v2_route(kind: str, data: bytes) -> str:

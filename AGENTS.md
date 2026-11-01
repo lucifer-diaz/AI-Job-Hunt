@@ -284,8 +284,17 @@ PDF when `RESUME_EXTRACTION_V2` is on. The rules a change has to keep:
   fallback for a file PDFium cannot open. Every word keeps its page, box and font: never drop provenance.
 * **Normalise artefacts, never meaning.** `normalize.TABLE` lists the characters that change; no NFKC. A line-break
   hyphen is removed only when the joined word is known and its halves are not; otherwise the hyphen stays.
-* **Deterministic, local, cheap.** No model, no network and no OCR in this step: it may run in the upload request.
-  The quality report and the log line hold counts, routes and flags, never resume words.
+* **Deterministic, local, bounded.** No model and no network in this step: it may run in the upload request. OCR
+  (`ocr.read_pdf`, Tesseract on this machine; a VLM backend would be a setting, off) runs only for a PDF the quality
+  report does not route `clean`, within `RESUME_OCR_MAX_PAGES` / `RESUME_OCR_TIMEOUT_SECONDS`; a missing, slow or
+  failing engine means no OCR, never a failed upload. The quality report and the log line hold counts, routes and
+  flags, never resume words.
+* **A correction needs evidence and is never silent** (`correction.correct`). Only an unknown or broken-looking word
+  is touched — never one the dictionary or the resume vocabulary knows. Evidence is the page reading a known word at
+  the same place, within two characters, or a substitution the file uses on at least `MIN_RULE_WORDS` different
+  unknown words (seed `lexicons/confusions.yaml`, or learnt from the page). Every change is a Correction on the record
+  with its evidence; `Resume.raw_text` keeps the file's word and `store.clean_text` applies the corrections nobody
+  undid (the view and grounding read it). A person keeps or undoes each; undo re-reads the resume.
 * **Structure is marked, never written into the resume.** `sections.detect` (synonyms, keywords, the document's own
   heading style; never a model) and `structure.view` produce the parse view the regex parser reads. `Resume.raw_text`
   stays what the file says; the view, stored on `ResumeExtraction`, holds only its words plus markers ("## Section",

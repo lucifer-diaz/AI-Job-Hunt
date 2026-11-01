@@ -236,6 +236,13 @@ class Settings(BaseSettings):
     # own resume uploads (worker setting resume_parsing.extraction_v2, Settings → Resumes). Job description files
     # follow this value.
     resume_extraction_v2: bool = False
+    # OCR for resume extraction V2 (app.services.resume_extraction.ocr): only for a PDF the quality report flags, on
+    # this machine (Tesseract's own binary; nothing leaves the server), bounded so an upload never waits long. Without
+    # the engine installed, corrections fall back to consistent substitution rules alone.
+    resume_ocr_enabled: bool = True
+    resume_ocr_backend: str = "tesseract"
+    resume_ocr_max_pages: int = 4
+    resume_ocr_timeout_seconds: int = 20
     # Re-rank qualified jobs once their description has been parsed. Off by default: parsing a backlog would
     # otherwise start a round of ranking calls.
     jd_rerank_after_parse: bool = False

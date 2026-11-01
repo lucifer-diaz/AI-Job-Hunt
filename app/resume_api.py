@@ -284,6 +284,23 @@ def review_value(resume_id: int, payload: ReviewActionIn, db: Session = Depends(
     return {**_commit(db, resume), "review_result": out}
 
 
+class CorrectionActionIn(BaseModel):
+    id: str = Field(max_length=40)
+    action: str = Field(pattern="^(keep|undo)$")
+
+
+@router.post("/api/resumes/{resume_id}/corrections")
+def correction_action(resume_id: int, payload: CorrectionActionIn, db: Session = Depends(get_user_db)):
+    """Keep a correction the reader made, or undo it (the word as the file has it comes back; the resume is re-read)."""
+    resume = _resume(db, resume_id)
+    try:
+        out = extraction_store.correction_action(db, resume, payload.id, payload.action)
+    except extraction_store.ReviewItemError as exc:
+        db.rollback()
+        raise HTTPException(400, str(exc)) from exc
+    return {**_commit(db, resume), "correction_result": out}
+
+
 @router.post("/api/resumes/{resume_id}/reparse")
 def reparse(resume_id: int, payload: ReparseIn, db: Session = Depends(get_user_db)):
     resume = _resume(db, resume_id)

@@ -740,6 +740,21 @@ describe('resume data', () => {
     expect(sent).toEqual({ id: 'h1', action: 'add' });
     expect(document.querySelectorAll('[data-rd-held]').length).toBe(1);
   });
+  it('lists corrections with their evidence and keeps or undoes them', async () => {
+    let sent;
+    const fix = status => ({ id: 'c1', original: 'Kaga', corrected: 'Kafka', method: 'ocr', evidence: ['the page reads “Kafka” there'], count: 3, status });
+    const ex = status => ({ source: 'pdfium', quality: { route: 'poor', reasons: [], ocr: 'tesseract' }, choices: [], unplaced: 0, sections: [], review: [], corrections: [fix(status)] });
+    await open(detail({ extraction: ex('applied') }), { 'POST /api/resumes/5/corrections': body => { sent = body; return detail({ extraction: ex('undone') }); } });
+    expect(document.querySelector('.rd-sections').open).toBe(true);
+    const row = document.querySelector('[data-rd-fix="c1"]');
+    expect(row.textContent).toContain('Kaga → Kafka');
+    expect(row.textContent).toContain('×3');
+    expect(row.textContent).toContain('the page reads “Kafka” there');
+    expect(row.textContent).toContain('Page shows it');
+    await ui.A['rd-fix']({ dataset: { id: 'c1', action: 'undo' } }); await settle();
+    expect(sent).toEqual({ id: 'c1', action: 'undo' });
+    expect(document.querySelector('[data-rd-fix="c1"]').textContent).toContain('Correct again');
+  });
   it('shows nothing about reading for a version read before the new reader', async () => {
     await open(detail({ extraction: null }));
     expect(document.querySelector('.rd-sections')).toBeNull();

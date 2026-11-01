@@ -124,3 +124,12 @@ class Extraction:
     sections: list[dict[str, object]] = field(default_factory=list)  # sections.Heading.as_dict(), in order
     view: str = ""  # structure.view: the cleaned text with its structure marked, for the parser
     lines: list[LineInfo] = field(default_factory=list)  # the cleaned text's lines with their look
+    corrections: list[dict[str, object]] = field(default_factory=list)  # correction.Correction.as_dict()
+    ocr: str | None = None  # the OCR engine that read the pages, when one did
+
+    @property
+    def clean_text(self) -> str:
+        """The text with its corrections applied (raw in document_text's sense: callers run clean_raw_text)."""
+        from app.services.resume_extraction.correction import apply
+
+        return apply(self.text, self.corrections) if self.corrections else self.text

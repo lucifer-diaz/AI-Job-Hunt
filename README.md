@@ -2807,6 +2807,12 @@ heading no table could place must be assigned before the resume can be verified,
 the account's next uploads. The AI structuring of such a resume reads the marked view (prompt v7): a skill it
 normalizes keeps how the resume writes it ("Apache Kafka · written “Kafka”"), and anything it proposes that the text
 does not contain is no longer dropped silently but listed under "Held back for review", to add or discard.
+A PDF whose text layer the quality report flags (a font that maps "fk" to "g", so "Kafka" reads "Kaga") is also read
+from its rendered pages with Tesseract, locally and within a time limit (`RESUME_OCR_*`; the Docker image installs it
+unless `INSTALL_OCR=false`). A word is corrected only with evidence — the page shows a known word there, or one
+substitution explains several unknown words — never a word the dictionary knows. Corrections are listed as
+"Kaga → Kafka" with their evidence in "How it was read", where each can be kept or undone; the file's own text is
+kept.
 Measure any change with `python scripts/agent_eval.py --suite resume_extraction --resume-pipeline v2`
 (`docs/resume-extraction-plan.md`, `docs/evals/`).
 

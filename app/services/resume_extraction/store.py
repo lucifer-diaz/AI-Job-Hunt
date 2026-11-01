@@ -61,12 +61,12 @@ def save(db: Session, resume: Resume, extraction: Extraction) -> ResumeExtractio
     row.pipeline_version = PIPELINE_VERSION
     row.source = extraction.layer.source if extraction.layer is not None else (
         "docx" if any(s.get("signal") == "style" for s in extraction.sections) else "text")
-    row.quality = extraction.quality.summary()
+    row.quality = {**extraction.quality.summary(), "ocr": extraction.ocr}
     row.sections = list(extraction.sections)
     row.layout = [_compact(info) for info in extraction.lines] or None
     row.overrides = {}
     row.parse_view = extraction.view
-    row.corrections, row.review = [], []
+    row.corrections, row.review = list(extraction.corrections), []
     db.flush()
     return row
 
@@ -94,9 +94,25 @@ def parse(db: Session, resume: Resume) -> dict[str, Any]:
     return sr.parse_deterministic(resume.raw_text or "")
 
 
+def clean_text(row: ResumeExtraction | None, raw_text: str) -> str:
+    """The stored text with the corrections nobody undid applied: what the parse view and grounding read."""
+    from app.services.resume_extraction.correction import apply
+
+    return apply(raw_text or "", row.corrections) if row is not None and row.corrections else (raw_text or "")
+
+
+def grounding_text(db: Session, resume: Resume) -> str:
+    """What the AI parse's values are checked against: the raw text and, when corrections were made, the clean text
+    (a corrected word is the page's word, with its evidence on the record)."""
+    row = record(db, resume.id) if resume.id is not None else None
+    clean = clean_text(row, resume.raw_text or "")
+    return resume.raw_text or "" if clean == (resume.raw_text or "") else f"{resume.raw_text}\n{clean}"
+
+
 def lines(row: ResumeExtraction, raw_text: str) -> list[LineInfo]:
-    """The stored text's lines with the look recorded for them (none when the record has no layout)."""
-    texts = (raw_text or "").split("\n")
+    """The clean text's lines with the look recorded for them (none when the record has no layout). Corrections
+    replace words, never lines, so the look still lines up."""
+    texts = clean_text(row, raw_text).split("\n")
     layout = row.layout or []
     out = []
     for i, text in enumerate(texts):
@@ -128,6 +144,8 @@ def summary(db: Session, resume_id: int) -> dict[str, Any] | None:
                           "preview": _preview(texts, int(s.get("line") or 0))} for s in row.sections],
             "unplaced": sum(s.get("method") == "unknown" for s in row.sections),
             "review": [{**item, "addable": item.get("kind") in ADDABLE} for item in row.review or []],
+            "corrections": [{k: c.get(k) for k in ("id", "original", "corrected", "method", "evidence", "count",
+                                                   "status")} for c in row.corrections or []],
             "choices": [{"kind": k, "label": sections.CHOICE_LABELS[k]} for k in sections.CHOICES]}
 
 
@@ -156,10 +174,6 @@ def assign(db: Session, resume: Resume, line: int, kind: str) -> dict[str, Any]:
 
     Returns {"filled": bool} — True when the data was re-parsed in place (nobody had reviewed or edited it), False
     when the new parse waits as a comparison."""
-    from app.services import resume_parsing
-    from app.services import resume_verification as rv
-    from app.services import structured_resume as sr
-
     if kind not in sections.CHOICES:
         raise UnknownHeading(f"Unknown section '{kind}'")
     row = record(db, resume.id)
@@ -172,7 +186,18 @@ def assign(db: Session, resume: Resume, line: int, kind: str) -> dict[str, Any]:
                                     subject=infos[line].text.strip()[:300],
                                     before={"kind": before.get("kind"), "method": before.get("method")} if before else None,
                                     after={"kind": kind}))
-    headings = sections.detect(infos, learned(db, resume.user_id), {int(k): v for k, v in row.overrides.items()})
+    return _reread(db, resume, row)
+
+
+def _reread(db: Session, resume: Resume, row: ResumeExtraction) -> dict[str, Any]:
+    """The view rebuilt from the clean text, its look and the person's choices; the data re-parsed from it: filled
+    while nobody reviewed or edited it, otherwise offered as the usual comparison."""
+    from app.services import resume_parsing
+    from app.services import resume_verification as rv
+    from app.services import structured_resume as sr
+
+    infos = lines(row, resume.raw_text)
+    headings = sections.detect(infos, learned(db, resume.user_id), {int(k): v for k, v in (row.overrides or {}).items()})
     row.sections = [h.as_dict() for h in headings]
     row.parse_view = structure.view(infos, headings)
     db.flush()
@@ -222,3 +247,23 @@ def review_action(db: Session, resume: Resume, item_id: str, action: str) -> dic
                                     after={"action": action}))
     db.flush()
     return {"action": action, "kind": item["kind"]}
+
+
+def correction_action(db: Session, resume: Resume, correction_id: str, action: str) -> dict[str, Any]:
+    """Keep a correction (the person confirms it) or undo it (the word as the file has it comes back and the resume
+    is read again; keeping an undone one re-applies it). Recorded as feedback either way. Does not commit."""
+    row = record(db, resume.id)
+    item = next((c for c in (row.corrections or []) if c.get("id") == correction_id), None) if row is not None else None
+    if item is None:
+        raise ReviewItemError("That correction is not on this resume")
+    if action not in ("keep", "undo"):
+        raise ReviewItemError("Choose keep or undo")
+    status = "kept" if action == "keep" else "undone"
+    reread = (status == "undone") != (item.get("status") == "undone")  # the clean text changes
+    row.corrections = [{**c, "status": status} if c.get("id") == correction_id else c for c in row.corrections]
+    db.add(ResumeExtractionFeedback(user_id=resume.user_id, resume_id=resume.id, kind="correction",
+                                    subject=str(item["original"])[:300],
+                                    before={"corrected": item["corrected"], "method": item.get("method")},
+                                    after={"action": action}))
+    db.flush()
+    return {"action": action, **(_reread(db, resume, row) if reread else {})}

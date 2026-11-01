@@ -193,6 +193,7 @@ function rdSectionCard(section, label, data, progress) {
 // How the file was read (resume extraction V2): the quality route, and each heading as written with the section it was
 // put in and how. Changing a heading's section re-reads the resume with it (filled while nothing is reviewed, else a
 // comparison). Folded away unless a heading needs a decision; versions read before V2 show nothing.
+const RD_FIX = { ocr: ['Page shows it', 'good'], rule: ['Consistent rule', 'brand'], 'ocr+rule': ['Page + rule', 'good'] };
 const RD_HELD = { skill: 'Skill', bullet: 'Bullet', role: 'Role', summary: 'Summary', project: 'Project', certification: 'Certification', award: 'Award', language: 'Language', education: 'Education', additional: 'Additional' };
 const RD_METHOD = { synonym: ['Known', 'good'], keyword: ['Guess', 'warn'], unknown: ['Choose', 'bad'], learned: ['Your earlier choice', 'brand'], person: ['Yours', 'brand'] };
 const RD_ROUTE = { clean: ['Read cleanly', 'good'], suspicious: ['A few words may be misread', 'warn'], poor: ['Many words may be misread', 'bad'], no_text: ['No text found (a scan?)', 'bad'] };
@@ -207,11 +208,16 @@ function rdSectionsPanel(active) {
   }).join('') || '<p class="settings-help">No section headings were found: everything was read as one block.</p>';
   const help = ex.unplaced ? `<div class="settings-notice"><strong>${ex.unplaced} heading${ex.unplaced === 1 ? '' : 's'} need${ex.unplaced === 1 ? 's' : ''} a section</strong><p>The reader could not place ${ex.unplaced === 1 ? 'it' : 'them'}. Choose a section to verify this resume; your choice is remembered for your next uploads.</p></div>` : '';
   const reasons = (ex.quality?.reasons || []).length ? ` · ${esc(ex.quality.reasons.join(' · '))}` : '';
-  const review = ex.review || [];
+  const review = ex.review || [], fixes = ex.corrections || [], pending = fixes.filter(c => c.status === 'applied').length;
+  const fixed = fixes.length ? `<div class="rd-fixes mb12"><div class="caps-sm mb8">Corrections · ${fixes.length}</div><p class="settings-help mb8">Words the file’s text got wrong (a broken font mapping), corrected only where ${ex.quality?.ocr ? 'the page itself shows the word, or ' : ''}one substitution explains several words. The file is unchanged; undo any you disagree with.</p>${fixes.map(c => {
+    const [label, tone] = RD_FIX[c.method] || [c.method, 'muted'];
+    const undone = c.status === 'undone';
+    return `<div class="rd-fix-row${undone ? ' is-undone' : ''}" data-rd-fix="${attr(c.id)}"><div class="grow"><span class="rd-fix-words"><s>${esc(c.original)}</s> → <b>${esc(c.corrected)}</b></span>${c.count > 1 ? `<span class="faint small"> ×${c.count}</span>` : ''}<div class="faint small">${esc((c.evidence || []).join(' · '))}</div></div>${pill(label, tone)}${undone ? `${pill('Undone', 'muted')}${btn('Correct again', 'rd-fix', { id: c.id, action: 'keep' }, 'sm', locked)}` : `${c.status === 'kept' ? pill('Kept', 'good') : btn('Keep', 'rd-fix', { id: c.id, action: 'keep' }, 'sm', locked)}${btn('Undo', 'rd-fix', { id: c.id, action: 'undo' }, 'sm ghost', locked)}`}</div>`;
+  }).join('')}</div>` : '';
   const held = review.length ? `<div class="rd-held mt16"><div class="caps-sm mb8">Held back for review · ${review.length}</div><p class="settings-help mb8">The AI parse proposed ${review.length === 1 ? 'this value' : 'these values'}, but the resume’s text does not contain ${review.length === 1 ? 'it' : 'them'} (a reworded or corrected word, or something it inferred). ${review.length === 1 ? 'It is' : 'They are'} not used unless you add ${review.length === 1 ? 'it' : 'them'}.</p>${review.map(item => `<div class="rd-held-row" data-rd-held="${attr(item.id)}"><span class="pill plain">${esc(RD_HELD[item.kind] || item.kind)}</span><div class="grow"><span>${esc(item.value)}</span>${item.where ? `<div class="faint small">${esc(item.where)}</div>` : ''}</div>${item.addable ? btn('Add', 'rd-review', { id: item.id, action: 'add' }, 'sm', locked) : '<span class="faint small">add it with Edit</span>'}${btn('Discard', 'rd-review', { id: item.id, action: 'discard' }, 'sm ghost', locked)}</div>`).join('')}</div>` : '';
   // <small>, not <span>: the details summary turns its <span> (the "+") when open.
-  const title = `<small class="rd-sec-sum"><b>How it was read</b>${pill(route, tone)}<em class="faint">${ex.sections.length} section${ex.sections.length === 1 ? '' : 's'}${ex.unplaced ? ` · ${ex.unplaced} to place` : ''}${review.length ? ` · ${review.length} held back` : ''}</em></small>`;
-  return `<details class="settings-details rd-sections" data-settings-details="resume-sections" ${ex.unplaced || review.length || SETTING_DETAILS.has('resume-sections') ? 'open' : ''}><summary>${title}<span aria-hidden="true">+</span></summary><div class="settings-details-body">${help}<p class="settings-help mb8">Each heading as the file writes it, and the section its lines were put in. Wrong? Pick another: the resume is read again with it${reasons}.</p><div class="rd-sec-list">${rows}</div>${held}</div></details>`;
+  const title = `<small class="rd-sec-sum"><b>How it was read</b>${pill(route, tone)}<em class="faint">${ex.sections.length} section${ex.sections.length === 1 ? '' : 's'}${ex.unplaced ? ` · ${ex.unplaced} to place` : ''}${fixes.length ? ` · ${fixes.length} correction${fixes.length === 1 ? '' : 's'}` : ''}${review.length ? ` · ${review.length} held back` : ''}</em></small>`;
+  return `<details class="settings-details rd-sections" data-settings-details="resume-sections" ${ex.unplaced || review.length || pending || SETTING_DETAILS.has('resume-sections') ? 'open' : ''}><summary>${title}<span aria-hidden="true">+</span></summary><div class="settings-details-body">${help}${fixed}<p class="settings-help mb8">Each heading as the file writes it, and the section its lines were put in. Wrong? Pick another: the resume is read again with it${reasons}.</p><div class="rd-sec-list">${rows}</div>${held}</div></details>`;
 }
 // The sections at a glance, sticky while reviewing: jump to one, or add one the parser did not find.
 function rdNav(data, progress) {
@@ -541,6 +547,13 @@ const RESUME_DATA_ACTIONS = {
     return rdRun(async () => {
       rdApply(await api(`/api/resumes/${active.id}/review`, { method: 'POST', body: { id: el.dataset.id, action: el.dataset.action } }));
     }, add ? 'Added: review it like any other fact' : 'Discarded');
+  },
+  // A correction the reader made: kept (confirmed), undone (the file's own word comes back) or made again.
+  'rd-fix': el => {
+    const active = rdActive(), keep = el.dataset.action === 'keep';
+    return rdRun(async () => {
+      rdApply(await api(`/api/resumes/${active.id}/corrections`, { method: 'POST', body: { id: el.dataset.id, action: el.dataset.action } }));
+    }, keep ? 'Correction kept' : 'Correction undone: read again with the file’s own word');
   },
   'rd-section-assign': el => {
     if (!el.value) return;
