@@ -84,3 +84,7 @@ MCP_SERVER_INSTRUCTIONS = instructions(
     "Batches are limited (see the error message when a batch is too large). A rejected item comes back with "
     "validation errors: fix only that item and save it again. Never invent facts to get past validation.",
 )
+
+# Beside a resume's held_back_facts (app.mcp.tools._held_back): unverified facts read with too little confidence.
+HELD_BACK_NOTE = ("Read from the file with low confidence and not verified: do not use these facts, even where the "
+                  "resume text shows them.")

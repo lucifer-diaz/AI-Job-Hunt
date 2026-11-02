@@ -15,6 +15,10 @@ Verification rules:
   `allow_unverified_resume_facts` is on, in which case unverified facts are included and marked.
 * Ranking may also read UNVERIFIED/EDITED facts when `ranking_uses_unverified` is on; they are kept apart as
   lower-confidence context. REJECTED facts never reach generation; the reviewer receives them to flag reuse.
+* With `allow_unverified_resume_facts` on, an unverified fact of a resume read with extraction V2 reaches generation
+  and review only when its confidence is high (app.services.resume_extraction.confidence); the others are held back
+  (`held_back_facts`, with their level and reasons; a held role holds its bullets too). Facts a person edited are
+  theirs and kept. A version read without V2 has no confidence and is used exactly as before. Ranking is not gated.
 
 * The Tailor needs the Ranker's completed FitAnalysis. Without one the context is refused (RANKING_REQUIRED) and no
   model is called: an empty analysis is never sent for the Tailor to fill in.
@@ -31,6 +35,7 @@ The numbers, and CONTEXT_BUILDER_VERSION, travel with the LLM call into LLMReque
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import re
@@ -81,6 +86,7 @@ MAX_PROJECTS = 3
 BULLETS_PER_PROJECT = 3
 VERIFIED_ONLY = ("VERIFIED",)
 WITH_UNVERIFIED = ("VERIFIED", "UNVERIFIED", "EDITED")
+HELD_BACK = "HELD_BACK"  # a context-only status: an unverified fact read with too little confidence to be used
 THEMES = {
     "leadership": ("lead", "leadership", "manager", "management", "mentor", "mentoring", "hiring", "hired", "director",
                    "head", "roadmap", "stakeholder", "managed", "led"),
@@ -188,6 +194,9 @@ class TaskContext:
     revision_feedback: dict[str, Any] = field(default_factory=dict)
     # Evidence held back from generation because its provenance disagrees with its source ({id, code}).
     excluded_evidence: list[dict[str, Any]] = field(default_factory=list)
+    # Unverified resume facts held back because their reading is not high confidence ({id, section, text, level,
+    # reasons}); the reviewer sees them to flag a claim that relies on one.
+    held_back_facts: list[dict[str, Any]] = field(default_factory=list)
     resume_text: str = ""  # a readable rendering of the selected facts (or the raw text when nothing is structured)
     stats: ContextStats = field(default_factory=ContextStats)
     # Not a field, so never part of the prompt payload (to_dict): {retrieval_ms, retrieval_mode} for call_stats, set
@@ -224,6 +233,7 @@ class TaskContext:
         out.pop("job_stats", None)
         out.pop("job_context", None)  # measured by app.services.job_context, not counted twice here
         out.pop("excluded_evidence", None)
+        out.pop("held_back_facts", None)
         out["job"] = {k: v for k, v in out["job"].items() if k != "description"}
         if out.get("source_resume"):  # the Tailor's canonical copy replaces the selections it was built from
             for duplicate in ("roles", "relevant_experience", "resume_text", "relevant_skills"):
@@ -538,6 +548,34 @@ def _candidate(profile: CandidateProfile, data: dict[str, Any], allowed: tuple[s
 GENERATION_TASKS = ("tailoring", "cover_letter", "followup", "application_answer", "application_form")
 
 
+def hold_back_unconfident(db: Session, resume: Resume | None, data: dict[str, Any] | None, allowed: tuple[str, ...],
+                          task: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """(the data with unverified facts below high confidence marked HELD_BACK, what was held back).
+
+    Only when unverified facts are allowed at all, for generation and review (never ranking), and only for a version
+    read with V2: without confidence the data is returned as it is. A fact a person verified, edited or rejected is
+    theirs and never touched, and the stored data is never changed (the marks are on a copy)."""
+    if not data or resume is None or "UNVERIFIED" not in allowed or task == "ranking":
+        return data or {}, []
+    levels = rv.confidence(db, resume)
+    if not levels:
+        return data, []
+    data = copy.deepcopy(data)
+    held = []
+    for unit in sr.iter_units(data):
+        if unit.kind == "personal" or unit.status != "UNVERIFIED":
+            continue
+        level = levels.get(unit.item_id)
+        by_parent = unit.parent is not None and _status(unit.parent) == HELD_BACK
+        if not by_parent and (level is None or level["level"] == "high"):
+            continue
+        unit.node["verification"] = {**(unit.node.get("verification") or {}), "status": HELD_BACK}
+        held.append({"id": unit.item_id, "section": unit.section, "text": unit.node.get("text") or rv._label(unit),
+                     "level": level["level"] if level else "unknown",
+                     "reasons": (level or {}).get("reasons", [])[:3] + (["its role is held back"] if by_parent else [])})
+    return data, held
+
+
 def _base(db: Session, profile: CandidateProfile, job: Job, task: str, allowed: tuple[str, ...],
           evidence_limit: int, caps: dict[str, int] | None = None, terms: JobTerms | None = None,
           out_of_scope: set[int] | frozenset[int] = frozenset()
@@ -546,6 +584,7 @@ def _base(db: Session, profile: CandidateProfile, job: Job, task: str, allowed: 
 
     resume = rv.resume_for(db, profile)
     data = resume.structured_data if resume is not None else {}
+    data, held_facts = hold_back_unconfident(db, resume, data, allowed, task)
     terms = terms or (generation_terms(job) if task in ("tailoring", "cover_letter") else job_terms(job))
     policy = candidate_policy(db, profile.user_id)
     experience, unverified = _select_experience(data or {}, terms, allowed, caps)
@@ -571,7 +610,8 @@ def _base(db: Session, profile: CandidateProfile, job: Job, task: str, allowed: 
         education=_reviewed_list(data or {}, "education", allowed, education_fields),
         certifications=_reviewed_list(data or {}, "certifications", allowed, ("name", "issuer", "issue_date")),
         job={**job_facts(job), "id": getattr(job, "id", None)}, policy=policy,
-        excluded_evidence=[{"id": i, "code": code} for i, code in sorted(held_back.items())])
+        excluded_evidence=[{"id": i, "code": code} for i, code in sorted(held_back.items())],
+        held_back_facts=held_facts)
     resume_texts = [unit.node.get("text") or "" for unit in sr.iter_units(data or {}) if unit.kind == "bullet"]
     context.relevant_evidence = consolidate(db, profile.user_id, [*context.relevant_experience, *projects],
                                             context.relevant_evidence, set(held_back), resume_texts)

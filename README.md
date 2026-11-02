@@ -2814,7 +2814,9 @@ substitution explains several unknown words — never a word the dictionary know
 "Kaga → Kafka" with their evidence in "How it was read", where each can be kept or undone; the file's own text is
 kept. Each fact of such a resume has a confidence computed from the same evidence (high: in the file's text word for
 word, nothing corrected); a fact rated lower is marked Check or Low with the reasons in its tooltip, and "Accept N
-high-confidence" verifies the high ones in one click. Only verified facts are used in tailored applications.
+high-confidence" verifies the high ones in one click. Only verified facts are used in tailored applications;
+if you allow unverified resume facts in the candidate policy, an unverified fact of a resume read this way is used
+only when it is rated high, and the others are held back (the reviewer and Claude Desktop are told which).
 Measure any change with `python scripts/agent_eval.py --suite resume_extraction --resume-pipeline v2`
 (`docs/resume-extraction-plan.md`, `docs/evals/`).
 

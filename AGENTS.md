@@ -320,6 +320,12 @@ PDF when `RESUME_EXTRACTION_V2` is on. The rules a change has to keep:
   route — each with a human-readable reason. "Accept high-confidence" (`resume_verification.verify_confident`) is the
   person's action and verifies only facts still UNVERIFIED that are rated high; tailoring stays verified-only. The
   `resume_extraction` gate `high_confidence_precision` (≥ 0.99) checks that a high fact is right.
+* **Unverified means high confidence, or held back.** With `allow_unverified_resume_facts` on, generation and review
+  use an UNVERIFIED fact of a V2 version only when it is rated high (`context_builder.hold_back_unconfident`, in
+  `_base`, on a copy marked `HELD_BACK`; a held role holds its bullets). The rest go to `TaskContext.held_back_facts`
+  (the reviewer's prompt shows them only when there are some; MCP `get_tailoring_context` / `get_review_context`
+  list them with `HELD_BACK_NOTE`). Ranking is not gated; VERIFIED, EDITED and REJECTED facts are never touched; a
+  version without confidence is used as before. Never let a held fact back in through another path.
 * **Measured, not assumed.** Run `python scripts/agent_eval.py --suite resume_extraction --resume-pipeline v2`; its
   hard gates (`valid_words_altered`, `hallucinated_values`) stay at 0. Fixtures are synthetic
   (`tests/fixtures/resume_extraction/`, rebuilt by `scripts/build_resume_fixtures.py`); a real resume goes only in the

@@ -18,7 +18,7 @@ from app.models import ConversationAction, Evidence, Job, JobRanking, ResumeVari
 from app.prompts.common import prompt_profile
 from app.prompts.mcp_application import APPLICATION_RULES, MCP_APPLICATION_PROMPT_VERSION
 from app.prompts.mcp_review import MCP_REVIEW_PROMPT_VERSION, REVIEW_RULES
-from app.prompts.mcp_tailoring import MCP_TAILORING_PROMPT_VERSION, TAILORING_RULES
+from app.prompts.mcp_tailoring import HELD_BACK_NOTE, MCP_TAILORING_PROMPT_VERSION, TAILORING_RULES
 from app.prompts.tailoring import JOB_FIELDS, fit_analysis_input
 from app.services import apply_queue, approval, conversation_actions, knowledge
 from app.services import resume_verification as rv
@@ -223,8 +223,23 @@ def get_tailoring_context(db: Session, job_ids: list[int]) -> dict[str, Any]:
             "active_resume": {"text": active.master_resume,
                               "resume_id": getattr(getattr(active, "chosen_resume", None), "id", None),
                               "source": getattr(active, "resume_source", "master_text"),
-                              "length_plan": plan, "roles": _roles(parsed, plan)},
+                              "length_plan": plan, "roles": _roles(parsed, plan),
+                              **_held_back(db, active)},
             "jobs": jobs}
+
+
+def _held_back(db: Session, view: Any) -> dict[str, Any]:
+    """The resume's unverified facts tailoring may not use because they were read with too little confidence
+    (context_builder.hold_back_unconfident), as the in-app Tailor leaves them out. Empty, and absent, otherwise."""
+    from app.services.context_builder import VERIFIED_ONLY, WITH_UNVERIFIED, hold_back_unconfident
+    from app.services.user_settings import candidate_policy
+
+    resume = getattr(view, "chosen_resume", None)
+    if resume is None:
+        return {}
+    allowed = WITH_UNVERIFIED if candidate_policy(db, view.user_id)["allow_unverified_resume_facts"] else VERIFIED_ONLY
+    _data, held = hold_back_unconfident(db, resume, resume.structured_data, allowed, "tailoring")
+    return {"held_back_facts": held, "held_back_note": HELD_BACK_NOTE} if held else {}
 
 
 def _length_plan(db: Session, view: Any) -> dict[str, Any]:
@@ -252,7 +267,8 @@ def _job_resume(db: Session, profile: Any, job: Job) -> dict[str, Any]:
     parsed, plan = parse_resume(view.master_resume), _length_plan(db, view)
     return {"resume": {"resume_id": chosen.id, "name": chosen.name or f"Version {chosen.version}",
                        "note": "Tailor this job from this resume, not active_resume",
-                       "text": view.master_resume, "length_plan": plan, "roles": _roles(parsed, plan)}}
+                       "text": view.master_resume, "length_plan": plan, "roles": _roles(parsed, plan),
+                       **_held_back(db, view)}}
 
 
 def _retailor_feedback(db: Session, job: Job) -> dict[str, Any]:
@@ -363,6 +379,7 @@ def get_review_context(db: Session, job_ids: list[int]) -> dict[str, Any]:
                                 "bullet_evidence": content.get("bullet_evidence") or [],
                                 "cover_letter": variant.cover_letter,
                                 "screening_answer_drafts": content.get("screening_answer_drafts") or {}},
+            **_held_back(db, rv.for_job(db, profile, job)),
         })
     return {"ok": True, "prompt_version": MCP_REVIEW_PROMPT_VERSION, "rules": list(REVIEW_RULES),
             "candidate_profile": facts,

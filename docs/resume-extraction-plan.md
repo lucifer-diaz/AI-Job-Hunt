@@ -371,6 +371,17 @@ position is found, not claimed) and cheaper. Keep a `source_quote` only for summ
   review header (confirmation first). A clean fixture went from 0% to 96% reviewed in one click.
 * Eval: new gate `high_confidence_precision` ≥ 0.99 — 1.0 over 398 high facts (fixtures and the two real resumes).
 
+### Phase 8: downstream gating [L] (done)
+
+* §6.1 kept for the default (verified-only). Where the person allows unverified facts, the spec's rule now applies
+  the other way round: an UNVERIFIED fact of a V2 version reaches tailoring, review, letters and follow-ups only when
+  rated high; medium, low and the bullets of a held role are held back with their reasons
+  (`context_builder.hold_back_unconfident`, on a copy; the stored data never changes).
+* The reviewer's prompt lists held-back facts (only when there are some, so other prompts are byte-identical); MCP
+  `get_tailoring_context` and `get_review_context` carry `held_back_facts` and a note; a tailored version records the
+  ids it was built without (`context.held_back_facts`). Ranking is not gated; EDITED facts and versions without V2
+  are unchanged. Application submission is untouched (it uses the approved packet).
+
 ## 13. What is left (not built)
 
 * Assigning an arbitrary line as a heading (a text file's unknown heading is not detected, so it cannot be picked).

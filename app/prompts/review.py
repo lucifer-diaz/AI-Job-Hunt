@@ -76,11 +76,17 @@ def build_review_prompt(candidate_profile: Any, evidence: list[dict[str, Any]] |
     if context is not None:
         evidence = context_value(context, "relevant_evidence", [])
         rejected = context_value(context, "rejected_facts", [])
+        held = context_value(context, "held_back_facts", [])
         policy = context_value(context, "policy", {}) or {}
         truth = [
             section("VERIFIED RESUME FACTS", to_json(resume_facts(context), limit=24000)),
             untrusted("REJECTED RESUME FACTS", "untrusted_resume_facts", to_json(rejected, limit=6000))
             if rejected else "",
+            # Shown only when something was held back, so every other review prompt is unchanged.
+            untrusted("HELD-BACK RESUME FACTS (unverified and read with low confidence: not usable, so a claim that "
+                      "relies on one is unsupported)", "untrusted_held_back_facts",
+                      to_json([{k: f.get(k) for k in ("id", "section", "text", "level")} for f in held], limit=6000))
+            if held else "",
             section("CANDIDATE POLICY", to_json({k: policy.get(k, False) for k in POLICY_FIELDS})),
         ]
     user = user_message(
