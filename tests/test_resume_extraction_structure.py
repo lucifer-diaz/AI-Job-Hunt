@@ -240,3 +240,27 @@ def test_deleting_a_version_also_removes_its_parse_task(user):
     assert client.delete(f"/api/resumes/{second}").status_code == 200
     with _db(user) as db:
         assert db.scalar(select(ResumeParseTask).where(ResumeParseTask.resume_id == second)) is None
+
+
+@pytest.mark.parametrize("heading", ["Expertise", "AREAS OF EXPERTISE", "Key Areas of Expertise", "Core Expertise",
+                                     "Technical Expertise", "Domain Expertise", "Expertise & Tools",
+                                     "Skills & Expertise", "Professional Expertise"])
+def test_an_expertise_heading_is_a_skills_section(heading):
+    long = "Platform engineer with nine years building streaming pipelines and internal tools for many teams."
+    doc = [LineInfo(text=t, size=s) for t, s in (("Alex Rivera", 14), ("Summary", 9), (long, 7), (heading, 9),
+                                                  ("Kafka, Kubernetes, Go", 7))]
+    assert [h.kind for h in sections.detect(doc) if h.text == heading] == ["skills"]
+    assert {s["name"] for s in parse_deterministic(structure.view(doc), marked=True)["skills"]} == {
+        "Kafka", "Kubernetes", "Go"}
+
+
+@pytest.mark.parametrize(("heading", "body", "kind"), [
+    ("Professional Experience & Expertise", "Lead Engineer | Acme | Remote | Jan 2020 - Dec 2024", "experience"),
+    ("Skills & Experience", "Lead Engineer | Acme | Remote | Jan 2020 - Dec 2024", "experience"),
+    ("Experience & Expertise", "Kafka, Kubernetes, Go", "skills")])
+def test_a_heading_naming_two_sections_is_placed_by_its_lines(heading, body, kind):
+    long = "Platform engineer with nine years building streaming pipelines and internal tools for many teams."
+    doc = [LineInfo(text=t, size=s) for t, s in (("Alex Rivera", 14), ("Summary", 9), (long, 7), (heading, 9),
+                                                  (body, 7))]
+    found = [(h.kind, h.method) for h in sections.detect(doc) if h.text == heading]
+    assert found == [(kind, "keyword")], "still a guess the person sees"

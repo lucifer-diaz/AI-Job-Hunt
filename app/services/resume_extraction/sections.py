@@ -108,10 +108,24 @@ def classify(text: str, learned: dict[str, str] | None = None) -> tuple[str, str
         return learned[p], "learned"
     if p in _EXACT:
         return _EXACT[p], "synonym"
-    for kind, words in KEYWORDS:
-        if any(w in p for w in words):
-            return kind, "keyword"
-    return OTHER, "unknown"
+    kinds = keyword_kinds(p)
+    return (kinds[0], "keyword") if kinds else (OTHER, "unknown")
+
+
+def keyword_kinds(p: str) -> list[str]:
+    """Every section whose keywords a heading phrase holds, in KEYWORDS order ("professional experience and
+    expertise" holds both experience and skills)."""
+    return [kind for kind, words in KEYWORDS if any(w in p for w in words)]
+
+
+def _by_content(lines: list[LineInfo], start: int, end: int, kinds: list[str]) -> str:
+    """For a heading that names more than one section: experience when its lines hold a role (a line with a date
+    range), else the first keyword's section. Deterministic; it stays a guess the person sees."""
+    from app.services.structured_resume import DATE_RANGE_RE
+
+    if "experience" in kinds and any(DATE_RANGE_RE.search(line.text) for line in lines[start + 1:end]):
+        return "experience"
+    return kinds[0]
 
 
 def _shape(line: LineInfo) -> bool:
@@ -201,7 +215,14 @@ def detect(lines: list[LineInfo], learned: dict[str, str] | None = None,
     for i, kind in overrides.items():
         if kind != NONE and 0 <= i < len(lines) and lines[i].text.strip():
             out.append(Heading(line=i, text=lines[i].text.strip(), kind=kind, method="person", signal="person"))
-    return sorted(out, key=lambda h: h.line)
+    out.sort(key=lambda h: h.line)
+    for n, h in enumerate(out):  # a heading naming two sections ("Experience & Expertise"): its lines decide
+        kinds = keyword_kinds(phrase(h.text)) if h.method == "keyword" else []
+        if len(kinds) > 1:
+            end = out[n + 1].line if n + 1 < len(out) else len(lines)
+            out[n] = Heading(line=h.line, text=h.text, kind=_by_content(lines, h.line, end, kinds), method=h.method,
+                             signal=h.signal)
+    return out
 
 
 def section_of(headings: list[Heading], index: int) -> str | None:
