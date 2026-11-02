@@ -755,6 +755,21 @@ describe('resume data', () => {
     expect(sent).toEqual({ id: 'c1', action: 'undo' });
     expect(document.querySelector('[data-rd-fix="c1"]').textContent).toContain('Correct again');
   });
+  it('marks facts the reader trusts less and accepts the high-confidence ones on request', async () => {
+    let called = false;
+    const confidence = { summary: { level: 'medium', reasons: ['normalized from “Kafka”'] }, resp_1: { level: 'low', reasons: ['“x” is not in the text as written'] }, exp_zendrive_2024: { level: 'high', reasons: ['in the file’s text word for word'] } };
+    const base = detail({ confidence });
+    const structured = { ...base.structured, experience: [{ ...base.structured.experience[0], verification: { status: 'UNVERIFIED', updated_at: null } }] };
+    await open(detail({ confidence, structured }), { 'POST /api/resumes/5/verify-confident': () => { called = true; return detail({ confidence }); } });
+    expect(document.querySelector('[data-rd-item="summary"] [data-rd-conf]').dataset.rdConf).toBe('medium');
+    expect(document.querySelector('[data-rd-item="summary"] [data-rd-conf]').getAttribute('title')).toContain('normalized from “Kafka”');
+    expect(document.querySelector('[data-rd-item="resp_1"] [data-rd-conf]')).toBeNull();  // rejected: confidence no longer matters
+    expect(document.querySelector('[data-rd-item="exp_zendrive_2024"] [data-rd-conf]')).toBeNull();  // high: nothing to flag
+    const accept = document.querySelector('[data-act="rd-accept-confident"]');
+    expect(accept.textContent).toContain('Accept 1 high-confidence');
+    await ui.A['rd-accept-confident'](); await settle();
+    expect(called).toBe(true);
+  });
   it('shows nothing about reading for a version read before the new reader', async () => {
     await open(detail({ extraction: null }));
     expect(document.querySelector('.rd-sections')).toBeNull();

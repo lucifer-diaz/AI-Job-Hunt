@@ -2812,7 +2812,9 @@ from its rendered pages with Tesseract, locally and within a time limit (`RESUME
 unless `INSTALL_OCR=false`). A word is corrected only with evidence — the page shows a known word there, or one
 substitution explains several unknown words — never a word the dictionary knows. Corrections are listed as
 "Kaga → Kafka" with their evidence in "How it was read", where each can be kept or undone; the file's own text is
-kept.
+kept. Each fact of such a resume has a confidence computed from the same evidence (high: in the file's text word for
+word, nothing corrected); a fact rated lower is marked Check or Low with the reasons in its tooltip, and "Accept N
+high-confidence" verifies the high ones in one click. Only verified facts are used in tailored applications.
 Measure any change with `python scripts/agent_eval.py --suite resume_extraction --resume-pipeline v2`
 (`docs/resume-extraction-plan.md`, `docs/evals/`).
 

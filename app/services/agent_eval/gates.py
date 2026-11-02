@@ -62,7 +62,9 @@ GATES: dict[str, tuple[Gate, ...]] = {
                           Gate("field_precision", ">=", 0.98, "structured facts are the resume's own"),
                           Gate("field_recall", ">=", 0.95, "the resume's facts are found"),
                           Gate("misfiled", "==", 0, "no section's content is filed under another"),
-                          Gate("bullets_intact", ">=", 0.98, "bullets come out whole and in reading order")),
+                          Gate("bullets_intact", ">=", 0.98, "bullets come out whole and in reading order"),
+                          Gate("high_confidence_precision", ">=", 0.99, "a fact rated high is right: accepting them "
+                               "all is safe")),
     "human_corrections": (Gate("accuracy", "==", 1.0, "correction rates come from stored facts, and the recruiter's "
                                "outcome is never counted as a model error"),),
 }

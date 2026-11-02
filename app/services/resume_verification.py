@@ -525,6 +525,32 @@ def verify_section(db: Session, resume: Resume, section: str, source: str = "USE
     return data
 
 
+def confidence(db: Session, resume: Resume) -> dict[str, dict[str, Any]]:
+    """Each fact's confidence (app.services.resume_extraction.confidence): {} for a version read without V2."""
+    from app.services.resume_extraction import store
+    from app.services.resume_extraction.confidence import assess
+
+    return assess(resume.structured_data, resume.raw_text or "", store.record(db, resume.id))
+
+
+def verify_confident(db: Session, resume: Resume, source: str = "USER") -> int:
+    """The person accepts every fact still unverified whose confidence is high, in one action. A fact a person edited
+    or decided is left alone, and nothing is ever verified without this request. Returns how many were verified."""
+    levels = confidence(db, resume)
+    data = copy.deepcopy(ensure_structured(db, resume))
+    count = 0
+    for unit in iter_units(data):
+        if unit.status == "UNVERIFIED" and levels.get(unit.item_id, {}).get("level") == "high":
+            record(db, resume, unit.path, "VERIFY", source, item_id=unit.item_id, old=unit.status, new="VERIFIED")
+            _set_status(unit, "VERIFIED")
+            count += 1
+    if count:
+        _touch(resume, data)
+        refresh_status(resume)
+        sync_evidence(db, resume)
+    return count
+
+
 def verify_resume(db: Session, resume: Resume, user_id: int | None) -> Resume:
     """Mark the whole resume VERIFIED. Every unit in the required sections must be VERIFIED or REJECTED."""
     from app.services.resume_extraction import store

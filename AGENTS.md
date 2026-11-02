@@ -314,6 +314,12 @@ PDF when `RESUME_EXTRACTION_V2` is on. The rules a change has to keep:
   keeps `raw`. What grounding drops is computed by `held_back` and stored on the record's review list — values only —
   for the person to add (through `rv.apply_edit`: their change, unverified) or discard. Nothing on the list reaches a
   workflow unasked; never loosen grounding to keep it.
+* **Confidence is computed, explained and never verifies by itself** (`confidence.assess`, on read, never stored: it
+  cannot go stale). It is rules over checkable signals — the value in the clean text word for word, the correction
+  behind a word and its evidence, a normalized or alias match, a fuzzy passage, a misread-looking word, the quality
+  route — each with a human-readable reason. "Accept high-confidence" (`resume_verification.verify_confident`) is the
+  person's action and verifies only facts still UNVERIFIED that are rated high; tailoring stays verified-only. The
+  `resume_extraction` gate `high_confidence_precision` (≥ 0.99) checks that a high fact is right.
 * **Measured, not assumed.** Run `python scripts/agent_eval.py --suite resume_extraction --resume-pipeline v2`; its
   hard gates (`valid_words_altered`, `hallucinated_values`) stay at 0. Fixtures are synthetic
   (`tests/fixtures/resume_extraction/`, rebuilt by `scripts/build_resume_fixtures.py`); a real resume goes only in the

@@ -1,6 +1,6 @@
 # Resume extraction V2: Phase 0 findings and plan
 
-Status: **Phases 1 – 6 done; the resume_extraction gate passes for V2. Phase 7 (per-fact confidence) is conditional.** Agreed decisions are in section 10; where they differ from the
+Status: **Phases 1 – 7 done; the resume_extraction gate passes for V2.** Section 13 lists what is left. Agreed decisions are in section 10; where they differ from the
 recommendations in sections 5 – 9, section 10 wins.
 
 ## 1. Summary
@@ -358,3 +358,23 @@ position is found, not claimed) and cheaper. Keep a `source_quote` only for summ
   broken PDFs fall back to rules and the gate depends on that environment.
 * Left as written, by design: words only the page could confirm but no dictionary knows (names: "WhiBield",
   "SeaCle") and single unknown words with no page to read ("Kaga" in a text file).
+
+### Phase 7: per-fact confidence and "accept high-confidence" (done)
+
+* `confidence.py`: the spec's rule table over checkable signals (value in the clean text word for word; the
+  correction behind a word — page, rule, both, kept, undone; normalized from `raw`, a known alias, a fuzzy passage;
+  a misread-looking or unknown word in a flagged file; a poor file one level lower), each with a reason. Computed on
+  read (not stored per unit as §6.3 proposed): it never goes stale when a correction is undone or a heading moved.
+* `verify_confident` + `POST /api/resumes/{id}/verify-confident`: the person verifies every unverified high fact in
+  one action; decided or edited facts are untouched. Gating stays verified-only (§6.1).
+* Settings → Resumes: "Check" / "Low" badges with the reasons on unverified facts, "Accept N high-confidence" in the
+  review header (confirmation first). A clean fixture went from 0% to 96% reviewed in one click.
+* Eval: new gate `high_confidence_precision` ≥ 0.99 — 1.0 over 398 high facts (fixtures and the two real resumes).
+
+## 13. What is left (not built)
+
+* Assigning an arbitrary line as a heading (a text file's unknown heading is not detected, so it cannot be picked).
+* Per-field correction claims from the model (`was_corrected`): corrections come from the page and rules instead.
+* An eval suite over recorded AI-parser outputs (grounding and held-back values are unit-tested).
+* OCR in a background worker, should uploads of flagged PDFs feel slow (today: in the request, bounded).
+* Real resumes from Word, Google Docs and Canva exports in `real/`, to measure how often /ActualText is missing.

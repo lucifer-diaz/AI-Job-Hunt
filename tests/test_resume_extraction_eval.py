@@ -99,8 +99,10 @@ def test_the_suite_scores_the_current_pipeline_on_every_gated_metric():
     result = SUITES["resume_extraction"](dataset_for("resume_extraction"), {})
     assert result.metrics["pipeline"] == "current" and result.metrics["cases"] == len(dataset_for(
         "resume_extraction").examples)
-    for gate in GATES["resume_extraction"]:
-        assert result.metrics[gate.metric] is not None, gate.metric
+    for gate in GATES["resume_extraction"]:  # today's reader rates no confidence: that gate stays BLOCKED for it
+        assert (result.metrics[gate.metric] is None) == (gate.metric == "high_confidence_precision"), gate.metric
+    v2 = SUITES["resume_extraction"](dataset_for("resume_extraction"), {"resume_pipeline": "v2"})
+    assert all(v2.metrics[gate.metric] is not None for gate in GATES["resume_extraction"])
     assert {"cer_clean", "cer_broken", "cer_actualtext", "cer_text"} <= set(result.metrics)
 
 

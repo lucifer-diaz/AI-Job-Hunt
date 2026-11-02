@@ -98,10 +98,28 @@ async function resumeDataSave() {
 }
 
 /* ───────────── rendering ───────────── */
-// A unit's status as a small icon (the word is in its tooltip and for screen readers).
+// A unit's status as a small icon (the word is in its tooltip and for screen readers); for a fact still waiting, how
+// far the reader trusts it when that is less than high (resume extraction V2), with the reasons in its tooltip.
+const RD_CONF = { medium: ['Check', 'warn'], low: ['Low', 'bad'] };
 function rdBadge(node) {
   const [icon, label, tone] = RD_STATUS[rdStatus(node)] || RD_STATUS.UNVERIFIED;
-  return `<span class="pill ${tone} rd-badge" title="${attr(label)}" data-rd-status="${rdStatus(node)}"><span aria-hidden="true">${icon}</span><span class="sr-only">${esc(label)}</span></span>`;
+  const conf = rdStatus(node) === 'UNVERIFIED' ? rdActive()?.confidence?.[node.id] : null;
+  const [clabel, ctone] = (conf && RD_CONF[conf.level]) || [];
+  const confidence = clabel ? `<span class="pill ${ctone} rd-conf" data-rd-conf="${conf.level}" title="${attr(`${conf.level === 'low' ? 'Low' : 'Medium'} confidence: ${conf.reasons.join('; ')}`)}">${clabel}<span class="sr-only">: ${esc(conf.reasons.join('; '))}</span></span>` : '';
+  return `<span class="pill ${tone} rd-badge" title="${attr(label)}" data-rd-status="${rdStatus(node)}"><span aria-hidden="true">${icon}</span><span class="sr-only">${esc(label)}</span></span>${confidence}`;
+}
+// Unverified facts the reader rates high: what "Accept high-confidence" verifies (the person's own action).
+function rdConfident(active) {
+  const levels = active?.confidence || {};
+  const walk = (node, out) => {
+    if (Array.isArray(node)) node.forEach(n => walk(n, out));
+    else if (node && typeof node === 'object') {
+      if (node.id && node.verification && rdStatus(node) === 'UNVERIFIED' && levels[node.id]?.level === 'high') out.push(node.id);
+      Object.values(node).forEach(v => { if (v && typeof v === 'object') walk(v, out); });
+    }
+    return out;
+  };
+  return walk(active?.structured, []).length;
 }
 function rdIcon(icon, label, act, data, disabled) {
   return `<button class="btn sm rd-icon" data-act="${act}" ${Object.entries(data).map(([k, v]) => `data-${k}="${attr(v)}"`).join(' ')} aria-label="${attr(label)}" title="${attr(label)}" ${disabled ? 'disabled' : ''}>${icon}</button>`;
@@ -375,6 +393,8 @@ function rdHeader() {
   const verified = active.verification_status === 'VERIFIED';
   const left = p.needs_review || 0;
   const next = !verified && left ? btn(`Review next <span class="rd-count">${left} left</span>`, 'rd-next', {}, 'primary', locked) : '';
+  const confident = verified ? 0 : rdConfident(active);
+  const accept = confident ? btn(`Accept ${confident} high-confidence`, 'rd-accept-confident', {}, '', locked) : '';
   const unplaced = active.extraction?.unplaced || 0;
   const verify = verified ? btn('✓ Resume verified', 'rd-verify-resume', {}, 'good', true)
     : btn('Verify resume', 'rd-verify-resume', {}, next || unplaced ? '' : 'primary', locked || blocking.length > 0 || unplaced > 0);
@@ -387,7 +407,7 @@ function rdHeader() {
     <p class="settings-help">${counts}. Only verified facts are used in tailored applications.${active.verified_at ? ` Last verified ${esc(rdDate(active.verified_at))}.` : ''}</p>
     ${active.is_active ? '' : '<p class="settings-help"><b>This resume is not active.</b> Reviewing it does not change which resume is used: it is used for jobs that match its target roles, or that you or a search setup chose it for.</p>'}
     ${RD.blocking?.length ? `<div class="settings-notice"><strong>${blocking.length} required item${blocking.length === 1 ? '' : 's'} still need review</strong><p>${blocking.slice(0, 5).map(b => esc(b.label)).join(' · ')}${blocking.length > 5 ? ' …' : ''}</p></div>` : ''}
-    <div class="rd-head-actions">${next}${verify}${menu}</div>${rdAiParse(active.ai_parse)}</section>` +
+    <div class="rd-head-actions">${next}${accept}${verify}${menu}</div>${confident ? `<p class="settings-help mt8">High-confidence facts are in the file’s text word for word, with nothing corrected. Facts marked Check or Low say why in their tooltip.</p>` : ''}${rdAiParse(active.ai_parse)}</section>` +
     rdComparison(active.pending_reparse);
 }
 function rdTabs() {
@@ -554,6 +574,11 @@ const RESUME_DATA_ACTIONS = {
     return rdRun(async () => {
       rdApply(await api(`/api/resumes/${active.id}/corrections`, { method: 'POST', body: { id: el.dataset.id, action: el.dataset.action } }));
     }, keep ? 'Correction kept' : 'Correction undone: read again with the file’s own word');
+  },
+  'rd-accept-confident': () => {
+    const active = rdActive(), n = rdConfident(active);
+    if (!n || !confirm(`Verify ${n} fact${n === 1 ? '' : 's'} the reader rates high (in the file’s text word for word, nothing corrected)? You can undo any of them.`)) return;
+    return rdRun(async () => { rdApply(await api(`/api/resumes/${active.id}/verify-confident`, { method: 'POST' })); }, `${n} fact${n === 1 ? '' : 's'} verified`);
   },
   'rd-section-assign': el => {
     if (!el.value) return;

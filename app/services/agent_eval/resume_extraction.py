@@ -52,6 +52,8 @@ class Pipeline:
     repair: Callable[[str], str]  # raw text layer → final text
     structure: Callable[[str, Any], dict[str, Any]]  # (final text, context) → StructuredResumeIn-shaped data
     route: Callable[[str, bytes], str] | None = None  # (kind, bytes) → quality route (clean / suspicious / poor)
+    # (structured data, final text, context) → {item_id: {"level", "reasons"}} over the materialized data
+    confidence: Callable[[dict[str, Any], str, Any], tuple[dict[str, Any], dict[str, Any]]] | None = None
 
 
 def _current_read(kind: str, data: bytes) -> tuple[str, str, Any]:
@@ -114,10 +116,45 @@ def _v2_route(kind: str, data: bytes) -> str:
     return pipeline.extract(kind, data).quality.route
 
 
+def _v2_confidence(data: dict[str, Any], text: str, context: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    from types import SimpleNamespace
+
+    from app.services.resume_extraction.confidence import assess
+    from app.services.structured_resume import materialize
+
+    units = materialize(data)
+    row = SimpleNamespace(corrections=context.corrections, quality={"route": context.quality.route}, layout=None)
+    return units, assess(units, text, row)
+
+
 PIPELINES: dict[str, Pipeline] = {
     "current": Pipeline(_current_read, _current_repair, _current_structure),
-    "v2": Pipeline(_v2_read, _v2_repair, _v2_structure, _v2_route),
+    "v2": Pipeline(_v2_read, _v2_repair, _v2_structure, _v2_route, _v2_confidence),
 }
+
+
+def high_confidence(resume: dict[str, Any], units: dict[str, Any], levels: dict[str, Any]) -> tuple[int, int, list[str]]:
+    """Facts rated high (skills, roles, bullets) and how many of them are the ground truth's: what "accept all
+    high-confidence" would verify, and whether that is safe. Returns (high, right, wrong examples)."""
+    from app.services.structured_resume import iter_units
+
+    want = expected_facts(resume)
+    truth = {"skills": {_key(v) for v in want["skills"]}, "experience": {_key(v) for v in want["roles"]},
+             "bullet": {_key(v) for v in want["bullets"]}}
+    high = right = 0
+    wrong: list[str] = []
+    for unit in iter_units(units):
+        if unit.kind not in truth or levels.get(unit.item_id, {}).get("level") != "high":
+            continue
+        node = unit.node
+        value: Any = {"skills": node.get("name", ""), "bullet": node.get("text", ""),
+                      "experience": (node.get("job_title", ""), node.get("company", ""))}[unit.kind]
+        high += 1
+        if _key(value) in truth[unit.kind]:
+            right += 1
+        else:
+            wrong.append(f"{unit.kind}: {value}")
+    return high, right, wrong
 # The quality route each fixture variant should get: the file's mapping is broken, or it is not.
 EXPECTED_ROUTE = {"clean": ("clean",), "actualtext": ("clean",), "broken": ("suspicious", "poor")}
 
@@ -403,7 +440,12 @@ def run(ds: Dataset, ctx: dict[str, Any]) -> SuiteResult:
         layer, final, context = pipeline.read(kind, data)
         expected = tokens("\n".join(document_lines(resume)))
         out = add_text(variant, expected, tokens(layer), tokens(final))
-        s = score_structure(resume, pipeline.structure(final, context), final)
+        structured = pipeline.structure(final, context)
+        s = score_structure(resume, structured, final)
+        if pipeline.confidence is not None and context is not None:
+            high, right, wrong = high_confidence(resume, *pipeline.confidence(structured, final, context))
+            totals.update({"high": high, "high_right": right})
+            out["high_but_wrong"] = wrong[:4]
         totals.update({k: s[k] if isinstance(s[k], int) else len(s[k]) for k in
                        ("facts_expected", "facts_produced", "facts_correct", "misfiled", "hallucinated",
                         "unrecognized_dropped", "bullets", "bullets_intact")})
@@ -438,5 +480,8 @@ def run(ds: Dataset, ctx: dict[str, Any]) -> SuiteResult:
         "unrecognized_dropped": totals["unrecognized_dropped"],
         "bullets_intact": _rate(totals["bullets_intact"], totals["bullets"]),
         "quality_routing": _rate(totals["routed_right"], totals["routed"]),  # None: the pipeline routes nothing
+        # Of the facts rated high, the share that is right: what "accept all high-confidence" would verify.
+        "high_confidence_precision": _rate(totals["high_right"], totals["high"]),
+        "high_confidence_facts": totals["high"],
     }
     return SuiteResult("resume_extraction", ds.identity(), metrics, cases)

@@ -97,7 +97,9 @@ def detail(resume: Resume) -> dict:
             # The latest AI structuring of this version (app.services.resume_parsing): status and counts only.
             "ai_parse": resume_parsing.status_of(db, resume.id) if db is not None else None,
             # How its file was read (resume extraction V2): quality route and the sections found; None = unknown.
-            "extraction": extraction_store.summary(db, resume.id) if db is not None else None}
+            "extraction": extraction_store.summary(db, resume.id) if db is not None else None,
+            # Each fact's confidence and why ({} for a version read without V2): orders review, never verifies.
+            "confidence": rv.confidence(db, resume) if db is not None else {}}
 
 
 def _commit(db: Session, resume: Resume) -> dict:
@@ -196,6 +198,14 @@ def verify(resume_id: int, db: Session = Depends(get_user_db)):
         db.rollback()
         raise HTTPException(422, {"message": str(exc), "blocking": exc.blocking}) from exc
     return _commit(db, resume)
+
+
+@router.post("/api/resumes/{resume_id}/verify-confident")
+def verify_confident(resume_id: int, db: Session = Depends(get_user_db)):
+    """Accept every unverified fact whose confidence is high, at the person's request."""
+    resume = _resume(db, resume_id)
+    count = rv.verify_confident(db, resume)
+    return {**_commit(db, resume), "verified": count}
 
 
 @router.post("/api/resumes/{resume_id}/verify-item")
