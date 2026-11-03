@@ -736,7 +736,7 @@ def test_model_calls_are_recorded_with_their_worker_and_prompt_version(owner, mo
                                                         ("interview_insights", "INTERVIEW_INSIGHTS")}
     assert all(r.prompt_version == "v1" for r in rows)
     assert insight_of(job_id).prompt_versions == {"company_insights": "v1", "interview_insights": "v1",
-                                                  "application_form": "v2"}
+                                                  "application_form": "v3"}
 
 
 # ───────────── cache ─────────────

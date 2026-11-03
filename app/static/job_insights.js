@@ -223,6 +223,7 @@ function insFormQuestion(q, jobId) {
   const actions = editing ? '' : [
     q.answer ? btn('Copy', 'ins-form-copy', { id: jobId, q: q.id }, 'sm ghost') : '',
     savable ? btn(q.status === 'DRAFTED' ? 'Review &amp; save' : 'Answer here', 'ins-form-edit', { id: jobId, q: q.id }, 'sm ghost') : '',
+    q.status === 'NEEDS_INPUT' && q.origin === 'FORM' && q.category !== 'PERSONAL' ? btn(label('insformdraft' + key, 'Draft with AI', 'Drafting…'), 'ins-form-redraft', { id: jobId, q: q.id }, 'sm ghost', isBusy('insformdraft' + key)) : '',
     savable ? btn('Open in library', 'ins-form-save', { id: jobId, q: q.id }, 'sm ghost') : '',
     q.origin === 'FORM' ? btn(label('insformrm' + key, 'Remove', 'Removing…'), 'ins-form-remove', { id: jobId, q: q.id }, 'sm ghost danger', isBusy('insformrm' + key)) : '',
   ].filter(Boolean).join('');
@@ -254,7 +255,7 @@ function insForm(x, jobId) {
   const form = 'insform' + jobId;
   const full = (f.from_form || []).length >= (f.max_questions || 20);
   return `<div class="col gap16">
-    <div class="box"><div class="base b mb4">Questions on the form</div><div class="xs muted mb8">Paste the questions the application asks, one per line. Each is drafted in the background from your resume for this job, your profile, your saved answers and the verified evidence retrieved for that question; questions only you can answer (work authorization, pay, notice period, personal details) are never drafted.</div>
+    <div class="box"><div class="base b mb4">Questions on the form</div><div class="xs muted mb8">Paste the questions the application asks, one per line. Each is drafted in the background from your resume for this job, your profile, your saved answers and the verified evidence retrieved for that question — when nothing answers it exactly, from your closest projects, labelled so you can check it; questions only you can answer (work authorization, pay, notice period, personal details) are never drafted.</div>
       ${textareaF(form, 'questions', '', `placeholder="Why do you want to join this company?&#10;Describe a project where you led a team." style="min-height:80px" aria-label="Questions from the application form"${full ? ' disabled' : ''}`)}
       <div class="row gap8 mt8">${btn(label('insformadd' + jobId, 'Add and draft', 'Adding…'), 'ins-form-add', { id: jobId }, 'primary sm', isBusy('insformadd' + jobId) || full)}${full ? '<span class="xs muted">Remove a question to add another.</span>' : ''}</div></div>
     <div><div class="row gap8 mb8"><span class="caps">FROM THE FORM</span><span class="xs faint">questions you pasted</span></div>
@@ -401,6 +402,15 @@ const INSIGHTS_ACTIONS = {
     return busy(`insformrm${id}:${q}`, async () => {
       D.insights = { ...(D.insights || {}), [id]: await api(`/api/jobs/${id}/insights/application-questions/${encodeURIComponent(q)}`, { method: 'DELETE' }) };
     });
+  },
+  // Drafts the question again in the background, adapted from the closest verified experience when nothing answers
+  // it exactly. The draft is never saved until the person reviews it.
+  'ins-form-redraft': el => {
+    const id = Number(el.dataset.id), q = el.dataset.q;
+    return busy(`insformdraft${id}:${q}`, async () => {
+      D.insights = { ...(D.insights || {}), [id]: await api(`/api/jobs/${id}/insights/application-questions/${encodeURIComponent(q)}/draft`, { method: 'POST' }) };
+      scheduleInsPoll(id);
+    }, 'Drafting in the background');
   },
   'ins-form-copy': el => {
     const f = D.insights?.[Number(el.dataset.id)]?.application_form || {};

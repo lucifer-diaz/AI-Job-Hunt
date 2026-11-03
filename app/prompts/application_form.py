@@ -33,7 +33,9 @@ from app.prompts.contracts import PERSONAL_FORM_CATEGORIES, ApplicationFormPrepR
 # v1: drafts for pasted form questions and predicted ones, citing requirement, evidence and known-answer ids.
 # v2: the candidate's profile and the job's resume (verified roles and bullets with their evidence ids), and what was
 #     retrieved for each pasted question.
-APPLICATION_FORM_PROMPT_VERSION = "v2"
+# v3: a question no fact answers exactly is drafted from the closest verified experience (form_basis CLOSEST) instead
+#     of being left to the candidate.
+APPLICATION_FORM_PROMPT_VERSION = "v3"
 APPLICATION_FORM_MARKER = "PREPARE_APPLICATION_FORM"
 MAX_POSTING_CHARS = 12000
 MAX_PREDICTED = 8
@@ -63,12 +65,17 @@ APPLICATION_FORM_SYSTEM = instructions(
   likely. Do not repeat a FORM QUESTIONS entry, and do not predict the standard personal questions.
 - form_decision DRAFT with form_answer when the supplied facts answer it: two to five sentences for an open question,
   a short phrase for a factual one. Cite the VERIFIED EVIDENCE ids it rests on in evidence_ids, the KNOWN ANSWERS
-  ids it reuses in knowledge_ids and the RESUME refs in form_resume_refs. A motivation answer may draw on COMPANY and the posting, and must still describe
-  only experience the evidence shows.
+  ids it reuses in knowledge_ids and the RESUME refs in form_resume_refs, with form_basis DIRECT. A motivation answer
+  may draw on COMPANY and the posting, and must still describe only experience the evidence shows.
+- When no supplied fact answers the question as asked but a verified role, project, bullet or evidence item is
+  relevant to it, still DRAFT: answer from the closest one, with form_basis CLOSEST. Describe only what that
+  experience shows (never stretch it to fit the question's wording), cite it as above, and say in form_note what it
+  was adapted from and what the candidate should check (e.g. "From the PROJ2 project; check it counts as recent").
+  The candidate reviews every draft before it is saved.
 - form_decision NEEDS_INPUT (form_answer null, what to decide in form_note) for every question in these categories:
   {", ".join(PERSONAL_FORM_CATEGORIES)} — work authorization, visa or sponsorship, salary or expected pay, notice
   period, start date or availability, relocation, demographic, disability, veteran, legal, contact or identity
-  questions — even when a fact seems to answer it; and for any question the supplied facts do not answer.""",
+  questions — even when a fact seems to answer it; and for a question nothing supplied is relevant to.""",
     NO_INVENTION_RULE + " " + GAPS_STAY_GAPS_RULE + " Never state a number (years, percentages, team sizes, amounts) "
     "that is not in VERIFIED EVIDENCE or KNOWN ANSWERS. Cite only ids that appear in the input.",
     JSON_ONLY_RULE,

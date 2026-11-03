@@ -735,6 +735,7 @@ PERSONAL_FORM_CATEGORIES = ("WORK_AUTHORIZATION", "COMPENSATION", "AVAILABILITY"
 FORM_CATEGORIES = ("MOTIVATION", "EXPERIENCE", "TECHNICAL", "LEADERSHIP", "BEHAVIORAL", *PERSONAL_FORM_CATEGORIES,
                    "OTHER")
 FORM_DECISIONS = ("DRAFT", "NEEDS_INPUT")
+FORM_BASES = ("DIRECT", "CLOSEST")
 
 
 class FormQuestionDraft(Contract):
@@ -750,6 +751,10 @@ class FormQuestionDraft(Contract):
                                            "(a personal, legal or preference answer, or a fact you were not given)")
     form_answer: Annotated[str | None, BeforeValidator(lambda v: _phrase(v) or None)] = Field(
         default=None, max_length=2500, description="the draft answer in the candidate's voice; null unless DRAFT")
+    form_basis: Annotated[Literal["DIRECT", "CLOSEST"], _choice(FORM_BASES, "DIRECT")] = Field(
+        default="DIRECT", description="for a DRAFT: DIRECT when the supplied facts answer the question as asked; "
+                                      "CLOSEST when none does and the draft is adapted from the nearest verified "
+                                      "experience")
     likely_because: Annotated[str, BeforeValidator(_phrase)] = Field(
         default="", max_length=300, description="for a predicted question: what in the posting makes a form likely "
                                                 "to ask it")
@@ -762,7 +767,8 @@ class FormQuestionDraft(Contract):
         description="RESUME refs (ROLE1, PROJ1, EDU1, CERT1, SKILLS, SUMMARY) of the verified resume facts the draft "
                     "rests on that are not bullets; a bullet is cited by its evidence_ids")
     form_note: Annotated[str, BeforeValidator(_phrase)] = Field(
-        default="", max_length=300, description="for NEEDS_INPUT: what the candidate has to decide or supply")
+        default="", max_length=300, description="for NEEDS_INPUT: what the candidate has to decide or supply; for a "
+                                                "CLOSEST draft: what it was adapted from and what to check")
 
     @model_validator(mode="after")
     def _draft_needs_an_answer(self) -> FormQuestionDraft:
