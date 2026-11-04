@@ -197,7 +197,8 @@ def _item(qid: str, question: str, origin: str, status: str, **values: Any) -> d
             "requirement_ids": values.get("requirement_ids") or [], "requirements": values.get("requirements") or [],
             "knowledge_ids": values.get("knowledge_ids") or [], "resume_refs": values.get("resume_refs") or [],
             "resume_facts": values.get("resume_facts") or [], "rationale": values.get("rationale") or None,
-            "reason": values.get("reason") or None, "kind": kind, "label": label}
+            "reason": values.get("reason") or None, "kind": kind, "label": label,
+            "basis": values.get("basis") or None}
 
 
 WAITING = "Also waiting for your answer in the Answer library; saving this answers it there"
@@ -302,9 +303,12 @@ def after_model(db: Session, job: Job, profile: Any, item: Any, *, qid: str, que
         return _item(qid, question, origin, NEEDS_INPUT, **common,
                      reason="The draft was withheld: " + "; ".join(p["message"] for p in problems[:2]))
     closest = item.form_basis == "CLOSEST"
-    reason = " ".join(r for r in ((item.form_note if closest else ""), WAITING if waiting else "") if r)
+    note = (item.form_note or "Nothing you saved answers this exactly; it was adapted from related experience.") \
+        if closest else ""
+    reason = " ".join(r for r in (note, WAITING if waiting else "") if r)
     return _item(qid, question, origin, DRAFTED, **common, answer=item.form_answer, evidence_ids=item.evidence_ids,
-                 label=CLOSEST_LABEL if closest else None, reason=reason or None,
+                 label=CLOSEST_LABEL if closest else None, basis="CLOSEST" if closest else None,
+                 reason=reason or None,
                  evidence=[evidence_labels.get(e, "") for e in item.evidence_ids], knowledge_ids=item.knowledge_ids,
                  resume_refs=item.form_resume_refs,
                  resume_facts=[(resume_facts or {}).get(r, r) for r in item.form_resume_refs])

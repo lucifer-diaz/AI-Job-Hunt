@@ -217,7 +217,8 @@ function insInterview(x, jobId) {
 }
 
 function insFormQuestion(q, jobId) {
-  const [word, tone] = INS_FORM_STATUS[q.status] || INS_FORM_STATUS.NEEDS_INPUT;
+  const [word, tone] = q.status === 'DRAFTED' && q.basis === 'CLOSEST' ? ['Adapted draft', 'warn']
+    : INS_FORM_STATUS[q.status] || INS_FORM_STATUS.NEEDS_INPUT;
   const key = `${jobId}:${q.id}`;
   const savable = q.status === 'DRAFTED' || q.status === 'NEEDS_INPUT', editing = savable && !!insState().editing?.[key];
   const actions = editing ? '' : [
@@ -229,6 +230,7 @@ function insFormQuestion(q, jobId) {
   ].filter(Boolean).join('');
   return `<div class="ins-q"><div class="row top-align gap8"><div class="grow"><div class="small b pretty">${esc(q.question)}</div>
       ${q.rationale ? `<div class="xs mt4"><span class="faint">Why likely:</span> ${esc(q.rationale)}</div>` : ''}
+      ${q.basis === 'CLOSEST' && q.status === 'DRAFTED' ? `<div class="xs b mt6" style="color:var(--warn-deep)">${esc(q.label)}</div>` : ''}
       ${editing ? insAnswerEditor(q, jobId) : q.answer ? `<div class="box soft mt8 small pretty" style="white-space:pre-wrap">${esc(q.answer)}</div>` : ''}
       ${q.evidence?.filter(Boolean).length ? `<div class="xs muted mt6">From your evidence: ${q.evidence.filter(Boolean).map(esc).join(' · ')}</div>` : ''}
       ${q.resume_facts?.filter(Boolean).length ? `<div class="xs muted mt4">From your resume: ${q.resume_facts.filter(Boolean).map(esc).join(' · ')}</div>` : ''}

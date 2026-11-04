@@ -163,6 +163,27 @@ describe('job insights', () => {
     expect([...div.querySelectorAll('[data-act="ins-form-edit"]')].map(b => b.textContent)).toEqual(['Answer here', 'Review & save']);
   });
 
+  it('marks a draft adapted from the closest experience and re-drafts a waiting question on a click', async () => {
+    const form = { pending: false, max_questions: 20, from_form: [
+      { id: 'f1', question: 'Tell us about a full-stack project.', origin: 'FORM', status: 'DRAFTED', kind: 'GENERATED', basis: 'CLOSEST',
+        label: 'Draft from your closest experience — check it fits before you save', answer: 'I built payment services.', reason: 'From PROJ1; check the frontend part.' },
+      { id: 'f2', question: 'Describe a system you scaled.', origin: 'FORM', status: 'NEEDS_INPUT', kind: 'UNKNOWN', reason: 'Your saved data does not answer this' },
+      { id: 'f3', question: 'Do you require visa sponsorship?', origin: 'FORM', status: 'NEEDS_INPUT', kind: 'UNKNOWN', category: 'PERSONAL' }],
+      likely: [{ id: 'f4', question: 'Why Grab?', origin: 'PREDICTED', status: 'DRAFTED', kind: 'GENERATED', answer: 'Direct draft.' }] };
+    const div = panel('form', insights({ application_form: form }));
+    expect(div.textContent).toContain('Adapted draft');
+    expect(div.textContent).toContain('Draft from your closest experience — check it fits before you save');
+    expect(div.textContent.match(/closest experience/g).length, 'a direct draft carries no adapted warning').toBe(1);
+    expect([...div.querySelectorAll('[data-act="ins-form-redraft"]')].map(b => b.dataset.q), 'never for a personal or drafted question').toEqual(['f2']);
+
+    fetchMock.mockImplementation(async () => response(insights({ application_form: { ...form, pending: true } })));
+    await ui.A['ins-form-redraft']({ dataset: { id: '7', q: 'f2' } });
+    const [url, opt] = fetchMock.mock.calls.find(([u]) => u.includes('/draft'));
+    expect(url).toBe('/api/jobs/7/insights/application-questions/f2/draft');
+    expect(opt.method).toBe('POST');
+    expect(ui.D.insights[7].application_form.pending).toBe(true);
+  });
+
   it('saves a reviewed draft to the library as verified without leaving the job', async () => {
     const draft = { id: 'f4', question: 'Describe a reliable system you built.', origin: 'PREDICTED', status: 'DRAFTED', kind: 'GENERATED', answer: 'I built reliable payment services.' };
     const saved = insights({ application_form: { from_form: [], likely: [{ ...draft, status: 'LIBRARY', kind: 'FACT', answer: 'I built and ran reliable payment services.' }] } });

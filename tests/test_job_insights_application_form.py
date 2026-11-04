@@ -529,7 +529,7 @@ def test_a_question_waiting_in_the_library_still_gets_a_draft_and_saving_answers
         run_insights()
         item = by_question(job_id)[FULLSTACK]
         assert item["status"] == "DRAFTED" and item["answer"], "a waiting question is drafted, not left waiting"
-        assert item["label"] == application_form.CLOSEST_LABEL
+        assert item["label"] == application_form.CLOSEST_LABEL and item["basis"] == "CLOSEST"
         assert "check it covers a frontend" in item["reason"] and application_form.WAITING in item["reason"]
 
         out = client.post(f"/api/jobs/{job_id}/insights/application-questions/{item['id']}/save",
