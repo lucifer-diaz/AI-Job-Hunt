@@ -155,3 +155,9 @@ def test_undoing_a_correction_reads_the_resume_with_the_files_word(user, monkeyp
     again = client.post(f"/api/resumes/{resume_id}/corrections", json={"id": fixes["seCings"]["id"], "action": "keep"})
     assert bullet in bullets(again.json())
     assert client.post(f"/api/resumes/{resume_id}/corrections", json={"id": "nope", "action": "keep"}).status_code == 400
+
+
+def test_a_page_reading_more_than_two_edits_away_is_not_taken():
+    assert correction.correct("Strong prxgrxmmxng skills.", [("prxgrxmmxng", "programming")]) == []
+    assert correction._glyph_edits("kaga", "kafka") == 1 and correction._glyph_edits("acribuyon", "attribution") == 2
+    assert correction._glyph_edits("prxgrxmmxng", "programming") == 3

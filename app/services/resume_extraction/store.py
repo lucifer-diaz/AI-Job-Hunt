@@ -203,7 +203,8 @@ def _reread(db: Session, resume: Resume, row: ResumeExtraction) -> dict[str, Any
     db.flush()
     parsed = sr.parse_deterministic(row.parse_view, marked=True)
     if resume_parsing.untouched(db, resume, resume.revision or 0):
-        resume.structured_data = sr.materialize(parsed)
+        # A new revision: an AI parse queued against the old view is compared, never applied over this one.
+        rv._touch(resume, sr.materialize(parsed))
         resume.pending_reparse = None
         resume.parser, resume.parser_version = "deterministic", sr.PARSER_VERSION
         rv.record(db, resume, "*", "PARSE", "PARSER", new={"parser": resume.parser, "sections": "assigned"})

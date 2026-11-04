@@ -271,11 +271,26 @@ def _projects(infos: list[LineInfo]) -> list[str]:
 _CATEGORY = re.compile(r"^[^,:]{1,40}:\s")
 
 
+WRAP_FILL = 0.8  # a wrapped line fills its column: at least this share of the section's widest line
+
+
+def _wrapped(previous: LineInfo, widest: int) -> bool:
+    """Evidence that `previous` ran on into the next line: it ends with a list separator, or (a PDF line, never a
+    Word paragraph, which never wraps in the text) it fills the column. A comma inside a line is no such evidence:
+    "Python, Java" and "SQL, Go" are two rows."""
+    text = previous.text.rstrip()
+    if text.endswith(","):
+        return True
+    return previous.style is None and previous.x0 is not None and len(text) >= WRAP_FILL * widest
+
+
 def _skills(infos: list[LineInfo]) -> list[str]:
     """A table row "Category  ⟶  a, b, c" reads "Category: a, b, c"; a comma list a narrow column wrapped
-    ("Platform Strategy, Incident" / "Management, API Gateway") is one line again. A list with one skill per line has
-    no commas and stays as it is."""
+    ("Platform Strategy, Incident" / "Management, API Gateway") is one line again, when the layout shows the wrap
+    (`_wrapped`). A list with one skill per line has no commas and stays as it is."""
     out: list[str] = []
+    widest = max((len(i.text.rstrip()) for i in infos), default=0)
+    previous: LineInfo | None = None
     for info in infos:
         if not info.text.strip():
             continue
@@ -284,11 +299,13 @@ def _skills(infos: list[LineInfo]) -> list[str]:
             line = f"{info.segments[0]}: {info.segments[1]}"
         else:
             line = _text(info)
-        if out and "," in out[-1] and not out[-1].rstrip().endswith(".") and not _CATEGORY.match(line) \
-                and not _BULLET.match(line):
+        if out and previous is not None and "," in out[-1] and not out[-1].rstrip().endswith(".") \
+                and not _CATEGORY.match(line) and not _BULLET.match(line) and not previous.segments \
+                and _wrapped(previous, widest):
             out[-1] = f"{out[-1].rstrip()} {line}"
         else:
             out.append(line)
+        previous = info
     return out
 
 

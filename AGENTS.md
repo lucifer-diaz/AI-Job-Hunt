@@ -291,7 +291,7 @@ PDF when `RESUME_EXTRACTION_V2` is on. The rules a change has to keep:
   flags, never resume words.
 * **A correction needs evidence and is never silent** (`correction.correct`). Only an unknown or broken-looking word
   is touched — never one the dictionary or the resume vocabulary knows. Evidence is the page reading a known word at
-  the same place, within two characters, or a substitution the file uses on at least `MIN_RULE_WORDS` different
+  the same place, at most two glyphs apart (`_glyph_edits`: a ligature glyph reads as up to three letters), or a substitution the file uses on at least `MIN_RULE_WORDS` different
   unknown words (seed `lexicons/confusions.yaml`, or learnt from the page). Every change is a Correction on the record
   with its evidence; `Resume.raw_text` keeps the file's word and `store.clean_text` applies the corrections nobody
   undid (the view and grounding read it). A person keeps or undoes each; undo re-reads the resume.

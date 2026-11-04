@@ -4,8 +4,8 @@ A wrong correction is worse than a missed one, so:
 
     only unknown words    a word the dictionary or the resume vocabulary knows is never changed ("Python",
                           "Hybrid", "Analytics" stay, whatever a rule says about "y")
-    ocr                   the page shows a known word at the same place, close to the layer's (one or two
-                          characters apart): "Kaga" where the page reads "Kafka"
+    ocr                   the page shows a known word at the same place, close to the layer's (at most two glyphs
+                          apart, each read as up to three letters): "Kaga" where the page reads "Kafka"
     rule                  a substitution this file uses consistently: from the seed table (lexicons/confusions.yaml)
                           or from the OCR disagreements, accepted only when it turns at least MIN_RULE_WORDS different
                           unknown words into known ones, and applied only to words it makes known
@@ -26,7 +26,8 @@ from pathlib import Path
 from app.services.resume_extraction.quality import broken, familiar
 
 MIN_RULE_WORDS = 2
-MAX_OCR_EDIT = 2  # characters the page's reading may differ by (a ligature is one glyph for two letters)
+MAX_OCR_EDIT = 2  # glyphs the page's reading may differ by
+MAX_GLYPH_LETTERS = 3  # letters one glyph may stand for (a ligature: "ffi")
 _WORD = re.compile(r"[^\s|•·,;:/()\"“”]+")
 _EDGE = ".!?'’"
 
@@ -86,8 +87,24 @@ def _substitute(word: str, glyph: str, seq: str) -> str | None:
     return None
 
 
+def _glyph_edits(word: str, reading: str) -> int:
+    """How many glyphs of the layer's word the page reads differently. A glyph may stand for up to MAX_GLYPH_LETTERS
+    letters (a ligature drawn as one: "C" for "tt", "g" for "fk"), so "aCribuYon" → "attribution" is two, while
+    "prxgrxmmxng" → "programming" is three. A difference that spans more than one glyph of the layer counts as
+    too many."""
+    count = 0
+    for tag, i1, i2, j1, j2 in SequenceMatcher(None, word, reading, autojunk=False).get_opcodes():
+        if tag == "equal":
+            continue
+        if i2 - i1 > 1 or j2 - j1 > MAX_GLYPH_LETTERS:
+            return MAX_OCR_EDIT + 1
+        count += 1
+    return count
+
+
 def _close(word: str, reading: str) -> bool:
-    return abs(len(word) - len(reading)) <= MAX_OCR_EDIT and SequenceMatcher(None, word.lower(), reading.lower()).ratio() >= 0.6
+    """At most MAX_OCR_EDIT glyphs apart (`_glyph_edits`), the rest of the word the same."""
+    return _glyph_edits(word.lower(), reading.lower()) <= MAX_OCR_EDIT
 
 
 def _rule_from(word: str, reading: str) -> tuple[str, str] | None:

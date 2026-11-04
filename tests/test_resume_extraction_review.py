@@ -150,3 +150,19 @@ def test_learning_counts_choices_and_the_latest_wins_a_tie(user):
     other = make_user(SessionLocal)
     with _db(other) as db:
         assert store.learned(db, other) == {}, "never another account's choices"
+
+
+def test_a_section_choice_is_a_new_revision_so_an_ai_parse_of_the_old_view_is_only_compared(user):
+    from app.services import resume_parsing
+
+    detail = _upload()
+    with _db(user) as db:
+        before = db.get(Resume, detail["id"]).revision or 0
+        assert resume_parsing.untouched(db, db.get(Resume, detail["id"]), before)
+    line = RESUME.split("\n").index("SELECTED ENGAGEMENTS")
+    assert client.post(f"/api/resumes/{detail['id']}/sections", json={"line": line, "kind": "skills"}).json()[
+        "section_result"] == {"filled": True}
+    with _db(user) as db:
+        resume = db.get(Resume, detail["id"])
+        assert (resume.revision or 0) == before + 1
+        assert not resume_parsing.untouched(db, resume, before), "a parse queued before the choice must not overwrite it"

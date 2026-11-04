@@ -1,6 +1,6 @@
 """[I] How far each fact of a resume read with V2 can be trusted, from signals code can check. Never a model's word.
 
-    high     every value is in the file's text word for word, and nothing in it was corrected (or the page and a
+    high     every value is in the file's text word for word (symbols included: "C++" is not "C#"), and nothing in it was corrected (or the page and a
              rule agree on the correction, or the person kept it)
     medium   a correction backed by one kind of evidence plus the dictionary (the page, or a consistent rule); a skill
              normalized from its written form ("Apache Kafka" from "Kafka"), or kept through a known alias; a bullet
@@ -31,6 +31,20 @@ def _cap(level: str, at_most: str) -> str:
     return LEVELS[min(LEVELS.index(level), LEVELS.index(at_most))]
 
 
+_FOLD = str.maketrans({"“": '"', "”": '"', "‘": "'", "’": "'", "–": "-", "—": "-", "\u00a0": " "})
+
+
+def _fold(text: str) -> str:
+    """Case, quote and dash forms and spacing folded; every other symbol kept (C++, C#, .NET, 45%, $2M)."""
+    return " ".join(str(text or "").translate(_FOLD).lower().split())
+
+
+def _exact(folded: str, value: str) -> bool:
+    """The value is in the text as written, symbols included, not inside a longer word (trailing . ; , ignored)."""
+    needle = _fold(value).rstrip(".;,")
+    return bool(needle) and re.search(rf"(?<![\w+#]){re.escape(needle)}(?![\w+#])", folded) is not None
+
+
 def _values(unit: sr.Unit) -> list[tuple[str, str]]:
     """(field, value) for every textual value of a unit."""
     out = []
@@ -52,6 +66,7 @@ def assess(data: dict[str, Any] | None, raw_text: str, row) -> dict[str, dict[st
         return {}
     clean = store.clean_text(row, raw_text)
     src = Source(clean)
+    folded = _fold(clean)
     fixes = {_norm(c["corrected"]): c for c in row.corrections or [] if c.get("status") != "undone"}
     route = (row.quality or {}).get("route", "clean")
     out: dict[str, dict[str, Any]] = {}
@@ -73,6 +88,9 @@ def assess(data: dict[str, Any] | None, raw_text: str, row) -> dict[str, dict[st
                 reasons.append(f"{what}: {'the page shows it' if fix.get('method') == 'ocr' else 'a consistent substitution'}")
         for field, value in values:
             if src.has(value):
+                if not _exact(folded, value):  # "C++" against "C#": the words agree, the symbols do not
+                    level = _cap(level, "medium")
+                    reasons.append(f"“{value[:60]}” is in the text only with other symbols or punctuation")
                 continue
             if unit.kind == "skills" and unit.node.get("raw") and normalizes(unit.node["raw"], value):
                 level = _cap(level, "medium")

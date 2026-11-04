@@ -986,12 +986,15 @@ def _item_evidence(db: Session, user_id: int, exclude: set[int]) -> dict[str, li
     return out
 
 
-def _plain_lines(profile: CandidateProfile) -> list[dict[str, Any]]:
+def _plain_lines(profile: CandidateProfile, data: dict[str, Any] | None = None,
+                 allowed: tuple[str, ...] = WITH_UNVERIFIED) -> list[dict[str, Any]]:
     """The lines of a resume that has no parsed roles, as source highlights. Only used when the candidate's policy
-    allows unverified resume facts: nothing in them was verified."""
+    allows unverified resume facts: nothing in them was verified. With `data` (facts held back: hold_back_unconfident)
+    the lines come from that data's allowed units, so a held-back fact never returns as a highlight."""
     from app.services.resume_format import to_plain
 
-    lines = [line.strip(" -*\t") for line in to_plain(profile.master_resume or "").splitlines()]
+    document = sr.render_document(_filtered(data, allowed)) if data is not None else profile.master_resume or ""
+    lines = [line.strip(" -*\t") for line in to_plain(document).splitlines()]
     return [{"text": line} for line in dict.fromkeys(lines) if len(line) > 20][:15]
 
 
@@ -1178,7 +1181,8 @@ def build_tailoring_context(db: Session, profile: CandidateProfile, job: Job, pl
     unstructured = not context.roles and policy["allow_unverified_resume_facts"]
     context.source_resume = source_resume(context, _item_evidence(db, profile.user_id,
                                                                   {e["id"] for e in context.excluded_evidence}),
-                                          _plain_lines(profile) if unstructured else None)
+                                          _plain_lines(profile, data if context.held_back_facts else None)
+                                          if unstructured else None)
     _attach_targets(db, profile, job, context)
     validate_tailoring_context(context, len(parse_resume(profile.master_resume or "").roles))
     _measure(context, rv.raw_text(profile), every, job)

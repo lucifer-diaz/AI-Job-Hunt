@@ -107,7 +107,7 @@ def test_bullets_without_a_character_split_where_sentences_end():
 
 
 def test_wrapped_headers_skill_lists_and_projects_are_one_line_again():
-    doc = [LineInfo(text=t) for t in (
+    doc = [LineInfo(text=t, x0=72.0) for t in (
         "Skills", "Engineering Leadership,", "Platform Strategy, Incident", "Management, Go",
         "Experience", "Staff Engineer | Wingtip | Boulder, CO | Sep 2014", "– Mar 2019", "- Built the order engine.",
         "Projects", "Pipeline Lint", "Open source linter for CI files with 1,200", "GitHub stars.")]
@@ -264,3 +264,11 @@ def test_a_heading_naming_two_sections_is_placed_by_its_lines(heading, body, kin
                                                   (body, 7))]
     found = [(h.kind, h.method) for h in sections.detect(doc) if h.text == heading]
     assert found == [(kind, "keyword")], "still a guess the person sees"
+
+
+def test_separate_skill_rows_are_never_joined_without_evidence_of_a_wrap():
+    for look in ({"style": "Normal"}, {"x0": 72.0}):  # Word paragraphs; short PDF rows that do not fill the column
+        doc = [LineInfo(text="Skills"), LineInfo(text="Python, Java", **look), LineInfo(text="SQL, Go", **look),
+               LineInfo(text="Kubernetes, Terraform, AWS Lambda", **look)]
+        names = [s["name"] for s in parse_deterministic(structure.view(doc))["skills"]]
+        assert {"Java", "SQL", "Go"} <= set(names) and "Java SQL" not in names, look

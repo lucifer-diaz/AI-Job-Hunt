@@ -127,3 +127,10 @@ def test_a_version_read_without_v2_has_no_confidence(user):
     detail = _upload(user, v2=False)
     assert detail["confidence"] == {}
     assert client.post(f"/api/resumes/{detail['id']}/verify-confident").json()["verified"] == 0
+
+
+def test_a_value_that_matches_only_without_its_symbols_is_not_high():
+    text = TEXT.replace("Kafka, K8s, Python", "Kafka, K8s, Python, C#")
+    by = levels(data(skills=[{"name": "C++"}, {"name": "C#"}]), text)
+    assert by["C#"]["level"] == "high"
+    assert by["C++"]["level"] == "medium" and "other symbols" in by["C++"]["reasons"][0]

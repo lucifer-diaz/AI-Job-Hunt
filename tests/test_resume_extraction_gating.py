@@ -156,3 +156,22 @@ def test_mcp_tailoring_and_review_context_name_what_is_held_back(user, monkeypat
         view = rv.selected(db, profile_for(db))
         out = tools._held_back(db, view)
         assert [f["text"] for f in out["held_back_facts"]] == [LOW] and out["held_back_note"]
+
+
+def test_a_held_back_fact_never_returns_as_a_highlight_of_a_resume_without_roles(user, monkeypatch):
+    from tests.conftest import COMPLETED_FIT_ANALYSIS
+
+    summary = "Platform engineer who builds event systems on Kafka and Python."
+    text = f"Alex Rivera\nalex@example.test\nSummary\n{summary}\nSkills\nKafka, Python\n"
+    with session(user) as db:
+        worker_settings.update(db, user, {"resume_parsing": {"extraction_v2": True}})
+    client.post("/api/profile/resume", files={"file": ("cv.txt", io.BytesIO(text.encode()), "text/plain")})
+    rate_low(monkeypatch, summary)
+    job_id = add_job(user)
+    with session(user) as db:
+        db.get(Job, job_id).fit_analysis = COMPLETED_FIT_ANALYSIS
+        db.commit()
+        context = cb.build_tailoring_context(db, profile_for(db), db.get(Job, job_id))
+        assert summary in {f["text"] for f in context.held_back_facts}
+        highlights = [h["text"] for h in context.source_resume.get("highlights") or []]
+        assert all("event systems" not in h for h in highlights), highlights
