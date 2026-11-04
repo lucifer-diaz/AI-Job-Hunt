@@ -5,6 +5,7 @@
     python scripts/agent_eval.py --report docs/evals/phase7-report.md   # also write the Markdown report
     python scripts/agent_eval.py --json                   # every metric, gate and failing case
     python scripts/agent_eval.py --jsonl                  # the cases as LangSmith Examples, for a manual import
+    python scripts/agent_eval.py --suite resume_extraction --with-real-resumes   # also your own resumes (real/)
 
 Exits 0 only when every gate passes (PASS); 1 when any is BLOCKED. Suites needing a database run in a throwaway
 SQLite file (never DATABASE_URL); providers are mocked and LangSmith export is off, so nothing is sent anywhere.
@@ -69,6 +70,9 @@ def main() -> int:
     parser.add_argument("--report")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--jsonl", action="store_true")
+    parser.add_argument("--with-real-resumes", action="store_true",
+                        help="resume_extraction: also score tests/fixtures/resume_extraction/real/ (gitignored)")
+    parser.add_argument("--resume-pipeline", default="current", help="resume_extraction: the pipeline to score")
     args = parser.parse_args()
     workdir = tempfile.mkdtemp(prefix="agent-eval-")
     os.environ.update({"DATABASE_URL": f"sqlite:///{workdir}/eval.db", "LLM_PROVIDER": "mock",
@@ -86,7 +90,7 @@ def main() -> int:
     if args.jsonl:
         print("\n".join(report.jsonl(names)))
         return 0
-    ctx = {}
+    ctx = {"real_resumes": args.with_real_resumes, "resume_pipeline": args.resume_pipeline}
     if "ats_answers" in names:
         ctx["resolve"] = _answer_resolver(dataset_for("ats_answers").fixture)
     results = suites.run(names, ctx)

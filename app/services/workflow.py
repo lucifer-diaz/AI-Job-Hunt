@@ -121,6 +121,7 @@ def tailor_job(db: Session, job: Job, progress: Progress = _no_progress, pages: 
     content["context"] = {**context.resume, **context.stats.as_dict(), "evidence_ids": sorted(context.evidence_ids),
                           "context_builder_version": context.call_stats()["context_builder_version"],
                           "excluded_evidence": context.excluded_evidence,
+                          "held_back_facts": [{"id": f["id"], "level": f["level"]} for f in context.held_back_facts],
                           "fit_analysis": {"ranking_id": context.fit_analysis.get("ranking_id"),
                                            "ranking_version": context.fit_analysis.get("ranking_version")},
                           "allow_unverified_resume_facts": context.policy.get("allow_unverified_resume_facts", False)}

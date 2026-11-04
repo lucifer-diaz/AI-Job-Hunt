@@ -2860,6 +2860,41 @@ English words (a bundled word list, `app/services/data/`), and replaces only wor
 back unchanged; a glyph that came out as an ordinary letter cannot be detected. Upload a file again to get a repaired
 version of a resume read before this existed.
 
+With the new reader on (Settings → Resumes → "Read PDF uploads with the new reader", per account; an account that never
+chose follows the server's `RESUME_EXTRACTION_V2`, off by default; job description files follow the server) a PDF is
+read by `app/services/resume_extraction/` instead: PDFium
+(`pypdfium2`) rather than pypdf, because PDFium honours the `/ActualText` that producers such as Apple Pages write
+beside a ligature glyph whose mapping is broken, so "Kafka" no longer reads "Kaga". Lines are rebuilt from the
+characters' positions (each word keeps its page, box and font for later stages), a word a line break split is joined
+only when the joined word is known and its halves are not ("optimiza-" / "tion"; "real-" / "time" keeps its hyphen),
+and only artefact characters are normalised (ligature and full-width forms, odd spaces; never NFKC, which would turn
+"m²" into "m2"). A quality report routes each file `clean`, `suspicious`, `poor` or `no_text` from counts alone
+(unknown lower-case words, broken-glyph suspects, unmapped characters). The glyph repair above still runs after it.
+A Word document is read with its tables and list bullets too. Then each section's heading is found (a synonym table —
+Core Skills, Areas of Expertise, Tech Stack, Career History… —, keywords, and the document's own heading style, so a
+bold role title is never a section; an unknown heading starts its own section instead of running on into the one
+before), and roles are assembled from common layouts (employer line then title line, several roles under one
+employer). The result is a *parse view* the regex parser reads, kept with the version in `resume_extractions` with the
+quality report and the section map; the stored text stays what the file says. In Settings → Resumes → Review, "How
+it was read" lists each heading as the file writes it with the section it was put in (Known, Guess, Choose, Yours);
+picking another section reads the resume again with it (filled while nothing is reviewed, else a comparison), a
+heading no table could place must be assigned before the resume can be verified, and each choice is remembered for
+the account's next uploads. The AI structuring of such a resume reads the marked view (prompt v7): a skill it
+normalizes keeps how the resume writes it ("Apache Kafka · written “Kafka”"), and anything it proposes that the text
+does not contain is no longer dropped silently but listed under "Held back for review", to add or discard.
+A PDF whose text layer the quality report flags (a font that maps "fk" to "g", so "Kafka" reads "Kaga") is also read
+from its rendered pages with Tesseract, locally and within a time limit (`RESUME_OCR_*`; the Docker image installs it
+unless `INSTALL_OCR=false`). A word is corrected only with evidence — the page shows a known word there, or one
+substitution explains several unknown words — never a word the dictionary knows. Corrections are listed as
+"Kaga → Kafka" with their evidence in "How it was read", where each can be kept or undone; the file's own text is
+kept. Each fact of such a resume has a confidence computed from the same evidence (high: in the file's text word for
+word, nothing corrected); a fact rated lower is marked Check or Low with the reasons in its tooltip, and "Accept N
+high-confidence" verifies the high ones in one click. Only verified facts are used in tailored applications;
+if you allow unverified resume facts in the candidate policy, an unverified fact of a resume read this way is used
+only when it is rated high, and the others are held back (the reviewer and Claude Desktop are told which).
+Measure any change with `python scripts/agent_eval.py --suite resume_extraction --resume-pipeline v2`
+(`docs/resume-extraction-plan.md`, `docs/evals/`).
+
 ### AI structuring of uploads
 
 The regex parser structures an upload at once, but it guesses at layouts (a header that names the employer before the

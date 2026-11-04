@@ -28,6 +28,10 @@ from app.prompts.contracts import EvidenceExtractionResult, ResumeParserOutput, 
 # titles at one employer, and two-column PDF text; every value copied as written, since code checks it against the text.
 RESUME_PARSER_PROMPT_VERSION = "v6"
 RESUME_PARSER_MARKER = "PARSE_RESUME"
+# v7: the variant for a resume read with resume extraction V2 (its parse view): sections and roles come marked, words
+# are copied exactly (no "fixing" a word the text does not contain: it is held back for review), and a normalized skill
+# names how the resume writes it (`raw`). Resumes read without V2 keep v6, byte for byte.
+RESUME_PARSER_V2_PROMPT_VERSION = "v7"
 # v2: typed output contract; a claim keeps the employer and role it sits under in the resume, never another one.
 EVIDENCE_EXTRACTION_PROMPT_VERSION = "v2"
 EVIDENCE_EXTRACTION_MARKER = "EXTRACT_EVIDENCE"
@@ -53,16 +57,7 @@ STRUCTURED_RESUME_TEMPLATE: dict[str, Any] = {
     "additional_information": [],
 }
 
-RESUME_PARSER_SYSTEM = instructions(
-    "You are a resume parser. Convert RESUME TEXT into structured JSON. You extract; you never improve, rewrite, "
-    "summarize or embellish, and you never infer what the resume does not state.",
-    UNTRUSTED_DATA_RULE,
-    NO_INVENTION_RULE + " Never add work authorization, salary or visa information. Missing values are null, an "
-    "empty string or an empty list.",
-    'Return one JSON object: {"structured_resume": {...}} using exactly this schema (a list holding one object '
-    "shows the shape of each item; return as many items as the resume supports, or an empty list):\n"
-    + json.dumps(STRUCTURED_RESUME_TEMPLATE, separators=(",", ":")),
-    """RULES
+_RESUME_PARSER_RULES = """RULES
 Dates: YYYY-MM when the text allows it (Oct 2025 -> 2025-10, Present -> null with "is_current": true). Always copy
   the original into raw_start_date / raw_end_date. Never guess a missing month or year: leave the normalized field
   null.
@@ -85,9 +80,48 @@ Education: institution is the school or college attended; university is the degr
   the resume names one separately (an affiliated college), otherwise null. grade is the GPA, CGPA, percentage or
   class exactly as written (8.2/10 CGPA, First Class), or null.
 Cleanup: drop duplicate bullets caused by PDF extraction, and fix only obvious character corruption
+  (quali[ication -> qualification, Ka[ka -> Kafka, Educa7on -> Education)."""
+
+
+def _parser_system(template: dict[str, Any], rules: str) -> str:
+    return instructions(
+        "You are a resume parser. Convert RESUME TEXT into structured JSON. You extract; you never improve, rewrite, "
+        "summarize or embellish, and you never infer what the resume does not state.",
+        UNTRUSTED_DATA_RULE,
+        NO_INVENTION_RULE + " Never add work authorization, salary or visa information. Missing values are null, an "
+        "empty string or an empty list.",
+        'Return one JSON object: {"structured_resume": {...}} using exactly this schema (a list holding one object '
+        "shows the shape of each item; return as many items as the resume supports, or an empty list):\n"
+        + json.dumps(template, separators=(",", ":")),
+        rules,
+        JSON_ONLY_RULE,
+    )
+
+
+RESUME_PARSER_SYSTEM = _parser_system(STRUCTURED_RESUME_TEMPLATE, _RESUME_PARSER_RULES)
+
+# The V2 variant (RESUME_PARSER_V2_PROMPT_VERSION): the reader already found the structure and repaired what it could
+# prove, so the model keeps the marked structure and copies; a skill it normalizes names its written form.
+_V2_TEMPLATE = {**STRUCTURED_RESUME_TEMPLATE, "skills": [{"name": None, "raw": None, "category": None}]}
+_V2_RULES = _RESUME_PARSER_RULES.replace(
+    """Cleanup: drop duplicate bullets caused by PDF extraction, and fix only obvious character corruption
   (quali[ication -> qualification, Ka[ka -> Kafka, Educa7on -> Education).""",
-    JSON_ONLY_RULE,
-)
+    """Structure: the text was read by a layout-aware reader. "## <Section>" starts a section, "### Title | Company |
+  Location | Dates" is one role, "- " starts a bullet, "Name: description" is one project. Keep every line in the
+  section and role it is marked under; do not move lines between them.
+Copy exactly, even a word that looks misread: the reader already repaired what it could prove. A value you change
+  is not in the text, so it is not used; it is shown to the person instead.
+Skills: when name is a normalized form (K8s -> Kubernetes, Kafka -> Apache Kafka), set raw to the skill exactly as
+  the resume writes it; otherwise raw is null.""")
+
+
+def _require_v2_rules() -> None:
+    if _V2_RULES == _RESUME_PARSER_RULES:  # the replaced rule changed wording: the variant would silently be v6
+        raise RuntimeError("resume parser V2 rules did not apply")
+
+
+_require_v2_rules()
+RESUME_PARSER_V2_SYSTEM = _parser_system(_V2_TEMPLATE, _V2_RULES)
 
 EVIDENCE_EXTRACTION_SYSTEM = instructions(
     "You extract concrete, factual achievement claims from the resume. You extract; you never improve, merge or "
@@ -101,8 +135,12 @@ EVIDENCE_EXTRACTION_SYSTEM = instructions(
 )
 
 
-def build_resume_parser_prompt(resume_text: str) -> Prompt:
+def build_resume_parser_prompt(resume_text: str, *, marked: bool = False) -> Prompt:
+    """`marked`: resume_text is a parse view (resume extraction V2); the v7 variant reads it."""
     user = user_message(RESUME_PARSER_MARKER, untrusted("RESUME TEXT", "untrusted_resume", resume_text, limit=40000))
+    if marked:
+        return Prompt("resume_parser", RESUME_PARSER_V2_PROMPT_VERSION, RESUME_PARSER_MARKER, RESUME_PARSER_V2_SYSTEM,
+                      user, ResumeParserOutput)
     return Prompt("resume_parser", RESUME_PARSER_PROMPT_VERSION, RESUME_PARSER_MARKER, RESUME_PARSER_SYSTEM, user,
                   ResumeParserOutput)
 

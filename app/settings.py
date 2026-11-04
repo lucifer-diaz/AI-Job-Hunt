@@ -230,6 +230,19 @@ class Settings(BaseSettings):
     # RESUME_PARSE_GRAPH_MODE: on (default; each task runs as a LangGraph thread, app.agents.resume_parsing, when
     # AGENT_GRAPHS_ENABLED and PostgreSQL allow it) or off (the same steps run in sequence without a graph).
     resume_parse_graph_mode: str = "on"
+    # RESUME_EXTRACTION_V2: read uploaded PDFs and Word documents with app.services.resume_extraction (PDFium, which
+    # honours the /ActualText some producers write for ligature glyphs; Word tables and list bullets; section headings
+    # and a structure-marked parse view; a quality report) instead of pypdf / paragraphs only. Off by default; off, extraction is exactly as before. The server's default: an account can choose for its
+    # own resume uploads (worker setting resume_parsing.extraction_v2, Settings → Resumes). Job description files
+    # follow this value.
+    resume_extraction_v2: bool = False
+    # OCR for resume extraction V2 (app.services.resume_extraction.ocr): only for a PDF the quality report flags, on
+    # this machine (Tesseract's own binary; nothing leaves the server), bounded so an upload never waits long. Without
+    # the engine installed, corrections fall back to consistent substitution rules alone.
+    resume_ocr_enabled: bool = True
+    resume_ocr_backend: str = "tesseract"
+    resume_ocr_max_pages: int = 4
+    resume_ocr_timeout_seconds: int = 20
     # Re-rank qualified jobs once their description has been parsed. Off by default: parsing a backlog would
     # otherwise start a round of ranking calls.
     jd_rerank_after_parse: bool = False

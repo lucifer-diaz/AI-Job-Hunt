@@ -7,6 +7,7 @@ __pycache__/
 .ruff_cache/
 .DS_Store
 data/resumes/
+data/real/
 data/packets/
 node_modules/
 coverage/

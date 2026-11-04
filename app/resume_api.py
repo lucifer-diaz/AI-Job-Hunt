@@ -20,6 +20,7 @@ from app.auth import get_user_db
 from app.models import Resume, ResumeDocument, SavedSearch
 from app.services import resume_matching, resume_parsing
 from app.services import resume_verification as rv
+from app.services.resume_extraction import store as extraction_store
 from app.services.structured_resume import SECTION_LABELS, StructuredResumeIn
 from app.services.user_settings import (
     CANDIDATE_POLICY_DEFAULTS,
@@ -94,7 +95,11 @@ def detail(resume: Resume) -> dict:
     return {**summary(resume), "structured": resume.structured_data, "progress": rv.progress(resume.structured_data),
             "pending_reparse": resume.pending_reparse, "sections": SECTION_LABELS,
             # The latest AI structuring of this version (app.services.resume_parsing): status and counts only.
-            "ai_parse": resume_parsing.status_of(db, resume.id) if db is not None else None}
+            "ai_parse": resume_parsing.status_of(db, resume.id) if db is not None else None,
+            # How its file was read (resume extraction V2): quality route and the sections found; None = unknown.
+            "extraction": extraction_store.summary(db, resume.id) if db is not None else None,
+            # Each fact's confidence and why ({} for a version read without V2): orders review, never verifies.
+            "confidence": rv.confidence(db, resume) if db is not None else {}}
 
 
 def _commit(db: Session, resume: Resume) -> dict:
@@ -151,7 +156,8 @@ def settings_resume(resume_id: int | None = Query(None), db: Session = Depends(g
             "current": detail(current) if current else None,
             "versions": [_card(v, files, setups.get(v.id, []) + (setups.get(None, []) if v.is_active else []))
                          for v in all_versions],
-            "policy": candidate_policy(db), "ai_only": resume_parsing.ai_only(db, profile.user_id)}
+            "policy": candidate_policy(db), "ai_only": resume_parsing.ai_only(db, profile.user_id),
+            "extraction_v2": resume_parsing.extraction_v2(db, profile.user_id)}
 
 
 @router.put("/api/settings/resume/policy")
@@ -192,6 +198,14 @@ def verify(resume_id: int, db: Session = Depends(get_user_db)):
         db.rollback()
         raise HTTPException(422, {"message": str(exc), "blocking": exc.blocking}) from exc
     return _commit(db, resume)
+
+
+@router.post("/api/resumes/{resume_id}/verify-confident")
+def verify_confident(resume_id: int, db: Session = Depends(get_user_db)):
+    """Accept every unverified fact whose confidence is high, at the person's request."""
+    resume = _resume(db, resume_id)
+    count = rv.verify_confident(db, resume)
+    return {**_commit(db, resume), "verified": count}
 
 
 @router.post("/api/resumes/{resume_id}/verify-item")
@@ -243,6 +257,58 @@ def original(resume_id: int, db: Session = Depends(get_user_db)):
         raise HTTPException(404, "The original file is not available for this version")
     return FileResponse(resume.source_storage_path, media_type=resume.source_media_type or "application/octet-stream",
                         filename=resume.source_filename or f"resume-v{resume.version}")
+
+
+class SectionAssignIn(BaseModel):
+    line: int = Field(ge=0)
+    kind: str = Field(max_length=40)
+
+
+@router.post("/api/resumes/{resume_id}/sections")
+def assign_section(resume_id: int, payload: SectionAssignIn, db: Session = Depends(get_user_db)):
+    """Put a heading the reader found in a section (or say it is none): the data is re-read with it."""
+    resume = _resume(db, resume_id)
+    try:
+        out = extraction_store.assign(db, resume, payload.line, payload.kind)
+    except extraction_store.UnknownHeading as exc:
+        db.rollback()
+        raise HTTPException(400, str(exc)) from exc
+    return {**_commit(db, resume), "section_result": out}
+
+
+class ReviewActionIn(BaseModel):
+    id: str = Field(max_length=40)
+    action: str = Field(pattern="^(add|discard)$")
+
+
+@router.post("/api/resumes/{resume_id}/review")
+def review_value(resume_id: int, payload: ReviewActionIn, db: Session = Depends(get_user_db)):
+    """A value the AI parse proposed but the resume's text does not contain: add it (your change, unverified) or
+    discard it."""
+    resume = _resume(db, resume_id)
+    try:
+        out = extraction_store.review_action(db, resume, payload.id, payload.action)
+    except (extraction_store.ReviewItemError, rv.ResumeConflict) as exc:
+        db.rollback()
+        raise HTTPException(400, str(exc)) from exc
+    return {**_commit(db, resume), "review_result": out}
+
+
+class CorrectionActionIn(BaseModel):
+    id: str = Field(max_length=40)
+    action: str = Field(pattern="^(keep|undo)$")
+
+
+@router.post("/api/resumes/{resume_id}/corrections")
+def correction_action(resume_id: int, payload: CorrectionActionIn, db: Session = Depends(get_user_db)):
+    """Keep a correction the reader made, or undo it (the word as the file has it comes back; the resume is re-read)."""
+    resume = _resume(db, resume_id)
+    try:
+        out = extraction_store.correction_action(db, resume, payload.id, payload.action)
+    except extraction_store.ReviewItemError as exc:
+        db.rollback()
+        raise HTTPException(400, str(exc)) from exc
+    return {**_commit(db, resume), "correction_result": out}
 
 
 @router.post("/api/resumes/{resume_id}/reparse")

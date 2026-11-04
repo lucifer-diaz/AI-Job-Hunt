@@ -9,6 +9,7 @@ beautifulsoup4>=4.13,<5
 jinja2>=3.1,<4
 python-multipart>=0.0.20,<1
 pypdf>=5.0,<7
+pypdfium2>=4.30,<6
 python-docx>=1.1,<2
 openai>=2.0,<3
 anthropic>=0.67,<1

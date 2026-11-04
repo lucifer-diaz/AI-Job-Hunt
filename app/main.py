@@ -93,6 +93,7 @@ from app.services import (
     mcp_tokens,
     preparation,
     ranker,
+    resume_parsing,
     resume_verification,
     server_settings,
     tailor_tasks,
@@ -974,8 +975,18 @@ async def resume_upload(file: UploadFile = File(...), db: Session = Depends(get_
         raise HTTPException(413, f"Resume exceeds {settings.max_resume_upload_mb} MB")
     if not data:
         raise HTTPException(400, "Resume is empty")
+    extraction = None  # how the file was read, recorded with its version (resume extraction V2)
     try:
-        extracted = document_text.extract(file.content_type, data)
+        if resume_parsing.extraction_v2(db, require_user_id(db)):
+            from app.services.resume_extraction import pipeline
+
+            from app.services.resume_extraction import store as extraction_store
+
+            extraction = pipeline.extract(file.content_type, data,
+                                          learned=extraction_store.learned(db, require_user_id(db)))
+            extracted = extraction.text
+        else:
+            extracted = document_text.extract(file.content_type, data, v2=False)
     except Exception as exc:
         raise HTTPException(422, f"Could not read resume: {exc}") from exc
     extracted = clean_raw_text(extracted)
@@ -999,7 +1010,8 @@ async def resume_upload(file: UploadFile = File(...), db: Session = Depends(get_
     db.flush()
     # A new resume version (or the existing one for this exact file), parsed and unverified until reviewed. It does
     # not replace the active resume: only the account's first resume becomes active by itself.
-    version = resume_verification.record_version(db, profile, extracted, document=document, source="upload")
+    version = resume_verification.record_version(db, profile, extracted, document=document, source="upload",
+                                                 extraction=extraction)
     db.commit()
     db.refresh(document)
     return {"id": document.id, "filename": document.original_filename, "size": document.size,

@@ -1,0 +1,29 @@
+Benedikt Okafor
+Machine Learning Engineer
+Austin, TX | ben.okafor@example.test | +1 512 555 0199 | https://github.example.test/bokafor
+
+Profile
+Machine learning engineer focused on retrieval, ranking and model optimization for search products. Comfortable from notebook to production, with a track record of shipping efficient inference services.
+
+Core Skills
+Python, PyTorch, scikit-learn, Apache Kafka, Ray, FastAPI, Docker, GCP, Vertex AI, Quillmark
+
+Work History
+Machine Learning Engineer | Tailspin Search | Austin, TX | Aug 2020 – Present
+• Built a hybrid retrieval pipeline combining BM25 and dense embeddings that lifted click-through by 9%.
+• Cut inference latency by 43% through quantization and batching optimization in PyTorch.
+• Owned the feature store migration to Kafka and Feast, retiring 3 legacy services.
+• Defined the offline evaluation workflow used for every ranking experiment.
+
+Data Scientist | Litware Insurance | Dallas, TX | Jul 2017 – Jul 2020
+• Trained gradient boosting models for claims triage, saving $2.1M annually in manual review.
+• Partnered with actuarial teams to productionize risk scoring with FastAPI on GCP.
+• Presented quarterly analytics findings to executives and drove adoption of A/B testing.
+
+
+Education
+M.S. Statistics | Riverbend University | 2015 – 2017
+B.S. Mathematics | Riverbend University | 2011 – 2015
+
+Licenses & Certifications
+Google Professional Machine Learning Engineer | Google Cloud | 2023

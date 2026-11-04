@@ -1,0 +1,140 @@
+{
+ "_comment": "Hand-written synthetic resumes: the ground truth of the resume_extraction suite. Every person, employer, school, address and link is invented (example.test). scripts/build_resume_fixtures.py renders each one to the documents under documents/; the suite holds every extraction to these values. Words are chosen to exercise ligature glyphs (ti, tf, fk, ft, tt, fi, fl), words that must never be 'corrected' (Python, Hybrid, Analytics, Gateway, PyTorch, YAML, BigQuery) and terms no lexicon knows (recognized: false), which must never be dropped.",
+ "resumes": {
+  "ana": {
+   "name": "Ana Whitfield",
+   "headline": "Senior Data Platform Engineer",
+   "contact": ["Seattle, WA", "ana.whitfield@example.test", "+1 206 555 0142", "https://linkedin.example.test/in/anawhitfield"],
+   "headings": {"summary": "Summary", "skills": "Skills", "experience": "Experience", "education": "Education", "certifications": "Certifications"},
+   "order": ["summary", "skills", "experience", "education", "certifications"],
+   "summary": "Data platform engineer with nine years of experience building streaming pipelines, workflow automation and analytics platforms. Led the digital transformation of batch reporting into real-time Kafka services with a focus on reliability and cost optimization.",
+   "skills": [
+    {"category": "Languages", "items": [{"name": "Python"}, {"name": "Scala"}, {"name": "SQL"}, {"name": "TypeScript"}]},
+    {"category": "Data", "items": [{"name": "Apache Kafka"}, {"name": "Airflow"}, {"name": "dbt"}, {"name": "BigQuery"}, {"name": "Snowflake"}]},
+    {"category": "Platform", "items": [{"name": "Kubernetes"}, {"name": "Terraform"}, {"name": "AWS"}, {"name": "Fluxgate", "recognized": false}]}
+   ],
+   "experience": [
+    {"title": "Senior Data Platform Engineer", "company": "Northwind Logistics", "location": "Seattle, WA", "dates": "Jan 2021 – Present", "start": "2021-01", "end": null,
+     "bullets": [
+      "Architected a Kafka streaming platform that processes 4 billion events per day with 99.95% availability.",
+      "Led the transformation of nightly batch jobs into real-time workflows, cutting reporting latency from 6 hours to 4 minutes.",
+      "Built a self-service data quality framework in Python adopted by 14 product teams.",
+      "Reduced cloud infrastructure cost by 31% through storage optimization and right-sizing Kubernetes clusters."
+     ]},
+    {"title": "Data Engineer", "company": "Fabrikam Health", "location": "Portland, OR", "dates": "Mar 2017 – Dec 2020", "start": "2017-03", "end": "2020-12",
+     "bullets": [
+      "Designed HIPAA-compliant ingestion pipelines for clinical analytics using Airflow and dbt.",
+      "Migrated 300 legacy ETL scripts to a hybrid cloud platform with automated testing.",
+      "Mentored 5 engineers and ran the internal data engineering certification program."
+     ]},
+    {"title": "Software Engineer", "company": "Contoso Retail", "location": "Boise, ID", "dates": "Jun 2015 – Feb 2017", "start": "2015-06", "end": "2017-02",
+     "bullets": [
+      "Shipped inventory forecasting services in Scala that improved stock efficiency by 12%.",
+      "Wrote the affiliate attribution service handling 2 million clicks per day."
+     ]}
+   ],
+   "education": [
+    {"degree": "B.S. Computer Science", "institution": "University of Lakeshore", "dates": "2011 – 2015"}
+   ],
+   "certifications": [
+    {"name": "AWS Certified Data Analytics – Specialty", "issuer": "Amazon Web Services", "date": "2022"},
+    {"name": "Certified Kubernetes Administrator", "issuer": "Cloud Native Computing Foundation", "date": "2021"}
+   ]
+  },
+  "ben": {
+   "name": "Benedikt Okafor",
+   "headline": "Machine Learning Engineer",
+   "contact": ["Austin, TX", "ben.okafor@example.test", "+1 512 555 0199", "https://github.example.test/bokafor"],
+   "headings": {"summary": "Profile", "skills": "Core Skills", "experience": "Work History", "education": "Education", "certifications": "Licenses & Certifications"},
+   "order": ["summary", "skills", "experience", "education", "certifications"],
+   "summary": "Machine learning engineer focused on retrieval, ranking and model optimization for search products. Comfortable from notebook to production, with a track record of shipping efficient inference services.",
+   "skills": [
+    {"category": "", "items": [{"name": "Python"}, {"name": "PyTorch"}, {"name": "scikit-learn"}, {"name": "Apache Kafka"}, {"name": "Ray"}, {"name": "FastAPI"}, {"name": "Docker"}, {"name": "GCP"}, {"name": "Vertex AI"}, {"name": "Quillmark", "recognized": false}]}
+   ],
+   "experience": [
+    {"title": "Machine Learning Engineer", "company": "Tailspin Search", "location": "Austin, TX", "dates": "Aug 2020 – Present", "start": "2020-08", "end": null,
+     "bullets": [
+      "Built a hybrid retrieval pipeline combining BM25 and dense embeddings that lifted click-through by 9%.",
+      "Cut inference latency by 43% through quantization and batching optimization in PyTorch.",
+      "Owned the feature store migration to Kafka and Feast, retiring 3 legacy services.",
+      "Defined the offline evaluation workflow used for every ranking experiment."
+     ]},
+    {"title": "Data Scientist", "company": "Litware Insurance", "location": "Dallas, TX", "dates": "Jul 2017 – Jul 2020", "start": "2017-07", "end": "2020-07",
+     "bullets": [
+      "Trained gradient boosting models for claims triage, saving $2.1M annually in manual review.",
+      "Partnered with actuarial teams to productionize risk scoring with FastAPI on GCP.",
+      "Presented quarterly analytics findings to executives and drove adoption of A/B testing."
+     ]}
+   ],
+   "education": [
+    {"degree": "M.S. Statistics", "institution": "Riverbend University", "dates": "2015 – 2017"},
+    {"degree": "B.S. Mathematics", "institution": "Riverbend University", "dates": "2011 – 2015"}
+   ],
+   "certifications": [
+    {"name": "Google Professional Machine Learning Engineer", "issuer": "Google Cloud", "date": "2023"}
+   ]
+  },
+  "chloe": {
+   "name": "Chloe Fitzgerald",
+   "headline": "Engineering Manager, Platform",
+   "contact": ["Denver, CO", "chloe.fitzgerald@example.test", "+1 720 555 0117", "https://chloefitz.example.test"],
+   "headings": {"summary": "About", "skills": "Areas of Expertise", "experience": "Career History", "education": "Academic Background", "projects": "Selected Projects"},
+   "order": ["summary", "skills", "experience", "projects", "education"],
+   "summary": "Engineering manager who builds platform teams and the internal tooling they rely on. Known for attention to developer experience, pragmatic architecture and calm incident leadership.",
+   "skills": [
+    {"category": "", "items": [{"name": "Engineering Leadership"}, {"name": "Platform Strategy"}, {"name": "Incident Management"}, {"name": "API Gateway Design"}, {"name": "Go"}, {"name": "Kubernetes"}, {"name": "Terraform"}, {"name": "Tessellate DSL", "recognized": false}]}
+   ],
+   "experience": [
+    {"title": "Engineering Manager, Platform", "company": "Adatum Cloud", "location": "Denver, CO", "dates": "Apr 2019 – Present", "start": "2019-04", "end": null,
+     "bullets": [
+      "Grew the platform organization from 6 to 22 engineers across 3 teams with 92% retention.",
+      "Launched an internal developer portal that reduced service setup time from 2 weeks to 1 day.",
+      "Ran the API gateway consolidation that retired 11 bespoke proxies and simplified on-call."
+     ]},
+    {"title": "Staff Software Engineer", "company": "Wingtip Toys", "location": "Boulder, CO", "dates": "Sep 2014 – Mar 2019", "start": "2014-09", "end": "2019-03",
+     "bullets": [
+      "Designed the order workflow engine in Go that handled the holiday peak of 18,000 orders per minute.",
+      "Introduced service level objectives and an incident review process adopted company-wide.",
+      "Wrote the settings service and its YAML schema used by 40 microservices."
+     ]}
+   ],
+   "projects": [
+    {"name": "Pipeline Lint", "description": "Open source linter for CI workflow files with 1,200 GitHub stars."},
+    {"name": "On-call Atlas", "description": "Shift scheduling tool that balances on-call load across time zones."}
+   ],
+   "education": [
+    {"degree": "B.S. Electrical Engineering", "institution": "Mesa State Institute", "dates": "2008 – 2012"}
+   ]
+  },
+  "dev": {
+   "name": "Devika Nair",
+   "headline": "Full Stack Developer",
+   "contact": ["Toronto, ON", "devika.nair@example.test", "+1 416 555 0163", "https://linkedin.example.test/in/devikanair"],
+   "headings": {"summary": "Professional Summary", "skills": "Tech Stack", "experience": "Professional Experience", "education": "Education"},
+   "order": ["summary", "skills", "experience", "education"],
+   "summary": "Full stack developer with six years of experience delivering accessible web applications and payment integrations for fintech and retail clients.",
+   "skills": [
+    {"category": "Frontend", "items": [{"name": "React"}, {"name": "TypeScript"}, {"name": "Next.js"}, {"name": "Tailwind CSS"}]},
+    {"category": "Backend", "items": [{"name": "Node.js"}, {"name": "PostgreSQL"}, {"name": "GraphQL"}, {"name": "Stripe API"}]},
+    {"category": "Tooling", "items": [{"name": "GitHub Actions"}, {"name": "Playwright"}, {"name": "Figma"}, {"name": "Brightlane SDK", "recognized": false}]}
+   ],
+   "experience": [
+    {"title": "Senior Full Stack Developer", "company": "Proseware Payments", "location": "Toronto, ON", "dates": "Feb 2022 – Present", "start": "2022-02", "end": null,
+     "bullets": [
+      "Rebuilt the merchant onboarding flow in React and Next.js, raising completion from 61% to 84%.",
+      "Integrated the Stripe API and 3 regional payment providers behind one checkout service.",
+      "Introduced Playwright end-to-end tests that cut production regressions by half."
+     ]},
+    {"title": "Full Stack Developer", "company": "Blue Yonder Retail", "location": "Ottawa, ON", "dates": "May 2019 – Jan 2022", "start": "2019-05", "end": "2022-01",
+     "bullets": [
+      "Delivered an accessible storefront redesign that met WCAG 2.1 AA across 200 pages.",
+      "Built GraphQL APIs on Node.js and PostgreSQL serving 1.5 million monthly users.",
+      "Automated release workflows with GitHub Actions, shortening deployments to 15 minutes."
+     ]}
+   ],
+   "education": [
+    {"degree": "B.Eng. Software Engineering", "institution": "Lakehead Polytechnic", "dates": "2014 – 2018"}
+   ]
+  }
+ }
+}

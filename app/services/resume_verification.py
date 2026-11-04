@@ -88,10 +88,24 @@ def versions(db: Session, profile: CandidateProfile) -> list[Resume]:
                            .order_by(desc(Resume.version))).all())
 
 
+def parse_text(db: Session, resume: Resume) -> str:
+    """What the regex parser reads: the parse view of a version read with resume extraction V2, else its raw text."""
+    from app.services.resume_extraction import store
+
+    return store.parse_text(db, resume)
+
+
+def parse_structured(db: Session, resume: Resume) -> dict[str, Any]:
+    """The regex parse of a version: from its parse view when it was read with V2, else from its raw text."""
+    from app.services.resume_extraction import store
+
+    return store.parse(db, resume)
+
+
 def ensure_structured(db: Session, resume: Resume) -> dict[str, Any]:
     """Structured data for a version, parsing it deterministically the first time (e.g. migrated versions)."""
     if resume.structured_data is None:
-        resume.structured_data = materialize(sr.parse_deterministic(resume.raw_text or ""))
+        resume.structured_data = materialize(parse_structured(db, resume))
         resume.parser, resume.parser_version = "deterministic", sr.PARSER_VERSION
         db.flush()
         record(db, resume, "*", "PARSE", "PARSER", new={"parser": resume.parser, "version": resume.parser_version,
@@ -125,11 +139,16 @@ def has_active(db: Session, profile: CandidateProfile) -> bool:
 
 
 def record_version(db: Session, profile: CandidateProfile, raw_text: str, *, document: ResumeDocument | None = None,
-                   source: str = "upload", name: str | None = None, activate: bool = False) -> Resume:
+                   source: str = "upload", name: str | None = None, activate: bool = False,
+                   extraction=None) -> Resume:
     """The version for this text (and file). An identical file or text reuses its version; nothing is overwritten.
 
     A new version never becomes active by itself (`activate` is for an explicit choice): the person's selection
-    stays as it is. The one exception is a profile with no active resume yet, whose first resume is used."""
+    stays as it is. The one exception is a profile with no active resume yet, whose first resume is used.
+
+    `extraction` (resume extraction V2) is recorded with a new version before it is parsed, so the parser reads its
+    parse view; a reused version gets it only when it has none yet, and its data is not parsed again."""
+    from app.services.resume_extraction import store
     digest = sr.text_hash(raw_text)
     query = select(Resume).where(Resume.candidate_profile_id == profile.id)
     existing = None
@@ -147,6 +166,8 @@ def record_version(db: Session, profile: CandidateProfile, raw_text: str, *, doc
             existing.source_filename = existing.source_filename or document.original_filename
             existing.source_media_type = existing.source_media_type or document.media_type
             existing.source_file_hash = existing.source_file_hash or document.checksum
+        if extraction is not None and store.record(db, existing.id) is None:
+            store.save(db, existing, extraction)
         ensure_structured(db, existing)
         resume = existing
     else:
@@ -162,6 +183,8 @@ def record_version(db: Session, profile: CandidateProfile, raw_text: str, *, doc
                         verification_status="UNVERIFIED", created_at=utcnow(), updated_at=utcnow())
         db.add(resume)
         db.flush()
+        if extraction is not None:
+            store.save(db, resume, extraction)
         ensure_structured(db, resume)
         # The regex parse is there at once; the AI structuring of the new version is queued (never run here).
         from app.services import resume_parsing
@@ -321,6 +344,13 @@ def delete_version(db: Session, resume: Resume) -> dict[str, int]:
             setups += 1
     for change in db.scalars(select(ResumeDataChange).where(ResumeDataChange.resume_id == resume.id)).all():
         db.delete(change)  # PostgreSQL cascades these; SQLite does not
+    from app.models import ResumeParseTask
+    from app.services.resume_extraction import store
+
+    if (extraction := store.record(db, resume.id)) is not None:
+        db.delete(extraction)  # cascaded on PostgreSQL too
+    for task in db.scalars(select(ResumeParseTask).where(ResumeParseTask.resume_id == resume.id)).all():
+        db.delete(task)  # likewise: on SQLite a pending task would outlive its resume and block a reused id
     evidence_tags.forget_resume(db, resume.id)  # its evidence tags (cascaded on PostgreSQL)
     profile_id = resume.candidate_profile_id
     db.delete(resume)
@@ -495,10 +525,40 @@ def verify_section(db: Session, resume: Resume, section: str, source: str = "USE
     return data
 
 
+def confidence(db: Session, resume: Resume) -> dict[str, dict[str, Any]]:
+    """Each fact's confidence (app.services.resume_extraction.confidence): {} for a version read without V2."""
+    from app.services.resume_extraction import store
+    from app.services.resume_extraction.confidence import assess
+
+    return assess(resume.structured_data, resume.raw_text or "", store.record(db, resume.id))
+
+
+def verify_confident(db: Session, resume: Resume, source: str = "USER") -> int:
+    """The person accepts every fact still unverified whose confidence is high, in one action. A fact a person edited
+    or decided is left alone, and nothing is ever verified without this request. Returns how many were verified."""
+    levels = confidence(db, resume)
+    data = copy.deepcopy(ensure_structured(db, resume))
+    count = 0
+    for unit in iter_units(data):
+        if unit.status == "UNVERIFIED" and levels.get(unit.item_id, {}).get("level") == "high":
+            record(db, resume, unit.path, "VERIFY", source, item_id=unit.item_id, old=unit.status, new="VERIFIED")
+            _set_status(unit, "VERIFIED")
+            count += 1
+    if count:
+        _touch(resume, data)
+        refresh_status(resume)
+        sync_evidence(db, resume)
+    return count
+
+
 def verify_resume(db: Session, resume: Resume, user_id: int | None) -> Resume:
     """Mark the whole resume VERIFIED. Every unit in the required sections must be VERIFIED or REJECTED."""
+    from app.services.resume_extraction import store
+
     data = ensure_structured(db, resume)
-    blocking = blocking_items(data)
+    # A heading no table could place must be assigned first: its lines may belong to any section.
+    blocking = [{"item_id": f"section:{s['line']}", "label": f"Heading \u201c{s['text']}\u201d: choose its section"}
+                for s in store.unplaced(db, resume.id)] + blocking_items(data)
     if blocking:
         raise VerificationBlocked(blocking)
     old = resume.verification_status
@@ -655,7 +715,7 @@ def reparse(db: Session, resume: Resume, use_ai: bool = False) -> dict[str, Any]
         resume_parsing.nudge()
         return {"queued": True, "task_id": task.id}
     ensure_structured(db, resume)
-    return compare(db, resume, sr.parse_deterministic(resume.raw_text or ""), parser="deterministic",
+    return compare(db, resume, parse_structured(db, resume), parser="deterministic",
                    parser_version=sr.PARSER_VERSION)
 
 

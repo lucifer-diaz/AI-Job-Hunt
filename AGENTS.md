@@ -269,6 +269,68 @@ The rules a change has to keep:
   tailoring (when on) re-tailors it once the new ranking qualifies it — never from the old resume's analysis, and only
   when its ranking was queued.
 
+## Resume extraction V2 (reading uploaded files)
+
+`app/services/resume_extraction/` (README §11 "Reading the file", `docs/resume-extraction-plan.md`) reads an uploaded
+PDF when `RESUME_EXTRACTION_V2` is on. The rules a change has to keep:
+
+* **Off is the old path, byte for byte.** `document_text.extract` calls the pipeline only for a PDF or DOCX with V2
+  on; TXT reads through `document_text.read_plain` either way. A version read without V2 has no `ResumeExtraction` row
+  and is parsed from its raw text exactly as before (`resume_verification.parse_text`).
+* **The switch is per account, defaulting to the server.** A resume upload passes `resume_parsing.extraction_v2`
+  (worker setting `resume_parsing.extraction_v2`, Settings → Resumes); a value the account never set follows
+  `RESUME_EXTRACTION_V2`. Callers without an account (job description files) pass nothing and follow the server.
+* **The text the file states comes first.** PDFium (`text_layer.read_pdfium`) honours `/ActualText`; pypdf is only the
+  fallback for a file PDFium cannot open. Every word keeps its page, box and font: never drop provenance.
+* **Normalise artefacts, never meaning.** `normalize.TABLE` lists the characters that change; no NFKC. A line-break
+  hyphen is removed only when the joined word is known and its halves are not; otherwise the hyphen stays.
+* **Deterministic, local, bounded.** No model and no network in this step: it may run in the upload request. OCR
+  (`ocr.read_pdf`, Tesseract on this machine; a VLM backend would be a setting, off) runs only for a PDF the quality
+  report does not route `clean`, within `RESUME_OCR_MAX_PAGES` / `RESUME_OCR_TIMEOUT_SECONDS`; a missing, slow or
+  failing engine means no OCR, never a failed upload. The quality report and the log line hold counts, routes and
+  flags, never resume words.
+* **A correction needs evidence and is never silent** (`correction.correct`). Only an unknown or broken-looking word
+  is touched — never one the dictionary or the resume vocabulary knows. Evidence is the page reading a known word at
+  the same place, at most two glyphs apart (`_glyph_edits`: a ligature glyph reads as up to three letters), or a substitution the file uses on at least `MIN_RULE_WORDS` different
+  unknown words (seed `lexicons/confusions.yaml`, or learnt from the page). Every change is a Correction on the record
+  with its evidence; `Resume.raw_text` keeps the file's word and `store.clean_text` applies the corrections nobody
+  undid (the view and grounding read it). A person keeps or undoes each; undo re-reads the resume.
+* **Structure is marked, never written into the resume.** `sections.detect` (synonyms, keywords, the document's own
+  heading style; never a model) and `structure.view` produce the parse view the regex parser reads. `Resume.raw_text`
+  stays what the file says; the view, stored on `ResumeExtraction`, holds only its words plus markers ("## Section",
+  "### Title | Company | …", "- "). An unknown heading starts its own section: lines never run on into a neighbour
+  and are never dropped. Only `resume_extraction.store` writes `resume_extractions`; a person's decisions go to
+  `resume_extraction_feedback`.
+* **A person's section choice wins, and is learnt by counting.** `store.assign` records the choice (feedback and the
+  record's `overrides`), rebuilds the view from the stored text and its recorded look (never from the file again) and
+  re-parses: the data is filled only while nothing is reviewed or edited (`resume_parsing.untouched`), otherwise the
+  new parse is the usual comparison the person resolves. `store.learned` is the account's own choices, counted per
+  heading as written, applied before the synonym table on its next uploads; never another account's. A view is parsed
+  with `parse_deterministic(..., marked=True)` so headings are not guessed again. A heading no table could place
+  (`unknown`) blocks `verify_resume` until it is assigned.
+* **The AI parse of a V2 version reads its parse view (prompt v7) and grounding never loses silently.** A version
+  read without V2 keeps prompt v6 byte for byte. A normalized skill stays only when its written form (`raw`) is in the
+  text and `resume_parsing.normalizes` (containment, a known alias, initials) checks it is the same skill; the unit
+  keeps `raw`. What grounding drops is computed by `held_back` and stored on the record's review list — values only —
+  for the person to add (through `rv.apply_edit`: their change, unverified) or discard. Nothing on the list reaches a
+  workflow unasked; never loosen grounding to keep it.
+* **Confidence is computed, explained and never verifies by itself** (`confidence.assess`, on read, never stored: it
+  cannot go stale). It is rules over checkable signals — the value in the clean text word for word, the correction
+  behind a word and its evidence, a normalized or alias match, a fuzzy passage, a misread-looking word, the quality
+  route — each with a human-readable reason. "Accept high-confidence" (`resume_verification.verify_confident`) is the
+  person's action and verifies only facts still UNVERIFIED that are rated high; tailoring stays verified-only. The
+  `resume_extraction` gate `high_confidence_precision` (≥ 0.99) checks that a high fact is right.
+* **Unverified means high confidence, or held back.** With `allow_unverified_resume_facts` on, generation and review
+  use an UNVERIFIED fact of a V2 version only when it is rated high (`context_builder.hold_back_unconfident`, in
+  `_base`, on a copy marked `HELD_BACK`; a held role holds its bullets). The rest go to `TaskContext.held_back_facts`
+  (the reviewer's prompt shows them only when there are some; MCP `get_tailoring_context` / `get_review_context`
+  list them with `HELD_BACK_NOTE`). Ranking is not gated; VERIFIED, EDITED and REJECTED facts are never touched; a
+  version without confidence is used as before. Never let a held fact back in through another path.
+* **Measured, not assumed.** Run `python scripts/agent_eval.py --suite resume_extraction --resume-pipeline v2`; its
+  hard gates (`valid_words_altered`, `hallucinated_values`) stay at 0. Fixtures are synthetic
+  (`tests/fixtures/resume_extraction/`, rebuilt by `scripts/build_resume_fixtures.py`); a real resume goes only in the
+  gitignored `real/` folder. Bump the dataset's `version` when a case changes.
+
 ## Resume structuring (AI parse of uploads)
 
 `app/services/resume_parsing.py` (queue and steps), `app/agents/resume_parsing.py` (the graph) and

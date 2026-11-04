@@ -96,6 +96,9 @@ class User(Base):
     job_requirements: Mapped[list[JobRequirementEvidence]] = relationship(back_populates="user", passive_deletes=True)
     job_parse_tasks: Mapped[list[JobDescriptionParseTask]] = relationship(back_populates="user", passive_deletes=True)
     resume_parse_tasks: Mapped[list[ResumeParseTask]] = relationship(back_populates="user", passive_deletes=True)
+    resume_extractions: Mapped[list[ResumeExtraction]] = relationship(back_populates="user", passive_deletes=True)
+    resume_extraction_feedback: Mapped[list[ResumeExtractionFeedback]] = relationship(back_populates="user",
+                                                                                      passive_deletes=True)
     job_fetch_tasks: Mapped[list[JobDescriptionFetchTask]] = relationship(back_populates="user", passive_deletes=True)
     job_insight_tasks: Mapped[list[JobInsightTask]] = relationship(back_populates="user", passive_deletes=True)
     job_insights: Mapped[list[JobInsight]] = relationship(back_populates="user", passive_deletes=True)
@@ -347,6 +350,55 @@ class ResumeParseTask(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class ResumeExtraction(Base):
+    """How one resume version was read (app.services.resume_extraction, RESUME_EXTRACTION_V2): the reader, the quality
+    report, where each section starts and how its heading was placed, and the parse view the regex parser reads.
+
+    Derived and never authoritative: Resume.raw_text stays what the file says, and the view holds only its words with
+    structure marked. Counts, kinds and the document's own headings; no data a person typed. One per version.
+    """
+
+    __tablename__ = "resume_extractions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("resume_extractions")
+    user: Mapped[User] = relationship(back_populates="resume_extractions")
+    resume_id: Mapped[int] = mapped_column(
+        ForeignKey("resumes.id", ondelete="CASCADE", name="fk_resume_extractions_resume_id"), unique=True)
+    pipeline_version: Mapped[str] = mapped_column(String(20))
+    source: Mapped[str] = mapped_column(String(20))  # pdfium | pypdf | docx | text
+    quality: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)  # QualityReport.summary()
+    sections: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)  # sections.Heading.as_dict()
+    parse_view: Mapped[str] = mapped_column(Text, default="")
+    # Each line's look (glyph height, weight, left edge, style, list item, columns), compact, so the view can be
+    # rebuilt from Resume.raw_text when a person assigns a heading; {"<line>": kind or "none"} are those choices.
+    layout: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    overrides: Mapped[dict[str, str]] = mapped_column(JSON, default=dict)
+    # Corrections made to the text and values held back for review (Phases 5 – 6); empty until then.
+    corrections: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    review: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+
+class ResumeExtractionFeedback(Base):
+    """A person's decision about how a resume was read (a heading assigned to a section, a correction accepted or
+    rejected), kept to learn the account's own headings and to measure the reader. Never another account's."""
+
+    __tablename__ = "resume_extraction_feedback"
+    __table_args__ = (Index("ix_resume_extraction_feedback_user_kind", "user_id", "kind"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("resume_extraction_feedback")
+    user: Mapped[User] = relationship(back_populates="resume_extraction_feedback")
+    resume_id: Mapped[int | None] = mapped_column(
+        ForeignKey("resumes.id", ondelete="SET NULL", name="fk_resume_extraction_feedback_resume_id"), nullable=True)
+    kind: Mapped[str] = mapped_column(String(20))  # section | correction | value
+    subject: Mapped[str] = mapped_column(String(300))  # the heading or term as written
+    before: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    after: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
 
 class KnowledgeAnswer(Base):

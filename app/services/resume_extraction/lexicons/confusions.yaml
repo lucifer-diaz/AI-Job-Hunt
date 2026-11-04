@@ -1,0 +1,13 @@
+# What a ligature glyph with a broken ToUnicode entry reads as, seen in real exports (docs/resume-extraction-plan.md
+# §3, the resume_extraction fixtures). A rule from this table is a *candidate* only: it is used in a file when it turns
+# at least two different unknown words into known ones there, and only on words it makes known.
+"Y": [ti]
+"Z": [ti]
+"y": [ti]
+"5": [ti]
+"[": [tf]
+"B": [tf]
+"G": [tf]
+"g": [fk]
+"4": [ft]
+"C": [tt]

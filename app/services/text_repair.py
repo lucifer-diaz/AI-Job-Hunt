@@ -98,6 +98,11 @@ def _suspects(token: str) -> list[int]:
     return out
 
 
+def suspect(token: str) -> bool:
+    """A token with a character that looks like a broken glyph ("architecYng", "pla[orms")."""
+    return bool(_suspects(token))
+
+
 def _with(token: str, glyph: str, ligature: str) -> str:
     out, positions = token, [i for i in _suspects(token) if token[i] == glyph]
     for i in reversed(positions):

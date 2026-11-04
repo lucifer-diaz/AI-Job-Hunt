@@ -8,6 +8,7 @@
     browser_actions    `browser_actions.check`: what a navigator proposal may make the browser do
     confirmation       `submission.ConfirmationVerifier.verify`: what counts as the site's confirmation
     human_corrections  `feedback.rates`: correction rates from stored facts, kept apart from recruiter outcomes
+    resume_extraction  uploaded resume → text → structure, against hand-written synthetic resumes
 
 Targets are the production functions, never a stand-in. A case's outputs carry ids, codes and flags only. The JD
 parser suite scores outputs a model produced earlier (recorded in the dataset): it measures those outputs and the
@@ -275,6 +276,13 @@ def rag(ds: Dataset, ctx: dict[str, Any]) -> SuiteResult:
     return SuiteResult("rag", ds.identity(), {"cases": report["cases"], **{k: report[k] for k in keys}})
 
 
+def resume_extraction(ds: Dataset, ctx: dict[str, Any]) -> SuiteResult:
+    """Resume extraction: text and structure from synthetic documents (app.services.agent_eval.resume_extraction)."""
+    from app.services.agent_eval import resume_extraction as rx
+
+    return rx.run(ds, ctx)
+
+
 def unsupported_claims(ds: Dataset, ctx: dict[str, Any]) -> SuiteResult:
     code, out = (ctx["preparation_output"] if "preparation_output" in ctx
                  else _script("preparation_eval.py", "--json"))
@@ -294,11 +302,12 @@ def unsupported_claims(ds: Dataset, ctx: dict[str, Any]) -> SuiteResult:
 SUITES: dict[str, Callable[[Dataset, dict[str, Any]], SuiteResult]] = {
     "jd_parser": jd_parser, "qualification": qualification, "rag": rag, "unsupported_claims": unsupported_claims,
     "ats_answers": ats_answers, "browser_actions": browser_actions, "confirmation": confirmation,
-    "human_corrections": human_corrections,
+    "human_corrections": human_corrections, "resume_extraction": resume_extraction,
 }
 # Suites whose cases live in an older suite's own dataset.
 EXTERNAL_DATASETS = {"rag": FIXTURES / "rag_eval" / "dataset.json",
-                     "unsupported_claims": FIXTURES / "preparation_eval" / "dataset.json"}
+                     "unsupported_claims": FIXTURES / "preparation_eval" / "dataset.json",
+                     "resume_extraction": FIXTURES / "resume_extraction" / "dataset.json"}
 
 
 def dataset_for(name: str) -> Dataset:
