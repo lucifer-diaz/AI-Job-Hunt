@@ -1,6 +1,6 @@
 # Job Hunt OS v0.5 — Guided application workspace
 
-A human-in-the-loop AI workflow for personal job hunting:
+A human-in-the-loop AI workflow for personal job hunting and tracking:
 
 **Apify Hunter → Ranker → Tailor → Reviewer → Approval → Application Tracker → Follow-up**
 
