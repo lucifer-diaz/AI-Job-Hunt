@@ -1,6 +1,7 @@
 {
   "name": "job-hunt-os-ui-tests",
   "private": true,
+  "license": "PolyForm-Noncommercial-1.0.0",
   "scripts": {
     "test": "vitest run",
     "test:coverage": "vitest run --coverage"

@@ -70,6 +70,81 @@ Auto-submit is intentionally not offered: approved packets always become an appl
 - Docker deployment
 - Separate cron command for scheduled follow-ups
 
+## Architecture
+
+```mermaid
+flowchart LR
+    SPA["Web workspace<br/>(vanilla JS)"]
+    Claude["Claude Desktop"]
+    API["FastAPI<br/>backend"]
+    MCP["MCP server<br/>(stdio)"]
+    Sched["Scheduler<br/>& workers"]
+    Graphs["LangGraph agent graphs<br/>qualification · preparation<br/>application · insights · resume parsing"]
+    LLM["LLM gateway<br/>(LLMClient)"]
+    PG[("PostgreSQL<br/>+ pgvector")]
+    Files[("Resumes<br/>& packets")]
+    LiteLLM["LiteLLM proxy"]
+    Models["OpenAI · Anthropic · Gemini<br/>OpenRouter · Ollama"]
+    LangSmith["LangSmith<br/>(optional, metadata only)"]
+    Apify["Apify actors"]
+    Gmail["Gmail API<br/>(read-only)"]
+    Chromium["Headless Chromium<br/>(Playwright)"]
+    Runner["browser-use runner<br/>(optional)"]
+    Sites["Job postings<br/>& ATS sites"]
+
+    SPA -- "REST + session" --> API
+    Claude -- "MCP token" --> MCP
+    API --> Files
+    API --> PG
+    MCP --> PG
+    API -- "starts" --> Sched
+    Sched -- "tasks · state · telemetry" --> PG
+    Sched -- "runs threads" --> Graphs
+    Graphs -- "checkpoints" --> PG
+    Graphs -- "GatewayChatModel" --> LLM
+    Graphs -. "traces" .-> LangSmith
+    Sched -- "prompts" --> LLM
+    LLM --> LiteLLM
+    LiteLLM --> Models
+    LLM -. "direct mode" .-> Models
+    Sched -- "job search · research" --> Apify
+    Sched -- "application replies" --> Gmail
+    Sched -- "JD recovery" --> Chromium
+    Chromium --> Sites
+    Sched -- "application forms" --> Runner
+    Runner --> Sites
+```
+
+The scheduler runs inside the FastAPI process, and PostgreSQL is the only queue and shared state (no Redis, Celery or
+separate worker service). Every model call goes through the LLM gateway (`LLMClient`), which picks each worker's model
+from its configuration and sends it to LiteLLM or straight to the provider. Every third-party call (models, Apify,
+Gmail, job sites) goes through the instrumented client (`external_api`), so it shows up in Monitoring.
+
+**Agent graphs (LangGraph).** Multi-step stages can run as LangGraph graphs (`app/agents/`): qualification (admit,
+recover, parse and rank a job), resume preparation (tailor, check the facts, review, wait for approval), application
+execution, Job Insights research and resume parsing. A graph conducts the existing services; it never writes job
+state itself, and its model calls go through the same LLM gateway (`GatewayChatModel`). The scheduler's workers run
+each graph thread under their task's lease, its checkpoints are kept in PostgreSQL so a run continues after a restart
+or a pause for a person, and traces can be exported to LangSmith (metadata only, off by default). Graphs need
+`AGENT_GRAPHS_ENABLED=true` and PostgreSQL; each one has its own mode (`QUALIFICATION_GRAPH_MODE`,
+`PREPARATION_GRAPH_MODE`, …), and with a graph off its stage runs the same steps without one. See
+[9c. Agent graphs](#9c-agent-graphs-experimental-off-by-default).
+
+| Layer | Stack |
+| --- | --- |
+| Frontend | Server-rendered Jinja pages with a single-page workspace in plain JavaScript (`app/static`), no build step |
+| Backend | Python 3.11+, FastAPI, SQLAlchemy 2, Pydantic v2, Alembic |
+| Data | PostgreSQL (SQLite for local development), pgvector for optional retrieval, local files for resumes and packets |
+| Background work | Built-in asyncio scheduler (`app/scheduler.py`) with PostgreSQL task tables (`FOR UPDATE SKIP LOCKED` leases) |
+| AI | LiteLLM gateway or a direct provider (OpenAI, Anthropic, Gemini, OpenRouter, Ollama), per-worker models with failover |
+| Agent graphs | LangGraph with the PostgreSQL checkpointer, LangChain core (gateway-bound chat model), optional LangSmith export |
+| Discovery & research | Apify actors, Lever and Greenhouse imports |
+| Browser | Playwright with headless Chromium; optional browser-use runner for application forms |
+| Integrations | Gmail (read-only, OAuth), MCP server for Claude Desktop, Google ADK agent (`job_hunt_agent`) |
+| Auth | Email and password accounts, HTTP-only session cookies, encrypted per-account API keys |
+| Tests | pytest, Vitest + jsdom |
+| Deployment | Docker, Render or Railway |
+
 ## 1. Local run
 
 ```bash
@@ -3601,3 +3676,15 @@ Relevant API regressions: `python -m pytest tests/test_workspace.py tests/test_a
 tests/test_dashboard_features.py -q`. No API or database migration is required.
 Rollback by reverting the Knowledge bank module, its dashboard script inclusion,
 and the associated routing and styles together.
+
+## License and commercial use
+
+**Job Hunt OS is source-available, not OSI-defined open-source software.**
+
+The project's original code is available under the [PolyForm Noncommercial License 1.0.0](LICENSE). You may use, study, modify and share it for purposes permitted by that license, including personal noncommercial self-hosting. **Commercial use (including paid hosted/SaaS offerings) requires a separate written license** from Rohan Roy.
+
+We welcome community contributions. Please read [CONTRIBUTING.md](CONTRIBUTING.md) and sign the [Contributor License Agreement](CLA.md) before any substantive contribution is merged (the CLA Assistant bot asks you to on your first pull request). Contributors retain copyright to their own original work while granting Rohan Roy personally the right to operate paid hosted and other commercially licensed versions without royalties.
+
+This repository is the **community edition**. A commercial edition (paid hosting, business and enterprise use) is licensed separately; see [COMMERCIAL-LICENSING.md](COMMERCIAL-LICENSING.md) for how the editions relate. For branding, see [TRADEMARKS.md](TRADEMARKS.md).
+
+Third-party dependencies keep their own licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
