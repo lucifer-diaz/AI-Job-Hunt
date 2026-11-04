@@ -98,6 +98,21 @@ def remove_question(insight: JobInsight, qid: str) -> bool:
     return True
 
 
+def redraft(insight: JobInsight, qid: str) -> None:
+    """Ask the model again for one pasted question the person is waiting on: its item is cleared, so it shows as
+    drafting and the next APPLICATION_FORM run (or `service.follow_up`) drafts it. A personal question, or one already
+    answered from the person's library, is refused: there is nothing for a model to write."""
+    pasted = next((q for q in insight.application_form_input or [] if q.get("id") == qid), None)
+    if pasted is None:
+        raise LookupError("Question not found")
+    item = next((q for q in insight.application_questions or [] if q.get("id") == qid), None)
+    if personal(pasted["question"], (item or {}).get("category")):
+        raise ValueError("Only you can answer this question; it is never drafted")
+    if item is not None and item.get("status") == LIBRARY:
+        raise ValueError("This question already has your saved answer")
+    insight.application_questions = [q for q in insight.application_questions or [] if q.get("id") != qid]
+
+
 MAX_ANSWER_CHARS = 8000
 
 
@@ -173,8 +188,8 @@ def current(items: list[dict[str, Any]], form_input: list[dict[str, Any]] | None
 
 def _item(qid: str, question: str, origin: str, status: str, **values: Any) -> dict[str, Any]:
     kind = {LIBRARY: "FACT", DRAFTED: "GENERATED"}.get(status, "UNKNOWN")
-    label = {LIBRARY: "Your saved answer", DRAFTED: "Draft — check and edit before you submit"}.get(
-        status, "Needs your answer")
+    label = values.get("label") or {LIBRARY: "Your saved answer",
+                                    DRAFTED: "Draft — check and edit before you submit"}.get(status, "Needs your answer")
     return {"id": qid, "question": question, "origin": origin, "status": status, "category": values.get("category"),
             "answer": values.get("answer"), "answer_source": values.get("answer_source"),
             "knowledge_answer_id": values.get("knowledge_answer_id"),
@@ -182,12 +197,19 @@ def _item(qid: str, question: str, origin: str, status: str, **values: Any) -> d
             "requirement_ids": values.get("requirement_ids") or [], "requirements": values.get("requirements") or [],
             "knowledge_ids": values.get("knowledge_ids") or [], "resume_refs": values.get("resume_refs") or [],
             "resume_facts": values.get("resume_facts") or [], "rationale": values.get("rationale") or None,
-            "reason": values.get("reason") or None, "kind": kind, "label": label}
+            "reason": values.get("reason") or None, "kind": kind, "label": label,
+            "basis": values.get("basis") or None}
 
 
-def before_model(db: Session, qid: str, question: str, origin: str) -> dict[str, Any] | None:
+WAITING = "Also waiting for your answer in the Answer library; saving this answers it there"
+CLOSEST_LABEL = "Draft from your closest experience — check it fits before you save"
+
+
+def before_model(db: Session, qid: str, question: str, origin: str,
+                 pending: set[str] | None = None) -> dict[str, Any] | None:
     """What the person's own data settles without a model: a verified saved answer (or a contact detail from the
-    profile), a sensitive saved answer, a question waiting in the Answer library, or a personal question."""
+    profile), a sensitive saved answer, or a personal question. A question already waiting in the Answer library is
+    not settled: it still gets a draft (its id goes into `pending`), and saving that draft answers the waiting row."""
     from app.services import knowledge
 
     found = knowledge.search(db, question, limit=3)
@@ -201,13 +223,12 @@ def before_model(db: Session, qid: str, question: str, origin: str) -> dict[str,
     if status == "NEEDS_CONFIRMATION":
         return _item(qid, question, origin, NEEDS_INPUT, category="PERSONAL",
                      reason="You saved a sensitive answer to this; confirm it on the form each time")
-    if status == "PENDING_HUMAN":
-        return _item(qid, question, origin, NEEDS_INPUT,
-                     reason="Already waiting for your answer in the Answer library")
     if personal(question):
         return _item(qid, question, origin, NEEDS_INPUT, category="PERSONAL",
                      reason="Only you can answer this (work authorization, pay, availability, relocation or "
                             "personal details). Save your answer in the Answer library to reuse it.")
+    if status == "PENDING_HUMAN" and pending is not None:
+        pending.add(qid)
     return None
 
 
@@ -254,10 +275,13 @@ def screen(answer: Any, *, form_refs: set[str], requirement_ids: set[str], evide
 
 def after_model(db: Session, job: Job, profile: Any, item: Any, *, qid: str, question: str, origin: str,
                 requirement_labels: dict[str, str], evidence_labels: dict[int, str],
-                resume_facts: dict[str, str] | None = None) -> dict[str, Any]:
+                resume_facts: dict[str, str] | None = None, waiting: bool = False) -> dict[str, Any]:
     """One model item as it is saved. A personal question never keeps a draft; a draft that states a number, a name
     or a work authorization the person's data does not support needs the person instead. A verified resume fact that
-    is not a bullet (a role, a degree, the skills ... cited by its RESUME ref) supports a draft like evidence does."""
+    is not a bullet (a role, a degree, the skills ... cited by its RESUME ref) supports a draft like evidence does.
+    A CLOSEST draft (no fact answers the question exactly; it is adapted from the nearest verified experience) passes
+    the same checks and is labelled so, with the model's note on what to check. `waiting`: the question is also
+    waiting in the Answer library."""
     from app.services.tailoring_results import check_prose
 
     common = {"category": item.form_category, "requirement_ids": item.requirement_ids,
@@ -269,7 +293,7 @@ def after_model(db: Session, job: Job, profile: Any, item: Any, *, qid: str, que
                             "details). Save your answer in the Answer library to reuse it.")
     if item.form_decision != "DRAFT":
         return _item(qid, question, origin, NEEDS_INPUT, **common,
-                     reason=item.form_note or "Your saved data does not answer this")
+                     reason=WAITING if waiting else item.form_note or "Your saved data does not answer this")
     if (not item.evidence_ids and not item.knowledge_ids and not item.form_resume_refs
             and item.form_category != "MOTIVATION"):
         return _item(qid, question, origin, NEEDS_INPUT, **common,
@@ -278,7 +302,13 @@ def after_model(db: Session, job: Job, profile: Any, item: Any, *, qid: str, que
     if problems:
         return _item(qid, question, origin, NEEDS_INPUT, **common,
                      reason="The draft was withheld: " + "; ".join(p["message"] for p in problems[:2]))
+    closest = item.form_basis == "CLOSEST"
+    note = (item.form_note or "Nothing you saved answers this exactly; it was adapted from related experience.") \
+        if closest else ""
+    reason = " ".join(r for r in (note, WAITING if waiting else "") if r)
     return _item(qid, question, origin, DRAFTED, **common, answer=item.form_answer, evidence_ids=item.evidence_ids,
+                 label=CLOSEST_LABEL if closest else None, basis="CLOSEST" if closest else None,
+                 reason=reason or None,
                  evidence=[evidence_labels.get(e, "") for e in item.evidence_ids], knowledge_ids=item.knowledge_ids,
                  resume_refs=item.form_resume_refs,
                  resume_facts=[(resume_facts or {}).get(r, r) for r in item.form_resume_refs])
@@ -374,8 +404,9 @@ def draft(db: Session, client: Any, job: Job, *, attempt: int, ctx: dict[str, An
     pasted = list((insight.application_form_input if insight else None) or [])
     settled: dict[str, dict[str, Any]] = {}
     ask: list[dict[str, str]] = []
+    waiting: set[str] = set()
     for n, q in enumerate(pasted, start=1):
-        early = before_model(db, q["id"], q["question"], FORM)
+        early = before_model(db, q["id"], q["question"], FORM, waiting)
         if early is not None:
             settled[q["id"]] = early
         else:
@@ -434,16 +465,16 @@ def draft(db: Session, client: Any, job: Job, *, attempt: int, ctx: dict[str, An
                     settled[asked["id"]] = after_model(
                         db, job, profile, item, qid=asked["id"], question=asked["question"], origin=FORM,
                         requirement_labels=ctx["requirements"], evidence_labels=evidence_labels,
-                        resume_facts=resume_facts)
+                        resume_facts=resume_facts, waiting=asked["id"] in waiting)
                 elif predict and len(predicted_items) < MAX_PREDICTED:
                     qid = question_id(PREDICTED, item.form_question)
                     if question_id(FORM, item.form_question) in seen or qid in seen:
                         continue
                     seen.add(qid)
-                    predicted_items.append(before_model(db, qid, item.form_question, PREDICTED) or after_model(
+                    predicted_items.append(before_model(db, qid, item.form_question, PREDICTED, waiting) or after_model(
                         db, job, profile, item, qid=qid, question=item.form_question, origin=PREDICTED,
                         requirement_labels=ctx["requirements"], evidence_labels=evidence_labels,
-                        resume_facts=resume_facts))
+                        resume_facts=resume_facts, waiting=qid in waiting))
 
     items = []
     for q in pasted:
@@ -453,7 +484,9 @@ def draft(db: Session, client: Any, job: Job, *, attempt: int, ctx: dict[str, An
             items.append(previous[q["id"]])  # the model did not answer this time: the last good draft stands
         else:
             items.append(_item(q["id"], q["question"], FORM, NEEDS_INPUT,
-                               reason="Not drafted: " + (errors[-1] if errors else "the model gave no answer")))
+                               reason=" ".join(r for r in ("Not drafted: " + (errors[-1] if errors else
+                                                                              "the model gave no answer"),
+                                                           WAITING if q["id"] in waiting else "") if r)))
     if predicted_items is not None:
         items += predicted_items
     else:

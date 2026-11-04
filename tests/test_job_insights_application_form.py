@@ -183,7 +183,7 @@ def test_predicted_questions_follow_the_rules_whatever_the_model_says(owner, mon
         assert "Tell us about your Kafka work." not in got, "an item citing an unknown id is dropped alone"
         uncited = got["What is your greatest strength?"]
         assert uncited["status"] == "NEEDS_INPUT", "a factual draft needs evidence"
-        assert insight_of(job_id).prompt_versions["application_form"] == "v2"
+        assert insight_of(job_id).prompt_versions["application_form"] == "v3"
     finally:
         _unseed()
 
@@ -504,3 +504,79 @@ def test_a_reviewed_answer_is_saved_to_the_library_from_the_insights_tab(owner, 
         with SessionLocal() as db:
             db.execute(delete(KnowledgeAnswer).where(KnowledgeAnswer.question.in_([why, visa])))
             db.commit()
+
+
+# ───────────── drafts from the closest experience ─────────────
+
+FULLSTACK = "Tell us about a recent project where you worked across both the frontend and backend."
+
+
+def test_a_question_waiting_in_the_library_still_gets_a_draft_and_saving_answers_it(owner, signed_in, monkeypatch):
+    fact = _seed(owner)
+    with SessionLocal() as db:  # asked once before and never answered: waiting in the Answer library
+        db.add(KnowledgeAnswer(user_id=owner, question=FULLSTACK, question_key=question_key(FULLSTACK),
+                               category="test_form", verified=False))
+        db.commit()
+    try:
+        _crafted(monkeypatch, lambda _user: [
+            {"form_ref": "F1", "form_question": FULLSTACK, "form_category": "EXPERIENCE", "form_decision": "DRAFT",
+             "form_basis": "CLOSEST", "form_answer": "I built reliable Python services for payments.",
+             "evidence_ids": [fact], "form_note": "From the payments services work; check it covers a frontend."}])
+        job_id = new_job(owner)
+        run_insights()
+        client = signed_in(owner)
+        client.post(f"/api/jobs/{job_id}/insights/application-questions", json={"questions": [FULLSTACK]})
+        run_insights()
+        item = by_question(job_id)[FULLSTACK]
+        assert item["status"] == "DRAFTED" and item["answer"], "a waiting question is drafted, not left waiting"
+        assert item["label"] == application_form.CLOSEST_LABEL and item["basis"] == "CLOSEST"
+        assert "check it covers a frontend" in item["reason"] and application_form.WAITING in item["reason"]
+
+        out = client.post(f"/api/jobs/{job_id}/insights/application-questions/{item['id']}/save",
+                          json={"answer": "My reviewed words.", "reviewed": True}).json()
+        with SessionLocal() as db:
+            rows = db.scalars(select(KnowledgeAnswer).where(KnowledgeAnswer.question == FULLSTACK)).all()
+        assert [(r.id, r.answer, r.verified) for r in rows] == [(out["knowledge_answer_id"], "My reviewed words.",
+                                                                  True)], "the waiting row is answered, not copied"
+    finally:
+        _unseed()
+
+
+def test_a_closest_draft_without_a_citation_is_still_withheld(owner, signed_in, monkeypatch):
+    _crafted(monkeypatch, lambda _user: [
+        {"form_ref": "F1", "form_question": FULLSTACK, "form_category": "EXPERIENCE", "form_decision": "DRAFT",
+         "form_basis": "CLOSEST", "form_answer": "I built a full-stack dashboard.", "form_note": "Adapted."}])
+    job_id = new_job(owner)
+    run_insights()
+    signed_in(owner).post(f"/api/jobs/{job_id}/insights/application-questions", json={"questions": [FULLSTACK]})
+    run_insights()
+    item = by_question(job_id)[FULLSTACK]
+    assert item["status"] == "NEEDS_INPUT" and item["answer"] is None
+
+
+def test_draft_with_ai_queues_one_question_and_refuses_a_personal_one(owner, signed_in):
+    job_id = new_job(owner)
+    run_insights()
+    client = signed_in(owner)
+    visa = "Do you require visa sponsorship to work here?"
+    client.post(f"/api/jobs/{job_id}/insights/application-questions", json={"questions": [FULLSTACK, visa]})
+    run_insights()
+    got = by_question(job_id)
+    url = f"/api/jobs/{job_id}/insights/application-questions/{{}}/draft"
+    out = client.post(url.format(got[FULLSTACK]["id"])).json()
+    drafting = next(q for q in out["application_form"]["from_form"] if q["id"] == got[FULLSTACK]["id"])
+    assert drafting["status"] == "PENDING" and out["application_form"]["pending"]
+    assert tasks_of(job_id)[-1].scope == "APPLICATION_FORM" and tasks_of(job_id)[-1].status == "PENDING"
+    assert client.post(url.format(got[visa]["id"])).status_code == 422, "a personal question is never drafted"
+    assert client.post(url.format("fnope")).status_code == 404
+    assert signed_in(make_user(SessionLocal)).post(url.format(got[FULLSTACK]["id"])).status_code == 404
+    assert run_insights() == ["completed"] and FULLSTACK in by_question(job_id)
+
+
+def test_the_contract_reads_form_basis_leniently():
+    out = ApplicationFormPrepResult.model_validate({"form_questions": [
+        {"form_question": "Describe a full-stack project.", "form_decision": "DRAFT", "form_answer": "x",
+         "form_basis": "closest"},
+        {"form_question": "Describe a backend project.", "form_decision": "DRAFT", "form_answer": "y",
+         "form_basis": "nonsense"}]})
+    assert [q.form_basis for q in out.form_questions] == ["CLOSEST", "DIRECT"]

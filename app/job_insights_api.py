@@ -193,6 +193,34 @@ def remove_form_question(job_id: int, question_id: str, db: Session = Depends(ge
     return views.insight_view(db, job)
 
 
+@router.post("/api/jobs/{job_id}/insights/application-questions/{question_id}/draft")
+def redraft_form_question(job_id: int, question_id: str, request: Request, background: BackgroundTasks,
+                          db: Session = Depends(get_user_db)) -> dict[str, Any]:
+    """Draft one pasted question again, in the background (an APPLICATION_FORM task), even when nothing answers it
+    exactly: the draft may be adapted from the closest verified experience. Nothing is answered in this request."""
+    job = _job(db, job_id)
+    insight = db.scalar(select(JobInsight).where(JobInsight.job_id == job.id))
+    if insight is None:
+        raise HTTPException(404, "Question not found")
+    try:
+        application_form.redraft(insight, question_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    try:
+        insight_tasks.enqueue(db, job, reason=insight_tasks.USER_REQUEST, force=True,
+                              scope=insight_tasks.APPLICATION_FORM)
+        db.commit()
+    except IntegrityError:  # a task was queued at the same moment; it (or its follow-up) drafts this question
+        db.rollback()
+        insight = db.scalar(select(JobInsight).where(JobInsight.job_id == job.id))
+        application_form.redraft(insight, question_id)
+        db.commit()
+    run_soon(background, request.app, "job_insights")
+    return views.insight_view(db, job)
+
+
 @router.post("/api/jobs/{job_id}/insights/application-questions/{question_id}/save")
 def save_form_answer(job_id: int, question_id: str, payload: ReviewedAnswerIn,
                      db: Session = Depends(get_user_db)) -> dict[str, Any]:
