@@ -6,7 +6,7 @@ A human-in-the-loop AI workflow for personal job hunting and tracking:
 
 It deliberately does **not** bypass anti-bot/CAPTCHA controls. It discovers and prepares applications, then either queues them for human approval or auto-approves reviewed materials according to your settings. External submission remains a user action.
 
-## Workspace (v0.5 redesign)
+## Workspace (v0.6 redesign)
 
 The dashboard is a single-page workspace served from `app/static/app.js`; every number on it comes from the API.
 
