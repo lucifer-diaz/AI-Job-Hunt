@@ -1,4 +1,4 @@
-# Job Hunt OS v0.5 — Guided application workspace
+# Job Hunt OS v0.5, Guided application workspace
 
 A human-in-the-loop AI workflow for personal job hunting and tracking:
 
